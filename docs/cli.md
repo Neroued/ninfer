@@ -3,24 +3,33 @@
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
 
+The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
+
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
-  --max-context 16384 \
-  --max-new 256
+  --max-context 32768 \
+  --max-new 8192 \
+  --kv-dtype fp8 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft
 ```
 
-Exactly one of `--prompt` and `--messages` is required.
+Exactly one of `--prompt` and `--messages` is required. The CLI normally omits `--kv-capacity`, so
+the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
 
 Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
 canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
 written to stderr, so stdout can be redirected independently:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
-  --prompt "Return one sentence." --max-new 64 \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Return one sentence." \
+  --max-context 4096 \
+  --max-new 64 \
+  --kv-dtype fp8 \
   > answer.txt 2> run.log
 ```
 
@@ -50,11 +59,14 @@ For example, this allows at most 512 model-origin thinking tokens while retainin
 output capacity for the inserted suffix and the answer:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain speculative decoding, then give a concise conclusion." \
   --max-context 4096 \
   --max-new 1024 \
-  --thinking-budget 512
+  --thinking-budget 512 \
+  --kv-dtype fp8 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft
 ```
 
 ## Startup memory profile
@@ -105,11 +117,14 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
-  --vision
+  --kv-dtype fp8 \
+  --vision \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft
 ```
 
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
@@ -142,6 +157,7 @@ proposal head and requires a selected backend:
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
+  --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
@@ -152,15 +168,18 @@ For DFlash:
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 --max-new 512 \
+  --kv-dtype fp8 \
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
 MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
 use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
-measured recommendation rather than a semantic limit.
+the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
+block length eight, while fifteen uses the full native block.
 
 ## Common options
+
+The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -181,7 +200,7 @@ measured recommendation rather than a semantic limit.
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override | registered model/mode default |
+| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
@@ -199,8 +218,8 @@ the loaded model and the rendered prompt mode. The current presets are:
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
-Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
-is task-specific and is therefore an explicit override rather than an inferred Engine default.
+Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
+precise-coding profile use explicit sampling overrides.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
@@ -210,11 +229,11 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical
-allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
-KV-cache type.
-Use `--kv-dtype int8` or `--kv-dtype fp8` for compact large-context allocations. FP8 selects the
-row-scaled E4M3 D256 cache profile. The prepared prompt must fit
+The registered model IDs have a native context limit of 262,144 tokens. The practical allocation
+on one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
+The compact large-context profile uses `--kv-dtype fp8`, which selects row-scaled E4M3 D256 KV
+storage. INT8 group-64 and BF16 are also available. Artifact identity selects the weight profile;
+`--kv-dtype` selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

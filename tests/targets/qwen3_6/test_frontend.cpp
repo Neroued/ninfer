@@ -2,10 +2,12 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
@@ -42,6 +44,20 @@ constexpr std::string_view kThinkingControlGuidance =
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
+constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
+
+constexpr ninfer::TokenId kByte80Token = 13;
+constexpr ninfer::TokenId kByteE0Token = 14;
+constexpr ninfer::TokenId kByteEDToken = 15;
+constexpr ninfer::TokenId kByteA0Token = 16;
+constexpr ninfer::TokenId kByteF4Token = 17;
+constexpr ninfer::TokenId kByte90Token = 18;
+constexpr ninfer::TokenId kByteF5Token = 19;
+constexpr ninfer::TokenId kByteF0Token = 20;
+constexpr ninfer::TokenId kByte9FToken = 21;
+constexpr ninfer::TokenId kByte98Token = 22;
+constexpr ninfer::TokenId kByteC2Token = 23;
+constexpr ninfer::TokenId kByteA2Token = 24;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -124,6 +140,20 @@ nlohmann::json decoder_added(std::string content, bool special = false) {
     return value;
 }
 
+std::string byte_level_symbol(std::uint8_t target) {
+    std::uint32_t next = 256;
+    for (int value = 0; value <= 255; ++value) {
+        const bool visible = (value >= 33 && value <= 126) || (value >= 161 && value <= 172) ||
+                             (value >= 174 && value <= 255);
+        const std::uint32_t codepoint = visible ? static_cast<std::uint32_t>(value) : next++;
+        if (value == target) {
+            return ninfer::text::unicode_internal::codepoint_to_utf8(
+                static_cast<std::int32_t>(codepoint));
+        }
+    }
+    throw std::logic_error("byte-level test symbol is outside one byte");
+}
+
 FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
@@ -136,13 +166,24 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
          added(248057, "<|video_pad|>", true), added(248068, "<think>"),
          added(248069, "</think>")});
-    result.tokenizer_json = nlohmann::json{
-        {"model",
-         {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
-          {"merges", nlohmann::json::array()}}},
-        {"added_tokens",
-         tokens}}.dump();
+    nlohmann::json vocab           = {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}};
+    vocab[byte_level_symbol(0x80)] = kByte80Token;
+    vocab[byte_level_symbol(0xe0)] = kByteE0Token;
+    vocab[byte_level_symbol(0xed)] = kByteEDToken;
+    vocab[byte_level_symbol(0xa0)] = kByteA0Token;
+    vocab[byte_level_symbol(0xf4)] = kByteF4Token;
+    vocab[byte_level_symbol(0x90)] = kByte90Token;
+    vocab[byte_level_symbol(0xf5)] = kByteF5Token;
+    vocab[byte_level_symbol(0xf0)] = kByteF0Token;
+    vocab[byte_level_symbol(0x9f)] = kByte9FToken;
+    vocab[byte_level_symbol(0x98)] = kByte98Token;
+    vocab[byte_level_symbol(0xc2)] = kByteC2Token;
+    vocab[byte_level_symbol(0xa2)] = kByteA2Token;
+    result.tokenizer_json          = nlohmann::json{
+                 {"model",
+                  {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
+                 {"added_tokens",
+                  tokens}}.dump();
 
     nlohmann::json decoder = nlohmann::json::object();
     for (const nlohmann::json& token : tokens) {
@@ -277,6 +318,33 @@ bool throws_invalid_argument(Callable&& callable) {
     return false;
 }
 
+int test_invalid_public_part_enums(const Frontend& frontend) {
+    ninfer::ChatMessage invalid_part_message;
+    invalid_part_message.role = ninfer::ChatRole::User;
+    invalid_part_message.parts.push_back(ninfer::MessagePart{
+        .kind = static_cast<ninfer::MessagePartKind>(255), .text = "invalid", .media = {}});
+    ninfer::PromptInput invalid_part;
+    invalid_part.messages.push_back(std::move(invalid_part_message));
+
+    ninfer::MessagePart media;
+    media.kind       = ninfer::MessagePartKind::Media;
+    media.media.kind = static_cast<ninfer::MediaKind>(255);
+    media.media.bytes.push_back(0);
+    ninfer::ChatMessage invalid_media_message;
+    invalid_media_message.role = ninfer::ChatRole::User;
+    invalid_media_message.parts.push_back(std::move(media));
+    ninfer::PromptInput invalid_media;
+    invalid_media.messages.push_back(std::move(invalid_media_message));
+
+    int failures =
+        check(throws_invalid_argument([&] { (void)frontend.prepare(std::move(invalid_part)); }),
+              "invalid public message-part kind was accepted");
+    failures +=
+        check(throws_invalid_argument([&] { (void)frontend.prepare(std::move(invalid_media)); }),
+              "invalid public media kind was accepted as video");
+    return failures;
+}
+
 template <class Callable>
 bool throws_processor_budget(Callable&& callable) {
     try {
@@ -387,6 +455,41 @@ int test_boundary_aware_tokenization() {
                           !normalized.boundaries.front().exact_frontier &&
                           normalized.boundaries.front().stable_frontier == 0,
                       "boundary-aware tokenizer split an NFC composition sequence");
+    constexpr std::array<fi::ByteSpan, 2> literal_spans{fi::ByteSpan{.begin = 0, .end = 1},
+                                                        fi::ByteSpan{.begin = 1, .end = 2}};
+    const fi::BoundaryEncodedText annotated =
+        tokenizer.encode_with_boundaries("abc", {}, {}, literal_spans);
+    failures += check(annotated.input_ids == encoded.input_ids,
+                      "literal provenance introduced an artificial BPE boundary");
+    return failures;
+}
+
+int test_literal_added_token_provenance() {
+    const fi::Tokenizer& tokenizer    = official_tokenizer();
+    constexpr std::string_view marker = "<|image_pad|>";
+    constexpr std::array<fi::ByteSpan, 2> split_literal{
+        fi::ByteSpan{.begin = 0, .end = 5},
+        fi::ByteSpan{.begin = 5, .end = marker.size()},
+    };
+    const std::vector<int> ordinary =
+        tokenizer.encode(marker, fi::EncodeOptions{.parse_added_tokens = false});
+    const fi::BoundaryEncodedText annotated =
+        tokenizer.encode_with_boundaries(marker, {}, {}, split_literal);
+    int failures = check(annotated.input_ids == ordinary &&
+                             std::find(annotated.input_ids.begin(), annotated.input_ids.end(),
+                                       248056) == annotated.input_ids.end(),
+                         "literal Vision token became an added token across text spans");
+
+    const std::string mixed         = "<|im_start|>x<|image_pad|><|im_end|>";
+    const std::size_t literal_begin = mixed.find(marker);
+    const std::array<fi::ByteSpan, 1> literal{
+        fi::ByteSpan{literal_begin, literal_begin + marker.size()}};
+    const std::vector<int> mixed_tokens =
+        tokenizer.encode_with_boundaries(mixed, {}, {}, literal).input_ids;
+    failures += check(
+        !mixed_tokens.empty() && mixed_tokens.front() == 248045 && mixed_tokens.back() == 248046 &&
+            std::find(mixed_tokens.begin(), mixed_tokens.end(), 248056) == mixed_tokens.end(),
+        "literal exclusion suppressed template-owned control tokens");
     return failures;
 }
 
@@ -508,6 +611,18 @@ int test_official_chat_template() {
                           "<parameter=nested>\n{\"x\": [1, 2]}\n</parameter>\n"
                           "</function>\n</tool_call><|im_end|>\n",
                       "nested or boolean tool arguments differ from official JSON rendering");
+
+    fi::ChatMessage preamble   = chat_message(ninfer::ChatRole::Assistant, "Let me check:");
+    preamble.reasoning_content = "I should inspect.";
+    preamble.tool_calls.push_back(
+        {.id = "call_read", .name = "read_file", .arguments_json = R"({"path":"a"})"});
+    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "inspect"), preamble},
+                                       no_generation) ==
+                          "<|im_start|>user\ninspect<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nI should inspect.\n</think>\n\n"
+                          "Let me check:\n\n<tool_call>\n<function=read_file>\n<parameter=path>\n"
+                          "a\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+                      "assistant reasoning, preamble and tool call did not share one exact turn");
 
     fi::ChatRenderOptions no_thinking;
     no_thinking.enable_thinking = false;
@@ -666,6 +781,35 @@ int test_ordered_instruction_turns() {
                                     no_generation);
               }),
               "invalid typed chat role was accepted");
+    return failures;
+}
+
+int test_assistant_continuation() {
+    fi::ChatRenderOptions options;
+    options.continuation    = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    options.enable_thinking = false;
+    const fi::RenderedChat rendered =
+        render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                     chat_message(ninfer::ChatRole::Assistant, "answer prefix")},
+                    options);
+    const std::string expected = "<|im_start|>user\nquestion<|im_end|>\n"
+                                 "<|im_start|>assistant\nanswer prefix";
+    int failures               = check(rendered.text == expected,
+                                       "assistant continuation closed the turn or opened a second assistant");
+    failures +=
+        check(rendered.rewrite_checkpoint &&
+                  rendered.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                  rendered.rewrite_checkpoint->offset == expected.find("<|im_start|>assistant"),
+              "assistant continuation did not retain its replayable opener boundary");
+
+    options.enable_thinking = true;
+    failures += check(throws_invalid_argument([&] {
+                          (void)render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                                             chat_message(ninfer::ChatRole::Assistant, "prefix")},
+                                            options);
+                      }),
+                      "assistant continuation accepted an ambiguous Thinking opener");
     return failures;
 }
 
@@ -990,8 +1134,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::PromptInput image_input;
     image_input.messages.push_back(std::move(image_message));
     image_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-        .after_message_count = 1,
-        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .after_message_count      = 1,
+        .kind                     = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+        .after_message_part_count = 1,
     });
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
@@ -1030,12 +1176,16 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
         !prepared_data.vision_items.front().token_spans.empty()) {
-        const auto span = prepared_data.vision_items.front().token_spans.front();
-        failures += check(prepared_data.context_cache.opportunities.size() == 1 &&
-                              prepared_data.context_cache.opportunities.front().frontier >=
-                                  span.begin + span.count &&
-                              prepared_data.context_cache.opportunities.front().frontier <
-                                  prepared_data.token_ids.size(),
+        const auto span            = prepared_data.vision_items.front().token_spans.front();
+        const auto explicit_marker = std::find_if(
+            prepared_data.context_cache.opportunities.begin(),
+            prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
+                return ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+            });
+        failures += check(explicit_marker != prepared_data.context_cache.opportunities.end() &&
+                              explicit_marker->frontier >= span.begin + span.count &&
+                              explicit_marker->frontier < prepared_data.token_ids.size(),
                           "media expansion did not remap the following message cache boundary");
     }
     if (image_patches.size() == 16 * 1536) {
@@ -1044,6 +1194,179 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                               image_patches[256] == bf16_bits(-1.0F) &&
                               image_patches[1536] == bf16_bits(16.0F / 127.5F - 1.0F),
                           "image frontend patch normalization/order is incorrect");
+    }
+    return failures;
+}
+
+int test_literal_control_tokens_with_media() {
+    fi::ChatRenderOptions no_generation;
+    no_generation.add_generation_prompt = false;
+    const fi::RenderedChat literal_rendered =
+        render_chat({chat_message(ninfer::ChatRole::User, "quoted <|image_pad|>")}, no_generation);
+    const std::vector<int> literal_tokens =
+        fi::encode_rendered_chat(official_tokenizer(), literal_rendered).input_ids;
+    int failures = check(
+        literal_rendered.text == "<|im_start|>user\nquoted <|image_pad|><|im_end|>\n" &&
+            literal_rendered.text.find("\xE2\x81\xA0") == std::string::npos &&
+            std::find(literal_tokens.begin(), literal_tokens.end(), 248056) == literal_tokens.end(),
+        "renderer changed or structurally tokenized a literal Vision marker");
+
+    fi::ChatMessage leading_tool;
+    leading_tool.role = ninfer::ChatRole::Tool;
+    leading_tool.parts.push_back(
+        fi::ChatPart{.kind = fi::ChatPartKind::Text, .text = "imported result"});
+    const fi::RenderedChat leading_tool_rendered = render_chat({leading_tool}, no_generation);
+    failures += check(
+        leading_tool_rendered.text ==
+            "<|im_start|>user\n<tool_response>\nimported result\n</tool_response><|im_end|>\n",
+        "leading tool result was rendered without its user-role envelope");
+
+    FrontendResources official = resources();
+    official.tokenizer_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    official.tokenizer_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+    official.generation_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    const Frontend frontend = FrontendFactory::create_component(official);
+
+    auto text_part = [](std::string text) {
+        return ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}};
+    };
+    auto image_part = [](std::vector<std::uint8_t> bytes, std::string source_name) {
+        ninfer::MessagePart image;
+        image.kind              = ninfer::MessagePartKind::Media;
+        image.media.kind        = ninfer::MediaKind::Image;
+        image.media.bytes       = std::move(bytes);
+        image.media.media_type  = "image/x-portable-pixmap";
+        image.media.source_name = std::move(source_name);
+        return image;
+    };
+
+    std::vector<std::uint8_t> result_b_bytes  = gradient_ppm();
+    std::vector<std::uint8_t> result_a1_bytes = result_b_bytes;
+    std::vector<std::uint8_t> result_a2_bytes = result_b_bytes;
+    result_a1_bytes.back() ^= 0x01U;
+    result_a2_bytes.back() ^= 0x02U;
+    const fi::Sha256Digest result_b_digest =
+        fi::sha256(std::span<const std::uint8_t>(result_b_bytes));
+    const fi::Sha256Digest result_a1_digest =
+        fi::sha256(std::span<const std::uint8_t>(result_a1_bytes));
+    const fi::Sha256Digest result_a2_digest =
+        fi::sha256(std::span<const std::uint8_t>(result_a2_bytes));
+
+    ninfer::ChatMessage system;
+    system.role = ninfer::ChatRole::System;
+    system.parts.push_back(
+        text_part("The quoted template contains <|video_pad|>, <|vision_start|>, "
+                  "<|image_pad|>, and <|vision_end|>."));
+
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(text_part("inspect both files"));
+
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = "quoted reasoning <|video_pad|>";
+    assistant.tool_calls.push_back(ninfer::ToolCall{
+        .id             = "call_A",
+        .name           = "read",
+        .arguments_json = R"({"path":"quoted <|image_pad|>.png"})",
+    });
+    assistant.tool_calls.push_back(
+        ninfer::ToolCall{.id = "call_B", .name = "read", .arguments_json = R"({"path":"b.png"})"});
+
+    ninfer::ChatMessage result_b;
+    result_b.role         = ninfer::ChatRole::Tool;
+    result_b.tool_call_id = "call_B";
+    result_b.parts.push_back(text_part("result B: literal <|image_"));
+    result_b.parts.push_back(text_part("pad|> then image "));
+    result_b.parts.push_back(image_part(std::move(result_b_bytes), "result-b.ppm"));
+
+    ninfer::ChatMessage result_a;
+    result_a.role         = ninfer::ChatRole::Tool;
+    result_a.tool_call_id = "call_A";
+    result_a.parts.push_back(text_part("result A first image "));
+    result_a.parts.push_back(image_part(std::move(result_a1_bytes), "result-a1.ppm"));
+    result_a.parts.push_back(text_part(" literal <|vision_start|> between images "));
+    result_a.parts.push_back(image_part(std::move(result_a2_bytes), "result-a2.ppm"));
+
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(system));
+    input.messages.push_back(std::move(user));
+    input.messages.push_back(std::move(assistant));
+    input.messages.push_back(std::move(result_b));
+    input.messages.push_back(std::move(result_a));
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"read","description":"quoted <|vision_start|><|image_pad|><|vision_end|> and <|video_pad|>","parameters":{"type":"object"}}})");
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
+        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+    });
+
+    const std::uint32_t counted = frontend.count_tokens(input);
+    const auto prepared         = frontend.prepare(std::move(input));
+    const auto& data            = FrontendFactory::inspect(prepared);
+    failures += check(data.token_ids.size() == counted,
+                      "literal controls changed token-counting semantics");
+    failures += check(data.vision_items.size() == 3 && data.media_payloads.size() == 3,
+                      "literal controls changed the typed media count");
+    const auto private_anchor = std::find_if(
+        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
+        [](const auto& opportunity) {
+            return opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor;
+        });
+    failures += check(private_anchor != data.context_cache.opportunities.end(),
+                      "literal controls lost the following cache boundary");
+    if (data.vision_items.size() == 3) {
+        const auto& b  = data.vision_items[0];
+        const auto& a1 = data.vision_items[1];
+        const auto& a2 = data.vision_items[2];
+        failures += check(
+            b.content_digest == result_b_digest && a1.content_digest == result_a1_digest &&
+                a2.content_digest == result_a2_digest && b.token_spans.size() == 1 &&
+                a1.token_spans.size() == 1 && a2.token_spans.size() == 1 &&
+                b.token_spans[0].count == 4 && a1.token_spans[0].count == 4 &&
+                a2.token_spans[0].count == 4 && b.token_spans[0].begin < a1.token_spans[0].begin &&
+                a1.token_spans[0].begin < a2.token_spans[0].begin,
+            "parallel tool-result media lost request or nested-content order");
+        if (private_anchor != data.context_cache.opportunities.end()) {
+            failures +=
+                check(private_anchor->frontier >= a2.token_spans[0].begin + a2.token_spans[0].count,
+                      "media provenance broke the following cache boundary");
+        }
+    }
+    failures += check(std::count(data.token_ids.begin(), data.token_ids.end(), 248056) == 12 &&
+                          std::count(data.token_ids.begin(), data.token_ids.end(), 248057) == 0 &&
+                          std::count(data.token_ids.begin(), data.token_ids.end(), 248053) == 3 &&
+                          std::count(data.token_ids.begin(), data.token_ids.end(), 248054) == 3,
+                      "literal Vision spellings became media tokens");
+    return failures;
+}
+
+int test_image_resize_rejection_policy() {
+    FrontendResources owned = resources();
+    owned.preprocessor_config_json =
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":1048576}})";
+    const Frontend frontend = FrontendFactory::create_component(owned);
+
+    ninfer::PromptInput small = image_input();
+    small.messages[0].parts[0].media.image_resize_policy =
+        ninfer::ImageResizePolicy::RejectOversized;
+    int failures = check(frontend.count_tokens(std::move(small)) != 0,
+                         "oversized_image=error rejected an image that needed no downsize");
+
+    ninfer::PromptInput oversized =
+        image_text_input(block_ppm(2048, 1024, 127), {}, "oversized.ppm");
+    oversized.messages[0].parts[0].media.image_resize_policy =
+        ninfer::ImageResizePolicy::RejectOversized;
+    try {
+        (void)frontend.count_tokens(std::move(oversized));
+        failures += check(false, "oversized_image=error allowed a required Vision downsize");
+    } catch (const ninfer::RequestError& error) {
+        failures += check(error.kind() == ninfer::RequestErrorKind::InvalidMedia,
+                          "oversized_image=error used the wrong request-error classification");
     }
     return failures;
 }
@@ -1080,13 +1403,18 @@ int test_explicit_leading_instruction_cache_boundary() {
         .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
     });
 
-    const auto prepared = frontend.prepare(std::move(input));
-    const auto& data    = FrontendFactory::inspect(prepared);
-    return check(data.context_cache.opportunities.size() == 1 &&
-                     data.context_cache.opportunities[0].kind ==
-                         ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                     data.context_cache.opportunities[0].frontier != 0 &&
-                     data.context_cache.opportunities[0].frontier < data.token_ids.size(),
+    const auto prepared        = frontend.prepare(std::move(input));
+    const auto& data           = FrontendFactory::inspect(prepared);
+    const auto explicit_marker = std::find_if(
+        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
+        [](const auto& opportunity) {
+            return ninfer::has_shared_candidate_evidence(
+                opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+        });
+    return check(explicit_marker != data.context_cache.opportunities.end() &&
+                     explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                     explicit_marker->frontier != 0 &&
+                     explicit_marker->frontier < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
                  "full-system marker");
 }
@@ -1243,6 +1571,8 @@ int test_cross_round_stop(const Frontend& frontend) {
                       "cross-round stop did not select the exact terminal token prefix");
     const auto second = session.commit_preview();
     failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
+    failures += check(session.matched_stop_string() == std::optional<std::string>("STOP"),
+                      "terminal output session lost the matched stop declaration");
     return failures;
 }
 
@@ -1290,6 +1620,51 @@ int test_terminal_flush(const Frontend& frontend) {
     return failures;
 }
 
+int test_structured_tool_output() {
+    FrontendResources owned = resources();
+    owned.tokenizer_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    owned.tokenizer_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+    owned.generation_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    const Frontend frontend = FrontendFactory::create_component(owned);
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string generated =
+        "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = official_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                "tool output did not reach the terminal transaction");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Calling.",
+                      "frontend did not hide the terminal tool-call suffix");
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
+                      "frontend did not publish the structured tool call");
+    if (!calls.empty()) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1",
+                          "frontend changed the declared string argument type");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -1297,10 +1672,10 @@ int test_reasoning_split(const Frontend& frontend) {
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.add_generation_prompt = true;
-    input.options.enable_thinking       = true;
-    auto prompt                         = frontend.prepare(std::move(input));
-    auto session                        = frontend.make_output_session(prompt, {});
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    auto prompt                   = frontend.prepare(std::move(input));
+    auto session                  = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 2 &&
@@ -1323,8 +1698,8 @@ ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& fronten
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.add_generation_prompt = true;
-    input.options.enable_thinking       = true;
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
     return frontend.prepare(std::move(input));
 }
 
@@ -1460,6 +1835,92 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
 
+    const auto decode_generated = [&](const std::vector<ninfer::TokenId>& tokens,
+                                      bool one_token_per_round) {
+        auto generated_prompt  = frontend.prepare_tokens({0});
+        auto generated_session = frontend.make_output_session(generated_prompt, {});
+        std::string text;
+        std::uint32_t budget = static_cast<std::uint32_t>(tokens.size());
+        if (one_token_per_round) {
+            for (const ninfer::TokenId token : tokens) {
+                const auto decision =
+                    generated_session.preview_model(std::array<ninfer::TokenId, 1>{token}, budget,
+                                                    ninfer::FinishReason::OutputLimit);
+                budget -= decision.accepted_tokens;
+                text += channel_text(generated_session.commit_preview(),
+                                     ninfer::OutputChannel::Content);
+            }
+        } else {
+            (void)generated_session.preview_model(tokens, budget,
+                                                  ninfer::FinishReason::OutputLimit);
+            text = channel_text(generated_session.commit_preview(), ninfer::OutputChannel::Content);
+        }
+        return text;
+    };
+
+    struct Utf8Case {
+        std::vector<ninfer::TokenId> tokens;
+        std::string expected;
+        const char* label;
+    };
+
+    const std::string replacement(kUtf8Replacement);
+    const std::vector<Utf8Case> utf8_cases = {
+        {{10, 1}, replacement + "helloST", "invalid continuation after leading byte"},
+        {{10, 11, 1}, replacement + "helloST", "maximal incomplete subpart"},
+        {{11, 1}, replacement + "helloST", "isolated continuation byte"},
+        {{10, 11}, replacement, "terminal incomplete suffix"},
+        {{kByteE0Token, kByte80Token, kByte80Token},
+         replacement + replacement + replacement,
+         "overlong codepoint"},
+        {{kByteEDToken, kByteA0Token, kByte80Token},
+         replacement + replacement + replacement,
+         "surrogate codepoint"},
+        {{kByteF4Token, kByte90Token, kByte80Token, kByte80Token},
+         replacement + replacement + replacement + replacement,
+         "out-of-range codepoint"},
+        {{kByteF5Token, 1}, replacement + "helloST", "invalid leading byte"},
+        {{kByteC2Token, kByteA2Token}, "¢", "valid two-byte codepoint"},
+        {{kByteF0Token, kByte9FToken, kByte98Token, kByte80Token},
+         "😀",
+         "valid four-byte codepoint"},
+    };
+    for (const Utf8Case& test : utf8_cases) {
+        const std::string batched = decode_generated(test.tokens, false);
+        const std::string split   = decode_generated(test.tokens, true);
+        failures += check(batched == test.expected, test.label);
+        failures += check(split == test.expected, test.label);
+        failures += check(split == batched,
+                          "generated UTF-8 recovery changed across decode-round boundaries");
+    }
+
+    auto repaired_stop_prompt = frontend.prepare_tokens({0});
+    ninfer::StopPolicy repaired_stop;
+    repaired_stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    auto repaired_stop_session = frontend.make_output_session(repaired_stop_prompt, repaired_stop);
+    const auto repaired_stop_decision = repaired_stop_session.preview_model(
+        std::array<ninfer::TokenId, 3>{10, 1, 2}, 3, ninfer::FinishReason::OutputLimit);
+    failures += check(repaired_stop_decision.finish_reason == ninfer::FinishReason::StopString,
+                      "UTF-8 recovery hid a following stop string");
+    const auto repaired_stop_output = repaired_stop_session.commit_preview();
+    failures += check(channel_text(repaired_stop_output, ninfer::OutputChannel::Content) ==
+                          replacement + "hello",
+                      "UTF-8 recovery changed stop-string publication");
+
+    auto repaired_reasoning_prompt  = thinking_prompt(frontend);
+    auto repaired_reasoning_session = frontend.make_output_session(repaired_reasoning_prompt, {});
+    const auto repaired_reasoning_decision = repaired_reasoning_session.preview_model(
+        std::array<ninfer::TokenId, 3>{10, 3, 4}, 3, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(repaired_reasoning_decision.finish_reason == ninfer::FinishReason::OutputLimit,
+              "UTF-8 recovery changed reasoning termination");
+    const auto repaired_reasoning_output = repaired_reasoning_session.commit_preview();
+    failures += check(channel_text(repaired_reasoning_output, ninfer::OutputChannel::Reasoning) ==
+                              replacement + "thought" &&
+                          channel_text(repaired_reasoning_output, ninfer::OutputChannel::Content) ==
+                              "answer",
+                      "UTF-8 recovery changed reasoning/content channel routing");
+
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
     const auto eos_decision = eos_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
@@ -1499,6 +1960,29 @@ int test_disabled_vision() {
     input.messages.push_back(std::move(message));
     failures += check(frontend.prepare(std::move(input)).summary().prompt_tokens != 0,
                       "Vision-disabled frontend rejected a text prompt");
+    return failures;
+}
+
+int test_invalid_media_classification() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto invalid_image      = [] {
+        ninfer::PromptInput input                    = image_input();
+        input.messages[0].parts[0].media.bytes       = {0x00, 0x01, 0x02};
+        input.messages[0].parts[0].media.source_name = "invalid-image.bin";
+        return input;
+    };
+    auto is_invalid_media = [](const auto& operation) {
+        try {
+            operation();
+        } catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::InvalidMedia;
+        }
+        return false;
+    };
+    int failures = check(is_invalid_media([&] { (void)frontend.prepare(invalid_image()); }),
+                         "invalid image preparation lost its typed request error");
+    failures += check(is_invalid_media([&] { (void)frontend.count_tokens(invalid_image()); }),
+                      "invalid image token counting lost its typed request error");
     return failures;
 }
 
@@ -1691,16 +2175,21 @@ int main() {
     failures += test_official_tokenizer_merge();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
+    failures += test_literal_added_token_provenance();
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_bounded_tokenizer_prefix();
     failures += test_context_capacity_guard();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
+    failures += test_assistant_continuation();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();
+    failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
+    failures += test_literal_control_tokens_with_media();
+    failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
@@ -1709,6 +2198,7 @@ int main() {
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
+    failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
@@ -1719,6 +2209,7 @@ int main() {
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
+    failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

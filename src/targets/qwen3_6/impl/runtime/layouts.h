@@ -19,7 +19,8 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
-using TensorLayout = TensorRegion;
+using TensorLayout                              = TensorRegion;
+inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct DFlashPersistentLayout {
     qwen3_6::PagedKVCacheLayout full;
@@ -37,6 +38,7 @@ struct PersistentLayout {
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
+    std::optional<TensorLayout> score_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
     std::size_t bytes            = 0;
@@ -59,6 +61,7 @@ struct WorkspacePlan {
     std::size_t mtp_round        = 0;
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
+    std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
@@ -76,6 +79,7 @@ struct SequencePlanningInputs {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
 };
@@ -99,6 +103,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;

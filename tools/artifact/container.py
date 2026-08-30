@@ -13,7 +13,6 @@ from .layouts import align_up, encoded_size, get_layout
 
 
 MAGIC = b"NINFER\x00\x02"
-_V1_MAGIC = b"NINFER\x00\x01"
 PREFIX = struct.Struct("<8sQ")
 PREFIX_BYTES = PREFIX.size
 PAYLOAD_ALIGNMENT = 4096
@@ -304,11 +303,6 @@ class Artifact:
                 raise ArtifactError("artifact is shorter than the v2 prefix")
             prefix = self._file.read(PREFIX_BYTES)
             magic, json_bytes = PREFIX.unpack(prefix)
-            if magic == _V1_MAGIC:
-                raise ArtifactError(
-                    "NInfer artifact v1 is no longer supported; migrate it with: "
-                    "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>"
-                )
             if magic != MAGIC:
                 raise ArtifactError("artifact magic is not NInfer v2")
             if json_bytes == 0:

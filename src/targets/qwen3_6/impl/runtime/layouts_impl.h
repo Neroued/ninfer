@@ -230,6 +230,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
+    if (plan.causal_scoring) {
+        out.score_hidden = add_tensor(
+            builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(kCausalScoreTile)},
+            "causal score hidden staging");
+    }
     qwen3_6::complete_round_state_layout(builder, out.round);
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
@@ -404,6 +409,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     scratch(text_prefill, ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
     out.text_prefill = finish(text_prefill);
 
+    if (plan.causal_scoring) {
+        WorkspaceLayoutBuilder causal_score;
+        matrix(causal_score, DType::BF16, TextConfig::output_rows,
+               static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        out.causal_score = finish(causal_score);
+    }
+
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
@@ -558,9 +572,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    out.general_capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill,
-                                     out.mtp_round, out.dflash_context, out.dflash_round});
-    out.capacity         = out.general_capacity;
+    out.general_capacity =
+        std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
+                  out.dflash_context, out.dflash_round, out.causal_score});
+    out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
@@ -655,6 +670,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_dtype            = inputs.kv_dtype;
@@ -729,6 +745,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
+        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };

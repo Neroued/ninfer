@@ -50,10 +50,10 @@ public:
         return digests_.empty() ? 0 : digests_.size() - 1U;
     }
 
-    [[nodiscard]] std::uint64_t at(std::size_t frontier) const;
+    [[nodiscard]] std::array<std::uint64_t, 2> at(std::size_t frontier) const;
 
 private:
-    std::vector<std::uint64_t> digests_;
+    std::vector<std::array<std::uint64_t, 2>> digests_;
 };
 
 [[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,

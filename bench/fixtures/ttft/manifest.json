@@ -39,6 +39,13 @@
       "prompt_tokens": 64512,
       "max_output_tokens": 32
     },
+    "long-64k-independent-32": {
+      "path": "bench/fixtures/ttft/text/long_64k_independent.json",
+      "sha256": "360f235f326a987e5a7347657731cb49315da5fa18c742f9587db4a8fa459572",
+      "prompt_tokens": 64512,
+      "max_output_tokens": 32,
+      "seed_common_prefix_tokens": 3
+    },
     "long-256k-32": {
       "path": "examples/cli/messages/long_niah_256k.json",
       "sha256": "73278973a82c80f5be8bcc7d4c89afd8bdd3edfe82e8900952cb4a7660cd9644",

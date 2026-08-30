@@ -2,11 +2,12 @@
 
 This directory contains committed, offline `--messages` inputs for exercising the product CLI from
 the repository root. It covers short text, chat history, images, video, mixed multimodal history,
-hard thinking problems, long decode, and four long-context capacities. This is an operator-facing
+hard thinking problems, long decode, and four long-context lengths. This is an operator-facing
 example set, not a second correctness framework.
 
-[`manifest.json`](manifest.json) lists each case, its intended observation, recommended runtime
-budget, and its prepared-prompt token count.
+[`manifest.json`](manifest.json) lists the frozen comparison cases, their intended observations,
+recommended runtime budgets, and prepared-prompt token counts. Standalone exploratory prompts may
+also live beside them when they deliberately have no frozen output oracle.
 
 ## Quick start
 
@@ -24,6 +25,24 @@ $CLI "$MODEL" \
 Expected stdout is exactly `42`. `--no-thinking --greedy` is the normal comparison mode for simple
 cases. Reasoning, progress, timings, memory, and MTP statistics are written to stderr; answer content
 is written to stdout.
+
+## Send the same fixture to Serve
+
+`send_to_serve` submits one CLI messages file to an already-running OpenAI Chat Completions
+endpoint. Run it as a repository module so it uses the maintained Serve client. Local CLI image and
+video paths are read on the client and encoded as data URIs; the server never receives a local
+filesystem path.
+
+```bash
+python3 -m examples.cli.send_to_serve \
+  examples/cli/messages/image_chart.json \
+  --base-url http://127.0.0.1:8080 \
+  --model qwen3.6-27b --no-thinking --max-tokens 64
+```
+
+Start `ninfer-serve` with `--vision` for media fixtures. Relative media paths use the current
+working directory by default; pass `--media-root` when invoking the command elsewhere. `--dry-run`
+prints the exact converted request without contacting a server.
 
 ## Text and multimodal cases
 
@@ -73,52 +92,57 @@ $CLI "$MODEL" --messages examples/cli/messages/thinking_logic_grid.json \
 
 $CLI "$MODEL" --messages examples/cli/messages/thinking_multimodal_checksum.json \
   --greedy --max-context 8192 --max-new 4096 --vision
-```
 
-The logic grid has one solution and must end with `CHECK=4606`. The multimodal case reads independent
-facts from two images and one video, then must end with `CHECKSUM=2238`.
-
-## Long decode
-
-This case deliberately gets a generous budget. It is meant to run until the model's stop token, not
-to discover the smallest `max-new` value that happens to fit one output.
-
-```bash
-$CLI "$MODEL" --messages examples/cli/messages/long_decode_design_review.json \
+$CLI "$MODEL" --messages examples/cli/messages/reasoning_jacobian_counterexample_3d.json \
   --greedy --max-context 32768 --max-new 16384
 ```
 
-The answer must contain all eight requested design sections plus `设计自检`. Its memory table must
-separate raw KV payload, 6.25% metadata, and total KV. The structural/factual oracle is intentional:
-the generated prose is not required to be byte-identical.
+The logic grid has one solution and must end with `CHECK=4606`. The multimodal case reads independent
+facts from two images and one video, then must end with `CHECKSUM=2238`. The Jacobian prompt is a
+standalone exact-proof stress case without a frozen model-output oracle, so it is intentionally not
+part of the comparison manifest.
+
+## Long decode
+
+The three frozen AIME 2026 cases deliberately get generous budgets. They are meant to run until the
+model's stop token, not to discover the smallest `max-new` value that happens to fit one output.
+
+```bash
+for CASE in 01 15 30; do
+  $CLI "$MODEL" --messages "examples/cli/messages/long_decode_aime26_${CASE}.json" \
+    --greedy --max-context 262144 --kv-dtype int8 --max-new 65536
+done
+```
+
+The boxed integer answers for cases 01, 15, and 30 are respectively `277`, `83`, and `393`.
 
 ## Long context
 
-These prompt lengths include the chat template with thinking disabled. The inputs freeze meaningful
-NInfer documentation and source excerpts, with four unique records placed across the packet.
+These prompt lengths include the chat template with thinking disabled. Each input freezes one long
+document with the same retrieval needle placed at 50% depth.
 
 ```bash
-$CLI "$MODEL" --messages examples/cli/messages/long_8k.json \
-  --max-context 8192 --kv-dtype bf16 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
-
-$CLI "$MODEL" --messages examples/cli/messages/long_64k.json \
-  --max-context 65536 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
-
-$CLI "$MODEL" --messages examples/cli/messages/long_128k.json \
-  --max-context 131072 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
-
-$CLI "$MODEL" --messages examples/cli/messages/long_256k.json \
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_8k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 64
+  --no-thinking --greedy --max-new 128
+
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_64k.json \
+  --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
+  --no-thinking --greedy --max-new 128
+
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_128k.json \
+  --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
+  --no-thinking --greedy --max-new 128
+
+$CLI "$MODEL" --messages examples/cli/messages/long_niah_256k.json \
+  --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
+  --no-thinking --greedy --max-new 128
 ```
 
 All four must output:
 
 ```text
-ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179
+ORCHID=493817; COLOR=COBALT
 ```
 
 The committed prompt token counts were validated against the Qwen3.6-27B and Qwen3.6-35B-A3B
@@ -131,13 +155,5 @@ when using these fixtures.
 All PNG and MP4 media are project-authored deterministic scenes. The video is five seconds at 8 FPS
 with forty H.264 frames. Runtime tests never depend on a network URL or mutable external content.
 
-The committed generated files are the actual inputs. To intentionally rebuild media and the four
-long-context JSON files from the current source tree:
-
-```bash
-python3 examples/cli/make_fixtures.py \
-  --tokenizer /path/to/Qwen3.6-27B
-```
-
-Regeneration updates the frozen source snapshot when selected project files change, so generated
-differences should be reviewed like any other fixture change.
+The committed files are the canonical inputs; there is no in-tree regeneration script. A deliberate
+replacement must update the file, its manifest hash, prompt-token count, and oracle together.

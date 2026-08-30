@@ -764,9 +764,9 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
   transforms and codecs use exact oracles.
-- Hugging Face, vLLM, llama.cpp, and the artifact-native Python route are execution/parity profiles,
-  not Op oracles. Their choices to cast attention probabilities, GDN controls, gated-norm values,
-  MoE route weights, expert activations, or convolution history do not bind NInfer kernels.
+- Hugging Face, vLLM, and llama.cpp are external execution profiles, not Op oracles. Their choices
+  to cast attention probabilities, GDN controls, gated-norm values, MoE route weights, expert
+  activations, or convolution history do not bind NInfer kernels.
 - NInfer kernels may select their natural accumulator precision, operand staging, intermediate
   materialization, workspace dtype, and reduction association. Each route is accepted directly
   against the one Op oracle with its own documented tolerance; the oracle precision does not become
@@ -954,7 +954,6 @@ The registered implementation maps these concerns as follows:
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
-| artifact-native diagnostic reference | `tools/reference/qwen3_6_35b_a3b/` |
 
 The registered 35B Public Engine conditionally materializes the DFlash companion when DFlash is the
 selected speculative backend. It runs through the same `.ninfer` Engine route as ordinary and MTP
@@ -963,12 +962,11 @@ its persistent state, workspace, proposal execution, context commit, target veri
 acceptance, and CUDA Graph lifecycle. When DFlash is not selected, its weights and state remain
 nonresident.
 
-The Python reference is diagnostic evidence, not a generated-token golden. Each production Op path
-is checked against its independent mathematical oracle; equality between different numerical or
-execution paths is not a runtime acceptance contract.
+Each production Op path is checked against its independent mathematical oracle; equality between
+different numerical or execution paths is not a runtime acceptance contract.
 
-As descriptive provenance for the checkpoint inspected by this reference, the local `config.json`
-SHA-256 is
+As descriptive provenance for the checkpoint used to establish this model contract, the local
+`config.json` SHA-256 is
 `93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99`, and the local
 `model.safetensors.index.json` SHA-256 is
 `41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83`. The index and all shard

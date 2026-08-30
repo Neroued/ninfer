@@ -175,9 +175,7 @@ Options parse_options(int argc, char** argv) {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-                throw std::invalid_argument("--top-k exceeds INT32_MAX");
-            }
+            if (top_k > 20) { throw std::invalid_argument("--top-k must be in [0,20]"); }
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);

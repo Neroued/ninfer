@@ -20,15 +20,16 @@ benchmark-report, and external protocol behavior. Repository verification princi
   alignment, Vision control, and family runtime mechanisms;
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix test;
+  prefix test and causal-scoring State/KV isolation test;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
-- `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
-  `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
-  Responses Item/state/SSE behavior, and incremental tool-call behavior;
+- `test_openai_schema.cpp`, `test_openai_responses.cpp`,
+  `test_openai_responses_store.cpp`, `test_anthropic_schema.cpp`, and
+  `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
+  and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v13 reports;
@@ -96,15 +97,13 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/convert \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
-artifact. The 35B-A3B reference binding test follows the same rule with
-`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
-target tests still run without either artifact.
+The Python suites cover generic artifact framing and exact converter inventories, source recipes,
+encoders, and payload verification. Model execution and real-artifact binding are tested through
+the C++ target and Engine suites below; there is no Python inference implementation.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
@@ -112,6 +111,14 @@ runs the real engine:
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
+The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
+score tile, overlapping target suffixes, and repeated-window State/KV isolation:
+
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_score_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:

@@ -26,6 +26,16 @@
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
 
+[[noreturn]] void throw_decode_error(const media::decode::Error& error) {
+    switch (error.kind()) {
+    case media::decode::ErrorKind::BudgetExceeded:
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+    case media::decode::ErrorKind::InvalidInput:
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, error.what());
+    }
+    throw std::logic_error("unknown media decode error kind");
+}
+
 using Clock = std::chrono::steady_clock;
 
 constexpr int kPatch                              = 16;
@@ -431,6 +441,24 @@ VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const Process
     return item;
 }
 
+void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& options,
+                                 const media::decode::Policy& policy) {
+    if (part.kind != ChatPartKind::Image ||
+        part.media.image_resize_policy != ImageResizePolicy::RejectOversized) {
+        return;
+    }
+    const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    const int aligned_h = round_even(static_cast<double>(image.height) / kFactor) * kFactor;
+    const int aligned_w = round_even(static_cast<double>(image.width) / kFactor) * kFactor;
+    const std::uint64_t area =
+        checked_mul(std::max(aligned_h, 0), std::max(aligned_w, 0), "image area");
+    if (area > options.image_max_pixels) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                             "image exceeds the native Vision geometry and oversized_image is "
+                             "set to 'error'");
+    }
+}
+
 VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
                               const media::decode::Policy& policy) {
     const media::decode::VideoInfo video = media::decode::inspect_video(
@@ -452,43 +480,39 @@ void append_repeated(std::string& out, std::string_view value, std::uint64_t cou
     for (std::uint64_t i = 0; i < count; ++i) { out += value; }
 }
 
-void append_placeholder(std::string& out, const VisionItem& item) {
+void append_media_token_run(std::string& out, std::string_view pad, std::uint64_t count,
+                            Modality modality, std::size_t item_index, std::size_t frame_index,
+                            std::vector<MediaTokenRunByteSpec>& runs) {
+    const std::size_t begin = out.size();
+    append_repeated(out, pad, count);
+    runs.push_back(MediaTokenRunByteSpec{
+        .bytes       = ByteSpan{begin, out.size()},
+        .modality    = modality,
+        .item_index  = item_index,
+        .frame_index = frame_index,
+    });
+}
+
+void append_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
+                        std::vector<MediaTokenRunByteSpec>& runs) {
     const std::uint64_t frame_tokens =
         static_cast<std::uint64_t>(item.grid.h / kMerge) * (item.grid.w / kMerge);
     if (item.modality == Modality::Image) {
-        append_repeated(out, kImagePad, frame_tokens);
+        append_media_token_run(out, kImagePad, frame_tokens, Modality::Image, item_index, 0, runs);
         return;
     }
     if (item.timestamps.size() != static_cast<std::size_t>(item.grid.t)) {
         throw std::logic_error("video timestamp count does not match grid");
     }
-    for (double timestamp : item.timestamps) {
+    for (std::size_t frame = 0; frame < item.timestamps.size(); ++frame) {
         std::ostringstream time;
-        time << '<' << std::fixed << std::setprecision(1) << timestamp << " seconds>";
+        time << '<' << std::fixed << std::setprecision(1) << item.timestamps[frame] << " seconds>";
         out += time.str();
         out += kVisionStart;
-        append_repeated(out, kVideoPad, frame_tokens);
+        append_media_token_run(out, kVideoPad, frame_tokens, Modality::Video, item_index, frame,
+                               runs);
         out += kVisionEnd;
     }
-}
-
-struct PlaceholderMatch {
-    std::size_t position = 0;
-    Modality modality    = Modality::Image;
-};
-
-std::optional<PlaceholderMatch> find_next_placeholder(std::string_view text, std::size_t begin) {
-    constexpr std::string_view prefix = "<|";
-    while ((begin = text.find(prefix, begin)) != std::string_view::npos) {
-        if (text.substr(begin).starts_with(kImagePad)) {
-            return PlaceholderMatch{.position = begin, .modality = Modality::Image};
-        }
-        if (text.substr(begin).starts_with(kVideoPad)) {
-            return PlaceholderMatch{.position = begin, .modality = Modality::Video};
-        }
-        begin += prefix.size();
-    }
-    return std::nullopt;
 }
 
 struct PlaceholderExpansion {
@@ -517,28 +541,37 @@ std::size_t map_expanded_boundary(std::size_t boundary, std::size_t source_size,
 }
 
 RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
+    if (!rendered.media_token_runs.empty()) {
+        throw std::logic_error("rendered chat media placeholders were already expanded");
+    }
+    if (rendered.media_placeholders.size() != items.size()) {
+        throw std::invalid_argument("chat media count does not match rendered placeholders");
+    }
     std::string source = std::move(rendered.text);
     std::string expanded;
     expanded.reserve(source.size());
     std::vector<PlaceholderExpansion> expansions;
     expansions.reserve(items.size());
     std::size_t source_cursor = 0;
-    for (const VisionItem& item : items) {
-        const std::optional<PlaceholderMatch> match = find_next_placeholder(source, source_cursor);
-        if (!match || match->modality != item.modality) {
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        const VisionItem& item                     = items[index];
+        const MediaPlaceholderByteSpec placeholder = rendered.media_placeholders[index];
+        if (placeholder.item_index != index || placeholder.modality != item.modality) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string_view needle = item.modality == Modality::Image ? kImagePad : kVideoPad;
-        expanded.append(source, source_cursor, match->position - source_cursor);
-        append_placeholder(expanded, item);
-        const std::size_t source_end = match->position + needle.size();
-        expansions.push_back(PlaceholderExpansion{.source_begin = match->position,
+        if (placeholder.bytes.begin < source_cursor || placeholder.bytes.end > source.size() ||
+            placeholder.bytes.end - placeholder.bytes.begin != needle.size() ||
+            source.compare(placeholder.bytes.begin, needle.size(), needle) != 0) {
+            throw std::logic_error("rendered media placeholder metadata does not match its text");
+        }
+        expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
+        append_placeholder(expanded, item, index, rendered.media_token_runs);
+        const std::size_t source_end = placeholder.bytes.end;
+        expansions.push_back(PlaceholderExpansion{.source_begin = placeholder.bytes.begin,
                                                   .source_end   = source_end,
                                                   .rendered_end = expanded.size()});
         source_cursor = source_end;
-    }
-    if (find_next_placeholder(source, source_cursor)) {
-        throw std::invalid_argument("rendered chat has unbound vision placeholders");
     }
     expanded.append(source, source_cursor, source.size() - source_cursor);
 
@@ -558,6 +591,16 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
     for (std::optional<std::size_t>& boundary : rendered.cache_boundaries) {
         if (boundary) { *boundary = map_boundary(*boundary, "cache boundary"); }
     }
+    std::vector<ByteSpan> mapped_literal_spans;
+    mapped_literal_spans.reserve(rendered.literal_spans.size());
+    for (const ByteSpan span : rendered.literal_spans) {
+        mapped_literal_spans.push_back(ByteSpan{
+            .begin = map_boundary(span.begin, "literal span"),
+            .end   = map_boundary(span.end, "literal span"),
+        });
+    }
+    rendered.literal_spans = std::move(mapped_literal_spans);
+    rendered.media_placeholders.clear();
     rendered.text = std::move(expanded);
     return rendered;
 }
@@ -596,82 +639,75 @@ void enforce_media_resource_limits(const PreprocessStats& stats, const Processor
     }
 }
 
-void assign_positions(ProcessedInput& output) {
+void assign_positions(ProcessedInput& output,
+                      std::span<const EncodedChat::MediaTokenRun> media_runs) {
     const std::size_t length = output.input_ids.size();
     output.positions.assign(length * 3, 0);
+    output.token_types.assign(length, 0);
     auto set = [&](int axis, std::size_t index, std::int32_t value) {
         output.positions[static_cast<std::size_t>(axis) * length + index] = value;
     };
-    std::size_t image_index = 0;
-    std::size_t video_index = 0;
-    int video_t             = 0;
-    std::int32_t current    = 0;
-    std::int32_t maximum    = 0;
-    std::size_t begin       = 0;
-    while (begin < length) {
-        const std::uint8_t modality = output.token_types[begin];
-        std::size_t end             = begin + 1;
-        while (end < length && output.token_types[end] == modality) { ++end; }
-        if (modality == 0) {
-            for (std::size_t i = begin; i < end; ++i) {
-                const std::int32_t position = current + static_cast<std::int32_t>(i - begin);
-                for (int axis = 0; axis < 3; ++axis) { set(axis, i, position); }
-                maximum = std::max(maximum, position);
-            }
-            current += static_cast<std::int32_t>(end - begin);
-        } else {
-            VisionItem* item = nullptr;
-            int grid_t       = 1;
-            if (modality == static_cast<std::uint8_t>(Modality::Image)) {
-                while (image_index < output.vision_items.size() &&
-                       output.vision_items[image_index].modality != Modality::Image) {
-                    ++image_index;
-                }
-                if (image_index == output.vision_items.size()) {
-                    throw std::invalid_argument("more image token runs than image inputs");
-                }
-                item = &output.vision_items[image_index++];
-            } else if (modality == static_cast<std::uint8_t>(Modality::Video)) {
-                while (video_index < output.vision_items.size() &&
-                       output.vision_items[video_index].modality != Modality::Video) {
-                    ++video_index;
-                }
-                if (video_index == output.vision_items.size()) {
-                    throw std::invalid_argument("more video token runs than video temporal grids");
-                }
-                item = &output.vision_items[video_index];
-                if (++video_t == item->grid.t) {
-                    ++video_index;
-                    video_t = 0;
-                }
-            } else {
-                throw std::invalid_argument("invalid multimodal token type");
-            }
-            const int gh               = item->grid.h / kMerge;
-            const int gw               = item->grid.w / kMerge;
-            const std::size_t expected = static_cast<std::size_t>(grid_t) * gh * gw;
-            if (end - begin != expected) {
-                throw std::invalid_argument("vision placeholder run does not match media grid");
-            }
-            item->token_spans.push_back(TokenSpan{begin, end - begin});
-            std::size_t index = begin;
-            for (int t = 0; t < grid_t; ++t) {
-                for (int y = 0; y < gh; ++y) {
-                    for (int x = 0; x < gw; ++x, ++index) {
-                        set(0, index, current + t);
-                        set(1, index, current + y);
-                        set(2, index, current + x);
-                        maximum = std::max({maximum, current + t, current + y, current + x});
-                    }
-                }
-            }
-            current += std::max(gh, gw);
+    std::vector<std::size_t> next_frame(output.vision_items.size(), 0);
+    std::int32_t current   = 0;
+    std::int32_t maximum   = 0;
+    std::size_t cursor     = 0;
+    const auto assign_text = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t index = begin; index < end; ++index) {
+            const std::int32_t position = current + static_cast<std::int32_t>(index - begin);
+            for (int axis = 0; axis < 3; ++axis) { set(axis, index, position); }
+            maximum = std::max(maximum, position);
         }
-        begin = end;
+        current += static_cast<std::int32_t>(end - begin);
+    };
+
+    for (const EncodedChat::MediaTokenRun& run : media_runs) {
+        if (run.tokens.begin < cursor || run.tokens.begin > length || run.tokens.count == 0 ||
+            run.tokens.count > length - run.tokens.begin) {
+            throw std::logic_error("encoded media token runs are not ordered disjoint spans");
+        }
+        assign_text(cursor, run.tokens.begin);
+        if (run.item_index >= output.vision_items.size()) {
+            throw std::logic_error("encoded media token run references no Vision item");
+        }
+        VisionItem& item = output.vision_items[run.item_index];
+        if (item.modality != run.modality || run.frame_index != next_frame[run.item_index]) {
+            throw std::logic_error("encoded media token run identity is inconsistent");
+        }
+        const std::size_t expected_frames = item.modality == Modality::Image ? 1 : item.grid.t;
+        if (run.frame_index >= expected_frames) {
+            throw std::logic_error("encoded media token run exceeds its temporal grid");
+        }
+        ++next_frame[run.item_index];
+
+        const int gh               = item.grid.h / kMerge;
+        const int gw               = item.grid.w / kMerge;
+        const std::size_t expected = static_cast<std::size_t>(gh) * gw;
+        if (run.tokens.count != expected) {
+            throw std::invalid_argument("vision placeholder run does not match media grid");
+        }
+        item.token_spans.push_back(run.tokens);
+        const std::size_t end = run.tokens.begin + run.tokens.count;
+        std::fill(output.token_types.begin() + static_cast<std::ptrdiff_t>(run.tokens.begin),
+                  output.token_types.begin() + static_cast<std::ptrdiff_t>(end),
+                  static_cast<std::uint8_t>(run.modality));
+        std::size_t index = run.tokens.begin;
+        for (int y = 0; y < gh; ++y) {
+            for (int x = 0; x < gw; ++x, ++index) {
+                set(0, index, current);
+                set(1, index, current + y);
+                set(2, index, current + x);
+                maximum = std::max({maximum, current, current + y, current + x});
+            }
+        }
+        current += std::max(gh, gw);
+        cursor = end;
     }
-    for (const VisionItem& item : output.vision_items) {
+    assign_text(cursor, length);
+
+    for (std::size_t index = 0; index < output.vision_items.size(); ++index) {
+        const VisionItem& item     = output.vision_items[index];
         const std::size_t expected = item.modality == Modality::Image ? 1 : item.grid.t;
-        if (item.token_spans.size() != expected) {
+        if (next_frame[index] != expected || item.token_spans.size() != expected) {
             throw std::invalid_argument("media grid count does not match placeholder runs");
         }
     }
@@ -706,11 +742,15 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
                                  std::size_t maximum_tokens) {
+    if (!rendered.media_placeholders.empty()) {
+        throw std::logic_error("rendered chat contains unexpanded media placeholders");
+    }
     EncodedChat encoded;
     std::vector<std::size_t> byte_boundaries;
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 1U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
-                            rendered.message_boundaries.size() + rendered.cache_boundaries.size());
+                            rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
+                            rendered.media_token_runs.size() * 2U);
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
     }
@@ -722,9 +762,14 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     for (const std::optional<std::size_t> boundary : rendered.cache_boundaries) {
         if (boundary) { byte_boundaries.push_back(*boundary); }
     }
+    for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
+        byte_boundaries.push_back(run.bytes.begin);
+        byte_boundaries.push_back(run.bytes.end);
+    }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
-        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens});
+        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
+        rendered.literal_spans);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
     std::size_t boundary_index = 0;
@@ -778,6 +823,29 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
                 to_frontier(boundary.stable_frontier, "cache boundary");
         }
     }
+    encoded.media_token_runs.reserve(rendered.media_token_runs.size());
+    for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
+        const TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
+        const TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
+        if (!begin.exact_frontier || !end.exact_frontier ||
+            *begin.exact_frontier >= *end.exact_frontier) {
+            throw std::logic_error("media token run is not an exact nonempty token span");
+        }
+        const std::size_t token_begin = *begin.exact_frontier;
+        const std::size_t token_end   = *end.exact_frontier;
+        const int expected_token      = run.modality == Modality::Image ? kImageToken : kVideoToken;
+        if (!std::all_of(encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin),
+                         encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_end),
+                         [expected_token](int token) { return token == expected_token; })) {
+            throw std::logic_error("media token run contains a non-media token");
+        }
+        encoded.media_token_runs.push_back(EncodedChat::MediaTokenRun{
+            .tokens      = TokenSpan{.begin = token_begin, .count = token_end - token_begin},
+            .modality    = run.modality,
+            .item_index  = run.item_index,
+            .frame_index = run.frame_index,
+        });
+    }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
     }
@@ -825,6 +893,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     try {
         for (const ChatPart* part : parts) {
             check_preparation_control(control);
+            enforce_image_resize_policy(*part, options_, policy);
             VisionItem item = part->kind == ChatPartKind::Image
                                   ? inspect_image_item(part->media.bytes, options_, policy)
                                   : inspect_video_item(part->media.bytes, options_, policy);
@@ -835,14 +904,9 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
             enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
         }
-    } catch (const media::decode::Error& error) {
-        if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
-            throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
-        }
-        throw;
-    }
+    } catch (const media::decode::Error& error) { throw_decode_error(error); }
     rendered                = expand_placeholders(std::move(rendered), items);
-    const std::size_t count = tokenizer_.encode(rendered.text).size();
+    const std::size_t count = encode_rendered_chat(tokenizer_, rendered).input_ids.size();
     check_preparation_control(control, "tokenization");
     return count;
 }
@@ -863,7 +927,11 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     if (maximum_prompt_tokens != std::numeric_limits<std::size_t>::max()) {
         const auto preliminary_started = Clock::now();
         const std::size_t preliminary_tokens =
-            tokenizer_.encode(rendered.text, EncodeOptions{.max_tokens = encode_limit}).size();
+            tokenizer_
+                .encode_with_boundaries(rendered.text, {},
+                                        EncodeOptions{.max_tokens = encode_limit},
+                                        rendered.literal_spans)
+                .input_ids.size();
         preliminary_tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - preliminary_started).count();
         check_preparation_control(control, "tokenization");
@@ -888,6 +956,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
+    try {
+        for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
+    } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
     std::vector<VisionItem> items;
     items.reserve(parts.size());
@@ -978,12 +1049,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     if (preparation_error) {
         try {
             std::rethrow_exception(preparation_error);
-        } catch (const media::decode::Error& error) {
-            if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
-                throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
-            }
-            throw;
-        }
+        } catch (const media::decode::Error& error) { throw_decode_error(error); }
     }
     if (patch_cursor != stats.raw_patches || output.media_payloads.size() != items.size()) {
         throw std::logic_error("preprocessed patch count does not match processor budget");
@@ -1009,15 +1075,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
-    output.token_types.resize(output.input_ids.size(), 0);
-    for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
-        if (output.input_ids[i] == kImageToken) {
-            output.token_types[i] = static_cast<std::uint8_t>(Modality::Image);
-        } else if (output.input_ids[i] == kVideoToken) {
-            output.token_types[i] = static_cast<std::uint8_t>(Modality::Video);
-        }
-    }
-    stats.prompt_tokens = output.input_ids.size();
+    stats.prompt_tokens                = output.input_ids.size();
     enforce_media_resource_limits(stats, options_);
 
     stats.media_cache_hits              = cache_stats.hits;
@@ -1028,7 +1086,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_seconds      = media_preprocess_seconds;
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
-    assign_positions(output);
+    assign_positions(output, encoded.media_token_runs);
     check_preparation_control(control);
     output.stats = stats;
     return output;

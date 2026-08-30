@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -39,13 +40,23 @@ std::string format_bytes(std::size_t bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
+    ninfer::serve::ServeOptions options;
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
-        if (options.help_requested) {
-            std::cout << ninfer::serve::serve_usage_text(argv[0]);
-            return 0;
-        }
+        options = ninfer::serve::parse_serve_options(argc, argv);
+    } catch (const std::invalid_argument& exception) {
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        return 1;
+    } catch (const std::exception& exception) {
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        return 1;
+    }
+    if (options.help_requested) {
+        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        return 0;
+    }
 
+    try {
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {
@@ -64,7 +75,6 @@ int main(int argc, char** argv) {
                                                             std::move(load_progress_options));
         const auto load_start = Clock::now();
         ninfer::serve::GenerationService service(options, load_progress.callback());
-        server.attach(service);
         std::ostringstream loaded;
         loaded << "model loaded in "
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
@@ -93,8 +103,7 @@ int main(int argc, char** argv) {
                  << " host-kv=" << format_bytes(cache.host_kv_capacity_bytes)
                  << " private=" << *cache.max_private_continuations
                  << " shared=" << *cache.max_shared_prefixes
-                 << " anchors=" << *cache.max_long_anchors_per_continuation
-                 << " markers=" << *cache.max_cache_markers_per_request;
+                 << " anchors=" << *cache.max_long_anchors_per_continuation;
         capacity << " context-cost-transfer="
                  << ninfer::context_cost_preset_source_name(context_cost.transfer_source)
                  << " context-cost-prefill="
@@ -111,6 +120,7 @@ int main(int argc, char** argv) {
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
+        server.attach(service);
 
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);
@@ -133,7 +143,6 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& exception) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
         return 1;
     }
 }

@@ -100,8 +100,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         .model_id   = identity.model_id,
         .weights_id = identity.weights_id,
     };
-    runtime::ResolvedContextCost context_cost =
-        runtime::resolve_context_cost(context_cost_identity, options.context_cost.preset_path);
+    runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
+        context_cost_identity, options.context_cost.preset_path);
 
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);

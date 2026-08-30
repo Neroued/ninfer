@@ -84,6 +84,7 @@ class Corpus:
             "long-8k-32": (7680, 32, 7744),
             "long-8k-independent-32": (7680, 32, 7744),
             "long-64k-32": (64512, 32, 64576),
+            "long-64k-independent-32": (64512, 32, 64576),
             "long-256k-32": (260096, 32, 260160),
             "interferer-256": (127, 256, 384),
             "holder-4096": (127, 4096, 4224),
@@ -99,21 +100,35 @@ class Corpus:
             if entitlement(prompt, output) != expected_entitlement:
                 raise CorpusError(f"shape entitlement changed for {name}")
 
-        seed = shapes["long-8k-16"]
-        independent = shapes["long-8k-independent-32"]
-        if seed["path"] == independent["path"] or seed["sha256"] == independent["sha256"]:
-            raise CorpusError("mixed-four long requests are not byte-distinct")
-        common = independent.get("seed_common_prefix_tokens")
-        if not isinstance(common, int) or common < 0 or common > 3:
-            raise CorpusError(
-                "mixed-four long requests do not diverge at the first system-content token"
-            )
+        independent_shapes = (
+            ("long-8k-16", "long-8k-independent-32", "mixed-four"),
+            ("long-64k-32", "long-64k-independent-32", "64K Host-swap"),
+        )
+        for seed_name, independent_name, owner in independent_shapes:
+            seed = shapes[seed_name]
+            independent = shapes[independent_name]
+            if (
+                seed["path"] == independent["path"]
+                or seed["sha256"] == independent["sha256"]
+            ):
+                raise CorpusError(f"{owner} long requests are not byte-distinct")
+            common = independent.get("seed_common_prefix_tokens")
+            if not isinstance(common, int) or common < 0 or common > 3:
+                raise CorpusError(
+                    f"{owner} long requests do not diverge at the first system-content token"
+                )
 
         if not (
             entitlement(7680, 16) + entitlement(127, 256) <= 8192
             and entitlement(7680, 16) + 2 * entitlement(127, 256) > 8192
         ):
             raise CorpusError("cache-pressure entitlement relation no longer holds")
+        long_64k_entitlement = entitlement(64512, 32)
+        if not (
+            long_64k_entitlement <= 65536
+            and 2 * long_64k_entitlement > 65536
+        ):
+            raise CorpusError("64K Host-swap entitlement relation no longer holds")
 
         for name in ("system-a", "system-b"):
             frontier = self.manifest["shared"][name]["marked_frontier_tokens"]

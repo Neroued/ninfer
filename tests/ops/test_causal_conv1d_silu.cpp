@@ -1,11 +1,14 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ops/op_tester.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -158,6 +161,232 @@ const char* call_name(StateCall call) {
         return "distinct-entry-exact-alias";
     }
     return "unknown";
+}
+
+// Slice one channel range out of the oracle's packed [column][channel] output.
+std::vector<double> oracle_slice(const std::vector<double>& packed, std::int32_t C, std::int32_t T,
+                                 std::int32_t first, std::int32_t rows) {
+    std::vector<double> slice(static_cast<std::size_t>(rows) * static_cast<std::size_t>(T));
+    for (std::int32_t column = 0; column < T; ++column) {
+        for (std::int32_t row = 0; row < rows; ++row) {
+            slice[offset(row, column, rows)] = packed[offset(first + row, column, C)];
+        }
+    }
+    return slice;
+}
+
+// The packed distinct-state entry enforces the same family rules the split entry does. One case
+// per rule it gained.
+int packed_rejection_case(std::int32_t T) {
+    constexpr std::int32_t C = 8192;
+    const std::size_t n      = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    GuardedDeviceBuffer x(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(static_cast<std::size_t>(C) * 4 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out(n * sizeof(std::uint16_t));
+
+    const Tensor tx(x.data(), DType::BF16, {C, T});
+    const Tensor tw(weight.data(), DType::BF16, {C, 4});
+    const Tensor tsi(state_in.data(), DType::BF16, {C, 3});
+
+    auto is_rejected = [&](const Tensor& state_in_arg, Tensor state_out_arg, Tensor out_arg) {
+        try {
+            ops::causal_conv1d_silu(tx, tw, state_in_arg, state_out_arg, out_arg, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    int failures         = 0;
+    auto expect_rejected = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cout << "FAIL causal_conv1d_silu T=" << T << " accepted " << what << '\n';
+            ++failures;
+        }
+    };
+    Tensor tso(state_out.data(), DType::BF16, {C, 3});
+    Tensor tout(out.data(), DType::BF16, {C, T});
+    Tensor out_over_x(x.data(), DType::BF16, {C, T});
+    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
+
+    expect_rejected(is_rejected(tsi, shifted_state_out, tout),
+                    "a state pair that overlaps without being the same storage");
+    expect_rejected(is_rejected(tsi, tso, out_over_x), "an out that overlaps x");
+    expect_rejected(is_rejected(tsi, tout, tout), "an out that overlaps conv_state_out");
+    return failures;
+}
+
+// The entry promises that a bad argument is rejected the same way whatever the column count.
+// One case per rejected class, on both sides of the route bound.
+int split_rejection_case(std::int32_t T) {
+    constexpr std::int32_t C  = 8192;
+    constexpr std::int32_t KD = 2048;
+    constexpr std::int32_t VD = 4096;
+    const std::size_t n       = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    GuardedDeviceBuffer x(n * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(static_cast<std::size_t>(C) * 4 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q(static_cast<std::size_t>(KD) * T * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k(static_cast<std::size_t>(KD) * T * sizeof(std::uint16_t));
+    GuardedDeviceBuffer v(static_cast<std::size_t>(VD) * T * sizeof(std::uint16_t));
+
+    const Tensor tx(x.data(), DType::BF16, {C, T});
+    const Tensor tw(weight.data(), DType::BF16, {C, 4});
+    const Tensor tsi(state_in.data(), DType::BF16, {C, 3});
+    Tensor tq(q.data(), DType::BF16, {KD, T});
+    Tensor tk(k.data(), DType::BF16, {KD, T});
+    Tensor tv(v.data(), DType::BF16, {VD, T});
+
+    const Tensor bad_null(nullptr, DType::BF16, {C, T});
+    const Tensor bad_dtype(weight.data(), DType::FP32, {C, 4});
+    Tensor bad_rank(q.data(), DType::BF16, {KD, T, 2});
+    Tensor bad_profile(q.data(), DType::BF16, {KD + 1, T});
+    Tensor other_profile(v.data(), DType::BF16, {6144, T});
+    Tensor bad_dest_dtype(q.data(), DType::FP32, {KD, T});
+    Tensor null_dest(nullptr, DType::BF16, {KD, T});
+    Tensor short_dest(q.data(), DType::BF16, {KD, T - 1});
+    Tensor over_x(x.data(), DType::BF16, {KD, T});
+    Tensor over_state(state_in.data(), DType::BF16, {KD, T});
+    Tensor misaligned(static_cast<std::uint16_t*>(q.data()) + 1, DType::BF16, {KD, T});
+
+    auto is_rejected = [&](const Tensor& x_in, const Tensor& weight_in, const Tensor& state_in_arg,
+                           Tensor state_out_arg, Tensor q_in, Tensor k_in, Tensor v_in) {
+        try {
+            ops::causal_conv1d_silu_split(x_in, weight_in, state_in_arg, state_out_arg, q_in, k_in,
+                                          v_in, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+    Tensor tso(state_out.data(), DType::BF16, {C, 3});
+    // A state pair that shares all but one element: the contract allows disjoint or exactly the
+    // same storage, and this is neither.
+    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
+
+    int failures = 0;
+    auto expect_rejected = [&](bool rejected, const char* what) {
+        if (!rejected) {
+            std::cout << "FAIL causal_conv1d_silu_split T=" << T << " accepted " << what << "\n";
+            ++failures;
+        }
+    };
+    expect_rejected(is_rejected(bad_null, tw, tsi, tso, tq, tk, tv), "a null x");
+    expect_rejected(is_rejected(tx, bad_dtype, tsi, tso, tq, tk, tv), "an FP32 weight");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, bad_rank, tk, tv), "a rank-3 destination");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, bad_profile, tk, tv),
+                    "a row profile that is not registered");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, tq, tk, other_profile),
+                    "the other geometry's row profile on these channels");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, bad_dest_dtype, tk, tv), "an FP32 destination");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, null_dest, tk, tv), "a null destination");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, short_dest, tk, tv),
+                    "a destination with fewer columns than x");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, tq, tq, tv),
+                    "two destinations in the same storage");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, over_x, tk, tv), "a destination overlapping x");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, over_state, tk, tv),
+                    "a destination overlapping the input state");
+    expect_rejected(is_rejected(tx, tw, tsi, tso, misaligned, tk, tv),
+                    "a destination that is not four-byte aligned");
+    expect_rejected(is_rejected(tx, tw, tsi, shifted_state_out, tq, tk, tv),
+                    "a state pair that overlaps without being the same storage");
+    return failures;
+}
+
+// One registered geometry, one column count, one state form. `offset_pairs` shifts every
+// destination by one BF16 pair, which the contract admits and the arena never produces.
+int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int32_t value_dim,
+               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed) {
+    const LogicalInput input       = make_input(C, T, seed);
+    const std::vector<float> state = make_state(C, seed + 2U);
+    const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+    const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
+
+    const std::size_t pad     = offset_pairs ? 2U * sizeof(std::uint16_t) : 0U;
+    const std::size_t q_bytes = static_cast<std::size_t>(q_dim) * T * sizeof(std::uint16_t);
+    const std::size_t k_bytes = static_cast<std::size_t>(k_dim) * T * sizeof(std::uint16_t);
+    const std::size_t v_bytes = static_cast<std::size_t>(value_dim) * T * sizeof(std::uint16_t);
+
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer q(q_bytes + pad);
+    GuardedDeviceBuffer k(k_bytes + pad);
+    GuardedDeviceBuffer v(v_bytes + pad);
+
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    state_in.copy_from_host(state_bits.data(), state_in.bytes());
+    state_out.fill(0x5a);
+    q.fill(kOutputPoison);
+    k.fill(kOutputPoison);
+    v.fill(kOutputPoison);
+
+    auto at = [&](GuardedDeviceBuffer& buffer) {
+        return static_cast<void*>(static_cast<char*>(buffer.data()) + pad);
+    };
+    auto pad_is_untouched = [&](GuardedDeviceBuffer& buffer, const char* label) {
+        if (pad == 0) { return 0; }
+        std::vector<std::uint8_t> head(pad);
+        buffer.copy_to_host(head.data(), pad);
+        for (const std::uint8_t byte : head) {
+            if (byte != kOutputPoison) {
+                std::cout << "FAIL causal_conv1d_silu_split wrote before " << label << '\n';
+                return 1;
+            }
+        }
+        return 0;
+    };
+
+    Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
+    Tensor ts_out((alias_state ? state_in : state_out).data(), DType::BF16, {C, 3});
+    Tensor tq(at(q), DType::BF16, {q_dim, T});
+    Tensor tk(at(k), DType::BF16, {k_dim, T});
+    Tensor tv(at(v), DType::BF16, {value_dim, T});
+
+    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
+    cuda_synchronize();
+
+    const std::string tag     = "causal_conv1d_silu_split C=" + std::to_string(C) +
+                                " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
+                                (offset_pairs ? " offset" : "");
+    const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
+    const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
+    const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
+
+    int failures = 0;
+    failures += pad_is_untouched(q, "out0");
+    failures += pad_is_untouched(k, "out1");
+    failures += pad_is_untouched(v, "out2");
+    failures += verify_output(tag + " q", from_device_bf16(at(q), q_count),
+                              oracle_slice(oracle.output, C, T, 0, q_dim));
+    failures += verify_output(tag + " k", from_device_bf16(at(k), k_count),
+                              oracle_slice(oracle.output, C, T, q_dim, k_dim));
+    failures += verify_output(tag + " v", from_device_bf16(at(v), v_count),
+                              oracle_slice(oracle.output, C, T, q_dim + k_dim, value_dim));
+    failures +=
+        verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(), final_bits);
+    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (!alias_state) {
+        failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
+    }
+    failures += verify_buffer_guards(tag + " x", x);
+    failures += verify_buffer_guards(tag + " weight", weight);
+    failures += verify_buffer_guards(tag + " state input", state_in);
+    failures += verify_buffer_guards(tag + " state output", state_out);
+    failures += verify_buffer_guards(tag + " q", q);
+    failures += verify_buffer_guards(tag + " k", k);
+    failures += verify_buffer_guards(tag + " v", v);
+    return failures;
 }
 
 int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed) {
@@ -502,6 +731,8 @@ int main() {
     failures += snapshot_case(kQwen27Channels, 15, 18, 14, 1, 4015U);
     failures += snapshot_case(kQwen27Channels, 16, 18, 17, 1, 4016U);
     failures += snapshot_case(kQwen35Channels, 17, 20, 16, 1, 4017U);
+    // Above the small-T bound the snapshot entry takes the sequence-snapshot kernel.
+    failures += snapshot_case(kQwen35Channels, 40, 44, 40, 1, 4040U);
 
     failures += batched_snapshot_case(kQwen35Channels, 1, {8, 9, 10, 11, 12, 13, 14, 15},
                                       {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 5001U);
@@ -510,6 +741,38 @@ int main() {
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
     failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+
+    // The split entry: both channel geometries, across the column counts that select each of its
+    // two routes and the boundary between them.
+    for (const std::int32_t T : {1, 2, 7, 15, 16, 17, 32, 33, 63, 64, 65, 257, 1024}) {
+        failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, false, false,
+                               6000U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
+                               7000U + static_cast<std::uint32_t>(T));
+    }
+
+    // The exact-alias state form, on both geometries, across every route boundary.
+    for (const std::int32_t T : {1, 2, 15, 16, 17, 32, 33, 64, 65, 257}) {
+        failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, true, false,
+                               6100U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, true, false,
+                               7100U + static_cast<std::uint32_t>(T));
+    }
+
+    // Destinations offset by a pair: four-byte aligned, which the contract admits, but not the
+    // 256-byte alignment the arena happens to give.
+    for (const std::int32_t T : {16, 33, 257}) {
+        failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, false, true,
+                               6200U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, true,
+                               7200U + static_cast<std::uint32_t>(T));
+    }
+
+    // Argument rejection, on both sides of the route bound.
+    failures += split_rejection_case(16);
+    failures += split_rejection_case(128);
+    failures += packed_rejection_case(16);
+    failures += packed_rejection_case(128);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

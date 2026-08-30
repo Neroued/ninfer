@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <algorithm>
@@ -244,14 +245,15 @@ int run(const Options& options) {
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     std::array<target::Package::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    const auto machine_cost = ninfer::runtime::generic_context_machine_cost_model();
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
         auto request_plan =
             program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
-                                       nullptr, std::nullopt, false);
+                                       nullptr, std::nullopt, false, machine_cost);
         if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-        auto resource_plan = program->seal_resource_plan(*request_plan, prompt, {}, {}, {}, {});
+        auto resource_plan = program->seal_identity(*request_plan, prompt);
         if (!resource_plan) {
             throw std::runtime_error("benchmark root resources were not sealed");
         }

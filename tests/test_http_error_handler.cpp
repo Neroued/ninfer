@@ -28,6 +28,11 @@ int main() {
                              "vision tokens exceed processor budget"));
     failures += check(media_budget.status == 400 && media_budget.code == "media_budget_exceeded",
                       "media resource rejection did not map to HTTP 400");
+    const ninfer::serve::ApiError invalid_media = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::InvalidMedia, "failed to open media"));
+    failures += check(invalid_media.status == 400 && invalid_media.code == "invalid_media" &&
+                          invalid_media.param == "messages",
+                      "invalid media did not retain its client-input classification");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
@@ -46,8 +51,20 @@ int main() {
     const ninfer::serve::ApiError cancelled =
         ninfer::serve::request_error_to_api_error(ninfer::RequestError(
             ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
-    failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
+    failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected" &&
+                          cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
+
+    failures +=
+        check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&
+                  ninfer::serve::matches_bearer_credential("bearer secret", "secret") &&
+                  ninfer::serve::matches_bearer_credential("\tBEARER   secret\t", "secret"),
+              "valid Bearer credentials were rejected because of scheme case or whitespace");
+    failures += check(!ninfer::serve::matches_bearer_credential("Basic secret", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearer wrong", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearersecret", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
+                      "invalid Bearer credentials were accepted");
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";
@@ -58,7 +75,11 @@ int main() {
     const Json messages_body = Json::parse(messages_response.body);
     failures += check(messages_result == httplib::Server::HandlerResponse::Handled &&
                           messages_body.at("type") == "error" &&
-                          messages_body.at("error").at("type") == "invalid_request_error" &&
+                          messages_body.at("error").at("type") == "request_too_large" &&
+                          messages_body.at("request_id").get<std::string>().starts_with("req_") &&
+                          messages_response.get_header_value("request-id") ==
+                              messages_body.at("request_id").get<std::string>() &&
+                          !messages_response.has_header("x-request-id") &&
                           messages_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty Anthropic 413 did not become a payload-limit error");
@@ -72,19 +93,43 @@ int main() {
     const Json openai_body = Json::parse(openai_response.body);
     failures += check(openai_result == httplib::Server::HandlerResponse::Handled &&
                           openai_body.at("error").at("code") == "request_too_large" &&
+                          openai_response.get_header_value_count("x-request-id") == 1 &&
+                          openai_response.get_header_value("x-request-id").starts_with("req_") &&
                           openai_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty OpenAI 413 did not become a payload-limit error");
 
+    httplib::Request missing_messages_request;
+    missing_messages_request.path = "/v1/messages/missing";
+    httplib::Response missing_messages_response;
+    missing_messages_response.status = 404;
+    missing_messages_response.set_header("request-id", "req_stale");
+    const auto missing_messages_result = ninfer::serve::handle_unrendered_http_error(
+        options, missing_messages_request, missing_messages_response);
+    const Json missing_messages_body = Json::parse(missing_messages_response.body);
+    failures +=
+        check(missing_messages_result == httplib::Server::HandlerResponse::Handled &&
+                  missing_messages_response.status == 404 &&
+                  missing_messages_body.at("error").at("type") == "not_found_error" &&
+                  missing_messages_body.at("request_id").get<std::string>().starts_with("req_") &&
+                  missing_messages_body.at("request_id") != "req_stale" &&
+                  missing_messages_response.get_header_value_count("request-id") == 1 &&
+                  missing_messages_response.get_header_value("request-id") ==
+                      missing_messages_body.at("request_id").get<std::string>(),
+              "missing Anthropic resource did not use the protocol error envelope");
+
     httplib::Response authored_response;
     authored_response.status = 413;
+    authored_response.set_header("x-request-id", "req_existing");
     authored_response.set_content(R"({"error":{"code":"application_error"}})", "application/json");
     const std::string authored_body = authored_response.body;
     const auto authored_result =
         ninfer::serve::handle_unrendered_http_error(options, openai_request, authored_response);
     failures += check(authored_result == httplib::Server::HandlerResponse::Unhandled &&
-                          authored_response.body == authored_body,
-                      "application-authored 413 was overwritten by the payload-limit handler");
+                          authored_response.body == authored_body &&
+                          authored_response.get_header_value_count("x-request-id") == 1 &&
+                          authored_response.get_header_value("x-request-id") == "req_existing",
+                      "application-authored 413 or its request ID was overwritten");
 
     httplib::Response other_response;
     other_response.status = 400;

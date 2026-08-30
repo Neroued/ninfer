@@ -1,159 +1,195 @@
-# NInfer 资源调度与上下文缓存架构
+# NInfer 资源调度与上下文缓存
 
-**文档状态：** 当前实现合同
+本文定义 NInfer 在有限 Device/Host 资源下选择、验证并提交上下文状态的规则。它是 admission
+materialization、prefix reuse、cache retention 和 pressure planning 的维护者权威。
 
-**目标模型：** 当前注册的 Qwen3.6/Qwen3.8 family variants
+本文解决的问题是：
 
-**目标硬件：** 单张 NVIDIA RTX 5090
+> Scheduler 已经选择一个等待请求后，应从哪个可恢复位置开始，保留或降级哪些 inactive context，
+> 才能以最低预测代价得到一个物理可执行且不会破坏 active request 完成保证的终态？
 
-**所属层级：** Engine / ResourceManager / Program
-
-**目标场景：** 本地 Agent、小规模并发、长上下文、MTP/DFlash speculative decoding
-
-本文定义 NInfer 的资源所有权、prefix reuse、Device/Host context storage、admission 与资源事务合同。
-顶层请求生命周期和 worker boundary 见 [Engine 架构](engine-architecture.md)，物理 KV pool、page table
-和 consumer contract 见 [Paged KV Context Store](paged-kv-cache.md)。
-
-本文只定义长期语义。具体 allocator 数据结构、scratch 字节布局、索引实现和调优常数不属于架构合同。
+顶层请求顺序和生命周期由 [Engine 架构](engine-architecture.md)定义。KV page、address space、
+replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-cache.md)定义。
 
 ---
 
-## 1. 产品边界
+## 1. 术语与边界
 
-当前产品只有一张 GPU、一个 resident model、一个 Engine worker 和启动固定的 \(1\ldots 8\) 个 active lanes。
-请求不抢占；Scheduler 先决定哪个 waiting request 有资格尝试 admission，ResourceManager 不能因为另一个请求
-具有更长或更热的 prefix 而替换它。
+本文使用以下术语：
 
-Prefix reuse 是降低重复 prefill 成本的资源策略，不是第二套请求调度器。它必须满足：
+| 术语 | 含义 |
+|---|---|
+| owner | 一个 active sequence、private continuation 或 shared prefix |
+| checkpoint | owner 内某个可恢复 frontier 的不可变完整状态 |
+| candidate | incoming request 可以采用的一个 root 或 exact checkpoint source |
+| planning target | candidate 与全部受影响 inactive owners 的完整逻辑终态 |
+| reservation | 已从全局可用容量中扣除、为未来物化或事务目的保留的容量 |
+| resource plan | Program 针对一个 target seal 的有序物理 transition |
+| placement | 一个完整 StateImage 或一个 KV logical page 的 Device/Host replica 状态 |
 
-- cache miss、合法降级和合法逐出只影响性能，不改变模型语义；
-- active request 一经发布便具有完成其最大合法上下文所需的资源保证；
-- inactive cache 可以为新请求让路，active resource 不可被借走；
-- State、Main KV、Backend KV 和 Host storage 分别受各自容量约束；
-- 所有 target-specific identity、frontier 和 state 完整性判断都由 Program 完成。
+本文后续简称 planning target 为 `target`；注册模型及其 package 写作 `model target`，两者不是同一概念。
+
+Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但不改变模型语义、请求顺序或生成结果。
+
+当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8` 和非抢占 active requests。
+由此得到两个基本规则：
+
+1. Scheduler 先确定本次尝试的 request，资源层只优化该 request 的 materialization；
+2. 一个 request 发布为 Active 后，其最大合法执行范围已经获得完整资源保证，inactive cache policy
+   不能再借用这部分容量。
 
 ---
 
-## 2. 三层职责
+## 2. 决策所有权
 
 ### 2.1 Scheduler
 
-Scheduler 只拥有请求顺序与时间公平性：
+Scheduler 选择：
 
-- FIFO head、protected-head 和 backfill；
+- 当前 FIFO head 或已经证明安全的 backfill request；
 - admission 尝试时机；
-- staged prefill 与 compact decode membership；
-- projected service work。
+- prefill、control 和 decode 的执行顺序。
 
-Scheduler 不持有 checkpoint、victim、physical page 或 allocator 信息。
+Scheduler 不读取 checkpoint placement、victim、page 或 allocator facts。
 
 ### 2.2 ResourceManager
 
-ResourceManager 只拥有逻辑 policy：
+ResourceManager 拥有逻辑缓存策略：
 
-- `Free | Materializing | Active | TerminalPending` lane 状态；
-- private/shared catalog 的逻辑可见性和预留 publication slot；
-- SessionIndex、ContentPrefixIndex 和 retention observations；
-- exact candidate shortlist；
-- source disposition、logical degradation action 顺序和成本比较；
-- Program 返回的 opaque handles 与稳定终态结果的采用。
+- private/shared catalog 与 SessionIndex；
+- candidate shortlist 和 logical claim；
+- retention class、命中历史与 publication order；
+- 跨 candidates 的 target 搜索和成本比较；
+- Program 终态结果的逻辑采用。
 
-ResourceManager 不保存物理占用账本，不保存 per-lane State/KV resource vector，不从 owner delta 推导容量，
-也不镜像 Program 的 allocator 或 replica 状态。
+ResourceManager 可以知道“某个 checkpoint 可从 Device、Host 或 root 恢复”的 Program summary，
+但不保存物理 occupancy、refcount、free page 或 Host arena 几何的副本。
 
 ### 2.3 Program
 
-Program 是唯一物理 authority。它拥有：
+Program 是唯一物理 authority，拥有：
 
-- StateImage、KVAddressSpace 和 LogicalKVPage 的真实对象与引用；
-- Device/Host State stores；
-- typed Device KV pools 和 Host KV extent store；
-- replica generation、content epoch、coverage 和 transfer state；
-- active sequence binding 与完成 reservation；
-- 物理 allocator、容量计数和阶段峰值检查；
-- 同一时刻至多一个改变全局资源拓扑的 transaction；
-- prefill、decode、speculative commit、capture 和 terminal state transition。
+- State 与 KV 的真实 objects、references 和 replicas；
+- Device pools、Host stores、allocators 和 reservations；
+- continuation completeness 与 exact prefix identity；
+- Move、Fork、COW、transfer 和 last-reference release；
+- 完整 post-state、每个 transition stage 的物理可行性；
+- 与当前资源状态绑定的 `ResourcePlan`。
 
-Program 的现有 stores、allocators 和引用关系本身就是物理事实。架构中的“资源图”是这些事实的概念模型，
-不要求再维护一个与真实容器并列的 `PhysicalGraph` 对象。
-
-整体调用方向为：
+调用关系为：
 
 ```text
-Scheduler
-    选择当前请求
+Scheduler selects one request
         │
         ▼
-ResourceManager
-    枚举 exact candidates
-    排序 logical degradation actions
+ResourceManager enumerates candidates and compares targets
         │
         ▼
-Program
-    从真实对象与 allocator 联合验证物理transition
-    需要分配、pressure或transfer时seal ResourcePlan
-    串行执行一个resource transition
+Program projects each complete target from real physical state
         │
         ▼
-ResourceManager
-    只采用稳定的 logical ResourceResult
+Program seals and executes one ResourcePlan
+        │
+        ▼
+ResourceManager adopts one stable ResourceResult
 ```
 
-不存在从 Program 返回到 ResourceManager 的逐步物理账本同步环。
+逻辑策略与物理事实通过 candidate assessment、opaque target handle、`ResourcePlan` 和
+`ResourceResult` 交互，不通过一份跨层共享的物理账本交互。
 
 ---
 
-## 3. 核心资源模型
+## 3. 资源模型
 
-### 3.1 四个不能混合的概念
+### 3.1 容量轴
 
-资源架构必须分别回答四个问题：
+Program 在启动时建立一个固定容量向量：
 
-| 概念 | 问题 | 表示 |
-|---|---|---|
-| logical reference | 哪些 active sequence 或 checkpoint 需要该对象？ | Program-owned object references |
-| protection/reservation | 哪些对象或未来容量当前不可回收？ | active sequence 与 open transaction 的内部记录 |
-| physical occupancy | 哪些 Device/Host allocation 实际存在？ | Program stores 与 allocators |
-| marginal reclaim | 删除一组 logical references 后真正释放什么？ | 对完整 hypothetical post-state 联合计算 |
+```text
+PhysicalCapacity = {
+    Device StateImage slots,
+    Host StateImage slots,
+    Device page groups for each typed KV pool,
+    Host KV arena bytes and allocator geometry,
+}
+```
 
-Logical owner 不是物理字节的结算 owner。Shared page 从两个引用变为一个引用时，只改变 logical references；
-它不发生物理“所有权转移”，也不产生等量 removed/added delta。
+这些轴相互独立。一个资源轴的余量不能补偿另一个轴的缺口。Host KV 的总空闲字节也不能替代
+allocator 对具体 extent 几何的可分配性判断。
 
-### 3.2 唯一占用公式
+Engine 另有固定的逻辑容量：
 
-对每个资源维度 \(r\)，稳定或 transaction 内部状态 \(S\) 的物理占用为：
+- active lanes；
+- private continuation catalog slots；
+- shared prefix catalog slots；
+- 每个 continuation 的 checkpoint/anchor 上限。
+
+Lane 和 catalog slot 不计入物理 bytes，但 target 只有同时满足逻辑容量和物理容量才可发布。
+
+### 3.2 唯一物理占用
+
+对任一物理资源维度 \(r\)，状态 \(S\) 的占用为：
 
 \[
 Used_r(S)=
-\sum_{x\in UniquePhysicalAllocations(S)} size_r(x)
+\sum_{x\in UniqueAllocations(S)} size_r(x)
 +
 \sum_{y\in ConcreteReservations(S)} size_r(y)
 \]
 
-其中：
+`UniqueAllocations` 包括：
 
-- `UniquePhysicalAllocations` 包含 Device/Host State replicas、Device KV page replicas 和 Host KV extents；
-- `ConcreteReservations` 包含 active future growth、COW/tail destination 和 transaction destination；
-- 同一个容量单位恰好出现在一项中：已经materialize的部分计allocation，尚未materialize但被保护的部分计reservation；
-- 同一 allocation 被多少 logical objects 引用都只计一次；
-- lane、catalog slot、SessionIndex cell 不进入物理资源向量。
+- Device/Host StateImage replicas；
+- Device KV page replicas；
+- Host KV extents。
 
-物理容量轴固定为：
+`ConcreteReservations` 包括：
 
-```text
-Device = state slots, typed KV page slots
-Host   = state slots, KV bytes
-```
+- active request 尚未 materialize 的未来增长；
+- partial-tail COW destination；
+- resource transition 的 copy destination 和 replacement capacity。
 
-对每个维度始终满足：
+同一个物理 allocation 被多个 checkpoints 或 address spaces 引用时只计一次。已经物化的容量计
+allocation，尚未物化但被保护的容量计 reservation；同一容量单位不能同时计入两项。
+
+每个稳定状态和 transition 中间状态都必须满足：
 
 \[
 Used_r(S)\le Capacity_r
 \]
 
-### 3.3 阶段峰值而不是最终净值
+### 3.3 完整 post-state 与联合回收
 
-一个 `ResourcePlan` 是有序物理阶段：
+资源回收由最终剩余引用决定。对一组 logical actions \(V\)：
+
+\[
+Reclaim_r(S,V)=
+Used_r(S)-Used_r(PostState(S,V))
+\]
+
+`PostState` 必须同时应用：
+
+- selected source 的 retain 或 consume；
+- 所有 victim owner/checkpoint outcomes；
+- 所有 surviving Device/Host placements；
+- active destination references 和 reservations；
+- 零引用 objects 的 release。
+
+因此通常有：
+
+\[
+Reclaim(S,A\cup B)\ne Reclaim(S,A)+Reclaim(S,B)
+\]
+
+删除一个 alias 可能不释放任何 allocation；两个 owners 一起删除最后一批 references 时，同一 allocation
+只释放一次。ResourceManager 不计算或相加 per-owner reclaim credit。
+
+Move、Fork、partial-tail COW 和 source placement 也由完整 post-state 决定。一个 source 在初始状态中
+存在多个引用，并不意味着最终一定 Fork；反之，保留任一 checkpoint 所需的引用后也不能把它当作 Move。
+
+### 3.4 有序阶段峰值
+
+一个物理 plan 是稳定状态之间的有序阶段：
 
 \[
 S_0\rightarrow S_1\rightarrow\cdots\rightarrow S_n
@@ -166,168 +202,104 @@ S_0\rightarrow S_1\rightarrow\cdots\rightarrow S_n
 \max_{0\le i\le n} Used_r(S_i)\le Capacity_r
 \]
 
-因此以下操作必须按实际顺序检查：
-
-- copy destination 分配；
-- D2H/H2D/D2D；
-- replacement replica publication；
-- old replica release；
-- partial-tail COW；
-- active growth reservation；
-- Host extent allocation、split 和 coalescing。
-
-最终 `Used(S_n)-Used(S_0)` 不能替代中间峰值。
-
-### 3.4 联合可回收量
-
-对完整 logical action 集合 \(V\)：
-
-\[
-Reclaim_r(S,V)=
-Used_r(S)-Used_r(RemoveReferences(S,V))
-\]
-
-`RemoveReferences` 必须先在同一个 hypothetical state 中应用全部 source disposition、victim actions、
-replica changes 和 destination references，再根据最后引用决定实际 release。
-
-通常不成立：
-
-\[
-Reclaim(S,A\cup B)=Reclaim(S,A)+Reclaim(S,B)
-\]
-
-只有 Program 从不相交的实际 objects 证明可加时，结果才会偶然相等。ResourceManager 永远不依赖这种可加性。
-
-典型边界为：
+阶段顺序必须表达真实 dependency：
 
 ```text
-删除 catalog alias
-active sequence 仍引用同一 page
-
-logical references changed
-physical occupancy unchanged
-active protection unchanged
-reclaim = 0
+reserve destination
+  -> copy
+  -> verify and publish replacement
+  -> release old replica
 ```
 
-### 3.5 一份资源 revision
+State restore、KV H2D/D2H、D2D fork、partial-tail COW 和 Host extent replacement 都遵循这一规则。
+最终净占用不能掩盖 copy-before-release 的瞬时峰值。
 
-Program 暴露单调 `resource_revision`，只用于使只读 plan 失效。下列稳定可观察事实改变时递增：
+### 3.5 Resource revision
 
-- owner/reference topology；
-- Device/Host replica placement；
-- global free/reserved capacity；
-- 会改变后续 allocator feasibility 的几何状态。
+Program 暴露单调 `resource_revision`，使只读 assessment 和 sealed plan 与一个稳定物理状态绑定。
+以下变化会推进 revision：
 
-Active 在已经取得的 reservation 内执行以下操作时不递增：
+- owner/reference topology 改变；
+- inactive Device/Host placement 改变；
+- global free/reserved capacity 改变；
+- 会改变后续 allocator feasibility 的几何状态改变。
 
-- reserved page 变为 mapped；
-- truncate/rollback 后同一 page 变回 reserved；
-- committed coverage 或 token frontier 前进；
-- 不改变 global free set 的 state 内容更新。
+Active request 在自己的 reservation 内进行 mapped/reserved 转换、推进 committed frontier 或更新
+state 内容时，不改变全局可用容量，因此不推进 revision。
 
-一个 open transaction 存续期间不允许建立第二个 topology plan，因此内部阶段不需要向外发布 revision。
-Transaction 到达稳定终态后，如果上述事实发生变化，只推进一次 revision。Capability generation 继续独立拒绝
-slot reuse 后的 stale handle。
+一个 open resource transition 的中间阶段不向外发布 revision。它到达稳定 commit/abort 状态后，
+若全局物理事实发生变化，只推进一次。Handle 的 owner/generation validation 独立阻止 slot reuse
+产生的 stale capability。
 
 ---
 
-## 4. Continuation、Checkpoint 与恢复语义
+## 4. Continuation 与 checkpoint
 
-### 4.1 State 决定能否恢复
+### 4.1 完整恢复条件
 
-对于当前混合 GDN/Full Attention targets：
+当前 model targets 同时包含可分页 Full Attention KV 和不能从任意较晚状态无损回退的 recurrent state。
+因此某个 frontier 可以复用，当且仅当 Program 能证明：
 
-- Full Attention KV 可以按 target 允许的 frontier 截断；
-- recurrent/GDN state 不能从较晚状态无损回退；
-- 只有某个 frontier 存在完整 target state，才可从该位置继续；
-- 只有 KV 而没有匹配 state 不构成 prefix hit。
+1. 存在该 frontier 的完整 StateImage；
+2. Main KV 满足 target 定义的 typed coverage；
+3. selected backend 的 KV 与 fixed state 满足同一 continuation；
+4. token、position、Vision 和 mode identity 与 incoming prompt 精确一致。
 
-因此：
+只有 token match、KV bytes 或 page match 时，缺少的是完整 continuation，不是一次部分 cache hit。
 
-> Checkpoint 的 StateImage 证明该 frontier 可恢复；typed KV requirements 描述恢复该 frontier 还需要哪些分页前缀。
+### 4.2 Continuation 组织
 
-### 4.2 Continuation
-
-`Continuation` 表示一条线性历史，而不是整体迁移的 bundle：
+Private continuation 表示一条可继续演化的会话历史：
 
 ```text
 PrivateContinuation
-├── target identity / token ledger
+├── exact target/token history
 ├── Main KV address space
-├── optional Backend KV address space
-├── optional endpoint checkpoint
-├── optional typed rewrite checkpoint
-└── optional sparse long anchors
+├── optional backend KV address space
+└── one or more immutable checkpoints
 ```
 
-Endpoint、rewrite 和 long anchors 可以引用同一 KV address space 的不同前缀。Continuation 组织逻辑历史；
-State 与 KV 的 Device/Host residency 仍独立。
+Shared prefix 是不可变的复用来源，可以被多个 private branches Fork。一个 continuation 内的多个
+checkpoints 可以引用相同 address space 的不同 prefix，但每个 checkpoint 都有自己的完整 StateImage
+identity。
 
-Shared stable prefix 是不可变的独立 continuation source：
+### 4.3 Checkpoint 种类
 
-```text
-SharedPrefix
-├── exact checkpoint state
-├── Main/Backend KV prefix
-└── immutable shared full pages
-```
+| Kind | 语义 |
+|---|---|
+| `SessionEndpoint` | 已完成请求的最新可继续状态 |
+| `TurnClosure` | 当前 turn 中可替换 assistant suffix 之前的稳定状态 |
+| `ResponseReplay` | generation opener 之前、可重新生成 response 的稳定状态 |
+| `LongAnchor` | retention policy 选择的较早长上下文恢复点 |
+| `SharedStablePrefix` | 多条历史共同使用的不可变稳定前缀 |
 
-### 4.3 Checkpoint
+`TurnClosure` 和 `ResponseReplay` 的 frontier 必须位于下一请求可能替换的 assistant suffix 之前。
+这样对话系统追加新的 user message 或改写生成尾部时，仍能复用稳定历史，而不会把可变 suffix 错当成
+prefix identity 的一部分。
 
-一个 checkpoint 包含：
+Checkpoint 发布后：
 
-```text
-kind / scope
-exact target identity
-token frontier
-complete StateImage handle
-target-defined typed KV requirements
-optional surviving fallback
-```
+- identity、frontier 和 required coverage 不变；
+- StateImage 与受保护的 KV prefix 不再原地修改；
+- Device/Host placement 可以由 resource transition 改变。
 
-当前逻辑种类为：
-
-- `SessionEndpoint`；
-- `TurnClosure`；
-- `ResponseReplay`；
-- `SharedStablePrefix`；
-- `LongAnchor`。
-
-`TurnClosure` 与 `ResponseReplay` 是 typed rewrite checkpoints。`TargetKVRequirement` 由 Program 定义，
-Main 与 Backend 不要求具有相同数值 frontier。
-
-Typed rewrite frontier 必须位于下一请求允许替换的 assistant suffix 之前，而不能位于该 suffix 内部。
-`ResponseReplay` 位于 generation opener 之前；`TurnClosure` 位于当前 open turn 中第一个可能被重写的
-assistant opener 之前。确定性的 opener/thinking prologue 属于低成本 rebuild suffix。这样立即后继请求无论回放
-response、关闭 tool loop，还是直接追加 replacement user message，都保留同一个稳定 conversation prefix；每条
-continuation 仍只需要一个 rolling rewrite StateImage。
-
-Checkpoint 发布后逻辑内容不可变：
-
-- identity 和 frontier 不变；
-- StateImage 不再原地修改；
-- required committed KV prefix 不被覆盖；
-- Device/Host residency 可以变化。
-
-### 4.4 有效与 Device-ready
+### 4.4 Valid 与 Device-ready
 
 Checkpoint \(c\) 有效，当且仅当：
 
-1. StateImage 至少有一份完整有效 replica；
-2. 每个 typed required KV page 至少有一份 content epoch 一致、coverage 足够的 replica。
+- StateImage 至少有一个完整 Device 或 Host replica；
+- 每个 required KV logical page 至少有一个 content epoch 一致且 coverage 足够的 Device 或 Host replica。
 
 \[
-\forall s,\forall p\in RequiredPages_s(c):
-ValidDevice(p,c)\lor ValidHost(p,c)
+\forall p\in RequiredPages(c),\qquad ValidDevice(p,c)\lor ValidHost(p,c)
 \]
 
-只有 State 和全部 required KV 都在 Device，且 active future reservation 可以取得时，checkpoint 才是
-Device-ready。有效 checkpoint 不等于可立即执行 checkpoint。
+有效 checkpoint 可能需要 H2D restore。只有全部 execution requirements 已在 Device，且 active future
+reservation 可以取得时，它才是 Device-ready。
 
 ### 4.5 Exact identity
 
-Exact identity 由 target Program 定义，可能包括：
+Program 的 exact verification 可以使用：
 
 - token IDs 和 token types；
 - position/MRoPE axes 与 RoPE delta；
@@ -335,847 +307,639 @@ Exact identity 由 target Program 定义，可能包括：
 - template/runtime mode；
 - checkpoint frontier。
 
-SessionKey、request ID、raw string、caller marker 和 hash 都只是 shortlist 或 ownership hint。最终命中必须由
-Program exact verification。Catalog 已绑定当前 Program/model instance，不增加 runtime target tag。
+Session key、marker、hash 和 prefix index 只缩小 candidate 集合，不证明命中。
 
-### 4.6 Request-level cache participation
+### 4.6 Request cache participation
 
-每个请求在提交Engine前已经确定context-cache participation，只有两种语义：
+每个请求在进入 Engine 前固定一种语义：
 
-- `ReadWrite`：可以枚举并精确验证prefix candidate，也可以在合法frontier capture并在finish发布continuation；
-- `Disabled`：不读取candidate、不建立capture group、不发布continuation，finish必须释放该请求持有的active
-  State/KV资源。
+- `ReadWrite`：允许读取 exact candidates、capture checkpoints，并在 finish 时发布 continuation；
+- `Disabled`：只允许 root materialization，结束时释放全部 active context resources。
 
-Serve启动配置决定外部请求采用哪一种语义；内部operational warmup固定采用`Disabled`。`Disabled`请求执行期间
-仍取得正常的active completion guarantee，但它结束后不得留在private/shared catalog、SessionIndex或任何
-Device/Host context replica中。因此warmup完成后不占用额外checkpoint容量`H`、Host容量`R`或catalog
-容量，首个外部请求的cache选择只由外部请求历史决定。
+`Disabled` 请求仍获得正常 active completion guarantee，但不会留下 private/shared catalog entry、
+SessionIndex binding 或 Device/Host checkpoint replica。Serve warmup 使用这一语义。
 
 ---
 
-## 5. State 物理语义
+## 5. State 与 KV 的 placement 语义
 
-### 5.1 Device 与 Host pools
+### 5.1 StateImage
 
-设 \(C\) 为最大 active concurrency，\(H\) 为额外 Device checkpoint state slots，\(R\) 为 Host state slots：
+StateImage 是完整迁移单位。设最大 active concurrency 为 \(C\)，额外 Device checkpoint slots 为 \(H\)，
+则：
 
 \[
 Capacity_{DeviceState}=C+H
 \]
 
-\[
-Capacity_{HostState}=R
-\]
+前 \(C\) 份容量形成 active guarantee，全部 slots 仍由同一个 Program pool 管理，不与 lane 固定配对。
+Host State 以完整 image 和独立 slot 容量计费。
 
-所有 Device state slots 同构，不固定划分 current/rewrite/cache，也不永久绑定 lane。每个 active sequence
-需要独占可写 destination；多个 rows 可以共享 immutable source。
+State transition 的语义只有：
 
-Host State 以完整 StateImage 为单位，不存在 partial state image。一个 logical StateImage 可以同时具有 Device
-和 Host replica，两份 replica 分别计入各自容量。
+| 操作 | 条件与结果 |
+|---|---|
+| InPlace | 唯一 active writer 在自己的 destination 上推进 |
+| Move | private source 被 consume，原 StateImage 成为 active destination |
+| Fork | immutable 或仍需保留的 source 写入新的 private destination |
+| Freeze | committed active StateImage 转为 immutable checkpoint |
+| Snapshot/Restore | 完整 StateImage 在 Device 与 Host 之间复制 |
 
-### 5.2 Lane 与 state slot 解耦
+Program 根据完整 post-state 选择 Move 或 Fork。Fork source 在 destination 首次 state-writing commit 完成前
+保持 pin；该结算属于 active model transaction，不能与新的 global resource transition 重叠。
 
-Lane 表示 request control identity 和 Scheduler membership。State slot 表示 target continuation image：
+### 5.2 Typed KV
 
-```text
-lane 0 -> state slot 4
-lane 1 -> state slot 1
-checkpoint A -> state slot 0
-```
+每个 continuation 对 Main KV 及 selected backend KV 分别持有 typed address space。各 pool 的 frontier、
+capacity 和 placement 独立。
 
-Program 内部 execution binding 为每个 row 提供：
+资源规划只使用以下语义：
 
-```text
-state_src_slot
-state_dst_slot
-```
+- required logical pages 与 committed coverage；
+- 每页可用的 Device/Host replica；
+- immutable references 和唯一 writer；
+- partial-tail COW requirement；
+- restore、demote 或 release 对 capacity 与 machine work 的影响。
 
-普通执行 `src == dst`；Fork 时 `src != dst`。这些 selector 只属于 Program。
+具体 page geometry、Host packed extent、COW 和 block-table publication 由
+[Paged KV Context Store](paged-kv-cache.md)定义。
 
-### 5.3 五个基本操作
-
-#### InPlace
-
-Active state 原地推进：
-
-```text
-read S0
-write S0
-```
-
-这是普通 prefill/decode 热路径。
-
-#### Move
-
-Private checkpoint 被唯一 branch destructive consume：
+Prefix Fork 后的 active address 可以按以下顺序同时包含共享与私有页：
 
 ```text
-CHECKPOINT S0 -> ACTIVE S0
+immutable full pages | unique mutable full pages | optional unique mutable tail
 ```
 
-没有 D2D state copy。是否仍可 Move 必须在完整 victim/source disposition 后根据实际剩余引用判断。
+Active capture 对不可变整页只增加引用，对唯一可写整页原地 Freeze；非对齐尾页保留给 checkpoint，并只
+复制一页作为新的 active writer。对齐 frontier 不发生 KV copy，后续增长再物化新的 writer page。
+Program 的 capture assessment、reservation 和 commit 使用同一个 snapshot-shape 分析，因此资源信用、
+transfer cost 与实际可提交的页所有权条件一致。
 
-#### Fork
-
-Shared 或必须保留的 source：
-
-```text
-read immutable S0
-write private S1
-```
-
-在 Program commit 确认 S1 已成为完整可继续执行的 target state 前，S0 保持 pin。Engine 不根据某次 kernel launch
-或某个字段推进自行推断 Fork 完成。
-
-#### Freeze
-
-完整 committed active state 原子转成 immutable checkpoint。若请求继续执行，则下一 unit 从该 checkpoint Fork
-到新 destination。优先使用 `Freeze + Fork`，不复制完整 state image。
-
-#### Snapshot / Restore
-
-完整 StateImage 在 Device 与 Host 之间 D2H/H2D。Private restore 可以直接成为 active；shared restore 可以建立
-Device checkpoint replica 后反复 Fork。
+State 与 KV 可以独立 placement，例如 State 在 Device、Main KV 部分在 Device、其余 Main KV 在 Host，
+backend KV 采用另一种 coverage。Checkpoint 只有在全部 required components 至少保留一份有效 replica
+时才继续存在。
 
 ---
 
-## 6. KV 物理语义
+## 6. Active completion guarantee
 
-### 6.1 Typed address spaces
+### 6.1 Admission reservation
 
-当前 Variant 具有一个 Main KV pool，并在需要时具有独立 Backend KV pool。每个 pool 有独立：
-
-- page namespace；
-- logical frontier；
-- physical capacity；
-- Device/Host residency；
-- materialization requirement。
-
-一个 pool 的空闲容量不能补偿另一个 pool。
-
-每个 continuation 在每个 pool 持有 Program-owned `KVAddressSpace`：
-
-```text
-KVAddressSpace
-├── typed pool identity
-├── committed frontier
-└── ordered LogicalKVPageHandle[]
-```
-
-Catalog 只保存 opaque address-space/checkpoint handles 与 policy summary，不复制 page membership、replicas、
-refcount 或 physical generation。
-
-### 6.2 Page identity、content 与 replica
-
-Logical page 至少具有以下可判定语义：
-
-```text
-object identity + capability generation
-current content epoch
-committed coverage
-logical references / writer protection
-optional Device replica
-optional Host replica
-transfer state
-```
-
-Replica 能覆盖 page 前 \(n\) 个 columns，当且仅当：
-
-\[
-replica.content\_epoch=page.content\_epoch
-\quad\land\quad
-replica.committed\_coverage\ge n
-\]
-
-正常 append 不改变已提交 prefix 的 content epoch，只推进 coverage。Speculative 或尚未提交的 bytes 不进入
-canonical coverage，也不能被 checkpoint 引用。
-
-### 6.3 Private append 与 shared COW
-
-Private continuation 保持单 writer。Endpoint、rewrite 与 active frontier可以共享同一 address space 和 partial
-tail，只要 writer 不覆盖任何 surviving checkpoint 的 protected prefix。
-
-Shared full pages不可变。Shared frontier 位于 page 中间时，各 branch 必须：
-
-```text
-share immutable full pages
-copy one private partial tail
-append private suffix
-```
-
-是否需要 COW 由完整 post-state 中的实际 sharing/writer 关系决定，不能只依据某个 pre-plan refcount。
-
-### 6.4 Host KV
-
-Host KV 使用 packed logical-order extents，不保存临时 Device physical page IDs：
-
-```text
-Host extent
-├── typed pool
-├── logical begin/count
-├── packed payload
-└── allocation handle/generation
-```
-
-表示方式与传输方式分离：
-
-```text
-Host representation = logical-order packed
-transfer execution  = coalesced physical runs
-```
-
-Host KV 使用有界 variable-size arena，短 continuation 只占实际 payload。可行性必须由真实 allocator 几何判断；
-`free bytes >= request bytes` 不是充分条件。架构不规定 allocator 必须是红黑树、segment tree 或其他具体容器。
-
-### 6.5 Partial residency
-
-Checkpoint 可以同时具有：
-
-```text
-State: Device or Host
-Main KV: prefix Device, suffix Host
-Backend KV: independent placement
-```
-
-Pressure 只迁移或释放覆盖实际缺口所需的低价值 extents，不默认整体 park continuation。优先保留被更多
-checkpoints 引用的早期 pages 和高 fan-out shared pages。
-
----
-
-## 7. Active reservation 与 lane 生命周期
-
-### 7.1 完成保证
-
-Admission 为 selected candidate 取得：
+一个 candidate 发布为 Active 前，Program 为它保障：
 
 ```text
 required Device checkpoint prefix
 + remaining prompt growth
 + maximum effective output growth
-+ target-defined bounded provisional growth
-+ required State/COW destinations
++ target-defined provisional/speculative growth
++ State and partial-tail COW destinations
++ selected backend requirements
 ```
 
-这些 reservation 由 Program 内部绑定到返回的 `SequenceHandle`。它们可以是具体 slots/pages，也可以是 allocator
-内部等价的不可挪用 reservation，但必须从 global available capacity 中精确扣除一次。
+这些资源绑定在返回的 `SequenceHandle` 中。物化进度只在 allocation 与 reserved-but-unmapped 之间转换，
+不会把容量交给另一个 request。
 
-另一个请求不能逐出或借用这些资源。Mapped 与 reserved-growth 之间转换不改变 total occupancy。
+Active truncate 或 speculative rollback 可以解除 mappings，但对应容量仍属于该 active reservation。
+只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
 
-### 7.2 Lane 状态
+### 6.2 Terminal 与 capture
 
-逻辑 lane 状态只有：
+TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，直到 Program 完成：
+
+- **Finish**：发布一个完整 immutable checkpoint；或
+- **Discard**：释放整个 active continuation。
+
+若 Finish 无法形成合法保留终态，必须采用 Discard。Optional capture 可以通过同一 pressure graph 改变
+inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
+不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
+
+### 6.3 Persistent backfill proof
+
+Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program
+提供的物理证明使用同一 feasibility oracle：
 
 ```text
-Free
-Materializing
-Active
-TerminalPending
+hypothetical state =
+    current stable state
+    - protected donor active reservations after their terminal release
+    + borrower full active reservation
+    + head root materialization
+    with all unprotected inactive cache releasable
 ```
 
-并满足：
-
-\[
-NonFreeLanes\le C
-\]
-
-- `Materializing`：已取得 lane 和 transaction destination reservation，但尚无 published active sequence；
-- `Active`：RequestRecord 持有有效 `SequenceHandle`；
-- `TerminalPending`：row 已退出 GPU membership，但仍持有 `SequenceHandle` 和完整 reservation，等待 terminal
-  resource transaction；
-- `Free`：无 sequence binding。
-
-Lane 不进入物理资源向量。
-
-### 7.3 Catalog publication capacity
-
-任何可能发布新 private/shared descriptor 的 operation，在 Program 第一次 mutation 前必须由 ResourceManager
-预留目标 catalog slot。Logical adoption 不允许在 Program commit 后分配或扩容。
-
-Private Move 可以复用 source descriptor slot；root/Fork 需要预留 destination slot。Finish 保留 endpoint时复用
-active private slot或预留替换位置；无法获得合法 publication capacity 时，optional capture跳过，terminal finish
-释放而不是无限 blocked。
+只有该完整状态可行，borrower 才具有 persistent-safe backfill 资格。证明与 `resource_revision` 绑定，
+不使用 borrower 或 donor 的预计完成时间。
 
 ---
 
-## 8. Candidate 与 pressure planning
+## 7. Materialization planning problem
 
-### 8.1 Scheduler 先选择请求
+### 7.1 Candidate
 
-Scheduler 先按 FIFO/protected-head/backfill 规则选择一个 request。ResourceManager 只为该 request 规划：
+ResourceManager 为已选 request 建立有界 candidate 集合：
+
+- root；
+- matching private endpoint；
+- typed rewrite checkpoint；
+- retained long anchor；
+- shared stable prefix。
+
+相同 capability 经不同 index 命中时先去重。Program 对每个 shortlist entry 执行 exact verification，
+并产生一个 `AdmissionCandidate`。Candidate 固定 source、destination、prompt 和 request work，但不提前
+决定 Move/Fork、victims 或最终 placements。
+
+Root 始终存在。它不复用 continuation state，代表从 prompt 开始正常 prefill。
+
+### 7.2 Shared publication candidate
+
+Shared prefix 的三个状态不能混为一谈：
+
+- **boundary** 是协议或 Engine 指出的逻辑内容边界；
+- **candidate** 是 Frontend 已解析到 exact token frontier 的可选写入机会；
+- **owner** 是 Program 已发布、具有完整 State/KV identity 与 placement 的 immutable checkpoint。
+
+外部协议或 C++ `PromptInput` 每个请求最多提交四个显式 markers。Frontend 还可以生成最多三个 Engine
+candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
+因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
+
+Candidate 保存 evidence flags。策略含义为：
+
+| Evidence | 首次出现时的准入能力 |
+|---|---|
+| `ExplicitBoundary` | 可以参与 pressure，但仍须有严格正净收益 |
+| `RequestedAutomatic` | 可以参与 pressure，但仍须有严格正净收益 |
+| `DefaultAutomatic` | 只能使用不降低现有 owner 的空余终态 |
+| `EngineStructural` | 只能使用不降低现有 owner 的空余终态 |
+| `EngineObserved` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
+
+Marker、evidence 和 shortlist key 都不证明命中；Program 对 read、dedup 和 publication 重新验证完整
+identity。候选创建 source 的顺序为：exact shared owner 直接 dedup；selected exact private reuse base 在
+第一次模型 mutation 前做零-prefill promotion；更晚 frontier 由 active prefill capture。早于 selected
+reuse base 且没有现成 exact source 的候选只保留为需求观察，不回滚状态或重新 prefill。
+
+Shared candidate 必须在 prefill 前决定是否增加 split，而物理状态只能在 frontier 到达时确定。因此实现
+分为两步：
+
+1. admission 已选定 materialization source 后，ResourceManager 用完整逻辑 portfolio 的乐观收益上界和
+   Program 返回的精确 split cost 选择 candidate subset；这一步不预留资源，也不承诺 publication；
+2. capture offer 到达后，`SharedCapturePlanner` 从当前 `resource_revision` 搜索完整物理 targets，可以联合
+   demote/evict 多个合法 inactive private/shared owners。shared catalog 已满时，logical replacement 与其他
+   物理 victims 属于同一个 target 和同一个 transaction。
+
+实际 planner 的 baseline 是同一 frontier 的 private-only policy。Shared publication 是可选投资：没有可行
+且严格正收益的 target 时执行 private baseline 或 Skip。
+
+### 7.3 Target
+
+Planner 的搜索节点是完整 target，而不是一条孤立 eviction action。一个 target 同时确定：
 
 ```text
-session endpoint
-session typed rewrite
-explicit shared stable prefix
-other matching shared prefixes
-long anchors
-root/full reset
+selected candidate
+selected source retained or consumed-to-active
+every eligible owner retained or evicted
+every surviving checkpoint and required coverage
+every surviving State/KV Device/Host placement
+logical publication destination
 ```
 
-ContentPrefixIndex 只生成 shortlist。相同 checkpoint 经多个 index/marker 命中时先按 capability identity 去重，
-再由 Program exact verify。Root 永远存在且只出现一次。
+Eligible victims 只包括未被 active reference、selected-source protection 或 open transaction pin 保护的
+inactive owners。Target 应用后产生的零引用 objects 自动释放。
 
-### 8.2 完整 choice 是唯一规划单位
+Program 从该完整终态重新推导：
 
-一个 plan 的输入必须同时固定：
-
-```text
-source checkpoint or root
-source disposition: Move or Fork
-logical degradation actions
-replica placement actions
-destination lane/state/KV reservations
-optional catalog publication slot
-```
-
-Program 在同一个 hypothetical post-state 中联合决定：
-
-- Move/Fork；
-- last-reference release；
-- State/KV Device/Host placement；
-- partial-tail COW；
-- Host/Device allocator feasibility；
-- ordered physical stages；
+- Move 或 Fork；
+- State/KV replacement 与 partial-tail COW；
+- last-reference releases；
 - active completion reservation；
-- terminal logical outcomes。
+- Host allocator geometry；
+- ordered stage peaks；
+- immediate work 与未来 recovery work。
 
-Program内部可以保存候选的阶段需求，但该值不越过Program边界。ResourceManager不能读取它，也不能把多个
-owner的局部释放量相加后自行判定可行性。
+一个 candidate 的 `identity target` 只应用 incoming activation 与必需的 source disposition，保持其他
+eligible inactive owners 的 checkpoint contents 和 placements 不变。它是该 candidate 压力降级图的根。
 
-候选在当前稳定状态中的初始缺口由Program逐维计算：
+### 7.4 单调降级图
+
+Pressure target 从 candidate 的 identity target 沿单调降级方向扩展：
+
+- 移除冗余 Device 或 Host replica；
+- 将 Device State/KV 降为 Host-only；
+- 缩短不再保留的 checkpoint coverage；
+- 删除 checkpoint；
+- evict 完整 inactive owner。
+
+Program 根据当前 residual deficit、checkpoint frontiers、page/extent boundaries 和共享引用生成语义
+successors。搜索不枚举物理操作的排列；每个 target 由 Program 映射到唯一规范 stage order。
+
+单个 owner action 暂时不产生 reclaim，也不能在联合 post-state 之前被删除，因为它可能与另一 action
+共同形成 last-reference release。
+
+---
+
+## 8. 规划目标与算法
+
+本节中的 `incumbent` 指当前已经找到的最佳可行完整 target。
+
+### 8.1 可行性与价值分离
+
+Program 先判断 target 是否结构合法、物理可行以及是否仍可继续降级。ResourceManager 只在物理可行且
+logical publication 可采用的 targets 之间比较价值。
+
+成本模型不参与容量判定。任何预测误差都只能改变“选择哪个可行方案”，不能让不可行方案通过。
+
+### 8.2 机器成本
+
+Program 将物理工作折叠为：
+
+```text
+Immediate =
+    ordered transfer phases
+  + remaining Text/Vision prefill
+  + required State/KV copy work
+```
+
+一次同 phase、同 direction 的 transfer batch 使用：
 
 \[
-Deficit_r(c)=\max\bigl(0, Used_r(S_0)+PeakAdditional_r(c)-Capacity_r\bigr)
+Transfer =
+\max(batch\_ns+operations\cdot operation\_ns,\ bytes\cdot ns\_per\_byte)
 \]
 
-`PeakAdditional`已经包含候选自己的source disposition与阶段顺序。Pressure option只针对这个真实缺口生成；
-不能用“所有维度都短缺”之类的哨兵替代，否则Host缺口会错误阻止Device到Host降级。
-
-### 8.3 Canonical degradation sequence
-
-Correctness不要求求解任意victim子集的全局最优组合。Program为每个owner返回有界、自包含的保留型
-alternatives，例如：
-
-```text
-release redundant Device replica
-move cold suffix/State to Host
-drop one low-value anchor or endpoint suffix
-```
-
-每个alternative描述该owner的一份完整目标状态，不是供ResourceManager相加的delta。ResourceManager按以下稳定
-policy key排序这些alternatives，并把完整owner eviction固定放在该owner最后：
-
-```text
-RetentionClass: Disposable < RecentPrivate < LiveSession < SharedStable
-estimated future recovery loss
-shared fan-out
-last successful hit
-stable owner/checkpoint ordinal
-```
-
-Protected source、active references和open transaction pins不进入序列。ResourceManager每次推进一个owner的下一
-alternative；同一owner的新alternative替换其旧alternative，然后让Program从真实当前状态重新seal完整choice。
-因此Program逐个联合评估：
-
-1. no pressure；
-2. canonical sequence产生的完整selected-action states；
-3. maximal safe release：保留 selected source/protected objects，删除其余全部可释放 inactive cache。
-
-即使单个action的standalone release为零，Program也必须从完整post-state重新计算，不能由ResourceManager跳过。
-中间states用于提高保留价值，不承担admission correctness。
-
-### 8.4 完备回退
-
-每次 request planning 都额外检查：
-
-```text
-root + release all unprotected inactive cache
-```
-
-因此 cache policy 不会永久阻止一个本来能在空 Engine中运行的 request：
-
-- request 的 isolated root completion requirement 已超过总/per-sequence容量：`PermanentlyInfeasible`；
-- isolated root可行，但当前被active reservations、lane或open transaction阻塞：`TemporarilyBlocked`；
-- 当前可行但需要transfer/pressure stages：`NeedsTransfer`；
-- 当前已经Device-ready且可同步发布：`Ready`。
-
-不对同一未变化的稳定状态重复轮询 `TemporarilyBlocked`；lane释放、resource revision变化、head protection变化或
-open transaction结束后重新检查。
-
-### 8.5 成本
-
-每个可行 plan 的比较成本为：
+Text suffix 的 prefill work 使用：
 
 \[
-Cost(c,V)=
-T_{state\ restore}
-+T_{KV\ restore}
-+T_{remaining\ prefill}
-+T_{transition}
-+Loss(V)
+AttentionPairs = B\,S+\frac{S(S+1)}{2}
 \]
 
-对每个受影响 checkpoint \(i\)：
+其中 \(B\) 是已复用 prefix tokens，\(S\) 是剩余 suffix tokens。Vision item/patch work 使用同一
+startup-resolved machine model 的独立分量。
+
+### 8.3 Portfolio value 与 future loss
+
+ResourceManager 保存最近 32 个成功 materialize 为 Active 的请求。每条 demand record 保存 reuse domain
+以及该请求 exact-matched、selected 或可创建的 prefix keys；不保存 prompt、媒体内容、session 原文或 API
+cache key。有 Engine session key 的请求使用其稳定 digest 作为 domain；无 session key 的每个请求形成独立
+domain。
+
+对 checkpoint \(p\) 和完整 portfolio state \(S\)：
 
 \[
-Loss_i=
-w_i\cdot
-\max(0,
-FutureRecoveryCost_i(after)-FutureRecoveryCost_i(before))
+Saving(p,S)=\max(0,\ Rebuild(p)-Recovery(p,S))
 \]
 
-`after` 必须来自联合 post-state：仍有效时使用其最佳 surviving replica path；被删除时使用 surviving fallback
-加重建成本。\(w_i\) 来自 retention class、fan-out、hit/recency observations。权重和机器时间系数属于 policy
-与离线校准，不参与资源正确性。
+`Rebuild` 是从 root 到该 frontier 的 canonical prefill cost；`Recovery` 是 Program 根据实际 State/KV
+placement 返回的最小 restore、copy 和必要 interval-prefill cost。每条 demand 只取所有 matching
+checkpoints 中的最大 saving：
 
-比较先使用预测 nanoseconds；精确相同时依次偏好：
+\[
+EmpiricalValue(S)=\sum_q\max_{p\ matches\ q}Saving(p,S)
+\]
+
+因此 tools、instructions 和 full-prompt 等嵌套 prefixes 不会对同一个未来请求重复计价。再加上尚未到期
+的显式 shared credit，得到公共价值：
+
+\[
+PublicValue(S)=EmpiricalValue(S)+SharedCredit(S)
+\]
+
+Private retention 表示每个 owner 还有一次未观测的后续复用。比较 baseline \(S_b\) 与 target \(S_t\) 时，
+保持 checkpoint identity 不变，先计算每个 checkpoint 的 saving 损失，再在 owner 内取最大值：
+
+\[
+PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
+\max(0,Saving(p,S_b)-Saving(p,S_t))
+\]
+
+不同 owners 的 `PrivateLoss` 相加。这样不会把同一 continuation 的嵌套 checkpoints 全部当作未来请求，
+也不会让一个仍然可用的末端 checkpoint 掩盖较早 TurnClosure 或 long anchor 的损失。权重为：
+
+| Private retention | prior weight |
+|---|---:|
+| Disposable | 1 |
+| RecentPrivate | 4 |
+| LiveSession | 16 |
+
+Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
+一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
+同一 frontier 的多个 evidence 不叠加 credit。
+
+对 mandatory materialization 的 candidate identity state \(I_c\) 和 pressure target \(T\)：
+
+\[
+FutureLoss_c(T)=\max(0,PublicValue(I_c)-PublicValue(T))
++\sum_o PrivateLoss_o(I_c,T),\qquad
+J(c,T)=Now(c,T)+FutureLoss_c(T)
+\]
+
+对 optional shared capture，比较 private-only state \(S_b\) 与 complete shared target \(S_t\)：
+
+\[
+NetGain=PublicValue(S_t)-PublicValue(S_b)
+-\sum_o PrivateLoss_o(S_b,S_t)-ImmediateDelta
+\]
+
+执行前 candidate subset 另减精确 `SplitCost`；capture offer 到达后 split 已经发生，不再重复计费。
+`ImmediateDelta` 包括 shared target 相对 private baseline 的 transfer/copy cost，并乘以当前 capture owner
+及被该 global transition 阻塞的其他请求数。只有 `NetGain>0` 才发布；相等、溢出或饱和无法证明严格
+正收益时保持 baseline。
+
+Selected source 的合法 `ConsumedToActive` 是 ownership transfer，不计作 eviction。其他随 pressure
+删除或降级的 checkpoints 通过 public value 与 private transition loss 进入 future loss。
+
+### 8.4 Lower bound
+
+每个搜索节点具有：
+
+\[
+LB(c,T)=MinimumRequestCost(c,T)+FutureLoss_c(T)
+\]
+
+`MinimumRequestCost` 保留无法被后续降级消除的 restore/prefill work，只排除完整 victim set 可能消除的
+private-source Fork/COW 或 optional pressure work。
+
+Lower bound 用于两件事：
+
+- 判断一个可行 identity target 是否已经支配所有可展开 alternatives；
+- 当 queue 最小 lower bound 严格大于 incumbent 完整成本时证明当前模型内最优。
+
+相等 lower bound 仍需进入确定性 tie-break，不能提前停止。
+
+### 8.5 无压力路径
+
+Planner 首先评估所有 exact candidate 的 identity target。若最佳可行 identity 的完整成本严格低于每个
+expandable candidate 的 lower bound，则直接 seal：
 
 ```text
-fewer destroyed SharedStable/LiveSession checkpoints
-fewer transferred bytes/operations
-more reused prompt tokens
-stable candidate/action ordinal
+inspect exact candidates
+  -> choose dominating feasible identity
+  -> seal ResourcePlan
 ```
 
-不宣称 canonical chain 上的 minimum 是任意 victim subset 的全局 optimum。
+这条路径不建立 pressure target graph，也不扫描与本次选择无关的物理对象。它覆盖资源充足时的普通
+cache hit 和 root admission。
+
+### 8.6 Correctness incumbent
+
+如果没有 identity target 同时满足物理与 logical publication 条件，Planner 在可选搜索预算之外先评估：
+
+```text
+root candidate
++ release all unprotected inactive cache
+```
+
+这是 maximal-release target。它不保留可牺牲的 cache value，但保证：
+
+- 搜索预算耗尽不会把本可运行请求错误地判成 blocked；
+- planner 始终拥有一个 correctness-first incumbent；
+- active reservations、selected-source protection 和 transaction pins 仍不可被释放。
+
+若 isolated root 本身超过 per-request 或总容量，结果为 permanently infeasible。若 isolated root 可行，
+但当前 active reservations、lane 或 open transaction 仍阻塞 maximal-release target，结果为 temporarily
+blocked。
+
+### 8.7 有界 best-first search
+
+有了 incumbent 后，Planner 在全部 candidate roots 上执行 best-first branch-and-bound：
+
+1. 以 lower bound 最小的 target 为下一 expansion；
+2. Program 原子地产生其 canonical successors；
+3. 每个等价完整 target 只 assessment 一次；
+4. 可行且逻辑可采用的 target 可以替换 incumbent；
+5. 仍可扩展且 lower bound 不高于 incumbent 的 target 回到 queue；
+6. queue 穷尽、证明 model-optimal，或达到 target/time/value budget 时停止；
+7. 始终使用停止时的最佳完整 incumbent。
+
+一次 expansion 的 children 要么完整加入，要么完整丢弃，避免 target budget 使结果依赖生成顺序。
+Budget 只控制 cache retention 质量；它不截断 candidate identity 检查和 maximal-release correctness
+assessment。
+
+若本次实际 assessment 的 canonical targets 为 \(N\)，heap search 的管理成本为 \(O(N\log N)\)，总成本再加
+Program 对这些 targets 的 physical projection work。设当前有 \(A\) 个 eligible owners，stored target
+decisions 使用 \(O(NA)\) memory；physical oracle 与 successor scratch 还受启动时配置的 owner、checkpoint
+和 logical-page descriptor 上限约束。\(N\) 由固定 target budget 封顶。
+因此组合目标空间可以很大，但一次 admission 的规划时间和内存不会随理论组合数无界增长。
+
+### 8.8 确定性选择
+
+首要比较键是 \(J\)。成本相等时依次偏好：
+
+1. 少影响已观测命中的 checkpoints，优先保留最近命中；
+2. 少 owner eviction、checkpoint deletion、copy operation 和 transferred bytes；
+3. 少剩余 Text/Vision prefill；
+4. 多复用 prompt tokens；
+5. 当前 session binding；
+6. candidate 与 target 的稳定 ordinal。
+
+`model_optimal` 只表示在当前 target graph、规范 stage order 和机器成本模型内已经证明最优，不表示真实
+请求分布上的全局最优 TTFT。
+
+### 8.9 Readiness
+
+最终结果只有四类：
+
+| 结果 | 含义 |
+|---|---|
+| `PermanentlyInfeasible` | isolated root completion requirement 超过当前 Engine 合同 |
+| `TemporarilyBlocked` | 单请求可行，但当前 active/lane/transaction 状态阻塞 |
+| `NeedsTransfer` | target 可行，需要异步 transfer 或 pressure stages |
+| `Ready` | target 已 Device-ready，可在当前 boundary 同步发布 |
+
+`TemporarilyBlocked` 只在 lane、FIFO protection、open transaction 或 resource revision 变化后重新检查。
+普通 decode 不重复运行 planner。
 
 ---
 
 ## 9. Resource transition
 
-### 9.1 两种执行形态
+### 9.1 三个对象
 
-需要分配、pressure或异步transfer的transition使用三个概念：
+需要 allocation、pressure 或 transfer 的终态通过：
 
 ```text
-ResourcePlan            immutable, read-only, resource_revision-bound
-RunningTransaction      Program-owned, at most one
-ResourceResult          Committed or Aborted stable outcome
+ResourcePlan
+  -> RunningTransaction
+  -> ResourceResult
 ```
 
-内部可以具有同步/异步 transfer stages，但不向 ResourceManager暴露逐阶段物理 receipt。
+- `ResourcePlan`：Program seal 的 immutable、move-only、revision-bound transition；
+- `RunningTransaction`：Program 当前执行中的唯一 global resource transition；
+- `ResourceResult`：Committed 或 Aborted 的完整稳定结果。
 
-已经由active reservation完整覆盖、且不需要新分配或transfer的`Finish`、`Discard`和inactive release是
-零阶段原子transition。它们在Program确认没有open transaction后同步返回稳定结果，不为“统一类型”制造空
-`ResourcePlan`。两种形态共享相同的串行化、revision、完整结果与logical adoption规则。
+Active reservation 已经覆盖且不需要新 allocation/transfer 的 finish、discard 或 inactive release 可以作为
+零阶段原子 transition 完成，但仍遵守同一串行化、revision 和完整结果规则。
 
 ### 9.2 Start
 
-同一 worker 在任何 mutation 前完成：
+Program 在第一次 mutation 前重新验证：
 
-1. 核对 plan 的 `resource_revision`；
-2. 核对 source/victim/destination capabilities 与 generations；
-3. 核对 ResourceManager 已预留的 logical adoption capacity；
-4. 用当前真实 allocator重新确认 ordered stages 的容量和几何；
-5. claim/pin source、victims 和依赖；
-6. 取得 transaction destinations 与 active completion reservations。
+1. plan 的 `resource_revision`；
+2. source、victim 和 destination capability generation；
+3. ResourceManager 已保留的 logical publication capacity；
+4. 当前 allocator 对每个 ordered stage 的容量和几何；
+5. source/victim dependencies 与 active protections。
 
-任一步 stale 或不再可行时，Program 返回无副作用 rejection；ResourceManager撤销尚未发布的 logical claims并
-fresh plan。成功 start 后 plan 被线性消费，不能换 candidate。
+Stale 或不再可行的 plan 在 start 前无物理副作用。Start 成功后，source、victims 和 destinations 被
+claim/pin，plan 被线性消费，不再更换 candidate 或 target。
 
 ### 9.3 Progress
 
-Transfer 可以同步完成，也可以跨 CUDA event：
+Transaction 可以跨同步 copy 或 CUDA event 推进。每个 replacement 遵循：
 
-- source、destination 和 release dependency始终被pin；
-- copy完成前不发布 replacement replica；
-- replacement发布后才可释放old replica；
-- active sequences只使用自己已有的 reservations；
-- 不启动第二个 topology transaction。
+```text
+destination reserved
+  -> copy complete
+  -> epoch/coverage verified
+  -> replacement published
+  -> old replica released when unreferenced
+```
 
-一个 long transaction 可以与既有active prefill/decode交错，只要两者的Program workspace/stream contract允许。
-Active execution不得使用自身reservation之外的global available capacity；需要真正把reservation归还全局的
-finish与capture等待ResourceTransaction。
+同一时间至多一个 global resource transition。既有 active execution 只有在使用自身既有 reservation、
+且不触碰 transaction mappings 时才能与 transfer 交错。
 
 ### 9.4 Commit
 
-Planned transaction commit是materialization/capture checkpoint的publication point，并把transaction带到稳定终态。它完成：
+Commit 发布：
 
-- 新 active/checkpoint binding；
-- source disposition；
-- committed victim demotion/eviction；
-- transaction-only pin/reservation cleanup；
-- 必要的 `resource_revision`推进；
-- 一个稳定 `ResourceResult`。
+- new active sequence 或 checkpoint；
+- selected source disposition；
+- 已提交的 owner/checkpoint degradation；
+- stable State/KV placements；
+- transaction pin/reservation cleanup；
+- 必要的 `resource_revision` 变化。
 
-`ResourceResult`只报告 ResourceManager需要采用的logical outcomes，例如：
-
-```text
-new SequenceHandle or checkpoint handle
-source retained or consumed
-which selected logical degradation actions committed
-session/publication replacement result
-terminal sequence released
-```
-
-它不携带供 ResourceManager重建物理占用的delta。Program可同时提供只读physical usage diagnostics，但该值不参与
-ResourceManager correctness。
-
-ResourceManager在Program commit前已预留所有adoption storage；commit后的logical adoption必须allocation-free且
-noexcept。若Program outcome与预留logical alternatives不一致，进入Engine-wide failure，不能重新规划。
+`ResourceResult` 包含 ResourceManager 采用逻辑终态所需的绝对结果，不包含供上层重建物理 occupancy 的
+delta。ResourceManager 在 start 前已预留 adoption storage，因此 commit 后的 adoption 必须 allocation-free
+且不能进行新的容量判断。
 
 ### 9.5 Abort
 
-只有target active/checkpoint publication前可以request-local abort。安全完成的victim demotion/deletion stage
-可以已经物理生效；Abort保证：
+Publication 前的 cancellation 或执行失败可以得到 request-local abort，只要 Program 仍能形成稳定物理状态。
+Abort 保证：
 
-- selected source仍然有效；
-- 不存在半发布active/checkpoint；
-- transaction destinations、unused reservations和pins被释放；
-- 返回一个稳定logical outcome。
+- selected source 仍有效；
+- target 没有半 Active 或半 published checkpoint；
+- unused destinations、reservations 和 pins 已释放；
+- 已安全完成的 victim demotion/deletion 被明确记录在 `ResourceResult` 中。
 
-已经完成并用于capacity preparation的合法 victim demotion/eviction不要求回滚；在transaction期间相应catalog
-entries保持claimed/hidden，最终由一次 `ResourceResult`明确哪些变化已提交。由于没有ResourceManager物理镜像，
-不存在逐progress同步或回放physical delta。
+已经发布 replacement 后完成的合法 pressure degradation 不需要逆向复制回原 placement。ResourceManager
+采用 abort result 中的实际终态，而不是回放中间 receipts。
 
-CUDA状态不可信、Program内部引用/allocator invariant失败或physical publication后无法adopt时进入Engine-wide
-cleanup/failure，不能伪装成cache miss。
+若 Program 已无法形成可解释的稳定状态，则进入 Engine-wide failure。
 
 ---
 
-## 10. Cancellation、capture 与 terminal
+## 10. Retention、session 与 publication
 
-### 10.1 Waiting 与 pre-start cancellation
+### 10.1 Retention policy
 
-Waiting request尚未取得physical resources。Start前观察到cancel时，撤销logical destination slot/claims，不调用
-Program，不改变resource revision。
+Private retention class 通过 owner prior 影响 portfolio value，不提供固定 eviction 顺序。Shared owner 的价值
+来自真实 demand 与尚未到期的 explicit credit。Planner 可以组合：
 
-### 10.2 Materializing cancellation
+- 删除冗余 replica；
+- 将 Device replica 降为 Host-only；
+- 删除不再保留的 checkpoint 或 suffix coverage；
+- evict 完整 inactive owner。
 
-Open Resume transaction在publication前cancel时执行Abort。若Program已经commit，则先采用active publication，
-下一boundary再把它转为terminal discard；不能把已commit结果倒退成pre-start cancellation。
+如果一个 placement change 会删除 checkpoint 的最后一份完整 State 或 required KV coverage，同一个
+target 必须先建立 replacement，或同时删除该 checkpoint。
 
-### 10.3 Active terminal
+Placement 只在 admission、capture、finish 或显式 inactive release 的 resource boundary 改变。普通 decode
+不运行周期性 promotion/demotion。
 
-Active row在model/output commit确定结束后进入`TerminalPending`：
+### 10.2 Session ordering
 
-- 退出后续GPU membership；
-- 继续持有 `SequenceHandle`及其全部reservation；
-- 冻结`Finish`或`Discard`决定；
-- 等待当前open transaction结束。
+SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Program 不读取 SessionKey。
 
-Worker优先结算最早的terminal pending row，然后才启动新的capture/admission。Finish可以保留新endpoint，也可以
-release；若保留方案在一次fresh plan中不可行，必须选择release，不能永久阻塞lane。Discard不发布checkpoint。
-Open transaction期间的active cancellation同样只记录意图；已发出的GPU unit可以提交到稳定active或
-`TerminalPending`，但不能在transaction中途释放reservation。
+每个可更新 SessionIndex 的请求取得单调 `publication_order`：
 
-### 10.4 Capture
+- 新结果只有 order 更大时才能替换当前 binding；
+- 较旧请求晚完成时成为 anonymous cache 或按 policy 释放；
+- matching private source 可以在合法时 consume-to-active；
+- shared source 始终保持 immutable；
+- abort 只能恢复自己仍持有 exact claim 的 former binding。
 
-Capture只从完整committed state发布。需要稳定frontier时，row在capture transaction结束前暂停继续推进。
+Capability generation 判断 handle 是否仍有效，publication order 判断哪个完成结果更新 session；两者职责不同。
 
-Optional capture无法获得catalog/State/KV容量或另一个resource transaction已经open时直接skip。一个execution
-result同时出现capture offer和terminal/cancel时，terminal优先，offer直接丢弃；不存在随后对stale frontier重试的
-capture。
+### 10.3 Logical publication capacity
 
-### 10.5 Fork 结算
+ResourceManager 必须在 Program mutation 前预留 active/private/shared destination slot。Program commit 后的
+logical adoption 不再扩容或搜索 slot。
 
-State Fork 的source pin不是独立cache任务。首个真正写入destination的execution commit原子关闭Fork并解除pin；
-这是已取得active entitlement内部的状态提交，不建立第三种resource transaction。任何active Fork尚未关闭时，
-Program拒绝启动新的global resource transaction。因而不存在一边执行Fork settlement、一边按旧pin拓扑执行
-materialization/capture plan的窗口，也不需要后台或pending cleanup协议。
-
----
-
-## 11. Session 与 publication order
-
-SessionKey只属于ResourceManager。Program不读取SessionKey，也不以它证明prefix identity。
-
-每个允许更新SessionIndex的request在RequestRecord建立时取得单调`publication_order`。Session entry只需要：
-
-```text
-current binding handle/revision or none
-last adopted publication_order
-optional exact request that currently claimed the binding
-```
-
-规则为：
-
-- 命名source只有incoming持有相同SessionKey且允许更新时才可destructive Move；否则Retain/Fork；
-- 匿名content-matched private source可以Move；
-- finish结果只有在自己的order新于当前last adopted order时才替换binding；
-- 较旧request晚完成时，其checkpoint转成anonymous cache或按policy释放，不能复活旧binding；
-- Move abort只恢复自己exact claim的former binding；若它已不再是current claim，则former object按anonymous policy处理；
-- `update_session_index=false`不创建writer，也不改变现有binding。
-
-一份publication order加capability generation足以处理乱序完成与slot reuse；不需要在Program与ResourceManager之间
-复制SessionKey或建立多套writer/terminal epochs。
+Private Move 可以复用 source descriptor；root 或 Fork 需要 destination。Optional capture 没有 slot 时跳过；
+terminal Finish 没有合法 publication capacity 时采用 Discard。
 
 ---
 
-## 12. Protected head 与 backfill
+## 11. 配置语义与有界性
 
-当FIFO head的isolated root plan可行、但当前被active reservations阻塞时，Scheduler建立protected-head状态：
+`ContextCacheOptions` 在 Engine 构造时解析为固定容量：
 
-1. 按projected remaining service work和submission order排列当前active lanes；
-2. 对 successive donor prefixes \(F\)，让Program联合模拟这些active protections解除、其terminal cache结果可被pressure；
-3. 找到第一个能为head构造root/full-release plan的 \(F\)；
-4. 保存head request generation、donor generations和当前resource revision。
-
-Later request只有在Program对其完整post-state证明以下条件时才可backfill：
-
-> Borrower持续持有其完整active reservation时，在同一donor set \(F\)结束后，head仍能取得root/full-release plan。
-
-不使用“borrower预计先完成”的temporal credit。任何ResourceTransaction稳定终态改变resource revision后，在启动下一
-backfill前重新验证protected-head状态。普通active frontier推进不使它失效。
-
-该检查由Program对完整hypothetical state执行；Scheduler和ResourceManager不保存per-lane physical charge或
-active unlock bucket表。
-
----
-
-## 13. Retention 与 pressure
-
-RetentionClass只有：
-
-```text
-SharedStable
-LiveSession
-RecentPrivate
-Disposable
-```
-
-Active、selected source、transaction victim dependency和pending terminal是临时protected状态，不是第五种
-retention class。
-
-典型pressure顺序为：
-
-### Device State
-
-1. 释放已有Host replica的低价值Device duplicate；
-2. 将cold checkpoint state下沉Host；
-3. 删除被替换或Disposable checkpoint；
-4. 删除低价值anchor/rewrite；
-5. optional capture放弃。
-
-### Device KV
-
-1. 释放zero-reference pages；
-2. 释放已有Host replica的低价值Device duplicate；
-3. 下沉private endpoint在rewrite之后的suffix；
-4. 下沉cold private pages；
-5. 最后处理高fan-out shared pages。
-
-### Host State/KV
-
-1. 删除zero-reference或Device已有完整替代的duplicate；
-2. 删除被替换/Disposable objects；
-3. 删除低价值anchor/private suffix；
-4. 删除接近surviving fallback的checkpoint；
-5. 最后删除LiveSession或SharedStable。
-
-若释放replica会使checkpoint失去最后一份完整State或required KV coverage，同一logical action必须删除该checkpoint，
-或先发布满足要求的replacement。
-
-不存在周期性background promotion/demotion scan。Placement改变只来自具体Resume/Capture/Finish或admission
-pressure plan。
-
----
-
-## 14. 关键边界
-
-| 情况 | 唯一处理规则 |
+| 配置轴 | 架构含义 |
 |---|---|
-| 删除一个shared alias | 只删reference；不是last reference则occupancy和reclaim均不变 |
-| 多个victims共同形成last reference | 在联合post-state中只释放一次 |
-| Move还是Fork | 应用完整source/victim actions后按surviving references决定 |
-| Device copy-before-release | destination、copy、publication、old release逐stage检查peak |
-| Host free bytes足够但碎片化 | 真实allocator exact preflight决定可行性 |
-| Active跨页增长 | 从自身reservation映射，不改变global available capacity |
-| Active truncate/rollback | page回到同一sequence reservation，不直接归还global pool |
-| Active仍有未结算State Fork | 先完成首个state-writing commit；Program拒绝启动global resource transaction |
-| Long transaction期间row完成 | 进入TerminalPending并保留SequenceHandle |
-| Long transaction期间active被cancel | 冻结cancel intent；不得从commit/abort路径提前释放reservation |
-| Resume publication前cancel | Abort并保留source；已完成victim changes由终态结果采用 |
-| Program已commit后cancel | 先采用commit，再走terminal Discard |
-| Capture与terminal同时出现 | terminal获胜，capture offer丢弃 |
-| Active到达capture frontier但另一个transaction仍open | 消费并skip optional capture；不启动第二个transaction |
-| Finish无法保留checkpoint | release sequence，lane必须有限步回到Free |
-| 同Session请求乱序finish | 只允许较新的publication_order更新binding |
-| 只有KV没有State | 不是hit，回退到更早checkpoint或root |
-| Cache占满导致admission失败 | 检查root+release-all-inactive；不把cache policy错误解释成永久不可行 |
+| `device_state_slots` | active guarantee 之外可保留的 Device checkpoint StateImages |
+| `host_state_slots` | 完整 Host StateImages |
+| `host_kv_capacity_bytes` | typed packed Host KV arena 总容量 |
+| `max_private_continuations` | private owner/catalog 容量 |
+| `max_shared_prefixes` | shared immutable owner/catalog 容量 |
+| `max_long_anchors_per_continuation` | 每条 private history 的 retained long checkpoints 上限 |
+
+所有 stores、catalogs、planner scratch 和 transaction adoption storage 都按解析后的上限在启动时建立。
+每请求 external markers 固定最多四个、Frontend candidates 固定最多三个、demand window 固定为 32；这些
+是产品语义与算法有界性，不是可调容量轴。
+配置必须满足：
+
+- private continuation capacity 至少覆盖全部 active requests；
+- Device State 总容量为 `max_concurrency + device_state_slots`；
+- Host State 与 Host KV 独立计费；
+- logical counts、address-space counts 和 storage sizes 可表示；
+- Program 可以兑现最小 active capacity 与 selected backend requirements。
+
+Context cache disabled 时采用 root-only 语义：不读取或发布 inactive continuation，Device/Host checkpoint
+容量为零，但 active execution 所需的 State/KV reservation 保持不变。
+
+公开默认值和启动命令由 `EngineOptions`、[CLI](../cli.md)与 [Serving](../serving.md)维护，不在本架构
+文档中复制。
 
 ---
 
-## 15. 概念接口
+## 12. 核心不变量
 
-以下接口描述模块边界，不规定具体C++类型名：
-
-```cpp
-RequestBasePlan describe_request(...);
-CandidateMatch inspect_checkpoint(...);
-ResourceAssessment assess(...);
-ResourcePlan seal(...);
-
-StartResult start(ResourcePlan&&, PreparedLogicalAdoption&&);
-ProgressResult progress(RunningTransaction&);
-ResourceResult commit(RunningTransaction&&);
-ResourceResult abort(RunningTransaction&&);
-
-TerminalResult finish_or_discard(SequenceHandle&&);
-```
-
-`inspect_checkpoint`、`assess`和`seal`无副作用。`ResourcePlan`是不透明的Program-owned value，
-不得向ResourceManager暴露raw allocation id、page id、slot id或allocator内部结构。
-
-`start`先验证plan引用的resource revision、source和victim assumptions；失效必须在任何物理修改前返回。成功后，
-Program独占`RunningTransaction`，ResourceManager只保留逻辑lane状态和预分配的adoption storage。
-
-`progress`推进有界物理工作，不生成供ResourceManager重放的physical receipt。`commit`或`abort`只返回一个稳定的
-`ResourceResult`，其中包含ResourceManager必须采用的逻辑终态：
-
-- source/target checkpoint的保留或发布；
-- 已提交victim degradation或deletion；
-- lane下一状态；
-- terminal/capture处理结果；
-- 诊断所需的plan与成本摘要。
-
-ResourceManager对终态的采用必须noexcept、无分配、无容量判断；相应catalog slot、victim result storage和lane transition
-storage在`start`前已经准备完毕。
+1. Scheduler 先选择 request；资源层不能以 cache value 改变请求顺序。
+2. ResourceManager 是 logical cache policy 的唯一 authority，Program 是 physical state 的唯一 authority。
+3. Physical occupancy 按 unique allocations 与 concrete reservations 计数，不按 logical references 重复计数。
+4. Reclaim、Move/Fork 和 COW 必须从完整联合 post-state 推导。
+5. 每个有序 transition stage 都必须满足容量与 allocator geometry。
+6. Prefix hit 必须具有 exact identity、完整 StateImage 和全部 required typed KV coverage。
+7. Published checkpoint immutable；每条 active continuation 至多一个 mutable writer。
+8. Active completion reservation 在 terminal resource result 采用前不可被借用或回收。
+9. 同一时刻至多一个 global resource transition，且 sealed plan 与 `resource_revision` 绑定。
+10. Start 前 stale rejection 无物理副作用；start 后不能更换 candidate 或 target。
+11. Program commit/abort 都返回完整稳定终态；ResourceManager adoption 已预分配且不能失败。
+12. Root 加释放全部 unprotected inactive cache 是 bounded search 之外的 correctness fallback。
+13. Planner 成本模型只排序可行 targets，不参与物理正确性。
+14. Session binding 只接受更大的 publication order。
+15. Retention 或 capture 失败必须退化为 skip/release，使 active lane 有有限终态。
+16. Shared publication 必须严格优于 private-only baseline；单个 demand 对嵌套 prefixes 只能贡献一次最大
+    saving。
+17. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
+    证明完整物理终态。
 
 ---
 
-## 16. 正确性不变量
+## 13. 实现位置
 
-以下不变量同时约束实现、测试和后续文档：
+| 职责 | 主要位置 |
+|---|---|
+| logical catalog、claims、session policy | `src/runtime/engine/resource_manager.h` |
+| cross-candidate bounded planner | `src/runtime/engine/materialization_planner.h` |
+| shared capture bounded planner | `src/runtime/engine/shared_capture_planner.h` |
+| shared/private portfolio value | `src/runtime/engine/context_portfolio_value.h` |
+| machine cost model | `src/runtime/engine/context_cost.*` |
+| common resource summaries | `src/runtime/contract/types.h` |
+| target physical projection 与 transaction | `src/targets/qwen3_6/impl/runtime/program*.h` |
+| State stores | `src/targets/qwen3_6/impl/runtime/state_image_store.h` |
+| logical KV/address spaces | `src/targets/qwen3_6/impl/runtime/logical_kv_store.h` |
+| Host KV extents | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h` |
+| public capacity options | `include/ninfer/types.h` |
 
-1. Scheduler先选择请求；资源层只能选择该请求的source、placement与pressure actions。
-2. Program中的State/KV stores、allocators、references和reservations是唯一物理权威。
-3. ResourceManager不维护第二份physical ledger、snapshot mirror或per-lane charge。
-4. Lane ownership、logical cache identity与physical placement彼此独立。
-5. Occupancy按unique physical allocations和concrete reservations计数，不按owner/reference重复计数。
-6. Reclaim对完整victim set的联合post-state计算，不相加独立owner delta。
-7. Plan只有在每个有序stage的peak均满足容量和allocator约束时才可sealed。
-8. Active sequence的未来增长reservation不可被其他请求撤销或借用。
-9. Active在自身mapped/reserved之间转换不改变global available capacity，也不推进resource revision。
-10. 每个active continuation恰有一个mutable state writer。
-11. Published checkpoint State和受保护KV内容不可被active执行原地修改。
-12. Shared full KV page只读；tail写入在共享前必须COW。
-13. Checkpoint恢复要求完整State和所有必需typed KV coverage。
-14. KV、session/hash命中或位置标记本身均不能构成有效checkpoint hit。
-15. 只有已提交State transition对应的tokens才能发布为canonical continuation。
-16. 被拒绝的speculative bytes不能扩展canonical KV coverage。
-17. Resume source在transaction commit或abort之前保持有效。
-18. 任何会删除最后可恢复副本的替换都必须先完成replacement publication。
-19. 一个materialization只属于一个Program topology transaction。
-20. Transaction进行时，active execution只能使用既有active reservations，不得依赖transaction临时资源。
-21. 未结算State Fork与global resource transaction不能同时存在。
-22. Pre-start stale rejection无物理副作用；start成功后不得静默改换candidate。
-23. Program commit后，ResourceManager adoption已经预分配且不能失败。
-24. Abort不会留下半active target，但可保留已经安全提交的victim degradation；这些变化必须出现在终态结果中。
-25. TerminalPending持续持有`SequenceHandle`及其完整reservation。
-26. Finish retention失败时必须释放sequence，并让lane有限步回到Free。
-27. Session binding只接受更大的`publication_order`，capability generation只验证持有者资格。
-28. Root加“释放全部inactive cache”的plan是admission完整性回退。
-29. Engine-wide failure先abort open resource transaction，再释放active lanes；异常catch不得颠倒顺序。
-30. 不变量破坏是内部错误，不得降级成普通cache miss或silent retry。
-
----
-
-## 17. 性能原则与成本模型
-
-普通decode round满足：
-
-```text
-state_src == state_dst
-no catalog scan
-no pressure scan
-no physical snapshot synchronization
-no ResourceManager accounting update
-```
-
-因此热路径只执行模型计算、已分配KV写入和必要的token publication。State copy只发生在Move/Freeze/Fork或显式snapshot；
-KV transfer只搬运选定checkpoint缺失的pages。
-
-Resource planning只发生在admission、resume、capture和finish边界。Program可为这些边界维护O(1) counters
-和可重建索引，但它们必须由真实stores同步更新，不能成为第二权威。所有bounded storage按启动配置一次分配。
-
-现有统一估算形式保留：
-
-```text
-transfer =
-    max(batch_ns + copies * operation_ns,
-        bytes * ns_per_byte)
-
-prefill =
-    chunks * chunk_ns
-  + suffix_tokens * token_ns
-  + attention_pairs * attention_pair_ns
-  + vision_work
-```
-
-其中：
-
-\[
-attention\_pairs = B S + \frac{S(S+1)}{2}
-\]
-
-其中\(B\)是复用prefix tokens，\(S\)是待prefill suffix tokens。
-
-模型参数是启动时不可变的实现配置。编译内置default profile是权威默认值；可选preset只有在目标、量化、硬件和相关运行
-配置完全匹配时才能替换它。成本模型影响choice排序，不改变可行性判定。
-
----
-
-## 18. 配置与有界性
-
-公开配置继续使用`ContextCacheOptions`中的现有容量维度：
-
-| 配置 | 默认值 |
-|---|---:|
-| Extra Device checkpoint State slots \(H\) | \(C\) |
-| Host State slots \(R\) | 8 |
-| Host KV budget | 8 GiB |
-| Private continuations \(P\) | \(2C\) |
-| Shared prefixes \(S\) | \(C\) |
-| Long anchors per private continuation \(L\) | 2 |
-| Cache markers per request \(M\) | 4 |
-
-这些是默认值，不是新的上限。显式配置只受已有产品并发上限 \(1 \le C \le 8\)、整数/地址可表示性、启动时真实内存分配
-和输入复杂度约束。实现不得把默认关系误写成`P <= 2C`、`S <= C`、`L <= 2`或`M <= 4`。
-
-Device State总量是\(C+H\)：前\(C\)个是active guarantee，后\(H\)个是全局Device-checkpoint capacity，
-不是每lane固定配对。Host State按image计费，Host KV按actual extent bytes计费。
-
-缓存关闭时解析为root-only：\(H=R=0\)、Host KV bytes为0、\(S=L=0\)、\(P=C\)；成功请求不发布
-continuation，\(M\)仍限制输入复杂度。Active reservation和正确执行所需资源仍然存在。
-
-Program按真实配置构造所有固定上限storage。若配置无法安全表示或启动分配失败，构造直接失败；运行时不得偷偷缩小容量、
-切换另一套调度算法或依赖动态扩容。
-
----
-
-## 19. 可观测性
-
-诊断数据从Program的物理权威和ResourceManager的逻辑权威分别导出；不得为了观测建立第二份可写physical ledger。
-边界事件至少能够说明：
-
-- 被选request、candidate、ready/degraded状态；
-- sealed plan、各stage peak、pressure actions与成本摘要；
-- State操作、KV transfer/COW和实际字节数；
-- transaction start/commit/abort及resource revision变化；
-- victim degradation、checkpoint publication/deletion；
-- TerminalPending、capture、finish和Fork结算结果；
-- 当前Program物理占用、concrete reservations与allocator失败原因；
-- cache hit层级和避免的prefill工作量。
-
-`RuntimeStats::terminal_pending_requests`在worker boundary计数已退出GPU membership、但仍持有完成reservation等待
-当前resource transaction收口的rows；它只用于诊断，不参与调度。
-
-普通decode不刷新结构性资源gauge。结构性统计只在resource revision或明确的统计采样边界读取；日志不得改变调度或分配时序。
-
----
-
-## 20. 结论
-
-整个架构归结为五条：
-
-1. ResourceManager决定“什么值得保留、尝试哪个恢复方案”，Program决定“物理上能否做到以及如何原子完成”。
-2. 容量只由unique allocations、concrete reservations和逐stage peak决定。
-3. 共享资源的释放只由完整post-state中的last-reference事实决定。
-4. 每次改变global available capacity、inactive placement或active/checkpoint ownership的操作都由Program串行；
-   需要分配、pressure或transfer的操作走`ResourcePlan -> RunningTransaction -> ResourceResult`，已经由active
-   reservation覆盖的terminal/release走零阶段原子transition。
-5. Active completion、terminal release与session publication都有不可被cache policy破坏的确定性终点。
-
-实现不需要owner vector结算、ResourceManager物理镜像、per-call execution receipt、permit网络、allocator digest或固定arena phase。
-这些结构既不增加上述语义，也不能替代Program对真实post-state和逐stage峰值的验证。
+路径用于定位当前实现，不改变本文定义的所有权边界。

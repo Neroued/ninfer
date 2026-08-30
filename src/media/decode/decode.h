@@ -13,6 +13,7 @@ namespace ninfer::media::decode {
 
 enum class ErrorKind {
     BudgetExceeded,
+    InvalidInput,
 };
 
 class Error final : public std::runtime_error {

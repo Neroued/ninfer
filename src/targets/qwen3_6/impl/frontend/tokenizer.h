@@ -18,6 +18,11 @@ struct EncodeOptions {
     std::size_t max_tokens  = std::numeric_limits<std::size_t>::max();
 };
 
+struct ByteSpan {
+    std::size_t begin = 0;
+    std::size_t end   = 0;
+};
+
 struct DecodeOptions {
     bool skip_special_tokens = false;
     std::vector<int> stop_token_ids;
@@ -68,7 +73,8 @@ public:
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
     BoundaryEncodedText encode_with_boundaries(std::string_view text,
                                                std::span<const std::size_t> byte_boundaries,
-                                               EncodeOptions options = {}) const;
+                                               EncodeOptions options                   = {},
+                                               std::span<const ByteSpan> literal_spans = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     [[nodiscard]] DecodedTokenView decoded_token(int id) const;
     [[nodiscard]] std::string_view decode_token_bytes(int id,

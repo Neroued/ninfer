@@ -180,9 +180,24 @@ private:
     friend class KVAddressSpaceStore;
 };
 
-// Transaction-exclusive conversion of one active writer address into an immutable checkpoint
-// while installing a new active writer address. Full pages are referenced in place; only a
-// non-aligned committed tail receives a new physical page.
+struct KVActiveSnapshotShape {
+    std::uint32_t full_pages           = 0;
+    std::uint32_t immutable_full_pages = 0;
+    std::uint32_t unique_full_pages    = 0;
+    std::uint32_t tail_columns         = 0;
+
+    [[nodiscard]] std::uint32_t copied_pages() const noexcept {
+        return tail_columns == 0 ? 0U : 1U;
+    }
+
+    [[nodiscard]] friend bool operator==(KVActiveSnapshotShape,
+                                         KVActiveSnapshotShape) noexcept = default;
+};
+
+// Transaction-exclusive conversion of one active address into an immutable checkpoint while
+// installing a new active writer address. An active address may begin with aliased immutable full
+// pages and end with unique mutable pages. Full pages are referenced in place; only a non-aligned
+// mutable tail receives a new physical page.
 class KVActiveSnapshotReservation {
 public:
     KVActiveSnapshotReservation() noexcept = default;
@@ -190,8 +205,7 @@ public:
 
     KVActiveSnapshotReservation(KVActiveSnapshotReservation&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), source_(other.source_),
-          destination_(other.destination_), frontier_(other.frontier_),
-          full_pages_(other.full_pages_), tail_columns_(other.tail_columns_),
+          destination_(other.destination_), frontier_(other.frontier_), shape_(other.shape_),
           entitlement_(other.entitlement_), tail_reservation_(std::move(other.tail_reservation_)),
           tail_destination_(other.tail_destination_) {
         other.tail_destination_.reset();
@@ -201,26 +215,24 @@ public:
     KVActiveSnapshotReservation(const KVActiveSnapshotReservation&)            = delete;
     KVActiveSnapshotReservation& operator=(const KVActiveSnapshotReservation&) = delete;
 
-    [[nodiscard]] bool needs_tail_copy() const noexcept { return tail_columns_ != 0; }
+    [[nodiscard]] bool needs_tail_copy() const noexcept { return shape_.copied_pages() != 0; }
 
 private:
     KVActiveSnapshotReservation(KVAddressSpaceStore& owner, KVAddressSpaceHandle source,
                                 KVAddressSpaceHandle destination, std::uint32_t frontier,
-                                std::uint32_t full_pages, std::uint32_t tail_columns,
-                                std::uint32_t entitlement,
+                                KVActiveSnapshotShape shape, std::uint32_t entitlement,
                                 DeviceKVPageReservation&& tail_reservation,
                                 std::optional<LogicalKVPageHandle> tail_destination) noexcept
         : owner_(&owner), source_(source), destination_(destination), frontier_(frontier),
-          full_pages_(full_pages), tail_columns_(tail_columns), entitlement_(entitlement),
-          tail_reservation_(std::move(tail_reservation)), tail_destination_(tail_destination) {}
+          shape_(shape), entitlement_(entitlement), tail_reservation_(std::move(tail_reservation)),
+          tail_destination_(tail_destination) {}
 
     KVAddressSpaceStore* owner_ = nullptr;
     KVAddressSpaceHandle source_;
     KVAddressSpaceHandle destination_;
-    std::uint32_t frontier_     = 0;
-    std::uint32_t full_pages_   = 0;
-    std::uint32_t tail_columns_ = 0;
-    std::uint32_t entitlement_  = 0;
+    std::uint32_t frontier_ = 0;
+    KVActiveSnapshotShape shape_;
+    std::uint32_t entitlement_ = 0;
     DeviceKVPageReservation tail_reservation_;
     std::optional<LogicalKVPageHandle> tail_destination_;
 
@@ -1193,6 +1205,58 @@ public:
         fork.owner_ = nullptr;
     }
 
+    [[nodiscard]] KVActiveSnapshotShape active_snapshot_shape(KVAddressSpaceHandle source_handle,
+                                                              std::uint32_t frontier) const {
+        const Address& source = require_active(source_handle);
+        if (frontier == 0 || frontier != source.committed_frontier) {
+            throw std::logic_error("active KV snapshot frontier is invalid");
+        }
+        const std::uint32_t required_pages    = pages_for_tokens(frontier);
+        const std::uint32_t entitlement_pages = entitlement(source);
+        if (source.page_count < required_pages || entitlement_pages < required_pages) {
+            throw std::logic_error("active KV snapshot frontier is not fully materialized");
+        }
+
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        KVActiveSnapshotShape shape{
+            .full_pages   = frontier / page_size,
+            .tail_columns = frontier % page_size,
+        };
+        bool mutable_full_seen = false;
+        for (std::uint32_t page = 0; page < shape.full_pages; ++page) {
+            const LogicalKVPageHandle logical = membership(source, page);
+            const std::uint32_t references    = pages_->address_references(logical);
+            const std::uint8_t writers        = pages_->writer_references(logical);
+            if (!pages_->device_resident(logical) || references == 0 ||
+                pages_->committed_columns(logical) < page_size ||
+                !pages_->can_retain_reference(logical, false)) {
+                throw std::logic_error("active KV snapshot full page is not stable");
+            }
+            if (writers == 0) {
+                if (mutable_full_seen || !pages_->can_pin_source(logical)) {
+                    throw std::logic_error("active KV snapshot page ownership is not ordered");
+                }
+                ++shape.immutable_full_pages;
+            } else if (writers == 1 && references == 1 && pages_->can_pin_active_source(logical)) {
+                mutable_full_seen = true;
+            } else {
+                throw std::logic_error("active KV snapshot full page ownership is invalid");
+            }
+            if (references == 1) { ++shape.unique_full_pages; }
+        }
+
+        if (shape.tail_columns != 0) {
+            const LogicalKVPageHandle tail = membership(source, shape.full_pages);
+            if (!pages_->device_resident(tail) || pages_->writer_references(tail) != 1 ||
+                pages_->address_references(tail) != 1 ||
+                pages_->committed_columns(tail) < shape.tail_columns ||
+                !pages_->can_pin_active_source(tail)) {
+                throw std::logic_error("active KV snapshot tail is not a unique writer");
+            }
+        }
+        return shape;
+    }
+
     [[nodiscard]] KVActiveSnapshotReservation
     prepare_active_snapshot(KVAddressSpaceHandle source_handle,
                             KVAddressSpaceHandle destination_handle, std::uint32_t frontier) {
@@ -1204,33 +1268,22 @@ public:
             frontier != source.committed_frontier) {
             throw std::logic_error("active KV snapshot endpoints are invalid");
         }
+        const KVActiveSnapshotShape shape     = active_snapshot_shape(source_handle, frontier);
         const std::uint32_t required_pages    = pages_for_tokens(frontier);
         const std::uint32_t entitlement_pages = entitlement(source);
-        if (source.page_count != required_pages || entitlement_pages < required_pages) {
-            throw std::logic_error("active KV snapshot frontier is not fully materialized");
-        }
-        const std::uint32_t page_size    = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t full_pages   = frontier / page_size;
-        const std::uint32_t tail_columns = frontier % page_size;
-        for (std::uint32_t page = 0; page < required_pages; ++page) {
-            const LogicalKVPageHandle logical = membership(source, page);
-            const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
-            if (!pages_->device_resident(logical) || pages_->writer_references(logical) != 1 ||
-                pages_->address_references(logical) != 1 ||
-                pages_->committed_columns(logical) < required ||
-                !pages_->can_pin_active_source(logical) ||
-                (page < full_pages && !pages_->can_retain_reference(logical, false))) {
-                throw std::logic_error("active KV snapshot source is not stable");
-            }
+        if (source.page_count != required_pages) {
+            throw std::logic_error("active KV snapshot source has untrimmed suffix pages");
         }
 
         DeviceKVPageReservation tail_reservation = pages_->physical_pool().make_empty_reservation();
-        if (tail_columns != 0) { pages_->physical_pool().resize_reservation(tail_reservation, 1); }
+        if (shape.copied_pages() != 0) {
+            pages_->physical_pool().resize_reservation(tail_reservation, shape.copied_pages());
+        }
         std::optional<LogicalKVPageHandle> tail_destination;
         try {
-            if (tail_columns != 0) {
+            if (shape.tail_columns != 0) {
                 tail_destination =
-                    pages_->materialize_transfer_destination(tail_reservation, tail_columns);
+                    pages_->materialize_transfer_destination(tail_reservation, shape.tail_columns);
             }
             for (std::uint32_t page = 0; page < required_pages; ++page) {
                 pages_->pin_source(membership(source, page));
@@ -1242,18 +1295,18 @@ public:
             throw;
         }
         return KVActiveSnapshotReservation(*this, source_handle, destination_handle, frontier,
-                                           full_pages, tail_columns, entitlement_pages,
-                                           std::move(tail_reservation), tail_destination);
+                                           shape, entitlement_pages, std::move(tail_reservation),
+                                           tail_destination);
     }
 
     [[nodiscard]] DeviceKVPageHandle
     active_snapshot_tail_source(const KVActiveSnapshotReservation& snapshot) const {
         require_active_snapshot(snapshot);
-        if (snapshot.tail_columns_ == 0) {
+        if (snapshot.shape_.tail_columns == 0) {
             throw std::logic_error("page-aligned active KV snapshot has no tail source");
         }
         const Address& source = require(snapshot.source_);
-        return pages_->physical(membership(source, snapshot.full_pages_));
+        return pages_->physical(membership(source, snapshot.shape_.full_pages));
     }
 
     [[nodiscard]] DeviceKVPageHandle
@@ -1268,11 +1321,14 @@ public:
     void commit_active_snapshot(KVActiveSnapshotReservation&& snapshot,
                                 cudaStream_t stream = nullptr) {
         require_active_snapshot(snapshot);
-        Address& source                     = require_active(snapshot.source_);
-        Address& destination                = require(snapshot.destination_);
+        Address& source      = require_active(snapshot.source_);
+        Address& destination = require(snapshot.destination_);
+        const KVActiveSnapshotShape shape =
+            active_snapshot_shape(snapshot.source_, snapshot.frontier_);
         const std::uint32_t required_pages  = pages_for_tokens(snapshot.frontier_);
         const std::uint32_t expected_growth = snapshot.entitlement_ - required_pages;
-        if (!source.row || !source.reservation.valid() || source.page_count != required_pages ||
+        if (shape != snapshot.shape_ || !source.row || !source.reservation.valid() ||
+            source.page_count != required_pages ||
             source.committed_frontier != snapshot.frontier_ ||
             source.reservation.pages() != expected_growth || destination.active ||
             destination.row || destination.reservation.valid() || destination.page_count != 0 ||
@@ -1281,20 +1337,17 @@ public:
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
-            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical) ||
-                pages_->writer_references(logical) != 1 ||
-                pages_->address_references(logical) != 1 ||
-                (page < snapshot.full_pages_ && !pages_->can_retain_reference(logical, false))) {
+            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical)) {
                 throw std::logic_error("active KV snapshot source changed before publication");
             }
         }
-        if (snapshot.tail_columns_ != 0 &&
+        if (snapshot.shape_.tail_columns != 0 &&
             (!snapshot.tail_destination_ || !pages_->valid(*snapshot.tail_destination_))) {
             throw std::logic_error("active KV snapshot tail destination is stale");
         }
 
         publish_scratch_.clear();
-        for (std::uint32_t page = 0; page < snapshot.full_pages_; ++page) {
+        for (std::uint32_t page = 0; page < snapshot.shape_.full_pages; ++page) {
             publish_scratch_.push_back(pages_->physical(membership(source, page)));
         }
         if (snapshot.tail_destination_) {
@@ -1302,20 +1355,19 @@ public:
         }
         tables_->publish(source.row->handle(), 0, publish_scratch_, stream);
 
-        for (std::uint32_t page = 0; page < required_pages; ++page) {
-            pages_->set_writer(membership(source, page), false);
-        }
-        for (std::uint32_t page = 0; page < snapshot.full_pages_; ++page) {
+        for (std::uint32_t page = 0; page < snapshot.shape_.full_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
+            if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
             pages_->retain_reference(logical, false);
             pages_->protect_coverage(logical, static_cast<std::uint32_t>(kPagedKVPageSize));
             membership(destination, page) = logical;
         }
         if (snapshot.tail_destination_) {
-            pages_->protect_coverage(membership(source, snapshot.full_pages_),
-                                     snapshot.tail_columns_);
+            const LogicalKVPageHandle tail = membership(source, snapshot.shape_.full_pages);
+            pages_->set_writer(tail, false);
+            pages_->protect_coverage(tail, snapshot.shape_.tail_columns);
             pages_->publish_transfer_destination(*snapshot.tail_destination_, true);
-            membership(destination, snapshot.full_pages_) = *snapshot.tail_destination_;
+            membership(destination, snapshot.shape_.full_pages) = *snapshot.tail_destination_;
             snapshot.tail_destination_.reset();
         }
         destination.page_count         = required_pages;
@@ -1324,9 +1376,9 @@ public:
         destination.row                = std::move(source.row);
         destination.active             = true;
 
-        if (snapshot.tail_columns_ != 0) {
-            pages_->release_active_reference(membership(source, snapshot.full_pages_));
-            pages_->retain_active_reference(membership(destination, snapshot.full_pages_));
+        if (snapshot.shape_.tail_columns != 0) {
+            pages_->release_active_reference(membership(source, snapshot.shape_.full_pages));
+            pages_->retain_active_reference(membership(destination, snapshot.shape_.full_pages));
         }
 
         source.row.reset();
@@ -1716,6 +1768,14 @@ private:
 
     [[nodiscard]] Address& require_active(KVAddressSpaceHandle handle) {
         Address& address = require(handle);
+        if (!address.active || !address.row || !address.reservation.valid()) {
+            throw std::logic_error("KV address space is not active");
+        }
+        return address;
+    }
+
+    [[nodiscard]] const Address& require_active(KVAddressSpaceHandle handle) const {
+        const Address& address = require(handle);
         if (!address.active || !address.row || !address.reservation.valid()) {
             throw std::logic_error("KV address space is not active");
         }

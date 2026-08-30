@@ -85,21 +85,22 @@ struct Fp8SmallTSchedule {
     static constexpr int kRowsPerCta        = WarpsPerCta * RowsPerWarp;
 };
 
-enum class Fp8A16MmaActivationStage : std::uint8_t {
+enum class Fp8A16SmallTMmaActivationStage : std::uint8_t {
     ActiveOnly,
     PaddedZero,
 };
 
-enum class Fp8A16MmaCache : std::uint8_t {
+enum class Fp8A16SmallTMmaCache : std::uint8_t {
     Default,
     Streaming,
 };
 
 template <int KWarps, int TileTokens, int MinBlocksPerSm,
-          Fp8A16MmaCache ActivationCache           = Fp8A16MmaCache::Default,
-          Fp8A16MmaCache WeightCache               = Fp8A16MmaCache::Streaming,
-          Fp8A16MmaActivationStage ActivationStage = Fp8A16MmaActivationStage::ActiveOnly>
-struct Fp8A16MmaSchedule {
+          Fp8A16SmallTMmaCache ActivationCache = Fp8A16SmallTMmaCache::Default,
+          Fp8A16SmallTMmaCache WeightCache     = Fp8A16SmallTMmaCache::Streaming,
+          Fp8A16SmallTMmaActivationStage ActivationStage =
+              Fp8A16SmallTMmaActivationStage::ActiveOnly>
+struct Fp8A16SmallTMmaSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
                   TileTokens == 40 || TileTokens == 48);
@@ -128,13 +129,14 @@ using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 
-inline constexpr std::int32_t kFp8VocabularyFirstA16MmaT = 1;
-inline constexpr std::int32_t kFp8VocabularyLastA16MmaT  = 48;
+inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
+inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;
+inline constexpr std::int32_t kFp8VocabularyFirstA16GemmT      = 42;
 
 template <int ActiveTokens>
-struct Fp8VocabularyA16MmaProductionSchedule {
-    static_assert(ActiveTokens >= kFp8VocabularyFirstA16MmaT);
-    static_assert(ActiveTokens <= kFp8VocabularyLastA16MmaT);
+struct Fp8VocabularyA16SmallTMmaProductionSchedule {
+    static_assert(ActiveTokens >= kFp8VocabularyFirstA16SmallTMmaT);
+    static_assert(ActiveTokens <= kFp8VocabularyLastA16SmallTMmaT);
 
     static constexpr int kTileTokens     = ActiveTokens <= 8    ? 8
                                            : ActiveTokens <= 16 ? 16
@@ -144,7 +146,7 @@ struct Fp8VocabularyA16MmaProductionSchedule {
                                                                 : 48;
     static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
     static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
-    using Type                           = Fp8A16MmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
+    using Type = Fp8A16SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
 };
 
 enum class Fp8Problem : std::uint8_t {

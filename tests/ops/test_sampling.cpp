@@ -62,13 +62,19 @@ std::vector<float> repeat_column(const std::vector<float>& column, int columns) 
 }
 
 std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_rows,
-                               int token_domain, int columns) {
+                               int token_domain, int columns, const ops::SamplingConfig& config,
+                               const std::vector<int>& counts) {
     std::vector<int> expected(static_cast<std::size_t>(columns));
     for (int t = 0; t < columns; ++t) {
         const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
         int best               = 0;
         for (int token = 1; token < token_domain; ++token) {
-            if (logits[base + token] > logits[base + best]) { best = token; }
+            const auto adjusted = [&](int candidate) {
+                const int count = counts[static_cast<std::size_t>(candidate)];
+                return logits[base + candidate] - config.presence_penalty * (count > 0) -
+                       config.frequency_penalty * count;
+            };
+            if (adjusted(token) > adjusted(best)) { best = token; }
         }
         expected[static_cast<std::size_t>(t)] = best;
     }
@@ -350,10 +356,14 @@ int greedy_contract() {
     const RunResult result = run_homogeneous_batch(logits, physical_rows, token_domain, batch,
                                                    config, 77, ops::kSamplePurposeDecode, &counts);
     int failures           = result.integrity_failures;
-    failures += verify_exact("sample greedy mathematical result", result.tokens,
-                             greedy_oracle(logits, physical_rows, token_domain, batch));
-    for (const std::vector<int>& row_counts : result.counts) {
-        failures += verify_exact("sample greedy skips token_counts updates", row_counts, counts);
+    failures +=
+        verify_exact("sample greedy mathematical result", result.tokens,
+                     greedy_oracle(logits, physical_rows, token_domain, batch, config, counts));
+    for (std::size_t row = 0; row < result.counts.size(); ++row) {
+        std::vector<int> expected_counts = counts;
+        ++expected_counts[static_cast<std::size_t>(result.tokens[row])];
+        failures += verify_exact("sample greedy increments selected token", result.counts[row],
+                                 expected_counts);
     }
     return failures;
 }
@@ -437,8 +447,10 @@ int heterogeneous_batch_contract() {
     int failures = result.integrity_failures;
     failures += verify_exact("sample heterogeneous batch tokens", result.tokens, {5, 11, 17, 19});
     std::vector<std::vector<int>> expected = counts;
-    ++expected[1][11];
-    ++expected[2][17];
+    for (int row = 0; row < batch; ++row) {
+        ++expected[static_cast<std::size_t>(row)]
+                  [static_cast<std::size_t>(result.tokens[static_cast<std::size_t>(row)])];
+    }
     for (int row = 0; row < batch; ++row) {
         failures += verify_exact("sample heterogeneous batch isolated token counts",
                                  result.counts[static_cast<std::size_t>(row)],
@@ -579,6 +591,27 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int increment_counts_contract() {
+    const std::vector<std::int32_t> ids{1, 3, 1, 7};
+    const std::vector<std::int32_t> initial{0, 2, 0, 4, 0, 0, 0, 1};
+    const std::vector<std::int32_t> expected{0, 4, 0, 5, 0, 0, 0, 2};
+    DeviceBuffer device_ids = to_device(ids);
+    GuardedDeviceBuffer device_counts(initial.size() * sizeof(std::int32_t));
+    device_counts.copy_from_host(initial.data(), initial.size() * sizeof(std::int32_t));
+    Tensor token_ids(device_ids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor counts(device_counts.data(), DType::I32, {static_cast<std::int32_t>(initial.size())});
+    ops::increment_token_counts(token_ids, counts, nullptr);
+    cuda_synchronize();
+
+    int failures =
+        verify_exact("increment token counts",
+                     from_device<std::int32_t>(device_counts.data(), initial.size()), expected);
+    failures += verify_exact("increment token counts read-only ids",
+                             from_device<std::int32_t>(device_ids, ids.size()), ids);
+    failures += device_counts.verify_guards("increment token counts guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +641,7 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += increment_counts_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

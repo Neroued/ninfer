@@ -185,11 +185,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                              config_before);
 
     auto expected_counts = initial_token_counts;
-    if (config.temperature > 0.0f) {
-        for (int i = 0; i < expected.num_sampled; ++i) {
-            ++expected_counts[static_cast<std::size_t>(
-                expected.sampled[static_cast<std::size_t>(i)])];
-        }
+    for (int i = 0; i < expected.num_sampled; ++i) {
+        ++expected_counts[static_cast<std::size_t>(expected.sampled[static_cast<std::size_t>(i)])];
     }
     failures +=
         verify_exact((label + " token counts").c_str(),
@@ -272,6 +269,30 @@ int deterministic_sampling_case() {
     return execute_accept_case("speculative sampling deterministic support", targets, logits_bits,
                                physical_rows, drafts, initial_length, token_domain, config,
                                token_counts, expected);
+}
+
+int greedy_penalty_case(int token_domain) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{1, 1};
+    const std::vector<std::int32_t> raw_targets{1, 1, 3};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1]                    = 5.0F;
+    logits[token_domain + 1]     = 5.0F;
+    logits[token_domain + 4]     = 4.5F;
+    logits[2 * token_domain + 3] = 5.0F;
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        bits[index] = f32_to_bf16(logits[index]);
+    }
+
+    ops::SamplingConfig config{};
+    config.temperature      = 0.0F;
+    config.presence_penalty = 1.0F;
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected = accept_state_oracle(drafts, 1, 4, 100);
+    return execute_accept_case(
+        "speculative greedy penalty token-domain=" + std::to_string(token_domain), raw_targets,
+        bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
 int batched_sampling_workspace_stride_case() {
@@ -439,6 +460,8 @@ int main() {
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
+    failures += greedy_penalty_case(64);
+    failures += greedy_penalty_case(257);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);

@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <bit>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -54,22 +55,49 @@ bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
     return true;
 }
 
-constexpr std::uint64_t kDigestOffset        = 1469598103934665603ULL;
-constexpr std::uint64_t kDigestPrime         = 1099511628211ULL;
+using DigestPair = std::array<std::uint64_t, 2>;
+
+constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
+constexpr DigestPair kDigestPrime{1099511628211ULL, 14029467366897019727ULL};
 constexpr std::uint64_t kTokenDigestDomain   = 0x6e696e6665722d74ULL;
 constexpr std::uint64_t kRewriteDigestDomain = 0x6e696e6665722d72ULL;
+constexpr std::uint64_t kVisionDigestDomain  = 0x6e696e6665722d76ULL;
 
-void mix_digest(std::uint64_t& digest, std::uint64_t value) noexcept {
-    for (std::uint32_t byte = 0; byte < 8; ++byte) {
-        digest ^= static_cast<std::uint8_t>(value >> (8U * byte));
-        digest *= kDigestPrime;
+void mix_digest(DigestPair& digest, std::uint64_t value) noexcept {
+    for (std::size_t lane = 0; lane < digest.size(); ++lane) {
+        const std::uint64_t lane_value =
+            lane == 0 ? value : std::rotl(value ^ 0x9e3779b97f4a7c15ULL, 29);
+        for (std::uint32_t byte = 0; byte < 8; ++byte) {
+            digest[lane] ^= static_cast<std::uint8_t>(lane_value >> (8U * byte));
+            digest[lane] *= kDigestPrime[lane];
+        }
     }
 }
 
-void append_digest(std::vector<std::uint64_t>& digests, TokenId token, std::uint8_t token_type,
+void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
+    mix_digest(digest, kVisionDigestDomain);
+    mix_digest(digest, static_cast<std::uint8_t>(item.modality));
+    mix_digest(digest, static_cast<std::uint32_t>(item.grid.temporal));
+    mix_digest(digest, static_cast<std::uint32_t>(item.grid.height));
+    mix_digest(digest, static_cast<std::uint32_t>(item.grid.width));
+    mix_digest(digest, item.patch_begin);
+    mix_digest(digest, item.patch_count);
+    for (const std::uint8_t byte : item.content_digest) { mix_digest(digest, byte); }
+    mix_digest(digest, item.timestamps.size());
+    for (const double timestamp : item.timestamps) {
+        mix_digest(digest, std::bit_cast<std::uint64_t>(timestamp));
+    }
+    mix_digest(digest, item.token_spans.size());
+    for (const TokenSpan& span : item.token_spans) {
+        mix_digest(digest, span.begin);
+        mix_digest(digest, span.count);
+    }
+}
+
+void append_digest(std::vector<DigestPair>& digests, TokenId token, std::uint8_t token_type,
                    const std::array<std::int32_t, 3>& positions,
                    std::span<const std::uint32_t> rewrite_frontiers, std::size_t& next_rewrite) {
-    std::uint64_t digest = digests.back();
+    DigestPair digest = digests.back();
     mix_digest(digest, kTokenDigestDomain);
     mix_digest(digest, static_cast<std::uint32_t>(token));
     mix_digest(digest, token_type);
@@ -82,7 +110,25 @@ void append_digest(std::vector<std::uint64_t>& digests, TokenId token, std::uint
         mix_digest(digest, rewrite_frontiers[next_rewrite]);
         ++next_rewrite;
     }
-    digests.push_back(digest == 0 ? 1 : digest);
+    for (std::uint64_t& lane : digest) {
+        if (lane == 0) { lane = 1; }
+    }
+    digests.push_back(digest);
+}
+
+std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens) {
+    if (item.token_spans.empty()) {
+        throw std::invalid_argument("Vision shortlist item has no token spans");
+    }
+    std::size_t previous_end = 0;
+    for (const TokenSpan& span : item.token_spans) {
+        if (span.count == 0 || span.begin > prompt_tokens ||
+            span.count > prompt_tokens - span.begin || span.begin < previous_end) {
+            throw std::invalid_argument("Vision shortlist item has invalid token spans");
+        }
+        previous_end = span.begin + span.count;
+    }
+    return previous_end;
 }
 
 } // namespace
@@ -260,15 +306,32 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
     reserve(tokens);
     digests_.push_back(kDigestOffset);
     std::size_t next_rewrite = 0;
+    std::size_t next_vision  = 0;
+    std::size_t next_vision_end =
+        prompt.vision_items.empty() ? 0 : checked_vision_end(prompt.vision_items.front(), tokens);
     for (std::size_t index = 0; index < tokens; ++index) {
         const std::array<std::int32_t, 3> positions{prompt.positions[index],
                                                     prompt.positions[tokens + index],
                                                     prompt.positions[2U * tokens + index]};
         append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions,
                       prompt.identity.rewrite_execution_frontiers, next_rewrite);
+        const std::size_t frontier = index + 1U;
+        while (next_vision < prompt.vision_items.size() && next_vision_end == frontier) {
+            mix_vision_item(digests_.back(), prompt.vision_items[next_vision]);
+            ++next_vision;
+            if (next_vision < prompt.vision_items.size()) {
+                next_vision_end = checked_vision_end(prompt.vision_items[next_vision], tokens);
+                if (next_vision_end < frontier) {
+                    throw std::invalid_argument("Vision shortlist items are not prefix ordered");
+                }
+            }
+        }
     }
     if (next_rewrite != prompt.identity.rewrite_execution_frontiers.size()) {
         throw std::invalid_argument("rewrite execution frontier exceeds the prompt");
+    }
+    if (next_vision != prompt.vision_items.size()) {
+        throw std::invalid_argument("Vision shortlist item exceeds the prompt");
     }
 }
 
@@ -308,7 +371,7 @@ void PrefixShortlistDigests::truncate(std::size_t tokens) {
     digests_.resize(tokens + 1U);
 }
 
-std::uint64_t PrefixShortlistDigests::at(std::size_t frontier) const {
+std::array<std::uint64_t, 2> PrefixShortlistDigests::at(std::size_t frontier) const {
     if (digests_.empty() || frontier > size()) {
         throw std::out_of_range("prefix shortlist frontier exceeds resident identity");
     }

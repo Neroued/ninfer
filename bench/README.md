@@ -3,7 +3,7 @@
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
 The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
 implementation selection behind those contracts. Target benchmarks measure Program/model
-composition. Correctness and model parity live outside this directory; development rules are in
+composition. Correctness lives in the affected test suites; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
 The frozen request corpus for the separate black-box Serve TTFT tool is documented under
@@ -306,7 +306,7 @@ normalization and chunked-workspace accesses. These deterministic byte counts de
 implementation-level tensor traffic; physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
-cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
+cmake --build build --parallel --target ninfer_gated_delta_net_bench
 ./build/bench/ninfer_gated_delta_net_bench \
   --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
@@ -314,9 +314,6 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_
 ./build/bench/ninfer_gated_delta_net_bench \
   --chunked-only --value-heads 32 --tokens 1024 --breakdown \
   --warmup 20 --repeat 100
-./build/bench/ninfer_gdn_layer_bench \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
 ```
 
 ## GDN input-projection Op benchmark
@@ -817,6 +814,30 @@ cmake --build build --parallel --target \
 Aligned registered shapes use 16-byte BF16 packs in the cache-sized regime. GELU and AddBias
 select their BF16x2 streaming routes for larger Vision items; odd or unaligned repository-internal
 test shapes exercise the scalar fallbacks.
+
+## Causal conv1d SiLU Op benchmark
+
+`ninfer_causal_conv1d_silu_bench` times one public entry per invocation. `--tokens` takes a list, so
+a route decision comes from one process rather than a series of them. `--cache` defaults to warm;
+pass `--cache cold` for the state route decisions are made in.
+
+```bash
+./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 8192 --tokens 1,2,7,15,16,17,24,32,33,64,65
+./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 10240 --tokens 1024,4096,8192
+```
+
+`--split` selects the split-output entry. Its partition follows the channel extent, because those
+are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096) and
+`--channels 10240` gives (2048, 2048, 6144).
+
+`--legacy-stage` times the stage the split entry replaced - one packed convolution into a `[C,T]`
+plane followed by three `extract_bf16_columns` - so the two can be compared under one set of
+timing conditions. It is a decision benchmark and is meant to be removed once that decision is
+closed.
+
+```bash
+./build/bench/ninfer_causal_conv1d_silu_bench --legacy-stage --split --cache cold --channels 8192 --tokens 1024,8192
+```
 
 ## Reports
 

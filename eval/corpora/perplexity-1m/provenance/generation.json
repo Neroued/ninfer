@@ -1,0 +1,10 @@
+{
+  "corpus_id": "ninfer-ppl-1m-v1",
+  "sizing": {
+    "role": "approximate stream boundary selection only",
+    "tokenizer": "Qwen3.6 family tokenizer.json",
+    "tokenizer_json_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "add_special_tokens": false,
+    "approximate_tokens_per_stream": 65536
+  }
+}

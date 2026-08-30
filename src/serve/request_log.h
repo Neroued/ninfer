@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 16;
+inline constexpr int kRequestLogSchemaVersion        = 18;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -34,11 +34,20 @@ struct RequestLogContext {
     bool has_tool_history = false;
     bool enable_thinking  = true;
     std::optional<std::uint32_t> thinking_budget;
+    std::optional<RequestedReasoningEffort> requested_reasoning_effort;
+    std::optional<ninfer::ReasoningEffort> resolved_reasoning_effort;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+};
+
+struct RequestLogMetadata {
+    std::string model;
+    bool stream                            = false;
+    bool output_tokens_explicit            = false;
+    bool preserve_thinking_semantic_change = false;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -56,6 +65,7 @@ struct RequestRejectionLogContext {
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
     bool has_tool_history = false;
+    std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     ApiError error;
 };
 
@@ -86,10 +96,12 @@ struct ThroughputReport {
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
+                                           const RequestLogMetadata& metadata,
                                            const PreparedRequest& prepared);
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
+                                                              const RequestLogMetadata& metadata,
                                                               ApiError error);
 
 // Compact console records retained for operator visibility.

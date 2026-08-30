@@ -1,7 +1,8 @@
 #pragma once
 
+#include "serve/anthropic_thinking_signature.h"
 #include "serve/generation_service.h"
-#include "serve/response_store.h"
+#include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -13,9 +14,14 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace ninfer::serve {
+
+void write_openai_error(httplib::Response& response, const ApiError& error);
+void write_anthropic_error(httplib::Response& response, const ApiError& error,
+                           const std::string& request_id);
 
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
@@ -23,6 +29,9 @@ namespace ninfer::serve {
 httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
+
+[[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
+                                             std::string_view api_key) noexcept;
 
 class HttpServer {
 public:
@@ -64,8 +73,9 @@ private:
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    AnthropicThinkingSigner anthropic_thinking_signer_;
     std::string public_model_id_;
-    ResponseStore response_store_;
+    OpenAIResponsesStore openai_responses_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

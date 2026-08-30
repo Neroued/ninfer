@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <memory>
+#include <string_view>
+#include <vector>
 
 namespace ninfer {
 
@@ -68,9 +70,16 @@ public:
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
 
-    // Raw token input is retained for parity tools and repeatable performance measurement.
+    // Raw token input is retained for repeatable correctness and performance measurement.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+
+    // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
+    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+
+    // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
+    [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
+                                                  std::uint32_t first_target);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
@@ -79,8 +88,9 @@ public:
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an
     // unconsumed handle cancels its request; wait() owns result consumption and may run
-    // independently from GPU execution. Streaming mode requires a non-null sink in wait();
-    // Aggregate mode requires a null sink.
+    // independently from GPU execution. Streaming mode requires a non-null sink in wait() and
+    // publishes one exact GenerationStart before output deltas; Aggregate mode requires a null
+    // sink.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
            OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,

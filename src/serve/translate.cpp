@@ -1,5 +1,7 @@
 #include "serve/translate.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -37,6 +39,7 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     ninfer::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
+    if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
     if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
     if (request.presence_penalty) {
         sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
@@ -65,8 +68,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
-    if (sampling.top_k && *sampling.top_k < 0) {
-        invalid_sampling("top_k must be nonnegative", "top_k");
+    if (sampling.top_k && (*sampling.top_k < 0 || *sampling.top_k > 20)) {
+        invalid_sampling("top_k must be in [0,20]", "top_k");
     }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
@@ -86,18 +89,20 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
 std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
     std::vector<const ToolDefinition*> tools;
     if (!request.uses_tools()) { return tools; }
-    if (request.tool_choice.mode == ToolChoiceMode::Named) {
-        for (const ToolDefinition& tool : request.tools) {
-            if (tool.name == request.tool_choice.name) {
-                tools.push_back(&tool);
-                break;
-            }
-        }
-        return tools;
-    }
     tools.reserve(request.tools.size());
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
     return tools;
+}
+
+std::string render_tool_definition(const ToolDefinition& tool) {
+    using Json  = nlohmann::json;
+    Json schema = Json::parse(tool.input_schema_json);
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    if (!tool.description.empty()) { function["description"] = tool.description; }
+    if (tool.input_examples_json) {
+        function["input_examples"] = Json::parse(*tool.input_examples_json);
+    }
+    return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
 } // namespace
@@ -106,26 +111,40 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities) {
     ResolvedPromptSemantics result{
-        .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
-        .reasoning_effort  = std::nullopt,
-        .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
+        .enable_thinking            = request.enable_thinking.value_or(server.enable_thinking),
+        .reasoning_effort           = std::nullopt,
+        .effective_reasoning_effort = std::nullopt,
+        .preserve_thinking          = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    const auto complete = [&]() {
+        if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+            result.enable_thinking) {
+            invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
+                                  "messages", "assistant_prefill_not_supported");
+        }
+        if (result.enable_thinking) {
+            result.effective_reasoning_effort = result.reasoning_effort
+                                                    ? result.reasoning_effort
+                                                    : capabilities.reasoning_effort.default_effort;
+        }
+        return result;
+    };
+    if (!request.reasoning_effort) { return complete(); }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
-        invalid_prompt_option("reasoning effort conflicts with enable_thinking",
-                              request.reasoning_effort_param, "conflicting_template_option");
+        invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",
+                              "conflicting_template_option");
     }
     result.enable_thinking = enables_thinking;
 
     if (requested == RequestedReasoningEffort::None) {
         if (!capabilities.enable_thinking) {
             invalid_prompt_option("the loaded chat template cannot disable thinking",
-                                  request.reasoning_effort_param, "reasoning_effort_not_supported");
+                                  "reasoning_effort", "reasoning_effort_not_supported");
         }
-        return result;
+        return complete();
     }
 
     switch (requested) {
@@ -144,7 +163,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+                              "reasoning_effort", "reasoning_effort_not_supported");
     case RequestedReasoningEffort::None:
         break;
     }
@@ -153,9 +172,9 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+                              "reasoning_effort", "reasoning_effort_not_supported");
     }
-    return result;
+    return complete();
 }
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
@@ -174,16 +193,16 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
         }
 
+        if (turn.role == ChatRole::Tool && turn.tool_result_is_error) {
+            ninfer::MessagePart error;
+            error.text = "[tool_error]\n";
+            message.parts.push_back(std::move(error));
+        }
+
         std::uint64_t text_bytes = 0;
-        for (const ContentPart& part : turn.content) {
+        for (std::size_t part_index = 0; part_index < turn.content.size(); ++part_index) {
+            const ContentPart& part = turn.content[part_index];
             if (part.kind == ContentKind::Text) {
-                if (!message.parts.empty() && !part.text.empty() &&
-                    message.parts.back().kind == ninfer::MessagePartKind::Text) {
-                    ninfer::MessagePart newline;
-                    newline.text = "\n";
-                    message.parts.push_back(std::move(newline));
-                    ++text_bytes;
-                }
                 ninfer::MessagePart text;
                 text.text = part.text;
                 message.parts.push_back(std::move(text));
@@ -191,9 +210,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     throw std::invalid_argument("cacheable instruction text exceeds uint32");
                 }
                 text_bytes += part.text.size();
-                continue;
-            }
-            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
+            } else if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
                 if (!acquire_media) {
                     throw std::logic_error("media acquisition callback is not configured");
                 }
@@ -201,73 +218,75 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 media.kind  = ninfer::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
-                continue;
+            } else {
+                ApiError error;
+                error.message = "content type '" + part.type_raw + "' is not supported";
+                error.param   = "messages";
+                error.code    = "modality_not_supported";
+                throw ApiException(std::move(error));
             }
-
-            ApiError error;
-            error.message = "content type '" + part.type_raw + "' is not supported";
-            error.param   = "messages";
-            error.code    = "modality_not_supported";
-            throw ApiException(std::move(error));
-        }
-        if (turn_index == 0 &&
-            (turn.role == ChatRole::System || turn.role == ChatRole::Developer)) {
-            for (const std::uint32_t boundary : turn.shared_cache_boundaries_after_text_bytes) {
-                if (boundary == 0 || boundary > text_bytes) {
-                    throw std::invalid_argument("instruction cache boundary exceeds its text");
+            if (part.cache_boundary_after) {
+                if (turn_index >= std::numeric_limits<std::uint32_t>::max() ||
+                    part_index >= std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::overflow_error("conversation cache boundary exceeds uint32");
                 }
-            }
-            if (!turn.shared_cache_boundaries_after_text_bytes.empty()) {
-                input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                    .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                    .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
-                    .leading_instruction_bytes =
-                        turn.shared_cache_boundaries_after_text_bytes.back(),
-                });
+                const bool leading_instruction =
+                    turn_index == 0 &&
+                    (turn.role == ChatRole::System || turn.role == ChatRole::Developer) &&
+                    part.kind == ContentKind::Text;
+                if (leading_instruction) {
+                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                        .kind     = part.cache_boundary_after->kind,
+                        .evidence = part.cache_boundary_after->evidence,
+                        .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                        .leading_instruction_bytes = static_cast<std::uint32_t>(text_bytes),
+                    });
+                } else {
+                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                        .after_message_count = static_cast<std::uint32_t>(turn_index + 1U),
+                        .kind                = part.cache_boundary_after->kind,
+                        .evidence            = part.cache_boundary_after->evidence,
+                        .location = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                        .after_message_part_count =
+                            static_cast<std::uint32_t>(message.parts.size()),
+                    });
+                }
             }
         }
         input.messages.push_back(std::move(message));
-        if (turn.private_cache_boundary_after) {
+        if (turn.cache_boundary_after) {
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::overflow_error("conversation cache boundary exceeds uint32");
             }
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
                 .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
-                .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                .kind                = turn.cache_boundary_after->kind,
+                .evidence            = turn.cache_boundary_after->evidence,
                 .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
             });
         }
     }
 
-    input.options.add_generation_prompt            = true;
+    input.options.continuation                     = request.continuation;
     input.options.enable_thinking                  = semantics.enable_thinking;
     input.options.reasoning_effort                 = semantics.reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.add_vision_id                    = false;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
-    std::optional<std::uint32_t> last_tool_cache_boundary;
     for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(tools[index]->definition_json);
+        input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
         if (tools[index]->cache_boundary_after) {
-            last_tool_cache_boundary = static_cast<std::uint32_t>(index + 1U);
+            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                .kind             = tools[index]->cache_boundary_after->kind,
+                .evidence         = tools[index]->cache_boundary_after->evidence,
+                .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                .after_tool_count = static_cast<std::uint32_t>(index + 1U),
+            });
         }
     }
-    // Qwen renders tools before the leading instruction. One shared descriptor is enough for an
-    // Anthropic request: the latest explicit breakpoint contains every earlier stable section and
-    // avoids pinning the sole shared slot with an earlier tool-only prefix during the same request.
-    bool has_shared_marker = false;
-    for (const ninfer::PromptCacheMarker& marker : input.context_cache.markers) {
-        has_shared_marker =
-            has_shared_marker || marker.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix;
-    }
-    if (!has_shared_marker && last_tool_cache_boundary) {
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
-            .after_tool_count = *last_tool_cache_boundary,
-        });
-    }
+    input.context_cache.allow_engine_automatic_shared_prefixes =
+        request.allow_engine_automatic_shared_prefixes;
     return input;
 }
 
@@ -279,35 +298,30 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking) {
-        options.execution.thinking.budget = server.default_thinking_budget;
+        options.execution.thinking.budget =
+            request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
-    options.stop.strings.reserve(request.stop_strings.size());
+    options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
+    options.stop.strings.reserve(request.stop_strings.size() *
+                                 (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
                 ninfer::StopString{.text              = stop,
                                    .channel           = ninfer::OutputChannel::Content,
                                    .include_in_output = false});
+            if (request.stop_strings_apply_to_reasoning) {
+                options.stop.strings.push_back(
+                    ninfer::StopString{.text              = stop,
+                                       .channel           = ninfer::OutputChannel::Reasoning,
+                                       .include_in_output = false});
+            }
         }
     }
     return options;
-}
-
-const char* finish_reason_wire(ninfer::FinishReason reason) {
-    switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
-        return "length";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
-        return "stop";
-    }
-    return "stop";
 }
 
 } // namespace ninfer::serve

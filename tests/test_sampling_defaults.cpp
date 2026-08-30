@@ -101,10 +101,18 @@ int main() {
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
         ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
-    failures += check(overridden.temperature == 0.0F && overridden.top_k == 0 &&
+    failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
-                      "explicit zero sampling overrides were lost");
+                      "explicit zero sampling overrides were not normalized to the target cap");
+
+    overrides.top_k = 21;
+    failures += check(throws_invalid([&] {
+                          (void)ninfer::runtime::resolve_sampling(
+                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
+                      }),
+                      "top_k beyond the executable candidate domain was accepted");
+    overrides.top_k = 0;
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {

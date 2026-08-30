@@ -113,17 +113,9 @@ GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens) {
     };
 }
 
-struct GdnPrefillConvRoots {
-    Tensor projected;
-    Tensor convolved;
-};
-
 template <class Config, class Allocator>
-GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, Config::convolution_dim, tokens),
-        matrix(allocator, DType::BF16, Config::convolution_dim, tokens),
-    };
+Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16, Config::convolution_dim, tokens);
 }
 
 template <class Config, class Allocator>

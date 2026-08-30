@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "core/nvtx.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/gelu.h"
@@ -263,6 +264,8 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     const qwen3_6::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
     const auto tokens64                       = control.merged_count;
+    nvtx::ScopedRange encode_range(nvtx::Name::VisionEncode, nvtx::Category::Vision,
+                                   static_cast<std::uint64_t>(patches64));
     if (item.patches.size() !=
         checked_mul(patches64, VisionScheduleConfig::patch_dim, "patch elements")) {
         throw std::invalid_argument("Vision processor patch buffer has invalid shape");
@@ -285,26 +288,34 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     cudaStream_t stream = ctx_.stream;
 
     Tensor position_ids = layout.position_ids.bind(backing);
-    copy_host(control.position_ids.data(), position_ids, stream);
-
-    Tensor x          = layout.x.bind(backing);
-    Tensor patch_bf16 = layout.patch_bf16.bind(backing);
-    copy_host(item.patches.data(), patch_bf16, stream);
-    ops::linear(patch_bf16, *patch_embed_, x, stream);
-    ops::add_bias(*patch_embed_bias_, x, stream);
-    // The artifact records the source table shape [rows,hidden], while Tensor's
-    // contiguous matrix convention is [inner,columns]. The payload is already
-    // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
-    Tensor pos_indices = layout.pos_indices.bind(backing);
-    Tensor pos_weights = layout.pos_weights.bind(backing);
-    copy_host(control.position_table_indices.data(), pos_indices, stream);
-    copy_host(control.position_table_weights.data(), pos_weights, stream);
-    Tensor position_table = position_embed_->reshape(
-        {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
-    ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    Tensor x            = layout.x.bind(backing);
+    Tensor patch_bf16   = layout.patch_bf16.bind(backing);
+    Tensor pos_indices  = layout.pos_indices.bind(backing);
+    Tensor pos_weights  = layout.pos_weights.bind(backing);
+    {
+        nvtx::ScopedRange patch_range(nvtx::Name::VisionPatchEmbedding, nvtx::Category::Vision,
+                                      static_cast<std::uint64_t>(patches64));
+        copy_host(control.position_ids.data(), position_ids, stream);
+        copy_host(item.patches.data(), patch_bf16, stream);
+        ops::linear(patch_bf16, *patch_embed_, x, stream);
+        ops::add_bias(*patch_embed_bias_, x, stream);
+        // The artifact records the source table shape [rows,hidden], while Tensor's
+        // contiguous matrix convention is [inner,columns]. The payload is already
+        // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
+        copy_host(control.position_table_indices.data(), pos_indices, stream);
+        copy_host(control.position_table_weights.data(), pos_weights, stream);
+        Tensor position_table = position_embed_->reshape(
+            {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
+        ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    }
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
+        nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
+                                      static_cast<std::uint64_t>(layer));
         const BlockW& block = blocks_[layer];
         {
+            nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
+                                              nvtx::Category::Attention,
+                                              static_cast<std::uint64_t>(layer));
             Tensor attended = layout.attended.bind(backing);
             {
                 Tensor qkv = layout.qkv.bind(backing);
@@ -343,6 +354,8 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
             ops::residual_add(projected, x, stream);
         }
         {
+            nvtx::ScopedRange mlp_range(nvtx::Name::VisionMlp, nvtx::Category::PostMixer,
+                                        static_cast<std::uint64_t>(layer));
             Tensor down = layout.mlp_down.bind(backing);
             Tensor up   = layout.mlp_up.bind(backing);
             {
@@ -359,16 +372,20 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         }
     }
 
-    Tensor normalized = layout.normalized.bind(backing);
-    ops::layer_norm(x, *merger_.norm_weight, *merger_.norm_bias, VisionScheduleConfig::norm_eps,
-                    normalized, stream);
-    Tensor merged = normalized.view({VisionScheduleConfig::merger_hidden, tokens});
-    Tensor hidden = layout.merger_hidden.bind(backing);
-    ops::linear(merged, *merger_.fc1, hidden, stream);
-    ops::add_bias(*merger_.fc1_bias, hidden, stream);
-    ops::gelu(hidden, ops::GeluMode::Exact, stream);
-    ops::linear(hidden, *merger_.fc2, output, stream);
-    ops::add_bias(*merger_.fc2_bias, output, stream);
+    {
+        nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
+                                      static_cast<std::uint64_t>(tokens64));
+        Tensor normalized = layout.normalized.bind(backing);
+        ops::layer_norm(x, *merger_.norm_weight, *merger_.norm_bias, VisionScheduleConfig::norm_eps,
+                        normalized, stream);
+        Tensor merged = normalized.view({VisionScheduleConfig::merger_hidden, tokens});
+        Tensor hidden = layout.merger_hidden.bind(backing);
+        ops::linear(merged, *merger_.fc1, hidden, stream);
+        ops::add_bias(*merger_.fc1_bias, hidden, stream);
+        ops::gelu(hidden, ops::GeluMode::Exact, stream);
+        ops::linear(hidden, *merger_.fc2, output, stream);
+        ops::add_bias(*merger_.fc2_bias, output, stream);
+    }
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,

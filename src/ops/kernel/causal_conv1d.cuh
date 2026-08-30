@@ -20,8 +20,59 @@ __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bf
 
 inline constexpr int kCausalConvChannelTile = 32;
 
+namespace detail {
+
+// One destination column resolved for a fixed row: the address of element (row,0) and the row
+// count of the destination that owns it.
+template <class Element>
+struct CausalConvOutputColumn {
+    Element* base;
+    std::int32_t rows;
+
+    __device__ __forceinline__ Element* at(std::int32_t t) const {
+        return base + static_cast<std::int64_t>(t) * rows;
+    }
+};
+
+// Output address map for a single contiguous [rows,T] destination. One destination admits any
+// row count, so the leading dimension stays a runtime value. The pointer is not restrict: the
+// entries that use this map do not establish that their destination is disjoint from x.
+template <class Element>
+struct CausalConvContiguousOutput {
+    Element* out;
+    std::int32_t rows;
+
+    __device__ __forceinline__ CausalConvOutputColumn<Element> column(std::int64_t row) const {
+        return {out + row, rows};
+    }
+};
+
+// Output address map for three destinations partitioned by row. The partition is a template
+// parameter: the registered geometries are the only ones the wrapper admits, so the boundaries and
+// the three leading dimensions are constants here. Callers writing pairs pass halved row counts,
+// which requires every boundary to be even.
+template <class Element, std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
+struct CausalConvSplitOutput3 {
+    static_assert(Rows0 > 0 && Rows1 > 0 && Rows2 > 0);
+
+    Element* __restrict__ out0;
+    Element* __restrict__ out1;
+    Element* __restrict__ out2;
+
+    __device__ __forceinline__ CausalConvOutputColumn<Element> column(std::int64_t row) const {
+        constexpr std::int32_t split1 = Rows0;
+        constexpr std::int32_t split2 = Rows0 + Rows1;
+        if (row < split1) { return {out0 + row, Rows0}; }
+        if (row < split2) { return {out1 + (row - split1), Rows1}; }
+        return {out2 + (row - split2), Rows2};
+    }
+};
+
+} // namespace detail
+
+template <class Output>
 __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                             const __nv_bfloat16* conv_state, __nv_bfloat16* out,
+                                             const __nv_bfloat16* conv_state, Output out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
     const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
@@ -32,28 +83,28 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     if (t >= T || c64 >= C64) { return; }
 
     const std::int32_t c       = static_cast<std::int32_t>(c64);
-    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const std::int64_t in_idx = static_cast<std::int64_t>(t) * C64 + c64;
     const __nv_bfloat16 x0     = (t >= 3) ? x[static_cast<std::int64_t>(t - 3) * C64 + c64]
                                           : conv_state[static_cast<std::int64_t>(t) * C64 + c64];
     const __nv_bfloat16 x1     = (t >= 2) ? x[static_cast<std::int64_t>(t - 2) * C64 + c64]
                                           : conv_state[static_cast<std::int64_t>(t + 1) * C64 + c64];
     const __nv_bfloat16 x2     = (t >= 1) ? x[static_cast<std::int64_t>(t - 1) * C64 + c64]
                                           : conv_state[static_cast<std::int64_t>(t + 2) * C64 + c64];
-    const __nv_bfloat16 x3     = x[out_idx];
+    const __nv_bfloat16 x3    = x[in_idx];
 
     float acc = 0.0f;
     acc += __bfloat162float(weight[c]) * __bfloat162float(x0);
     acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(x1);
     acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(x2);
     acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x3);
-    out[out_idx] = __float2bfloat16_rn(silu(acc));
+    *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 }
 
+template <class Output>
 __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
                                                    const __nv_bfloat16* weight,
-                                                   const __nv_bfloat16* conv_state,
-                                                   __nv_bfloat16* out, std::int32_t C,
-                                                   std::int32_t T) {
+                                                   const __nv_bfloat16* conv_state, Output out,
+                                                   std::int32_t C, std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
     const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
@@ -65,16 +116,15 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
     const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
     const auto* state2  = reinterpret_cast<const __nv_bfloat162*>(conv_state);
-    auto* out2          = reinterpret_cast<__nv_bfloat162*>(out);
 
-    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + p;
+    const std::int64_t in_idx = static_cast<std::int64_t>(t) * C2 + p;
     const __nv_bfloat162 x0    = (t >= 3) ? x2[static_cast<std::int64_t>(t - 3) * C2 + p]
                                           : state2[static_cast<std::int64_t>(t) * C2 + p];
     const __nv_bfloat162 x1    = (t >= 2) ? x2[static_cast<std::int64_t>(t - 2) * C2 + p]
                                           : state2[static_cast<std::int64_t>(t + 1) * C2 + p];
     const __nv_bfloat162 x2v   = (t >= 1) ? x2[static_cast<std::int64_t>(t - 1) * C2 + p]
                                           : state2[static_cast<std::int64_t>(t + 2) * C2 + p];
-    const __nv_bfloat162 x3    = x2[out_idx];
+    const __nv_bfloat162 x3   = x2[in_idx];
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -82,7 +132,7 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
-    out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+    *out.column(p).at(t) = __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 
 // Writes the trailing width-3 conv window after consuming the T input columns.
@@ -123,52 +173,13 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
     }
 }
 
-// Small-T ordinary form. One thread owns a channel for the complete sequence, so the initial
-// state and four weights are loaded once and the final state is published in the same launch.
-// conv_state_in and conv_state_out may be identical or disjoint.
-__global__ void causal_conv1d_sequence_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                              const __nv_bfloat16* conv_state_in,
-                                              __nv_bfloat16* conv_state_out, __nv_bfloat16* out,
-                                              std::int32_t C, std::int32_t T) {
-    const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-    const std::int64_t C64 = static_cast<std::int64_t>(C);
-    if (c64 >= C64) { return; }
-
-    __nv_bfloat16 s0 = conv_state_in[c64];
-    __nv_bfloat16 s1 = conv_state_in[C64 + c64];
-    __nv_bfloat16 s2 = conv_state_in[2 * C64 + c64];
-    const float w0   = __bfloat162float(weight[c64]);
-    const float w1   = __bfloat162float(weight[C64 + c64]);
-    const float w2   = __bfloat162float(weight[2 * C64 + c64]);
-    const float w3   = __bfloat162float(weight[3 * C64 + c64]);
-
-    for (std::int32_t t = 0; t < T; ++t) {
-        const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
-        const __nv_bfloat16 x0     = x[out_idx];
-
-        float acc = 0.0f;
-        acc += w0 * __bfloat162float(s0);
-        acc += w1 * __bfloat162float(s1);
-        acc += w2 * __bfloat162float(s2);
-        acc += w3 * __bfloat162float(x0);
-
-        out[out_idx] = __float2bfloat16_rn(silu(acc));
-        s0           = s1;
-        s1           = s2;
-        s2           = x0;
-    }
-
-    conv_state_out[c64]           = s0;
-    conv_state_out[C64 + c64]     = s1;
-    conv_state_out[2 * C64 + c64] = s2;
-}
-
 // Small-T ordinary form parallelized across both channels and tokens. Each CTA owns one channel
 // tile for the full sequence. Loading history into shared memory before any state publication makes
 // the exact-alias state form safe without a second kernel.
+template <class Output>
 __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                             const __nv_bfloat16* conv_state_in,
-                                            __nv_bfloat16* conv_state_out, __nv_bfloat16* out,
+                                            __nv_bfloat16* conv_state_out, Output out,
                                             std::int32_t C, std::int32_t T) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
@@ -201,15 +212,15 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
         p1 < 0 ? history[p1 + 3][lane] : x[static_cast<std::int64_t>(p1) * C64 + c64];
     const __nv_bfloat16 x2 =
         p2 < 0 ? history[p2 + 3][lane] : x[static_cast<std::int64_t>(p2) * C64 + c64];
-    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
-    const __nv_bfloat16 x3     = x[out_idx];
+    const std::int64_t x_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const __nv_bfloat16 x3   = x[x_idx];
 
     float acc = 0.0f;
     acc += __bfloat162float(weights[0][lane]) * __bfloat162float(x0);
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
-    out[out_idx] = __float2bfloat16_rn(silu(acc));
+    *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 
     if (t == 0) {
         for (std::int32_t s = 0; s < 3; ++s) {

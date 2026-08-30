@@ -86,6 +86,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
+  ops/launcher/target_logprobs.cu
   ops/launcher/vision_pos_embed.cu
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
@@ -161,7 +162,8 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
-  ops/linear/fp8/fp8_a16_mma.cu
+  ops/linear/fp8/fp8_a16_small_t_mma.cu
+  ops/linear/fp8/fp8_a16_gemm_mma.cu
   ops/linear/fp8/fp8_a8.cu
   ops/linear/fp8/fp8_dispatch.cpp
   ops/linear/nvfp4/nvfp4_format.cpp
@@ -264,6 +266,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
+  ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
@@ -346,17 +349,26 @@ add_library(ninfer::engine ALIAS ninfer_engine)
 if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
-    serve/openai_schema.cpp
-    serve/responses_schema.cpp
-    serve/anthropic_schema.cpp
-    serve/response_store.cpp
-    serve/tool_call_parser.cpp
+    serve/http_transport.cpp
+    serve/request_validation.cpp
+    serve/openai_chat_request.cpp
+    serve/openai_chat_response.cpp
+    serve/openai_chat_http.cpp
+    serve/openai_common.cpp
+    serve/openai_responses_request.cpp
+    serve/openai_responses_state.cpp
+    serve/openai_responses_response.cpp
+    serve/anthropic_thinking_signature.cpp
+    serve/anthropic_messages_request.cpp
+    serve/anthropic_messages_response.cpp
+    serve/anthropic_messages_http.cpp
+    serve/openai_responses_store.cpp
     serve/translate.cpp
     serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp
-    serve/responses_http.cpp
+    serve/openai_responses_http.cpp
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE

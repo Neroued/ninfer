@@ -94,7 +94,7 @@ struct Package {
     using SequencePlanner            = qwen3_6::SequencePlanner<detail::Variant>;
     using SequencePlan               = qwen3_6::SequencePlan<detail::Variant>;
     using RequestBasePlan            = qwen3_6::RequestBasePlan<detail::Variant>;
-    using AdmissionPlan              = qwen3_6::AdmissionPlan<detail::Variant>;
+    using AdmissionCandidate         = qwen3_6::AdmissionCandidate<detail::Variant>;
     using ResourcePlan               = qwen3_6::ResourcePlan<detail::Variant>;
     using PersistentBackfillProof    = qwen3_6::PersistentBackfillProof<detail::Variant>;
     using SequenceHandle             = qwen3_6::SequenceHandle<detail::Variant>;
@@ -104,7 +104,9 @@ struct Package {
     using CacheSessionKey            = qwen3_6::PreparedSessionKey;
     using ContinuationSummary        = qwen3_6::ContinuationSummary;
     using SharedPrefixSummary        = qwen3_6::SharedPrefixSummary;
-    using PressureOption             = qwen3_6::PressureOption;
+    using PressurePlanningSession    = qwen3_6::PressurePlanningSession<detail::Variant>;
+    using PressureTargetHandle       = qwen3_6::PressureTargetHandle;
+    using CapturePressurePlan        = qwen3_6::CapturePressurePlan<detail::Variant>;
     using MaterializationResult      = qwen3_6::MaterializationResult<detail::Variant>;
     using ContextTransactionProgress = qwen3_6::ContextTransactionProgress<detail::Variant>;
     using CaptureAssessment          = qwen3_6::CaptureAssessment;

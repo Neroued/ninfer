@@ -1,6 +1,12 @@
 #include "serve/anthropic_thinking_signature.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#else
 #include <sys/random.h>
+#endif
 
 #include <array>
 #include <bit>
@@ -187,6 +193,16 @@ bool decode_digest(std::string_view encoded, Digest& digest) {
 
 AnthropicThinkingSigner::Key random_key() {
     AnthropicThinkingSigner::Key key{};
+#if defined(_WIN32)
+    // CNG (BCryptGenRandom) is the Windows secure-random source; it fills the
+    // whole buffer in one call and reports failure via an NTSTATUS code.
+    const NTSTATUS status =
+        ::BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
+                          BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) {
+        throw std::runtime_error("failed to initialize Anthropic Thinking signer");
+    }
+#else
     std::size_t offset = 0;
     while (offset < key.size()) {
         const ssize_t count = ::getrandom(key.data() + offset, key.size() - offset, 0);
@@ -200,6 +216,7 @@ AnthropicThinkingSigner::Key random_key() {
         }
         offset += static_cast<std::size_t>(count);
     }
+#endif
     return key;
 }
 

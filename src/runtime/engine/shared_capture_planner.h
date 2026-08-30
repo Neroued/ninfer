@@ -101,6 +101,7 @@ public:
         queue_.push_back(identity);
         std::optional<Incumbent> incumbent;
         std::uint32_t targets_evaluated = 0;
+        std::uint32_t canonical_targets = 1;
         std::size_t cursor              = 0;
 
         while (cursor < queue_.size() && targets_evaluated < input.target_budget) {
@@ -127,12 +128,13 @@ public:
 
             if (!assessment.expandable || contains(expanded_, target)) { continue; }
             auto prepared                 = session.prepare_expansion(target);
-            const std::uint32_t remaining = input.target_budget - targets_evaluated;
+            const std::uint32_t remaining = input.target_budget - canonical_targets;
             if (prepared.new_canonical_count() > remaining) {
                 session.discard_expansion(std::move(prepared));
                 continue;
             }
             const auto children = session.commit_expansion(std::move(prepared));
+            canonical_targets += children.new_canonical_count;
             expanded_.push_back(target);
             for (const PressureTargetHandle child : children.children) {
                 if (!contains(assessed_, child) && !contains(queue_, child)) {

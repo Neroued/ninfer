@@ -954,6 +954,7 @@ public:
     std::uint32_t private_pressure_alternatives     = 1;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
     std::uint32_t pressure_action_degradation_units = 1;
+    std::optional<std::uint32_t> pressure_expansion_arena_capacity;
     bool include_cumulative_private_target          = false;
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
@@ -1295,6 +1296,12 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
     require(scratch_live_ && prepared.generation == generation_ &&
                 prepared.scratch_generation == scratch_generation_,
             "fake prepared expansion is stale");
+    if (program_->pressure_expansion_arena_capacity) {
+        const std::size_t maximum = *program_->pressure_expansion_arena_capacity;
+        if (prepared.new_count > maximum - std::min(maximum, targets_.size())) {
+            throw std::length_error("prepared pressure expansion exceeds the target arena");
+        }
+    }
     committed_children_.clear();
     std::uint32_t new_count = 0;
     for (Target& child : expansion_scratch_) {
@@ -2201,6 +2208,96 @@ void test_repeated_private_reuse_selects_zero_prefill_shared_promotion() {
     (void)finish_active(manager, program, second, 16);
 }
 
+void test_shared_capture_bounds_committed_pressure_targets() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions             = 11;
+    program.private_pressure_alternatives         = 2;
+    program.pressure_expansion_arena_capacity     = Planner::kTargetBudget + 2U;
+    program.pressure_target_immediate_ns_override = 0;
+    FakeCaptureAssessment capture{
+        .shortlist_key          = FakeShortlistKey{.digest = 99, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .projected_recovery_ns  = 0,
+        .publishes_shared       = true,
+        .physically_feasible    = false,
+    };
+    std::array<FakeContinuationHandle, 16> private_owner_storage;
+    std::array<FakeSharedPrefixHandle, 4> shared_owner_storage;
+    std::array<const FakeContinuationHandle*, 16> private_owners;
+    std::array<std::uint32_t, 16> private_ordinals;
+    std::array<const FakeSharedPrefixHandle*, 4> shared_owners;
+    std::array<std::uint32_t, 4> shared_ordinals;
+    std::array<Planner::OwnerPolicy, 20> owner_policies;
+    std::array<Planner::CheckpointPolicy, 20> checkpoint_policies;
+    for (std::size_t index = 0; index < private_owner_storage.size(); ++index) {
+        private_owner_storage[index] =
+            FakeContinuationHandle(static_cast<std::uint32_t>(index + 1U), 0);
+        private_owners[index]   = &private_owner_storage[index];
+        private_ordinals[index] = static_cast<std::uint32_t>(index);
+        owner_policies[index]   = Planner::OwnerPolicy{
+            .ordinal                  = static_cast<std::uint32_t>(index),
+            .private_retention_weight = 1,
+        };
+        checkpoint_policies[index] = Planner::CheckpointPolicy{
+            .owner_ordinal = static_cast<std::uint32_t>(index),
+            .checkpoint    = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                           .frontier = 16,
+                                           .ordinal  = 0},
+            .rebuild_ns    = 100,
+        };
+    }
+    for (std::size_t index = 0; index < shared_owner_storage.size(); ++index) {
+        const std::size_t ordinal      = private_owner_storage.size() + index;
+        shared_owner_storage[index].id = static_cast<std::uint32_t>(index + 1U);
+        shared_owners[index]           = &shared_owner_storage[index];
+        shared_ordinals[index]         = static_cast<std::uint32_t>(ordinal);
+        owner_policies[ordinal]        = Planner::OwnerPolicy{
+            .ordinal = static_cast<std::uint32_t>(ordinal),
+        };
+        checkpoint_policies[ordinal] = Planner::CheckpointPolicy{
+            .owner_ordinal = static_cast<std::uint32_t>(ordinal),
+            .checkpoint    = CheckpointRef{.kind     = CheckpointKind::SharedStablePrefix,
+                                           .frontier = 16,
+                                           .ordinal  = 0},
+            .rebuild_ns    = 100,
+        };
+    }
+
+    Planner planner;
+    const auto result = planner.plan(program, test_cost_model(),
+                                     Planner::Input{
+                                         .capture                = &capture,
+                                         .private_owners         = private_owners,
+                                         .private_owner_ordinals = private_ordinals,
+                                         .shared_owners          = shared_owners,
+                                         .shared_owner_ordinals  = shared_ordinals,
+                                         .owner_policies         = owner_policies,
+                                         .checkpoint_policies    = checkpoint_policies,
+                                         .candidate_rebuild_ns   = 1000,
+                                         .target_budget          = Planner::kTargetBudget,
+                                     });
+    require(!result, "bounded shared capture search unexpectedly found a feasible pressure target");
+
+    program.required_pressure_actions = 0;
+    const auto later                  = planner.plan(program, test_cost_model(),
+                                                     Planner::Input{
+                                                         .capture                = &capture,
+                                                         .private_owners         = private_owners,
+                                                         .private_owner_ordinals = private_ordinals,
+                                                         .shared_owners          = shared_owners,
+                                                         .shared_owner_ordinals  = shared_ordinals,
+                                                         .owner_policies         = owner_policies,
+                                                         .checkpoint_policies    = checkpoint_policies,
+                                                         .candidate_rebuild_ns   = 1000,
+                                                         .target_budget          = Planner::kTargetBudget,
+                                                     });
+    require(later.has_value(),
+            "ordinary pressure capacity outcome prevented a later valid shared capture plan");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -2396,6 +2493,8 @@ int main() {
              test_observed_shared_candidate_requires_independent_domains);
     run_test("zero-prefill private promotion",
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
+    run_test("shared capture committed target bound",
+             test_shared_capture_bounds_committed_pressure_targets);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);

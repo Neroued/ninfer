@@ -659,6 +659,13 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         std::optional<Selection> selected;
         for (int destructive = 0; destructive < 2 && !selected; ++destructive) {
             for (const std::size_t owner_index : owner_order) {
+                // populate_options gives the admission's source owner no options
+                // (eviction_choices == 0), and every other owner walk skips it on that
+                // basis. Skip it here as well: proposing pressure decisions for the
+                // continuation the admission itself reuses is rejected by
+                // compose_materialization through the engine-fatal "materialization
+                // pressure owner is duplicated" contract check (#135).
+                if (options.eviction_choices[owner_index] == 0) { continue; }
                 const std::uint16_t current_choice = target.owner_choices[owner_index];
                 const PressureDecision* current =
                     current_choice == 0 ? nullptr

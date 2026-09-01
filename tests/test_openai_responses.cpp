@@ -20,7 +20,8 @@ namespace {
 using Json = nlohmann::json;
 using namespace ninfer::serve;
 
-constexpr char kReasoningSummaryPlaceholder[] = "reasoning summary is not supported";
+constexpr char kReasoningSummaryPlaceholder[] =
+    "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }

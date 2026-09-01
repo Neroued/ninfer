@@ -50,7 +50,11 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    const std::size_t workspace_bytes =
+        ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, workspace,
+                        nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -214,10 +218,12 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+#endif
     return failures;
 }
 
@@ -283,7 +289,8 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 613U));
 
-    int failures          = 0;
+    int failures = 0;
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t one = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
     const std::size_t seven = ops::gdn_input_proj_workspace_capacity_bytes(
@@ -303,12 +310,15 @@ int run_fp8() {
         std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
         ++failures;
     }
+#endif
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
+#ifndef NINFER_VOLTA_BUILD
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
+#endif
     return failures;
 }
 

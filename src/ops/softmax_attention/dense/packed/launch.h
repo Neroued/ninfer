@@ -2,6 +2,8 @@
 
 #include "core/tensor.h"
 
+#include <cstddef>
+
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {

@@ -3,9 +3,9 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
-resident model, and a startup-fixed capacity of one to eight active requests.
+single NVIDIA GeForce RTX 5090 or Tesla V100. It runs text, image, and video prompts through a local
+CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU,
+one resident model, and a startup-fixed capacity of one to eight active requests.
 
 NInfer supports five artifact identities. The quick-start commands use Qwen3.8-27B NVFP4.
 
@@ -22,10 +22,11 @@ tokenizer, chat template, and media frontend resources required by its registere
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
-newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
-`libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
+NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090 with CUDA Toolkit 13.1 or a Tesla V100
+with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg
+development libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and
+`libswscale >= 7`), and `libcurl >= 7.85`. The build accepts only `sm_120a` and `sm_70`; one binary
+targets one architecture.
 
 Build the product binaries:
 
@@ -36,6 +37,24 @@ cd ninfer
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+For a V100, select CUDA 12.8 and Volta explicitly:
+
+```bash
+cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build-v100 -j
+```
+
+The same five `.ninfer` artifacts and public Engine/CLI/serving routes are supported by both
+builds. See the [V100 port notes](docs/v100.md) for qualification and the preferred-GPU launcher.
+
+On Volta, loading an NVFP4 artifact repacks each dense MLP gate/up payload in place on the GPU into
+the QPN fragment order used by the decode kernels. The `.ninfer` file and host-side artifact bytes
+are unchanged, the device allocation remains the same size, and temporary repack storage is
+released before inference. Device-resident gate/up weights are therefore deliberately mutated at
+load; the V100 path does not retain checkpoint-native immutable layout for those payloads.
 
 Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
 target or packaged binary distribution; run NInfer from its source build tree.
@@ -111,8 +130,37 @@ reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multim
 
 ## Performance
 
-Published measurements use an RTX 5090. [Performance](docs/performance.md) records the exact
-benchmark profiles and methodology.
+The main published measurements use an RTX 5090. [Performance](docs/performance.md) records those
+benchmark profiles and methodology; [V100 port notes](docs/v100.md) records the Volta qualification.
+
+### Tesla V100 single-request generation
+
+The Qwen3.8-27B NVFP4 short-context MTP5 target round is **60.16 ms** with 5.0 licensed tokens,
+or **83.10 committed tok/s**. The preserved pre-synchronization binary measures 60.71 ms and
+82.36 tok/s under the identical ten-round procedure, so the synchronized decode-critical round is
+2.2% faster in latency and 0.9% faster in derived throughput.
+
+The complete before/after sweep used the public Engine benchmark on a Tesla V100-SXM2-32GB with
+CUDA 12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with
+CUDA Graphs and the optimized proposal head. Each result used one discarded warmup and three
+measured repetitions.
+
+| Model profile | MTP K | Prefill before / after | Decode before / after |
+|---|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 4 | 1,128.8 / **1,131.6** | 49.04 / **59.70** |
+| Qwen3.6-27B `nvfp4` | 5 | unavailable / **235.8** | unavailable / **54.71** |
+| Qwen3.8-27B `groupwise-int` | 5 | **1,127.5** / 1,123.6 | 74.64 / **75.36** |
+| Qwen3.8-27B `nvfp4` | 5 | 1,132.1 / **1,160.1** | 85.75 / **86.78** |
+| Qwen3.6-35B-A3B `groupwise-int` | 5 | 757.7 / **763.4** | 191.25 / **211.41** |
+
+The old Qwen3.6 NVFP4 binary faults during its legacy Volta W8 load path, so it has no valid
+baseline. The synchronized Qwen3.6 NVFP4 artifact uses a slower A16 prefill route; the Qwen3.8
+NVFP4 artifact uses the qualified wide-prefill route.
+
+The 35B-A3B production DFlash round sweep at a 2,048-token context selected K=3: 134.33 published
+tok/s, 93.3% draft acceptance, and 3.8 mean output tokens per round over ten measured rounds after
+two warmups. The [V100 port notes](docs/v100.md) contain the detailed before/after methodology,
+DFlash sweep, and exact interpretation of these single-request results.
 
 ### Concurrent MTP3 decode
 

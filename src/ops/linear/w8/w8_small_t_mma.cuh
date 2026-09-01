@@ -60,6 +60,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
     RowPolicy row_policy = {}) {
+// ldmatrix (sm_75+) + mma.m16n8k16 (sm_80+), same as every other tensor-core kernel this
+// port has hit. Unlike rowsplit_grouped_mma.cuh / bf16_gdn_gating_proj_gemm_mma.cuh, this
+// one genuinely IS on the decode-critical path (vocabulary/gate-up/down/attention-in-out
+// projections — see docs/v100.md), so it doesn't just get trapped and forgotten:
+// launch_w8_small_t (w8_small_t.cu) routes to the already-Volta-validated warp-per-row
+// SIMT kernel (w8_rowsplit_gemm_simt.cuh) instead below sm_80, via the NINFER_VOLTA_BUILD
+// host-side signal (CMakeLists.txt) — __CUDA_ARCH__ isn't visible in that host function,
+// so the kernel body itself still needs its own guard purely so it compiles.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     constexpr int kHidden     = Geometry::kInputRows;
     constexpr int kTileK      = Schedule::kTileKPerWarp;
     constexpr int kWarps      = Schedule::kKWarps;
@@ -342,6 +351,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             }
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)codes;
+    (void)scales;
+    (void)output;
+    (void)epilogue;
+    (void)row_policy;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

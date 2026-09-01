@@ -36,6 +36,12 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
 
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (x.ne[1] > 1) {
+        bf16_linear_add_volta_launch(x, weight, residual, stream);
+        return;
+    }
+#endif
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {
     case Bf16LinearAddScheduleId::Decode:
         bf16_linear_add_decode_launch(x, weight, residual, stream);

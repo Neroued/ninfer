@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -255,6 +256,55 @@ struct SmallTWorkspace {
     Tensor l;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
+                                std::int32_t batch_size, DType cache_dtype) {
+    const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
+                                    q_heads == CausalD256H16Kv2::QHeads;
+    return supported_geometry && batch_size == 1 &&
+           (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
+           width >= detail::kVoltaFlashMinimumWidth;
+}
+
+struct VoltaFlashWorkspace {
+    Tensor k_gathered;
+    Tensor v_gathered;
+    Tensor mask;
+    Tensor q_f32;
+    Tensor out_f32;
+    Tensor dst_meta;
+};
+
+template <class Allocator>
+VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace,
+                                                   std::int32_t q_heads,
+                                                   std::int32_t width,
+                                                   CausalAttentionExecutionEnvelope envelope) {
+    const std::int32_t kv_heads = q_heads == CausalD256H24Kv4::QHeads
+                                      ? CausalD256H24Kv4::KVHeads
+                                      : CausalD256H16Kv2::KVHeads;
+    const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
+    const std::int32_t n_kv =
+        ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
+        detail::kVoltaFlashKeyPad;
+    const std::int32_t tokens = std::min(width, detail::kVoltaFlashQBlockTokens);
+
+    return {
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16,
+                        {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        workspace.alloc(
+            DType::FP32,
+            {2, static_cast<std::int32_t>(
+                    detail::causal_attention_volta_flash_meta_elements(q_heads, tokens)),
+             1, 1}),
+    };
+}
+#endif
+
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
                                            std::int32_t tokens, std::int32_t splits,
@@ -377,7 +427,23 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::CausalAttentionRoute route =
             detail::causal_attention_resolve_route(q_heads, width, batch_size, envelope);
-        if (route == detail::CausalAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::CausalAttentionRoute::Prompt) {
+#ifdef NINFER_VOLTA_BUILD
+            if (volta_flash_route_possible(q_heads, width, batch_size, cache_dtype)) {
+                WorkspaceLayoutBuilder layout;
+                (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
+                return layout.peak_bytes(1);
+            }
+#endif
+            return std::size_t{0};
+        }
+#ifdef NINFER_VOLTA_BUILD
+        // Volta FP8 uses the exact direct kernel. INT8 has a native tensor-core small-T route
+        // which applies the registered D256 transform to both Q and newly appended K.
+        if (cache_dtype == DType::FP8_E4M3FN) {
+            return std::size_t{0};
+        }
+#endif
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
@@ -394,6 +460,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+#ifdef NINFER_VOLTA_BUILD
+    // The native targets' prompt route is workspace-free, so the interval query historically
+    // stopped at the verify frontier. Volta's registered prompt routes gather paged KV into a
+    // fixed flash-attention staging layout. Its capacity is monotone in width until the Q tile is
+    // full (and constant afterwards), making the interval's largest width the exact witness.
+    if (max_width > kMaximumVerifyTokens) {
+        maximum = std::max(maximum, exact_capacity(max_width));
+    }
+#endif
     return maximum;
 }
 
@@ -420,6 +495,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, envelope);
+#ifdef NINFER_VOLTA_BUILD
+    if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
+        volta_flash_route_possible(q.ne[1], width, batch, cache.dtype)) {
+        VoltaFlashWorkspace staging =
+            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+        detail::causal_attention_volta_flash_launch(
+            q, k, v, positions, kv_table_rows, scale, cache, envelope,
+            detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
+            staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
+        return;
+    }
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
+                                               scale, cache, out, stream);
+        return;
+    }
+#endif
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -450,6 +542,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+#ifdef NINFER_VOLTA_BUILD
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
+#endif
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;

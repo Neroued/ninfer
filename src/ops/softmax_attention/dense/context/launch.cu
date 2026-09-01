@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 #include "ops/softmax_attention/dense/context/kernel.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/dense/context/volta.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -98,6 +101,23 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                               const ContextAttentionPlan& plan, Tensor& partial_acc,
                               Tensor& partial_m, Tensor& partial_l, Tensor& out,
                               cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const dim3 grid(static_cast<unsigned>(q.ne[2]), kContextQueryQHeads,
+                    static_cast<unsigned>(q.ne[3]));
+    context_attention_volta_kernel<<<grid, kContextAttentionVoltaThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(query_k.data),
+        static_cast<const __nv_bfloat16*>(query_v.data),
+        static_cast<const std::int32_t*>(context_lengths.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(table_rows.data),
+        static_cast<const __nv_bfloat16*>(context.k_pages.data),
+        static_cast<const __nv_bfloat16*>(context.v_pages.data),
+        static_cast<const std::int32_t*>(context.block_tables.data), context.k_pages.ne[2],
+        context.block_tables.ne[0], q.ne[2], scale, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#else
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == ContextAttentionRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -180,6 +200,7 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
         }
         throw std::invalid_argument("context_softmax_attention: inconsistent plan");
     });
+#endif
 }
 
 } // namespace ninfer::ops::detail

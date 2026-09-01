@@ -43,8 +43,13 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
     }
 }
 
+#ifdef NINFER_VOLTA_BUILD
+constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::A16Only;
+constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::A16Only;
+#else
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::AllowA8;
+#endif
 
 ops::LinearPolicy text_policy(const Weight& weight) {
     switch (weight.qtype) {
@@ -161,7 +166,7 @@ void Variant::attention_projection(const Tensor& hidden,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
-                             stream);
+                             workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
@@ -210,7 +215,7 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+                            workspace, stream);
         return;
     }
     const Weight& fused =
@@ -344,7 +349,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        return ops::q4_q5_attn_input_proj_workspace_capacity_bytes(first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -384,7 +389,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        return ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);

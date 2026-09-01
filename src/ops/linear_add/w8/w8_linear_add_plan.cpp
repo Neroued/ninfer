@@ -199,6 +199,21 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     if (!w8_linear_add_admits(problem)) {
         throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // Every schedule in the tables above except SimtR8C4 and the DecodeR* family
+    // reaches the trap-stubbed mma/split-K kernels below sm_80. SimtR8C4's
+    // launcher takes the token count as a runtime argument rather than a
+    // compile-time one, so it already covers arbitrary T. Overriding here rather
+    // than adding a Volta copy of each table: the tables encode sm_120a tile
+    // preferences that have no meaning when only one kernel is legal.
+    // T=1 keeps each table's own decode schedule -- both are already SIMT, and
+    // they are what this port tuned for the 27B target, which shares this Op.
+    if (problem.cols == 1) {
+        return {problem.k == 6144 ? W8LinearAddScheduleId::DecodeR16
+                                  : W8LinearAddScheduleId::SimtR8C4};
+    }
+    return {W8LinearAddScheduleId::SimtR8C4};
+#else
     const auto resolve_from = [&](const auto& routes) -> W8LinearAddPlan {
         for (const RouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
@@ -208,6 +223,7 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
+#endif // NINFER_VOLTA_BUILD
 }
 
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,

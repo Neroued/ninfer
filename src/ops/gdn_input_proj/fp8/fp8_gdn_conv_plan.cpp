@@ -68,7 +68,7 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
                        Fp8GdnConvScheduleId schedule, WorkspaceArena& workspace,
                        cudaStream_t stream) {
     if (schedule == Fp8GdnConvScheduleId::MaterializedA16) {
-        fp8_gdn_input_a16_dispatch(x, weight, projected, z, stream);
+        fp8_gdn_input_a16_dispatch(x, weight, projected, z, &workspace, stream);
         return;
     }
     if (schedule == Fp8GdnConvScheduleId::MaterializedA8) {

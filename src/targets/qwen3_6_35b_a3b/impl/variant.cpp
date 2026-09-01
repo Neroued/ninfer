@@ -166,10 +166,16 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1] * hidden.ne[2])});
-    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
+    // The policy-bearing overload, not the convenience one: this leaf is handed a
+    // workspace and the wide-T route needs it to stage a dequantized parent. The
+    // capacity is already reported by
+    // gdn_input_projection_workspace_capacity_bytes() below, which forwards to the
+    // Op's own query.
+    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat,
+                        ops::LinearPolicy::A16Only, workspace, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(

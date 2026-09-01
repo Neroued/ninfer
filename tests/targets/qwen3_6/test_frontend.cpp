@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -87,6 +88,23 @@ std::string read_template_fixture(const char* path) {
     return source;
 }
 
+std::string official_resource_path(std::string_view filename) {
+    const char* directory = std::getenv("NINFER_QWEN3_6_FRONTEND_RESOURCES");
+    if (directory == nullptr || *directory == '\0') {
+        throw std::runtime_error(
+            "NINFER_QWEN3_6_FRONTEND_RESOURCES must name a directory containing the official "
+            "Qwen3.6 frontend JSON resources");
+    }
+    std::string path(directory);
+    if (path.back() != '/') { path.push_back('/'); }
+    path.append(filename);
+    return path;
+}
+
+std::string read_official_resource(std::string_view filename) {
+    return read_file(official_resource_path(filename).c_str());
+}
+
 const std::string& thinking_toggle_template_source() {
     static const std::string source = read_template_fixture(
         NINFER_SOURCE_DIR "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
@@ -113,11 +131,11 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_official_resource("tokenizer.json");
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_official_resource("tokenizer_config.json");
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_official_resource("generation_config.json");
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -1222,12 +1240,9 @@ int test_literal_control_tokens_with_media() {
         "leading tool result was rendered without its user-role envelope");
 
     FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    official.tokenizer_json          = read_official_resource("tokenizer.json");
+    official.tokenizer_config_json   = read_official_resource("tokenizer_config.json");
+    official.generation_config_json  = read_official_resource("generation_config.json");
     const Frontend frontend = FrontendFactory::create_component(official);
 
     auto text_part = [](std::string text) {
@@ -1373,12 +1388,9 @@ int test_image_resize_rejection_policy() {
 
 int test_explicit_leading_instruction_cache_boundary() {
     FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    official.tokenizer_json          = read_official_resource("tokenizer.json");
+    official.tokenizer_config_json   = read_official_resource("tokenizer_config.json");
+    official.generation_config_json  = read_official_resource("generation_config.json");
     const Frontend frontend           = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
     ninfer::ChatMessage system;
@@ -1622,12 +1634,9 @@ int test_terminal_flush(const Frontend& frontend) {
 
 int test_structured_tool_output() {
     FrontendResources owned = resources();
-    owned.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    owned.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    owned.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    owned.tokenizer_json          = read_official_resource("tokenizer.json");
+    owned.tokenizer_config_json   = read_official_resource("tokenizer_config.json");
+    owned.generation_config_json  = read_official_resource("generation_config.json");
     const Frontend frontend = FrontendFactory::create_component(owned);
 
     ninfer::ChatMessage message;

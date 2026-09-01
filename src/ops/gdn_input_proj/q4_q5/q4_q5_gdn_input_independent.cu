@@ -70,11 +70,21 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
         launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
         return;
     }
+#ifdef NINFER_VOLTA_BUILD
+    // GroupedMixedMmaR64C128 (the T>16 route) needs Ampere+ mma/ldmatrix and is trap-stubbed on
+    // sm_70. launch_q4_simt_route<Q4GdnSimtR8C8Schedule> is a plain SIMT dot-product kernel that
+    // already takes cols as a runtime grid parameter (div_up(cols, kColsPerTile)) with no
+    // compile-time T bound -- the T<=16 split above is a routing choice, not a kernel limit, so
+    // it generalizes to any prefill width unchanged. See docs/v100.md.
+    launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
+    return;
+#else
     if (x.ne[1] <= 16) {
         launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
+#endif
 }
 
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
@@ -161,11 +171,19 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
+#ifdef NINFER_VOLTA_BUILD
+    // Same reasoning as launch_q4 above: launch_q5_simt_r8_c8 is a plain SIMT kernel with cols
+    // as a runtime grid parameter, so it generalizes past T=16 unchanged once
+    // GroupedMixedMmaR64C128 is unavailable. See docs/v100.md.
+    launch_q5_simt_r8_c8(x, weight, value, z, stream);
+    return;
+#else
     if (x.ne[1] <= 16) {
         launch_q5_simt_r8_c8(x, weight, value, z, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
+#endif
 }
 
 void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,

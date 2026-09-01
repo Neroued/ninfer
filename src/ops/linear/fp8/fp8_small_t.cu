@@ -65,7 +65,12 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
         launch_registered<Fp8MlpGateUpGeometry>(x, weight, out, stream);
         return;
     case Fp8Problem::Vocabulary:
+#ifdef NINFER_VOLTA_BUILD
+        launch_registered<Fp8VocabularyGeometry>(x, weight, out, stream);
+        return;
+#else
         break;
+#endif
     case Fp8Problem::Residual6144:
         launch_registered<Fp8Residual6144Geometry>(x, weight, out, stream);
         return;

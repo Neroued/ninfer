@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 #include "ops/softmax_attention/sliding_window/kernel.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/sliding_window/volta.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -92,6 +95,23 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const dim3 grid(static_cast<unsigned>(q.ne[2]), kContextQueryQHeads,
+                    static_cast<unsigned>(q.ne[3]));
+    sliding_window_attention_volta_kernel<<<grid, kSlidingWindowVoltaThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(query_k.data),
+        static_cast<const __nv_bfloat16*>(query_v.data),
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const __nv_bfloat16*>(context.k.data),
+        static_cast<const __nv_bfloat16*>(context.v.data),
+        static_cast<int>(context.padded_capacity), q.ne[2], scale,
+        static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#else
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -152,6 +172,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });
+#endif
 }
 
 } // namespace ninfer::ops::detail

@@ -17,6 +17,15 @@ struct RouteSpec {
     W8LinearSwiGluScheduleId schedule;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// The DFlash MLP is W8-only and its tuned routes all use Ampere+ MMA past
+// decode. The paired SIMT kernel streams gate/up rows together and tiles any T.
+constexpr std::array<RouteSpec, 3> kRoutes{{
+    {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
+    {2, 4, W8LinearSwiGluScheduleId::SimtPairC4},
+    {5, kAnyCols, W8LinearSwiGluScheduleId::SimtPairC8},
+}};
+#else
 constexpr std::array<RouteSpec, 18> kRoutes{{
     {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
     {2, 48, W8LinearSwiGluScheduleId::SplitKMmaExactT},
@@ -37,6 +46,7 @@ constexpr std::array<RouteSpec, 18> kRoutes{{
     {513, 560, W8LinearSwiGluScheduleId::MmaR128C80},
     {561, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
 }};
+#endif
 
 constexpr bool catalog_is_closed() {
     std::int64_t expected = 1;
@@ -60,6 +70,10 @@ const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) no
     switch (schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
         return "linear_swiglu.w8.decode.pair.r16";
+    case W8LinearSwiGluScheduleId::SimtPairC4:
+        return "linear_swiglu.w8.simt.pair.c4";
+    case W8LinearSwiGluScheduleId::SimtPairC8:
+        return "linear_swiglu.w8.simt.pair.c8";
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
         return "linear_swiglu.w8.splitk.mma.pair.exact_t";
     case W8LinearSwiGluScheduleId::MmaR32C64:
@@ -85,7 +99,9 @@ const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) no
 }
 
 bool w8_linear_swiglu_schedule_uses_mma(W8LinearSwiGluScheduleId schedule) noexcept {
-    return schedule != W8LinearSwiGluScheduleId::DecodePairR16;
+    return schedule != W8LinearSwiGluScheduleId::DecodePairR16 &&
+           schedule != W8LinearSwiGluScheduleId::SimtPairC4 &&
+           schedule != W8LinearSwiGluScheduleId::SimtPairC8;
 }
 
 bool w8_linear_swiglu_admits(const W8LinearSwiGluProblem& problem) noexcept {
@@ -113,6 +129,12 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
     switch (plan.schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
         w8_linear_swiglu_decode_pair_r16_launch(x, w, out, stream);
+        return;
+    case W8LinearSwiGluScheduleId::SimtPairC4:
+        w8_linear_swiglu_simt_pair_c4_launch(x, w, out, stream);
+        return;
+    case W8LinearSwiGluScheduleId::SimtPairC8:
+        w8_linear_swiglu_simt_pair_c8_launch(x, w, out, stream);
         return;
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
         w8_linear_swiglu_splitk_exact_t_launch(x, w, out, stream);

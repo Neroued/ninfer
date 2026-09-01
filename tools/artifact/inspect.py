@@ -42,6 +42,11 @@ def main() -> None:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--objects", action="store_true", help="list every stored object")
     parser.add_argument("--json", action="store_true", help="emit the summary as JSON")
+    parser.add_argument(
+        "--resources-dir",
+        type=Path,
+        help="extract resource objects beneath this directory using their artifact names",
+    )
     args = parser.parse_args()
 
     with Artifact.open(args.artifact) as artifact:
@@ -63,6 +68,16 @@ def main() -> None:
         if args.objects:
             for obj in artifact.objects:
                 print(_object_line(obj))
+        if args.resources_dir is not None:
+            for obj in artifact.objects:
+                if not isinstance(obj, ResourceObject):
+                    continue
+                relative = Path(obj.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError(f"resource name is not a safe relative path: {obj.name}")
+                destination = args.resources_dir / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(artifact.payload(obj))
 
 
 if __name__ == "__main__":

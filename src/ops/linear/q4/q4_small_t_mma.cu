@@ -53,6 +53,13 @@ bool matches(const Tensor& x, const Weight& weight) {
 
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // q4_small_t_mma_kernel traps below sm_80 (see q4_small_t_mma.cuh) — this is a plain,
+    // unfused projection (draft-head logits), so unlike linear_swiglu's fused case, it maps
+    // directly onto the already-validated generic q4 SIMT kernel with no composition needed.
+    launch_q4_simt_r8_c8(x, weight, out, stream);
+    return;
+#endif
     if (matches<FullGeometry>(x, weight) && x.ne[1] <= kLastFullT) {
         kFullLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstSmallT)](x, weight, out, stream);
         return;

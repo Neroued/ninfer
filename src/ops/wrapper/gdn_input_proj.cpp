@@ -344,7 +344,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_w8_rowsplit(weight, kRows, "query/key/value/z weight");
-    detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
+    detail::w8_gdn_input_dispatch(x, weight, qkv, z, workspace, stream);
 }
 
 detail::Q4Q5GdnInputConvPlan resolve_q4_q5_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
@@ -707,6 +707,14 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
     const detail::W8GdnInputConvPlan plan = resolve_w8_conv_plan(geometry.width, geometry.batch);
+    if (plan.schedule == detail::W8GdnInputConvScheduleId::Materialized) {
+        compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
+                       query, key, value, z, geometry, workspace, stream,
+                       [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                           gdn_input_proj(x_flat, weight, record_flat, z_flat, stream);
+                       });
+        return;
+    }
     if (plan.schedule != detail::W8GdnInputConvScheduleId::SplitKMmaFused) {
         throw std::logic_error("W8 ReplaySSM record domain selected a non-record schedule");
     }
@@ -718,7 +726,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 } // namespace
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -733,7 +741,12 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, workspace, stream);
+}
+
+std::size_t q4_q5_gdn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                           std::int32_t max_tokens) {
+    return detail::q4_q5_gdn_input_capacity_workspace_bytes(min_tokens, max_tokens);
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -766,7 +779,10 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
         (void)detail::w8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
-        return 0;
+        // Zero for every schedule that computes in place; the Volta CUTLASS route
+        // stages a dequantized [12288,2048] parent plus the activation cast, and
+        // that has to be declared here or the arena rejects it at run time.
+        return detail::w8_gdn_input_workspace_bytes(min_tokens, max_tokens);
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
@@ -800,7 +816,16 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             (void)resolve_w8_conv_plan(min_width, batch_size);
             (void)resolve_w8_conv_plan(max_width, batch_size);
         }
-        return composed_snapshot_capacity(channels, batch_size * max_width, 0);
+        // The composed path's `projected` buffer stays live across the nested
+        // gdn_input_proj(..., projected, ...) call inside its lambda (see
+        // compose_batched_snapshot), so that call's own transient need (nonzero only on Volta
+        // wide-T) must be added on top, not just sized for `projected` alone.
+        const std::size_t projection_workspace =
+            q4_q5 ? detail::q4_q5_gdn_input_capacity_workspace_bytes(
+                        batch_size * min_width, batch_size * max_width)
+                  : 0;
+        return composed_snapshot_capacity(channels, batch_size * max_width,
+                                          projection_workspace);
     }
 
     std::int32_t largest_materialized_width = 0;
@@ -815,11 +840,22 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);
         (void)resolve_w8_conv_plan(max_width, 1);
+#ifdef NINFER_VOLTA_BUILD
+        if (max_width >= 2) { largest_materialized_width = max_width; }
+#else
         if (max_width >= 17) { largest_materialized_width = max_width; }
+#endif // NINFER_VOLTA_BUILD
     }
     if (largest_materialized_width == 0) { return 0; }
+    // Same nesting concern as the batch_size>1 branch above: `scratch.projected` stays live
+    // across the nested gdn_input_proj(..., scratch.projected, ...) call (see the
+    // Materialized branch of gdn_input_proj_conv_snapshot), so add its own transient need.
+    const std::size_t projection_workspace =
+        q4_q5 ? detail::q4_q5_gdn_input_capacity_workspace_bytes(1, largest_materialized_width)
+              : 0;
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
+    if (projection_workspace != 0) { (void)layout.alloc_bytes(projection_workspace); }
     return layout.peak_bytes(1);
 }
 
@@ -866,10 +902,16 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, batch_size);
         (void)resolve_q4_q5_conv_plan(max_width, batch_size);
-    } else {
-        (void)resolve_w8_conv_plan(min_width, batch_size);
-        (void)resolve_w8_conv_plan(max_width, batch_size);
+        // The ProjectionEpilogueFused branch and W8 need nothing, but the Materialized
+        // fallback's nested gdn_input_proj(..., record_flat, z_flat, ...) call (see
+        // compose_record) writes directly into caller-owned conv_record -- no outer
+        // "projected" buffer here, unlike the snapshot path -- but still has its own
+        // transient need on Volta wide-T (the CUTLASS route), which must be reported.
+        return detail::q4_q5_gdn_input_capacity_workspace_bytes(batch_size * min_width,
+                                                                 batch_size * max_width);
     }
+    (void)resolve_w8_conv_plan(min_width, batch_size);
+    (void)resolve_w8_conv_plan(max_width, batch_size);
     return 0;
 }
 
@@ -900,7 +942,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(detail::kNvfp4InternalPolicy,
                                                                 std::max(min_width, 4), max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
@@ -940,7 +982,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
+                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, ws, stream);
             });
         return;
     }
@@ -956,7 +998,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
-    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, ws, stream);
     detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                valid_columns, initial_state_slots,
                                                snapshot_base_slots, query, key, value, stream);
@@ -1005,7 +1047,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
+                                      workspace, stream);
                    });
 }
 

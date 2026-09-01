@@ -11,6 +11,8 @@ namespace ninfer::ops::detail {
 
 enum class W8LinearSwiGluScheduleId {
     DecodePairR16,
+    SimtPairC4,
+    SimtPairC8,
     SplitKMmaExactT,
     MmaR32C64,
     MmaR32C80,

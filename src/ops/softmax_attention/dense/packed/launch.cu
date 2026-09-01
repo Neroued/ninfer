@@ -2,6 +2,9 @@
 
 #include "ops/softmax_attention/dense/packed/kernel.cuh"
 #include "core/device.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/dense/packed/volta.cuh"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -36,6 +39,19 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
 void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const dim3 grid(static_cast<unsigned>(q.ne[2]), kPackedAttentionHeads, 1u);
+    packed_attention_volta_kernel<<<grid, kPackedAttentionVoltaThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const std::int32_t*>(cu_seqlens.data), cu_seqlens.ne[0] - 1, 0, q.ne[2],
+        static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
+        stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1),
+        stride_elements(k, 2), stride_elements(v, 0), stride_elements(v, 1),
+        stride_elements(v, 2));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#else
     const bool packed_segments = tiles != nullptr;
     const int max_tiles =
         packed_segments ? tiles->ne[1] : (q.ne[2] + kPackedAttentionBr - 1) / kPackedAttentionBr;
@@ -49,6 +65,7 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
     launch_flash<kPackedAttentionBr, kPackedAttentionBc>(
         q, k, v, packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr,
         0, max_tiles, out, stream);
+#endif
 }
 
 std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
@@ -75,6 +92,18 @@ std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
 void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k, const Tensor& v,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const dim3 grid(static_cast<unsigned>(q.ne[2]), kPackedAttentionHeads, 1u);
+    packed_attention_volta_kernel<<<grid, kPackedAttentionVoltaThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), nullptr, 0, segment_length, q.ne[2],
+        static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
+        stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1),
+        stride_elements(k, 2), stride_elements(v, 0), stride_elements(v, 1),
+        stride_elements(v, 2));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#else
     const std::int32_t segments    = q.ne[2] / segment_length;
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
     switch (tile_size) {
@@ -90,6 +119,7 @@ void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
     default:
         throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");
     }
+#endif
 }
 
 void packed_attention_uniform_launch(const Tensor& q, const Tensor& k, const Tensor& v,

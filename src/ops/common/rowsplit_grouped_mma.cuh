@@ -38,6 +38,18 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     const __nv_bfloat16* __restrict__ x, RowSplitGroupedMmaJob job0, RowSplitGroupedMmaJob job1,
     RowSplitGroupedMmaJob job2, RowSplitGroupedMmaJob job3, std::int32_t k, std::int32_t t,
     std::int32_t padded_k) {
+// This kernel only ever gets dispatched for wide column counts (T >= 17 in the current
+// attn/gdn input-projection routing tables) — batched/prefill-shaped work that's out of
+// scope for the decode-only Volta MVP (on V100). The narrow-T path those same
+// tables route to for decode (T <= 16) already runs on q4/q5's plain SIMT rowsplit
+// kernels, which are Volta-validated. Rather than leave this genuinely unreachable-on-
+// Volta kernel unported (which would fail the whole ninfer_ops static-library build,
+// since every .cu file has to compile for the target to link at all), it gets a loud
+// stub below sm_80 instead of a real port: __trap() so an accidental call — e.g. someone
+// wiring up prefill on Volta later without checking this — fails immediately and
+// obviously, instead of silently reading tensor-core PTX that was never actually taught
+// to run here and producing garbage.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
@@ -350,6 +362,17 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             }
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)job0;
+    (void)job1;
+    (void)job2;
+    (void)job3;
+    (void)k;
+    (void)t;
+    (void)padded_k;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

@@ -34,6 +34,10 @@ void bf16_linear_add_aggregate_mma_launch(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream);
 void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 cudaStream_t stream);
+#ifdef NINFER_VOLTA_BUILD
+void bf16_linear_add_volta_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  cudaStream_t stream);
+#endif
 
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream);

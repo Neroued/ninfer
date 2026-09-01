@@ -109,10 +109,15 @@ __device__ __forceinline__ void q4_simt_issue_stage(uint4* __restrict__ shared_c
     cp_commit();
 }
 
+// `x_origin` already points at this stage's first K element of column 0 of the tile, and
+// `x_col_stride` is the element distance between consecutive columns. That indirection lets the
+// same body serve either a direct global-memory read (origin = x + col0*k + stage*kStageK,
+// stride = k) or a block-staged shared-memory read (origin = the shared tile, stride = kStageK)
+// without duplicating the dequant/FMA math -- see the staging rationale in the kernel below.
 template <class Schedule, bool FullStage, bool FullCols>
 __device__ __forceinline__ void
-q4_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int col0,
-                      int active_cols, int stage, int active_groups,
+q4_simt_consume_stage(const __nv_bfloat16* __restrict__ x_origin, std::int64_t x_col_stride,
+                      int active_cols, int active_groups,
                       const uint4* __restrict__ shared_codes,
                       const std::uint32_t* __restrict__ shared_scales, int lane,
                       float (&acc)[Schedule::kColsPerTile]) {
@@ -133,13 +138,13 @@ q4_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int c
             float weights[8];
             Q4SimtDecodeAtom::decode_eight(packed, scale_bits, weights);
 
-            const std::int64_t xk = static_cast<std::int64_t>(stage) * Schedule::kStageK +
-                                    static_cast<std::int64_t>(phase) * 256 + lane * 8;
+            const std::int64_t xk = static_cast<std::int64_t>(phase) * 256 + lane * 8;
 #pragma unroll
             for (int col = 0; col < kCols; ++col) {
                 if (FullCols || col < active_cols) {
                     const uint4 values =
-                        load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * k + xk);
+                        load_vec<uint4>(x_origin + static_cast<std::int64_t>(col) * x_col_stride +
+                                        xk);
                     const float2 x0 = bf16x2_bits_to_float2(values.x);
                     const float2 x1 = bf16x2_bits_to_float2(values.y);
                     const float2 x2 = bf16x2_bits_to_float2(values.z);
@@ -220,13 +225,28 @@ __global__ __launch_bounds__(
     __shared__ __align__(16) uint4 shared_codes[kRowsPerCta][kPipelineStages][kCodeVecsPerStage];
     __shared__ __align__(16)
         std::uint32_t shared_scales[kRowsPerCta][kPipelineStages][kScalePairsPerStage];
+#ifdef NINFER_VOLTA_BUILD
+    // One stage's K-slice of activations for the whole column tile, shared by every warp in the
+    // CTA. kColsPerTile x kStageK x 2B = 16 KiB at the widest (C8) schedule, on top of the
+    // ~8.5 KiB of code/scale staging -- still inside the 48 KiB static budget, and free in
+    // occupancy terms because this kernel is register-limited (ncu: Block Limit Registers 2)
+    // well before shared memory binds.
+    __shared__ __align__(16) __nv_bfloat16 x_stage[kColsPerTile * Schedule::kStageK];
+    static_assert(kColsPerTile * Schedule::kStageK * static_cast<int>(sizeof(__nv_bfloat16)) +
+                          Schedule::kSharedBytes <=
+                      48 * 1024,
+                  "Q4 SIMT activation staging must fit the static shared budget");
+#endif
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row  = static_cast<int>(blockIdx.x) * kRowsPerCta + warp;
-    if constexpr (!kFull) {
-        if (row >= rows) { return; }
-    }
+    // A warp whose row is past the end must NOT return early: the activation staging below is a
+    // block-wide cooperative step with __syncthreads(), and an early return would deadlock the
+    // barrier for the surviving warps. Instead the row is clamped to a valid one (so every load
+    // stays in bounds) and only the epilogue store is suppressed.
+    const bool row_active = kFull || row < rows;
+    const int safe_row    = row_active ? row : (rows > 0 ? rows - 1 : 0);
 
     const int col0        = static_cast<int>(blockIdx.y) * kColsPerTile;
     const int active_cols = kFull ? kColsPerTile : min(kColsPerTile, cols - col0);
@@ -236,9 +256,9 @@ __global__ __launch_bounds__(
     const int stages =
         kFull ? groups / kGroupsPerStage : (groups + kGroupsPerStage - 1) / kGroupsPerStage;
 
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * padded_groups *
+    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(safe_row) * padded_groups *
                                                Q4RowSplitStorage::kCodeBytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * padded_groups *
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(safe_row) * padded_groups *
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
 
     float acc[kColsPerTile];
@@ -278,10 +298,41 @@ __global__ __launch_bounds__(
         const int active_groups =
             kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - stage * kGroupsPerStage);
         const int buffer = stage % kPipelineStages;
-        q4_simt_consume_stage<Schedule, kFull, kFull>(x, k, col0, active_cols, stage, active_groups,
-                                                      shared_codes[warp][buffer],
+#ifdef NINFER_VOLTA_BUILD
+        // Every warp in this CTA owns a different output row but reads the *same* activation
+        // slice, so reading x straight from global (as the pre-staging code did, once per column
+        // per phase per warp) costs kRowsPerCta-fold redundant L1/LSU traffic -- ~30x the weight
+        // traffic at this op's shapes, and the single structural difference between this kernel
+        // and the much more efficient T=1 GEMV sibling (which stages x in shared). Staging the
+        // stage's K-slice once per CTA collapses that to a single read. bf16 is kept as the
+        // staged type so the consume path's uint4 vector loads and its exact bf16->float
+        // conversion are both bit-for-bit unchanged -- this is a pure traffic optimisation with
+        // no numerical effect, unlike the HFMA2/dp4a experiments recorded in the V100 implementation.
+        __syncthreads();
+        {
+            const int staged_vecs = (active_groups * Q4RowSplitStorage::kGroupK) / 8;
+            const std::int64_t src_k0 = static_cast<std::int64_t>(stage) * Schedule::kStageK;
+            for (int i = static_cast<int>(threadIdx.x); i < active_cols * staged_vecs;
+                 i += static_cast<int>(blockDim.x)) {
+                const int col = i / staged_vecs;
+                const int j   = i - col * staged_vecs;
+                const uint4 v = load_vec<uint4>(
+                    x + static_cast<std::int64_t>(col0 + col) * k + src_k0 + j * 8);
+                *reinterpret_cast<uint4*>(&x_stage[col * Schedule::kStageK + j * 8]) = v;
+            }
+        }
+        __syncthreads();
+        q4_simt_consume_stage<Schedule, kFull, kFull>(x_stage, Schedule::kStageK, active_cols,
+                                                      active_groups, shared_codes[warp][buffer],
                                                       shared_scales[warp][buffer], lane, acc);
+        __syncthreads();
+#else
+        q4_simt_consume_stage<Schedule, kFull, kFull>(
+            x + static_cast<std::int64_t>(col0) * k + static_cast<std::int64_t>(stage) * Schedule::kStageK,
+            k, active_cols, active_groups, shared_codes[warp][buffer],
+            shared_scales[warp][buffer], lane, acc);
         __syncwarp();
+#endif
     }
 
     if constexpr (std::is_same_v<Epilogue, Q4SimtStoreEpilogue>) {
@@ -289,7 +340,7 @@ __global__ __launch_bounds__(
         for (int col = 0; col < kColsPerTile; ++col) {
             if (kFull || col < active_cols) {
                 const float sum = warp_reduce_sum(acc[col]);
-                if (lane == 0) {
+                if (lane == 0 && row_active) {
                     if constexpr (SplitOutput) {
                         if (row < SplitRow) {
                             out[static_cast<std::int64_t>(col0 + col) * out_ld + row] =
@@ -311,7 +362,7 @@ __global__ __launch_bounds__(
         for (int col = 0; col < kColsPerTile; ++col) {
             sums[col] = (kFull || col < active_cols) ? warp_reduce_sum(acc[col]) : 0.0F;
         }
-        if (lane == 0) {
+        if (lane == 0 && row_active) {
             epilogue.template operator()<SplitOutput, SplitRow>(out, out_tail, out_ld, out_tail_ld,
                                                                 row, col0, active_cols, sums);
         }

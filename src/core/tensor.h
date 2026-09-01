@@ -44,6 +44,7 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    VoltaQpnPrepacked   = 4,
 };
 
 struct Weight {

@@ -221,6 +221,13 @@ struct Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8VocabularyGeometry> {
+    using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+};
+#endif
+
 template <>
 struct Fp8LinearDecodeProductionSchedule<Fp8Residual6144Geometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
@@ -252,6 +259,11 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
 
+#ifdef NINFER_VOLTA_BUILD
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyGeometry> = kFp8LastSmallT;
+#endif
+
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
     case Fp8Problem::AttnInput:
@@ -261,7 +273,11 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     case Fp8Problem::MlpGateUp:
         return kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
     case Fp8Problem::Vocabulary:
+#ifdef NINFER_VOLTA_BUILD
+        return kFp8LinearSmallTMax<Fp8VocabularyGeometry>;
+#else
         break;
+#endif
     case Fp8Problem::Residual6144:
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:

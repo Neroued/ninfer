@@ -28,12 +28,17 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
 // Exact contraction mechanisms shared by G1/G2/G3. Semantic Ops own their route frontier and
 // call one of these launchers after resolving their complete-form plan.
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                cudaStream_t stream);
+                                WorkspaceArena* workspace, cudaStream_t stream);
 
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                WorkspaceArena& workspace, cudaStream_t stream);
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
+
+#ifdef NINFER_VOLTA_BUILD
+void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream);
+#endif
 
 } // namespace ninfer::ops::detail

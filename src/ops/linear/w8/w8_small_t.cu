@@ -60,6 +60,17 @@ constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeo
 } // namespace
 
 void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // w8_small_t_mma_kernel's tensor-core path (ldmatrix + mma.m16n8k16) traps below sm_80
+    // (see w8_small_t_mma.cuh) — it doesn't have a Volta body at all, unlike the other
+    // trap-stubbed kernels in this port, since this one is genuinely decode-critical.
+    // Route through the already-validated, fully general warp-per-row SIMT kernel instead:
+    // w8_rowsplit_gemm_simt_kernel handles any T via for_each_token_slice (see
+    // w8_rowsplit_gemm_simt.cu), it just isn't the *fastest* choice for this T range on
+    // sm_120a, which is why the mma table exists there in the first place.
+    launch_w8_simt_r8_c8(x, weight, out, stream);
+    return;
+#endif
     if (weight.n == W8VocabularyProjectionGeometry::kOutputRows &&
         weight.k == W8VocabularyProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8VocabularyProjectionGeometry::kInputRows &&

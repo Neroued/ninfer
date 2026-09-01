@@ -87,6 +87,12 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+#ifdef NINFER_VOLTA_BUILD
+    const std::array invocations{
+        Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{4, ops::LinearPolicy::A16Only},
+    };
+#else
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
@@ -95,6 +101,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
     };
+#endif
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;

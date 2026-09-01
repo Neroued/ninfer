@@ -18,10 +18,10 @@
 //     ownership.
 //   - W8 bytes are converted to FP32 and scaled per 32-value group.
 //     fp32 FMA into per-column accumulators; warp-shuffle reduction per column.
-//   - kTt is 4 or 8 only. Larger column tiles blow past the register budget
-//     (kTt=16 needs ~98 regs -> 2 blocks/SM -> latency-bound at ~20% of DRAM),
-//     so T > 8 re-streams the weights once per 8-column tile instead; the mma
-//     tensor-core GEMM takes over where that stops winning.
+//   - The per-warp tile is 4 or 8 only. A 16-column accumulator tile blows past the register
+//     budget (~98 regs), so the Volta wide route instead pairs two C8 warps on one output row.
+//     This keeps the proven register footprint while placing duplicate weight fetches in the
+//     same CTA/L1 working set. T > 16 is sliced in whole paired tiles.
 //
 // Correctness for arbitrary shapes: full 1024-value slabs require k % 8 == 0
 // (16-byte aligned x columns) and cover [0, k/1024*1024); every remaining group
@@ -144,9 +144,23 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
-template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full,
-          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput>
-__global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
+template <class Schedule, int ColsPerWarp, int WarpsPerCta, int PipelineStages, bool Full,
+          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput,
+          int ColWarpsPerRow = 1>
+__global__
+#ifdef NINFER_VOLTA_BUILD
+// ncu measured this kernel (the w8 vocab/lm-head projection, N=248320) at 81 registers/thread,
+// Block Limit Registers=2, Theoretical Occupancy only 25% -- no __launch_bounds__ existed here
+// at all before this. Swept minBlocks 3/4/5/6/8 (each measured via ncu occupancy + nsys/decode
+// speed + byte-identical correctness across 3 prompts and MTP): monotonic improvement through 5
+// (paired with the shared-memory carveout request in the launcher below, without which shared
+// memory co-limits back down to whatever registers alone would give), roughly flat 5->6, then a
+// real regression at 8 (too tight a register squeeze, same shape of failure round 2 hit on a
+// different kernel). 5 is the plateau's conservative edge. Net win, both paths, same prompt:
+// MTP 33.33 -> ~36.2 tok/s (+8.6%), non-MTP 31.35 -> ~32.35 tok/s (+3.2%).
+__launch_bounds__(WarpsPerCta * 32, 5)
+#endif
+void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ scales, Output output,
                                              std::int32_t rows, std::int32_t k, std::int32_t cols,
@@ -154,21 +168,26 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     using Codec                = typename Schedule::Codec;
     constexpr int kPrefetch    = PipelineStages - 1;
     constexpr int kHighU4Alloc = Schedule::kHighU4 > 0 ? Schedule::kHighU4 : 1;
+    constexpr int kRowsPerCta  = WarpsPerCta / ColWarpsPerRow;
+    constexpr int kColsPerCta  = ColsPerWarp * ColWarpsPerRow;
+    static_assert(ColWarpsPerRow > 0 && WarpsPerCta % ColWarpsPerRow == 0);
 
-    __shared__ __align__(16) uint4 s_nib[RowsPerCta][PipelineStages][Schedule::kNibU4];
-    __shared__ __align__(16) uint4 s_hi[RowsPerCta][PipelineStages][kHighU4Alloc];
-    __shared__ __align__(16) std::uint32_t s_sc[RowsPerCta][PipelineStages][Schedule::kScaleU32];
+    __shared__ __align__(16) uint4 s_nib[WarpsPerCta][PipelineStages][Schedule::kNibU4];
+    __shared__ __align__(16) uint4 s_hi[WarpsPerCta][PipelineStages][kHighU4Alloc];
+    __shared__ __align__(16) std::uint32_t s_sc[WarpsPerCta][PipelineStages][Schedule::kScaleU32];
 
-    const int lane     = static_cast<int>(threadIdx.x) & 31;
-    const int warp     = static_cast<int>(threadIdx.x) >> 5;
-    const int cta_row0 = static_cast<int>(blockIdx.x) * RowsPerCta;
-    const int row      = cta_row0 + warp;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int row_warp    = warp / ColWarpsPerRow;
+    const int column_warp = warp - row_warp * ColWarpsPerRow;
+    const int cta_row0    = static_cast<int>(blockIdx.x) * kRowsPerCta;
+    const int row         = cta_row0 + row_warp;
     if constexpr (!Full) {
         if (row >= rows) { return; }
     }
     const W8OutputTile output_tile = output.tile(cta_row0);
-    const int col0                 = static_cast<int>(blockIdx.y) * ColsPerTile;
-    const int ncols                = Full ? ColsPerTile : min(ColsPerTile, cols - col0);
+    const int col0  = static_cast<int>(blockIdx.y) * kColsPerCta + column_warp * ColsPerWarp;
+    const int ncols = Full ? ColsPerWarp : max(0, min(ColsPerWarp, cols - col0));
 
     const int kg_padded           = padded_k / Codec::kGroupK;
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
@@ -176,9 +195,9 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
     const __nv_bfloat16* x0       = x + static_cast<std::int64_t>(col0) * k;
 
-    float acc[ColsPerTile];
+    float acc[ColsPerWarp];
 #pragma unroll
-    for (int i = 0; i < ColsPerTile; ++i) { acc[i] = 0.0f; }
+    for (int i = 0; i < ColsPerWarp; ++i) { acc[i] = 0.0f; }
 
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
@@ -204,7 +223,7 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         __syncwarp();
 
         const int buf = s % PipelineStages;
-        w8_simt_consume_slab<Schedule, ColsPerTile>(x0, static_cast<std::int64_t>(s) * 1024, k,
+        w8_simt_consume_slab<Schedule, ColsPerWarp>(x0, static_cast<std::int64_t>(s) * 1024, k,
                                                     ncols, s_nib[warp][buf], s_hi[warp][buf],
                                                     s_sc[warp][buf], lane, acc);
         __syncwarp();
@@ -221,7 +240,7 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         Codec::load_pair(codes, nullptr, scales, static_cast<std::int64_t>(row) * kg_padded + g,
                          lane, w0, w1);
 #pragma unroll
-        for (int tt = 0; tt < ColsPerTile; ++tt) {
+        for (int tt = 0; tt < ColsPerWarp; ++tt) {
             if (tt < ncols) {
                 const std::int64_t xb = static_cast<std::int64_t>(tt) * k + kk;
                 acc[tt]               = fmaf(w0, __bfloat162float(x0[xb]), acc[tt]);
@@ -231,7 +250,7 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     }
 
 #pragma unroll
-    for (int tt = 0; tt < ColsPerTile; ++tt) {
+    for (int tt = 0; tt < ColsPerWarp; ++tt) {
         if (tt >= ncols) { continue; }
         float a = acc[tt];
         a       = warp_reduce_sum(a);

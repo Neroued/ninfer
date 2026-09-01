@@ -211,6 +211,13 @@ int run(const Options& options) {
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
+    engine.context_cache.enabled                = false;
+    engine.context_cache.device_state_slots     = 0;
+    engine.context_cache.host_state_slots       = 0;
+    engine.context_cache.host_kv_capacity_bytes = 0;
+    engine.context_cache.max_private_continuations = options.batch_size;
+    engine.context_cache.max_shared_prefixes               = 0;
+    engine.context_cache.max_long_anchors_per_continuation = 0;
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);

@@ -1,6 +1,9 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -164,6 +167,11 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     DensePostMixerPayload out;
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
+#ifdef NINFER_VOLTA_BUILD
+    if (out.gate_up.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+    }
+#endif
     return out;
 }
 

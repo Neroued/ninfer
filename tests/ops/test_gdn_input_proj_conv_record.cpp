@@ -352,10 +352,12 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
+#ifndef NINFER_VOLTA_BUILD
     failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
     failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+#endif
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
@@ -527,15 +529,19 @@ int run_fp8() {
     failures += run_fp8_oracle_case(parent, 3, 1, {2}, ops::LinearPolicy::A16Only, 1721U);
     failures += run_fp8_oracle_case(parent, 4, 1, {}, ops::LinearPolicy::A16Only, 1731U);
     failures += run_fp8_oracle_case(parent, 6, 1, {5}, ops::LinearPolicy::A16Only, 1741U);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_oracle_case(parent, 7, 1, {}, ops::LinearPolicy::AllowA8, 1751U);
     failures += run_fp8_oracle_case(parent, 9, 1, {7}, ops::LinearPolicy::AllowA8, 1761U);
     failures += run_fp8_oracle_case(parent, 10, 1, {}, ops::LinearPolicy::AllowA8, 1771U);
+#endif
     failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
     failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
     failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);
     failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
                                     ops::LinearPolicy::AllowA8, 1821U);
+#endif
     return failures;
 }
 
@@ -547,7 +553,8 @@ int main() {
         return 77;
     }
 
-    int failures                   = 0;
+    int failures = 0;
+#ifndef NINFER_VOLTA_BUILD
     const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                         std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -563,6 +570,7 @@ int main() {
         std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+#endif
     failures += run_q4_q5();
     failures += run_w8();
     failures += run_nvfp4();

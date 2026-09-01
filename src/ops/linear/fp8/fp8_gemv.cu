@@ -42,7 +42,12 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
         launch_exact<Fp8MlpGateUpGeometry>(x, weight, out, stream);
         return;
     case Fp8Problem::Vocabulary:
+#ifdef NINFER_VOLTA_BUILD
+        launch_exact<Fp8VocabularyGeometry>(x, weight, out, stream);
+        return;
+#else
         break;
+#endif
     case Fp8Problem::Residual6144:
         launch_exact<Fp8Residual6144Geometry>(x, weight, out, stream);
         return;

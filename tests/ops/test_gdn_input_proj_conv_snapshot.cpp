@@ -786,6 +786,7 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
@@ -820,6 +821,7 @@ int run_nvfp4() {
                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
+#endif
     return failures;
 }
 
@@ -941,10 +943,13 @@ int run_fp8() {
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+#endif
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
@@ -982,6 +987,7 @@ int run_fp8() {
     failures += run_batched(4, 2, {4, 2}, 937U);
     failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
     failures += parent.verify_preserved("batched FP8 parent weight");
+#endif
     return failures;
 }
 
@@ -994,6 +1000,7 @@ int main() {
     }
 
     int failures = 0;
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
     const std::size_t q4_witness =
@@ -1044,6 +1051,7 @@ int main() {
         std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+#endif
     failures += run_q4_q5();
     failures += run_w8();
     failures += run_nvfp4();

@@ -1,9 +1,21 @@
 #pragma once
 
+#include "ninfer/ops/linear.h"
+
 #include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+// Several NVFP4 plans drive a sub-projection internally and choose the policy themselves rather
+// than taking the caller's, so a target that asks for A16 cannot reach them. On Volta the A4
+// route is a __trap() -- cvt.e2m1x2 is Blackwell hardware and always will be -- so those internal
+// choices have to collapse to A16 here. See docs/v100.md.
+#ifdef NINFER_VOLTA_BUILD
+inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::A16Only;
+#else
+inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::AllowA4;
+#endif
 
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
@@ -170,6 +182,32 @@ struct Nvfp4LinearDecodeProductionSchedule {
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 
+#ifdef NINFER_VOLTA_BUILD
+// Qualified Volta schedule shared by all five registered geometries. Their common performance
+// envelope does not justify per-geometry specializations.
+//
+// The whole envelope is per-thread register footprint. Values-per-lane 8 rather than 16 is
+// worth 2.1x at T=13 and 4.3x at T=32; with 16 values a 16-warp CTA cannot be resident at all
+// past T=13, while with 8 it is the fastest choice at T=14..20. Accumulator chains were swept
+// and never won: unlike the tensor-core routes this kernel is not dependency-bound.
+template <class Geometry, int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule {
+    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
+    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static constexpr int kWarpsPerCta   = ActiveTokens <= 3    ? 16
+                                          : ActiveTokens <= 13 ? 4
+                                          : ActiveTokens <= 20 ? 16
+                                                               : 4;
+    static constexpr int kValuesPerLane = ActiveTokens <= 3 ? 16 : 8;
+    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    using Type =
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+};
+
+#else // NINFER_VOLTA_BUILD
+
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
 // through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
 // are measured occupancy/register crossovers, not semantic frontiers.
@@ -233,5 +271,7 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
                             Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
+
+#endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

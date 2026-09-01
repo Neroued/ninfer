@@ -280,12 +280,17 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
+    const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
+    const std::size_t workspace_bytes =
+        ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(min_tokens, max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
     const auto make_launch = [&](std::int32_t tokens) {
         return [&, tokens](cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, workspace,
+                                launch_stream);
         };
     };
     measure_points(

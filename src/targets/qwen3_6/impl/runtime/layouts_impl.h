@@ -646,8 +646,15 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
+    // sm_70 (Volta) is additionally accepted here: this port replaced every reachable
+    // Ampere+/Hopper+/Blackwell-only kernel in the Text + plain-MTP path (bf16/int8 KV,
+    // GQA decode, w8 groupwise-int linear/attn/GDN, MTP draft head) with validated SIMT
+    // equivalents -- see docs/v100.md. Vision and DFlash remain gated separately
+    // above/elsewhere and nvfp4 kernels stay permanently trap-stubbed on sm_70, so this
+    // does not open any path this port hasn't actually covered.
+    if (device.sm() != 120 && device.sm() != 70) {
+        throw std::invalid_argument(
+            "Qwen3.6 family runtime requires compute capability 12.0 (or 7.0 on the Volta port)");
     }
 }
 

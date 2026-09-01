@@ -37,10 +37,20 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   `workspace` is caller-owned call-scoped transient storage sized by
+ *   q4_q5_gdn_input_proj_workspace_capacity_bytes(). It must not overlap the input, either
+ *   parent weight, or either output. Most registered routes need no transient allocation; only
+ *   wide-T Volta builds do (a real tensor-core GEMM path).
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream);
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Transient workspace capacity gdn_input_proj(x, qk_weight, value_z_weight, ...) needs across
+ * the given closed token interval [min_tokens, max_tokens].
+ */
+[[nodiscard]] std::size_t
+q4_q5_gdn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Single-parent GDN projection. Registered parent forms are:

@@ -79,4 +79,21 @@ void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor&
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
+inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
+inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
+inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
+
+std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads,
+                                                       std::int32_t tokens);
+
+void causal_attention_volta_flash_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t q_block_tokens,
+    Tensor& k_gathered, Tensor& v_gathered, Tensor& mask, Tensor& q_f32,
+    Tensor& out_f32, Tensor& dst_meta, Tensor& out, cudaStream_t stream);
+#endif
+
 } // namespace ninfer::ops::detail

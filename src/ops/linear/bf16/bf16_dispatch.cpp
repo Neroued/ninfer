@@ -17,7 +17,11 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     const std::int32_t small_t_end =
         n == 5120 ? kBf16SmallTMaxTokens : kBf16LinearSmallTDispatchEnd;
     if (t <= small_t_end) { return launch_bf16_small_t; }
+#ifdef NINFER_VOLTA_BUILD
+    return launch_bf16_cutlass_sm70;
+#else
     return launch_bf16_mma;
+#endif
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

@@ -103,8 +103,11 @@ RoundMeasurement measure_round(target::Package::Program& program, ninfer::Device
                                target::Package::SequenceHandle sequence,
                                std::uint32_t draft_tokens) {
     const std::array<target::Package::SequenceHandle, 1> sequences{sequence};
+    // Serving supplies the request's full remaining output budget. Keep enough room for this
+    // verify/commit and the following proposal; an exact K+1 budget changes the next-round
+    // proposal extent and does not represent steady generation.
     const std::array<ninfer::runtime::RoundBudget, 1> budgets{
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
+        ninfer::runtime::RoundBudget{.generated_tokens_remaining = 4 * (draft_tokens + 1)}};
     ninfer::CudaEventTimer timer(device);
     timer.start();
     auto pending                 = program.decode(sequences, budgets);
@@ -130,10 +133,10 @@ int run(const Options& options) {
     ninfer::EngineOptions engine;
     engine.artifact_path       = options.artifact;
     engine.device              = options.device;
-    engine.max_context         = static_cast<std::uint32_t>(seed.size() + 64ULL +
-                                                            static_cast<std::uint64_t>(measured_rounds) *
-                                                                (options.draft_tokens + 1ULL) +
-                                                            2ULL * options.draft_tokens);
+    const std::uint64_t budget_rounds = static_cast<std::uint64_t>(measured_rounds) + 2ULL;
+    engine.max_context = static_cast<std::uint32_t>(
+        seed.size() + 64ULL + budget_rounds * (options.draft_tokens + 1ULL) +
+        2ULL * options.draft_tokens);
     engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
     engine.prefill_chunk       = 128;
     engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
@@ -141,6 +144,13 @@ int run(const Options& options) {
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
+    engine.context_cache.enabled                = false;
+    engine.context_cache.device_state_slots     = 0;
+    engine.context_cache.host_state_slots       = 0;
+    engine.context_cache.host_kv_capacity_bytes = 0;
+    engine.context_cache.max_private_continuations         = 1;
+    engine.context_cache.max_shared_prefixes               = 0;
+    engine.context_cache.max_long_anchors_per_continuation = 0;
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
@@ -160,7 +170,8 @@ int run(const Options& options) {
     auto sequence = std::move(planner).finalize(resolution.main_page_groups);
     auto program  = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::ResolvedExecutionOptions execution;
-    execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
+    execution.requested_output_tokens =
+        static_cast<std::uint32_t>(1ULL + budget_rounds * (options.draft_tokens + 1ULL));
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(prompt, execution);
     const auto machine_cost           = ninfer::runtime::generic_context_machine_cost_model();

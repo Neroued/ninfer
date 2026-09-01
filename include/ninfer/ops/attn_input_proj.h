@@ -26,12 +26,22 @@ namespace ninfer::ops {
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
  * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
- * Current registered routes require no transient allocation. The Op has no persistent state side
- * effect.
+ *
+ * `workspace` is caller-owned call-scoped transient storage sized by
+ * q4_q5_attn_input_proj_workspace_capacity_bytes(). It must not overlap the input, either parent
+ * weight, or any output. Most registered routes need no transient allocation; only wide-T Volta
+ * builds do (a real tensor-core GEMM path). The Op has no persistent state side effect.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream);
+                     WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Transient workspace capacity attn_input_proj(x, query_key_weight, gate_value_weight, ...)
+ * needs across the given closed token interval [min_tokens, max_tokens].
+ */
+[[nodiscard]] std::size_t
+q4_q5_attn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Computes the single-parent Q/K/output-gate/V projection.

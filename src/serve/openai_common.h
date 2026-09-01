@@ -28,9 +28,9 @@ struct OpenAIPromptCachePolicy {
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len);
+                             std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata);
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len);
+                              std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata);
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 

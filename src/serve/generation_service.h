@@ -103,6 +103,10 @@ public:
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
+    [[nodiscard]] ninfer::ModelMetadata model_metadata() const {
+        return engine_->model_metadata();
+    }
+
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }

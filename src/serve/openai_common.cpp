@@ -38,6 +38,31 @@ std::string responses_identifier(std::string_view prefix) {
 
 using Json = nlohmann::json;
 
+namespace {
+
+// OpenAI model object carrying the llama.cpp-compatible `meta` field. `id` is the public OpenAI
+// alias; the `meta` facts describe the registered artifact behind it. n_ctx is the configured
+// per-request context ceiling (equal to max_model_len); n_ctx_train is the model's native
+// training context. ftype is the registered weights profile (the NInfer quantization name).
+Json make_model_object_json(const std::string& model_id, std::int64_t created,
+                            std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata) {
+    return Json{{"id", model_id},
+                {"object", "model"},
+                {"created", created},
+                {"owned_by", "ninfer"},
+                {"max_model_len", max_model_len},
+                {"meta",
+                 Json{{"n_vocab", metadata.vocab_size},
+                      {"n_ctx", max_model_len},
+                      {"n_ctx_train", metadata.native_context},
+                      {"n_embd", metadata.embedding_size},
+                      {"n_params", metadata.parameters},
+                      {"size", metadata.weight_bytes},
+                      {"ftype", metadata.weights_id}}}};
+}
+
+} // namespace
+
 bool parse_openai_prompt_cache_breakpoint(const Json& value, std::string_view param) {
     if (!value.contains("prompt_cache_breakpoint") ||
         value.at("prompt_cache_breakpoint").is_null()) {
@@ -177,26 +202,18 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len) {
+                             std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
     const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len}}})}};
+                          {"data",
+                           Json::array({make_model_object_json(model_id, created, max_model_len,
+                                                               metadata)})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {{"id", model_id},
-                          {"object", "model"},
-                          {"created", created},
-                          {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len}};
-    return payload.dump();
+                              std::uint32_t max_model_len, const ninfer::ModelMetadata& metadata) {
+    return make_model_object_json(model_id, created, max_model_len, metadata).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

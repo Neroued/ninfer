@@ -64,6 +64,16 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
                              std::string(target_key) + "'");
 }
 
+ModelMetadata Package::model_metadata() {
+    // Static dimension facts owned by this target. The Engine sets model_id/weights_id from the
+    // loaded identity and measures parameters/weight_bytes from the artifact.
+    return ModelMetadata{
+        .vocab_size     = static_cast<std::uint64_t>(qwen3_6::kTokenDomain),
+        .embedding_size = static_cast<std::uint64_t>(detail::TextConfig::hidden),
+        .native_context = static_cast<std::uint64_t>(detail::kNativeContext),
+    };
+}
+
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;

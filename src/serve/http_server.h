@@ -102,6 +102,7 @@ private:
     ServeOptions options_;
     AnthropicThinkingSigner anthropic_thinking_signer_;
     std::string public_model_id_;
+    ninfer::ModelMetadata model_metadata_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;

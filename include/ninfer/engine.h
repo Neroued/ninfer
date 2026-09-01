@@ -104,6 +104,7 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

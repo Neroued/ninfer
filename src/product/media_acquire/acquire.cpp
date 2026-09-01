@@ -2,15 +2,21 @@
 
 #include <curl/curl.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -203,6 +209,14 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
     if (!policy.allow_remote) { throw std::invalid_argument("remote media URLs are disabled"); }
     static std::once_flag init;
     std::call_once(init, [] {
+#if defined(_WIN32)
+        WSADATA wsa_data {};
+        if (::WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+            throw std::runtime_error("failed to initialize Winsock");
+        }
+        static const auto wsa_cleanup = [] { ::WSACleanup(); };
+        std::atexit(wsa_cleanup);
+#endif
         if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
             throw std::runtime_error("failed to initialize libcurl");
         }
@@ -287,7 +301,11 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
+#if defined(_WIN32)
+        if (ec || relative.empty() || relative.native().starts_with(L"..")) {
+#else
         if (ec || relative.empty() || relative.native().starts_with("..")) {
+#endif
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

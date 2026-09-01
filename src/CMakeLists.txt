@@ -277,18 +277,37 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+if(WIN32)
+  # utf8proc.h marks its API __declspec(dllimport) unless UTF8PROC_STATIC is set;
+  # compiling the source itself with dllimport is an error (C2491).
+  target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
+endif()
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
+if(NINFER_BUILD_MEDIA)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  # API-compatible stub: keeps the vision frontend compiling without FFMPEG.
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode_stub.cpp)
+endif()
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
-    product/media_acquire/acquire.cpp)
+  if(NINFER_BUILD_MEDIA)
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire.cpp)
+    target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+    if(WIN32)
+      target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+    endif()
+  else()
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire_stub.cpp)
+  endif()
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

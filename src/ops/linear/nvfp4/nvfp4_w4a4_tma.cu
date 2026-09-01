@@ -71,8 +71,11 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     (void)kConfigured;
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
+    static_assert(sizeof(Nvfp4W4a4TmaDescriptors) == 512);
+    const std::uint64_t* descriptor_bytes = nvfp4_stage_tma_descriptor(descriptors, stream);
     nvfp4_w4a4_tma_kernel<Geometry, Schedule>
-        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(descriptors, alpha, epilogue, output);
+        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(descriptor_bytes, alpha, epilogue,
+                                                             output);
     CUDA_CHECK(cudaGetLastError());
 }
 

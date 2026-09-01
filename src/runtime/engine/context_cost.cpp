@@ -12,7 +12,11 @@
 #include <system_error>
 #include <utility>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -23,7 +27,29 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
+
+// Portable 128-bit unsigned integer (MSVC has no __int128).
+struct UInt128 {
+    std::uint64_t hi = 0;
+    std::uint64_t lo = 0;
+};
+
+// 64x64 -> 128 unsigned multiply via 32-bit limb decomposition.
+constexpr UInt128 multiply128(std::uint64_t left, std::uint64_t right) noexcept {
+    const std::uint64_t left_lo  = left & 0xFFFFFFFFU;
+    const std::uint64_t left_hi  = left >> 32U;
+    const std::uint64_t right_lo = right & 0xFFFFFFFFU;
+    const std::uint64_t right_hi = right >> 32U;
+    const std::uint64_t t        = left_lo * right_lo;
+    const std::uint64_t cross_lo = (left_lo * right_hi) & 0xFFFFFFFFU +
+                                   (left_hi * right_lo) & 0xFFFFFFFFU;
+    const std::uint64_t cross_hi = (left_lo * right_hi) >> 32U +
+                                   (left_hi * right_lo) >> 32U;
+    const std::uint64_t lo = t + ((cross_lo & 0xFFFFFFFFU) << 32U);
+    const std::uint64_t hi = left_hi * right_hi + cross_hi + (cross_lo >> 32U) +
+                             (lo < t ? 1U : 0U);
+    return {hi, lo};
+}
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -36,18 +62,22 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
+    const UInt128 product = multiply128(left, right);
+    return product.hi != 0 ? std::numeric_limits<std::uint64_t>::max() : product.lo;
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+    const UInt128 product = multiply128(coefficient, units);
+    // Saturate when product >= (uint64_max << 32) == {hi = 0xFFFFFFFF, lo = 0}.
+    constexpr std::uint64_t kMaxHi = 0xFFFFFFFFU;
+    constexpr std::uint64_t kMaxLo = 0xFFFFFFFF00000000ULL;
+    if (product.hi > kMaxHi || (product.hi == kMaxHi && product.lo >= kMaxLo)) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const std::uint64_t lo = product.lo + kContextCostQ32One - 1U;
+    const std::uint64_t hi = product.hi + (lo < product.lo ? 1U : 0U);
+    return (hi << 32U) | (lo >> 32U);
 }
 
 void require_object(const Json& value, std::string_view context) {
@@ -296,7 +326,12 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+#if defined(_WIN32)
+    const long long process_id = static_cast<long long>(::GetCurrentProcessId());
+#else
+    const long long process_id = static_cast<long long>(::getpid());
+#endif
+    temporary += ".tmp." + std::to_string(process_id) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

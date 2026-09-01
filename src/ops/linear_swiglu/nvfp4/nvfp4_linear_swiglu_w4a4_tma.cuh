@@ -46,9 +46,8 @@ template <class Geometry, class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
-        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
+        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const std::uint64_t
+                                                                      descriptors[64],
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
     static_assert(Geometry::kOutputRows == 34816);
@@ -65,6 +64,13 @@ __global__ __launch_bounds__(
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
+    // MSVC cannot pass the 128-aligned TMA descriptor by value (C2719), so it is
+    // passed as a pointer to a device buffer in global memory. That buffer is
+    // written by the host (cudaMemcpyAsync H2D in nvfp4_stage_tma_descriptor), so
+    // it is already visible to the TMA unit's tensormap proxy — no in-kernel
+    // staging and no tensormap fence are required. (Staging the descriptor into
+    // local/shared memory inside the kernel makes it invisible to the TMA unit
+    // without a fence.proxy.tensormap, which surfaces as "Illegal instruction".)
     const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
     const int pair_begin  = static_cast<int>(blockIdx.x) * kPairN;
 
@@ -77,6 +83,8 @@ __global__ __launch_bounds__(
         asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
     }
     __syncthreads();
+    const Nvfp4W4a4TmaDescriptors* tma_desc =
+        reinterpret_cast<const Nvfp4W4a4TmaDescriptors*>(descriptors);
 
     constexpr int kKTiles = Geometry::kInputRows / Schedule::kBlockK;
 
@@ -98,16 +106,16 @@ __global__ __launch_bounds__(
                 nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &tma_desc->a_codes,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                nvfp4_tma_load_2d(tensors.b_codes[stage], &tma_desc->b_codes,
                                   k_tile * Schedule::kCodeRowBytes, pair_begin,
                                   &shared.full[stage]);
                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
-                                  &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                  &tma_desc->b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
+                nvfp4_tma_load_2d(tensors.a_scale4[stage], &tma_desc->a_scales, (k_tile / 2) * 16,
                                   token_begin, &shared.full[stage]);
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
@@ -117,9 +125,9 @@ __global__ __launch_bounds__(
                     (((pair_begin + kIntermediate) / 128) * Geometry::kScaleTilesPerRow +
                      k_tile * Schedule::kK64PerStage) *
                     32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &tma_desc->b_scales, 0,
                                   gate_scale_row, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &tma_desc->b_scales, 0,
                                   up_scale_row, &shared.full[stage]);
             }
         }

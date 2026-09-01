@@ -13,7 +13,11 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -507,12 +511,14 @@ int main() {
     const std::string human_throughput = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
+                          human_throughput.find("kv=n/a") != std::string::npos &&
                           human_throughput.find("materializing=1") != std::string::npos &&
                           human_throughput.find("capture_pending=1") != std::string::npos &&
                           human_throughput.find("terminal_pending=1") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
-                          human_throughput.find("host=15.00ms") != std::string::npos &&
-                          human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
+                          human_throughput.find("batch=1.80") != std::string::npos &&
+                          human_throughput.find("host=15.0ms") != std::string::npos &&
+                          human_throughput.find("dhost=1000.0us/rd") != std::string::npos &&
+                          human_throughput.find("devwait=20.0ms/rd") != std::string::npos,
                       "human throughput report mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
@@ -572,10 +578,14 @@ int main() {
                           console_prefix.ends_with("] [info] ninfer-serve: "),
                       "console log prefix mismatch");
 
+#if defined(_WIN32)
+    const long long test_process_id = static_cast<long long>(::GetCurrentProcessId());
+#else
+    const long long test_process_id = static_cast<long long>(::getpid());
+#endif
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
-         ".jsonl");
+        ("ninfer-request-log-test-" + std::to_string(test_process_id) + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

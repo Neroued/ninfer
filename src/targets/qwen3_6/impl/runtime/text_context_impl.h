@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include "core/verbose.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -34,6 +35,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -44,13 +46,64 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
+// Verbose: dump the first few host int32 values about to be copied to device.
+// Lets us tell whether a device buffer holds garbage because the *host* source
+// was already garbage (upstream bug) or because the copy/device side is at fault.
+void verbose_dump_i32(const char* label, const std::int32_t* source, std::size_t count) {
+    if (!verbose_enabled() || source == nullptr) { return; }
+    const std::size_t shown = std::min<std::size_t>(count, 16);
+    std::fprintf(stderr, "[verbose] %s: n=%zu values=[", label, count);
+    for (std::size_t i = 0; i < shown; ++i) {
+        std::fprintf(stderr, "%s%d", i ? ", " : "", source[i]);
+    }
+    if (count > shown) { std::fprintf(stderr, ", ..."); }
+    std::fprintf(stderr, "]\n");
+}
+
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
+    verbose_dump_i32("copy_i32 h2d", source,
+                     static_cast<std::size_t>(destination.bytes() / sizeof(std::int32_t)));
     CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
                                cudaMemcpyHostToDevice, stream));
+}
+
+// Verbose: true if the stream is currently in CUDA graph capture mode. Synchronizing
+// or doing a blocking device readback is illegal during capture, so probes must
+// bail out when this is true.
+bool verbose_stream_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+           capture != cudaStreamCaptureStatusNone;
+}
+
+// Verbose: read back a device int32 tensor (synchronously) and dump the first
+// few values. Used to inspect the argmax index and the remap table at the point
+// where the MTP draft token is produced.
+void verbose_dump_device_i32(const char* label, const void* device_ptr, std::size_t count,
+                             cudaStream_t stream) {
+    if (!verbose_enabled() || device_ptr == nullptr || count == 0 ||
+        verbose_stream_capturing(stream)) {
+        return;
+    }
+    const std::size_t shown = std::min<std::size_t>(count, 16);
+    std::vector<std::int32_t> host(shown);
+    const cudaError_t err = cudaMemcpy(host.data(), device_ptr, shown * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[verbose] %s: readback FAILED: %s\n", label,
+                     cudaGetErrorString(err));
+        return;
+    }
+    std::fprintf(stderr, "[verbose] %s: n=%zu values=[", label, count);
+    for (std::size_t i = 0; i < shown; ++i) {
+        std::fprintf(stderr, "%s%d", i ? ", " : "", host[i]);
+    }
+    if (count > shown) { std::fprintf(stderr, ", ..."); }
+    std::fprintf(stderr, "]\n");
 }
 
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
@@ -566,8 +619,22 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
         ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+        if (verbose_enabled() && !verbose_stream_capturing(ctx_.stream)) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+            verbose_dump_device_i32("proposal_argmax: argmax index (pre-remap)",
+                                    proposal_tokens.data, static_cast<std::size_t>(T),
+                                    ctx_.stream);
+            verbose_dump_device_i32("proposal_argmax: remap table sample", proposal_head_ids_,
+                                    static_cast<std::size_t>(proposal_head_n_), ctx_.stream);
+        }
         ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                       ctx_.stream);
+        if (verbose_enabled() && !verbose_stream_capturing(ctx_.stream)) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+            verbose_dump_device_i32("proposal_argmax: remapped token ids (post-remap)",
+                                    proposal_tokens.data, static_cast<std::size_t>(T),
+                                    ctx_.stream);
+        }
     } else {
         Tensor output_logits = matrix_window(logits, T);
         ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);

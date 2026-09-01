@@ -249,6 +249,7 @@ void HttpServer::run_stats_reporter() {
     ninfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const std::uint32_t kv_capacity = service_->memory_summary().kv_capacity;
 
     for (;;) {
         {
@@ -258,8 +259,10 @@ void HttpServer::run_stats_reporter() {
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
+        ThroughputReport report =
+            make_throughput_report(previous, current,
+                                   std::chrono::duration<double>(now - previous_time).count());
+        report.kv_capacity_tokens = kv_capacity;
         if (report_has_activity(report)) { log_throughput(report); }
         previous      = current;
         previous_time = now;
@@ -267,8 +270,10 @@ void HttpServer::run_stats_reporter() {
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
-    const ThroughputReport tail        = make_throughput_report(
-        previous, current, std::chrono::duration<double>(now - previous_time).count());
+    ThroughputReport tail =
+        make_throughput_report(previous, current,
+                               std::chrono::duration<double>(now - previous_time).count());
+    tail.kv_capacity_tokens = kv_capacity;
     if (report_has_activity(tail)) { log_throughput(tail); }
 }
 

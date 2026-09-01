@@ -1,8 +1,11 @@
 #include "artifact/materializer.h"
 
+#include "core/verbose.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -247,6 +250,36 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     if (copied != total || next_range != ranges.size()) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
+    }
+    if (ninfer::verbose_enabled()) {
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            if (placement.bytes > (1ULL << 20)) { continue; }
+            const ObjectHandle handle = placement.object;
+            const ObjectDescriptor& desc = reader.objects().at(handle.index);
+            const PayloadSpan payload = reader.payload(desc);
+            std::byte* dev = static_cast<std::byte*>(out.objects_.at(handle.index).device);
+            const std::size_t n =
+                static_cast<std::size_t>(std::min<std::uint64_t>(64, placement.bytes));
+            std::vector<std::byte> host(n);
+            (void)cudaMemcpy(host.data(), dev, n, cudaMemcpyDeviceToHost);
+            bool match = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (host[i] != payload.data[i]) { match = false; break; }
+            }
+            std::fprintf(stderr,
+                         "[verbose] materialize check: %s bytes=%llu dev=%p file_off=%llu match=%s\n",
+                         std::string(object_name(desc)).c_str(),
+                         (unsigned long long)placement.bytes, (void*)dev,
+                         (unsigned long long)payload.absolute_offset, match ? "YES" : "NO");
+            if (!match) {
+                std::fprintf(stderr, "[verbose]   dev  = ");
+                for (std::size_t i = 0; i < n; ++i) { std::fprintf(stderr, "%02x", (unsigned)host[i]); }
+                std::fprintf(stderr, "\n[verbose]   file = ");
+                for (std::size_t i = 0; i < n; ++i) { std::fprintf(stderr, "%02x", (unsigned)payload.data[i]); }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        std::fflush(stderr);
     }
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =

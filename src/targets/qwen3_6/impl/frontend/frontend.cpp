@@ -37,6 +37,7 @@ namespace fi = frontend_internal;
 
 constexpr std::size_t kPatchFeatures   = 1536;
 constexpr std::string_view kThinkClose = "</think>";
+constexpr std::string_view kReplacementCharacter = "\xef\xbf\xbd";
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
@@ -399,7 +400,12 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+struct Utf8Prefix {
+    std::size_t size = 0;
+    bool malformed    = false;
+};
+
+Utf8Prefix valid_utf8_prefix_size(std::string_view bytes) {
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto lead         = static_cast<unsigned char>(bytes[offset]);
@@ -422,24 +428,37 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
             codepoint = lead & 0x07U;
             minimum   = 0x10000U;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            return Utf8Prefix{.size = offset, .malformed = true};
         }
-        if (offset + length > bytes.size()) { return offset; }
+        if (offset + length > bytes.size()) {
+            // The sequence runs past what we hold, so it may simply be split across tokens.
+            // The continuation bytes that ARE present still have to be well formed: if one of
+            // them is not, the sequence is malformed now and no later token can repair it.
+            // Without this check a malformed lead byte is indistinguishable from a truncated
+            // one, so the decoder waits for bytes that never arrive and terminalize discards
+            // the buffer -- dropping any valid text that followed the bad byte.
+            for (std::size_t index = offset + 1; index < bytes.size(); ++index) {
+                const auto byte = static_cast<unsigned char>(bytes[index]);
+                if ((byte & 0xc0U) != 0x80U) {
+                    return Utf8Prefix{.size = offset, .malformed = true};
+                }
+            }
+            return Utf8Prefix{.size = offset};
+        }
         for (std::size_t index = 1; index < length; ++index) {
             const auto byte = static_cast<unsigned char>(bytes[offset + index]);
             if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
+                return Utf8Prefix{.size = offset, .malformed = true};
             }
             codepoint = (codepoint << 6U) | (byte & 0x3fU);
         }
         if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
             codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
+            return Utf8Prefix{.size = offset, .malformed = true};
         }
         offset += length;
     }
-    return offset;
+    return Utf8Prefix{.size = offset};
 }
 
 std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker,
@@ -604,11 +623,25 @@ void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPol
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending.append(bytes);
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
-    feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
+    for (;;) {
+        const Utf8Prefix prefix = valid_utf8_prefix_size(state.utf8_pending);
+        if (prefix.size != 0) {
+            const std::string text = state.utf8_pending.substr(0, prefix.size);
+            state.utf8_pending.erase(0, prefix.size);
+            feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
+            if (best_match != nullptr && best_match->found) { return; }
+            if (state.utf8_pending.empty()) { return; }
+            continue;
+        }
+        if (!prefix.malformed) { return; }
+
+        // Drop the malformed sequence's lead byte. Any following byte is re-evaluated as the
+        // start of a new sequence, so valid ASCII and independent malformed bytes are preserved.
+        state.utf8_pending.erase(0, 1);
+        feed_decoded_text(state, kReplacementCharacter, policy, emitted, committed_tokens,
+                          best_match);
+        if (best_match != nullptr && best_match->found) { return; }
+    }
 }
 
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
@@ -618,7 +651,7 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
-        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
+        feed_decoded_text(state, kReplacementCharacter, policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,

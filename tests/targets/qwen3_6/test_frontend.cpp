@@ -43,6 +43,7 @@ constexpr std::string_view kThinkingControlGuidance =
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
+constexpr std::string_view kReplacementCharacter = "\xef\xbf\xbd";
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -140,7 +141,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          {"vocab",
+           {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12},
+            {"Ģ", 13}, {"À", 14}, {"à", 15}, {"Ã", 16}, {"©", 17}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -1612,9 +1615,62 @@ int test_thinking_budget_control(const Frontend& frontend) {
 }
 
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
+    const std::string replacement(kReplacementCharacter);
+    int failures = 0;
+
+    auto continuation_prompt  = frontend.prepare_tokens({0});
+    auto continuation_session = frontend.make_output_session(continuation_prompt, {});
+    const auto continuation_decision = continuation_session.preview_model(
+        std::array<ninfer::TokenId, 3>{0, 10, 0}, 4, ninfer::FinishReason::OutputLimit);
+    failures += check(continuation_decision.accepted_tokens == 3 &&
+                          !continuation_decision.finished(),
+                      "malformed UTF-8 continuation ended generation");
+    const auto continuation_output = continuation_session.commit_preview();
+    failures += check(channel_text(continuation_output, ninfer::OutputChannel::Content) ==
+                          std::string("x") + replacement + "x",
+                      "malformed UTF-8 continuation was not replaced and followed by valid text");
+
+    auto leading_prompt  = frontend.prepare_tokens({0});
+    auto leading_session = frontend.make_output_session(leading_prompt, {});
+    const auto leading_decision = leading_session.preview_model(
+        std::array<ninfer::TokenId, 3>{0, 14, 0}, 4, ninfer::FinishReason::OutputLimit);
+    failures += check(leading_decision.accepted_tokens == 3 && !leading_decision.finished(),
+                      "malformed UTF-8 leading byte ended generation");
+    const auto leading_output = leading_session.commit_preview();
+    failures += check(channel_text(leading_output, ninfer::OutputChannel::Content) ==
+                          std::string("x") + replacement + "x",
+                      "malformed UTF-8 leading byte was not replaced and followed by valid text");
+
+    auto codepoint_prompt  = frontend.prepare_tokens({0});
+    auto codepoint_session = frontend.make_output_session(codepoint_prompt, {});
+    const auto codepoint_decision = codepoint_session.preview_model(
+        std::array<ninfer::TokenId, 5>{0, 15, 13, 13, 0}, 6, ninfer::FinishReason::OutputLimit);
+    failures += check(codepoint_decision.accepted_tokens == 5 &&
+                          !codepoint_decision.finished(),
+                      "malformed UTF-8 codepoint ended generation");
+    const auto codepoint_output = codepoint_session.commit_preview();
+    failures += check(channel_text(codepoint_output, ninfer::OutputChannel::Content) ==
+                          std::string("x") + replacement + replacement + replacement + "x",
+                      "malformed UTF-8 codepoint was not replaced and followed by valid text");
+
+    auto split_prompt  = frontend.prepare_tokens({0});
+    auto split_session = frontend.make_output_session(split_prompt, {});
+    const auto split_lead = split_session.preview_model(std::array<ninfer::TokenId, 1>{16}, 3,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures += check(split_lead.accepted_tokens == 1 && !split_lead.finished(),
+                      "split UTF-8 lead byte unexpectedly ended generation");
+    failures += check(split_session.commit_preview().empty(),
+                      "split UTF-8 codepoint was published before completion");
+    const auto split_tail = split_session.preview_model(std::array<ninfer::TokenId, 1>{17}, 2,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures += check(split_tail.accepted_tokens == 1 && !split_tail.finished(),
+                      "split UTF-8 continuation unexpectedly ended generation");
+    const auto split_output = split_session.commit_preview();
+    failures += check(channel_text(split_output, ninfer::OutputChannel::Content) == "é",
+                      "split UTF-8 codepoint was not published when complete");
+
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
-    int failures            = 0;
     std::uint32_t remaining = 4;
     for (const ninfer::TokenId token : {10, 11}) {
         const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{token},

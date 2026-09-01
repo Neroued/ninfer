@@ -920,7 +920,13 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        if (!reasoning.at("summary").is_string()) {
+            bad_request("reasoning.summary must be a string", "reasoning");
+        }
+        out.reasoning_summary = reasoning.at("summary").get<std::string>();
+    }
+    for (const char* key : {"context", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
@@ -1192,12 +1198,16 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "background_not_supported");
         }
     }
-    if (body.contains("include") && !body.at("include").is_null()) {
+    if (body.contains("include")) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        for (const Json& field : body.at("include")) {
+            if (!field.is_string()) { bad_request("include entries must be strings", "include"); }
+            const std::string value = field.get<std::string>();
+            if (value != "reasoning.encrypted_content") {
+                bad_request("additional response field '" + value + "' is not supported", "include",
+                            "include_not_supported");
+            }
+            out.include_reasoning_encrypted_content = true;
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

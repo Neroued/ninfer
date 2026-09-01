@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/console_log.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
@@ -236,6 +237,22 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
                 {"has_more", end < ordered.size()}};
 }
 
+void log_compatibility_warning(std::uint64_t request_id,
+                               const OpenAIResponsesCreateRequest& request) {
+    std::string message;
+    if (request.prompt.reasoning_summary) {
+        message = "reasoning.summary returns placeholder";
+    }
+    if (request.include_reasoning_encrypted_content) {
+        if (!message.empty()) { message += "; "; }
+        message += "reasoning.encrypted_content returns raw reasoning content";
+    }
+    if (message.empty()) { return; }
+    write_console_log(ConsoleLogLevel::Warning,
+                      "request " + std::to_string(request_id) +
+                          " OpenAI Responses compatibility downgrade: " + message);
+}
+
 } // namespace
 
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
@@ -288,6 +305,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const RequestLogContext log_context = make_request_log_context(
         req_id, "openai_responses", resolved.generation, metadata, prepared);
     resolved.generation.messages.clear();
+    log_compatibility_warning(req_id, request);
     log_request_start(log_context);
 
     if (!request.stream) {

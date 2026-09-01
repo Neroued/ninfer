@@ -16,6 +16,8 @@ namespace {
 
 using Json = nlohmann::json;
 
+constexpr char kReasoningSummaryPlaceholder[] = "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
+
 std::string response_status(ninfer::FinishReason reason) {
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
@@ -49,14 +51,31 @@ void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest
     if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
 }
 
+// Build the display-only reasoning summary requested by the client.
+Json reasoning_summary(const OpenAIResponsesCreateRequest& request) {
+    if (!request.prompt.reasoning_summary) { return Json::array(); }
+    return Json::array({Json{{"type", "summary_text"}, {"text", kReasoningSummaryPlaceholder}}});
+}
+
+// Mirror raw reasoning into the opaque field requested by Harness. This is deliberately not
+// encryption; replayed prompt and cache semantics continue to come only from reasoning_text.
+void add_reasoning_encrypted_content(Json& item, const OpenAIResponsesCreateRequest& request,
+                                     const std::string& reasoning) {
+    if (request.include_reasoning_encrypted_content) {
+        item["encrypted_content"] = reasoning;
+    }
+}
+
 Json response_common(const std::string& id, std::int64_t created_at,
                      const OpenAIResponsesCreateRequest& request,
                      const OpenAIResponsesRuntimeValues& runtime) {
-    const Json reasoning = {{"effort", request.prompt.generation.reasoning_effort
-                                           ? Json(requested_reasoning_effort_name(
-                                                 *request.prompt.generation.reasoning_effort))
-                                           : Json(nullptr)},
-                            {"summary", nullptr}};
+    const Json reasoning = {
+        {"effort",
+         request.prompt.generation.reasoning_effort
+             ? Json(requested_reasoning_effort_name(*request.prompt.generation.reasoning_effort))
+             : Json(nullptr)},
+        {"summary", request.prompt.reasoning_summary ? Json(*request.prompt.reasoning_summary)
+                                                     : Json(nullptr)}};
     return Json{
         {"id", id},
         {"object", "response"},
@@ -105,13 +124,15 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
                                            ? "completed"
                                            : item_status.c_str();
-        built.output_items.push_back(
-            Json{{"id", ids.reasoning},
-                 {"type", "reasoning"},
-                 {"status", reasoning_status},
-                 {"summary", Json::array()},
-                 {"content",
-                  Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}});
+        Json reasoning_item = {
+            {"id", ids.reasoning},
+            {"type", "reasoning"},
+            {"status", reasoning_status},
+            {"summary", reasoning_summary(request)},
+            {"content",
+             Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}};
+        add_reasoning_encrypted_content(reasoning_item, request, outcome.reasoning);
+        built.output_items.push_back(std::move(reasoning_item));
     }
 
     if (needs_message_item(outcome, status)) {
@@ -233,21 +254,49 @@ public:
 
     std::vector<std::string> ensure_reasoning() {
         if (reasoning_started) { return {}; }
-        reasoning_started = true;
-        ids.reasoning     = new_openai_response_item_id("rs");
-        reasoning_index   = next_output_index++;
-        const Json item   = {{"id", ids.reasoning},
-                             {"type", "reasoning"},
-                             {"status", "in_progress"},
-                             {"summary", Json::array()},
-                             {"content", Json::array()}};
-        const Json part   = {{"type", "reasoning_text"}, {"text", ""}};
-        return {sse(event("response.output_item.added",
-                          Json{{"output_index", reasoning_index}, {"item", item}})),
-                sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
-                                                              {"output_index", reasoning_index},
-                                                              {"content_index", 0},
-                                                              {"part", part}}))};
+        reasoning_started               = true;
+        ids.reasoning                   = new_openai_response_item_id("rs");
+        reasoning_index                 = next_output_index++;
+        const Json summary              = reasoning_summary(request);
+        const Json item                 = {{"id", ids.reasoning},
+                                           {"type", "reasoning"},
+                                           {"status", "in_progress"},
+                                           {"summary", summary},
+                                           {"content", Json::array()}};
+        const Json part                 = {{"type", "reasoning_text"}, {"text", ""}};
+        std::vector<std::string> events = {
+            sse(event("response.output_item.added",
+                      Json{{"output_index", reasoning_index}, {"item", item}}))};
+        if (!summary.empty()) {
+            const Json added_summary_part = {{"type", "summary_text"}, {"text", ""}};
+            const Json& done_summary_part = summary.at(0);
+            events.push_back(sse(event("response.reasoning_summary_part.added",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"summary_index", 0},
+                                            {"part", added_summary_part}})));
+            events.push_back(sse(event("response.reasoning_summary_text.delta",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"summary_index", 0},
+                                            {"delta", kReasoningSummaryPlaceholder}})));
+            events.push_back(sse(event("response.reasoning_summary_text.done",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"summary_index", 0},
+                                            {"text", kReasoningSummaryPlaceholder}})));
+            events.push_back(sse(event("response.reasoning_summary_part.done",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"summary_index", 0},
+                                            {"part", done_summary_part}})));
+        }
+        events.push_back(
+            sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
+                                                          {"output_index", reasoning_index},
+                                                          {"content_index", 0},
+                                                          {"part", part}})));
+        return events;
     }
 
     std::vector<std::string> close_reasoning(const std::string& final_text,
@@ -256,11 +305,12 @@ public:
         reasoning_done  = true;
         reasoning_text  = final_text;
         const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        const Json item = {{"id", ids.reasoning},
-                           {"type", "reasoning"},
-                           {"status", item_status},
-                           {"summary", Json::array()},
-                           {"content", Json::array({part})}};
+        Json item = {{"id", ids.reasoning},
+                     {"type", "reasoning"},
+                     {"status", item_status},
+                     {"summary", reasoning_summary(request)},
+                     {"content", Json::array({part})}};
+        add_reasoning_encrypted_content(item, request, reasoning_text);
         return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
                                                                {"content_index", 0},

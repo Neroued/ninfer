@@ -20,6 +20,8 @@ namespace {
 using Json = nlohmann::json;
 using namespace ninfer::serve;
 
+constexpr char kReasoningSummaryPlaceholder[] = "reasoning summary is not supported";
+
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
     std::cerr << "FAIL: " << message << '\n';
@@ -207,6 +209,60 @@ int test_budgets_and_nonsemantic_hints() {
     return failures;
 }
 
+int test_reasoning_encrypted_content_request() {
+    const Json base = {{"model", "m"}, {"input", "hello"}};
+    int failures    = 0;
+
+    Json body       = base;
+    body["include"] = Json::array({"reasoning.encrypted_content"});
+    const OpenAIResponsesCreateRequest requested =
+        parse_openai_responses_create_request(body, limits());
+    failures += check(requested.include_reasoning_encrypted_content &&
+                          requested.prompt.input_turns.size() == 1 &&
+                          requested.prompt.input_turns[0].content[0].text == "hello",
+                      "reasoning encrypted content is retained without changing prompt input");
+
+    body["include"] = Json::array();
+    failures += check(!parse_openai_responses_create_request(body, limits())
+                           .include_reasoning_encrypted_content,
+                      "empty include retains the omitted behavior");
+
+    body["include"] = Json::array({"reasoning.encrypted_content",
+                                    "reasoning.encrypted_content"});
+    failures += check(parse_openai_responses_create_request(body, limits())
+                          .include_reasoning_encrypted_content,
+                      "duplicate supported include entries are idempotent");
+
+    body["include"] = Json::array({"message.output_text.logprobs"});
+    const ApiError unsupported =
+        api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
+    failures += check(unsupported.status == 400 && unsupported.param == "include" &&
+                          unsupported.code == "include_not_supported",
+                      "unsupported additional output fields fail precisely");
+
+    body["include"] = Json::array({true});
+    const ApiError invalid_entry =
+        api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
+    failures += check(invalid_entry.status == 400 && invalid_entry.param == "include" &&
+                          invalid_entry.message == "include entries must be strings",
+                      "include rejects non-string entries");
+
+    body["include"] = "reasoning.encrypted_content";
+    const ApiError invalid_shape =
+        api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
+    failures += check(invalid_shape.status == 400 && invalid_shape.param == "include" &&
+                          invalid_shape.message == "include must be an array",
+                      "include rejects a non-array value");
+
+    body["include"] = nullptr;
+    const ApiError null_shape =
+        api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
+    failures += check(null_shape.status == 400 && null_shape.param == "include" &&
+                          null_shape.message == "include must be an array",
+                      "include rejects null when the field is present");
+    return failures;
+}
+
 int test_typed_items_and_cache_markers() {
     const Json body = {
         {"model", "m"},
@@ -387,7 +443,12 @@ bool same_assistant_turn(const ChatTurn& left, const ChatTurn& right) {
 
 int test_response_output_history_round_trip() {
     const OpenAIResponsesCreateRequest source = parse_openai_responses_create_request(
-        Json{{"model", "m"}, {"input", "Inspect both files"}, {"store", false}}, limits());
+        Json{{"model", "m"},
+             {"input", "Inspect both files"},
+             {"include", Json::array({"reasoning.encrypted_content"})},
+             {"reasoning", Json{{"effort", "low"}, {"summary", "auto"}}},
+             {"store", false}},
+        limits());
     GenerationOutcome outcome;
     outcome.reasoning     = "I should inspect both paths.";
     outcome.text          = "Let me check:";
@@ -410,14 +471,26 @@ int test_response_output_history_round_trip() {
         }
     }
     input.push_back(Json{{"type", "message"}, {"role", "user"}, {"content", "Continue"}});
+    Json plain_input = input;
+    for (Json& item : plain_input) {
+        if (item.at("type") == "reasoning") { item.erase("encrypted_content"); }
+    }
     const OpenAIResponsesCreateRequest replay = parse_openai_responses_create_request(
-        Json{{"model", "m"}, {"input", std::move(input)}, {"store", false}}, limits());
+        Json{{"model", "m"},
+             {"input", input},
+             {"include", Json::array({"reasoning.encrypted_content"})},
+             {"store", false}},
+        limits());
+    const OpenAIResponsesCreateRequest plain_replay = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", std::move(plain_input)}, {"store", false}}, limits());
 
     int failures = 0;
-    failures +=
-        check(built.output_history.size() == 1 && replay.prompt.input_turns.size() == 5 &&
-                  same_assistant_turn(replay.prompt.input_turns[1], built.output_history[0]),
-              "Responses output Items did not round-trip to their stored assistant history");
+    failures += check(
+        built.output_history.size() == 1 && replay.prompt.input_turns.size() == 5 &&
+            built.output_items[0].at("encrypted_content") == outcome.reasoning &&
+            same_assistant_turn(replay.prompt.input_turns[1], built.output_history[0]) &&
+            same_assistant_turn(replay.prompt.input_turns[1], plain_replay.prompt.input_turns[1]),
+        "Reasoning Items did not round-trip without changing prompt or cache semantics");
 
     GenerationOutcome incomplete;
     incomplete.reasoning     = "unfinished reasoning";
@@ -815,12 +888,13 @@ int test_previous_response_call_graph() {
 }
 
 int test_response_object() {
-    const OpenAIResponsesCreateRequest request =
-        parse_openai_responses_create_request(Json{{"model", "m"},
-                                                   {"input", "hello"},
-                                                   {"reasoning", Json{{"effort", "low"}}},
-                                                   {"store", false}},
-                                              limits());
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", "hello"},
+             {"include", Json::array({"reasoning.encrypted_content"})},
+             {"reasoning", Json{{"effort", "low"}, {"summary", "concise"}}},
+             {"store", false}},
+        limits());
     OpenAIResponsesRuntimeValues runtime;
     runtime.temperature = 0.6F;
     runtime.top_p       = 0.95F;
@@ -828,20 +902,49 @@ int test_response_object() {
         make_openai_response_object("resp_test", 123, request, runtime, sample_outcome());
     const Json& response = built.body;
     int failures         = 0;
+    const Json summary =
+        Json::array({Json{{"type", "summary_text"}, {"text", kReasoningSummaryPlaceholder}}});
     failures += check(response.at("object") == "response" && response.at("status") == "completed" &&
                           response.at("completed_at").is_number_integer(),
                       "completed response has a completion timestamp");
+    failures +=
+        check(response.at("reasoning").at("summary") == "concise" &&
+                  response.at("output")[0].at("summary") == summary &&
+                  response.at("output")[0].at("content")[0].at("text") == "thought" &&
+                  response.at("output")[0].at("encrypted_content") == "thought",
+              "reasoning placeholders preserve raw reasoning in both replays");
     failures += check(response.at("max_output_tokens").is_null(),
                       "omitted output budget remains null in the response");
     failures += check(response.at("output").size() == 2 &&
                           response.at("output")[0].at("type") == "reasoning" &&
                           response.at("output")[1].at("type") == "message",
                       "reasoning and message are emitted as typed output Items");
-    failures +=
-        check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
-                  response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
-                  response.at("usage").at("total_tokens") == 18,
-              "usage and cached token details serialized");
+    failures += check(
+        response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
+            response.at("usage").at("output_tokens") == 7 &&
+            response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
+            response.at("usage").at("total_tokens") == 18 && built.output_history.size() == 1 &&
+            built.output_history[0].reasoning_content == "thought",
+        "summary placeholder does not enter usage or persisted reasoning history");
+
+    const OpenAIResponsesCreateRequest omitted_request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"store", false}}, limits());
+    const BuiltOpenAIResponse omitted_summary = make_openai_response_object(
+        "resp_omitted_summary", 123, omitted_request, runtime, sample_outcome());
+    failures += check(omitted_summary.body.at("reasoning").at("summary").is_null() &&
+                          omitted_summary.body.at("output")[0].at("summary").empty() &&
+                          !omitted_summary.body.at("output")[0].contains("encrypted_content"),
+                      "omitted reasoning output options retain the default Item shape");
+
+    GenerationOutcome answer_only = sample_outcome();
+    answer_only.reasoning.clear();
+    answer_only.reasoning_tokens = 0;
+    const BuiltOpenAIResponse without_reasoning =
+        make_openai_response_object("resp_answer_only", 123, request, runtime, answer_only);
+    failures += check(without_reasoning.body.at("reasoning").at("summary") == "concise" &&
+                          without_reasoning.body.at("output").size() == 1 &&
+                          without_reasoning.body.at("output")[0].at("type") == "message",
+                      "requested summary does not invent a reasoning Item");
 
     GenerationOutcome incomplete = sample_outcome();
     incomplete.text.clear();
@@ -851,7 +954,8 @@ int test_response_object() {
     failures += check(limited.body.at("status") == "incomplete" &&
                           limited.body.at("completed_at").is_null() &&
                           limited.body.at("output").size() == 1 &&
-                          limited.body.at("output")[0].at("type") == "reasoning",
+                          limited.body.at("output")[0].at("type") == "reasoning" &&
+                          limited.body.at("output")[0].at("encrypted_content") == "thought",
                       "reasoning-only incomplete output does not invent an empty message");
 
     GenerationOutcome tools = sample_outcome();
@@ -871,8 +975,14 @@ int test_response_object() {
 }
 
 int test_sse_sequence_and_failures() {
-    OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
-        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+    OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(Json{{"model", "m"},
+                                                   {"input", "hello"},
+                                                   {"include", Json::array(
+                                                                   {"reasoning.encrypted_content"})},
+                                                   {"reasoning", Json{{"summary", "detailed"}}},
+                                                   {"stream", true}},
+                                              limits());
     OpenAIResponsesEventStream encoder("resp_stream", 123, request, {});
     std::vector<std::string> wire = encoder.start();
     std::vector<std::string> next = encoder.reasoning_delta("thought");
@@ -887,20 +997,115 @@ int test_sse_sequence_and_failures() {
     int failures                    = 0;
     std::uint64_t expected_sequence = 0;
     std::string text_deltas;
+    std::string summary_deltas;
+    std::string reasoning_id;
+    std::vector<std::string> event_types;
+    const Json summary =
+        Json::array({Json{{"type", "summary_text"}, {"text", kReasoningSummaryPlaceholder}}});
     for (const std::string& event : wire) {
         failures += check(event.find("[DONE]") == std::string::npos,
                           "Responses stream does not use Chat [DONE]");
-        const Json payload = parse_event(event);
+        const Json payload     = parse_event(event);
+        const std::string type = payload.at("type").get<std::string>();
+        event_types.push_back(type);
         failures += check(payload.at("sequence_number") == expected_sequence++,
                           "SSE sequence numbers are contiguous");
-        if (payload.at("type") == "response.output_text.delta") {
+        if (type == "response.output_item.added" && payload.at("item").at("type") == "reasoning") {
+            reasoning_id = payload.at("item").at("id").get<std::string>();
+            failures += check(payload.at("output_index") == 0 &&
+                                  payload.at("item").at("summary") == summary &&
+                                  !payload.at("item").contains("encrypted_content"),
+                              "reasoning output_item.added defers raw encrypted content");
+        } else if (type == "response.output_item.done" &&
+                   payload.at("item").at("type") == "reasoning") {
+            failures += check(payload.at("output_index") == 0 &&
+                                  payload.at("item").at("id") == reasoning_id &&
+                                  payload.at("item").at("summary") == summary &&
+                                  payload.at("item").at("encrypted_content") == "thought",
+                              "reasoning output_item.done carries the complete raw mirror");
+        } else if (type.starts_with("response.reasoning_summary_")) {
+            failures +=
+                check(payload.at("item_id") == reasoning_id && payload.at("output_index") == 0 &&
+                          payload.at("summary_index") == 0,
+                      "reasoning summary events retain stable Item indices");
+            if (type == "response.reasoning_summary_part.added") {
+                failures +=
+                    check(payload.at("part") == Json{{"type", "summary_text"}, {"text", ""}},
+                          "reasoning summary part starts empty");
+            } else if (type == "response.reasoning_summary_text.delta") {
+                summary_deltas += payload.at("delta").get<std::string>();
+            } else if (type == "response.reasoning_summary_text.done") {
+                failures += check(payload.at("text") == kReasoningSummaryPlaceholder,
+                                  "reasoning summary text done carries the placeholder");
+            } else if (type == "response.reasoning_summary_part.done") {
+                failures += check(payload.at("part") == summary.at(0),
+                                  "reasoning summary part done carries the placeholder");
+            }
+        }
+        if (type == "response.output_text.delta") {
             text_deltas += payload.at("delta").get<std::string>();
         }
     }
-    failures += check(parse_event(wire.front()).at("type") == "response.created" &&
-                          parse_event(wire.back()).at("type") == "response.completed" &&
-                          text_deltas == "answer",
-                      "SSE starts, reconstructs output, and terminates canonically");
+    const std::vector<std::string> expected_types = {"response.created",
+                                                     "response.in_progress",
+                                                     "response.output_item.added",
+                                                     "response.reasoning_summary_part.added",
+                                                     "response.reasoning_summary_text.delta",
+                                                     "response.reasoning_summary_text.done",
+                                                     "response.reasoning_summary_part.done",
+                                                     "response.content_part.added",
+                                                     "response.reasoning_text.delta",
+                                                     "response.reasoning_text.done",
+                                                     "response.content_part.done",
+                                                     "response.output_item.done",
+                                                     "response.output_item.added",
+                                                     "response.content_part.added",
+                                                     "response.output_text.delta",
+                                                     "response.output_text.delta",
+                                                     "response.output_text.done",
+                                                     "response.content_part.done",
+                                                     "response.output_item.done",
+                                                     "response.completed"};
+    failures +=
+        check(event_types == expected_types && summary_deltas == kReasoningSummaryPlaceholder,
+              "SSE emits the complete reasoning summary lifecycle in order");
+    failures += check(
+        parse_event(wire.front()).at("type") == "response.created" &&
+            parse_event(wire.back()).at("type") == "response.completed" &&
+            parse_event(wire.back()).at("response").at("reasoning").at("summary") == "detailed" &&
+            parse_event(wire.back()).at("response").at("output")[0].at("summary") == summary &&
+            parse_event(wire.back())
+                    .at("response")
+                    .at("output")[0]
+                    .at("encrypted_content") == "thought" &&
+            text_deltas == "answer",
+        "SSE starts, reconstructs output, and terminates canonically");
+
+    OpenAIResponsesCreateRequest no_summary_request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream no_summary_stream("resp_no_summary", 123, no_summary_request, {});
+    std::vector<std::string> no_summary_wire = no_summary_stream.start();
+    next                                     = no_summary_stream.reasoning_delta("thought");
+    no_summary_wire.insert(no_summary_wire.end(), next.begin(), next.end());
+    OpenAIResponsesStreamFinish no_summary_finish = no_summary_stream.finish(sample_outcome());
+    no_summary_wire.insert(no_summary_wire.end(), no_summary_finish.events_before_terminal.begin(),
+                           no_summary_finish.events_before_terminal.end());
+    bool saw_summary_event = false;
+    bool saw_empty_summary = false;
+    bool saw_encrypted_content = false;
+    for (const std::string& event : no_summary_wire) {
+        const Json payload     = parse_event(event);
+        const std::string type = payload.at("type").get<std::string>();
+        saw_summary_event = saw_summary_event || type.starts_with("response.reasoning_summary_");
+        if ((type == "response.output_item.added" || type == "response.output_item.done") &&
+            payload.at("item").at("type") == "reasoning") {
+            saw_empty_summary = payload.at("item").at("summary").empty();
+            saw_encrypted_content =
+                saw_encrypted_content || payload.at("item").contains("encrypted_content");
+        }
+    }
+    failures += check(!saw_summary_event && saw_empty_summary && !saw_encrypted_content,
+                      "omitted reasoning options emit neither summary nor encrypted placeholders");
 
     OpenAIResponsesEventStream failed("resp_failed", 123, std::move(request), {});
     (void)failed.start();
@@ -964,6 +1169,7 @@ int main() {
     int failures = 0;
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
+    failures += test_reasoning_encrypted_content_request();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();

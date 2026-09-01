@@ -1,6 +1,7 @@
 # NInfer
 
-> Selected checkpoints. Maximum single-GPU inference performance.
+> Selected checkpoints. Maximum single-GPU inference performance. Native NVFP4 on Blackwell;
+> software NVFP4 on Volta.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090 or Tesla V100. It runs text, image, and video prompts through a local
@@ -19,6 +20,64 @@ NInfer supports five artifact identities. The quick-start commands use Qwen3.8-2
 
 The artifact identity fixes the exact model and weight profile. Every artifact also embeds the
 tokenizer, chat template, and media frontend resources required by its registered target.
+
+## Performance
+
+Performance is reported separately for the RTX 5090 and Tesla V100. [Performance](docs/performance.md)
+records the RTX 5090 benchmark profiles and methodology; [V100 qualification](docs/v100.md) records
+the Volta methodology, complete artifact sweep, and DFlash window sweep.
+
+### Tesla V100: software NVFP4 and groupwise inference
+
+The Qwen3.8-27B NVFP4 short-context MTP5 target round is **60.16 ms** with 5.0 licensed tokens,
+or **83.10 committed tok/s**.
+
+The single-request sweep uses the public Engine benchmark on a Tesla V100-SXM2-32GB with CUDA
+12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with CUDA
+Graphs and the optimized proposal head. Each result uses one discarded warmup and three measured
+repetitions.
+
+| Model profile | MTP K | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 4 | 1,131.6 | 59.70 |
+| Qwen3.6-27B `nvfp4` | 5 | 235.8 | 54.71 |
+| Qwen3.8-27B `groupwise-int` | 5 | 1,123.6 | 75.36 |
+| Qwen3.8-27B `nvfp4` | 5 | 1,160.1 | 86.78 |
+| Qwen3.6-35B-A3B `groupwise-int` | 5 | 763.4 | 211.41 |
+
+On Volta, NVFP4 is decoded and executed in software using tuned FP16 tensor-core and SIMT kernels.
+Dense MLP gate/up payloads are prepacked in place during model load for the QPN decode layout; the
+artifact on disk is unchanged and inference does not perform runtime weight repacking.
+
+The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **134.33 tok/s**, 93.3%
+draft acceptance, and 3.8 mean output tokens per round over ten measured rounds after two warmups.
+
+### Concurrent MTP3 decode
+
+Saturated decode used INT8 group-64 KV, CUDA Graphs, MTP3, and one 8,192-token generation per active
+request. Values are aggregate committed decode throughput and MTP acceptance from complete
+intervals whose actual decode batch equaled the configured concurrency.
+
+| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
+| Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
+| Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
+| Qwen3.8-27B `nvfp4` | 143.8 / 48.9% | 267.6 / 48.1% | 461.1 / 45.8% | 766.6 / 46.0% | 5.33× |
+
+### Single-request serving
+
+The serial serving corpus used INT8 group-64 KV, CUDA Graphs, a 1,024-token prefill chunk, and five
+fixed seeds after warm-up. The table keeps one short-prefill, one extreme-prefill, and one
+structured-output MTP3 point for each published profile; the full context and scenario matrices are
+in the performance document.
+
+| Model profile | 7,680-token prefill | 260,096-token prefill | Structured MTP3 decode |
+|---|---:|---:|---:|
+| Qwen3.6-35B-A3B `groupwise-int` | 15,544.3 tok/s | 5,157.1 tok/s | 770.9 tok/s |
+| Qwen3.6-27B `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
+| Qwen3.6-27B `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
+| Qwen3.8-27B `nvfp4` | 8,340.4 tok/s | 2,203.1 tok/s | 219.8 tok/s |
 
 ## Quick start
 
@@ -127,67 +186,6 @@ requests retain their completion reservations.
 See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
-
-## Performance
-
-The main published measurements use an RTX 5090. [Performance](docs/performance.md) records those
-benchmark profiles and methodology; [V100 port notes](docs/v100.md) records the Volta qualification.
-
-### Tesla V100 single-request generation
-
-The Qwen3.8-27B NVFP4 short-context MTP5 target round is **60.16 ms** with 5.0 licensed tokens,
-or **83.10 committed tok/s**. The preserved pre-synchronization binary measures 60.71 ms and
-82.36 tok/s under the identical ten-round procedure, so the synchronized decode-critical round is
-2.2% faster in latency and 0.9% faster in derived throughput.
-
-The complete before/after sweep used the public Engine benchmark on a Tesla V100-SXM2-32GB with
-CUDA 12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with
-CUDA Graphs and the optimized proposal head. Each result used one discarded warmup and three
-measured repetitions.
-
-| Model profile | MTP K | Prefill before / after | Decode before / after |
-|---|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 4 | 1,128.8 / **1,131.6** | 49.04 / **59.70** |
-| Qwen3.6-27B `nvfp4` | 5 | unavailable / **235.8** | unavailable / **54.71** |
-| Qwen3.8-27B `groupwise-int` | 5 | **1,127.5** / 1,123.6 | 74.64 / **75.36** |
-| Qwen3.8-27B `nvfp4` | 5 | 1,132.1 / **1,160.1** | 85.75 / **86.78** |
-| Qwen3.6-35B-A3B `groupwise-int` | 5 | 757.7 / **763.4** | 191.25 / **211.41** |
-
-The old Qwen3.6 NVFP4 binary faults during its legacy Volta W8 load path, so it has no valid
-baseline. The synchronized Qwen3.6 NVFP4 artifact uses a slower A16 prefill route; the Qwen3.8
-NVFP4 artifact uses the qualified wide-prefill route.
-
-The 35B-A3B production DFlash round sweep at a 2,048-token context selected K=3: 134.33 published
-tok/s, 93.3% draft acceptance, and 3.8 mean output tokens per round over ten measured rounds after
-two warmups. The [V100 port notes](docs/v100.md) contain the detailed before/after methodology,
-DFlash sweep, and exact interpretation of these single-request results.
-
-### Concurrent MTP3 decode
-
-Saturated decode used INT8 group-64 KV, CUDA Graphs, MTP3, and one 8,192-token generation per active
-request. Values are aggregate committed decode throughput and MTP acceptance from complete
-intervals whose actual decode batch equaled the configured concurrency.
-
-| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
-|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
-| Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
-| Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
-| Qwen3.8-27B `nvfp4` | 143.8 / 48.9% | 267.6 / 48.1% | 461.1 / 45.8% | 766.6 / 46.0% | 5.33× |
-
-### Single-request serving
-
-The serial serving corpus used INT8 group-64 KV, CUDA Graphs, a 1,024-token prefill chunk, and five
-fixed seeds after warm-up. The table keeps one short-prefill, one extreme-prefill, and one
-structured-output MTP3 point for each published profile; the full context and scenario matrices are
-in the performance document.
-
-| Model profile | 7,680-token prefill | 260,096-token prefill | Structured MTP3 decode |
-|---|---:|---:|---:|
-| Qwen3.6-35B-A3B `groupwise-int` | 15,544.3 tok/s | 5,157.1 tok/s | 770.9 tok/s |
-| Qwen3.6-27B `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
-| Qwen3.6-27B `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
-| Qwen3.8-27B `nvfp4` | 8,340.4 tok/s | 2,203.1 tok/s | 219.8 tok/s |
 
 ## Evaluation
 

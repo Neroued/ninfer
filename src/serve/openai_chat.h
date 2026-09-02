@@ -23,7 +23,8 @@ struct OpenAIChatRequest {
     bool include_usage          = false;
     bool output_tokens_explicit = false;
     // llama.cpp-compatible response observations. Final timings remain unconditional;
-    // timings_per_token controls only cumulative timing snapshots on streamed output chunks.
+    // timings_per_token controls cumulative timing snapshots on streamed output chunks and,
+    // together with return_progress, on prompt-progress chunks.
     bool timings_per_token = false;
     bool return_progress   = false;
 };

@@ -708,6 +708,10 @@ int test_stream_observations() {
                   initial["prompt_progress"]["processed"] == 12 &&
                   initial["prompt_progress"]["time_ms"] == 0,
               "initial prompt progress begins at the admitted cache frontier");
+    failures += check(initial["timings"]["prompt_n"] == 20 && initial["timings"]["prompt_ms"] == 0.0 &&
+                          initial["timings"]["prompt_per_second"] == 0.0 &&
+                          initial["timings"]["predicted_n"] == 0,
+                      "initial prompt progress carries a zero prompt-only timing snapshot");
 
     const Json middle = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
         .total_prompt_tokens     = 32,
@@ -718,6 +722,11 @@ int test_stream_observations() {
     failures += check(middle["prompt_progress"]["processed"] == 20 &&
                           middle["prompt_progress"]["time_ms"] == 57,
                       "prompt progress exposes a cumulative completed frontier");
+    failures += check(middle["timings"]["prompt_ms"] == 57.0 &&
+                          middle["timings"]["prompt_per_token_ms"] == 7.125 &&
+                          middle["timings"]["prompt_per_second"] == 1000.0 * 8.0 / 57.0 &&
+                          middle["timings"]["predicted_n"] == 0,
+                      "prompt progress timings observe the processed suffix so far");
     const Json complete = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
         .total_prompt_tokens     = 32,
         .reused_prompt_tokens    = 12,
@@ -727,6 +736,17 @@ int test_stream_observations() {
     failures +=
         check(complete["prompt_progress"]["processed"] == complete["prompt_progress"]["total"],
               "final prompt progress reaches the complete prompt");
+    failures += check(complete["timings"]["prompt_per_token_ms"] == 5.0 &&
+                          complete["timings"]["prompt_per_second"] == 200.0,
+                      "final prompt progress timings span the complete prompt suffix");
+
+    OpenAIChatStream plain(identity(), false, false, true);
+    (void)plain.start();
+    plain.note_start(
+        ninfer::GenerationStart{.prompt = {.prompt_tokens = 8}, .reused_prompt_tokens = 0});
+    const Json plain_progress = parse_sse(plain.initial_prompt_progress());
+    failures += check(!plain_progress.contains("timings"),
+                      "prompt progress omits timings without timings_per_token");
 
     stream.note_timing(ninfer::GenerationTimingObservation{
         .generated_tokens = 1, .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 0});

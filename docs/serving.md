@@ -399,6 +399,7 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.summary` | omitted, `null`, or any string; every string requests the same fixed protocol placeholder without changing model execution, and the original value is echoed in the response |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -410,7 +411,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -511,9 +512,14 @@ invocation are also rejected because their semantics cannot be honored.
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
 `cancelled` in `status`, and a typed `output` array. NInfer may emit:
 
-- a `reasoning` Item containing raw `reasoning_text` and an empty summary;
+- a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
+  `reasoning.summary` is requested;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
+
+When `include:["reasoning.encrypted_content"]` is requested, reasoning Items also
+carries en `encrypted_content` equal to its raw `reasoning_text`. This field is **not**
+**encrypted** and provides no confidentiality.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
@@ -557,6 +563,19 @@ The normal lifecycle is:
 3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
+
+For a reasoning Item requested with any string-valued `reasoning.summary`, its
+`response.output_item.added` and `.done` payloads carry the same placeholder summary. Immediately
+after the Item is added, the stream emits `response.reasoning_summary_part.added`,
+`response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, and
+`response.reasoning_summary_part.done` with `summary_index:0`, then continues with the raw
+`reasoning_text` content lifecycle. Omitted or `null` summary requests emit none of these summary
+events and retain an empty Item `summary` array.
+
+For `include:["reasoning.encrypted_content"]`, the in-progress
+`response.output_item.added` Item omits `encrypted_content` because the complete reasoning text is
+not available yet. `response.output_item.done` and the terminal Response output contain the same
+complete raw mirror. A response with no reasoning Item emits no encrypted placeholder.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
@@ -622,9 +641,10 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
-accepted placeholders.
+moderation, Structured Outputs/JSON mode, `include` values other than
+`reasoning.encrypted_content`, background execution, compaction, files/audio, and
+OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
+these are compatibility boundaries rather than silently accepted approximations.
 
 ## Anthropic Messages
 

@@ -138,4 +138,14 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor
                                                    float scale, const PagedKVLayerView& cache,
                                                    Tensor& out, cudaStream_t stream);
 
+void causal_attention_prompt_rk2v4e8_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                            const Tensor& positions, const Tensor& valid_columns,
+                                            const Tensor& table_rows, float scale,
+                                            PagedKVBatchLayerView cache, Tensor& out,
+                                            cudaStream_t stream);
+
+void causal_attention_prompt_rk2v4e8_attention_launch(const Tensor& q, const Tensor& positions,
+                                                      float scale, const PagedKVLayerView& cache,
+                                                      Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

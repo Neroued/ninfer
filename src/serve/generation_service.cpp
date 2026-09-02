@@ -38,6 +38,31 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point deadline;
 };
 
+namespace {
+// Parse the canonical context-capacity message
+// "prepared prompt has N tokens, exceeding Engine max_context M" into (N, M).
+// Returns false (and leaves the outputs untouched) if the shape does not match, so callers
+// degrade gracefully to a message-only error body.
+bool parse_context_capacity(const std::string& message, int& prompt_tokens, int& max_context) {
+    const std::string has    = "prepared prompt has ";
+    const std::string tokens = " tokens, exceeding Engine max_context ";
+    const auto has_pos   = message.find(has);
+    if (has_pos == std::string::npos) { return false; }
+    const auto tokens_pos = message.find(tokens, has_pos + has.size());
+    if (tokens_pos == std::string::npos) { return false; }
+    const auto num_start = has_pos + has.size();
+    const auto num_end   = tokens_pos;
+    if (num_start >= num_end) { return false; }
+    try {
+        prompt_tokens = std::stoi(message.substr(num_start, num_end - num_start));
+        max_context   = std::stoi(message.substr(tokens_pos + tokens.size()));
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
     error.param   = "messages";
@@ -46,6 +71,14 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
+        {
+            int prompt_tokens = 0;
+            int max_context   = 0;
+            if (parse_context_capacity(error.message, prompt_tokens, max_context)) {
+                error.prompt_tokens = prompt_tokens;
+                error.max_context   = max_context;
+            }
+        }
         break;
     case ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
         error.param.clear();
@@ -59,6 +92,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     case ninfer::RequestErrorKind::InvalidMedia:
         error.status = 400;
         error.code   = "invalid_media";
+        // Make the rejection actionable for agentic clients: the media part that failed to
+        // decode must be dropped from (or re-attached with valid bytes to) the conversation
+        // history before the next request.
+        error.message +=
+            " (a media part in the conversation could not be decoded; drop it from the "
+            "history or re-attach it with valid bytes, then retry)";
         break;
     case ninfer::RequestErrorKind::Overloaded:
         error.param.clear();
@@ -411,6 +450,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
+    outcome.max_context         = options_.max_context;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

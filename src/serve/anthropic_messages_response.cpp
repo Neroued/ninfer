@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -82,7 +83,7 @@ Json final_usage(const GenerationOutcome& outcome) {
     const int prompt = std::max(0, outcome.prompt_tokens);
     const int cached = static_cast<int>(std::min<std::uint64_t>(
         outcome.metrics.prefix_cache_hit_tokens, static_cast<std::uint64_t>(prompt)));
-    return Json{
+    Json usage = Json{
         {"input_tokens", prompt - cached},
         {"cache_creation_input_tokens", nullptr},
         {"cache_read_input_tokens", cached},
@@ -92,6 +93,13 @@ Json final_usage(const GenerationOutcome& outcome) {
         {"server_tool_use", Json{{"web_search_requests", 0}, {"web_fetch_requests", 0}}},
         {"service_tier", nullptr},
         {"inference_geo", nullptr}};
+    if (outcome.max_context > 0) {
+        const int max_context = static_cast<int>(outcome.max_context);
+        const double fill     = static_cast<double>(prompt) / static_cast<double>(max_context);
+        usage["context_fill"]      = std::round(fill * 10000.0) / 10000.0;
+        usage["context_remaining"] = std::max(0, max_context - prompt);
+    }
+    return usage;
 }
 
 Json streaming_start_usage(int input_tokens, std::optional<int> cache_read_input_tokens) {

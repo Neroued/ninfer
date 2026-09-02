@@ -203,6 +203,8 @@ std::string make_error_body(const ApiError& error) {
     Json rendered     = {{"message", error.message}, {"type", error.type}};
     rendered["param"] = error.param.empty() ? Json(nullptr) : Json(error.param);
     rendered["code"]  = error.code.empty() ? Json(nullptr) : Json(error.code);
+    if (error.prompt_tokens.has_value()) { rendered["prompt_tokens"] = *error.prompt_tokens; }
+    if (error.max_context.has_value()) { rendered["max_context"] = *error.max_context; }
     return Json{{"error", std::move(rendered)}}.dump();
 }
 

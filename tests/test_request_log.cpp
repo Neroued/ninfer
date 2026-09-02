@@ -511,7 +511,7 @@ int main() {
     const std::string human_throughput = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("kv=n/a") != std::string::npos &&
+                          human_throughput.find("kvpool=n/a") != std::string::npos &&
                           human_throughput.find("materializing=1") != std::string::npos &&
                           human_throughput.find("capture_pending=1") != std::string::npos &&
                           human_throughput.find("terminal_pending=1") != std::string::npos &&

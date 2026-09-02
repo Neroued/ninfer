@@ -29,6 +29,10 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    // Optional structured context for context_length_exceeded: the offending prompt token
+    // count and the logical context ceiling. Emitted as numeric fields in the error body when set.
+    std::optional<int> prompt_tokens;
+    std::optional<int> max_context;
 };
 
 class ApiException : public std::runtime_error {

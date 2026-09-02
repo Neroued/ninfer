@@ -49,6 +49,9 @@ struct GenerationOutcome {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
+    // Logical per-sequence context ceiling (ServeOptions::max_context). Lets the response
+    // builders report context_fill / context_remaining without re-reading server options.
+    std::uint32_t max_context = 0;
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;

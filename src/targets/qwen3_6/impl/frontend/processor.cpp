@@ -545,7 +545,11 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         throw std::logic_error("rendered chat media placeholders were already expanded");
     }
     if (rendered.media_placeholders.size() != items.size()) {
-        throw std::invalid_argument("chat media count does not match rendered placeholders");
+        throw std::invalid_argument(
+            "chat media count does not match rendered placeholders (" +
+                std::to_string(rendered.media_placeholders.size()) + " rendered, " +
+                std::to_string(items.size()) + " decoded); a media part in the conversation "
+                "failed to resolve (stale/truncated bytes or dead URL) — drop or re-attach it");
     }
     std::string source = std::move(rendered.text);
     std::string expanded;
@@ -937,7 +941,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                                 "prepared prompt exceeds Engine max_context " +
+                                 "prepared prompt has " + std::to_string(preliminary_tokens) +
+                                     " tokens, exceeding Engine max_context " +
                                      std::to_string(maximum_prompt_tokens));
         }
     }
@@ -1067,7 +1072,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control, "tokenization");
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                             "prepared prompt exceeds Engine max_context " +
+                             "prepared prompt has " + std::to_string(encoded.input_ids.size()) +
+                                 " tokens, exceeding Engine max_context " +
                                  std::to_string(maximum_prompt_tokens));
     }
     output.input_ids                   = std::move(encoded.input_ids);

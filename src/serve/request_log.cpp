@@ -643,9 +643,9 @@ std::string format_throughput(const ThroughputReport& report) {
             static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
         const double pct = 100.0 * static_cast<double>(occupied_tokens) /
                            static_cast<double>(report.kv_capacity_tokens);
-        out << " kv=" << std::setprecision(0) << pct << "%";
+        out << " kvpool=" << std::setprecision(0) << pct << "%";
     } else {
-        out << " kv=n/a";
+        out << " kvpool=n/a";
     }
     out << " running=" << cur.running_requests
         << " prefilling=" << cur.prefilling_requests

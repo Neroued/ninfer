@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -20,6 +21,7 @@ struct CompletionUsage {
     int completion_tokens = 0;
     int cached_tokens     = 0;
     int reasoning_tokens  = 0;
+    int max_context       = 0;
 };
 
 const char* finish_reason(ninfer::FinishReason reason) {
@@ -63,12 +65,19 @@ Json tool_calls_json(const std::vector<ToolCall>& calls, bool include_index) {
 
 Json usage_json(const CompletionUsage& usage) {
     const int cached_tokens = std::clamp(usage.cached_tokens, 0, usage.prompt_tokens);
-    return Json{{"prompt_tokens", usage.prompt_tokens},
-                {"prompt_tokens_details", Json{{"cached_tokens", cached_tokens}}},
-                {"completion_tokens", usage.completion_tokens},
-                {"completion_tokens_details",
-                 Json{{"reasoning_tokens", std::max(0, usage.reasoning_tokens)}}},
-                {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    Json body = Json{{"prompt_tokens", usage.prompt_tokens},
+                     {"prompt_tokens_details", Json{{"cached_tokens", cached_tokens}}},
+                     {"completion_tokens", usage.completion_tokens},
+                     {"completion_tokens_details",
+                      Json{{"reasoning_tokens", std::max(0, usage.reasoning_tokens)}}},
+                     {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    if (usage.max_context > 0) {
+        const double fill = static_cast<double>(usage.prompt_tokens) /
+                            static_cast<double>(usage.max_context);
+        body["context_fill"]      = std::round(fill * 10000.0) / 10000.0;
+        body["context_remaining"] = std::max(0, usage.max_context - usage.prompt_tokens);
+    }
+    return body;
 }
 
 CompletionUsage usage_from(const GenerationOutcome& outcome) {
@@ -77,6 +86,7 @@ CompletionUsage usage_from(const GenerationOutcome& outcome) {
         .completion_tokens = outcome.completion_tokens,
         .cached_tokens     = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens),
         .reasoning_tokens  = outcome.reasoning_tokens,
+        .max_context       = static_cast<int>(outcome.max_context),
     };
 }
 

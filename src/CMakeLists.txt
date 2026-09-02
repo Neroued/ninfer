@@ -95,6 +95,7 @@ add_library(ninfer_ops STATIC
   ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
   ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cu
   ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+  ops/softmax_attention/dense/causal_cache/small_t_rk2v4e8.cu
   ops/softmax_attention/dense/causal_cache/prompt.cu
   ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
   ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu

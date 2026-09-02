@@ -266,7 +266,8 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
     const bool fp32_acc = cache_storage == KvCacheStorage::BFloat16 ||
                           cache_storage == KvCacheStorage::Fp8E4M3Row256 ||
                           cache_storage == KvCacheStorage::Nvfp4Group16 ||
-                          cache_storage == KvCacheStorage::Fp8KeyNvfp4Value;
+                          cache_storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+                          cache_storage == KvCacheStorage::Rk2v4E8;
     return {
         workspace.alloc(fp32_acc ? DType::FP32 : DType::BF16,
                         {kHeadDim, q_heads, tokens, splits * batch_size}),

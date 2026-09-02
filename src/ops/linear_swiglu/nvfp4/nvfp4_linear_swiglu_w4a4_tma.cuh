@@ -71,10 +71,10 @@ __global__ __launch_bounds__(
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
-            nvfp4_mbarrier_init(&shared.full[stage], 1);
-            nvfp4_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
+            cta_mbarrier_init(&shared.full[stage], 1);
+            cta_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
         }
-        asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
+        cta_mbarrier_fence_init();
     }
     __syncthreads();
 
@@ -89,13 +89,13 @@ __global__ __launch_bounds__(
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
                 const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
-                nvfp4_mbarrier_wait(&shared.empty[stage], empty_phase);
+                cta_mbarrier_wait(&shared.empty[stage], empty_phase);
                 constexpr std::uint32_t kTransactionBytes =
                     Schedule::kBlockM * Schedule::kCodeRowBytes +
                     Schedule::kBlockN * Schedule::kCodeRowBytes +
                     Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4 +
                     2 * Schedule::kBlockN * Schedule::kK64PerStage * 4;
-                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
+                cta_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
@@ -150,7 +150,7 @@ __global__ __launch_bounds__(
     for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
         const int stage                = k_tile % Schedule::kStages;
         const std::uint32_t full_phase = (k_tile / Schedule::kStages) & 1U;
-        nvfp4_mbarrier_wait(&shared.full[stage], full_phase);
+        cta_mbarrier_wait(&shared.full[stage], full_phase);
 
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
@@ -212,7 +212,7 @@ __global__ __launch_bounds__(
                 }
             }
         }
-        if (lane == 0) { nvfp4_mbarrier_arrive(&shared.empty[stage]); }
+        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
     }
 
     asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory");

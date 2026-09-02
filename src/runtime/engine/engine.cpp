@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
@@ -85,6 +86,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
     }
     return options;
+}
+
+DeviceContext initialize_device(const EngineOptions& options) {
+    StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
+    DeviceContext device(options.device);
+    phase.complete();
+    return device;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -214,13 +222,15 @@ public:
                               std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
+        : options(normalize_engine_options(std::move(engine_options))),
+          device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
-        core              = std::visit(
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        core = std::visit(
             [&](auto& target_ptr) -> Core {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
@@ -229,16 +239,17 @@ public:
                         return std::make_unique<ScoreCore27>(*target_ptr, device);
                     }
                     return std::make_unique<Core27>(*target_ptr, device, options,
-                                                                 std::move(constructed.context_cost));
+                                                    std::move(constructed.context_cost));
                 } else {
                     if (options.purpose == EnginePurpose::CausalScoring) {
                         return std::make_unique<ScoreCore35>(*target_ptr, device);
                     }
                     return std::make_unique<Core35>(*target_ptr, device, options,
-                                                                 std::move(constructed.context_cost));
+                                                    std::move(constructed.context_cost));
                 }
             },
             active);
+        finalize_phase.complete();
     }
 
     ~Impl() noexcept {
@@ -257,7 +268,12 @@ public:
     Core core;
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) {
+    StartupObserver startup_observer = options.startup_observer;
+    StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
+    impl_ = std::make_shared<Impl>(std::move(options));
+    startup_phase.complete();
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;

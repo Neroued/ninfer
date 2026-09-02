@@ -1,6 +1,5 @@
 #include "serve/http_server.h"
 
-#include "serve/console_log.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
@@ -39,10 +38,9 @@ struct PendingResponseStorage {
 struct StreamingResponse {
     PreparedRequest prepared;
     PendingResponseStorage storage;
-    RequestLogContext log_context;
     std::unique_ptr<OpenAIResponsesEventStream> encoder;
     std::atomic<bool> cancelled{false};
-    bool started = false;
+    std::atomic<bool> started{false};
 };
 
 ApiError responses_error(ApiError error) {
@@ -237,22 +235,6 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
                 {"has_more", end < ordered.size()}};
 }
 
-void log_compatibility_warning(std::uint64_t request_id,
-                               const OpenAIResponsesCreateRequest& request) {
-    std::string message;
-    if (request.prompt.reasoning_summary) {
-        message = "reasoning.summary returns placeholder";
-    }
-    if (request.include_reasoning_encrypted_content) {
-        if (!message.empty()) { message += "; "; }
-        message += "reasoning.encrypted_content returns raw reasoning content";
-    }
-    if (message.empty()) { return; }
-    write_console_log(ConsoleLogLevel::Warning,
-                      "request " + std::to_string(request_id) +
-                          " OpenAI Responses compatibility downgrade: " + message);
-}
-
 } // namespace
 
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
@@ -270,6 +252,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         write_openai_error(res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
+        operational_log_.http_failure(
+            "openai_responses",
+            make_internal_request_failure(RequestFailurePhase::Http, exception.what()));
         write_openai_error(res, internal_error(exception));
         return;
     }
@@ -289,118 +274,238 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
-        log_request_rejected(make_request_rejection_log_context(
+        record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
         write_openai_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
-        log_request_rejected(make_request_rejection_log_context(
+        record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
         write_openai_error(res, error);
         return;
     }
 
-    const std::int64_t created          = unix_time_now();
-    const RequestLogContext log_context = make_request_log_context(
-        req_id, "openai_responses", resolved.generation, metadata, prepared);
+    const std::int64_t created = unix_time_now();
+    auto lifecycle             = begin_request(make_request_log_context(
+        req_id, "openai_responses", resolved.generation, metadata, prepared));
     resolved.generation.messages.clear();
-    log_compatibility_warning(req_id, request);
-    log_request_start(log_context);
 
     if (!request.stream) {
+        GenerationOutcome outcome;
         try {
-            const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-            const OpenAIResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
-            BuiltOpenAIResponse response =
-                make_openai_response_object(id, created, request, runtime, outcome);
-            PendingResponseStorage storage;
-            storage.input_turns      = std::move(request.prompt.input_turns);
-            storage.input_items      = std::move(request.prompt.input_items);
-            storage.previous_context = std::move(resolved.parent);
-            if (resolved.session_key) { storage.session_key = std::move(*resolved.session_key); }
-            storage.enabled = request.store;
-            commit_stored_response(openai_responses_store_, std::move(storage), id, response.body,
-                                   std::move(response.output_history), prepared.preserve_thinking);
-            log_request_done(log_context, outcome);
-            set_owned_json_content(res, response.body.dump(), prepared.lifetime);
+            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
-            log_request_error(log_context, error.message);
+            lifecycle->failure(make_generation_request_failure(error));
             write_openai_error(res, error);
+            return;
         } catch (const std::exception& exception) {
-            log_request_error(log_context, exception.what());
+            lifecycle->failure(
+                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+            write_openai_error(res, internal_error(exception));
+            return;
+        }
+        lifecycle->done(outcome);
+
+        std::optional<BuiltOpenAIResponse> response;
+        try {
+            const OpenAIResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
+            response.emplace(make_openai_response_object(id, created, request, runtime, outcome));
+        } catch (const ApiException& exception) {
+            const ApiError error = responses_error(exception.error());
+            lifecycle->response_failure(
+                make_request_failure(RequestFailurePhase::ResponseRender, error));
+            write_openai_error(res, error);
+            return;
+        } catch (const std::exception& exception) {
+            lifecycle->response_failure(make_internal_request_failure(
+                RequestFailurePhase::ResponseRender, exception.what()));
+            write_openai_error(res, internal_error(exception));
+            return;
+        }
+
+        PendingResponseStorage storage;
+        storage.input_turns      = std::move(request.prompt.input_turns);
+        storage.input_items      = std::move(request.prompt.input_items);
+        storage.previous_context = std::move(resolved.parent);
+        if (resolved.session_key) { storage.session_key = std::move(*resolved.session_key); }
+        storage.enabled = request.store;
+        try {
+            commit_stored_response(openai_responses_store_, std::move(storage), id, response->body,
+                                   std::move(response->output_history), prepared.preserve_thinking);
+        } catch (const ApiException& exception) {
+            const ApiError error = responses_error(exception.error());
+            lifecycle->response_failure(
+                make_request_failure(RequestFailurePhase::ResponseStore, error));
+            write_openai_error(res, error);
+            return;
+        } catch (const std::exception& exception) {
+            lifecycle->response_failure(make_internal_request_failure(
+                RequestFailurePhase::ResponseStore, exception.what()));
+            write_openai_error(res, internal_error(exception));
+            return;
+        }
+
+        try {
+            set_owned_json_content(res, response->body.dump(), prepared.lifetime);
+        } catch (const std::exception& exception) {
+            lifecycle->response_failure(make_internal_request_failure(
+                RequestFailurePhase::ResponseRender, exception.what()));
             write_openai_error(res, internal_error(exception));
         }
         return;
     }
 
-    auto stream                      = std::make_shared<StreamingResponse>();
-    stream->prepared                 = std::move(prepared);
-    stream->storage.input_turns      = std::move(request.prompt.input_turns);
-    stream->storage.input_items      = std::move(request.prompt.input_items);
-    stream->storage.previous_context = std::move(resolved.parent);
-    if (resolved.session_key) { stream->storage.session_key = std::move(*resolved.session_key); }
-    stream->storage.enabled = request.store;
-    stream->log_context     = log_context;
-    stream->encoder         = std::make_unique<OpenAIResponsesEventStream>(
-        id, created, std::move(request), runtime_values(stream->prepared));
+    try {
+        auto stream                      = std::make_shared<StreamingResponse>();
+        stream->prepared                 = std::move(prepared);
+        stream->storage.input_turns      = std::move(request.prompt.input_turns);
+        stream->storage.input_items      = std::move(request.prompt.input_items);
+        stream->storage.previous_context = std::move(resolved.parent);
+        if (resolved.session_key) {
+            stream->storage.session_key = std::move(*resolved.session_key);
+        }
+        stream->storage.enabled = request.store;
+        stream->encoder         = std::make_unique<OpenAIResponsesEventStream>(
+            id, created, std::move(request), runtime_values(stream->prepared));
 
-    prepare_sse_response(res);
-    res.set_chunked_content_provider(
-        "text/event-stream",
-        [this, stream, id](std::size_t, httplib::DataSink& sink) -> bool {
-            if (stream->started) {
-                sink.done();
-                return true;
-            }
-            stream->started = true;
-            SseTransport transport(sink, stream->cancelled);
-            try {
-                transport.write(stream->encoder->start());
-                StreamSink output;
-                output.on_reasoning = [&](const std::string& text) {
-                    transport.write(stream->encoder->reasoning_delta(text));
-                };
-                output.on_content = [&](const std::string& text) {
-                    transport.write(stream->encoder->content_delta(text));
-                };
-                output.is_cancelled = [&] { return transport.poll(); };
-
-                const GenerationOutcome outcome      = service_->run(stream->prepared, &output);
-                OpenAIResponsesStreamFinish finished = stream->encoder->finish(outcome);
-                commit_stored_response(openai_responses_store_, std::move(stream->storage), id,
-                                       finished.response.body,
-                                       std::move(finished.response.output_history),
-                                       stream->prepared.preserve_thinking);
-                transport.write(finished.events_before_terminal);
-                log_request_done(stream->log_context, outcome);
-                transport.write(stream->encoder->terminal(finished.response));
-                sink.done();
-                return true;
-            } catch (const ClientDisconnected& exception) {
-                log_request_error(stream->log_context, exception.what());
-                return false;
-            } catch (const ApiException& exception) {
-                const ApiError error = responses_error(exception.error());
-                log_request_error(stream->log_context, error.message);
-                try {
-                    transport.write(stream->encoder->failed(error));
+        prepare_sse_response(res);
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, stream, id, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
-                } catch (const ClientDisconnected&) { return false; }
-            } catch (const std::exception& exception) {
-                const ApiError error = internal_error(exception);
-                log_request_error(stream->log_context, error.message);
+                }
+                SseTransport transport(sink, stream->cancelled);
+                const auto send_failed = [&](const ApiError& error) {
+                    try {
+                        render_and_write(transport, [&] { return stream->encoder->failed(error); });
+                        sink.done();
+                        return true;
+                    } catch (const ClientDisconnected&) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception.what()));
+                        return false;
+                    }
+                };
                 try {
-                    transport.write(stream->encoder->failed(error));
+                    render_and_write(transport, [&] { return stream->encoder->start(); });
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_failed(error);
+                }
+
+                GenerationOutcome outcome;
+                try {
+                    StreamSink output;
+                    output.on_reasoning = [&](const std::string& text) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->reasoning_delta(text); });
+                    };
+                    output.on_content = [&](const std::string& text) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->content_delta(text); });
+                    };
+                    output.is_cancelled = [&] { return transport.poll(); };
+
+                    outcome = service_->run(stream->prepared, &output);
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_failed(error);
+                } catch (const ApiException& exception) {
+                    const ApiError error = responses_error(exception.error());
+                    lifecycle->failure(make_generation_request_failure(error));
+                    return send_failed(error);
+                } catch (const std::exception& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::Generation, exception.what()));
+                    return send_failed(error);
+                }
+
+                lifecycle->done(outcome);
+                std::optional<OpenAIResponsesStreamFinish> finished;
+                try {
+                    finished.emplace(stream->encoder->finish(outcome));
+                } catch (const ApiException& exception) {
+                    const ApiError error = responses_error(exception.error());
+                    lifecycle->response_failure(
+                        make_request_failure(RequestFailurePhase::ResponseRender, error));
+                    return send_failed(error);
+                } catch (const std::exception& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_failed(error);
+                }
+
+                try {
+                    commit_stored_response(openai_responses_store_, std::move(stream->storage), id,
+                                           finished->response.body,
+                                           std::move(finished->response.output_history),
+                                           stream->prepared.preserve_thinking);
+                } catch (const ApiException& exception) {
+                    const ApiError error = responses_error(exception.error());
+                    lifecycle->response_failure(
+                        make_request_failure(RequestFailurePhase::ResponseStore, error));
+                    return send_failed(error);
+                } catch (const std::exception& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseStore, exception.what()));
+                    return send_failed(error);
+                }
+
+                std::string terminal;
+                try {
+                    terminal = stream->encoder->terminal(finished->response);
+                } catch (const std::exception& exception) {
+                    const ApiError error = internal_error(exception);
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_failed(error);
+                }
+                try {
+                    transport.write(finished->events_before_terminal);
+                    transport.write(terminal);
                     sink.done();
                     return true;
-                } catch (const ClientDisconnected&) { return false; }
-            }
-        },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+                } catch (const ClientDisconnected&) {
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
+            },
+            [stream, lifecycle](bool successful) {
+                stream->cancelled.store(true, std::memory_order_release);
+                if (!successful || !stream->started.load(std::memory_order_acquire)) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                }
+            });
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+        write_openai_error(res, internal_error(exception));
+    }
 }
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
@@ -418,6 +523,9 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
     } catch (const std::exception& exception) {
+        operational_log_.http_failure(
+            "openai_responses_input_tokens",
+            make_internal_request_failure(RequestFailurePhase::Http, exception.what()));
         write_openai_error(res, internal_error(exception));
     }
 }

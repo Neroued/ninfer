@@ -5,6 +5,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include <cstdint>
@@ -86,11 +87,43 @@ context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
     }
 }
 
+template <typename ContextPolicy, int KeyBlock, int Threads>
+__device__ __forceinline__ void
+context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat16* query, int key0,
+                           int valid_keys, bool query_tile, int kv_head, int physical_page,
+                           ContextPolicy& policy, int tid) {
+    constexpr int VecsPerRow = kContextQueryHeadDim / 8;
+    if (query_tile) {
+        for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
+            const int row                = chunk / VecsPerRow;
+            const int d                  = (chunk - row * VecsPerRow) * 8;
+            const bool live              = row < valid_keys;
+            const std::int64_t src_index = context_query_query_kv_index(kv_head, d, live ? row : 0);
+            const int4 values = live ? bf16x8_bits_to_f16x8_bits(load_vec<int4>(query + src_index))
+                                     : make_int4(0, 0, 0, 0);
+            store_vec(&dst[row * kContextQueryHeadDim + context_query_swz(row, d)], values);
+        }
+        return;
+    }
+
+    const std::int64_t context_tile = policy.context_tile(kv_head, key0, physical_page);
+    for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
+        const int row      = chunk / VecsPerRow;
+        const int d        = (chunk - row * VecsPerRow) * 8;
+        const bool live    = row < valid_keys;
+        const int safe_row = live ? row : 0;
+        const std::int64_t src_index =
+            policy.context_index(context_tile, d, live ? key0 + row : 0, safe_row);
+        __half* smem = &dst[row * kContextQueryHeadDim + context_query_swz(row, d)];
+        cp_async_zfill<16, Cache::cg>(smem, context + src_index, live ? 16 : 0);
+    }
+}
+
 template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
 __device__ __forceinline__ void context_query_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ valid_columns,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     ContextPolicy policy, int length, int max_context, int split_capacity, float scale,
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -107,7 +140,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
     constexpr int QKKs          = D / 16;
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = KeyBlock / 16;
-    constexpr int RowBytes      = D * static_cast<int>(sizeof(__nv_bfloat16));
+    constexpr int RowBytes      = D * static_cast<int>(sizeof(__half));
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -173,7 +206,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
 
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     __nv_bfloat16* k_s = shared;
-    __nv_bfloat16* v_s = shared + KeyBlock * D;
+    __half* v_s        = reinterpret_cast<__half*>(shared + KeyBlock * D);
 
     // The two K/V buffers together hold at least Br rows. Use them once as Q staging, then retain
     // all Q MMA fragments in registers for the complete split.
@@ -262,7 +295,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
         cp_wait<0>();
         __syncthreads();
 
-        context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
+        context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads>(
             v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
             current_page, policy, tid);
         cp_commit();
@@ -357,11 +390,11 @@ __device__ __forceinline__ void context_query_split_partial_body(
             block_l1 += p10 + p11;
             const int pk = nt >> 1;
             if ((nt & 1) == 0) {
-                p_frag[pk][0] = pack_bf16x2(p00, p01);
-                p_frag[pk][1] = pack_bf16x2(p10, p11);
+                p_frag[pk][0] = pack_f16x2(p00, p01);
+                p_frag[pk][1] = pack_f16x2(p10, p11);
             } else {
-                p_frag[pk][2] = pack_bf16x2(p00, p01);
-                p_frag[pk][3] = pack_bf16x2(p10, p11);
+                p_frag[pk][2] = pack_f16x2(p00, p01);
+                p_frag[pk][3] = pack_f16x2(p10, p11);
             }
         }
         block_l0 = warp_sum<4>(block_l0, FullMask);
@@ -398,12 +431,12 @@ __device__ __forceinline__ void context_query_split_partial_body(
                                   v_lane_base + static_cast<unsigned>(next_pk * 16 * RowBytes),
                                   static_cast<unsigned>(next_n2 << 4), v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
-                     p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
+            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
+                    p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
             if (n2 + 1 < PVNt) {
-                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
-                         p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
-                         vf[cur][3]);
+                mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                        p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
+                        vf[cur][3]);
             }
         }
 

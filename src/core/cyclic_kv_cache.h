@@ -12,7 +12,7 @@
 namespace ninfer {
 
 /**
- * Fixed cyclic BF16 K/V storage with absolute-position addressing.
+ * Fixed cyclic BF16-K/FP16-V storage with absolute-position addressing.
  *
  * A logical absolute position p resides in physical slot p % capacity. The view deliberately
  * carries no mutable frontier: callers supply the live absolute interval to the consuming Op.

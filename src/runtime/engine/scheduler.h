@@ -42,7 +42,7 @@ public:
 
         [[nodiscard]] std::uint64_t protection_epoch() const noexcept { return protection_epoch_; }
 
-        [[nodiscard]] std::uint64_t resource_revision() const noexcept {
+        [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept {
             return resource_revision_;
         }
 
@@ -52,16 +52,16 @@ public:
 
     private:
         AdmissionGrant(std::uint64_t request_id, BackfillClass backfill_class,
-                       std::uint64_t protection_epoch, std::uint64_t resource_revision,
+                       std::uint64_t protection_epoch, ProgramResourceRevision resource_revision,
                        std::uint64_t service_work_quanta) noexcept
             : request_id_(request_id), backfill_class_(backfill_class),
               protection_epoch_(protection_epoch), resource_revision_(resource_revision),
               service_work_quanta_(service_work_quanta) {}
 
-        std::uint64_t request_id_          = 0;
-        BackfillClass backfill_class_      = BackfillClass::None;
-        std::uint64_t protection_epoch_    = 0;
-        std::uint64_t resource_revision_   = 0;
+        std::uint64_t request_id_       = 0;
+        BackfillClass backfill_class_   = BackfillClass::None;
+        std::uint64_t protection_epoch_ = 0;
+        ProgramResourceRevision resource_revision_;
         std::uint64_t service_work_quanta_ = 0;
 
         friend class Scheduler;
@@ -285,12 +285,12 @@ public:
             service_work_quanta == 0) {
             throw std::logic_error("head admission is not bound to the observed FIFO head");
         }
-        return AdmissionGrant(request_id, BackfillClass::None, 0, 0, service_work_quanta);
+        return AdmissionGrant(request_id, BackfillClass::None, 0, {}, service_work_quanta);
     }
 
     [[nodiscard]] bool protect_blocked_head(std::uint64_t request_id,
                                             std::span<const ActiveAdmissionSnapshot> active,
-                                            std::uint64_t resource_revision) {
+                                            ProgramResourceRevision resource_revision) {
         if (!fifo_head_id_ || *fifo_head_id_ != request_id) {
             throw std::logic_error("blocked admission does not match the observed FIFO head");
         }
@@ -308,7 +308,7 @@ public:
     [[nodiscard]] std::optional<AdmissionGrant>
     qualify_backfill(std::uint64_t request_id, std::uint64_t service_work_quanta,
                      std::span<const ActiveAdmissionSnapshot> active,
-                     std::uint64_t program_proof_revision) const {
+                     ProgramResourceRevision program_proof_revision) const {
         if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_) {
             throw std::logic_error("backfill qualification has no open protected head");
         }
@@ -326,8 +326,8 @@ public:
     [[nodiscard]] bool validate_grant(const AdmissionGrant& grant) const noexcept {
         if (grant.request_id_ == 0 || grant.service_work_quanta_ == 0) { return false; }
         if (grant.backfill_class_ == BackfillClass::None) {
-            return grant.protection_epoch_ == 0 && grant.resource_revision_ == 0 && fifo_head_id_ &&
-                   *fifo_head_id_ == grant.request_id_;
+            return grant.protection_epoch_ == 0 && grant.resource_revision_.value == 0 &&
+                   fifo_head_id_ && *fifo_head_id_ == grant.request_id_;
         }
         if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_ ||
             protection_->epoch_id != grant.protection_epoch_ ||

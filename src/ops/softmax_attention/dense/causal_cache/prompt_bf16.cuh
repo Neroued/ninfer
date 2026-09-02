@@ -8,7 +8,9 @@
 //   * Q, K, V staged in 96 KiB of dynamic shared memory (single-buffered), with
 //     the cp.async of the next K/V tile overlapped against the current
 //     QK / PV tensor-core work (exactly FA's single-buffer overlap pattern).
-//   * m16n8k16 bf16 MMA for both S = Q Kᵀ and O += P V, online softmax in exp2.
+//   * m16n8k16 BF16 MMA for S = Q Kᵀ, FP16 MMA for O += P V, and FP32 accumulation.
+//   * Persistent V is already FP16; FP32 softmax probabilities are rounded once to FP16 at the
+//     PV operand boundary.
 //
 // The op first writes the new chunk K/V into absolute positions in the paged cache,
 // then computes causal attention for
@@ -19,39 +21,41 @@
 
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
+#include <cuda_fp16.h>
+
 namespace ninfer::ops {
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
-template <typename Geometry>
-__device__ __forceinline__ void
-causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_head, int k0,
-                       int max_query_abs, int physical_page, int tid) {
+template <typename Geometry, typename Element>
+__device__ __forceinline__ void causal_prompt_stage_kv(Element* dst, const Element* cache,
+                                                       int kv_head, int k0, int max_query_abs,
+                                                       int physical_page, int tid) {
     constexpr int D         = kCausalPromptHeadDim;
     constexpr int Bc        = kCausalPromptBc;
     constexpr int Threads   = kCausalPromptThreads;
-    constexpr int VecPerRow = D / 8; // 8 bf16 per 16B cp.async
+    constexpr int VecPerRow = D / 8; // 8 two-byte elements per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
-    const __nv_bfloat16* cache_block =
+    const Element* cache_block =
         cache + paged_kv_element_offset<kCausalPromptHeadDim, Geometry::KVHeads>(
                     physical_page, kv_head, k0 & kPagedKVPageMask, 0);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-            const int key_l  = chunk >> 5;        // / VecPerRow (32)
-            const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
-            __nv_bfloat16* p = &dst[key_l * D + causal_prompt_swz(key_l, d)];
+            const int key_l = chunk >> 5;        // / VecPerRow (32)
+            const int d     = (chunk & 31) << 3; // (chunk % 32) * 8
+            Element* p      = &dst[key_l * D + causal_prompt_swz(key_l, d)];
             cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
         }
     } else {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-            const int key_l  = chunk >> 5;        // / VecPerRow (32)
-            const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
-            __nv_bfloat16* p = &dst[key_l * D + causal_prompt_swz(key_l, d)];
+            const int key_l = chunk >> 5;        // / VecPerRow (32)
+            const int d     = (chunk & 31) << 3; // (chunk % 32) * 8
+            Element* p      = &dst[key_l * D + causal_prompt_swz(key_l, d)];
             if ((k0 + key_l) <= max_query_abs) {
                 cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
             } else {
@@ -68,8 +72,7 @@ template <typename Geometry, typename Metadata>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
     void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                              const __nv_bfloat16* __restrict__ cache_k,
-                                             const __nv_bfloat16* __restrict__ cache_v,
-                                             Metadata metadata,
+                                             const __half* __restrict__ cache_v, Metadata metadata,
                                              const std::int32_t* __restrict__ positions,
                                              float scale, __nv_bfloat16* __restrict__ out,
                                              std::int32_t width) {
@@ -87,9 +90,9 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     static_assert(Threads == 128);
 
     extern __shared__ __align__(16) __nv_bfloat16 causal_smem[];
-    __nv_bfloat16* q_s = causal_smem;  // [Br, D] swizzled
-    __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
-    __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
+    __nv_bfloat16* q_s = causal_smem;                             // [Br, D] swizzled
+    __nv_bfloat16* k_s = q_s + Br * D;                            // [Bc, D] swizzled
+    __half* v_s        = reinterpret_cast<__half*>(k_s + Bc * D); // [Bc, D] swizzled
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -199,7 +202,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
-        // Overlap V(kb) load against the QK MMA below.
+        // Preserve the global FP16 V load/QK overlap.
         causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
                                          tid);
         ninfer::ops::cp_commit();
@@ -303,11 +306,11 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
                 if ((nt & 1) == 0) {
-                    p_frag[pk][0] = pack_bf16x2(p00, p01);
-                    p_frag[pk][1] = pack_bf16x2(p10, p11);
+                    p_frag[pk][0] = pack_f16x2(p00, p01);
+                    p_frag[pk][1] = pack_f16x2(p10, p11);
                 } else {
-                    p_frag[pk][2] = pack_bf16x2(p00, p01);
-                    p_frag[pk][3] = pack_bf16x2(p10, p11);
+                    p_frag[pk][2] = pack_f16x2(p00, p01);
+                    p_frag[pk][3] = pack_f16x2(p10, p11);
                 }
             }
         } else {
@@ -329,11 +332,11 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
                 if ((nt & 1) == 0) {
-                    p_frag[pk][0] = pack_bf16x2(p00, p01);
-                    p_frag[pk][1] = pack_bf16x2(p10, p11);
+                    p_frag[pk][0] = pack_f16x2(p00, p01);
+                    p_frag[pk][1] = pack_f16x2(p10, p11);
                 } else {
-                    p_frag[pk][2] = pack_bf16x2(p00, p01);
-                    p_frag[pk][3] = pack_bf16x2(p10, p11);
+                    p_frag[pk][2] = pack_f16x2(p00, p01);
+                    p_frag[pk][3] = pack_f16x2(p10, p11);
                 }
             }
         }
@@ -350,7 +353,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
             acc[n][3] *= alpha1;
         }
 
-        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s.
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
@@ -388,10 +391,10 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                               causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
                                                      ckv, v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                     p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
+                    p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
+            mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
+                    p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     }
 

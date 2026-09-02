@@ -71,6 +71,25 @@ struct ContextMachineCostModel {
     operator==(const ContextMachineCostModel&, const ContextMachineCostModel&) noexcept = default;
 };
 
+struct PricedMaterializationMachineWork {
+    std::uint64_t optimistic_request_ns = 0;
+    std::uint64_t immediate_ns          = 0;
+    std::uint64_t transferred_bytes     = 0;
+    std::uint32_t copy_operations       = 0;
+};
+
+[[nodiscard]] PricedMaterializationMachineWork
+price_materialization_machine_work(const ContextMachineCostModel& model,
+                                   const MaterializationMachineWork& work) noexcept;
+
+[[nodiscard]] std::uint64_t price_checkpoint_recovery_work(
+    const ContextMachineCostModel& model,
+    std::span<const CheckpointRecoveryAlternativeWork> alternatives) noexcept;
+
+[[nodiscard]] std::uint64_t price_context_transfer_requirements(
+    const ContextMachineCostModel& model,
+    std::span<const ContextTransferRequirement> requirements) noexcept;
+
 struct ContextCostIdentity {
     std::string hardware_class;
     std::string model_id;

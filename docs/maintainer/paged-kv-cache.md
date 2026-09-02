@@ -78,11 +78,14 @@ MTP 与 DFlash 在一个 Engine 内互斥，因此当前最多有两个 growing 
 | MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
 | DFlash Full | DFlash persistent full-context K/V | DFlash context frontier |
 
-Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64 或 FP8-E4M3FN-row256 KV profile；DFlash Full
-使用自己的 BF16 layout。
+Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
+KV profile；DFlash Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
+写入端将 BF16 V 一次转换为 FP16。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
+FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
 
-Common pool implementation 只接收 `KVPageGeometry`、plane inventory 和 capacity。Target/runtime 负责把
-plane ordinal 解释成 layer、K/V、code 或 scale。
+`PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
+layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
+`KVPageGeometry`、plane inventory 和 capacity，不解释 storage mode。
 
 ### 3.2 Main capacity
 
@@ -238,6 +241,7 @@ DFlash Full 使用 head-major page run：
 - \(X=D\) 表示 K/V 或 quantized code plane；
 - INT8-G64 scale plane 使用 \(X=D/64\)；
 - FP8-E4M3FN-row256 scale plane 使用 \(X=1\)；
+- NVFP4-G16 code plane 使用 packed U8 \(X=D/2\)，scale plane 使用 U8 \(X=D/16\)；
 - \(H\) 是 KV heads；
 - \(N_{physical}\) 是该 pool 的 physical page count。
 
@@ -260,8 +264,23 @@ address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
 \]
 
 Code 与 scale planes 使用同一个 \(g\)，但使用各自 Tensor 的 leading coordinate 和 strides。
-Exact persistent codec 由对应 target model 与 consuming Op 定义；allocator 只解释 plane bytes、order
-和 page-group identity。
+Exact persistent codec 由 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) 定义，
+consumer arithmetic 由 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) 定义；
+allocator 只解释 plane bytes、order 和 page-group identity。
+
+D256 Main/MTP profile 的单 token/head 物理 payload 为：
+
+| profile | K code + scale | V code + scale | K+V |
+|---|---:|---:|---:|
+| BF16 | 512 B | 512 B | 1024 B |
+| INT8-G64 | 256 B + 8 B | 256 B + 8 B | 528 B |
+| FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
+| NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
+| K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
+
+K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
+identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
+summary 均从这一 typed plane inventory 计算，不能用 `2 * vector_bytes` 代替 K8V4 的非对称字节数。
 
 ### 4.4 Logical position domain
 
@@ -616,8 +635,7 @@ PagedKVLayerView
 ├── block_table          I32 [Nlogical]
 ├── head_dim
 ├── num_kv_heads
-├── dtype
-└── quant_group
+└── storage
 ```
 
 View 只包含一个 layer 的 plane tensors 与一行 block table。它不包含 allocator handle、request identity、
@@ -632,7 +650,7 @@ PagedKVBatchLayerView
 ├── shared layer planes
 ├── block_tables         I32 [Nlogical, C]
 ├── head_dim / num_kv_heads
-├── dtype / quant_group
+├── storage
 └── table_rows[B]        separate Op input
 ```
 
@@ -722,6 +740,7 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | 职责 | 主要位置 |
 |---|---|
 | Device page pools、reservations与execution tables | `src/core/paged_kv_cache.*` |
+| closed K/V data/scale plane schema | `src/core/paged_kv_storage.h` |
 | Host packed page layout与arena | `src/core/host_kv_arena.*` |
 | logical pages、references与address spaces | `src/targets/qwen3_6/impl/runtime/logical_kv_store.h` |
 | Host extent membership | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h` |
@@ -730,7 +749,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | public paged consumer views | `src/core/paged_kv_cache.h` |
 | growing-cache Ops | `include/ninfer/ops/`, `src/ops/` |
 
-Exact model state、KV codec 和 backend mathematics 见
+Exact model state 和 backend mathematics 见
 [Qwen3.6-27B model](qwen3.6-27b-model.md)与
-[Qwen3.6-35B-A3B model](qwen3.6-35b-a3b-model.md)。路径用于定位当前实现，不把文件或类名本身提升为
+[Qwen3.6-35B-A3B model](qwen3.6-35b-a3b-model.md)；persistent KV codec 和 causal consumer
+numerical contract 由上表中的 growing-cache Ops 定义。路径用于定位当前实现，不把文件或类名本身提升为
 外部接口。

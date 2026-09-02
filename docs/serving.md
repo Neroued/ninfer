@@ -697,7 +697,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -726,7 +726,8 @@ The table lists executable defaults. The startup example selects a long-context 
 
 Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
 and optional transfer or artifact-prefill entries from `--context-cost-presets FILE`. A malformed
-file aborts startup; the startup console line and JSONL record identify the selected source.
+file aborts startup; the operational context-cost record and JSONL `server_start` identify the
+selected source.
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
@@ -744,6 +745,19 @@ zero-valued flags.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
+Serve writes operational records to stderr using
+`[YYYY-MM-DD HH:MM:SS.mmm] [level] [ninfer-serve] message`. Startup records expose CUDA setup,
+including Engine startup, artifact inspection, target planning/finalization, weight materialization,
+pinned staging, frontend/Program construction, Host State and Host KV pinning, CUDA Graph
+preparation, Engine finalization, Serve warmup, and readiness. Interactive terminals show one
+transient weight-materialization progress line. Redirected stderr contains only persistent
+structured phase records, including rate-limited progress for long loads. Nested startup phase
+durations explain their inclusive parent and must not be summed. Normal lifecycle and client
+rejections are `info`; overload, timeout, and upstream failures are `warning`; internal operation
+failures are `error`; a process-level unrecoverable failure is `critical`. Operational request
+records contain stable classifications and counts, never prompts, generated text, request bodies,
+credentials, or arbitrary client error messages.
+
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
@@ -754,7 +768,7 @@ is also rejected if it resolves to the model artifact.
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.
 
-Every line is one `ninfer_serve_request_log` schema-v18 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v19 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -765,8 +779,8 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search/bound diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
-| `request_error` | the resolved request configuration and generation error message |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
@@ -776,11 +790,10 @@ the template has no tiered default. A preparation rejection always leaves the re
 
 `request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
 future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
-model-optimal and budget-exhausted flags; the best remaining lower bound and absolute/relative gap; selected degradation
-units; and whether the selected target was the maximal root fallback. Stop reasons are `no_pressure`, `model_optimal`,
-`queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and `value_of_next_expansion`.
-`model_optimal` is relative to the configured machine/cache-value model, semantic target graph, and canonical stage
-contract—not a claim that observed TTFT is globally optimal. Aborted planning attempts are not published.
+the budget-exhausted flag; selected degradation units; and whether the selected target was the maximal root fallback.
+Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and
+`value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
+Aborted planning attempts are not published.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -802,20 +815,22 @@ request is delayed by the full round, so these values explain request latency bu
 summed across concurrent requests**.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
-replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
-but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
-generation requests receive a request ID when they enter synchronous preparation. Successful
-preparation produces `request_start`; a preparation failure produces `request_rejected` without a
-matching start. Later generation failures produce `request_error`. Schema/model validation
-rejections before preparation and token-count-only calls are not measurement requests and do not
-receive request IDs.
+replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the
+aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
+request ID when they enter synchronous preparation. Successful preparation produces
+`request_start`; a preparation failure produces `request_rejected` without a matching start. Each
+started generation transaction then has exactly one machine terminal: `request_done` when Engine
+returns its outcome, or `request_error` when generation fails before an outcome exists. Later
+response rendering, Responses storage, or terminal transport failures are operational response
+events only and do not add a second JSONL terminal. Schema/model validation rejections before
+preparation and token-count-only calls are not measurement requests and do not receive request IDs.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
 tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
 and DFlash this is the accepted committed output, not draft or rejected tokens.
-`avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
+The operational field `average_decode_batch` and JSONL `average_size` are decode row-rounds divided
+by decode rounds during the same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
 `terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
 `context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
@@ -832,8 +847,9 @@ mutually exclusive Host phases and their `total`; `device_wait_seconds` is separ
 `detail_subset_seconds` and `detail_invocations` expose admission, context-transaction, replica, and
 stats-publication slow paths; these detail values are already contained in a top-level Host phase
 and must not be added to `total`. Per-round, per-row-round, and per-invocation normalized values are
-`null` when their denominator is zero. The stderr interval line shows only total Host milliseconds,
-decode Host/device-wait microseconds per round, boundary, and maintenance; use JSONL for analysis.
+`null` when their denominator is zero. The operational interval record contains token rates,
+scheduler gauges, total Host-active milliseconds, and average decode batch; use JSONL for complete
+measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
@@ -878,11 +894,11 @@ defined in [Resource scheduling and context cache](maintainer/resource-schedulin
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
 `--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
-skips Vision execution, while new suffix media is encoded normally. The completion log reports the
-reused token count as `cache=`.
+skips Vision execution, while new suffix media is encoded normally. The operational completion
+record reports the reused token count as `prefix_cache_hit_tokens=`.
 
-The completion log reports one of six reuse paths: `root`, `private_endpoint`,
-`private_turn_closure`, `private_response_replay`, `private_long_anchor`, or
+The operational completion record reports one of six `prefix_reuse_path` values: `root`,
+`private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, or
 `shared_stable_prefix`. Reuse validation covers KV, recurrent state, hidden state, selected-backend
 state, and the exact prompt frontier. With stable `preserve_thinking=true`, the auxiliary checkpoint
 rolls to the message frontier immediately before the current response's deterministic generation

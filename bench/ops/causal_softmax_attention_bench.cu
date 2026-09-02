@@ -8,6 +8,7 @@
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "core/paged_kv_storage.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -31,19 +32,15 @@ using namespace ninfer;
 namespace {
 
 constexpr std::int32_t kHeadDim          = 256;
-constexpr std::int32_t kKvGroup          = 64;
-constexpr std::int32_t kFp8KvGroup       = 256;
 constexpr float kScale                   = 0.0625F;
 constexpr std::size_t kFlushBytes        = std::size_t{256} << 20;
 constexpr double kDenseF16Bf16TcTflops   = 209.5;
 constexpr double kDenseFp8TcTflops       = 419.0;
-constexpr double kMixedFp8F16TcTflops    = 279.333;
-constexpr double kRtx5090DramGBs         = 1792.0;
 constexpr double kColdPureReadCeilingGBs = 1674.5;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, All };
+enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
@@ -80,7 +77,7 @@ struct Options {
 struct Result {
     Entry entry;
     Geometry geometry;
-    DType kv_dtype;
+    KvCacheStorage storage;
     Execution execution;
     CacheState cache;
     PageMapping mapping;
@@ -91,6 +88,11 @@ struct Result {
     std::string table_rows;
     std::size_t workspace_bytes;
     double logical_bytes;
+    double physical_bytes;
+    double logical_cache_bytes;
+    double key_vector_bytes;
+    double value_vector_bytes;
+    double physical_cache_bytes;
     double qk_flops;
     double pv_flops;
     double physical_kv_read_bytes;
@@ -103,7 +105,7 @@ struct Result {
                  "usage: ninfer_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|all] [--batch B,...] [--tokens W,...] "
+                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -178,10 +180,14 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Int8;
             else if (value == "fp8")
                 options.kv = KvChoice::Fp8;
+            else if (value == "nvfp4")
+                options.kv = KvChoice::Nvfp4;
+            else if (value == "k8v4")
+                options.kv = KvChoice::K8V4;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, or all");
+                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
@@ -299,86 +305,71 @@ Options parse_options(int argc, char** argv) {
 
 std::int32_t align_context(std::int32_t visible) { return ((visible + 127) / 128) * 128; }
 
-std::size_t cache_plane_bytes(const Geometry& geometry, DType dtype, std::int32_t physical_pages) {
-    return static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kPagedKVPageSize *
-           physical_pages * dtype_size(dtype);
+std::size_t data_plane_bytes(const Geometry& geometry, const PagedKVVectorLayout& layout,
+                             std::int32_t physical_pages) {
+    return static_cast<std::size_t>(layout.data_leading_extent) * geometry.kv_heads *
+           kPagedKVPageSize * physical_pages * dtype_size(layout.data_dtype);
 }
 
-std::int32_t scale_groups(DType dtype) {
-    if (dtype == DType::I8) return kHeadDim / kKvGroup;
-    if (dtype == DType::FP8_E4M3FN) return kHeadDim / kFp8KvGroup;
-    return 0;
-}
-
-std::size_t scale_plane_bytes(const Geometry& geometry, DType dtype, std::int32_t physical_pages) {
-    return static_cast<std::size_t>(scale_groups(dtype)) * geometry.kv_heads * kPagedKVPageSize *
-           physical_pages * dtype_size(DType::FP16);
+std::size_t scale_plane_bytes(const Geometry& geometry, const PagedKVVectorLayout& layout,
+                              std::int32_t physical_pages) {
+    return static_cast<std::size_t>(layout.scale_leading_extent) * geometry.kv_heads *
+           kPagedKVPageSize * physical_pages * dtype_size(layout.scale_dtype);
 }
 
 PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
                                  DeviceBuffer& v_scale, DeviceBuffer& block_table,
-                                 const Geometry& geometry, DType dtype, std::int32_t padded) {
-    const bool quantized              = dtype != DType::BF16;
-    const std::int32_t groups         = scale_groups(dtype);
+                                 const Geometry& geometry, KvCacheStorage storage,
+                                 std::int32_t padded, std::int32_t physical_pages) {
+    const PagedKVStorageLayout layout = paged_kv_storage_layout(storage, kHeadDim);
     const std::int32_t logical_pages  = padded / kPagedKVPageSize;
-    const std::int32_t physical_pages = static_cast<std::int32_t>(
-        k.bytes / (static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kPagedKVPageSize *
-                   dtype_size(dtype)));
     return {
-        .k_pages =
-            Tensor(k.p, dtype, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
-        .v_pages =
-            Tensor(v.p, dtype, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
-        .k_scale_pages = quantized
-                             ? Tensor(k_scale.p, DType::FP16,
-                                      {groups, kPagedKVPageSize, geometry.kv_heads, physical_pages})
+        .k_pages = Tensor(
+            k.p, layout.key.data_dtype,
+            {layout.key.data_leading_extent, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
+        .v_pages       = Tensor(v.p, layout.value.data_dtype,
+                                {layout.value.data_leading_extent, kPagedKVPageSize, geometry.kv_heads,
+                                 physical_pages}),
+        .k_scale_pages = layout.key.has_scale()
+                             ? Tensor(k_scale.p, layout.key.scale_dtype,
+                                      {layout.key.scale_leading_extent, kPagedKVPageSize,
+                                       geometry.kv_heads, physical_pages})
                              : Tensor(),
-        .v_scale_pages = quantized
-                             ? Tensor(v_scale.p, DType::FP16,
-                                      {groups, kPagedKVPageSize, geometry.kv_heads, physical_pages})
+        .v_scale_pages = layout.value.has_scale()
+                             ? Tensor(v_scale.p, layout.value.scale_dtype,
+                                      {layout.value.scale_leading_extent, kPagedKVPageSize,
+                                       geometry.kv_heads, physical_pages})
                              : Tensor(),
         .block_table   = Tensor(block_table.p, DType::I32, {logical_pages}),
         .head_dim      = kHeadDim,
         .num_kv_heads  = geometry.kv_heads,
-        .dtype         = dtype,
-        .quant_group   = dtype == DType::I8           ? kKvGroup
-                         : dtype == DType::FP8_E4M3FN ? kFp8KvGroup
-                                                      : 0,
+        .storage       = storage,
     };
 }
 
 PagedKVBatchLayerView make_batch_cache_view(const PagedKVLayerView& cache) {
-    return {
-        .k_pages       = cache.k_pages,
-        .v_pages       = cache.v_pages,
-        .k_scale_pages = cache.k_scale_pages,
-        .v_scale_pages = cache.v_scale_pages,
-        .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
-        .head_dim      = cache.head_dim,
-        .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
-        .quant_group   = cache.quant_group,
-    };
+    return single_row_paged_kv_batch_view(cache);
 }
 
 PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
                                             DeviceBuffer& v_scale, DeviceBuffer& block_tables,
-                                            const Geometry& geometry, DType dtype,
-                                            std::int32_t padded, std::int32_t table_rows) {
-    const PagedKVLayerView direct =
-        make_cache_view(k, v, k_scale, v_scale, block_tables, geometry, dtype, padded);
-    PagedKVBatchLayerView result = make_batch_cache_view(direct);
+                                            const Geometry& geometry, KvCacheStorage storage,
+                                            std::int32_t padded, std::int32_t physical_pages,
+                                            std::int32_t table_rows) {
+    const PagedKVLayerView direct = make_cache_view(k, v, k_scale, v_scale, block_tables, geometry,
+                                                    storage, padded, physical_pages);
+    PagedKVBatchLayerView result  = make_batch_cache_view(direct);
     result.block_tables =
         Tensor(block_tables.p, DType::I32, {padded / kPagedKVPageSize, table_rows});
     return result;
 }
 
-std::size_t workspace_capacity(const Geometry& geometry, DType dtype, std::int32_t tokens,
-                               std::int32_t batch, std::int32_t visible) {
+std::size_t workspace_capacity(const Geometry& geometry, KvCacheStorage storage,
+                               std::int32_t tokens, std::int32_t batch, std::int32_t visible) {
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
                                                          static_cast<std::uint32_t>(visible)};
     return ops::causal_softmax_attention_workspace_capacity_bytes(
-        {kHeadDim, geometry.query_heads, geometry.kv_heads}, dtype, envelope, batch, tokens,
+        {kHeadDim, geometry.query_heads, geometry.kv_heads}, storage, envelope, batch, tokens,
         tokens);
 }
 
@@ -393,10 +384,11 @@ std::int32_t profile_visible(std::span<const std::int32_t> contexts,
 
 class Case {
 public:
-    Case(Geometry geometry, DType dtype, std::int32_t tokens,
+    Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
          std::span<const std::int32_t> table_rows, PageMapping mapping)
-        : batch_(static_cast<std::int32_t>(contexts.size())),
+        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
+          batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
                               [tokens](std::int32_t valid) { return valid != tokens; })),
           visible_(profile_visible(contexts, valid_columns)), padded_(align_context(visible_)),
@@ -412,18 +404,22 @@ public:
           positions_(static_cast<std::size_t>(tokens) * batch_ * sizeof(std::int32_t)),
           valid_columns_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
           table_rows_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
-          cache_k_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
-          cache_v_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
-          cache_k_scale_(bench::make_zeros(dtype != DType::BF16
-                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
-                                               : std::size_t{1})),
-          cache_v_scale_(bench::make_zeros(dtype != DType::BF16
-                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
-                                               : std::size_t{1})),
+          cache_k_(
+              bench::make_zeros(data_plane_bytes(geometry, storage_layout_.key, physical_pages_))),
+          cache_v_(bench::make_zeros(
+              data_plane_bytes(geometry, storage_layout_.value, physical_pages_))),
+          cache_k_scale_(bench::make_zeros(
+              storage_layout_.key.has_scale()
+                  ? scale_plane_bytes(geometry, storage_layout_.key, physical_pages_)
+                  : std::size_t{1})),
+          cache_v_scale_(bench::make_zeros(
+              storage_layout_.value.has_scale()
+                  ? scale_plane_bytes(geometry, storage_layout_.value, physical_pages_)
+                  : std::size_t{1})),
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
-          workspace_bytes_(workspace_capacity(geometry, dtype, tokens, batch_, visible_)),
+          workspace_bytes_(workspace_capacity(geometry, storage, tokens, batch_, visible_)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
           k_tensor_(k_.p, DType::BF16, {kHeadDim, geometry.kv_heads, tokens, batch_}),
@@ -433,10 +429,10 @@ public:
           table_rows_tensor_(table_rows_.p, DType::I32, {batch_}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
           cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
-                                      block_table_, geometry, dtype, padded_)),
+                                      block_table_, geometry, storage, padded_, physical_pages_)),
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
-                                                  cache_v_scale_, block_table_, geometry, dtype,
-                                                  padded_, batch_)),
+                                                  cache_v_scale_, block_table_, geometry, storage,
+                                                  padded_, physical_pages_, batch_)),
           envelope_{static_cast<std::uint32_t>(visible_), static_cast<std::uint32_t>(visible_)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch_, 0);
         for (std::int32_t row = 0; row < batch_; ++row) {
@@ -486,6 +482,7 @@ public:
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
 private:
+    PagedKVStorageLayout storage_layout_;
     std::int32_t batch_;
     bool masked_;
     std::int32_t visible_;
@@ -521,10 +518,20 @@ private:
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
 
-const char* dtype_name(DType dtype) {
-    if (dtype == DType::BF16) return "bf16";
-    if (dtype == DType::I8) return "int8";
-    return "fp8";
+const char* storage_name(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return "bf16";
+    case KvCacheStorage::Int8Group64:
+        return "int8";
+    case KvCacheStorage::Fp8E4M3Row256:
+        return "fp8";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    }
+    return "unknown";
 }
 
 const char* execution_name(Execution execution) {
@@ -546,10 +553,8 @@ std::string profile_name(std::span<const std::int32_t> values) {
     return result;
 }
 
-double cache_vector_bytes(DType dtype) {
-    if (dtype == DType::BF16) { return static_cast<double>(kHeadDim * dtype_size(DType::BF16)); }
-    return static_cast<double>(kHeadDim * dtype_size(dtype) +
-                               scale_groups(dtype) * dtype_size(DType::FP16));
+double cache_vector_bytes(const PagedKVVectorLayout& layout) {
+    return static_cast<double>(layout.physical_bytes());
 }
 
 double causal_key_sum(std::int32_t tokens, std::int32_t context) {
@@ -566,19 +571,45 @@ double causal_key_sum(std::span<const std::int32_t> contexts,
     return total;
 }
 
-double logical_bytes(Entry entry, const Geometry& geometry, DType dtype,
+double modeled_bytes(Entry entry, const Geometry& geometry, KvCacheStorage storage,
                      std::span<const std::int32_t> contexts,
-                     std::span<const std::int32_t> valid_columns) {
+                     std::span<const std::int32_t> valid_columns, bool physical_cache) {
+    const auto layout              = paged_kv_storage_layout(storage, kHeadDim);
     std::int64_t valid_token_count = 0;
     for (const std::int32_t valid : valid_columns) { valid_token_count += valid; }
     const double valid_tokens = static_cast<double>(valid_token_count);
     const double q_and_output = 2.0 * kHeadDim * geometry.query_heads * valid_tokens * 2.0;
-    const double cache_reads  = causal_key_sum(contexts, valid_columns) * geometry.kv_heads * 2.0 *
-                               cache_vector_bytes(dtype);
+    const double key_bytes =
+        physical_cache ? cache_vector_bytes(layout.key) : layout.logical_vector_bytes();
+    const double value_bytes =
+        physical_cache ? cache_vector_bytes(layout.value) : layout.logical_vector_bytes();
+    const double cache_reads =
+        causal_key_sum(contexts, valid_columns) * geometry.kv_heads * (key_bytes + value_bytes);
     if (entry == Entry::Cached) { return q_and_output + cache_reads; }
     const double input_kv     = 2.0 * kHeadDim * geometry.kv_heads * valid_tokens * 2.0;
-    const double cache_writes = 2.0 * geometry.kv_heads * valid_tokens * cache_vector_bytes(dtype);
+    const double cache_writes = geometry.kv_heads * valid_tokens * (key_bytes + value_bytes);
     return q_and_output + cache_reads + input_kv + cache_writes;
+}
+
+double visible_cache_vectors(std::span<const std::int32_t> contexts,
+                             std::span<const std::int32_t> valid_columns) {
+    double visible_rows = 0.0;
+    for (std::size_t row = 0; row < contexts.size(); ++row) {
+        if (valid_columns[row] > 0) { visible_rows += contexts[row] + valid_columns[row]; }
+    }
+    return visible_rows;
+}
+
+double cache_footprint_bytes(const Geometry& geometry, KvCacheStorage storage,
+                             std::span<const std::int32_t> contexts,
+                             std::span<const std::int32_t> valid_columns, bool physical) {
+    const auto layout = paged_kv_storage_layout(storage, kHeadDim);
+    const double key_bytes =
+        physical ? cache_vector_bytes(layout.key) : layout.logical_vector_bytes();
+    const double value_bytes =
+        physical ? cache_vector_bytes(layout.value) : layout.logical_vector_bytes();
+    return visible_cache_vectors(contexts, valid_columns) * geometry.kv_heads *
+           (key_bytes + value_bytes);
 }
 
 double contraction_flops(const Geometry& geometry, std::span<const std::int32_t> contexts,
@@ -586,14 +617,19 @@ double contraction_flops(const Geometry& geometry, std::span<const std::int32_t>
     return 2.0 * kHeadDim * geometry.query_heads * causal_key_sum(contexts, valid_columns);
 }
 
-double physical_kv_read_bytes(const Geometry& geometry, DType dtype,
+double physical_kv_read_bytes(const Geometry& geometry, KvCacheStorage storage,
                               std::span<const std::int32_t> contexts,
                               std::span<const std::int32_t> valid_columns) {
-    double visible_rows = 0.0;
-    for (std::size_t row = 0; row < contexts.size(); ++row) {
-        if (valid_columns[row] > 0) { visible_rows += contexts[row] + valid_columns[row]; }
-    }
-    return visible_rows * geometry.kv_heads * 2.0 * cache_vector_bytes(dtype);
+    return cache_footprint_bytes(geometry, storage, contexts, valid_columns, true);
+}
+
+double qk_tensor_peak_tflops(KvCacheStorage storage) {
+    // The cache storage does not by itself prescribe the QK operand type. The production NVFP4
+    // route expands represented Q/K to FP16, whereas FP8 and K8V4 use E4M3 Q/K. All remaining
+    // public routes use the BF16/FP16 dense peak in this benchmark's mixed-roofline model.
+    return storage == KvCacheStorage::Fp8E4M3Row256 || storage == KvCacheStorage::Fp8KeyNvfp4Value
+               ? kDenseFp8TcTflops
+               : kDenseF16Bf16TcTflops;
 }
 
 bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheState cache,
@@ -611,35 +647,40 @@ bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheSta
 }
 
 void report(const Result& result) {
-    const double seconds = result.timing.median_us * 1.0e-6;
-    const double gbps    = result.logical_bytes / seconds / 1.0e9;
-    const double tflops  = (result.qk_flops + result.pv_flops) / seconds / 1.0e12;
+    const double seconds        = result.timing.median_us * 1.0e-6;
+    const double logical_gbps   = result.logical_bytes / seconds / 1.0e9;
+    const double physical_gbps  = result.physical_bytes / seconds / 1.0e9;
+    const double cache_gbps     = result.physical_kv_read_bytes / seconds / 1.0e9;
+    const double tflops         = (result.qk_flops + result.pv_flops) / seconds / 1.0e12;
+    const double qk_tflops      = result.qk_flops / seconds / 1.0e12;
+    const double pv_tflops      = result.pv_flops / seconds / 1.0e12;
+    const double qk_peak        = qk_tensor_peak_tflops(result.storage);
+    const double mixed_floor_us = (result.qk_flops / (qk_peak * 1.0e12) +
+                                   result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+                                  1.0e6;
     const double tensor_core_roofline =
-        result.kv_dtype == DType::FP8_E4M3FN ? kMixedFp8F16TcTflops : kDenseF16Bf16TcTflops;
-    std::printf("entry=%-6s geometry=%-14s kv=%-4s mapping=%-10s execution=%-5s cache=%-4s "
+        (result.qk_flops + result.pv_flops) / ((mixed_floor_us * 1.0e-6) * 1.0e12);
+    std::printf("entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
                 "B=%d W=%d contexts=%s valid=%s rows=%s "
                 "workspace=%9zu median=%10.3f us min=%10.3f us p95=%10.3f us "
-                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
-                entry_name(result.entry), result.geometry.name, dtype_name(result.kv_dtype),
+                "logical=%8.1f GB/s physical=%8.1f GB/s math=%7.2f TFLOP/s "
+                "(%5.1f%% of %.1f)\n",
+                entry_name(result.entry), result.geometry.name, storage_name(result.storage),
                 mapping_name(result.mapping), execution_name(result.execution),
                 cache_name(result.cache), result.batch, result.tokens, result.row_contexts.c_str(),
                 result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
-                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / tensor_core_roofline * 100.0, tensor_core_roofline);
-    if (result.kv_dtype == DType::FP8_E4M3FN) {
-        const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
-                                       result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
-                                      1.0e6;
-        const double physical_gbps = result.physical_kv_read_bytes / seconds / 1.0e9;
-        std::printf("  fp8 qk_flops=%.0f pv_flops=%.0f mixed_tc_floor=%8.3f us "
-                    "mixed_tc_roofline=%5.1f%% physical_kv_read=%.0f bytes "
-                    "physical_kv_read=%8.1f GB/s (%5.1f%% of %.1f)\n",
-                    result.qk_flops, result.pv_flops, mixed_floor_us,
-                    mixed_floor_us / result.timing.median_us * 100.0, result.physical_kv_read_bytes,
-                    physical_gbps, physical_gbps / kColdPureReadCeilingGBs * 100.0,
-                    kColdPureReadCeilingGBs);
-    }
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us, logical_gbps,
+                physical_gbps, tflops, tflops / tensor_core_roofline * 100.0, tensor_core_roofline);
+    std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
+                "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
+                "pv_full_op=%7.2f TFLOP/s mixed_tc_floor=%8.3f us "
+                "mixed_tc_roofline=%5.1f%% physical_kv_read=%.0f bytes "
+                "effective_cache=%8.1f GB/s (%5.1f%% of %.1f)\n",
+                result.key_vector_bytes, result.value_vector_bytes, result.logical_cache_bytes,
+                result.physical_cache_bytes, result.qk_flops, result.pv_flops, qk_tflops, pv_tflops,
+                mixed_floor_us, mixed_floor_us / result.timing.median_us * 100.0,
+                result.physical_kv_read_bytes, cache_gbps,
+                cache_gbps / kColdPureReadCeilingGBs * 100.0, kColdPureReadCeilingGBs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -649,37 +690,41 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
-              "table_rows,workspace_bytes,logical_bytes,qk_flops,pv_flops,"
-              "mixed_tc_floor_us,mixed_tc_roofline_pct,physical_kv_read_bytes,"
+              "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
+              "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
+              "qk_full_op_tflops,pv_full_op_tflops,qk_tensor_peak_tflops,"
+              "pv_tensor_peak_tflops,mixed_tc_floor_us,mixed_tc_roofline_pct,"
+              "physical_kv_read_bytes,"
               "physical_kv_read_gbps,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
-               << dtype_name(result.kv_dtype) << ',' << mapping_name(result.mapping) << ','
+               << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
                << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
                << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.qk_flops << ',' << result.pv_flops
-               << ',';
-        if (result.kv_dtype == DType::FP8_E4M3FN) {
-            const double seconds        = result.timing.median_us * 1.0e-6;
-            const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
-                                           result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
-                                          1.0e6;
-            output << mixed_floor_us << ',' << mixed_floor_us / result.timing.median_us * 100.0
-                   << ',' << result.physical_kv_read_bytes << ','
-                   << result.physical_kv_read_bytes / seconds / 1.0e9;
-        } else {
-            output << ",,,";
-        }
+               << ',' << result.logical_bytes << ',' << result.physical_bytes << ','
+               << result.logical_cache_bytes << ',' << result.key_vector_bytes << ','
+               << result.value_vector_bytes << ',' << result.physical_cache_bytes << ','
+               << result.qk_flops << ',' << result.pv_flops << ',';
+        const double seconds        = result.timing.median_us * 1.0e-6;
+        const double qk_peak        = qk_tensor_peak_tflops(result.storage);
+        const double mixed_floor_us = (result.qk_flops / (qk_peak * 1.0e12) +
+                                       result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+                                      1.0e6;
+        output << result.qk_flops / seconds / 1.0e12 << ',' << result.pv_flops / seconds / 1.0e12
+               << ',' << qk_peak << ',' << kDenseF16Bf16TcTflops << ',' << mixed_floor_us << ','
+               << mixed_floor_us / result.timing.median_us * 100.0 << ','
+               << result.physical_kv_read_bytes << ','
+               << result.physical_kv_read_bytes / seconds / 1.0e9;
         output << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << '\n';
     }
 }
 
-void profile(Case& data, Entry entry, const Geometry& geometry, DType dtype, const Options& options,
-             std::int32_t batch, std::int32_t width, std::string_view contexts,
-             std::string_view valid_columns, std::string_view table_rows, DeviceBuffer& flush,
-             cudaStream_t stream) {
+void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage storage,
+             const Options& options, std::int32_t batch, std::int32_t width,
+             std::string_view contexts, std::string_view valid_columns, std::string_view table_rows,
+             DeviceBuffer& flush, cudaStream_t stream) {
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
@@ -700,7 +745,7 @@ void profile(Case& data, Entry entry, const Geometry& geometry, DType dtype, con
     std::printf(
         "PROFILE entry=%s geometry=%s kv=%s mapping=%s dispatch=public execution=%s cache=%s "
         "B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s\n",
-        entry_name(entry), geometry.name, dtype_name(dtype), mapping_name(options.mapping),
+        entry_name(entry), geometry.name, storage_name(storage), mapping_name(options.mapping),
         execution_name(execution), cache_name(cache), batch, width,
         static_cast<int>(contexts.size()), contexts.data(), static_cast<int>(valid_columns.size()),
         valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data());
@@ -720,11 +765,14 @@ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
     return {kH24Kv4, kH16Kv2};
 }
 
-std::vector<DType> selected_dtypes(KvChoice choice) {
-    if (choice == KvChoice::Bf16) { return {DType::BF16}; }
-    if (choice == KvChoice::Int8) { return {DType::I8}; }
-    if (choice == KvChoice::Fp8) { return {DType::FP8_E4M3FN}; }
-    return {DType::BF16, DType::I8, DType::FP8_E4M3FN};
+std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
+    if (choice == KvChoice::Bf16) { return {KvCacheStorage::BFloat16}; }
+    if (choice == KvChoice::Int8) { return {KvCacheStorage::Int8Group64}; }
+    if (choice == KvChoice::Fp8) { return {KvCacheStorage::Fp8E4M3Row256}; }
+    if (choice == KvChoice::Nvfp4) { return {KvCacheStorage::Nvfp4Group16}; }
+    if (choice == KvChoice::K8V4) { return {KvCacheStorage::Fp8KeyNvfp4Value}; }
+    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
 }
 
 struct RowProfile {
@@ -775,24 +823,24 @@ int main(int argc, char** argv) {
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
-        const std::vector<Geometry> geometries = selected_geometries(options.geometry);
-        const std::vector<DType> dtypes        = selected_dtypes(options.kv);
+        const std::vector<Geometry> geometries     = selected_geometries(options.geometry);
+        const std::vector<KvCacheStorage> storages = selected_storages(options.kv);
 
         if (options.profile) {
-            const Entry entry        = options.entry;
-            const Geometry geometry  = geometries.front();
-            const DType dtype        = dtypes.front();
-            const std::int32_t batch = options.batches.front();
-            const std::int32_t width = options.tokens.front();
+            const Entry entry            = options.entry;
+            const Geometry geometry      = geometries.front();
+            const KvCacheStorage storage = storages.front();
+            const std::int32_t batch     = options.batches.front();
+            const std::int32_t width     = options.tokens.front();
             const std::int32_t context =
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
-            Case data(geometry, dtype, width, rows.contexts, rows.valid_columns, rows.table_rows,
+            Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
                       options.mapping);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
-            profile(data, entry, geometry, dtype, options, batch, width, context_name, valid_name,
+            profile(data, entry, geometry, storage, options, batch, width, context_name, valid_name,
                     table_name, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
@@ -802,13 +850,13 @@ int main(int argc, char** argv) {
         const std::vector<std::int32_t> context_profiles =
             options.row_contexts.empty() ? options.contexts : std::vector<std::int32_t>{0};
         for (const Geometry& geometry : geometries) {
-            for (const DType dtype : dtypes) {
+            for (const KvCacheStorage storage : storages) {
                 for (const std::int32_t batch : options.batches) {
                     for (const std::int32_t context : context_profiles) {
                         for (const std::int32_t tokens : options.tokens) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
-                            Case data(geometry, dtype, tokens, rows.contexts, rows.valid_columns,
+                            Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
                                       rows.table_rows, options.mapping);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
@@ -840,10 +888,12 @@ int main(int argc, char** argv) {
                                              cache != CacheState::Warm)) {
                                             continue;
                                         }
+                                        const auto storage_layout =
+                                            paged_kv_storage_layout(storage, kHeadDim);
                                         Result result{
                                             entry,
                                             geometry,
-                                            dtype,
+                                            storage,
                                             execution,
                                             cache,
                                             options.mapping,
@@ -853,13 +903,21 @@ int main(int argc, char** argv) {
                                             profile_name(rows.valid_columns),
                                             profile_name(rows.table_rows),
                                             data.workspace_bytes(),
-                                            logical_bytes(entry, geometry, dtype, rows.contexts,
-                                                          rows.valid_columns),
+                                            modeled_bytes(entry, geometry, storage, rows.contexts,
+                                                          rows.valid_columns, false),
+                                            modeled_bytes(entry, geometry, storage, rows.contexts,
+                                                          rows.valid_columns, true),
+                                            cache_footprint_bytes(geometry, storage, rows.contexts,
+                                                                  rows.valid_columns, false),
+                                            cache_vector_bytes(storage_layout.key),
+                                            cache_vector_bytes(storage_layout.value),
+                                            cache_footprint_bytes(geometry, storage, rows.contexts,
+                                                                  rows.valid_columns, true),
                                             contraction_flops(geometry, rows.contexts,
                                                               rows.valid_columns),
                                             contraction_flops(geometry, rows.contexts,
                                                               rows.valid_columns),
-                                            physical_kv_read_bytes(geometry, dtype, rows.contexts,
+                                            physical_kv_read_bytes(geometry, storage, rows.contexts,
                                                                    rows.valid_columns),
                                             measure(data, entry, execution, cache, &graph, flush,
                                                     stream, options.warmup, options.repeat)};

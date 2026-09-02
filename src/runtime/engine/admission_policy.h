@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "runtime/contract/types.h"
 
 #include <array>
 #include <cstddef>
@@ -24,30 +25,32 @@ struct ActiveAdmissionSnapshot {
 // fresh proof for each borrower; Scheduler freezes only the incumbent identities whose eventual
 // release is allowed to make the FIFO head runnable.
 struct AdmissionProtection {
-    std::uint64_t epoch_id          = 0;
-    std::uint64_t head_request_id   = 0;
-    std::uint64_t resource_revision = 0;
+    std::uint64_t epoch_id        = 0;
+    std::uint64_t head_request_id = 0;
+    ProgramResourceRevision resource_revision;
     std::array<std::uint64_t, kMaximumConcurrency> donor_ids{};
     std::size_t donor_count = 0;
 };
 
 [[nodiscard]] AdmissionProtection
 make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
-                          std::uint64_t resource_revision,
+                          ProgramResourceRevision resource_revision,
                           std::span<const ActiveAdmissionSnapshot> active);
 
 // Revalidates the frozen donor partition after Program topology changed. Current-epoch persistent
 // borrowers are never promoted to donors, so repeated backfill cannot move the head's frontier.
 void rebind_admission_protection(AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
-                                 std::uint64_t resource_revision);
+                                 ProgramResourceRevision resource_revision);
 
 [[nodiscard]] bool
 protection_has_live_donor(const AdmissionProtection& protection,
                           std::span<const ActiveAdmissionSnapshot> active) noexcept;
 
-[[nodiscard]] bool persistent_backfill_is_authorized(
-    const AdmissionProtection& protection, std::uint64_t candidate_request_id,
-    std::span<const ActiveAdmissionSnapshot> active, std::uint64_t program_proof_revision) noexcept;
+[[nodiscard]] bool
+persistent_backfill_is_authorized(const AdmissionProtection& protection,
+                                  std::uint64_t candidate_request_id,
+                                  std::span<const ActiveAdmissionSnapshot> active,
+                                  ProgramResourceRevision program_proof_revision) noexcept;
 
 } // namespace ninfer::runtime

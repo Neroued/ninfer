@@ -684,6 +684,15 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool
+    can_release_reference_after_active_reference(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.references != 0 && page.active_references != 0 &&
+               page.active_references <= page.references && page.writer_references <= 1 &&
+               page.source_pins == 0 && !page.destination_pinned;
+    }
+
     [[nodiscard]] bool release_reference(LogicalKVPageHandle handle, bool writer) noexcept {
         if (!can_release_reference(handle, writer)) { return false; }
         Page& page = pages_[handle.index_];
@@ -1670,13 +1679,41 @@ public:
         return pages_->valid(page) && pages_->active_address_references(page) != 0;
     }
 
-    [[nodiscard]] bool release(KVAddressSpaceHandle handle) noexcept {
+    [[nodiscard]] bool can_release(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
-        Address& address = addresses_[handle.index_];
+        const Address& address = addresses_[handle.index_];
         if (address.active || address.row || address.reservation.valid()) { return false; }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
         }
+        return true;
+    }
+
+    [[nodiscard]] bool can_release_after_deactivate(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (!address.active) { return can_release(handle); }
+        if (!address.row) { return false; }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->can_release_reference_after_active_reference(membership(address, page))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool release_after_deactivate(KVAddressSpaceHandle handle) noexcept {
+        if (!can_release_after_deactivate(handle)) { return false; }
+        try {
+            if (addresses_[handle.index_].active) { deactivate(handle); }
+        } catch (...) { std::terminate(); }
+        if (!release(handle)) { std::terminate(); }
+        return true;
+    }
+
+    [[nodiscard]] bool release(KVAddressSpaceHandle handle) noexcept {
+        if (!can_release(handle)) { return false; }
+        Address& address = addresses_[handle.index_];
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!pages_->release_reference(membership(address, page), false)) { std::terminate(); }
             membership(address, page) = {};

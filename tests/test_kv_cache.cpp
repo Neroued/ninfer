@@ -456,6 +456,19 @@ int main() {
                     },
             },
             "HeadMajor");
+        failures += exercise_layout_and_transfer(
+            context,
+            ninfer::KVPageGeometry{
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes =
+                    {
+                        {ninfer::DType::FP8_E4M3FN, 256, 2, 256},
+                        {ninfer::DType::U8, 128, 2, 256},
+                        {ninfer::DType::FP16, 1, 2, 256},
+                        {ninfer::DType::U8, 16, 2, 256},
+                    },
+            },
+            "K8V4 asymmetric PageMajor");
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

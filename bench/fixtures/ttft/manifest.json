@@ -51,42 +51,54 @@
       "sha256": "b00be51579f76f06bdd4d3641d185bfb43350d71a75858f8eae83ec32492dbe6",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "OMEGA",
+      "second_cohort_prompt_tokens": 55000
     },
     "rotation-55k-1": {
       "path": "bench/fixtures/ttft/text/rotation_55k_1.json",
       "sha256": "4170d17d17733ca23c9d52449d58232fe72c79356f991577a39f5d8591d8dcb8",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "SIGMA",
+      "second_cohort_prompt_tokens": 55000
     },
     "rotation-55k-2": {
       "path": "bench/fixtures/ttft/text/rotation_55k_2.json",
       "sha256": "1274f6f889e233189a6b870e03de63b7237ec9c1c407b48c4fc94f95415496d9",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "VIOLET",
+      "second_cohort_prompt_tokens": 55000
     },
     "rotation-55k-3": {
       "path": "bench/fixtures/ttft/text/rotation_55k_3.json",
       "sha256": "5bfe7c1c610640e785391153f6680e7178c057fdc2026dbbff356f8499e366d1",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "THETA",
+      "second_cohort_prompt_tokens": 55000
     },
     "rotation-55k-4": {
       "path": "bench/fixtures/ttft/text/rotation_55k_4.json",
       "sha256": "23829a48cfe472ce35e79b1b9b9558d05af7ed8fbe58956f894736f459270099",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "APPLE",
+      "second_cohort_prompt_tokens": 55000
     },
     "rotation-55k-5": {
       "path": "bench/fixtures/ttft/text/rotation_55k_5.json",
       "sha256": "747ab03b82f70f542b6d45828e4345ecf192139a0043d994cf7ffae522f3cab9",
       "prompt_tokens": 55000,
       "max_output_tokens": 32,
-      "max_peer_common_prefix_tokens": 3
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "CHARLIE",
+      "second_cohort_prompt_tokens": 55000
     },
     "long-256k-32": {
       "path": "examples/cli/messages/long_niah_256k.json",

@@ -257,12 +257,28 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           ops/softmax_attention/plain_and_packed.cpp
           ops/softmax_attention/context.cpp
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_softmax_attention_nvfp4_test
+  COMMAND ninfer_softmax_attention_test --nvfp4-only)
+add_test(NAME ninfer_softmax_attention_k8v4_test
+  COMMAND ninfer_softmax_attention_test --k8v4-only)
+set_tests_properties(
+  ninfer_softmax_attention_nvfp4_test
+  ninfer_softmax_attention_k8v4_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES ops/test_sliding_window_attention.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_test
   SOURCES ops/test_kv_cache_append.cpp
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_kv_cache_append_nvfp4_test
+  COMMAND ninfer_kv_cache_append_test --nvfp4-only)
+add_test(NAME ninfer_kv_cache_append_k8v4_test
+  COMMAND ninfer_kv_cache_append_test --k8v4-only)
+set_tests_properties(
+  ninfer_kv_cache_append_nvfp4_test
+  ninfer_kv_cache_append_k8v4_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)

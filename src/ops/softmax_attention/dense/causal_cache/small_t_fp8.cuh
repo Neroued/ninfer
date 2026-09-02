@@ -17,23 +17,14 @@
 
 namespace ninfer::ops {
 
-__device__ __forceinline__ void causal_small_t_fp8_store_swz(std::uint8_t* tile, int row, int d,
-                                                             std::uint8_t code) {
-    const int col_b16 = d >> 1;
-    const int byte    = d & 1;
-    const int off = (row * (kCausalHeadDim / 2) + causal_small_t_tc_swz(row, col_b16)) * 2 + byte;
-    tile[off]     = code;
-}
-
 __device__ __forceinline__ int4 causal_small_t_fp8_dequant_f16x8(const std::uint8_t* codes,
                                                                  __half scale) {
     const int2 raw         = load_vec<int2>(codes);
     const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
-    const __half2 scale2   = __halves2half2(scale, scale);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 value2 = __hmul2(kv_cache_fp8_code2_to_half2(c[i]), scale2);
+        const __half2 value2 = kv_cache_fp8_dequant_code2_to_half2(c[i], scale);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -162,7 +153,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int window = last_pos + 1;
     const int active_split_count =
-        causal_small_t_fp8_active_splits<Geometry>(window, split_count, TokenTile);
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
     if (split >= active_split_count) return;
 
     const int logical_tiles = div_up(window, Bc);
@@ -273,7 +264,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            causal_small_t_fp8_store_swz(q_s, row, d, kv_cache_fp8_quant_code(values[r], inv));
+            causal_small_t_store_byte_swizzled(q_s, row, d, DB16,
+                                               kv_cache_fp8_quant_code(values[r], inv));
         }
         if (lane == 0) q_scale_tmp[row] = qs;
     }
@@ -624,7 +616,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_fp8_reduce_outpu
         partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
     }
     const int active_splits =
-        causal_small_t_fp8_active_splits<Geometry>(window, split_count, tokens);
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, tokens);
     __shared__ float reduce[256];
     float local_m = -CUDART_INF_F;
     for (int split = tid; split < active_splits; split += blockDim.x) {

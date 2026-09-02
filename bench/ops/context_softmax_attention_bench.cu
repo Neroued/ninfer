@@ -170,12 +170,11 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
     const std::int32_t pages = paged_context(context) / kPagedKVPageSize;
     return {
         .k_pages      = Tensor(k.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
-        .v_pages      = Tensor(v.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
+        .v_pages      = Tensor(v.p, DType::FP16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
         .block_tables = Tensor(block_tables.p, DType::I32, {pages, 1}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKvHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .storage      = KvCacheStorage::BFloat16,
     };
 }
 

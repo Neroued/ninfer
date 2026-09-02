@@ -47,9 +47,9 @@ void validate_active_partition(const AdmissionProtection& protection,
 } // namespace
 
 AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
-                                              std::uint64_t resource_revision,
+                                              ProgramResourceRevision resource_revision,
                                               std::span<const ActiveAdmissionSnapshot> active) {
-    if (epoch_id == 0 || head_request_id == 0 || resource_revision == 0 || active.empty() ||
+    if (epoch_id == 0 || head_request_id == 0 || resource_revision.value == 0 || active.empty() ||
         active.size() > kMaximumConcurrency) {
         throw std::invalid_argument("invalid protected-admission identity");
     }
@@ -72,8 +72,9 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
 
 void rebind_admission_protection(AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
-                                 std::uint64_t resource_revision) {
-    if (protection.epoch_id == 0 || protection.head_request_id == 0 || resource_revision == 0) {
+                                 ProgramResourceRevision resource_revision) {
+    if (protection.epoch_id == 0 || protection.head_request_id == 0 ||
+        resource_revision.value == 0) {
         throw std::invalid_argument("invalid protected-admission rebind");
     }
     validate_active_partition(protection, active);
@@ -90,9 +91,10 @@ bool protection_has_live_donor(const AdmissionProtection& protection,
 bool persistent_backfill_is_authorized(const AdmissionProtection& protection,
                                        std::uint64_t candidate_request_id,
                                        std::span<const ActiveAdmissionSnapshot> active,
-                                       std::uint64_t program_proof_revision) noexcept {
+                                       ProgramResourceRevision program_proof_revision) noexcept {
     if (candidate_request_id == 0 || candidate_request_id == protection.head_request_id ||
-        program_proof_revision == 0 || program_proof_revision != protection.resource_revision ||
+        program_proof_revision.value == 0 ||
+        program_proof_revision != protection.resource_revision ||
         !protection_has_live_donor(protection, active)) {
         return false;
     }

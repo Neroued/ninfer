@@ -146,6 +146,43 @@ void test_exact_evaluation() {
                    .attention_pairs == std::numeric_limits<std::uint64_t>::max(),
            "prefill attention work did not saturate");
     expect(model.prefill_ns(work) == 299, "prefill formula or Q32 rounding changed");
+
+    ninfer::runtime::MaterializationMachineWork materialization;
+    materialization.pressure_transfers[0]             = {.payload_bytes = 4, .copy_operations = 1};
+    materialization.candidate_transfers[0]            = {.payload_bytes = 4, .copy_operations = 1};
+    materialization.optimistic_candidate_transfers[0] = {.payload_bytes   = 100,
+                                                         .copy_operations = 1};
+    materialization.remaining_prefill_work.tokens     = 2;
+    const auto priced = ninfer::runtime::price_materialization_machine_work(model, materialization);
+    expect(priced.immediate_ns == 27 && priced.optimistic_request_ns == 51 &&
+               priced.transferred_bytes == 8 && priced.copy_operations == 2,
+           "materialization work was not priced once across its serial phases");
+
+    const std::array recovery{
+        ninfer::runtime::CheckpointRecoveryAlternativeWork{
+            .prefill = {.tokens = 100},
+        },
+        ninfer::runtime::CheckpointRecoveryAlternativeWork{
+            .transfers = {ninfer::TransferWork{},
+                          ninfer::TransferWork{.payload_bytes = 40, .copy_operations = 1},
+                          ninfer::TransferWork{}},
+        },
+    };
+    expect(ninfer::runtime::price_checkpoint_recovery_work(model, recovery) == 20,
+           "recovery pricing did not select the cheapest supported physical recipe");
+    const std::array requirements{
+        ninfer::runtime::ContextTransferRequirement{
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1},
+        },
+        ninfer::runtime::ContextTransferRequirement{
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1},
+        },
+    };
+    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 16,
+           "capture transfer requirements were not coalesced before pricing");
+
     model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
     expect(model.prefill_ns({.chunks = 2}) == std::numeric_limits<std::uint64_t>::max(),
            "prefill cost did not saturate");

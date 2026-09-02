@@ -5,10 +5,13 @@
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -59,6 +62,15 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
+std::vector<std::uint16_t> fp16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const __half value = __float2half_rn(values[i]);
+        std::memcpy(&bits[i], &value, sizeof(value));
+    }
+    return bits;
+}
+
 void sliding_window_attention_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                                      const std::vector<float>& query_v,
                                      const std::vector<float>& context_k,
@@ -98,7 +110,7 @@ void sliding_window_attention_oracle(const std::vector<float>& q, const std::vec
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int lane_capacity = 1) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
-        .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
+        .v               = Tensor(v.p, DType::FP16, {kD, kWindow, kKVHeads, lane_capacity}),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
@@ -165,7 +177,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const auto query_k_expected   = bf16_bits(query_k);
     const auto query_v_expected   = bf16_bits(query_v);
     const auto context_k_expected = bf16_bits(context_k);
-    const auto context_v_expected = bf16_bits(context_v);
+    const auto context_v_expected = fp16_bits(context_v);
     const std::vector<int> valid_expected{valid_columns};
     const std::vector<int> lane_expected{0};
 
@@ -273,7 +285,7 @@ int run_batch_case() {
     DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
     DeviceBuffer d_context_k = to_device(bf16_bits(context_k));
-    DeviceBuffer d_context_v = to_device(bf16_bits(context_v));
+    DeviceBuffer d_context_v = to_device(fp16_bits(context_v));
     DeviceBuffer d_positions = to_device_i32(positions);
     DeviceBuffer d_valid     = to_device(valid);
     DeviceBuffer d_lanes     = to_device(lanes);

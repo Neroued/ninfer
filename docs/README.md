@@ -43,6 +43,7 @@ Runtime and Op references:
 - [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
 - [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
+- [Operational logging channels, ownership, format, levels, and data policy](maintainer/logging.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)

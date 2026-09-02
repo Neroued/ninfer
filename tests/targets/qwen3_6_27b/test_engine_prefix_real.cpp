@@ -1296,6 +1296,85 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     return 0;
 }
 
+int exercise_materialization_source_pressure_protection(const char* artifact) {
+    // The source occupies 121 pages and the second owner occupies six, leaving one free page. The
+    // branch reuses the source's 120-page turn closure but needs two suffix pages. Under the old
+    // guided closure, the source's unprotected endpoint tail was selected as the one-page Host KV
+    // victim even though the same continuation was the materialization source.
+    constexpr std::uint32_t kLongPromptTokens  = 7683;
+    constexpr std::uint32_t kLongOutputTokens  = 31;
+    constexpr std::uint32_t kShortPromptTokens = 350;
+    ninfer::Engine engine(pressure_resume_engine_options(artifact));
+
+    const std::optional<std::string> long_text =
+        exact_repeated_prompt_text(engine, kLongPromptTokens, "alpha");
+    const std::optional<std::string> short_text =
+        exact_repeated_prompt_text(engine, kShortPromptTokens, "bravo");
+    if (!long_text || !short_text) {
+        std::cerr << "source-pressure fixture could not construct exact prompt geometry\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult source =
+        engine.generate(engine.prepare(pressure_turn(*long_text, "source-pressure-origin",
+                                                     ninfer::CacheRetentionHint::LiveSession)),
+                        fixed_output(kLongOutputTokens));
+    const ninfer::GenerationResult resident =
+        engine.generate(engine.prepare(pressure_turn(*short_text, "source-pressure-resident",
+                                                     ninfer::CacheRetentionHint::LiveSession)),
+                        fixed_output(1));
+    const ninfer::RuntimeStats before_branch = engine.runtime_stats();
+    if (source.prompt.prompt_tokens != kLongPromptTokens ||
+        source.generated_token_ids.size() != kLongOutputTokens ||
+        resident.prompt.prompt_tokens != kShortPromptTokens ||
+        resident.generated_token_ids.size() != 1 ||
+        before_branch.device_main_kv_occupied_pages != 127) {
+        std::cerr << "source-pressure fixture did not establish 127 resident pages: source="
+                  << source.prompt.prompt_tokens << '+' << source.generated_token_ids.size()
+                  << " resident=" << resident.prompt.prompt_tokens << '+'
+                  << resident.generated_token_ids.size()
+                  << " pages=" << before_branch.device_main_kv_occupied_pages << '\n';
+        return 1;
+    }
+
+    ninfer::PromptInput branch = pressure_turn(*long_text, "source-pressure-branch",
+                                               ninfer::CacheRetentionHint::LiveSession);
+    std::string suffix;
+    for (std::uint32_t index = 0; index < 96; ++index) { suffix += " delta"; }
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(suffix), .media = {}});
+    branch.messages.push_back(std::move(followup));
+
+    const ninfer::GenerationResult branched =
+        engine.generate(engine.prepare(std::move(branch)), fixed_output(1));
+    const ninfer::RuntimeStats after_branch = engine.runtime_stats();
+    const std::uint64_t demoted_pages =
+        after_branch.main_kv_d2h_pages - before_branch.main_kv_d2h_pages;
+    const std::uint64_t degraded = after_branch.pressure_private_owners_degraded -
+                                   before_branch.pressure_private_owners_degraded;
+    const bool private_partial_source =
+        branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateResponseReplay ||
+        branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateTurnClosure;
+    if (branched.generated_token_ids.size() != 1 || !private_partial_source ||
+        branched.reused_prompt_tokens == 0 ||
+        branched.reused_prompt_tokens >= branched.prompt.prompt_tokens || demoted_pages == 0 ||
+        degraded == 0 || branched.materialization.selected_maximal_fallback) {
+        std::cerr << "source-pressure branch did not preserve its source under guided Host KV "
+                     "pressure: path="
+                  << static_cast<int>(branched.prefix_reuse_path)
+                  << " reused=" << branched.reused_prompt_tokens
+                  << " prompt=" << branched.prompt.prompt_tokens << " demoted=" << demoted_pages
+                  << " degraded=" << degraded
+                  << " maximal=" << branched.materialization.selected_maximal_fallback << " stop="
+                  << ninfer::materialization_stop_reason_name(branched.materialization.stop_reason)
+                  << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_private_checkpoint_pressure_retention(const char* artifact) {
     constexpr std::uint32_t kLongPromptTokens  = 7683;
     constexpr std::uint32_t kLongOutputTokens  = 16;
@@ -1602,6 +1681,16 @@ int main() {
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
+    if (scenario != nullptr && std::string_view(scenario) == "source-pressure-protection") {
+        if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
+            std::cerr << "source-pressure-protection requires "
+                         "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_materialization_source_pressure_protection(qwen38_nvfp4);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
     if (scenario != nullptr && std::string_view(scenario) == "rewrite-checkpoint") {
         if (nvfp4 == nullptr || *nvfp4 == '\0') {
             std::cerr << "rewrite-checkpoint requires NINFER_QWEN3_6_27B_NVFP4_WEIGHTS\n";
@@ -1652,6 +1741,10 @@ int main() {
         }
     }
     if (qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0') {
+        if (const int result = exercise_materialization_source_pressure_protection(qwen38_nvfp4);
+            result != 0) {
+            return result;
+        }
         if (const int result = exercise_private_checkpoint_pressure_retention(qwen38_nvfp4);
             result != 0) {
             return result;

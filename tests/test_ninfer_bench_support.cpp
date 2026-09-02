@@ -142,6 +142,18 @@ int test_cli_contract() {
     const qb::BenchOptions fp8 =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
     failures += expect(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
+    const qb::BenchOptions nvfp4 =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"});
+    failures += expect(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16, "NVFP4 KV");
+    const qb::BenchOptions k8v4 =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "k8v4"});
+    failures += expect(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value, "K8V4 KV");
+    failures += expect(qb::usage_text("ninfer_bench").find("nvfp4|k8v4") != std::string::npos,
+                       "benchmark help omits new KV modes");
+    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Nvfp4Group16), "nvfp4",
+                              "NVFP4 report name");
+    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Fp8KeyNvfp4Value), "k8v4",
+                              "K8V4 report name");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(

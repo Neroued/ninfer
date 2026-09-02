@@ -384,18 +384,42 @@ public:
     }
 
     void abort_fork(StateImageHandle source, StateImageHandle destination) {
-        Object& source_object      = require(source);
-        Object& destination_object = require(destination);
-        if (source_object.role != StateImageRole::CheckpointImmutable ||
-            source_object.source_pins == 0 ||
-            destination_object.role != StateImageRole::ActiveMutable ||
-            !destination_object.device_slot || !destination_object.destination_pinned) {
+        if (!can_abort_fork(source, destination)) {
             throw std::logic_error("StateImage fork abort is invalid");
         }
+        Object& source_object      = require(source);
+        Object& destination_object = require(destination);
         --source_object.source_pins;
         destination_object.destination_pinned = false;
         destination_object.role               = StateImageRole::ReservedDestination;
         destination_object.content_epoch      = 0;
+    }
+
+    [[nodiscard]] bool can_abort_fork(StateImageHandle source,
+                                      StateImageHandle destination) const noexcept {
+        if (!valid(source) || !valid(destination)) { return false; }
+        const Object& source_object      = objects_[source.index_];
+        const Object& destination_object = objects_[destination.index_];
+        return source != destination && source_object.role == StateImageRole::CheckpointImmutable &&
+               source_object.source_pins != 0 &&
+               destination_object.role == StateImageRole::ActiveMutable &&
+               destination_object.device_slot.has_value() && destination_object.destination_pinned;
+    }
+
+    [[nodiscard]] bool
+    can_release_after_fork_abort(StateImageHandle source, StateImageHandle destination,
+                                 std::uint32_t released_checkpoint_references) const {
+        if (!can_abort_fork(source, destination)) { return false; }
+        const Object& object = require(destination);
+        if (object.checkpoint_references != released_checkpoint_references ||
+            object.source_pins != 0 || has_pending_replica(object)) {
+            return false;
+        }
+        if (object.host_slot) {
+            if (host_ == nullptr) { return false; }
+            (void)host_->view(*object.host_slot);
+        }
+        return true;
     }
 
     [[nodiscard]] StateImageSelectors selectors(StateImageHandle source,
@@ -598,24 +622,43 @@ public:
     }
 
     [[nodiscard]] bool release(StateImageHandle handle) noexcept {
-        if (!valid(handle)) { return false; }
+        if (!can_release(handle)) { return false; }
         Object& object = objects_[handle.index_];
-        if (object.checkpoint_references != 0 || object.source_pins != 0 ||
-            object.destination_pinned || has_pending_replica(object)) {
-            return false;
+        if (object.host_slot) {
+            if (host_ == nullptr || !host_->release(*object.host_slot)) { return false; }
+            object.host_slot.reset();
         }
         if (object.device_slot) {
             return_device_slot(*object.device_slot);
             object.device_slot.reset();
         }
-        if (object.host_slot) {
-            if (host_ == nullptr || !host_->release(*object.host_slot)) { return false; }
-            object.host_slot.reset();
-        }
         object.role          = StateImageRole::Free;
         object.content_epoch = 0;
         if (++object.generation == 0) { ++object.generation; }
         free_objects_[free_object_count_++] = handle.index_;
+        return true;
+    }
+
+    [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.checkpoint_references == 0 && object.source_pins == 0 &&
+               !object.destination_pinned && !has_pending_replica(object);
+    }
+
+    [[nodiscard]] bool
+    can_release_after_checkpoint_references(StateImageHandle handle,
+                                            std::uint32_t released_references) const {
+        const Object& object = require(handle);
+        if (released_references > object.checkpoint_references) { return false; }
+        if (object.checkpoint_references != released_references) { return true; }
+        if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+            return false;
+        }
+        if (object.host_slot) {
+            if (host_ == nullptr) { return false; }
+            (void)host_->view(*object.host_slot);
+        }
         return true;
     }
 

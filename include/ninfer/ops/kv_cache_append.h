@@ -23,8 +23,9 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * Append every K/V row to single-sequence paged growing-cache storage.
  *
  * k/v are contiguous BF16 [256,4|2,T] and positions is contiguous sequential device I32 [T].
- * BF16 cache rows are copied bit-for-bit. INT8-G64 cache rows use one scale for each contiguous
- * 64-value group. For codec input values x, the persistent INT8 group encoding is
+ * BF16 cache mode copies K bit-for-bit and stores V as FP16_RNE(BF16 input). INT8-G64 cache rows
+ * use one scale for each contiguous 64-value group. For codec input values x, the persistent
+ * INT8 group encoding is
  *
  *   a          = max_i abs(FP32(x[i]))
  *   scale_bits = FP16_RNE(a / 127)
@@ -44,27 +45,34 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  *           code[i]    = E4M3FN_RNE_SATFINITE(FP32(x[i]) * inv)
  *   decode[i] = FP32(E4M3FN(code[i])) * s.
  *
- * V uses represented BF16 source values directly as x. For both quantized profiles, K is a paired
- * physical representation for causal Attention: its implementation-owned fixed orthogonal
- * preparation selects x, and the causal consumer applies the matching private Q preparation. The
- * transform and raw K code/scale bytes are not standalone mathematical outputs. Standalone and
- * fused append produce the same consumable K representation. Every addressed code/value and scale
- * is overwritten, and no unrelated cache row is read or written. Inputs and every cache
- * plane/table are pairwise non-overlapping. The Op owns no persistent allocation, frontier,
- * request identity, or commit authority.
+ * NVFP4-G16 encodes a D256 row as sixteen independent groups. Each group stores sixteen E2M1
+ * codes in eight U8 bytes (lower d in the low nibble) plus one UE4M3 scale byte. Its scale is
+ * UE4M3_RNE_SATFINITE(clamp(absmax/6, 2^-9, 448)); an all-zero group stores zero scale and codes.
+ * Codes are E2M1_RNE_SATFINITE(x/scale). There is no matrix-level divisor. Thus one represented
+ * vector occupies 128 code bytes plus 16 scale bytes. K8V4 uses the existing 256-byte row-scaled
+ * FP8 K code plus one FP16 scale, and the 144-byte NVFP4 representation for V.
+ *
+ * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4 and K8V4 apply it
+ * to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
+ * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform
+ * results and raw code/scale bytes are not standalone mathematical outputs. Standalone and fused
+ * append produce byte-identical cache representations. Every addressed code/value and scale is
+ * overwritten, and no unrelated cache row is read or written. Inputs and every cache plane/table
+ * are pairwise non-overlapping. The Op owns no persistent allocation, frontier, request identity,
+ * or commit authority.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
 
 /**
- * Append device-selected exact BF16 prefixes to batched paged growing-cache storage.
+ * Append device-selected BF16 prefixes to batched paged growing-cache storage.
  *
  * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and
  * table_rows are contiguous device I32 [B]. For row b and i in [0,counts[b]), k/v[:, :, i, b]
- * are copied bit-for-bit to logical position positions[i,b] through table row table_rows[b]. The
- * paged planes use head-major order [128,64,Nphysical,8]. No byte belonging only to the rejected
- * physical tail [counts[b],T) is written. Inputs are unchanged, and the Op neither decides nor
- * publishes a committed frontier.
+ * store K bit-for-bit and V as FP16_RNE(BF16 input) at logical position positions[i,b] through
+ * table row table_rows[b]. The paged planes use head-major order [128,64,Nphysical,8]. No byte
+ * belonging only to the rejected physical tail [counts[b],T) is written. Inputs are unchanged,
+ * and the Op neither decides nor publishes a committed frontier.
  *
  * The caller guarantees T>0, B=1..8, envelope.min_count <= counts[b] <= envelope.max_count <= T,
  * sequential nonnegative live positions, materialized table entries for every position allowed by
@@ -76,14 +84,15 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             PagedKVBatchLayerView cache, cudaStream_t stream);
 
 /**
- * Append device-selected exact BF16 prefixes to lane-owned cyclic storage.
+ * Append device-selected BF16 prefixes to lane-owned cyclic storage.
  *
- * k/v, positions, counts, and their exact-copy and mutation contracts match the paged overload;
- * lanes[b] selects the destination lane. The fixed geometry is D=128, Hkv=8, capacity=4096, and
- * absolute position p maps to slot p mod 4096. The caller guarantees that each row's existing live
- * interval ends immediately before positions[0,b], advancing it by counts[b] makes every
- * overwritten old slot dead, and one row commits at most the ring capacity. Consequently, no two
- * live writes race for one physical slot. The Op does not own or publish the lane frontier.
+ * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
+ * overload; lanes[b] selects the destination lane. The fixed geometry is D=128, Hkv=8,
+ * capacity=4096, and absolute position p maps to slot p mod 4096. The caller guarantees that each
+ * row's existing live interval ends immediately before positions[0,b], advancing it by counts[b]
+ * makes every overwritten old slot dead, and one row commits at most the ring capacity.
+ * Consequently, no two live writes race for one physical slot. The Op does not own or publish the
+ * lane frontier.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& lanes,

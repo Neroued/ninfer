@@ -55,8 +55,7 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
 void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream) {
-    const CausalPromptDirectMetadata metadata{
-        static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
     causal_attention_prompt_fp8_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                    stream);
 }
@@ -68,7 +67,7 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const 
                                         cudaStream_t stream) {
     kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
     const auto launch = [&]<bool Masked>() {
-        const CausalPromptBatchMetadata<Masked> metadata{
+        const PagedKVBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,

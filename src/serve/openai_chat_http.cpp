@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -44,7 +45,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                     : GenerationConsumerMode::Aggregate,
                                      [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
-        log_request_rejected(make_request_rejection_log_context(
+        record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
         write_openai_error(res, exception.error());
         return;
@@ -53,84 +54,171 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         error.status  = 500;
         error.type    = "internal_error";
         error.message = exception.what();
-        log_request_rejected(make_request_rejection_log_context(
+        record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, error));
         write_openai_error(res, error);
         return;
     }
 
     const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
-    const RequestLogContext log_context       = make_request_log_context(
-        req_id, "openai_chat_completions", request.generation, metadata, prepared);
-    log_request_start(log_context);
+    auto lifecycle                            = begin_request(make_request_log_context(
+        req_id, "openai_chat_completions", request.generation, metadata, prepared));
 
     if (!request.stream) {
+        GenerationOutcome outcome;
         try {
-            const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-            log_request_done(log_context, outcome);
+            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+        } catch (const ApiException& exception) {
+            lifecycle->failure(make_generation_request_failure(exception.error()));
+            write_openai_error(res, exception.error());
+            return;
+        } catch (const std::exception& exception) {
+            const RequestFailure failure =
+                make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
+            lifecycle->failure(failure);
+            ApiError error;
+            error.status  = 500;
+            error.type    = "internal_error";
+            error.message = exception.what();
+            write_openai_error(res, error);
+            return;
+        }
+        lifecycle->done(outcome);
+        try {
             set_owned_json_content(res, make_chat_completion_response(identity, outcome),
                                    prepared.lifetime);
         } catch (const std::exception& exception) {
-            log_request_error(log_context, exception.what());
-            throw;
+            lifecycle->response_failure(make_internal_request_failure(
+                RequestFailurePhase::ResponseRender, exception.what()));
+            ApiError error;
+            error.status  = 500;
+            error.type    = "internal_error";
+            error.message = exception.what();
+            write_openai_error(res, error);
         }
         return;
     }
 
-    auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-    auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage);
+    try {
+        auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage);
 
-    prepare_sse_response(res);
-    res.set_chunked_content_provider(
-        "text/event-stream",
-        [this, stream, encoder, log_context](std::size_t, httplib::DataSink& sink) -> bool {
-            if (stream->started) {
-                sink.done();
-                return true;
-            }
-            stream->started = true;
-            SseTransport transport(sink, stream->cancelled);
-            try {
-                transport.write(encoder->start());
-                StreamSink output;
-                output.on_content = [&](const std::string& text) {
-                    transport.write(encoder->content_delta(text));
-                };
-                output.on_reasoning = [&](const std::string& text) {
-                    transport.write(encoder->reasoning_delta(text));
-                };
-                output.is_cancelled = [&] { return transport.poll(); };
-
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
-                log_request_done(log_context, outcome);
-                transport.write(encoder->finish(outcome));
-                sink.done();
-                return true;
-            } catch (const ClientDisconnected& exception) {
-                log_request_error(log_context, exception.what());
-                return false;
-            } catch (const ApiException& exception) {
-                log_request_error(log_context, exception.error().message);
-                try {
-                    transport.write(sse_error_event(exception.error()));
+        prepare_sse_response(res);
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
-                } catch (const ClientDisconnected&) { return false; }
-            } catch (const std::exception& exception) {
-                log_request_error(log_context, exception.what());
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = exception.what();
+                }
+                SseTransport transport(sink, stream->cancelled);
+                const auto send_error = [&](const ApiError& error) {
+                    try {
+                        render_and_write(transport, [&] { return sse_error_event(error); });
+                        sink.done();
+                        return true;
+                    } catch (const ClientDisconnected&) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception.what()));
+                        return false;
+                    }
+                };
                 try {
-                    transport.write(sse_error_event(error));
+                    render_and_write(transport, [&] { return encoder->start(); });
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "internal_error";
+                    error.message = exception.what();
+                    return send_error(error);
+                }
+
+                GenerationOutcome outcome;
+                try {
+                    StreamSink output;
+                    output.on_content = [&](const std::string& text) {
+                        render_and_write(transport, [&] { return encoder->content_delta(text); });
+                    };
+                    output.on_reasoning = [&](const std::string& text) {
+                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
+                    };
+                    output.is_cancelled = [&] { return transport.poll(); };
+
+                    outcome = service_->run(stream->prepared, &output);
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "internal_error";
+                    error.message = exception.what();
+                    return send_error(error);
+                } catch (const ApiException& exception) {
+                    lifecycle->failure(make_generation_request_failure(exception.error()));
+                    return send_error(exception.error());
+                } catch (const std::exception& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::Generation, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "internal_error";
+                    error.message = exception.what();
+                    return send_error(error);
+                }
+
+                lifecycle->done(outcome);
+                std::vector<std::string> terminal;
+                try {
+                    terminal = encoder->finish(outcome);
+                } catch (const std::exception& exception) {
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    ApiError error;
+                    error.status  = 500;
+                    error.type    = "internal_error";
+                    error.message = exception.what();
+                    return send_error(error);
+                }
+                try {
+                    transport.write(terminal);
                     sink.done();
                     return true;
-                } catch (const ClientDisconnected&) { return false; }
-            }
-        },
-        [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+                } catch (const ClientDisconnected&) {
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
+            },
+            [stream, lifecycle](bool successful) {
+                stream->cancelled.store(true, std::memory_order_release);
+                if (!successful || !stream->started.load(std::memory_order_acquire)) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                }
+            });
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        write_openai_error(res, error);
+    }
 }
 
 } // namespace ninfer::serve

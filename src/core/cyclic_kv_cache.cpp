@@ -70,7 +70,7 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
         layout.k.push_back(builder.add_tensor(DType::BF16,
                                               {head_dim, padded, num_kv_heads, lane_capacity},
                                               kArenaAlign, prefix + " K"));
-        layout.v.push_back(builder.add_tensor(DType::BF16,
+        layout.v.push_back(builder.add_tensor(DType::FP16,
                                               {head_dim, padded, num_kv_heads, lane_capacity},
                                               kArenaAlign, prefix + " V"));
     }
@@ -98,7 +98,7 @@ CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layo
     k_.reserve(layout.k.size());
     v_.reserve(layout.v.size());
     for (std::size_t layer = 0; layer < layout.k.size(); ++layer) {
-        if (layout.k[layer].dtype != DType::BF16 || layout.v[layer].dtype != DType::BF16 ||
+        if (layout.k[layer].dtype != DType::BF16 || layout.v[layer].dtype != DType::FP16 ||
             layout.k[layer].shape != expected_shape || layout.v[layer].shape != expected_shape) {
             throw std::invalid_argument("Cyclic KV layer layout is inconsistent");
         }

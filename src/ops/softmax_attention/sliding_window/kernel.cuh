@@ -42,7 +42,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
         const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
         const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
-        const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+        const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
         int padded_context, int max_context, int split_capacity, float scale,
         __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {

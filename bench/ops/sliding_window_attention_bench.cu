@@ -162,7 +162,7 @@ Options parse_options(int argc, char** argv) {
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
-        .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
+        .v               = Tensor(v.p, DType::FP16, {kHeadDim, kWindow, kKvHeads, 1}),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKvHeads,

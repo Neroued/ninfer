@@ -4,114 +4,82 @@
     {
       "id": "wikitext-00",
       "domain": "english_reference",
-      "path": "data/wikitext/00.txt",
-      "bytes": 277332,
-      "sha256": "9dc7c437f80afc9b7a6c2da214bf190c9381d8eacec1edc12e841ba1e96a2a22"
+      "path": "data/wikitext/00.txt"
     },
     {
       "id": "wikitext-01",
       "domain": "english_reference",
-      "path": "data/wikitext/01.txt",
-      "bytes": 279968,
-      "sha256": "5c31da39664211e5e8536c6b5d6dff4518ef5a19d87e9648043ca67ef83a7f96"
+      "path": "data/wikitext/01.txt"
     },
     {
       "id": "wikitext-02",
       "domain": "english_reference",
-      "path": "data/wikitext/02.txt",
-      "bytes": 287421,
-      "sha256": "b6cd11c5dbb0f097ded7a6ba55fe524f1f3e02c6ad6957e654a4ec6ace76ab4f"
+      "path": "data/wikitext/02.txt"
     },
     {
       "id": "wikitext-03",
       "domain": "english_reference",
-      "path": "data/wikitext/03.txt",
-      "bytes": 288145,
-      "sha256": "81a64a0ef6eb5cf368e8d877928c8e6397d2851e7b9293a9ac32f0f6fe40cba1"
+      "path": "data/wikitext/03.txt"
     },
     {
       "id": "pg19-00",
       "domain": "english_long_form",
-      "path": "data/pg19/00.txt",
-      "bytes": 253868,
-      "sha256": "51195c4b1f8f61ce8564b31b5d7dbe808ef488e6403299f5a38a9f025c72fc6a"
+      "path": "data/pg19/00.txt"
     },
     {
       "id": "pg19-01",
       "domain": "english_long_form",
-      "path": "data/pg19/01.txt",
-      "bytes": 248501,
-      "sha256": "32e15c3509bc766ecdd8fd16ae4cf4ba7fe7277107a0dbb328fbf40b530dd869"
+      "path": "data/pg19/01.txt"
     },
     {
       "id": "pg19-02",
       "domain": "english_long_form",
-      "path": "data/pg19/02.txt",
-      "bytes": 265408,
-      "sha256": "1df87dc71265fecfd8f3e837fa6da035e980476148630241969db5d48b94e8e1"
+      "path": "data/pg19/02.txt"
     },
     {
       "id": "pg19-03",
       "domain": "english_long_form",
-      "path": "data/pg19/03.txt",
-      "bytes": 251960,
-      "sha256": "442483b8a411298106dc6a04d846789cc231b05608368a9f47676effd5fbf129"
+      "path": "data/pg19/03.txt"
     },
     {
       "id": "zhwiki-00",
       "domain": "chinese_reference",
-      "path": "data/zhwiki/00.txt",
-      "bytes": 216699,
-      "sha256": "a6bb7daee717c80921c79b601f8787215b49a9134213b785b5c6acb88d3ffbb2"
+      "path": "data/zhwiki/00.txt"
     },
     {
       "id": "zhwiki-01",
       "domain": "chinese_reference",
-      "path": "data/zhwiki/01.txt",
-      "bytes": 232851,
-      "sha256": "7c43485f97005d3ed98a98b130d9b0897eeba91b90856b01395eda3c4c5917d2"
+      "path": "data/zhwiki/01.txt"
     },
     {
       "id": "zhwiki-02",
       "domain": "chinese_reference",
-      "path": "data/zhwiki/02.txt",
-      "bytes": 234385,
-      "sha256": "7c7610d6343c5fa58b6cebf59ff8423c535bd31fd267799dca523efe58e102fd"
+      "path": "data/zhwiki/02.txt"
     },
     {
       "id": "zhwiki-03",
       "domain": "chinese_reference",
-      "path": "data/zhwiki/03.txt",
-      "bytes": 214569,
-      "sha256": "fae3f1bf54531a50c1e253854f477d0370209bc020a775c3db6d476d06a8494f"
+      "path": "data/zhwiki/03.txt"
     },
     {
       "id": "ninfer-00",
       "domain": "ninfer_code",
-      "path": "data/ninfer/00.txt",
-      "bytes": 227452,
-      "sha256": "ffa159736c11bdafd29e2903bdfd3ae75294c9d26a03b37df071fcbecdc73312"
+      "path": "data/ninfer/00.txt"
     },
     {
       "id": "ninfer-01",
       "domain": "ninfer_code",
-      "path": "data/ninfer/01.txt",
-      "bytes": 242674,
-      "sha256": "bc275ec39434e271bf6afadb4ad23de61a8f6aabcd1014c35bc4d5d5e8f3fe69"
+      "path": "data/ninfer/01.txt"
     },
     {
       "id": "ninfer-02",
       "domain": "ninfer_code",
-      "path": "data/ninfer/02.txt",
-      "bytes": 249148,
-      "sha256": "87885c5f20ad58ccb4c375837d63545abc388fc1498da4c77f3dce8d7eac0664"
+      "path": "data/ninfer/02.txt"
     },
     {
       "id": "ninfer-03",
       "domain": "ninfer_code",
-      "path": "data/ninfer/03.txt",
-      "bytes": 242505,
-      "sha256": "f666130d5b41674d37730d4de6e1296d3a717ad0f0a973a16650c0621890a881"
+      "path": "data/ninfer/03.txt"
     }
   ],
   "modes": {

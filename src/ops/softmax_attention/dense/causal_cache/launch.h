@@ -24,7 +24,7 @@ struct CausalSmallTInvocation {
 };
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                             DType cache_dtype,
+                                             KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope);
 
 bool causal_attention_uses_small_t(std::int32_t tokens);
@@ -60,6 +60,32 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
                                                 Tensor& partial_l, Tensor& out,
                                                 cudaStream_t stream);
 
+void causal_attention_small_t_nvfp4_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+
+void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor& positions,
+                                                  float scale, const PagedKVLayerView& cache,
+                                                  CausalAttentionExecutionEnvelope envelope,
+                                                  Tensor& partial_acc, Tensor& partial_m,
+                                                  Tensor& partial_l, Tensor& out,
+                                                  cudaStream_t stream);
+
+void causal_attention_small_t_k8v4_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+
+void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& positions,
+                                                 float scale, const PagedKVLayerView& cache,
+                                                 CausalAttentionExecutionEnvelope envelope,
+                                                 Tensor& partial_acc, Tensor& partial_m,
+                                                 Tensor& partial_l, Tensor& out,
+                                                 cudaStream_t stream);
+
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
@@ -78,5 +104,25 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const 
 void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream);
+
+void causal_attention_prompt_nvfp4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& valid_columns,
+                                          const Tensor& table_rows, float scale,
+                                          PagedKVBatchLayerView cache, Tensor& out,
+                                          cudaStream_t stream);
+
+void causal_attention_prompt_nvfp4_attention_launch(const Tensor& q, const Tensor& positions,
+                                                    float scale, const PagedKVLayerView& cache,
+                                                    Tensor& out, cudaStream_t stream);
+
+void causal_attention_prompt_k8v4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                         const Tensor& positions, const Tensor& valid_columns,
+                                         const Tensor& table_rows, float scale,
+                                         PagedKVBatchLayerView cache, Tensor& out,
+                                         cudaStream_t stream);
+
+void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor& positions,
+                                                   float scale, const PagedKVLayerView& cache,
+                                                   Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

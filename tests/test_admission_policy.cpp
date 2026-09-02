@@ -71,7 +71,11 @@ bool throws_logic(Function&& function) {
 int main() {
     using ninfer::runtime::ActiveAdmissionSnapshot;
     using ninfer::runtime::BackfillClass;
-    using Scheduler = ninfer::runtime::Scheduler<SchedulerRequest>;
+    using ninfer::runtime::ProgramResourceRevision;
+    using Scheduler     = ninfer::runtime::Scheduler<SchedulerRequest>;
+    const auto revision = [](std::uint64_t value) {
+        return ProgramResourceRevision{.value = value};
+    };
 
     int failures = 0;
     const std::array<ActiveAdmissionSnapshot, 2> incumbents{
@@ -79,18 +83,19 @@ int main() {
         ActiveAdmissionSnapshot{.request_id = 2},
     };
 
-    auto protection = ninfer::runtime::make_admission_protection(7, 10, 31, incumbents);
-    failures += check(protection.donor_count == 2 && protection.donor_ids[0] == 1 &&
-                          protection.donor_ids[1] == 2 && protection.resource_revision == 31,
-                      "protection did not freeze every incumbent donor");
+    auto protection = ninfer::runtime::make_admission_protection(7, 10, revision(31), incumbents);
+    failures +=
+        check(protection.donor_count == 2 && protection.donor_ids[0] == 1 &&
+                  protection.donor_ids[1] == 2 && protection.resource_revision == revision(31),
+              "protection did not freeze every incumbent donor");
     failures += check(ninfer::runtime::protection_has_live_donor(protection, incumbents),
                       "live donor was not recognized");
-    failures +=
-        check(ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents, 31),
-              "matching Program proof did not authorize persistent backfill");
-    failures +=
-        check(!ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents, 30),
-              "stale Program proof authorized persistent backfill");
+    failures += check(ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents,
+                                                                         revision(31)),
+                      "matching Program proof did not authorize persistent backfill");
+    failures += check(!ninfer::runtime::persistent_backfill_is_authorized(protection, 11,
+                                                                          incumbents, revision(30)),
+                      "stale Program proof authorized persistent backfill");
 
     const std::array<ActiveAdmissionSnapshot, 3> with_borrower{
         incumbents[0],
@@ -101,46 +106,46 @@ int main() {
             .backfill_class = BackfillClass::Persistent,
         },
     };
-    ninfer::runtime::rebind_admission_protection(protection, with_borrower, 32);
-    failures += check(
-        protection.donor_count == 2 && protection.resource_revision == 32 &&
-            ninfer::runtime::persistent_backfill_is_authorized(protection, 12, with_borrower, 32),
-        "revision rebind changed the frozen donor partition");
+    ninfer::runtime::rebind_admission_protection(protection, with_borrower, revision(32));
+    failures += check(protection.donor_count == 2 && protection.resource_revision == revision(32) &&
+                          ninfer::runtime::persistent_backfill_is_authorized(
+                              protection, 12, with_borrower, revision(32)),
+                      "revision rebind changed the frozen donor partition");
 
     const std::array<ActiveAdmissionSnapshot, 1> borrower_only{with_borrower[2]};
-    ninfer::runtime::rebind_admission_protection(protection, borrower_only, 33);
-    failures += check(
-        !ninfer::runtime::protection_has_live_donor(protection, borrower_only) &&
-            !ninfer::runtime::persistent_backfill_is_authorized(protection, 12, borrower_only, 33),
-        "backfill remained open after every frozen donor completed");
+    ninfer::runtime::rebind_admission_protection(protection, borrower_only, revision(33));
+    failures += check(!ninfer::runtime::protection_has_live_donor(protection, borrower_only) &&
+                          !ninfer::runtime::persistent_backfill_is_authorized(
+                              protection, 12, borrower_only, revision(33)),
+                      "backfill remained open after every frozen donor completed");
 
     const std::array<ActiveAdmissionSnapshot, 1> unknown_active{
         ActiveAdmissionSnapshot{.request_id = 99},
     };
-    failures +=
-        check(throws_logic([&] {
-                  ninfer::runtime::rebind_admission_protection(protection, unknown_active, 34);
-              }),
-              "unclassified post-protection active request was accepted as a donor");
+    failures += check(throws_logic([&] {
+                          ninfer::runtime::rebind_admission_protection(protection, unknown_active,
+                                                                       revision(34));
+                      }),
+                      "unclassified post-protection active request was accepted as a donor");
 
     Scheduler scheduler;
     scheduler.observe_fifo_head(10);
-    failures += check(scheduler.protect_blocked_head(10, incumbents, 40),
+    failures += check(scheduler.protect_blocked_head(10, incumbents, revision(40)),
                       "blocked FIFO head did not open a donor epoch");
-    auto stale = scheduler.qualify_backfill(11, 50, incumbents, 40);
+    auto stale = scheduler.qualify_backfill(11, 50, incumbents, revision(40));
     failures += check(stale && stale->backfill_class() == BackfillClass::Persistent &&
                           scheduler.validate_grant(*stale),
                       "Program-proved borrower did not receive a persistent grant");
     if (!stale) { return 1; }
     const std::uint64_t epoch = stale->protection_epoch();
-    failures += check(scheduler.protect_blocked_head(10, incumbents, 41) &&
+    failures += check(scheduler.protect_blocked_head(10, incumbents, revision(41)) &&
                           !scheduler.validate_grant(*stale),
                       "resource revision did not invalidate an uncommitted grant");
 
-    auto first = scheduler.qualify_backfill(11, 50, incumbents, 41);
-    failures +=
-        check(first && first->protection_epoch() == epoch && first->resource_revision() == 41,
-              "revalidated borrower changed the logical protection epoch");
+    auto first = scheduler.qualify_backfill(11, 50, incumbents, revision(41));
+    failures += check(first && first->protection_epoch() == epoch &&
+                          first->resource_revision() == revision(41),
+                      "revalidated borrower changed the logical protection epoch");
     if (!first) { return 1; }
     scheduler.commit_admission(std::move(*first));
 
@@ -153,9 +158,9 @@ int main() {
             .backfill_class = BackfillClass::Persistent,
         },
     };
-    failures += check(scheduler.protect_blocked_head(10, active_after_first, 42),
+    failures += check(scheduler.protect_blocked_head(10, active_after_first, revision(42)),
                       "existing persistent borrower prevented revision revalidation");
-    auto second = scheduler.qualify_backfill(12, 1, active_after_first, 42);
+    auto second = scheduler.qualify_backfill(12, 1, active_after_first, revision(42));
     failures += check(second && scheduler.validate_grant(*second),
                       "second Program-proved borrower was not cumulatively admitted");
 

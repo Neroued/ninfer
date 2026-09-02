@@ -29,20 +29,6 @@
 
 namespace ninfer::ops {
 
-// Store one int8 code into a d-contiguous-as-b16 swizzled tile so the same
-// causal_small_t_tc_swz / ldmatrix path that serves bf16 tiles serves the int8 tile.
-// A b16 lane holds two packed int8 (d even = low byte, d odd = high byte); this
-// matches the byte layout a 16 B cp.async of d-contiguous cache bytes produces
-// (see the design doc / kernel comments), so Q (byte stores) and K (cp.async)
-// agree.
-__device__ __forceinline__ void causal_small_t_i8_store_swz(std::int8_t* tile, int row, int d,
-                                                            int d_b16_stride, std::int8_t code) {
-    const int c   = d >> 1;
-    const int lo  = d & 1;
-    const int off = (row * d_b16_stride + causal_small_t_tc_swz(row, c)) * 2 + lo;
-    tile[off]     = code;
-}
-
 // Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
 // m16 row tile computes QK + online softmax, while all CTA warps partition the
 // tile's 256-wide PV output. This keeps each thread's PV accumulator at 16, 32,
@@ -311,8 +297,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             amax            = warp_max(amax, FullMask);
             const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_small_t_i8_store_swz(q_i8, row, d0, DB16, kv_cache_int8_quant_code(x0, inv));
-            causal_small_t_i8_store_swz(q_i8, row, d1, DB16, kv_cache_int8_quant_code(x1, inv));
+            causal_small_t_store_byte_swizzled(q_i8, row, d0, DB16,
+                                               kv_cache_int8_quant_code(x0, inv));
+            causal_small_t_store_byte_swizzled(q_i8, row, d1, DB16,
+                                               kv_cache_int8_quant_code(x1, inv));
             if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
         }
     }

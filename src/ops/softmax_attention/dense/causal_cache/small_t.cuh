@@ -120,8 +120,8 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
 }
 
 template <typename Geometry>
-__device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int launch_capacity,
-                                                                int tokens) {
+__device__ __forceinline__ int
+causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
     int splits = causal_small_t_default_splits<Geometry>(window);
     if constexpr (Geometry::SmallTSplitScale == 1) {
         if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
@@ -131,6 +131,15 @@ __device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int 
 
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+template <typename Byte>
+__device__ __forceinline__ void causal_small_t_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                   int d_b16_stride, Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off     = (row * d_b16_stride + causal_small_t_tc_swz(row, col_b16)) * 2 + byte;
+    tile[off]         = code;
 }
 
 __device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {
@@ -153,9 +162,16 @@ __device__ __forceinline__ void causal_small_t_tc_row_to_qt(int row, int tokens,
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+__device__ __forceinline__ float causal_partial_acc_value(float value) { return value; }
+
+__device__ __forceinline__ float causal_partial_acc_value(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename PartialAcc, typename Geometry, int DChunk, bool Int8, bool MultiBatch,
+          bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
-    const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
+    const PartialAcc* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out) {
@@ -254,7 +270,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
             const float weight =
                 expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
                      head_m);
-            numerator += __bfloat162float(partial_acc[causal_partial_acc_index<Geometry>(
+            numerator += causal_partial_acc_value(partial_acc[causal_partial_acc_index<Geometry>(
                              q_head, d, token, split, tokens)]) *
                          weight;
         }

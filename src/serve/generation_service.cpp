@@ -222,7 +222,7 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
+GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
     : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
@@ -242,7 +242,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.load_progress            = std::move(load_progress);
+    engine_options.startup_observer         = std::move(startup_observer);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(

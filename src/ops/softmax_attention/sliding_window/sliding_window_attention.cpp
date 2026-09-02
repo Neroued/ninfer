@@ -56,7 +56,7 @@ void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::BF16) {
+    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
     }
     require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");

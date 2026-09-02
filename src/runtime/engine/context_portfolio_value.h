@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/contract/types.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -11,13 +13,13 @@
 namespace ninfer::runtime {
 
 struct ContextPortfolioOwnerPolicy {
-    std::uint32_t ordinal                  = 0;
+    PlanningOwnerId owner;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
 };
 
 struct ContextPortfolioCheckpointValue {
-    std::uint32_t owner_ordinal        = 0;
+    PlanningOwnerId owner;
     std::uint32_t demand_mask          = 0;
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
@@ -46,12 +48,12 @@ public:
         owner_scratch_.clear();
         for (const ContextPortfolioOwnerPolicy& policy : owners) {
             if (std::find_if(owner_scratch_.begin(), owner_scratch_.end(), [&](const auto& item) {
-                    return item.ordinal == policy.ordinal;
+                    return item.owner == policy.owner;
                 }) != owner_scratch_.end()) {
-                throw std::logic_error("portfolio owner policy ordinal is duplicated");
+                throw std::logic_error("portfolio owner policy ID is duplicated");
             }
             owner_scratch_.push_back(
-                OwnerValue{.ordinal                  = policy.ordinal,
+                OwnerValue{.owner                    = policy.owner,
                            .private_retention_weight = policy.private_retention_weight,
                            .explicit_shared_credit   = policy.explicit_shared_credit});
         }
@@ -59,7 +61,7 @@ public:
         for (const ContextPortfolioCheckpointValue& checkpoint : checkpoints) {
             const auto owner = std::find_if(
                 owner_scratch_.begin(), owner_scratch_.end(),
-                [&](const OwnerValue& item) { return item.ordinal == checkpoint.owner_ordinal; });
+                [&](const OwnerValue& item) { return item.owner == checkpoint.owner; });
             if (owner == owner_scratch_.end()) {
                 throw std::logic_error("portfolio checkpoint has no owner policy");
             }
@@ -103,7 +105,7 @@ public:
 
 private:
     struct OwnerValue {
-        std::uint32_t ordinal                  = 0;
+        PlanningOwnerId owner;
         std::uint32_t private_retention_weight = 0;
         bool explicit_shared_credit            = false;
         std::uint64_t baseline_best            = 0;

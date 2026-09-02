@@ -65,6 +65,11 @@ ResourceManager 拥有逻辑缓存策略：
 ResourceManager 可以知道“某个 checkpoint 可从 Device、Host 或 root 恢复”的 Program summary，
 但不保存物理 occupancy、refcount、free page 或 Host arena 几何的副本。
 
+ResourceManager 对 active request 的逻辑保护保存为 owner edge，而不是 catalog capability 或引用计数镜像。
+Capability generation 是 planning/transaction 的瞬时结构快照；owner edge 是持续到 active request terminal
+settlement 的逻辑 lease。另一个 reader 改变同一 owner 的 Device/Host residency 时可以推进 generation，但不
+使已有 owner edge stale。所有 active logical reference counts 都从这些 edges 派生。
+
 ### 2.3 Program
 
 Program 是唯一物理 authority，拥有：
@@ -587,9 +592,10 @@ domain。
 Saving(p,S)=\max(0,\ Rebuild(p)-Recovery(p,S))
 \]
 
-`Rebuild` 是从 root 到该 frontier 的 canonical prefill cost；`Recovery` 是 Program 根据实际 State/KV
-placement 返回的最小 restore、copy 和必要 interval-prefill cost。每条 demand 只取所有 matching
-checkpoints 中的最大 saving：
+`Rebuild` 是从 root 到该 frontier 的 canonical prefill cost。Program 根据实际 State/KV placement 枚举所有
+受支持的 restore/copy/interval-prefill recovery recipes；common runner 用本次 planning problem 的同一个
+immutable machine cost model 定价并取最小值作为 `Recovery`。Program 不接收 cost model，也不替策略层选择
+recipe。每条 demand 只取所有 matching checkpoints 中的最大 saving：
 
 \[
 EmpiricalValue(S)=\sum_q\max_{p\ matches\ q}Saving(p,S)
@@ -646,126 +652,103 @@ NetGain=PublicValue(S_t)-PublicValue(S_b)
 Selected source 的合法 `ConsumedToActive` 是 ownership transfer，不计作 eviction。其他随 pressure
 删除或降级的 checkpoints 通过 public value 与 private transition loss 进入 future loss。
 
-### 8.4 Lower bound
+### 8.4 排序提示不是证明
 
-每个搜索节点具有：
+Program 为未 assessment 的 target 返回 physical residual、预计剩余步数、transfer work 和稳定 ordinal。
+ResourceManager 将其与 selected hits、retention weight、shared credit 和 hit epoch 合并成确定性 priority。
+这些值只决定先探索谁：
 
-\[
-LB(c,T)=MinimumRequestCost(c,T)+FutureLoss_c(T)
-\]
+- 不能标记 target feasible；
+- 不能排除 candidate 或 target；
+- 不能证明 incumbent 最优；
+- 不能参与 physical readiness。
 
-`MinimumRequestCost` 保留无法被后续降级消除的 restore/prefill work，只排除完整 victim set 可能消除的
-private-source Fork/COW 或 optional pressure work。
-
-Lower bound 用于两件事：
-
-- 判断一个可行 identity target 是否已经支配所有可展开 alternatives；
-- 当 queue 最小 lower bound 严格大于 incumbent 完整成本时证明当前模型内最优。
-
-相等 lower bound 仍需进入确定性 tie-break，不能提前停止。
+只有完整 exact assessment 与 logical-adoption check 可以产生可采用方案。日志不再发布
+`model_optimal`、remaining lower bound 或 bound gap。
 
 ### 8.5 无压力路径
 
-Planner 首先评估所有 exact candidate 的 identity target。若最佳可行 identity 的完整成本严格低于每个
-expandable candidate 的 lower bound，则直接 seal：
+Planner 必须先读取全部 exact candidate identities。只有 Program 明确表示所有 candidate 均不需要也不能
+通过 pressure 改善当前 materialization work 时，才直接 seal 最佳可采用 identity。只要任一 candidate
+仍 expandable，就建立同一 bounded pressure domain；不能因为估计成本高于 incumbent 而跳过它。
 
-```text
-inspect exact candidates
-  -> choose dominating feasible identity
-  -> seal ResourcePlan
-```
-
-这条路径不建立 pressure target graph，也不扫描与本次选择无关的物理对象。它覆盖资源充足时的普通
-cache hit 和 root admission。
+最终 shared-capture split 由 ResourceManager 在 selected candidate 已确定后选择。Program 在 seal 内验证并
+消费 `FinalScheduleIntent`；返回的 `ResourcePlan` 不再具有 post-seal mutation API，Scheduler 看到的
+summary 已是最终值。
 
 ### 8.6 Correctness incumbent
 
-如果没有 identity target 同时满足物理与 logical publication 条件，Planner 在可选搜索预算之外先评估：
+若没有 identity target 同时满足物理与 logical publication 条件，Planner 在 optional budget 之外 assessment：
 
 ```text
 root candidate
 + release all unprotected inactive cache
 ```
 
-这是 maximal-release target。它不保留可牺牲的 cache value，但保证：
+root maximal target 由 candidate-specific eligible domain 构造；selected source 没有 victim cell。它不保留
+可牺牲 cache value，但保证 heuristic、target budget 或 wall budget 失败不会把本可运行请求误判为 blocked。
+active requirements、source required coverage、writer 和 transaction pins 始终留在 Program 的 requirement
+union 中。
 
-- 搜索预算耗尽不会把本可运行请求错误地判成 blocked；
-- planner 始终拥有一个 correctness-first incumbent；
-- active reservations、selected-source protection 和 transaction pins 仍不可被释放。
+若 isolated root 超过静态合同，结果为 permanently infeasible；若 isolated root 可行但 active guarantee、
+lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
-若 isolated root 本身超过 per-request 或总容量，结果为 permanently infeasible。若 isolated root 可行，
-但当前 active reservations、lane 或 open transaction 仍阻塞 maximal-release target，结果为 temporarily
-blocked。
+### 8.7 有界 heuristic search
 
-### 8.7 有界 anytime search
+Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证 identity
+或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
 
-有了 incumbent 后，Planner 保留一个完整的 lazy branch-and-bound frontier。Program 原子地产生全部
-canonical children，但 children 先只取得 candidate-root 的 certified lower bound 和一份 cheap
-guidance；Planner 每次只对一个 popped target 调用 exact assessment，因此预算检查粒度不会退化成整层
-children 的 projection batch。
+一次 planning problem 中：
 
-Planner 先为每个仍有竞争力的 candidate 构造一个 target-owned direct closure，再运行小型
-deterministic Pareto beam：
+1. ResourceManager mint `PlanningCandidateId`、`PlanningOwnerId` 并保留到 catalog capability 的唯一映射；
+2. Program 为每个 candidate 建立只包含 eligible victims 的 domain，source 结构性缺席；
+3. target 是 Program-owned opaque handle；runner 不构造 State/KV action；
+4. guidance 只排列 frontier；
+5. Program exact evaluator 从完整联合 post-state 结算 unique State/KV identity、alias、placement、Move/Fork、
+   COW、Host geometry 和 stage peak；
+6. ResourceManager 按 owner ID 判断 logical adoption 与 future value；
+7. budget 耗尽时返回最佳已验证 incumbent。
 
-- ResourceManager 只根据 selected hits、shared credit、retention weight、last-hit epoch 和稳定 ordinal 排列
-  owner 偏好；它不理解 target 的 State/KV 物理动作；
-- Program 从 candidate 的完整 physical peak、当前 occupancy/capacity 和已选 pressure effects 计算 residual，
-  优先沿低价值 owner 追加不删除 checkpoint 的 canonical successors，得到一个完整 closure；pressure effect
-  必须作用于完整 peak 后再与 capacity 比较，不能直接作用于已经 clamp 为零的 deficit，否则 Host 有空闲时的
-  Device-to-Host demotion 会被误判为新的 Host 缺口；
-- direct closure 只提供一个待验证 target；Program 的完整 compose、alias accounting、Host extent allocation
-  和 physical-peak proof 仍由随后的一次 exact assessment 完成；
-- 若 direct closure 未形成可用 seed，Program 从相同的 peak/residual 与 transfer metadata 提供 cheap
-  guidance；ResourceManager 根据 owner outcomes、retention weight、hit history 和 shared credit 形成独立的
-  logical-damage axes；
-- beam 在 physical progress、logical damage 和 estimated work 的 Pareto frontier 上排序，逐个送入 exact
-  assessment；每个 candidate 找到普通可行 target 后结束自己的 seed phase；
-- beam 丢弃的 target 仍留在 lazy exact frontier，heuristic 不能删除 proof path。
+普通 expansion、guided closure、root maximal 与 seal 使用同一 candidate-specific domain 和同一 exact
+evaluator。不存在另一套 source/victim eligibility 规则，也不存在 synthetic capture
+`AdmissionCandidate` 跨越 common planner 边界。
 
-Direct closure、guided seed 与后续 exact search 共享同一个 wall budget；budget 在不可分的 closure 或 exact
-assessment 之间检查，因此单次操作最多造成一次粒度内超时。
+Search management 使用 ordinal-indexed `BoundedTargetLedger`。Program target choices 存放在
+planning-session-owned flat arena；每个 target 只保存 offset/count，canonical lookup 使用 flat hash。Prepare
+expansion 在 arena 尾部建立 scratch，commit 只保留新 canonical targets，discard 回卷到原 mark。Session
+开始时按固定 target/owner 上限取得容器容量；capacity exhaustion 返回已有 incumbent，不能改变 correctness。
 
-随后继续 exact branch-and-bound：
+Target budget 同时约束 canonical targets 与 exact assessments。Materialization 另在不可分的 Program
+operation 之间检查 wall/value budget；identity assessments 和 root maximal correctness assessment 不计
+optional budget。Shared capture 以固定 target budget 约束工作量，incumbent 始终为 Skip。任何 budget 只影响
+cache quality，不改变 mandatory request readiness。
 
-1. 未 assessment 的 target 只携带保守的 certified lower bound；
-2. Program exact assessment 与 ResourceManager logical-publication check 是采用 target 的唯一 oracle；
-3. 可行且逻辑可采用的 target 可以替换 incumbent；
-4. 仍可扩展且 lower bound 不高于 incumbent 的 target 进入 exact queue；
-5. queue 与 lazy frontier 穷尽、证明 model-optimal，或达到 target/time/value budget 时停止；
-6. 始终使用停止时的最佳完整 incumbent。
+### 8.8 目标函数与确定性
 
-Guidance 只决定工作顺序，不能创建 `ResourcePlan`、标记 target feasible、执行 exact pruning，或贡献
-`model_optimal` 证明。一次 expansion 的 children 要么完整加入，要么完整丢弃，避免 target budget 使结果
-依赖生成顺序。Budget 只控制 cache retention 质量；它不截断 candidate identity 检查和 maximal-release
-correctness assessment。Guided seed 同时受 exact-assessment 数量和 wall watchdog 限制；watchdog 在每个 exact
-assessment 之间检查，单个不可分 assessment 最多造成一次粒度内超时。
+对 exact feasible assessment：
 
-Pressure session 的热路径不使用 page/target 的线性 canonical lookup：target choices 进入预定容量的 flat
-hash index；State/KV placement 与 alias accounting 使用 Program 启动时按 logical descriptor capacity 分配的
-generation scratch。Exact assessment 缓存 successor expansion 所需的 residual，checkpoint baseline recovery
-在 session 开始时计算一次；当前 incumbent 还可保留其 complete composed projection，seal 只执行最终
-revalidation，不重复 compose。上述缓存都绑定当前 `resource_revision` 和单个 planning session，不跨 Program
-共享。
+```text
+J = price(Program machine work)
+  + ResourceManager portfolio loss
+```
 
-若本次实际 assessment 的 canonical targets 为 \(N\)，heap search 的管理成本为 \(O(N\log N)\)，小 beam
-的管理成本有固定上限，总成本再加 Program 对这些 targets 的 physical projection work。设当前有 \(A\) 个
-eligible owners，stored target decisions 使用 \(O(NA)\) memory；physical oracle 与 successor scratch 还受
-启动时配置的 owner、checkpoint 和 logical-page descriptor 上限约束。\(N\) 由固定 target budget 封顶。
-因此组合目标空间可以很大，但一次 admission 的规划时间和内存不会随理论组合数无界增长。
+Program 只形成 canonical transfer/prefill work，并为 checkpoint recovery 枚举受支持的物理 recipes；
+ResourceManager 提供 demand、retention 和 shared credit；runner 使用同一次 planning problem 的 immutable
+machine cost model 统一定价并比较。成本模型不会进入 Program API，只能改变已验证 targets 的探索和选择
+顺序，不能改变 physical status、readiness、source protection 或 target generation。
 
-### 8.8 确定性选择
+相同 `J` 下依次偏好：
 
-首要比较键是 \(J\)。成本相等时依次偏好：
-
-1. 少影响已观测命中的 checkpoints，优先保留最近命中；
+1. 少影响已观测命中的 checkpoints，保留最近命中；
 2. 少 owner eviction、checkpoint deletion、copy operation 和 transferred bytes；
 3. 少剩余 Text/Vision prefill；
 4. 多复用 prompt tokens；
 5. 当前 session binding；
 6. candidate 与 target 的稳定 ordinal。
 
-`model_optimal` 只表示在当前 target graph、规范 stage order 和机器成本模型内已经证明最优，不表示真实
-请求分布上的全局最优 TTFT。
+停止原因只描述实际边界：`no_pressure`、`queue_exhausted`、`target_budget`、
+`expansion_capacity`、`time_budget` 或 `value_of_next_expansion`。它们不声明当前 target graph 或真实
+TTFT 的全局最优性。
 
 ### 8.9 Readiness
 
@@ -815,6 +798,11 @@ Program 在第一次 mutation 前重新验证：
 Stale 或不再可行的 plan 在 start 前无物理副作用。Start 成功后，source、victims 和 destinations 被
 claim/pin，plan 被线性消费，不再更换 candidate 或 target。
 
+ResourceManager 在调用 Program start 前先建立唯一 logical transaction record，并把所有 source/victim 与
+publication destinations 置为 claimed/reserved。Program 在第一次物理 mutation 前完成自己的 preflight。
+同步 start 返回 Aborted 时，ResourceManager 回滚完整 logical claim；start 成功后 logical record 与 Program
+transaction 一直同时存在，直到 stable result adoption 或 Engine-wide cleanup。
+
 ### 9.3 Progress
 
 Transaction 可以跨同步 copy 或 CUDA event 推进。每个 replacement 遵循：
@@ -826,6 +814,17 @@ destination reserved
   -> replacement published
   -> old replica released when unreferenced
 ```
+
+Materialization 与 active capture 共用一条单调 pressure phase：
+
+```text
+HostReleases -> CopyPreparation -> CopiesInFlight? -> CopyPublication -> Committed
+```
+
+phase 是全局 pressure 顺序的唯一 authority。每个 owner work 可以保存 destination/copy 是否已实际提交以及
+mutation 是否已发布的执行事实，用于形成 absolute result；这些事实不能改变或绕过全局 phase。无 copy 时从
+`CopyPreparation` 直接进入 `CopyPublication`。Cancellation 只在稳定 phase boundary 采用，已发布的 Host
+release 或 victim eviction 通过绝对 `ResourceResult` 报告。
 
 同一时间至多一个 global resource transition。既有 active execution 只有在使用自身既有 reservation、
 且不触碰 transaction mappings 时才能与 transfer 交错。
@@ -842,8 +841,10 @@ Commit 发布：
 - 必要的 `resource_revision` 变化。
 
 `ResourceResult` 包含 ResourceManager 采用逻辑终态所需的绝对结果，不包含供上层重建物理 occupancy 的
-delta。ResourceManager 在 start 前已预留 adoption storage，因此 commit 后的 adoption 必须 allocation-free
-且不能进行新的容量判断。
+delta。每个 owner claim 绑定确切的 `CheckpointRef` 删除集合，而不是只绑定删除数量；ResourceManager
+逐项核对最终 summary 恰好等于原 checkpoint 集合减去该集合。因此同数量但不同 checkpoint 的替换会在任何
+catalog mutation 前失败。ResourceManager 在 start 前已预留 adoption storage，因此 commit 后的 adoption
+不能进行新的容量判断。
 
 ### 9.5 Abort
 
@@ -917,9 +918,11 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 | `max_shared_prefixes` | shared immutable owner/catalog 容量 |
 | `max_long_anchors_per_continuation` | 每条 private history 的 retained long checkpoints 上限 |
 
-所有 stores、catalogs、planner scratch 和 transaction adoption storage 都按解析后的上限在启动时建立。
-每请求 external markers 固定最多四个、Frontend candidates 固定最多三个、demand window 固定为 32；这些
-是产品语义与算法有界性，不是可调容量轴。
+所有 stores、catalogs、Program unique-object scratch 和 reusable planner frontiers 都按解析后的上限建立。
+每个 pressure planning session 的 target arena、hash 和 assessment storage 在 session 开始时按固定上限取得
+容量；target expansion 不得突破该容量。Logical claim manifests 与 adoption 所需容量必须在 Program mutation
+前取得。每请求 external markers 固定最多四个、Frontend candidates 固定最多三个、demand window 固定为
+32；这些是产品语义与算法有界性，不是可调容量轴。
 配置必须满足：
 
 - private continuation capacity 至少覆盖全部 active requests；
@@ -965,12 +968,14 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 | 职责 | 主要位置 |
 |---|---|
 | logical catalog、claims、session policy | `src/runtime/engine/resource_manager.h` |
+| bounded target ledger 与 common search primitives | `src/runtime/engine/resource_search.h` |
 | cross-candidate bounded planner | `src/runtime/engine/materialization_planner.h` |
-| shared capture bounded planner | `src/runtime/engine/shared_capture_planner.h` |
+| typed shared-capture bounded entrypoint | `src/runtime/engine/shared_capture_planner.h` |
 | shared/private portfolio value | `src/runtime/engine/context_portfolio_value.h` |
 | machine cost model | `src/runtime/engine/context_cost.*` |
 | common resource summaries | `src/runtime/contract/types.h` |
-| target physical projection 与 transaction | `src/targets/qwen3_6/impl/runtime/program*.h` |
+| unique-object projection contract | `src/targets/qwen3_6/impl/runtime/resource_projection.h` |
+| target domain、projection 与 transaction | `src/targets/qwen3_6/impl/runtime/program*.h`、`pressure_planner.h` |
 | State stores | `src/targets/qwen3_6/impl/runtime/state_image_store.h` |
 | logical KV/address spaces | `src/targets/qwen3_6/impl/runtime/logical_kv_store.h` |
 | Host KV extents | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h` |

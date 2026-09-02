@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/layout.h"
+#include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>
@@ -25,8 +26,7 @@ struct PagedKVLayerView {
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    DType dtype               = DType::BF16;
-    std::int32_t quant_group  = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -38,9 +38,11 @@ struct PagedKVBatchLayerView {
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
-    DType dtype               = DType::BF16;
-    std::int32_t quant_group  = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
 };
+
+/** Rebinds one checked single-sequence table row as a one-row batched view. */
+[[nodiscard]] PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache);
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.
 struct KVPlaneGeometry {

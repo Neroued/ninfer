@@ -46,28 +46,14 @@ inline constexpr int kCausalPromptFp8SmemBytes =
 static_assert(kCausalPromptFp8DConsumers == 4);
 static_assert(kCausalPromptFp8SmemBytes == 92416);
 
-__device__ __forceinline__ void causal_prompt_fp8_store_swz(std::uint8_t* tile, int row, int d,
-                                                            std::uint8_t code) {
-    const int col_b16 = d >> 1;
-    const int byte    = d & 1;
-    const int off     = (row * kCausalPromptFp8DB16 + causal_prompt_swz(row, col_b16)) * 2 + byte;
-    tile[off]         = code;
-}
-
-__device__ __forceinline__ int causal_prompt_fp8_p_swz(int row, int col) {
-    if constexpr (kCausalPromptFp8Bc == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
-    return causal_prompt_swz(row, col);
-}
-
 __device__ __forceinline__ int4 causal_prompt_fp8_dequant_f16x8(const std::uint8_t* codes8,
                                                                 __half scale) {
     const int2 raw         = load_vec<int2>(codes8);
     const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
-    const __half2 s2       = __halves2half2(scale, scale);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 value2 = __hmul2(kv_cache_fp8_code2_to_half2(c[i]), s2);
+        const __half2 value2 = kv_cache_fp8_dequant_code2_to_half2(c[i], scale);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -157,7 +143,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            causal_prompt_fp8_store_swz(q_fp8, row, d, kv_cache_fp8_quant_code(values[r], inv));
+            causal_prompt_store_byte_swizzled(q_fp8, row, d,
+                                              kv_cache_fp8_quant_code(values[r], inv));
         }
         if (lane == 0) q_scale[row] = qs;
     }
@@ -347,10 +334,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
                                       : 0.0F;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_s[row0 * Bc + causal_prompt_fp8_p_swz(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + causal_prompt_fp8_p_swz(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + causal_prompt_fp8_p_swz(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + causal_prompt_fp8_p_swz(row1, col1)] = __float2half_rn(p11);
+                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col0)] = __float2half_rn(p00);
+                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col1)] = __float2half_rn(p01);
+                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col0)] = __float2half_rn(p10);
+                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col1)] = __float2half_rn(p11);
             }
             bl0 = warp_sum<4>(bl0, FullMask);
             bl1 = warp_sum<4>(bl1, FullMask);
@@ -410,7 +397,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             const int pcol = k * 16 + a_coloff;
             ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
                         smem_addr(&p_s[(row_base + a_rowoff) * Bc +
-                                       causal_prompt_fp8_p_swz(row_base + a_rowoff, pcol)]));
+                                       causal_prompt_p_swz<Bc>(row_base + a_rowoff, pcol)]));
 #pragma unroll
             for (int n = 0; n < PVNtPerWarp; ++n) {
                 const int global_n = d_slice * PVNtPerWarp + n;

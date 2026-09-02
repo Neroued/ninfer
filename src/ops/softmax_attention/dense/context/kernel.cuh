@@ -72,7 +72,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void context_attention_split_p
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {

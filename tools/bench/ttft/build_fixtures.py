@@ -8,6 +8,7 @@ never loads a tokenizer, creates images, or calls a token-count endpoint in the 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -27,6 +28,8 @@ IMAGE_VISION_TOKENS = 1024
 MANY_IMAGE_COUNT = 28
 GENERATED_IMAGE_COUNT = 56
 VISION_TOKEN_LIMIT = 32_768
+ROTATION_55K_LABELS = ("ALPHA", "BRAVO", "COBALT", "DELTA", "EMBER", "FOXTROT")
+ROTATION_55K_SECOND_LABELS = ("OMEGA", "SIGMA", "VIOLET", "THETA", "APPLE", "CHARLIE")
 
 
 def _json_text(value: Any) -> str:
@@ -138,6 +141,22 @@ def _common_rendered_tokens(
             break
         common += 1
     return common
+
+
+def _replace_rotation_label(
+    messages: Sequence[dict[str, Any]], replacement: str
+) -> list[dict[str, Any]]:
+    result = copy.deepcopy(list(messages))
+    if not result or result[0].get("role") != "system":
+        raise RuntimeError("55K rotation fixture has no leading system marker")
+    content = result[0].get("content")
+    if not isinstance(content, str):
+        raise RuntimeError("55K rotation system marker is not text")
+    original, separator, suffix = content.partition(" ")
+    if not separator or len(original) != len(replacement):
+        raise RuntimeError("second 55K cohort label does not preserve fixture shape")
+    result[0]["content"] = replacement + separator + suffix
+    return result
 
 
 def _common_prefix_messages(
@@ -428,7 +447,7 @@ def build(tokenizer_path: Path) -> None:
 
     rotation_55k: list[list[dict[str, str]]] = []
     rotation_55k_paths: list[Path] = []
-    for index, label in enumerate(("ALPHA", "BRAVO", "COBALT", "DELTA", "EMBER", "FOXTROT")):
+    for index, label in enumerate(ROTATION_55K_LABELS):
         messages = _fit_user_prompt(
             tokenizer,
             source_ids,
@@ -447,10 +466,17 @@ def build(tokenizer_path: Path) -> None:
         _write_json(path, messages)
         rotation_55k.append(messages)
         rotation_55k_paths.append(path)
+    rotation_55k_second = [
+        _replace_rotation_label(messages, ROTATION_55K_SECOND_LABELS[index])
+        for index, messages in enumerate(rotation_55k)
+    ]
+    if any(_prompt_tokens(tokenizer, messages) != 55000 for messages in rotation_55k_second):
+        raise RuntimeError("second 55K cohort does not preserve the exact prompt shape")
+    all_rotation_55k = [*rotation_55k, *rotation_55k_second]
     rotation_55k_common = max(
-        _common_rendered_tokens(tokenizer, rotation_55k[left], rotation_55k[right])
-        for left in range(len(rotation_55k))
-        for right in range(left + 1, len(rotation_55k))
+        _common_rendered_tokens(tokenizer, all_rotation_55k[left], all_rotation_55k[right])
+        for left in range(len(all_rotation_55k))
+        for right in range(left + 1, len(all_rotation_55k))
     )
     if rotation_55k_common > 3:
         raise RuntimeError(
@@ -549,6 +575,8 @@ def build(tokenizer_path: Path) -> None:
                     prompt_tokens=55000,
                     max_output_tokens=32,
                     max_peer_common_prefix_tokens=rotation_55k_common,
+                    second_cohort_label=ROTATION_55K_SECOND_LABELS[index],
+                    second_cohort_prompt_tokens=55000,
                 )
                 for index, path in enumerate(rotation_55k_paths)
             },
@@ -701,6 +729,8 @@ def check() -> None:
         or record.get("prompt_tokens") != 55000
         or record.get("max_output_tokens") != 32
         or record.get("max_peer_common_prefix_tokens", 4) > 3
+        or record.get("second_cohort_prompt_tokens") != 55000
+        or not isinstance(record.get("second_cohort_label"), str)
         for record in rotation
     ):
         raise RuntimeError("55K rotation fixtures are outside their qualified shape")
@@ -708,6 +738,25 @@ def check() -> None:
         {record["sha256"] for record in rotation}
     ) != 6:
         raise RuntimeError("55K rotation fixtures are not byte-distinct")
+    original_labels: list[str] = []
+    for record in rotation:
+        messages = json.loads((REPO_ROOT / record["path"]).read_text(encoding="utf-8"))
+        system = messages[0].get("content") if isinstance(messages, list) and messages else None
+        original, separator, _ = system.partition(" ") if isinstance(system, str) else ("", "", "")
+        if not original or not separator:
+            raise RuntimeError("55K rotation fixture has no system label")
+        original_labels.append(original)
+    second_labels = [record["second_cohort_label"] for record in rotation]
+    if (
+        len(set(original_labels)) != len(rotation)
+        or len(set(second_labels)) != len(rotation)
+        or set(second_labels) & set(original_labels)
+        or any(
+            len(original) != len(second)
+            for original, second in zip(original_labels, second_labels, strict=True)
+        )
+    ):
+        raise RuntimeError("55K rotation cohort labels are not shape-preserving and distinct")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

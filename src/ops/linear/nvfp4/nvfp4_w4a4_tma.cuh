@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
@@ -132,41 +133,6 @@ struct Nvfp4W4a4TmaSharedStorage {
     alignas(8) std::uint64_t empty[Schedule::kStages];
 };
 
-__device__ __forceinline__ void nvfp4_mbarrier_init(std::uint64_t* barrier,
-                                                    std::uint32_t arrivals) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-                 :
-                 : "r"(smem_addr(barrier)), "r"(arrivals)
-                 : "memory");
-}
-
-__device__ __forceinline__ void nvfp4_mbarrier_wait(std::uint64_t* barrier, std::uint32_t phase) {
-    constexpr std::uint32_t kSuspendTicks = 0x989680;
-    asm volatile("{\n"
-                 ".reg .pred done;\n"
-                 "wait_loop:\n"
-                 "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, %2;\n"
-                 "@done bra wait_done;\n"
-                 "bra wait_loop;\n"
-                 "wait_done:\n"
-                 "}\n"
-                 :
-                 : "r"(smem_addr(barrier)), "r"(phase), "r"(kSuspendTicks)
-                 : "memory");
-}
-
-__device__ __forceinline__ void nvfp4_mbarrier_arrive(std::uint64_t* barrier) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(smem_addr(barrier)) : "memory");
-}
-
-__device__ __forceinline__ void nvfp4_mbarrier_arrive_expect_tx(std::uint64_t* barrier,
-                                                                std::uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
-                 :
-                 : "r"(smem_addr(barrier)), "r"(bytes)
-                 : "memory");
-}
-
 __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
                                                   std::int32_t coordinate0,
                                                   std::int32_t coordinate1,
@@ -195,10 +161,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
-            nvfp4_mbarrier_init(&shared.full[stage], 1);
-            nvfp4_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
+            cta_mbarrier_init(&shared.full[stage], 1);
+            cta_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
         }
-        asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
+        cta_mbarrier_fence_init();
     }
     __syncthreads();
 
@@ -213,13 +179,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
                 const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
-                nvfp4_mbarrier_wait(&shared.empty[stage], empty_phase);
+                cta_mbarrier_wait(&shared.empty[stage], empty_phase);
                 constexpr std::uint32_t kTransactionBytes =
                     Schedule::kBlockM * Schedule::kCodeRowBytes +
                     Schedule::kBlockN * Schedule::kCodeRowBytes +
                     Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4 +
                     Schedule::kBlockN * Schedule::kK64PerStage * 4;
-                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
+                cta_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
@@ -262,7 +228,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
         const int stage                = k_tile % Schedule::kStages;
         const std::uint32_t full_phase = (k_tile / Schedule::kStages) & 1U;
-        nvfp4_mbarrier_wait(&shared.full[stage], full_phase);
+        cta_mbarrier_wait(&shared.full[stage], full_phase);
 
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
@@ -316,7 +282,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 }
             }
         }
-        if (lane == 0) { nvfp4_mbarrier_arrive(&shared.empty[stage]); }
+        if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
     }
 
     // The epilogue reuses the tensor pipeline's shared-memory storage. All consumer

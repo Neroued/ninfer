@@ -131,9 +131,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
-                                   DType dtype) noexcept {
+                                   KvCacheStorage storage) noexcept {
     return static_cast<std::uint32_t>(backend) | (static_cast<std::uint32_t>(proposal) << 8U) |
-           (static_cast<std::uint32_t>(dtype) << 16U);
+           (static_cast<std::uint32_t>(storage) << 16U);
 }
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
@@ -328,7 +328,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
-            capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
+            capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -484,15 +484,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                              *shared_identity, selected.frontier)) {
             return std::nullopt;
         }
-        plan->reuse              = ReusePath::SharedStablePrefix;
-        plan->reuse_base         = selected.frontier;
-        plan->source_disposition = runtime::ClaimDisposition::Retained;
+        plan->reuse       = ReusePath::SharedStablePrefix;
+        plan->reuse_base  = selected.frontier;
+        plan->source_mode = runtime::PrivateSourceMode::Retain;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
-        plan->source_disposition              = must_retain_private_source
-                                                    ? runtime::ClaimDisposition::Retained
-                                                    : runtime::ClaimDisposition::ConsumedToActive;
+        plan->source_mode                     = must_retain_private_source
+                                                    ? runtime::PrivateSourceMode::Retain
+                                                    : runtime::PrivateSourceMode::ConsumeToActive;
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
@@ -521,9 +521,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                                  selected.frontier)) {
                 return std::nullopt;
             }
-            plan->reuse              = ReusePath::PrivateLongAnchor;
-            plan->reuse_base         = selected.frontier;
-            plan->source_disposition = runtime::ClaimDisposition::Retained;
+            plan->reuse       = ReusePath::PrivateLongAnchor;
+            plan->reuse_base  = selected.frontier;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
         } else {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private rewrite checkpoint ordinal is invalid");
@@ -575,7 +575,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool can_retain_rewrite =
         desired && source != nullptr &&
-        plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive &&
+        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
         can_retain_rewrite_checkpoint(prompt, *desired, *source, plan->reuse, plan->reuse_base);
     if (!base.summary.publish_continuation || !desired) {
         plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
@@ -593,7 +593,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     // checkpoint aliases the endpoint image, that image must remain immutable and the whole source
     // is preserved through the normal Fork path.
     if (source != nullptr && plan->reuse == ReusePath::PrivateEndpoint &&
-        plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         const StateImageHandle endpoint =
             selected_state(*source, plan->reuse, plan->selected_checkpoint);
         std::vector<StateImageHandle> optional_states;
@@ -607,7 +607,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         }
         if (std::find(optional_states.begin(), optional_states.end(), endpoint) !=
             optional_states.end()) {
-            plan->source_disposition = runtime::ClaimDisposition::Retained;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
         } else {
             std::vector<StateImageHandle> unique;
             unique.reserve(optional_states.size());
@@ -629,14 +629,13 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             }
         }
     }
-    if (source != nullptr &&
-        plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+    if (source != nullptr && plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         plan->state_fork_required =
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
     }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
-        plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         std::vector<StateImageHandle> optional_states;
         optional_states.reserve(1U + source->long_anchors.size());
         if (plan->rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
@@ -830,9 +829,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         const bool splits_private_both =
             source != nullptr && selected_state_residency == StateReplicaResidency::Both;
         const bool forks_device_state =
-            (plan->source_disposition == runtime::ClaimDisposition::Retained &&
-             !splits_private_both) ||
-            (plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive &&
+            (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
+            (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
         if (speculative_backend == SpeculativeBackend::DFlash && forks_device_state &&
             selected_state_residency != StateReplicaResidency::HostOnly) {
@@ -848,7 +846,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         if (source_kv == nullptr) { throw std::logic_error("checkpoint has no KV address space"); }
         const std::uint32_t backend_frontier =
             backend_frontier_at(speculative_backend, plan->reuse_base);
-        if (plan->source_disposition == runtime::ClaimDisposition::Retained) {
+        if (plan->source_mode == runtime::PrivateSourceMode::Retain) {
             plan->text_prefix_fork_required    = true;
             plan->backend_prefix_fork_required = source_kv->backend && backend_frontier != 0;
         } else if (source != nullptr) {
@@ -918,7 +916,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     }
     active.state_slots += plan->active_optional_resources.device.state_slots;
     if ((source != nullptr || shared_source != nullptr) &&
-        plan->source_disposition == runtime::ClaimDisposition::Retained) {
+        plan->source_mode == runtime::PrivateSourceMode::Retain) {
         const SequenceKVBundle* source_kv =
             source != nullptr ? (source->kv ? &*source->kv : nullptr)
                               : (shared_source->kv ? &*shared_source->kv : nullptr);
@@ -1296,18 +1294,16 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
         plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
 }
 
-std::uint64_t ProgramImplCore::shared_capture_split_cost_ns(
-    const AdmissionCandidate& candidate, const PreparedPromptData& prompt,
-    std::span<const std::uint32_t> frontiers,
-    const runtime::ContextMachineCostModel& machine_cost) {
+runtime::PrefillWork
+ProgramImplCore::shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
+                                                   const PreparedPromptData& prompt,
+                                                   std::span<const std::uint32_t> frontiers) {
     if (candidate.impl_ == nullptr || candidate.impl_->planning_revision != resource_revision()) {
         throw std::logic_error("shared capture projection observes a stale admission candidate");
     }
-    const std::uint64_t baseline = machine_cost.prefill_ns(candidate.impl_->remaining_prefill_work);
     AdmissionCandidate projected(std::make_unique<AdmissionCandidateImpl>(*candidate.impl_));
     select_shared_captures(projected, prompt, frontiers);
-    const std::uint64_t target = machine_cost.prefill_ns(projected.impl_->remaining_prefill_work);
-    return target > baseline ? target - baseline : 0;
+    return projected.impl_->remaining_prefill_work;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

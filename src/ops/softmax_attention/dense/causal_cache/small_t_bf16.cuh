@@ -1,12 +1,13 @@
 #pragma once
 
-// ninfer::ops - split-KV causal small-T attention, BF16 KV-cache partial kernel.
+// ninfer::ops - split-KV causal small-T attention, BF16-K/FP16-V partial kernel.
 // Standalone from the int8 kernel (causal_attention_small_t_i8.cuh): shared scaffolding
 // lives in causal_attention_small_t.cuh, but the body/append/load are not shared so the
-// bf16 path can be tuned independently. Processes one KV head, one query-head
-// subgroup, and one token tile; a reducer combines the split-local partials.
+// BF16 path can keep BF16 QK while converting P/V to FP16 for PV. Processes one KV head,
+// one query-head subgroup, and one token tile; a reducer combines FP32 split-local partials.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
@@ -19,10 +20,10 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    __half* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -44,10 +45,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     static_assert(QkvRows >= Br);
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ __align__(16) __half p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
     __nv_bfloat16* k_s = qkv_s;
-    __nv_bfloat16* v_s = qkv_s + Bc * D;
+    __half* v_s        = reinterpret_cast<__half*>(qkv_s + Bc * D);
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -100,7 +101,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                    0.0f;
             }
         }
     };
@@ -146,8 +147,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     }
 
     if constexpr (CacheInput::writes_cache) {
-        // The owning split writes each new row. Current attention reads those rows directly from
-        // input below, so no split depends on another split's cache write.
+        // The owning split writes each new row. K is copied exactly and V is rounded once to FP16.
+        // Only that same CTA consumes the just-written V row below.
         for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
@@ -161,7 +162,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 const std::int64_t cache_off = causal_cache_index<Geometry>(
                     physical_page, kv_head, d, p_tok & kPagedKVPageMask);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                store_vec(&cache_v[cache_off],
+                          bf16x8_bits_to_f16x8_bits(load_vec<int4>(&input.v[new_off])));
             }
         }
         __syncthreads();
@@ -192,7 +194,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     const int warp_row0 = warp * 16;
-    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
+    __half* p_sw        = &p_s[warp * 16 * Bc];
 
     unsigned af_q[QKKs][4];
 #pragma unroll
@@ -217,15 +219,16 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
-        // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
-        // Current-step tokens come from k_new/v_new; tail slots are zeroed.
+        // Stage BF16 K and persistent FP16 V with one cp.async wave (16B/thread, high MLP).
+        // Current-step K comes from input and V from the row converted above; tail slots are
+        // zeroed.
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
             const int d          = (chunk - key_l * (D / 8)) * 8;
             const int key        = k0 + key_l;
             __nv_bfloat16* k_dst = &k_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
-            __nv_bfloat16* v_dst = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
+            __half* v_dst        = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
             if (key >= split_start && key < split_end) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
@@ -235,7 +238,9 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                         const std::int64_t off =
                             kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        const std::int64_t cache_off = causal_cache_index<Geometry>(
+                            physical_page, kv_head, d, key & kPagedKVPageMask);
+                        ninfer::ops::cp_async<16>(v_dst, &cache_v[cache_off]);
                     } else {
                         const std::int64_t off = causal_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -334,10 +339,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                                   : 0.0f;
             bl0 += p00 + p01;
             bl1 += p10 + p11;
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)]           = __float2half_rn(p00);
+            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)]           = __float2half_rn(p01);
+            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] = __float2half_rn(p10);
+            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] = __float2half_rn(p11);
         }
         bl0 = warp_sum<4>(bl0, FullMask);
         bl1 = warp_sum<4>(bl1, FullMask);
@@ -369,8 +374,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 const int vcol = n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_s[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                         vf[0], vf[1]);
+                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                        vf[0], vf[1]);
             }
         }
         __syncthreads();
@@ -395,35 +400,26 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         }
     }
 
-    // MMA fragments hold each row in four-lane groups. Stage the final split-local
-    // accumulator through shared memory so partial_acc is written as contiguous d-vector stores.
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0   = n * 8 + 2 * lid;
-        const int d1   = d0 + 1;
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
-            qkv_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
-            qkv_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
+            int q_head = 0;
+            int token  = 0;
+            causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
+            const std::int64_t dst =
+                causal_partial_acc_index<Geometry>(q_head, d0, token, split, tokens);
+            *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
         }
         if (row1 < row_count) {
-            qkv_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
-            qkv_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
-        }
-    }
-    __syncthreads();
-
-    for (int chunk = tid; chunk < row_count * (D / 8); chunk += Threads) {
-        const int row = chunk / (D / 8);
-        const int d   = (chunk - row * (D / 8)) * 8;
-        int q_head    = 0;
-        int token     = 0;
-        causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+            int q_head = 0;
+            int token  = 0;
+            causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
-            store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
+                causal_partial_acc_index<Geometry>(q_head, d0, token, split, tokens);
+            *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
 }

@@ -48,7 +48,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8>]
+          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -64,8 +64,7 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `fp8` selects
-row-scaled E4M3 D256 KV storage. MTP is enabled with
+MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
@@ -390,8 +389,9 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16, INT8-G64, and FP8-E4M3FN-row256 KV storage. Production dispatch receives the
-caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV choices.
+with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV storage. Production dispatch
+receives the caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV
+choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
@@ -424,11 +424,19 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
   --execution eager --cache cold --warmup 10 --repeat 61
 ```
 
-For FP8 points the report and CSV additionally expose separate QK/PV FLOPs, the mixed Tensor Core
-floor (`419 TFLOP/s` E4M3/FP32 QK plus `209.5 TFLOP/s` FP16/FP32 PV), and a one-stream persistent-KV
-payload. The latter counts one 516-byte K+V row per visible KV head and reports bandwidth against
-the measured `1674.5 GB/s` cold pure-read ceiling; it does not inflate the numerator with Q/output,
-append traffic, metadata, workspace, or duplicate cache reads.
+For FP8, NVFP4, and K8V4 points the report and CSV expose separate QK/PV FLOPs, their
+full-public-Op-equivalent TFLOP/s, a mixed Tensor Core floor, separate
+`key_vector_bytes`/`value_vector_bytes`, actual `physical_cache_bytes`, and a one-stream
+persistent-KV payload. The per-contraction rates deliberately divide by complete Op latency and
+are explanatory, not isolated MMA throughput. The QK ceilings are `419 TFLOP/s` for the E4M3/FP32
+FP8 and K8V4 routes and `209.5 TFLOP/s` for the FP16/FP32 NVFP4 route; PV uses the
+`209.5 TFLOP/s` FP16/FP32 ceiling in all three modes. The CSV records both operand-specific peaks
+alongside mixed peak utilization so a storage-format label cannot silently select the wrong peak.
+Persistent K+V bytes per D256 token/head are 516 for FP8, 288 for NVFP4, and 402 for K8V4
+(258-byte K plus 144-byte V). Effective bandwidth uses the measured `1674.5 GB/s` cold pure-read
+ceiling and does not inflate the numerator with Q/output, append traffic, metadata, workspace, or
+duplicate cache reads. These roofline fields explain a complete public-Op result; they are not an
+acceptance threshold.
 
 `ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
@@ -474,8 +482,10 @@ instruction utilization require a profiler capture of the complete public call.
 ## KV cache append Op benchmark
 
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
-one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64, or
-FP8-E4M3FN-row256 caches. `--mode prefix` calls device-count prefix publication for BF16 D128/KV8
+one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
+FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
+asymmetric storage profiles. `--mode prefix`
+calls device-count prefix publication for BF16 D128/KV8
 linear or 4096-slot cyclic caches; `T` is the public envelope and `C` is the device commit count.
 Every measured interval or captured graph contains exactly one selected public append call.
 

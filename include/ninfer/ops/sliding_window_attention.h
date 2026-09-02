@@ -28,9 +28,10 @@ struct SlidingWindowAttentionExecutionEnvelope {
  * query columns, positions[i,b]=L+i for i<V, and lanes[b] selects its cyclic-cache lane. Columns
  * i>=V are an inert physical tail and produce exact BF16 zero.
  *
- * The read-only cyclic context contains committed absolute positions [max(0,L-window),L), with
- * absolute position p stored at slot p mod window. Temporary query K/V is a separate segment at
- * [L,L+V). For live query position p_i, a populated context or temporary key at p_j is visible
+ * The read-only cyclic BFloat16 context stores BF16 K and FP16 V for committed absolute positions
+ * [max(0,L-window),L), with absolute position p stored at slot p mod window. Temporary query K/V is
+ * a separate BF16 segment at [L,L+V). For live query position p_i, a populated context or
+ * temporary key at p_j is visible
  * exactly when abs(p_j-p_i)<window. Thus distance 4095 is included and 4096 is excluded; every
  * live query also sees every live temporary query row in its batch row. Query head h reads KV head
  * floor(h/4).

@@ -30,7 +30,7 @@ License. Provenance segments identify each article as `article/<id>`; its stable
 
 `data/pg19/` contains excerpts from books in DeepMind's PG-19 test split. PG-19 is distributed under
 the Apache License 2.0 and was prepared from books in Project Gutenberg published before 1919.
-The selected book identifiers, titles, source URLs, and input hashes are recorded in
+The selected book identifiers, titles, and source URLs are recorded in
 `provenance/pg19.jsonl`. Project Gutenberg's trademark and local-jurisdiction terms remain
 applicable independently of the source texts' public-domain status in the United States.
 

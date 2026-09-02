@@ -11,6 +11,34 @@ inline constexpr int kPagedKVPageMask  = kPagedKVPageSize - 1;
 
 static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
 
+struct PagedKVDirectMetadata {
+    const std::int32_t* table;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+};
+
+template <bool Masked>
+struct PagedKVBatchMetadata {
+    const std::int32_t* tables;
+    const std::int32_t* valid_columns;
+    const std::int32_t* table_rows;
+    std::int32_t table_stride;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
+        if constexpr (Masked) {
+            const std::int32_t valid = valid_columns[0];
+            return valid <= 0 ? 0 : (valid < width ? valid : width);
+        }
+        return width;
+    }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const {
+        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+};
+
 __device__ __forceinline__ std::int32_t paged_kv_physical_page(const std::int32_t* block_table,
                                                                std::int32_t position) {
     return block_table[position >> kPagedKVPageShift];

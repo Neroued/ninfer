@@ -30,6 +30,8 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3Row256,
+    Nvfp4Group16,
+    Fp8KeyNvfp4Value,
 };
 
 enum class EnginePurpose : std::uint8_t {
@@ -77,8 +79,47 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
 };
 
-struct LoadProgress {
-    std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
+enum class StartupPhase : std::uint8_t {
+    EngineStartup,
+    CudaInitialize,
+    ArtifactInspect,
+    TargetPlan,
+    WeightsMaterialize,
+    WeightsStagingPin,
+    TargetFinalize,
+    FrontendInitialize,
+    ProgramInitialize,
+    HostStatePin,
+    HostKvPin,
+    CudaGraphPrepare,
+    EngineFinalize,
+};
+
+enum class StartupStatus : std::uint8_t {
+    Begin,
+    Progress,
+    Complete,
+    Failed,
+};
+
+enum class StartupProgressUnit : std::uint8_t {
+    None,
+    Bytes,
+};
+
+struct StartupEvent {
+    StartupPhase phase                = StartupPhase::EngineStartup;
+    StartupStatus status              = StartupStatus::Begin;
+    StartupProgressUnit progress_unit = StartupProgressUnit::None;
+    std::uint64_t current             = 0;
+    std::uint64_t total               = 0;
+    std::uint64_t elapsed_ns          = 0;
+};
+
+struct StartupObserver {
+    // Startup diagnostics never participate in Engine control flow. Callback exceptions are
+    // ignored by the publishing boundary so a logging failure cannot invalidate model startup.
+    std::function<void(const StartupEvent& event)> callback;
 };
 
 struct ContextCacheOptions {
@@ -124,7 +165,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
-    LoadProgress load_progress;
+    StartupObserver startup_observer;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -576,12 +617,9 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
-// Why pressure planning stopped for the materialization decision committed to one request.
-// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
-// numerical cost model; it is not a claim about globally optimal observed TTFT.
+// Why bounded pressure planning stopped for the materialization decision committed to one request.
 enum class MaterializationStopReason : std::uint8_t {
     NoPressure,
-    ModelOptimal,
     QueueExhausted,
     TargetBudget,
     ExpansionCapacity,
@@ -594,8 +632,6 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
     switch (reason) {
     case MaterializationStopReason::NoPressure:
         return "no_pressure";
-    case MaterializationStopReason::ModelOptimal:
-        return "model_optimal";
     case MaterializationStopReason::QueueExhausted:
         return "queue_exhausted";
     case MaterializationStopReason::TargetBudget:
@@ -611,21 +647,17 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
 }
 
 struct MaterializationDiagnostics {
-    std::uint64_t predicted_now_ns              = 0;
-    std::uint64_t predicted_future_loss_ns      = 0;
-    std::uint64_t predicted_total_ns            = 0;
-    std::uint32_t targets_evaluated             = 0;
-    std::uint64_t projection_work               = 0;
-    std::uint64_t planning_elapsed_ns           = 0;
-    std::uint64_t search_elapsed_ns             = 0;
-    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
-    bool model_optimal                          = true;
-    bool budget_exhausted                       = false;
-    std::uint64_t best_remaining_lower_bound_ns = 0;
-    std::uint64_t absolute_bound_gap_ns         = 0;
-    double relative_bound_gap                   = 0.0;
-    std::uint32_t selected_degradation_units    = 0;
-    bool selected_maximal_fallback              = false;
+    std::uint64_t predicted_now_ns           = 0;
+    std::uint64_t predicted_future_loss_ns   = 0;
+    std::uint64_t predicted_total_ns         = 0;
+    std::uint32_t targets_evaluated          = 0;
+    std::uint64_t projection_work            = 0;
+    std::uint64_t planning_elapsed_ns        = 0;
+    std::uint64_t search_elapsed_ns          = 0;
+    MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
+    bool budget_exhausted                    = false;
+    std::uint32_t selected_degradation_units = 0;
+    bool selected_maximal_fallback           = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

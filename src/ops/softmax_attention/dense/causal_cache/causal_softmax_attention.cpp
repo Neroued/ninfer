@@ -2,7 +2,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
-#include "ops/kv_cache/d256_profile.h"
+#include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
@@ -48,15 +48,14 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    D256KVCacheProfile profile{};
+    PagedKVStorageLayout layout{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        layout = paged_kv_storage_layout(cache.storage, kHeadDim);
     } catch (const std::invalid_argument&) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
     }
-    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim ||
-        cache.quant_group != profile.quant_group) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -67,13 +66,14 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
+    if (cache.k_pages.dtype != layout.key.data_dtype ||
+        cache.v_pages.dtype != layout.value.data_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache data dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v pages");
+    require_shape(cache.k_pages, layout.key.data_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache k pages");
+    require_shape(cache.v_pages, layout.value.data_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
     if (cache.block_table.dtype != DType::I32) {
@@ -82,36 +82,37 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
     require_contiguous_nonnull(cache.block_table, op, "block table");
 
-    if (cache.dtype == DType::BF16) {
-        if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
+    const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
+                                    const char* name) {
+        if (!vector.has_scale()) {
+            if (tensor.data != nullptr) {
+                throw std::invalid_argument(std::string(op) +
+                                            ": unscaled KV cache must not have scales");
+            }
+            return;
         }
-        return static_cast<std::uint32_t>(capacity);
-    }
-
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-    }
-    require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache k scale pages");
-    require_shape(cache.v_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache v scale pages");
-    require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
-    require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
+        if (tensor.dtype != vector.scale_dtype) {
+            throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+        }
+        require_shape(tensor, vector.scale_leading_extent, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, name);
+        require_contiguous_nonnull(tensor, op, name);
+    };
+    validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
+    validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
     return static_cast<std::uint32_t>(capacity);
 }
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    D256KVCacheProfile profile{};
+    PagedKVStorageLayout layout{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        layout = paged_kv_storage_layout(cache.storage, kHeadDim);
     } catch (const std::invalid_argument&) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
     }
-    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim ||
-        cache.quant_group != profile.quant_group) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -123,13 +124,14 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
+    if (cache.k_pages.dtype != layout.key.data_dtype ||
+        cache.v_pages.dtype != layout.value.data_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache data dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v pages");
+    require_shape(cache.k_pages, layout.key.data_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache k pages");
+    require_shape(cache.v_pages, layout.value.data_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
     if (cache.block_tables.dtype != DType::I32) {
@@ -138,22 +140,24 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     require_shape(cache.block_tables, logical_pages, table_rows, 1, 1, op, "block tables");
     require_contiguous_nonnull(cache.block_tables, op, "block tables");
 
-    if (cache.dtype == DType::BF16) {
-        if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
+    const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
+                                    const char* name) {
+        if (!vector.has_scale()) {
+            if (tensor.data != nullptr) {
+                throw std::invalid_argument(std::string(op) +
+                                            ": unscaled KV cache must not have scales");
+            }
+            return;
         }
-        return static_cast<std::uint32_t>(capacity);
-    }
-
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-    }
-    require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache k scale pages");
-    require_shape(cache.v_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache v scale pages");
-    require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
-    require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
+        if (tensor.dtype != vector.scale_dtype) {
+            throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+        }
+        require_shape(tensor, vector.scale_leading_extent, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, name);
+        require_contiguous_nonnull(tensor, op, name);
+    };
+    validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
+    validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
     return static_cast<std::uint32_t>(capacity);
 }
 
@@ -258,9 +262,13 @@ struct SmallTWorkspace {
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
                                            std::int32_t tokens, std::int32_t splits,
-                                           std::int32_t batch_size, DType cache_dtype) {
+                                           std::int32_t batch_size, KvCacheStorage cache_storage) {
+    const bool fp32_acc = cache_storage == KvCacheStorage::BFloat16 ||
+                          cache_storage == KvCacheStorage::Fp8E4M3Row256 ||
+                          cache_storage == KvCacheStorage::Nvfp4Group16 ||
+                          cache_storage == KvCacheStorage::Fp8KeyNvfp4Value;
     return {
-        workspace.alloc(cache_dtype == DType::FP8_E4M3FN ? DType::FP32 : DType::BF16,
+        workspace.alloc(fp32_acc ? DType::FP32 : DType::BF16,
                         {kHeadDim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
@@ -269,15 +277,15 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
-                            DType cache_dtype, CausalAttentionExecutionEnvelope envelope,
+                            KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
                             Tensor& out, Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
+            detail::causal_attention_split_capacity(q.ne[1], count, cache_storage, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1, cache_dtype);
+            allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1, cache_storage);
         Tensor q_chunk        = q.slice(2, begin, count);
         Tensor position_chunk = positions.slice(0, begin, count);
         Tensor out_chunk      = out.slice(2, begin, count);
@@ -294,9 +302,9 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
+            detail::causal_attention_split_capacity(q.ne[1], count, cache.storage, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3], cache.dtype);
+            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3], cache.storage);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
                                                 partial.m, partial.l, out, stream);
@@ -308,7 +316,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                                    CausalAttentionExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     for_each_small_t_chunk(
-        q, positions, workspace, cache.dtype, envelope, out,
+        q, positions, workspace, cache.storage, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
             detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
@@ -350,13 +358,14 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 } // namespace detail
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, DType cache_dtype, CausalAttentionExecutionEnvelope envelope,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width) {
     require_causal_geometry(geometry, "causal_softmax_attention workspace");
     const std::int32_t q_heads = geometry.query_heads;
     bool supported_dtype       = true;
     try {
-        (void)d256_kv_cache_profile(cache_dtype);
+        (void)paged_kv_storage_layout(cache_storage, kHeadDim);
     } catch (const std::invalid_argument&) { supported_dtype = false; }
     if (!supported_dtype || batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
@@ -369,9 +378,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q_heads, width, cache_dtype, envelope);
+            detail::causal_attention_split_capacity(q_heads, width, cache_storage, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size, cache_dtype);
+        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size, cache_storage);
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
@@ -427,9 +436,9 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
+            detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch, cache.dtype);
+            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch, cache.storage);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                                 scale, cache, envelope, 0, width, partial.acc,
                                                 partial.m, partial.l, out, stream);
@@ -456,9 +465,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
     if (detail::causal_attention_uses_small_t(q.ne[2])) {
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
+            detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.storage, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1, cache.dtype);
+            allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1, cache.storage);
         detail::causal_attention_cached_small_t_launch(
             q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
         return;

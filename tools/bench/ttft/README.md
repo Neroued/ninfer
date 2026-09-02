@@ -181,6 +181,7 @@ Baseline and cache cases:
 | `session-alternating` | `cache-pressure-device` | `A1, B1, A2, B2` across two stored Responses lineages. |
 | `session-alternating-64k-host-swap` | `cache-swap-64k-host` | Two early-divergent 64512-token sessions run as `A1, B1, A2, B2`; one fits Device, the pair requires two Host KV covers for bidirectional rotation. |
 | `session-rotation-55k-host` | `cache-rotation-55k-host` | Six early-divergent 55000-token stored Responses roots, one warm branch from root 0, then three sequential six-root rounds; covers the large materialization target graph behind sequential Host-KV rotation. |
+| `session-rotation-55k-two-cohort-stream` | `cache-rotation-55k-host` | Replays the complete sequential rotation estate, keeps two 900-token store-free Responses streams continuously active, creates six distinct second-cohort 55000-token roots, then runs three second-cohort resume rounds. This is the process-history, concurrency, and Host State descriptor-pressure graph reported in issue #144. |
 | `unmarked-common-prefix-miss` | `cache-hot` | Two standalone user messages share over 4096 tokens but no legal marker. |
 | `resume-after-interference-device` | `cache-pressure-device` | Fixed A/B/C/A2 graph with source placement available on Device. |
 | `resume-after-interference-state-host` | `cache-pressure-state-host` | Same graph with checkpoint State available only on Host. |
@@ -254,9 +255,10 @@ The normal entry point is one managed command:
 python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
 ```
 
-`smoke` runs the short baseline, `resource` runs the six Device/Host/eviction/catalog comparisons,
-the 64K bidirectional Host-swap case, and the six-session 55K Host-rotation case. `full` runs all 56
-audited cases. `resource` is the default and `--samples` defaults to one.
+`smoke` runs the short baseline. `resource` runs the six Device/Host/eviction/catalog comparisons,
+the 64K bidirectional Host-swap case, the original six-session 55K Host-rotation case, and its
+two-cohort concurrent-stream pressure case. `full` runs every audited case. `resource` is the
+default and `--samples` defaults to one.
 Repeat `--case NAME` instead of `--campaign` to run a focused subset through the same managed
 lifecycle, for example:
 

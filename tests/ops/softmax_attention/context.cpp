@@ -4,11 +4,14 @@
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -131,6 +134,15 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
+std::vector<std::uint16_t> fp16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const __half value = __float2half_rn(values[i]);
+        std::memcpy(&bits[i], &value, sizeof(value));
+    }
+    return bits;
+}
+
 void context_attention_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                               const std::vector<float>& query_v,
                               const std::vector<float>& context_k,
@@ -162,12 +174,11 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
                                         int physical_pages, int table_rows = 1) {
     return {
         .k_pages      = Tensor(k.p, DType::BF16, {kD, kPage, physical_pages, kKVHeads}),
-        .v_pages      = Tensor(v.p, DType::BF16, {kD, kPage, physical_pages, kKVHeads}),
+        .v_pages      = Tensor(v.p, DType::FP16, {kD, kPage, physical_pages, kKVHeads}),
         .block_tables = Tensor(block_tables.p, DType::I32, {logical_pages, table_rows}),
         .head_dim     = kD,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .storage      = KvCacheStorage::BFloat16,
     };
 }
 
@@ -253,7 +264,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const auto query_k_expected   = bf16_bits(query_k);
     const auto query_v_expected   = bf16_bits(query_v);
     const auto context_k_expected = bf16_bits(physical_k);
-    const auto context_v_expected = bf16_bits(physical_v);
+    const auto context_v_expected = fp16_bits(physical_v);
     const std::vector<int> length_expected{context_length};
     const std::vector<int> valid_expected{valid_columns};
     const std::vector<int> table_row_expected{0};
@@ -388,7 +399,7 @@ int graph_mapping_replay_case() {
     DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
     DeviceBuffer d_context_k = to_device(bf16_bits(physical_k));
-    DeviceBuffer d_context_v = to_device(bf16_bits(physical_v));
+    DeviceBuffer d_context_v = to_device(fp16_bits(physical_v));
     DeviceBuffer d_table     = to_device<std::int32_t>({0, 1});
     DeviceBuffer d_length    = to_device_i32({context_length});
     DeviceBuffer d_valid     = to_device_i32({tokens});
@@ -500,7 +511,7 @@ int batch_table_case() {
     DeviceBuffer d_query_k    = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v    = to_device(bf16_bits(query_v));
     DeviceBuffer d_context_k  = to_device(bf16_bits(physical_k));
-    DeviceBuffer d_context_v  = to_device(bf16_bits(physical_v));
+    DeviceBuffer d_context_v  = to_device(fp16_bits(physical_v));
     DeviceBuffer d_tables     = to_device(block_tables);
     DeviceBuffer d_lengths    = to_device(lengths);
     DeviceBuffer d_valid      = to_device(valid);

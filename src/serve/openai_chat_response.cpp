@@ -107,6 +107,24 @@ CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t
         static_cast<double>(observation.generation_elapsed_ns) * kNanosecondsToMilliseconds);
 }
 
+// Prompt-only live snapshot for prompt-progress chunks: no output token is committed yet, so the
+// predicted fields stay zero and the prompt rates span the processed suffix, not the full prompt.
+CompletionTimings progress_timings(std::uint32_t total_tokens, std::uint32_t cached_tokens,
+                                   std::uint32_t processed_tokens, std::uint64_t elapsed_ns) {
+    constexpr double kNanosecondsToMilliseconds = 1.0e-6;
+    CompletionTimings timings;
+    timings.cache_n        = std::min(cached_tokens, total_tokens);
+    timings.prompt_n       = total_tokens - timings.cache_n;
+    const double prompt_ms =
+        finite_nonnegative(static_cast<double>(elapsed_ns) * kNanosecondsToMilliseconds);
+    const std::uint32_t processed_suffix =
+        processed_tokens > timings.cache_n ? processed_tokens - timings.cache_n : 0;
+    timings.prompt_ms           = prompt_ms;
+    timings.prompt_per_token_ms = milliseconds_per_token(processed_suffix, prompt_ms);
+    timings.prompt_per_second   = tokens_per_second(processed_suffix, prompt_ms);
+    return timings;
+}
+
 Json prompt_progress_json(std::uint32_t total, std::uint32_t cached, std::uint32_t processed,
                           std::uint64_t elapsed_ns) {
     return Json{{"total", total},
@@ -281,6 +299,10 @@ std::string OpenAIChatStream::initial_prompt_progress() {
     if (include_usage_) { payload["usage"] = nullptr; }
     payload["prompt_progress"] =
         prompt_progress_json(prompt_tokens_, cached_tokens_, cached_tokens_, 0);
+    if (timings_per_token_) {
+        payload["timings"] =
+            timings_json(progress_timings(prompt_tokens_, cached_tokens_, cached_tokens_, 0));
+    }
     return event(std::move(payload));
 }
 
@@ -301,6 +323,11 @@ std::string OpenAIChatStream::prompt_progress(const ninfer::PromptProgress& prog
     payload["prompt_progress"] =
         prompt_progress_json(progress.total_prompt_tokens, progress.reused_prompt_tokens,
                              progress.processed_prompt_tokens, progress.elapsed_ns);
+    if (timings_per_token_) {
+        payload["timings"] = timings_json(progress_timings(
+            progress.total_prompt_tokens, progress.reused_prompt_tokens,
+            progress.processed_prompt_tokens, progress.elapsed_ns));
+    }
     return event(std::move(payload));
 }
 

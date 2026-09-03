@@ -382,7 +382,10 @@ int run_fp8_target() {
             std::cerr << "FP8 attention projection workspace interval mismatch\n";
             ++failures;
         }
-        for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
+        // 1024 and 4096 reach the TMA-staged route; 4288 leaves it a partial trailing tile,
+        // which this op's four-output store otherwise never sees; 1345 is not a whole cp.async
+        // token tile, a case the route reaches only since that condition was removed.
+        for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024, 1345, 4096, 4288})
             failures += run_target_projection_case(parent, nullptr, t, policy);
         for (int t : {1,  4,  5,  6,  8,  9,  16,  24,  25,  32,  33,  34,
                       64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 160, 161})

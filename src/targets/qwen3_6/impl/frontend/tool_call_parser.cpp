@@ -411,25 +411,114 @@ class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
                          const Contract& contract)
-        : text_(text), max_name_length_(max_name_length), contract_(contract) {}
-
-    FallbackReason parse(std::vector<RawToolCall>& calls) const {
-        std::size_t pos = 0;
-        for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (pos == text_.size()) {
-                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
+        : text_(text), max_name_length_(max_name_length), contract_(contract) {
+        // Classify every marker in one forward pass so the terminal parse stays linear in the
+        // region size: envelope scans walk the marker table instead of re-running string finds
+        // over the remaining suffix, and opener/close queries are binary searches.
+        for (std::size_t pos = 0; pos < text_.size(); ++pos) {
+            if (text_[pos] != '<') { continue; }
+            MarkerKind kind{};
+            if (starts_with_at(text_, pos, kToolOpen)) {
+                kind = MarkerKind::kToolOpen;
+            } else if (starts_with_at(text_, pos, kToolClose)) {
+                kind = MarkerKind::kToolClose;
+            } else if (starts_with_at(text_, pos, kParamOpen)) {
+                kind = MarkerKind::kParamOpen;
+            } else if (starts_with_at(text_, pos, kParamClose)) {
+                kind = MarkerKind::kParamClose;
+            } else {
+                continue;
             }
-            if (!starts_with_at(text_, pos, kToolOpen)) {
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
-            }
-
-            RawToolCall call;
-            const FallbackReason failure = parse_tool_call(pos, call);
-            if (failure != FallbackReason::None) { return failure; }
-            calls.push_back(std::move(call));
+            markers_.push_back(Marker{.pos = pos, .kind = kind});
+            if (kind == MarkerKind::kToolOpen) { tool_open_positions_.push_back(pos); }
+            else if (kind == MarkerKind::kToolClose) { tool_close_positions_.push_back(pos); }
         }
+        closes_after_.resize(markers_.size());
+        std::size_t running = 0;
+        for (std::size_t index = markers_.size(); index-- > 0;) {
+            closes_after_[index] = running;
+            if (markers_[index].kind == MarkerKind::kToolClose) { ++running; }
+        }
+    }
+
+    // Byte position of the first <tool_call> opener in the region, or npos.
+    std::size_t first_tool_open() const {
+        return tool_open_positions_.empty() ? std::string_view::npos
+                                            : tool_open_positions_.front();
+    }
+
+    // Byte position of the next <tool_call> opener at or after from, or npos.
+    std::size_t next_tool_open(std::size_t from) const {
+        const auto it =
+            std::lower_bound(tool_open_positions_.begin(), tool_open_positions_.end(), from);
+        return it == tool_open_positions_.end() ? std::string_view::npos : *it;
+    }
+
+    // Byte position of the next </tool_call> marker at or after from, or npos.
+    std::size_t next_tool_close(std::size_t from) const {
+        const auto it = std::lower_bound(tool_close_positions_.begin(),
+                                         tool_close_positions_.end(), from);
+        return it == tool_close_positions_.end() ? std::string_view::npos : *it;
+    }
+
+    // Structurally parse the <tool_call> block that starts at pos; on success end is the index
+    // just past the block's closing marker. A non-None result is a block-level structural or
+    // identity failure; the caller restores the block verbatim and keeps scanning the region.
+    FallbackReason try_parse_tool_call(std::size_t pos, RawToolCall& call,
+                                       std::size_t& end) const {
+        if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
+        skip_format_whitespace(text_, pos);
+        const FallbackReason failure = parse_function(pos, call);
+        if (failure != FallbackReason::None) { return failure; }
+        skip_format_whitespace(text_, pos);
+        if (!consume(pos, kToolClose)) { return FallbackReason::MalformedStructure; }
+        end = pos;
+        return FallbackReason::None;
+    }
+
+    // Index just past the closing marker that balances the <tool_call> opener at open_pos.
+    // A closing marker inside unclosed parameter text is literal value bytes and never balances
+    // the envelope. Returns npos when the envelope is not balanced, i.e. truncated or prose.
+    std::size_t find_block_envelope_end(std::size_t open_pos) const {
+        const std::size_t index = static_cast<std::size_t>(
+            std::lower_bound(markers_.begin(), markers_.end(), open_pos,
+                             [](const Marker& marker, std::size_t pos) {
+                                 return marker.pos < pos;
+                             }) -
+            markers_.begin());
+        if (index >= markers_.size() || markers_[index].pos != open_pos ||
+            markers_[index].kind != MarkerKind::kToolOpen) {
+            return std::string_view::npos;
+        }
+        if (closes_after_[index] == 0) { return std::string_view::npos; }
+
+        int depth     = 1;
+        bool in_param = false;
+        for (std::size_t i = index + 1; i < markers_.size(); ++i) {
+            switch (markers_[i].kind) {
+                case MarkerKind::kToolOpen:
+                    ++depth;
+                    break;
+                case MarkerKind::kToolClose:
+                    if (in_param) { break; }
+                    if (depth == 1) { return markers_[i].pos + kToolClose.size(); }
+                    --depth;
+                    break;
+                case MarkerKind::kParamOpen:
+                    in_param = true;
+                    break;
+                case MarkerKind::kParamClose:
+                    in_param = false;
+                    break;
+            }
+            // If the remaining closing markers cannot bring the envelope back to depth 1, the
+            // envelope is truncated; stop the walk instead of scanning markers that cannot
+            // close it.
+            if (closes_after_[i] < static_cast<std::size_t>(depth - 1)) {
+                return std::string_view::npos;
+            }
+        }
+        return std::string_view::npos;
     }
 
 private:
@@ -437,15 +526,6 @@ private:
         if (!starts_with_at(text_, pos, token)) { return false; }
         pos += token.size();
         return true;
-    }
-
-    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
-        if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
-        skip_format_whitespace(text_, pos);
-        const FallbackReason failure = parse_function(pos, call);
-        if (failure != FallbackReason::None) { return failure; }
-        skip_format_whitespace(text_, pos);
-        return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
@@ -535,9 +615,20 @@ private:
         }
     }
 
+    enum class MarkerKind { kToolOpen, kToolClose, kParamOpen, kParamClose };
+
+    struct Marker {
+        std::size_t pos;
+        MarkerKind kind;
+    };
+
     std::string_view text_;
     std::size_t max_name_length_;
     const Contract& contract_;
+    std::vector<Marker> markers_;
+    std::vector<std::size_t> tool_open_positions_;
+    std::vector<std::size_t> tool_close_positions_;
+    std::vector<std::size_t> closes_after_;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -598,27 +689,90 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract) {
-    const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    const std::string_view view(text);
+    const QwenToolRegionParser region(view, max_tool_name_length, contract);
+    const std::size_t first = region.first_tool_open();
+    if (first == std::string_view::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
-    out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
     out.diagnostics.marker_seen = true;
 
-    std::vector<RawToolCall> raw_calls;
-    const std::string_view tool_region = std::string_view(text).substr(first);
-    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
+    // Per-block salvage: a block whose structure or tool identity cannot be represented is
+    // restored verbatim instead of returning the whole marker region to ordinary content; the
+    // remaining blocks are still parsed. The first block-level failure explains the region if no
+    // block commits.
+    FallbackReason region_failure    = FallbackReason::MalformedStructure;
+    bool saw_block_rejection         = false;
+    std::vector<std::string> verbatim_spans;
+
+    std::size_t pos = first;
+    for (;;) {
+        if (pos == view.size()) { break; }
+
+        if (starts_with_at(view, pos, kToolOpen)) {
+            RawToolCall call;
+            std::size_t block_end = 0;
+            const FallbackReason failure = region.try_parse_tool_call(pos, call, block_end);
+            if (failure == FallbackReason::None) {
+                out.tool_calls.push_back(normalize_raw_tool_call(call, contract, out.diagnostics));
+                pos = block_end;
+                continue;
+            }
+            if (!saw_block_rejection) {
+                region_failure      = failure;
+                saw_block_rejection = true;
+            }
+
+            // Restore the whole <tool_call> envelope verbatim. Nested <tool_call> markers inside
+            // a rejected block are parameter text, not top-level calls, and must not be
+            // promoted; closing markers inside parameter values are literal value bytes, so the
+            // envelope runs to the block's own closing marker.
+            const std::size_t envelope_end = region.find_block_envelope_end(pos);
+            if (envelope_end != std::string_view::npos) {
+                verbatim_spans.emplace_back(view.substr(pos, envelope_end - pos));
+                pos = envelope_end;
+                continue;
+            }
+
+            // Truncated envelope (no balanced closing marker): restore it verbatim up to the
+            // earliest of the next opening marker and the next closing marker so a following
+            // well-formed block keeps its own bytes.
+            const std::size_t search_from = pos + kToolOpen.size();
+            std::size_t span_end          = view.size();
+            const std::size_t next_open   = region.next_tool_open(search_from);
+            if (next_open != std::string_view::npos) { span_end = next_open; }
+            const std::size_t close       = region.next_tool_close(search_from);
+            if (close != std::string_view::npos) {
+                const std::size_t close_end = close + kToolClose.size();
+                if (close_end < span_end) { span_end = close_end; }
+            }
+            verbatim_spans.emplace_back(view.substr(pos, span_end - pos));
+            pos = span_end;
+            continue;
+        }
+
+        // Prose and format whitespace outside any well-formed block.
+        const std::size_t next_open = region.next_tool_open(pos);
+        const std::size_t span_end  = next_open == std::string_view::npos ? view.size() : next_open;
+        verbatim_spans.emplace_back(view.substr(pos, span_end - pos));
+        pos = span_end;
+    }
+
+    if (out.tool_calls.empty()) {
+        out.diagnostics.fallback_reason = region_failure;
         return fallback(text, out.diagnostics);
     }
 
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
-        out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+    std::string complement;
+    for (const std::string& span : verbatim_spans) { complement += span; }
+    if (trim_format_whitespace(complement).empty()) {
+        // Every block in the region committed: the residual inter-block formatting is not content.
+        out.content = rtrim_format_whitespace(view.substr(0, first));
+    } else {
+        // The verbatim spans form an exact partition of the region minus the committed blocks, so
+        // the pre-marker prefix plus the complement restores every non-call byte.
+        out.content = std::string(view.substr(0, first)) + std::move(complement);
     }
-
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
     return out;
@@ -684,7 +838,9 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        // The salvaged verbatim spans were held inside the tool region, so they must be
+        // published as terminal content alongside the committed calls.
+        return Terminal{.content     = std::move(parsed.content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }

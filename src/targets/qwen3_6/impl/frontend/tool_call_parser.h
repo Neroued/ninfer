@@ -67,8 +67,10 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             const ToolCallOutputContract& contract);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time, each well-formed declared call is retained structurally and every
+// unrepresentable block is restored verbatim, keeping the remaining calls in the region; a
+// rejected block's <tool_call> envelope balances only on a closing marker outside parameter
+// text, so literal closing markers and nested markers inside it are not promoted to calls.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {

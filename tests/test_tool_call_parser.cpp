@@ -551,10 +551,15 @@ int test_strict_structure_and_active_tool_set() {
         check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
                        "missing structural tags were accepted");
 
+    // Trailing prose after a well-formed block does not sink the call: the block commits and the
+    // prose is restored verbatim (per-block salvage, issue #158).
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
+    const auto suffix_parsed = fi::parse_qwen_tool_call_output(suffix, 64, contract);
+    failures += check(suffix_parsed.is_tool_call_response && suffix_parsed.tool_calls.size() == 1 &&
+                          suffix_parsed.content == "\nextra answer" &&
+                          suffix_parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "trailing prose after a well-formed call was not restored verbatim");
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
@@ -634,12 +639,191 @@ int test_conflicting_duplicate_tool_contracts_use_legacy_normalization() {
     return failures;
 }
 
-int test_all_or_nothing_structural_commit() {
-    const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+int test_truncated_trailing_block_salvages_preceding_calls() {
+    const auto contract = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
     const std::string text = tool_call("configure", {{"flag", "true"}}) +
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                          "partially valid tool-call region was partially committed");
+
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "a truncated trailing block sank the preceding valid call");
+    failures += check(
+        parsed.content == "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n",
+        "the truncated trailing block was not restored verbatim");
+    failures += check(parsed.diagnostics.structured_call_count == 1 &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "salvaged region reported a fallback");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("flag") == true, "salvaged call arguments changed");
+    }
+    return failures;
+}
+
+int test_mixed_region_salvage() {
+    const auto contract = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    const std::string first = tool_call("configure", {{"flag", "true"}});
+    // The middle block duplicates its flag parameter: a block-level identity failure that no
+    // normalization can represent, restored verbatim while the neighbouring blocks commit.
+    const std::string broken = "<tool_call>\n<function=configure>\n<parameter=flag>\ntrue\n"
+                               "</parameter>\n<parameter=flag>\nfalse\n</parameter>\n</function>\n"
+                               "</tool_call>";
+    const std::string third = tool_call("configure", {{"flag", "false"}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output(first + "\n" + broken + "\n" + third, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2,
+                      "one invalid block sank neighbouring valid calls");
+    failures += check(parsed.content == "\n" + broken + "\n",
+                      "invalid block or its surrounding bytes were not restored");
+    failures += check(parsed.diagnostics.structured_call_count == 2 &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "salvaged region reported a fallback");
+    if (parsed.tool_calls.size() == 2) {
+        const Json first_args = Json::parse(parsed.tool_calls[0].arguments_json);
+        const Json third_args = Json::parse(parsed.tool_calls[1].arguments_json);
+        failures += check(first_args.at("flag") == true && third_args.at("flag") == false,
+                          "salvaged call arguments changed");
+    }
+
+    const std::string undeclared = tool_call("other", {{"flag", "true"}});
+    const auto parsed_undeclared =
+        fi::parse_qwen_tool_call_output(first + "\n" + undeclared, 64, contract);
+    failures += check(parsed_undeclared.is_tool_call_response &&
+                          parsed_undeclared.tool_calls.size() == 1 &&
+                          parsed_undeclared.content == "\n" + undeclared,
+                      "undeclared-name block was not isolated from valid calls");
+    return failures;
+}
+
+int test_nested_marker_in_rejected_block_not_promoted() {
+    const std::vector<std::string> definitions = {
+        tool_definition("orchestrate", Json{{"body", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}}),
+    };
+    const auto contract = *contract_from_definitions(definitions);
+    const std::string nested = tool_call("bash", {{"command", "echo nested"}});
+    // The outer block is structurally malformed: body is declared twice. Its second value
+    // carries an otherwise valid <tool_call> block as literal parameter text.
+    const std::string rejected =
+        "<tool_call>\n<function=orchestrate>\n<parameter=body>\nfirst pass\n</parameter>\n"
+        "<parameter=body>\n" +
+        nested + "\n</parameter>\n</function>\n</tool_call>";
+
+    int failures = 0;
+    failures += check_rejected(
+        rejected, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+        "marker nested in a rejected block was promoted to a call");
+
+    const std::string first = tool_call("bash", {{"command", "echo one"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(first + "\n" + rejected, 64, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.content == "\n" + rejected,
+                      "rejected envelope was not restored verbatim next to a valid call");
+    return failures;
+}
+
+int test_literal_close_in_rejected_envelope() {
+    const std::vector<std::string> definitions = {
+        tool_definition("orchestrate", Json{{"body", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}}),
+    };
+    const auto contract = *contract_from_definitions(definitions);
+    const std::string nested = tool_call("bash", {{"command", "echo nested"}});
+    // The outer block is structurally malformed: body is declared twice. Its second value
+    // carries a literal </tool_call> closing marker as value bytes; the well-formed block
+    // after the parameter closes is still inside the outer envelope and must not be promoted.
+    const std::string rejected =
+        "<tool_call>\n<function=orchestrate>\n<parameter=body>\nfirst pass\n</parameter>\n"
+        "<parameter=body>\nvalue with literal close: </tool_call>\n</parameter>\n" +
+        nested + "\n</function>\n</tool_call>";
+
+    int failures = 0;
+    failures += check_rejected(
+        rejected, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+        "a literal closing marker inside a rejected envelope closed the envelope early");
+
+    const std::string first = tool_call("bash", {{"command", "echo one"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(first + "\n" + rejected, 64, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.content == "\n" + rejected,
+                      "a rejected envelope with a literal closing marker was split before its "
+                      "nested block");
+    return failures;
+}
+
+int test_unmatched_openers_before_valid_call() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    std::string openers;
+    for (int i = 0; i < 256; ++i) { openers += "<tool_call>"; }
+    const std::string valid = tool_call("bash", {{"command", "echo one"}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output(openers + "\n" + valid, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "a well-formed call after unmatched openers was lost");
+    failures += check(parsed.content == openers + "\n",
+                      "unmatched openers were not restored verbatim");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "echo one",
+                          "salvaged bash command after unmatched openers changed");
+    }
+    return failures;
+}
+
+int test_prose_latched_marker_salvage() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string first  = tool_call("bash", {{"command", "echo one"}});
+    const std::string second = tool_call("bash", {{"command", "echo two"}});
+    const std::string text   = "The model emits <tool_call> blocks.\n" + first + "\n" + second;
+    const auto parsed        = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2,
+                      "calls after a prose-latched marker were lost");
+    failures += check(parsed.content == "The model emits <tool_call> blocks.\n\n",
+                      "prose around a spurious marker was not restored verbatim");
+    if (parsed.tool_calls.size() == 2) {
+        const Json first_args  = Json::parse(parsed.tool_calls[0].arguments_json);
+        const Json second_args = Json::parse(parsed.tool_calls[1].arguments_json);
+        failures += check(first_args.at("command") == "echo one" &&
+                              second_args.at("command") == "echo two",
+                          "salvaged bash commands changed");
+    }
+    return failures;
+}
+
+int test_mixed_decoder_salvage() {
+    auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    const std::string text = "emits <tool_call> markup.\n" +
+                             tool_call("bash", {{"command", "one"}}) + "\n" +
+                             tool_call("missing", {{"x", "y"}});
+    std::string visible;
+    constexpr std::size_t kChunk = 7;
+    for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
+        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+    }
+    const auto terminal = decoder.finish();
+
+    int failures = 0;
+    failures += check(visible == "emits", "bytes before the first marker leaked or were held");
+    failures += check(terminal.tool_calls.size() == 1,
+                      "valid call next to an undeclared block was lost");
+    failures += check(visible + terminal.content ==
+                          "emits <tool_call> markup.\n\n" + tool_call("missing", {{"x", "y"}}),
+                      "mixed terminal lost or reordered verbatim bytes");
+    if (terminal.tool_calls.size() == 1) {
+        const Json args = Json::parse(terminal.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "one", "salvaged command arguments changed");
+    }
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -752,7 +936,13 @@ int main() {
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
-    failures += test_all_or_nothing_structural_commit();
+    failures += test_truncated_trailing_block_salvages_preceding_calls();
+    failures += test_mixed_region_salvage();
+    failures += test_nested_marker_in_rejected_block_not_promoted();
+    failures += test_literal_close_in_rejected_envelope();
+    failures += test_unmatched_openers_before_valid_call();
+    failures += test_prose_latched_marker_salvage();
+    failures += test_mixed_decoder_salvage();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();

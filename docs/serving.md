@@ -565,7 +565,12 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+At terminal time, well-formed declared calls in the held region are emitted as function calls and
+every block that cannot be represented — an undeclared or invalid name, a duplicate parameter, or
+unparseable markup — is restored verbatim while the remaining calls in the region commit; a
+rejected block's `<tool_call>` envelope balances only on a closing marker outside parameter text,
+so a literal `</tool_call>` inside a parameter value stays value text and the envelope is one
+verbatim span whose nested markers are not emitted as calls.
 
 ### Local response state and resources
 
@@ -847,7 +852,9 @@ the template has no tiered default. A preparation rejection always leaves the re
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+`trailing_content`. A region falls back only when no block in it commits a call; the reason then
+classifies the first block-level failure. These counters contain no tool arguments or generated
+text.
 
 `request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
 future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;

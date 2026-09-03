@@ -1158,16 +1158,21 @@ void validate_common_top_level(const Json& body, bool create) {
 } // namespace
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& body,
-                                                                   const RequestLimits& limits) {
+                                                                   const RequestLimits& limits,
+                                                                   bool auto_system_shared_prefix) {
     require_object(body);
     validate_common_top_level(body, true);
     reject_unsupported_platform_fields(body);
-    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    cache_policy.auto_system_shared_prefix = auto_system_shared_prefix;
 
     ParsedPromptFields parsed = parse_prompt_fields(body, limits);
-    apply_openai_prompt_cache_policy(parsed.prompt.generation, cache_policy);
     OpenAIResponsesCreateRequest out;
     out.prompt              = std::move(parsed.prompt);
+    // The prompt policy is applied after resolution assembles
+    // generation.messages (resolve_openai_responses_prompt), because at parse
+    // time the leading instructions/input turns are not yet in messages.
+    out.prompt.cache_policy = cache_policy;
     out.tools               = std::move(parsed.wire_tools);
     out.tool_choice         = std::move(parsed.wire_tool_choice);
     out.tool_identities     = std::move(parsed.tool_identities);

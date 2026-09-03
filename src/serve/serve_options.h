@@ -48,6 +48,9 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    // Issue #142: publish a shared-prefix candidate at the leading
+    // system/developer frontier (default on for agent workloads).
+    bool auto_system_shared_prefix = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

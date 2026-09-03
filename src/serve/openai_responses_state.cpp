@@ -1,3 +1,4 @@
+#include "serve/openai_common.h"
 #include "serve/openai_responses.h"
 #include "serve/request_validation.h"
 
@@ -178,6 +179,12 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     resolved.generation.messages.insert(resolved.generation.messages.end(),
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
+
+    // The prompt cache policy needs the resolved leading instructions/input
+    // turns, so it is applied here rather than at parse time.
+    if (request.cache_policy) {
+        apply_openai_prompt_cache_policy(resolved.generation, *request.cache_policy);
+    }
 
     if (response_id) {
         if (parent_record) {

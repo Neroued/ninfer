@@ -20,6 +20,11 @@ enum class OpenAIPromptCacheAutomatic : std::uint8_t {
 
 struct OpenAIPromptCachePolicy {
     OpenAIPromptCacheAutomatic automatic = OpenAIPromptCacheAutomatic::Default;
+    // Issue #142: additionally publish a shared-prefix candidate at the
+    // leading system/developer frontier so agent sibling sessions share a
+    // long head even without a client marker. The last-content implicit
+    // candidate stays untouched.
+    bool auto_system_shared_prefix = true;
 };
 
 [[nodiscard]] bool parse_openai_prompt_cache_breakpoint(const nlohmann::json& value,

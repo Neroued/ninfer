@@ -144,8 +144,25 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
     const bool automatic_enabled =
         policy.automatic != OpenAIPromptCacheAutomatic::Disabled && automatic_target != nullptr;
     const bool automatic_merges_explicit = automatic_enabled && automatic_target->has_value();
-    const std::size_t explicit_write_slots =
+    // Issue #142: the leading-instruction automatic candidate is a distinct
+    // marker when the leading run is unmarked, so it consumes one of the four
+    // frontend marker slots (frontend.cpp rejects more than four).
+    std::size_t leading_instruction = static_cast<std::size_t>(-1);
+    if (policy.auto_system_shared_prefix) {
+        for (std::size_t index = 0; index < request.messages.size(); ++index) {
+            const ChatRole role = request.messages[index].role;
+            if (role != ChatRole::System && role != ChatRole::Developer) { break; }
+            leading_instruction = index;
+        }
+    }
+    const bool system_candidate =
+        policy.auto_system_shared_prefix && automatic_enabled &&
+        leading_instruction != static_cast<std::size_t>(-1) &&
+        !request.messages[leading_instruction].cache_boundary_after.has_value();
+    const std::size_t base_slots =
         !automatic_enabled || automatic_merges_explicit ? 4U : 3U;
+    const std::size_t explicit_write_slots =
+        base_slots - (system_candidate ? 1U : 0U);
     const std::size_t first_selected = explicit_boundaries.size() > explicit_write_slots
                                            ? explicit_boundaries.size() - explicit_write_slots
                                            : 0U;
@@ -169,6 +186,18 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             automatic_target->value().evidence |= evidence;
         } else {
             *automatic_target = CacheBoundary{.evidence = evidence};
+        }
+        // Issue #142: a second automatic candidate at the leading
+        // system/developer frontier (agent siblings share the long head).
+        // Mark the end of the contiguous leading instruction run so requests
+        // sharing both system and developer turns reuse the whole prefix.
+        if (policy.auto_system_shared_prefix &&
+            leading_instruction != static_cast<std::size_t>(-1)) {
+            ChatTurn& turn = request.messages[leading_instruction];
+            if (!turn.cache_boundary_after) {
+                turn.cache_boundary_after = CacheBoundary{
+                    .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic};
+            }
         }
     }
     // OpenAI already defines the automatic/explicit write policy for every request. Existing

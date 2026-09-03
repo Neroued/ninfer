@@ -34,6 +34,10 @@ struct OpenAIResponsesPromptRequest {
     std::vector<nlohmann::json> input_items;
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    // Applied after prompt resolution assembles generation.messages (the
+    // policy needs the resolved system/developer turns to place the
+    // leading-instruction candidate).
+    std::optional<OpenAIPromptCachePolicy> cache_policy;
 };
 
 struct OpenAIResponsesCreateRequest {
@@ -72,7 +76,9 @@ struct BuiltOpenAIResponse {
 };
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const nlohmann::json& body,
-                                                                   const RequestLimits& limits);
+                                                                   const RequestLimits& limits,
+                                                                   bool auto_system_shared_prefix =
+                                                                       true);
 
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const nlohmann::json& body,

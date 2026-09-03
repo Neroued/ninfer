@@ -118,6 +118,9 @@ struct Package {
     using Program                    = qwen3_6::Program<detail::Variant>;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
+    // Static dimension facts (vocab_size, embedding_size, native_context). The Engine completes
+    // model_id, weights_id, parameters, and weight_bytes before the metadata is published.
+    [[nodiscard]] static ModelMetadata model_metadata();
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);

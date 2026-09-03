@@ -84,6 +84,24 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
+// Artifact-measured model facts. n_params is the total logical (dequantized) element count over
+// every registered weight tensor; size is the total encoded payload bytes of those tensors. Both
+// are pure functions of the artifact's tensor inventory, independent of device memory layout.
+void measure_artifact_weights(artifact::Reader& reader, ModelMetadata& metadata) {
+    std::uint64_t parameters   = 0;
+    std::uint64_t weight_bytes = 0;
+    for (const auto& object : reader.objects()) {
+        const auto* tensor = std::get_if<artifact::TensorDescriptor>(&object);
+        if (tensor == nullptr) { continue; } // Non-weight resources (tokenizer, templates).
+        std::uint64_t elements = 1;
+        for (const auto dimension : tensor->shape) { elements *= dimension; }
+        parameters   += elements;
+        weight_bytes += artifact::object_bytes(*tensor);
+    }
+    metadata.parameters   = parameters;
+    metadata.weight_bytes = weight_bytes;
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
@@ -150,8 +168,17 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
     summary.context_cost         = context_cost.summary;
+
+    // The target owns the static dimension facts; the registered identity and the artifact
+    // measurements complete the model metadata served by /v1/models.
+    ModelMetadata metadata = Target::model_metadata();
+    metadata.model_id      = identity.model_id;
+    metadata.weights_id    = identity.weights_id;
+    measure_artifact_weights(reader, metadata);
+
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
+                             .model_metadata    = std::move(metadata),
                              .sampling_defaults = sampling_defaults,
                              .context_cost      = std::move(context_cost.model)};
 }

@@ -228,6 +228,7 @@ public:
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
+        model_metadata    = std::move(constructed.model_metadata);
         sampling_defaults = constructed.sampling_defaults;
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         core = std::visit(
@@ -264,6 +265,7 @@ public:
     DeviceContext device;
     targets::ActiveTarget active;
     LoadSummary load;
+    ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     Core core;
 };
@@ -478,6 +480,11 @@ const EngineOptions& Engine::options() const {
 LoadSummary Engine::load_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->load;
+}
+
+ModelMetadata Engine::model_metadata() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->model_metadata;
 }
 
 MemorySummary Engine::memory_summary() const {

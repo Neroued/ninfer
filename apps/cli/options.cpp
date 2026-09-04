@@ -58,6 +58,7 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (text == "rk2v4-e8") { return KvCacheStorage::Rk2v4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -80,7 +81,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk2v4-e8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"

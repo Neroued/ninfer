@@ -23,6 +23,20 @@ attention scores against an exact FP32 ground-truth dot product:
 Metrics reported per method: cosine similarity vs FP32 reference, mean abs
 error, max abs error, and per-needle retrieval ranking.
 
+**Scope of this oracle — read this before relying on the number.** This is
+an *independent* oracle for the E8 Conway-Sloane **mathematics**. Its kernel
+header (`test_e8_codec.cuh`) is a self-contained, deliberately separate
+implementation of the lattice/root-code math — it does **not** `#include`
+the production `src/ops/kernel/e8_lattice.cuh` / `e8_root_codec.cuh`, so the
+5/5 needle result does not by itself exercise the production
+`rk2v4e8_codec.cuh` 208 B plane layout, the V Hadamard rotation/inverse, or
+paged addressing. Keeping the oracle independent (rather than letting it
+`#include` and test itself) is intentional: a self-including test would be
+circular. The production route — the 208 B representation, V rotation,
+paging, and final attention output — is validated separately by the end-to-end
+boot + needle-in-haystack verification (see `PORT-RK2V4E8.md`), which serves
+the real `rk2v4e8` append + small-T/prompt kernels against a model artifact.
+
 ## Verified result (GeForce RTX 5090, sm_120a)
 
 - **Needle retrieval: 100%** — all 5 embedded needles correctly recovered

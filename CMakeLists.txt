@@ -77,6 +77,9 @@ endif()
 if(BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
+  # Standalone E8 compressed-KV codec oracle (no engine / weight deps);
+  # registered so `ctest -R ninfer_kv_e8_verify` exercises the rk2v4-e8 codec.
+  add_subdirectory(tools/test_kv)
 endif()
 if(NINFER_BUILD_BENCHMARKS)
   add_subdirectory(bench)

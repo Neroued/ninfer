@@ -148,6 +148,9 @@ struct ContextCostOptions {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    // Optional startup replacement for the artifact's frontend/chat_template.jinja.
+    // The source must resolve to a template semantics the target accepts.
+    std::filesystem::path chat_template_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.

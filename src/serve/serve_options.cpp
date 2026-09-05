@@ -80,7 +80,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--chat-template FILE] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -110,6 +110,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --chat-template FILE replaces the artifact frontend chat template at startup;\n"
+           "       the file must be byte-identical to a template the target accepts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -153,6 +155,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
+            }
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
+            if (options.chat_template_path.empty()) {
+                throw std::invalid_argument("--chat-template must not be empty");
             }
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(

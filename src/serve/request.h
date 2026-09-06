@@ -178,6 +178,10 @@ struct GenerationRequest {
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
+    // Benchmark/serving extension shared with vLLM, SGLang and llama.cpp: suppress the
+    // checkpoint's default stop tokens so generation runs to the requested token budget.
+    // Caller-supplied stop tokens and stop strings still apply.
+    bool ignore_eos = false;
     int max_tokens                       = 0; // resolved budget; zero means immediate output limit
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;

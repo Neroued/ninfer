@@ -306,6 +306,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
+    options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {

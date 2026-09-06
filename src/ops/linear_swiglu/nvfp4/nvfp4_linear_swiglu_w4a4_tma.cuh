@@ -12,6 +12,15 @@
 
 namespace ninfer::ops::detail {
 
+// SwiGLU epilogue activation.
+//
+// The accurate `silu` compiles to a guarded slow path for `expf` (64
+// CALL.REL.NOINC plus 64 FCHK per kernel in SASS) and a Newton-refined divide,
+// and the result is then rounded to bf16 on the very next instruction. The
+// hardware-approximate forms are ~1e-6 relative, four orders of magnitude below
+// the bf16 quantum, so nothing that survives the rounding is affected.
+__device__ __forceinline__ float swiglu_silu(float x) { return __fdividef(x, 1.0f + __expf(-x)); }
+
 template <class Schedule>
 struct Nvfp4LinearSwiGluTmaTensorStorage {
     static_assert(Schedule::kBlockN == 128);
@@ -236,10 +245,10 @@ __global__ __launch_bounds__(
                 shared_output + token1 * kOutputStride + pair_row);
             const auto& gate = accumulators[mma_m][mma_n];
             const auto& up   = accumulators[mma_m][mma_n + kGateMmaFragments];
-            *destination0    = __floats2bfloat162_rn(silu(gate[0] * alpha) * (up[0] * alpha),
-                                                     silu(gate[1] * alpha) * (up[1] * alpha));
-            *destination1    = __floats2bfloat162_rn(silu(gate[2] * alpha) * (up[2] * alpha),
-                                                     silu(gate[3] * alpha) * (up[3] * alpha));
+            *destination0    = __floats2bfloat162_rn(swiglu_silu(gate[0] * alpha) * (up[0] * alpha),
+                                                     swiglu_silu(gate[1] * alpha) * (up[1] * alpha));
+            *destination1    = __floats2bfloat162_rn(swiglu_silu(gate[2] * alpha) * (up[2] * alpha),
+                                                     swiglu_silu(gate[3] * alpha) * (up[3] * alpha));
         }
     }
 

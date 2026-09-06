@@ -142,6 +142,14 @@ const std::string& reasoning_effort_template_source() {
     return source;
 }
 
+const std::string& froggeric_v225_template_source() {
+    static const std::string source = read_template_fixture(NINFER_SOURCE_DIR
+                                                            "/tests/fixtures/frontend/"
+                                                            "reasoning_effort_froggeric_v225_"
+                                                            "chat_template.jinja");
+    return source;
+}
+
 const fi::CompiledChatTemplate& thinking_toggle_template() {
     static const fi::CompiledChatTemplate value =
         fi::CompiledChatTemplate::resolve(thinking_toggle_template_source());
@@ -151,6 +159,12 @@ const fi::CompiledChatTemplate& thinking_toggle_template() {
 const fi::CompiledChatTemplate& reasoning_effort_template() {
     static const fi::CompiledChatTemplate value =
         fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    return value;
+}
+
+const fi::CompiledChatTemplate& froggeric_v225_template() {
+    static const fi::CompiledChatTemplate value =
+        fi::CompiledChatTemplate::resolve(froggeric_v225_template_source());
     return value;
 }
 
@@ -904,6 +918,17 @@ int test_reasoning_effort_chat_template() {
                       }),
                       "reasoning effort and disabled thinking were accepted together");
 
+    fi::ChatRenderOptions v225_off;
+    v225_off.enable_thinking = false;
+    failures += check(froggeric_v225_template()
+                                  .render({chat_message(ninfer::ChatRole::System, ""),
+                                           chat_message(ninfer::ChatRole::User, "hello")},
+                                          v225_off)
+                                  .text ==
+                              "<|im_start|>user\nhello<|im_end|>\n"
+                              "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                      "froggeric v22.5 template did not disable thinking on request");
+
     fi::ChatRenderOptions unsupported;
     unsupported.reasoning_effort = ninfer::ReasoningEffort::Low;
     failures += check(throws_invalid_argument([&] {
@@ -942,6 +967,16 @@ int test_reasoning_effort_chat_template() {
             .text.ends_with("<tool_call>\n<function=f>\n</function>\n"
                             "</tool_call><|im_end|>\n"),
         "empty tool arguments did not follow the reasoning-effort template");
+
+    const ninfer::PromptCapabilities v225_capabilities =
+        froggeric_v225_template().capabilities();
+    failures += check(v225_capabilities.enable_thinking &&
+                          v225_capabilities.reasoning_effort.low &&
+                          v225_capabilities.reasoning_effort.medium &&
+                          v225_capabilities.reasoning_effort.xhigh &&
+                          v225_capabilities.reasoning_effort.default_effort ==
+                              ninfer::ReasoningEffort::XHigh,
+                      "froggeric v22.5 template did not advertise reasoning-effort capabilities");
     return failures;
 }
 
@@ -2203,6 +2238,29 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
+int test_chat_template_file_override() {
+    static const std::filesystem::path kFixturePath =
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/reasoning_effort_froggeric_v225_chat_template.jinja";
+    ninfer::targets::qwen3_6::FrontendOptions options;
+    options.max_context      = std::numeric_limits<std::uint32_t>::max();
+    options.chat_template_path = kFixturePath;
+    const Frontend overridden  = FrontendFactory::create_component(resources(), options);
+    const ninfer::PromptCapabilities capabilities = overridden.prompt_capabilities();
+    int failures = check(capabilities.reasoning_effort.low &&
+                             capabilities.reasoning_effort.medium &&
+                             capabilities.reasoning_effort.xhigh &&
+                             capabilities.reasoning_effort.default_effort ==
+                                 ninfer::ReasoningEffort::XHigh,
+                         "chat-template override did not reach prompt capabilities");
+    failures += check(throws_invalid_argument([&] {
+                      ninfer::targets::qwen3_6::FrontendOptions missing           = options;
+                      missing.chat_template_path        = "/ninfer-nonexistent-chat-template.jinja";
+                      (void)FrontendFactory::create_component(resources(), missing);
+                  }),
+                  "unreadable chat-template override was accepted");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
@@ -2218,6 +2276,7 @@ int main() {
     failures += test_ordered_instruction_turns();
     failures += test_assistant_continuation();
     failures += test_reasoning_effort_chat_template();
+    failures += test_chat_template_file_override();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();

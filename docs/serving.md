@@ -29,6 +29,12 @@ With `C=2` and two extra Device checkpoint slots, the process owns two active St
 plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
 pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
 
+Pass `--chat-template FILE` to serve an operator-managed chat template in place of the artifact's
+`frontend/chat_template.jinja`. The file replaces the template resource at startup and must be
+byte-identical to a template the target recognizes; validation and acceptance are exact, so any
+later edit to the file is rejected at startup. `qwen3.8-froggeric-v22.5`
+(froggeric/Qwen-Fixed-Chat-Templates) is an accepted reasoning-effort template.
+
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with

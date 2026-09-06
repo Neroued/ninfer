@@ -107,8 +107,11 @@ __global__ __launch_bounds__(
                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
-                                  token_begin, &shared.full[stage]);
+                constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
+                const int scale_tile =
+                    (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
+                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, 0,
+                                  scale_tile * 16, &shared.full[stage]);
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
                                             k_tile * Schedule::kK64PerStage) *

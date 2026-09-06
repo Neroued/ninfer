@@ -50,8 +50,17 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
     return layout.peak_bytes(1);
 }
 
+// The TMA route reads activation scales one [256 tokens, 16 groups] tile per request, and wants
+// that tile contiguous. Every route that shares make_nvfp4_w4a4_tma_descriptors asks the same
+// question, so the predicate lives here.
+inline constexpr std::int32_t kNvfp4TmaBlockM = 256;
+
+[[nodiscard]] inline bool nvfp4_w4a4_tma_route(std::int32_t tokens) {
+    return tokens >= 1024 && (tokens % kNvfp4TmaBlockM) == 0;
+}
+
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream);
+                                bool blocked_scales, cudaStream_t stream);
 
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);

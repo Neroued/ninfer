@@ -38,14 +38,21 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
 
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                           cudaStream_t stream) {
+                           bool blocked_scales, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
     const std::int32_t tasks  = tokens * ActivationGeometry::kGroupsPerRow;
-    nvfp4_w4a4_quantize_kernel<ActivationGeometry>
-        <<<(tasks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+    const int blocks          = (tasks + kThreads - 1) / kThreads;
+    if (blocked_scales) {
+        nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, true, kNvfp4TmaBlockM>
+            <<<blocks, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                              workspace.codes, workspace.scales, tokens,
+                                              weight.input_scale_divisor);
+    } else {
+        nvfp4_w4a4_quantize_kernel<ActivationGeometry><<<blocks, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
             weight.input_scale_divisor);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -89,19 +96,22 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
 } // namespace
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream) {
+                                bool blocked_scales, cudaStream_t stream) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
     }
     switch (weight.k) {
     case Nvfp4Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, blocked_scales,
+                                                           stream);
         return;
     case Nvfp4Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, blocked_scales,
+                                                           stream);
         return;
     case Nvfp4Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, blocked_scales,
+                                                            stream);
         return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
@@ -110,7 +120,7 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
 
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_tma_route(x.ne[1]), stream);
     const std::int32_t tokens = x.ne[1];
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::AttnInput:

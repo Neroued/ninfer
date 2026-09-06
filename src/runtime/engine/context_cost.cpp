@@ -212,6 +212,14 @@ const ContextPrefillPreset* find_prefill(const ContextCostMachinePreset& machine
     return found == machine.prefill.end() ? nullptr : &*found;
 }
 
+const ContextPrefillPreset* find_prefill_by_weights(const ContextCostMachinePreset& machine,
+                                                    std::string_view weights_id) noexcept {
+    const auto found =
+        std::find_if(machine.prefill.begin(), machine.prefill.end(),
+                     [&](const auto& preset) { return preset.weights_id == weights_id; });
+    return found == machine.prefill.end() ? nullptr : &*found;
+}
+
 void validate_presets(const std::vector<ContextCostMachinePreset>& presets,
                       std::string_view context) {
     for (std::size_t machine_index = 0; machine_index < presets.size(); ++machine_index) {
@@ -572,6 +580,12 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
         if (const ContextPrefillPreset* prefill =
                 find_prefill(*machine, identity.model_id, identity.weights_id)) {
             model.prefill  = prefill->cost;
+            prefill_source = ContextCostPresetSource::CompiledDefault;
+        } else if (const ContextPrefillPreset* by_weights =
+                       find_prefill_by_weights(*machine, identity.weights_id)) {
+            // A registered model with no row of its own is closer to another model in the same
+            // weight format than to the generic profile, which is the slowest measured one.
+            model.prefill  = by_weights->cost;
             prefill_source = ContextCostPresetSource::CompiledDefault;
         }
     }

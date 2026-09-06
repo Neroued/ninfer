@@ -4,6 +4,7 @@
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_output.cuh"
@@ -54,6 +55,18 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const Fp8A8Workspace scratch =
         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
+    using TmaSchedule = typename Fp8LinearA8TmaSchedule<Geometry>::Type;
+    using TmaRows     = Fp8SwiGluRows<TmaSchedule::kBlockN / 2, kIntermediate>;
+    if (fp8_a8_tma_applies<Geometry, TmaSchedule, Schedule>(x.ne[1], scratch.codes, weight.qdata)) {
+        fp8_a8_tma_launch<Geometry, TmaSchedule, Fp8IdentityEpilogue, Fp8SwiGluOutput, TmaRows,
+                          true>(
+            scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const __nv_bfloat16*>(weight.scales), x.ne[1], Fp8IdentityEpilogue{},
+            Fp8SwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate}, stream,
+            TmaRows{});
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
         launch_mma<true>(weight, out, scratch, x.ne[1], stream);
     } else {

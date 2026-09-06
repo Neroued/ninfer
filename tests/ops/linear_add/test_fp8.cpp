@@ -106,11 +106,21 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{96, ops::LinearPolicy::AllowA8},
         Invocation{128, ops::LinearPolicy::AllowA8},
         Invocation{129, ops::LinearPolicy::AllowA8},
+        // The residual add is the one epilogue that folds into the store, so it is the one that
+        // has to be checked where the store drops rows. Both shapes here have 5120 output rows
+        // and the same block counts but different routing: 5120x6144 is bounded at 4096 and
+        // takes 1664 with a partial tile, while 5120x17408 takes 4160.
+        // Not a whole cp.async token tile. The route reaches this width only since that
+        // condition was removed, and the residual add is the epilogue that folds into the
+        // store, so it is the one that has to be checked where the store drops rows.
+        Invocation{4001, ops::LinearPolicy::AllowA8},
+        Invocation{4096, ops::LinearPolicy::AllowA8},
+        Invocation{4160, ops::LinearPolicy::AllowA8},
     };
     for (int columns = 2; columns <= 24; ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
-    constexpr std::int32_t kMaximumTokens = 1024;
+    constexpr std::int32_t kMaximumTokens = 4160;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
     const std::vector<std::int32_t> rows = sampled_indices(n);

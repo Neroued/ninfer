@@ -309,7 +309,11 @@ int run_fp8() {
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
+    // 4096 and 4160 reach the TMA-staged route, which declines every width below it, and
+    // 4160 leaves a partial trailing tile. Without them this op output type never runs there.
+    // 1153 is not a whole cp.async token tile, a width the route reaches only since that
+    // condition was removed; 4160 leaves it a partial trailing tile.
+    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024, 1153, 4096, 4160}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;

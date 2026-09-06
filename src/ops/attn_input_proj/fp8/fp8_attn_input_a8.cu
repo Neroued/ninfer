@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
+#include "ops/linear/fp8/fp8_a8_schedule.cuh"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
@@ -36,6 +38,24 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
             output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The TMA-staged route. Placed in the wide arm of the ladder below, next to the schedule it
+// falls back to: the predicate compares the two, so the schedule it names has to be the one that
+// would otherwise run at this width.
+void run_tma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+             Fp8A8Workspace workspace, int tokens, cudaStream_t stream) {
+    const Fp8AttentionInputOutput output{
+        static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(v.data),
+    };
+    fp8_a8_tma_launch<Geometry, typename Fp8LinearA8TmaSchedule<Geometry>::Type>(
+        workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{}, output,
+        stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -76,6 +96,9 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
         run<Wide128>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 144)
         run<Tail144>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    else if (fp8_a8_tma_applies<Geometry, Fp8LinearA8TmaSchedule<Geometry>::Type, Prefill>(
+                 x.ne[1], workspace.codes, weight.qdata))
+        run_tma(weight, q, gate, k, v, workspace, x.ne[1], stream);
     else
         run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
 }

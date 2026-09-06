@@ -44,7 +44,19 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using Schedule    = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using TmaSchedule = typename Fp8LinearA8TmaSchedule<Geometry>::Type;
+    if (fp8_a8_tma_applies<Geometry, TmaSchedule, Schedule>(tokens, workspace.codes,
+                                                            weight.qdata)) {
+        auto* output = static_cast<__nv_bfloat16*>(residual.data);
+        fp8_a8_tma_launch<Geometry, TmaSchedule>(
+            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const __nv_bfloat16*>(weight.scales), tokens,
+            Fp8AddResidualEpilogue{output, Geometry::kOutputRows},
+            Fp8ContiguousOutput{output, Geometry::kOutputRows}, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if ((tokens % Schedule::kBlockTokens) == 0) {
         launch_mma<Geometry, true>(weight, residual, workspace, tokens, stream);
     } else {

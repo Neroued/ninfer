@@ -10,6 +10,17 @@ using namespace ninfer;
 using namespace ninfer::test::linear;
 
 int run_fp8_a8() {
+    // Widths for the TMA-staged route, one aligned and one with a partial trailing tile per shape,
+    // read off the predicate rather than assumed: admission is a step function of two wave counts,
+    // so it differs per geometry and is not monotonic in token count. 4160 is declined on
+    // attn_input and mlp_gate_up, so those two take 4288; 5120x6144 is bounded at 4096, so
+    // its partial width has to come from below that, hence 1664. Partial trailing tiles are the
+    // common case among admitted widths, not an edge.
+    //
+    // The last width in each list is not a whole cp.async token tile. Those widths reach the route
+    // only because the multiple-of-tile condition was removed, and they are the ones whose output
+    // the previous kernel cannot be compared against byte for byte, so a host reference is the
+    // only thing that checks them.
     constexpr std::array attn_invocations{
         Invocation{12, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
@@ -17,6 +28,9 @@ int run_fp8_a8() {
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1023, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1345, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4288, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     int failures = run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                              {14336, 5120, 829U, Comparison::Sampled, true, attn_invocations});
@@ -25,6 +39,9 @@ int run_fp8_a8() {
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1153, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4160, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                           {16384, 5120, 839U, Comparison::Sampled, true, gdn_invocations});
@@ -34,6 +51,9 @@ int run_fp8_a8() {
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1153, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4288, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                           {34816, 5120, 853U, Comparison::Sampled, true, mlp_invocations});
@@ -42,7 +62,10 @@ int run_fp8_a8() {
         Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1664, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4001, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                           {5120, 6144, 857U, Comparison::Sampled, true, residual6144_invocations});
@@ -51,6 +74,9 @@ int run_fp8_a8() {
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4001, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{4160, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     failures +=
         run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,

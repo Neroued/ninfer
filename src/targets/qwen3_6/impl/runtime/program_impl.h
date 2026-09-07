@@ -10754,11 +10754,13 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     try {
         if (!text_active) {
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row,
+                    device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));

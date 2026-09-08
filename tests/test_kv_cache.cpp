@@ -417,9 +417,143 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     return failures;
 }
 
+
+std::span<const ninfer::DeviceKVPageHandle> one_page_span(ninfer::DeviceKVPageLease& lease) {
+    static ninfer::DeviceKVPageHandle stored;
+    stored = lease.handle();
+    return std::span<const ninfer::DeviceKVPageHandle>(&stored, 1);
+}
+
+// Demonstrates that release_page() returns a physical page to the free list without
+// zeroing or protecting its content.  Stale user data persists across release + re-allocate
+// on the same physical index — this is a structural precondition for the dangerous race.
+// (Contributed upstream: https://github.com/Neroued/ninfer/pull/211)
+int exercise_page_release_fence(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    PlannedCache plan = plan_cache(2, 2, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(pool.geometry());
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 6, layouts);
+
+    // 1. Allocate page 0 and write known data.
+    std::vector<ninfer::DeviceKVPageLease> pages = materialize(pool, 1);
+    std::optional<ninfer::HostKVAllocation> write =
+        host_arena.allocate(host_layout, 1);
+    ninfer::HostKVAllocationView write_view = host_arena.writable_view(*write);
+    std::memset(write_view.data(), 0xAB, host_layout.page_stride);
+    pool.copy_from_host(host_arena.view(*write),
+                        one_page_span(pages[0]),
+                        context.stream);
+    context.synchronize();
+
+    // 2. Release and re-allocate — gets the same physical index.
+    pages[0].release();
+    pages.clear();
+    pages = materialize(pool, 1);
+
+    // 3. Read back without writing new data.
+    std::optional<ninfer::HostKVAllocation> readback =
+        host_arena.allocate(host_layout, 1);
+    ninfer::HostKVAllocationView readback_view = host_arena.writable_view(*readback);
+    std::memset(readback_view.data(), 0, host_layout.page_stride);
+    pool.copy_to_host(one_page_span(pages[0]),
+                      readback_view, context.stream);
+    context.synchronize();
+
+    // 4. The re-allocated page still holds the old (0xAB) data — release_page()
+    //    does not clear or fence the page.
+    const ninfer::HostKVAllocationConstView readback_contents = host_arena.view(*readback);
+    failures += expect(page_payload_equal(readback_contents, 0, host_arena.view(*write), 0),
+                       "re-allocated page does not contain stale data from prior lease; "
+                       "pool zeroed or invalidated the page on release");
+
+    (void)write_view;
+    (void)readback_view;
+    return failures;
+}
+
+// Dangerous-only test: writes to the same physical page from two independent
+// non-blocking streams without ordering, reproducing the Xid-79 crash pattern.
+// The transfer-stream write is still in-flight when release_page() returns the
+// page to the free list.  After re-allocation, the compute stream writes new
+// data to the same GPU address.  This concurrent-write is undefined behaviour;
+// on Blackwell it can produce cudaErrorLaunchFailure → Xid-79 → GPU lockup.
+//
+// Run with --dangerous on hardware that can tolerate a GPU reset.
+int exercise_page_release_race(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    PlannedCache plan = plan_cache(2, 2, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(pool.geometry());
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 6, layouts);
+
+    // 1. Allocate page, write 0xAB on transfer_stream — do NOT synchronize.
+    std::vector<ninfer::DeviceKVPageLease> pages = materialize(pool, 1);
+    std::optional<ninfer::HostKVAllocation> old =
+        host_arena.allocate(host_layout, 1);
+    ninfer::HostKVAllocationView old_view = host_arena.writable_view(*old);
+    std::memset(old_view.data(), 0xAB, host_layout.page_stride);
+    pool.copy_from_host(host_arena.view(*old),
+                        one_page_span(pages[0]),
+                        context.transfer_stream);
+
+    // 2. Release — no fence, page returns to free list while transfer_stream
+    //    write is still in-flight.
+    pages[0].release();
+    pages.clear();
+
+    // 3. Re-allocate same physical index, write 0xCD on context.stream.
+    //    Both streams may issue concurrent writes to the same GPU address.
+    pages = materialize(pool, 1);
+    std::optional<ninfer::HostKVAllocation> fresh =
+        host_arena.allocate(host_layout, 1);
+    ninfer::HostKVAllocationView fresh_view = host_arena.writable_view(*fresh);
+    std::memset(fresh_view.data(), 0xCD, host_layout.page_stride);
+    pool.copy_from_host(host_arena.view(*fresh),
+                        one_page_span(pages[0]),
+                        context.stream);
+    context.synchronize();
+
+    // 4. Read back (may crash before reaching here).
+    std::optional<ninfer::HostKVAllocation> readback =
+        host_arena.allocate(host_layout, 1);
+    ninfer::HostKVAllocationView readback_view = host_arena.writable_view(*readback);
+    std::memset(readback_view.data(), 0, host_layout.page_stride);
+    pool.copy_to_host(one_page_span(pages[0]),
+                      readback_view, context.stream);
+    context.synchronize();
+
+    // 5. If we survive, verify the payload matches the new write.  A stale 0xAB
+    //    would prove the transfer-stream write raced past release + re-allocate.
+    const ninfer::HostKVAllocationConstView rb = host_arena.view(*readback);
+    const ninfer::HostKVAllocationConstView fv = host_arena.view(*fresh);
+    failures += expect(page_payload_equal(rb, 0, fv, 0),
+                       "page payload after release+reallocate showed stale transfer-stream "
+                       "data; release_page() is missing a CUDA ordering fence");
+
+    (void)old_view;
+    (void)fresh_view;
+    (void)readback_view;
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     int device_count              = 0;
     const cudaError_t count_error = cudaGetDeviceCount(&device_count);
     if (cuda_unavailable(count_error) || (count_error == cudaSuccess && device_count == 0)) {
@@ -431,9 +565,29 @@ int main() {
         return 1;
     }
 
+    bool dangerous = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--dangerous") == 0) { dangerous = true; }
+    }
+
     try {
         ninfer::DeviceContext context(0);
-        int failures = exercise_reservation_and_mapping(context);
+
+        std::cout << "  page_release_fence (safe) ... " << std::flush;
+        int fence_failures = exercise_page_release_fence(context);
+        std::cout << (fence_failures == 0 ? "PASS" : "FAIL") << '\n';
+
+        std::cout << "  page_release_race (dangerous) ... " << std::flush;
+        int race_failures = 0;
+        if (dangerous) {
+            race_failures = exercise_page_release_race(context);
+            std::cout << (race_failures == 0 ? "PASS" : "FAIL") << '\n';
+        } else {
+            std::cout << "SKIP  (use --dangerous to enable)\n";
+        }
+
+        int failures = fence_failures + race_failures;
+        failures += exercise_reservation_and_mapping(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{

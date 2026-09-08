@@ -18,7 +18,8 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
 
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / out.nb[0]);
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out_ld};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
@@ -39,7 +40,8 @@ void launch_vocabulary_tile(const Tensor& x, const Weight& weight, Tensor& out, 
     using Geometry = W8VocabularyProjectionGeometry;
     using Schedule = W8SmallTMmaSchedule<Capacity <= 32 ? 8 : 4, Capacity, 2,
                                          W8SmallTMmaScaleAccess::Shared>;
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / out.nb[0]);
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out_ld};
     w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
                           W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
         <<<Geometry::kOutputRows / 16, Schedule::kThreads, 0, stream>>>(

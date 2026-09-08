@@ -19,7 +19,8 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     const std::int32_t padded_k = w.padded_shape[1];
     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), rows};
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / out.nb[0]);
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out_ld};
     w8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);

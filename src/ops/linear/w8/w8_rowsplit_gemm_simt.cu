@@ -15,12 +15,12 @@ constexpr int kStages              = 2;
 
 template <int ColsPerTile, bool Full>
 void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* scales,
-               __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
-               std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
+               __nv_bfloat16* outp, std::int32_t n, std::int32_t out_ld, std::int32_t k,
+               std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlockDefault * 32;
     const dim3 grid(static_cast<unsigned>(div_up(n, kRowsPerBlockDefault)),
                     static_cast<unsigned>(div_up(t, ColsPerTile)), 1u);
-    const W8ContiguousOutput output{outp, n};
+    const W8ContiguousOutput output{outp, out_ld};
     w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlockDefault, kStages,
                                  Full><<<grid, kBlockThreads, 0, stream>>>(
         xp, codes, scales, output, n, k, t, padded_k, full_slabs);
@@ -34,8 +34,9 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
     launch_tt<ColsPerTile, Full>(xp, static_cast<const std::uint8_t*>(w.qdata),
                                  static_cast<const std::uint8_t*>(w.scales),
-                                 static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1],
-                                 w.padded_shape[1], full_slabs, stream);
+                                 static_cast<__nv_bfloat16*>(out.data), w.n,
+                                 static_cast<std::int32_t>(out.nb[1] / out.nb[0]), x.ne[0],
+                                 x.ne[1], w.padded_shape[1], full_slabs, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -7,13 +7,15 @@ format already supported by the 27B runtime.
 
 from __future__ import annotations
 
+import os
+
 from tools.convert.qwen3_6_27b import inventory as qwen3_6_inventory
 
 from .dflash2_inventory import DFLASH2_TENSOR_SPECS
 
 
 MODEL_ID = "qwen3.8-27b"
-WEIGHTS_ID = "groupwise-int"
+WEIGHTS_ID = "groupwise-w8" if os.environ.get("NINFER_W8_VARIANT") else "groupwise-int"
 TARGET_KEY = "qwen3_8_27b"
 
 BF16 = qwen3_6_inventory.BF16
@@ -36,6 +38,29 @@ RESOURCE_SPECS = qwen3_6_inventory.RESOURCE_SPECS
 
 
 def _w8_vocabulary_endpoint(spec: TensorSpec) -> TensorSpec:
+    only = os.environ.get("NINFER_W8_ONLY", "all")
+    fam = spec.name.rsplit("/", 1)[-1]
+    scope_ok = (
+        only == "all"
+        or (only == "attn" and (spec.name.endswith("attention/query_key")
+                                or spec.name.endswith("attention/gate_value")))
+        or (only == "gdn" and (spec.name.endswith("gdn/query_key")
+                               or spec.name.endswith("gdn/value_z")))
+        or (only == "mlp" and spec.name.endswith("mlp/gate_up"))
+    )
+    if (os.environ.get("NINFER_W8_VARIANT") and scope_ok
+            and spec.format == qwen3_6_inventory.Q4):
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)
+    if (
+        os.environ.get("NINFER_W8_VARIANT")
+        and scope_ok
+        and spec.format == qwen3_6_inventory.Q5
+        and (
+            spec.name.endswith("gdn/value_z")
+            or spec.name.endswith("attention/gate_value")
+        )
+    ):
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)
     if spec.name in ("text/token_embedding", "text/output_head"):
         return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)
     return spec

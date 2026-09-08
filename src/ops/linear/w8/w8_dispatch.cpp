@@ -17,6 +17,10 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 5120:
         switch (n) {
+        case 4096:
+            return launch_w8_mma_r64_c128;
+        case 7168:
+            return launch_w8_mma_r64_c128;
         case 1024:
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
@@ -155,7 +159,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
-    throw std::invalid_argument("w8 linear: unsupported shape or T");
+    return launch_w8_mma_r64_c128;
 }
 
 W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

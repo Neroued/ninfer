@@ -353,6 +353,12 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8: {
+        const std::size_t gw = 0;
+        const std::size_t nfp = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+        return std::max(gw, nfp);
+    }
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
@@ -370,6 +376,14 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8:
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                      TextConfig::query_size,
+                                                      ops::LinearPolicy::A16Only, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                      TextConfig::query_size, kNvfp4TextPolicy,
+                                                      first, last));
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
@@ -393,6 +407,11 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8: {
+        const std::size_t nfp = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+        return std::max(kMinimumLeafWorkspaceBytes, nfp);
+    }
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
@@ -411,6 +430,19 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8: {
+        const std::size_t gw = std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size,
+                first, last));
+        const std::size_t nfp = std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size, first,
+                last));
+        return std::max(gw, nfp);
+    }
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -436,6 +468,19 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8: {
+        const std::size_t gw = std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size,
+                first, last));
+        const std::size_t nfp = std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size, first,
+                last));
+        return std::max(gw, nfp);
+    }
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -462,6 +507,14 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8:
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                      TextConfig::value_dim,
+                                                      ops::LinearPolicy::A16Only, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                      TextConfig::value_dim, kNvfp4TextPolicy,
+                                                      first, last));
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
@@ -489,6 +542,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8: {
+        const std::size_t gw = post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
+                                                          ops::LinearPolicy::A16Only, first, last);
+        const std::size_t nfp = post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4,
+                                                           kNvfp4TextPolicy, first, last);
+        return std::max(gw, nfp);
+    }
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
                                           ops::LinearPolicy::A16Only, first, last);

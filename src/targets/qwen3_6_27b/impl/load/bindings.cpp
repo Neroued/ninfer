@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -37,6 +38,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseW8:
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
@@ -214,7 +216,23 @@ load_gdn_control_projection(const GdnPlan& plan,
     };
 }
 
-void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
+void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out,
+                                bool w8_text = false) {
+    const char* w8_bind_env  = std::getenv("NINFER_W8_BIND");
+    const std::string w8_bind = w8_text ? (w8_bind_env ? w8_bind_env : "all") : "none";
+    const bool w8_attn       = w8_bind == "all" || w8_bind == "attn";
+    const bool w8_gdn        = w8_bind == "all" || w8_bind == "gdn";
+    const bool w8_mlp        = w8_bind == "all" || w8_bind == "mlp";
+    const NumericFormat attn_qk_fmt = w8_attn ? NumericFormat::W8G32_F16S
+                                              : NumericFormat::Q4G64_F16S;
+    const NumericFormat attn_gv_fmt = w8_attn ? NumericFormat::W8G32_F16S
+                                              : NumericFormat::Q5G64_F16S;
+    const NumericFormat gdn_qk_fmt = w8_gdn ? NumericFormat::W8G32_F16S
+                                            : NumericFormat::Q4G64_F16S;
+    const NumericFormat gdn_vz_fmt = w8_gdn ? NumericFormat::W8G32_F16S
+                                            : NumericFormat::Q5G64_F16S;
+    const NumericFormat mlp_gu_fmt = w8_mlp ? NumericFormat::W8G32_F16S
+                                            : NumericFormat::Q4G64_F16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -224,9 +242,9 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         if (target.is_full_attention) {
             target.attention.projection = SplitAttentionProjectionPlan{
                 .query_key  = bind_weight(binder, prefix + "attention/query_key",
-                                          NumericFormat::Q4G64_F16S, {7168, 5120}),
+                                          attn_qk_fmt, {7168, 5120}),
                 .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {7168, 5120}),
+                                          attn_gv_fmt, {7168, 5120}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -249,8 +267,8 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.input_projection = SplitGdnInputProjectionPlan{
                 .query_key = bind_weight(binder, prefix + "gdn/query_key",
-                                         NumericFormat::Q4G64_F16S, {4096, 5120}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
+                                         gdn_qk_fmt, {4096, 5120}),
+                .value_z   = bind_weight(binder, prefix + "gdn/value_z", gdn_vz_fmt,
                                          {12288, 5120}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
@@ -261,7 +279,7 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
         target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
+            bind_weight(binder, prefix + "mlp/gate_up", mlp_gu_fmt, {34816, 5120});
         target.mlp.down =
             bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
     }
@@ -474,6 +492,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         bind_groupwise_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen38GroupwiseW8:
+        bind_groupwise_text_layers(binder, out, /*w8_text=*/true);
         break;
     case WeightsProfile::Qwen36Nvfp4:
         bind_nvfp4_text_layers(binder, out);

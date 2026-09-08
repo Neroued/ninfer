@@ -9,6 +9,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +58,39 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, std::int32_t h
         !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
+}
+
+Weight w8_slice_weight_rows(const Weight& weight, std::int32_t row0, std::int32_t rows) {
+    Weight slice                          = weight;
+    const std::int64_t qdata_row_bytes    = weight.padded_shape[1];
+    const std::int64_t scales_row_bytes   = static_cast<std::int64_t>(weight.k / weight.group_size) * 2;
+    slice.qdata                           = static_cast<const std::uint8_t*>(weight.qdata) +
+                  static_cast<std::int64_t>(row0) * qdata_row_bytes;
+    slice.scales                          = static_cast<const std::uint8_t*>(weight.scales) +
+                  static_cast<std::int64_t>(row0) * scales_row_bytes;
+    slice.n                               = rows;
+    slice.shape[0]                        = rows;
+    slice.padded_shape[0]                 = rows;
+    slice.scale_ne[0]                     = rows;
+    slice.payload                         = nullptr;
+    slice.payload_bytes                   = 0;
+    return slice;
+}
+
+void w8_two_parent_attn_input(const Tensor& x, const Weight& query_key_weight,
+                              const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                              Tensor& v, std::int32_t q_rows, std::int32_t kv_rows,
+                              cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t hidden = x.ne[0];
+    const Weight q_w = w8_slice_weight_rows(query_key_weight, 0, q_rows);
+    const Weight k_w = w8_slice_weight_rows(query_key_weight, q_rows, kv_rows);
+    const Weight gate_w = w8_slice_weight_rows(gate_value_weight, 0, q_rows);
+    const Weight v_w = w8_slice_weight_rows(gate_value_weight, q_rows, kv_rows);
+    detail::select_w8_a16_launch(q_rows, hidden, cols)(x, q_w, q, stream);
+    detail::select_w8_a16_launch(q_rows, hidden, cols)(x, gate_w, gate, stream);
+    detail::select_w8_a16_launch(kv_rows, hidden, cols)(x, k_w, k, stream);
+    detail::select_w8_a16_launch(kv_rows, hidden, cols)(x, v_w, v, stream);
 }
 
 void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32_t hidden,
@@ -232,6 +266,14 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
+    if (query_key_weight.qtype == QType::W8G32_F16S &&
+        gate_value_weight.qtype == QType::W8G32_F16S) {
+        require_w8_rowsplit(query_key_weight, kQRows + kKvRows, kHidden, "query/key weight");
+        require_w8_rowsplit(gate_value_weight, kQRows + kKvRows, kHidden, "gate/value weight");
+        w8_two_parent_attn_input(x, query_key_weight, gate_value_weight, q, gate, k, v, kQRows,
+                                 kKvRows, stream);
+        return;
+    }
     require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
 

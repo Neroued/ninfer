@@ -89,6 +89,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen38GroupwiseInt;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-w8") {
+        return WeightsProfile::Qwen38GroupwiseW8;
+    }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }

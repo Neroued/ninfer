@@ -1,5 +1,6 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
+#include <cuda_bf16.h>
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"

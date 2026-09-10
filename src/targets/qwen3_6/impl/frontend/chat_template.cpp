@@ -27,6 +27,18 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
+// froggeric/Qwen-Fixed-Chat-Templates v22.5 (template_version "qwen3.8-froggeric-v22.5").
+// Renders the same ChatML surface as the reasoning-effort template above. The fixed C++
+// renderer does not implement this family's in-message control markers (<|im_start|>think_on|>,
+// <|im_start|>think_off|>, <|im_start|>think_low|> embedded in message content), the
+// auto_disable_thinking_with_tools knob, or max_tool_arg_chars/max_tool_response_chars
+// truncation; requests relying on those render with the semantics above. Acceptance is
+// byte-exact; any edit to the template file changes the digest and is rejected.
+constexpr Sha256Digest kReasoningEffortTemplateV225Digest{
+    0xe5, 0x76, 0x84, 0xba, 0xe4, 0x15, 0x62, 0x11, 0xa5, 0x54, 0x73, 0xc5, 0xa6, 0x3b, 0xe9, 0x76,
+    0xa4, 0x05, 0xa3, 0x7a, 0xb5, 0xbe, 0x5a, 0xe0, 0xe5, 0xab, 0xf1, 0xdf, 0x53, 0x49, 0xc4, 0xb2,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -417,6 +429,9 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     if (digest == kReasoningEffortTemplateDigest) {
+        return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
+    }
+    if (digest == kReasoningEffortTemplateV225Digest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +

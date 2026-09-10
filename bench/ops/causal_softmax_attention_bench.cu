@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -45,6 +46,12 @@ enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 enum class PageMapping : std::uint8_t { Identity, Fragmented };
+// off: no gate at all. standalone: the Op runs ungated and the standalone sigmoid_mul follows,
+// which is exactly what a full-attention layer used to issue. fused: the gate is handed to the Op.
+// standalone and fused compute the same bytes, so their medians compare directly; off is the
+// control that neither form changes. The cached entry takes no gate parameter, so it applies the
+// standalone multiply in both gated modes and is a second control inside the same table.
+enum class GateMode : std::uint8_t { Off, Standalone, Fused };
 
 struct Geometry {
     const char* name;
@@ -62,6 +69,7 @@ struct Options {
     Execution execution     = Execution::Graph;
     CacheMode cache         = CacheMode::Cold;
     PageMapping mapping     = PageMapping::Identity;
+    GateMode gate           = GateMode::Off;
     std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 12, 16, 1024};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192};
@@ -100,7 +108,21 @@ struct Result {
     bench::ColdTiming timing;
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;
+    // The mode this row was actually measured in, not the one asked for on the command line: the
+    // cached entry takes no gate parameter, so it is standalone whenever a gate is requested.
+    GateMode gate = GateMode::Off;
 };
+
+const char* gate_name(GateMode gate) noexcept {
+    return gate == GateMode::Off ? "off" : gate == GateMode::Standalone ? "standalone" : "fused";
+}
+
+// The cached entry takes no gate parameter, so a requested fused gate is a standalone multiply
+// there. Every line that names a gate names this one.
+GateMode effective_gate(GateMode requested, Entry entry) noexcept {
+    return entry == Entry::Cached && requested == GateMode::Fused ? GateMode::Standalone
+                                                                  : requested;
+}
 
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
@@ -112,7 +134,7 @@ struct Result {
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--mapping identity|fragmented] "
+                 "[--mapping identity|fragmented] [--gate off|standalone|fused] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -235,6 +257,16 @@ Options parse_options(int argc, char** argv) {
                 options.mapping = PageMapping::Fragmented;
             else
                 usage("--mapping expects identity or fragmented");
+        } else if (argument == "--gate") {
+            const std::string_view value(next("--gate requires a value"));
+            if (value == "off")
+                options.gate = GateMode::Off;
+            else if (value == "standalone")
+                options.gate = GateMode::Standalone;
+            else if (value == "fused")
+                options.gate = GateMode::Fused;
+            else
+                usage("--gate expects off, standalone, or fused");
         } else if (argument == "--graph-calls") {
             options.graph_calls =
                 parse_i32(next("--graph-calls requires a value"), 1, 128, "--graph-calls");
@@ -417,8 +449,9 @@ class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
-         std::span<const std::int32_t> table_rows, PageMapping mapping)
-        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
+         std::span<const std::int32_t> table_rows, PageMapping mapping,
+         GateMode gate = GateMode::Off)
+        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)), gate_(gate),
           batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
                               [tokens](std::int32_t valid) { return valid != tokens; })),
@@ -451,6 +484,8 @@ public:
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
+          gate_buffer_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
+                                        tokens * batch_)),
           workspace_bytes_(workspace_capacity(geometry, storage, tokens, batch_, visible_)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
@@ -460,6 +495,8 @@ public:
           valid_columns_tensor_(valid_columns_.p, DType::I32, {batch_}),
           table_rows_tensor_(table_rows_.p, DType::I32, {batch_}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
+          gate_tensor_(gate_buffer_.p, DType::BF16,
+                       {kHeadDim, geometry.query_heads, tokens, batch_}),
           cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
                                       block_table_, geometry, storage, padded_, physical_pages_)),
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
@@ -524,11 +561,15 @@ public:
             ops::causal_softmax_attention(
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream);
+                workspace_, output_tensor_, stream,
+                gate_ == GateMode::Fused ? &gate_tensor_ : nullptr);
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
                 kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
+        }
+        if (gate_ == GateMode::Standalone || (gate_ == GateMode::Fused && entry == Entry::Cached)) {
+            ops::sigmoid_mul(gate_tensor_, output_tensor_, stream);
         }
     }
 
@@ -542,6 +583,7 @@ public:
 
 private:
     PagedKVStorageLayout storage_layout_;
+    GateMode gate_;
     std::int32_t batch_;
     bool masked_;
     std::int32_t visible_;
@@ -561,6 +603,7 @@ private:
     DeviceBuffer cache_v_scale_;
     DeviceBuffer block_table_;
     DeviceBuffer output_;
+    DeviceBuffer gate_buffer_;
     std::size_t workspace_bytes_;
     WorkspaceArena workspace_;
     Tensor q_tensor_;
@@ -570,6 +613,7 @@ private:
     Tensor valid_columns_tensor_;
     Tensor table_rows_tensor_;
     Tensor output_tensor_;
+    Tensor gate_tensor_;
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
     ops::CausalAttentionExecutionEnvelope envelope_;
@@ -706,15 +750,15 @@ void report(const Result& result) {
     const double pv_tflops     = result.pv_flops / seconds / 1.0e12;
     std::printf(
         "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
-        "B=%d W=%d contexts=%s valid=%s rows=%s "
+        "gate=%-10s B=%d W=%d contexts=%s valid=%s rows=%s "
         "workspace=%9zu peak=%9zu nodes=%zu calls=%d median=%10.3f us min=%10.3f us p95=%10.3f us "
         "logical_payload=%8.1f GB/s physical_payload=%8.1f GB/s math=%7.2f TFLOP/s\n",
         entry_name(result.entry), result.geometry.name, storage_name(result.storage),
         mapping_name(result.mapping), execution_name(result.execution), cache_name(result.cache),
-        result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
-        result.table_rows.c_str(), result.workspace_bytes, result.workspace_peak,
-        result.graph_nodes, result.graph_calls, result.timing.median_us, result.timing.min_us,
-        result.timing.p95_us, logical_gbps, physical_gbps, tflops);
+        gate_name(result.gate), result.batch, result.tokens, result.row_contexts.c_str(),
+        result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
+        result.workspace_peak, result.graph_nodes, result.graph_calls, result.timing.median_us,
+        result.timing.min_us, result.timing.p95_us, logical_gbps, physical_gbps, tflops);
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
@@ -731,7 +775,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output
-        << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
+        << "entry,geometry,kv_dtype,mapping,execution,cache,gate,B,W,row_contexts,valid_columns,"
            "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
            "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
            "qk_full_op_tflops,pv_full_op_tflops,"
@@ -741,12 +785,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
-               << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
-               << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.physical_bytes << ','
-               << result.logical_cache_bytes << ',' << result.key_vector_bytes << ','
-               << result.value_vector_bytes << ',' << result.physical_cache_bytes << ','
-               << result.qk_flops << ',' << result.pv_flops << ',';
+               << gate_name(result.gate) << ',' << result.batch << ',' << result.tokens << ','
+               << result.row_contexts << ',' << result.valid_columns << ',' << result.table_rows
+               << ',' << result.workspace_bytes << ',' << result.logical_bytes << ','
+               << result.physical_bytes << ',' << result.logical_cache_bytes << ','
+               << result.key_vector_bytes << ',' << result.value_vector_bytes << ','
+               << result.physical_cache_bytes << ',' << result.qk_flops << ',' << result.pv_flops
+               << ',';
         const double seconds = result.timing.median_us * 1.0e-6;
         output << result.qk_flops / seconds / 1.0e12 << ',' << result.pv_flops / seconds / 1.0e12
                << ',' << result.unique_kv_bytes << ',' << result.unique_kv_bytes / seconds / 1.0e9;
@@ -781,9 +826,10 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
     }
     std::printf(
         "PROFILE entry=%s geometry=%s kv=%s mapping=%s dispatch=public execution=%s cache=%s "
-        "B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
+        "gate=%s B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
         entry_name(entry), geometry.name, storage_name(storage), mapping_name(options.mapping),
-        execution_name(execution), cache_name(cache), batch, width,
+        execution_name(execution), cache_name(cache),
+        gate_name(effective_gate(options.gate, entry)), batch, width,
         static_cast<int>(contexts.size()), contexts.data(), static_cast<int>(valid_columns.size()),
         valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data(),
         options.graph_calls);
@@ -874,7 +920,7 @@ int main(int argc, char** argv) {
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
-                      options.mapping);
+                      options.mapping, options.gate);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
@@ -884,6 +930,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        std::printf("gate=%s\n", gate_name(options.gate));
         std::vector<Result> results;
         const std::vector<std::int32_t> context_profiles =
             options.row_contexts.empty() ? options.contexts : std::vector<std::int32_t>{0};
@@ -895,7 +942,7 @@ int main(int argc, char** argv) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
-                                      rows.table_rows, options.mapping);
+                                      rows.table_rows, options.mapping, options.gate);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||
@@ -965,6 +1012,7 @@ int main(int argc, char** argv) {
                                         result.workspace_peak = data.workspace_peak();
                                         result.graph_calls =
                                             execution == Execution::Graph ? options.graph_calls : 1;
+                                        result.gate = effective_gate(options.gate, entry);
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;

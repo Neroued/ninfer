@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
@@ -1659,6 +1660,19 @@ ReductionCriterion attention_criterion(KvCacheStorage storage) {
     throw std::logic_error("unregistered causal-attention test storage");
 }
 
+// The gated route rounds to BF16 twice -- once on the attention result, once on the product with
+// the gate -- where the ungated route rounds once. The second rounding moves an element by at
+// most 2^-9 of itself, and the gate cannot enlarge an element, so 2^-9 is what both the
+// relative-L2 bound and the bound taken relative to the largest reference have to grow by. The
+// absolute floor is unchanged: it is there for elements near zero, which the extra rounding
+// cannot move by more than it already covers.
+ReductionCriterion gated_attention_criterion(KvCacheStorage storage) {
+    ReductionCriterion criterion = attention_criterion(storage);
+    criterion.relative_l2 += 0x1p-9;
+    criterion.gross_relative_to_max_reference += 0x1p-9;
+    return criterion;
+}
+
 int verify_attention(const std::string& label, const std::vector<double>& actual,
                      const std::vector<double>& reference, const ReductionCriterion& criterion) {
     return verify_reduction(label.c_str(), actual, reference, criterion);
@@ -2075,6 +2089,54 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         if (workspace.used() != 0 || workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace mismatch\n";
             ++failures;
+        }
+
+        // Handing the Op a gate must produce exactly what applying sigmoid_mul afterwards
+        // produces -- on the route that folds the multiply into the reduce epilogue and on the
+        // routes that fall back to the standalone kernel alike. Re-running the Op is safe:
+        // appending the same k/v to the same rows again leaves the cache byte-identical, which
+        // the standalone-parity check above has just established.
+        {
+            const auto gate_bits =
+                to_bf16_bits(make_bf16_values(q.size(), test_case.seed + 97u, -3.0F, 3.0F));
+            GuardedDeviceBuffer dgate(gate_bits.size() * sizeof(std::uint16_t));
+            GuardedDeviceBuffer dexpected(output.size() * sizeof(std::uint16_t));
+            dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
+            dexpected.copy_from_host(output.data(), output.size() * sizeof(std::uint16_t));
+            Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+            Tensor texpected(dexpected.data(), DType::BF16,
+                             {kHeadDim, geometry.q_heads, width, batch});
+            // The reference is a second ungated run of the Op, not the first run's output: that
+            // separates "the gate is exact" from "the Op repeats itself", and only the first is
+            // what this check is about.
+            ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+                                          op_geometry(geometry), kAttentionScale, cache.view(),
+                                          envelope, workspace, texpected, device.stream);
+            cuda_synchronize(device.stream);
+            failures +=
+                verify_exact((label + " ungated repeat").c_str(),
+                             copy_from_guarded<std::uint16_t>(dexpected, output.size()), output);
+            ops::sigmoid_mul(tgate, texpected, device.stream);
+            ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+                                          op_geometry(geometry), kAttentionScale, cache.view(),
+                                          envelope, workspace, tout, device.stream, &tgate);
+            cuda_synchronize(device.stream);
+            const auto gated_output = copy_from_guarded<std::uint16_t>(dout, q.size());
+            failures += verify_exact((label + " fused gate").c_str(), gated_output,
+                                     copy_from_guarded<std::uint16_t>(dexpected, output.size()));
+            // Both checks above compare production against production, so an error shared by the
+            // attention result, the sigmoid or the BF16 boundary would pass them. This one does
+            // not: the gated output is qualified against the same FP64 attention oracle the
+            // ungated output is judged by, multiplied by a host sigmoid of the gate.
+            std::vector<double> gated_reference(reference.size());
+            for (std::size_t i = 0; i < gated_reference.size(); ++i)
+                gated_reference[i] =
+                    reference[i] / (1.0 + std::exp(-double(bf16_to_f32(gate_bits[i]))));
+            failures += verify_attention(label + " fused gate against the oracle",
+                                         bf16_bits_to_double(gated_output), gated_reference,
+                                         gated_attention_criterion(storage));
+            failures += dgate.verify_guards((label + " fused gate input").c_str());
+            failures += dout.verify_guards((label + " fused gate output").c_str());
         }
     }
     return failures;

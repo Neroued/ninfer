@@ -10,7 +10,13 @@ int main() {
 
     try {
         constexpr std::array<std::int32_t, 5> kA16Cases{1, 2, 4, 16, 128};
-        constexpr std::array<std::int32_t, 11> kA8Cases{1, 2, 3, 8, 16, 48, 64, 65, 96, 128, 1024};
+        // The last three entries are the point of this list: below them the TMA-staged route
+        // declines, so without them the paired-rows instantiation this op is the only user of -
+        // two TMA loads per stage, a non-identity row policy - is executed by no test. 1153 is
+        // not a whole cp.async token tile, which is a case the route reaches only since the
+        // multiple-of-tile condition was removed.
+        constexpr std::array<std::int32_t, 14> kA8Cases{1,  2,  3,   8,    16,   48,   64,
+                                                        65, 96, 128, 1024, 1153, 4096, 4288};
         int failures = 0;
         failures += run_profile(
             "LinearSwiGLU FP8_A16",

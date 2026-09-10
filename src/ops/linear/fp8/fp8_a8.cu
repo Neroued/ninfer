@@ -4,6 +4,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
@@ -100,10 +101,31 @@ void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The TMA route is chosen by fp8_a8_tma_applies, not by this function: it needs at least one full
+// 256-token tile, a width inside this geometry's measured bounds, and a modelled cost below the
+// cp.async route's. A partial trailing tile is allowed: TMA zero-fills the rows past the descriptor
+// extent, and the epilogue neither reads their activation scale nor stores them. Everything else
+// keeps the cp.async route.
+template <class Geometry, class Schedule>
+void launch_tma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
+                cudaStream_t stream) {
+    fp8_a8_tma_launch<Geometry, Schedule>(
+        workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
+        Fp8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows}, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using Schedule    = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using TmaSchedule = typename Fp8LinearA8TmaSchedule<Geometry>::Type;
+    if (fp8_a8_tma_applies<Geometry, TmaSchedule, Schedule>(tokens, workspace.codes,
+                                                            weight.qdata)) {
+        launch_tma<Geometry, TmaSchedule>(weight, out, workspace, tokens, stream);
+        return;
+    }
     if ((tokens % Schedule::kBlockTokens) == 0) {
         launch_mma<Geometry, Schedule, true>(weight, out, workspace, tokens, stream);
     } else {

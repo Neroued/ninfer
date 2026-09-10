@@ -53,6 +53,7 @@ Runtime and Op references:
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+- [FP8 A8 GEMM TMA route: measurements behind its routing constants](maintainer/fp8-a8-tma-route.md)
 
 `engine-architecture.md` is the sole top-level Engine architecture reference.
 `resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,

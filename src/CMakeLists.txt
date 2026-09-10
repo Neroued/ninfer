@@ -307,7 +307,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc CUDA::cuda_driver)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC

@@ -67,9 +67,12 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
     for_each_token_slice(t_count, 1, [&](int token_offset, int token_count) {
         const Tensor logits_slice = logits.slice(1, token_offset, token_count);
         Tensor out_slice          = out.slice(0, token_offset, token_count);
-        CUDA_CHECK(cudaMemsetAsync(out_slice.data, 0,
-                                   static_cast<std::size_t>(token_count) * sizeof(std::int32_t),
-                                   stream));
+        // token_count is a whole slice, not a single column: for_each_token_slice hands
+        // out up to the grid.y limit at once, so the reset has to cover all of it.
+        argmax_reset_winners_kernel<<<
+            static_cast<unsigned int>(div_up(token_count, kArgmaxResetBlock)), kArgmaxResetBlock, 0,
+            stream>>>(static_cast<std::int32_t*>(out_slice.data), token_count);
+        CUDA_CHECK(cudaGetLastError());
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
         argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(

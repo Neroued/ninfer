@@ -92,6 +92,21 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { out[t] = indices[0]; }
 }
 
+// The tiled route opens its atomic contest from row 0, so every winner slot in the slice has
+// to hold 0 before it starts. A memset and this kernel write the same bytes, but they do not cost
+// the same as graph nodes: on sm_120a the memset node measured 4.6-8.4 us of decode-graph critical
+// path against 1.1 us for this kernel, and the node count is unchanged. Numbers in the commit
+// message.
+inline constexpr int kArgmaxResetBlock = 256;
+
+__launch_bounds__(kArgmaxResetBlock) __global__
+    void argmax_reset_winners_kernel(std::int32_t* out, std::int32_t count) {
+    const std::int32_t i =
+        static_cast<std::int32_t>(blockIdx.x) * static_cast<std::int32_t>(blockDim.x) +
+        static_cast<std::int32_t>(threadIdx.x);
+    if (i < count) { out[i] = 0; }
+}
+
 __launch_bounds__(kArgmaxBlock) __global__
     void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {

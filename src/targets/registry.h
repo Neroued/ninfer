@@ -83,6 +83,7 @@ using ActiveTarget =
 struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
+    ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     runtime::ContextMachineCostModel context_cost;
 };

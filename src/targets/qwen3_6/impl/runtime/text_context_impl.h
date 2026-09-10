@@ -23,6 +23,7 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
@@ -44,6 +45,32 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+// The fused Q/K norm + RoPE Op covers the two text head geometries with a 1-D position axis. The
+// mrope path and any future geometry keep the three calls it replaces. Both branches are the same
+// arithmetic - the Op is bit-exact against them - so this chooses a schedule, not a result.
+inline constexpr bool kFusedQkNormRope =
+    kCfg.head_dim == 256 && kCfg.rotary_dim == 64 &&
+    ((kCfg.n_q == 16 && kCfg.n_kv == 2) || (kCfg.n_q == 24 && kCfg.n_kv == 4));
+
+void split_qk_norm_rope(const Tensor& positions, const Tensor& q_norm, const Tensor& k_norm,
+                        const Tensor& q, const Tensor& k, Tensor& qn, Tensor& kn,
+                        cudaStream_t stream) {
+    ops::rmsnorm(q, q_norm, kCfg.rms_eps, true, qn, stream);
+    ops::rmsnorm(k, k_norm, kCfg.rms_eps, true, kn, stream);
+    ops::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, stream);
+}
+
+void qk_norm_rope(const Tensor& positions, const Tensor& q_norm, const Tensor& k_norm,
+                  const Tensor& q, const Tensor& k, Tensor& qn, Tensor& kn, cudaStream_t stream) {
+    if constexpr (kFusedQkNormRope) {
+        if (positions.ne[1] == 1) {
+            ops::rmsnorm_rope(positions, q_norm, k_norm, q, k, qn, kn, stream);
+            return;
+        }
+    }
+    split_qk_norm_rope(positions, q_norm, k_norm, q, k, qn, kn, stream);
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -380,10 +407,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     const auto results = workspace_recipe::mtp_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    qk_norm_rope(rope_for_op, *mtp_.q_norm, *mtp_.k_norm, q, k, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -839,14 +864,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    qk_norm_rope(rope_for_op, *w.q_norm, *w.k_norm, q, k, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =

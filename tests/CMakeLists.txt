@@ -168,6 +168,14 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_35b_a3b_mtp_graph_profiles_test
+  SOURCES targets/qwen3_6_35b_a3b/test_mtp_graph_profiles.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_35b_a3b_mtp_graph_profiles_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_mtp_graph_profiles_test PRIVATE CUDA::cudart)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   SOURCES targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp
   NEEDS_SOURCE_DIR

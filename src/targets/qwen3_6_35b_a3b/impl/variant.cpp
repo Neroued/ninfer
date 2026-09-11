@@ -7,6 +7,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_35b_a3b::detail::Variant
@@ -54,13 +55,38 @@ std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
     return graph_profiles_through(max_frontier, ends);
 }
 
-bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
-                                        std::uint32_t max_visible_keys) {
+bool verify_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
+                                 std::uint32_t max_visible_keys) {
     const std::uint32_t tokens = draft_window + 1;
     if (tokens <= 6) { return false; }
     if (batch_size > 1) { return true; }
+    // At batch one the route only depends on the target while the width is inside the verify
+    // domain; past it causal_attention_resolve_route returns Prompt for every envelope. Without
+    // this line the mirror claims a target dependence the route does not have, which costs a
+    // second topology class at widths no verify path can request.
+    if (tokens > 16) { return false; }
     const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
     return max_visible_keys > prompt_visible_limit;
+}
+
+// Largest target size that still resolves away from ChunkedSmallT for this verify width, or zero
+// when the route does not depend on the target at all. Found by bisecting
+// verify_uses_chunked_small_t itself, which is monotone in max_visible_keys, so a planner that
+// needs to break its frontier at the route flip never restates the route table to do it.
+std::uint32_t verify_route_flip_target(std::uint32_t draft_window) {
+    constexpr std::uint32_t kUnbounded = std::numeric_limits<std::uint32_t>::max();
+    if (!verify_uses_chunked_small_t(draft_window, 1U, kUnbounded)) { return 0U; }
+    std::uint32_t prompt_side  = 0U;
+    std::uint32_t chunked_side = kUnbounded;
+    while (chunked_side - prompt_side > 1U) {
+        const std::uint32_t mid = prompt_side + (chunked_side - prompt_side) / 2U;
+        if (verify_uses_chunked_small_t(draft_window, 1U, mid)) {
+            chunked_side = mid;
+        } else {
+            prompt_side = mid;
+        }
+    }
+    return prompt_side;
 }
 
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
@@ -105,9 +131,25 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
+    // Past a verify width of six the attention route stops being unconditional and starts turning
+    // on the envelope visible-key count, so the frontier has to break where the route flips: the
+    // two sides emit different node counts and cannot share one executable. The break is derived
+    // from the same predicate that sets topology_class below, so the boundary and the class it is
+    // meant to separate cannot drift apart, and it keeps holding above the window any verify path
+    // can request today.
+    const std::uint32_t flip_target = verify_route_flip_target(draft_window);
+    if (flip_target != 0U) { add_shifted(flip_target, draft_window + 1); }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1, ends);
+
+    std::vector<GraphExecutionProfile> profiles = graph_profiles_through(capacity - 1, ends);
+    for (GraphExecutionProfile& profile : profiles) {
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        profile.topology_class =
+            verify_uses_chunked_small_t(draft_window, 1U, target_max) ? 1U : 0U;
+    }
+    return profiles;
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
@@ -119,7 +161,7 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
             capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
         const bool split_swa           = profile.max > 96U;
         const bool chunked_target =
-            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+            verify_uses_chunked_small_t(draft_window, batch_size, target_max);
         profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
     }
     return profiles;

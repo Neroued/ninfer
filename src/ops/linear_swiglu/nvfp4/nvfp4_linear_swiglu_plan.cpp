@@ -126,7 +126,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();
         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+        // Inside the TMA case, so this route always reads tile-contiguous scales. Note its own
+        // predicate admits every multiple of 256 from 256 up, which is wider than the shared one.
+        launch_nvfp4_w4a4_quantize(x, weight, scratch, true, stream);
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_linear_swiglu_w4a4_tma(
             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),

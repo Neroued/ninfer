@@ -19,9 +19,12 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
                                          const std::uint8_t* activation_scales,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, std::int32_t tokens) {
-    constexpr std::uint32_t kCodeColumns  = 64;
-    constexpr std::uint32_t kScaleColumns = 16;
-    constexpr std::uint32_t kPairN        = Schedule::kBlockN / 2;
+    constexpr std::uint32_t kCodeColumns = 64;
+    // Activation scales arrive tile-contiguous, one [BlockM tokens, 16 groups] tile per request.
+    constexpr std::uint32_t kScaleTileGroups = 16;
+    constexpr std::uint64_t kScaleTilesPerPlane =
+        static_cast<std::uint64_t>(Geometry::kGroupsPerRow) / kScaleTileGroups;
+    constexpr std::uint32_t kPairN = Schedule::kBlockN / 2;
     constexpr std::uint64_t kWeightScaleBytes =
         static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
 
@@ -34,10 +37,13 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
         const_cast<std::uint8_t*>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
         kPairN, CU_TENSOR_MAP_SWIZZLE_64B, "encode LinearSwiGLU weight codes TMA");
-    descriptors.a_scales = nvfp4_make_tma_2d(
-        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        Geometry::kGroupsPerRow, tokens, Geometry::kGroupsPerRow, kScaleColumns, Schedule::kBlockM,
-        CU_TENSOR_MAP_SWIZZLE_NONE, "encode LinearSwiGLU activation scales TMA");
+    descriptors.a_scales =
+        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(activation_scales),
+                          CU_TENSOR_MAP_DATA_TYPE_UINT8, Schedule::kBlockM,
+                          (static_cast<std::uint64_t>(tokens) / Schedule::kBlockM) *
+                              kScaleTilesPerPlane * kScaleTileGroups,
+                          Schedule::kBlockM, Schedule::kBlockM, kScaleTileGroups,
+                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode LinearSwiGLU activation scales TMA");
     descriptors.b_scales =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                           16, kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,

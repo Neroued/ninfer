@@ -119,8 +119,14 @@ __global__ __launch_bounds__(
                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales,
-                                      (k_tile / 2) * 16, token_begin, &shared.full[stage]);
+                    // The box is tile-contiguous, so its address is a tile index rather than a
+                    // (byte column, token row) pair; the two-slot buffer and the even-tile guard
+                    // are unchanged.
+                    constexpr int kScaleTilesPerPlane = Geometry::kGroupsPerRow / 16;
+                    const int scale_tile =
+                        (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales, 0,
+                                      scale_tile * 16, &shared.full[stage]);
                 }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +

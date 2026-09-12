@@ -9,6 +9,7 @@
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
 #include "ops/common/mma.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
@@ -26,8 +27,21 @@ union alignas(16) W8Bf16x8Bits {
 
 static_assert(sizeof(W8Bf16x8Bits) == 16);
 
+// The predicated loads below inherited Cache::ca from cp_async_zfill's default, while the full path
+// a few lines down spells cg. This parameter makes that a choice. It defaults to ca, so adding it
+// changes no instantiation, and it governs the predicated branch only - the full branch keeps its
+// own cg - which is why it is named for it.
+//
+// ca stays the default because whether cg pays is not a property of the schedule. On the two
+// BM = 16 schedules in this tree - src/ops/linear/w8/w8_feature.cu and
+// src/ops/attn_input_proj/w8/w8_dflash2_attn_input.cu - m / BM CTAs read the same activation tile
+// (m is the weight-row count, the kernel's first size argument) and four of them share an SM; L1
+// serves 35.6 % of their sectors, and forcing cg there costs +16.8 % and +21.0 % of the operation.
+// Most other schedules gain from cg, but not all, and not on every shape: MmaR64x16C48K128A1, a
+// BM = 64 tile, gains 3.3 % on [34816, 5120] and loses 1.1 % on [248320, 5120]. So the policy is
+// set per schedule and only where it has been measured across the shapes that reach it.
 template <int BM_, int BN_, int WM_, int WN_, int MIN_BLOCKS_, int STAGES_ = 2, int BK_ = 64,
-          int ACTIVATION_STAGES_ = STAGES_>
+          int ACTIVATION_STAGES_ = STAGES_, Cache PredicatedCache_ = Cache::ca>
 struct W8RowSplitMmaGemmSchedule {
     static constexpr int BM                = BM_;
     static constexpr int BN                = BN_;
@@ -47,6 +61,16 @@ struct W8RowSplitMmaGemmSchedule {
     static constexpr int SCALE_CACHE_BYTES = 16;
     static constexpr int SMEM_BYTES =
         BM * BK * 2 + ACTIVATION_STAGES * BN * BK * 2 + BM * BK + BM * SCALE_CACHE_BYTES;
+
+    // Cache policy for the predicated loads only; see the note above the template.
+    static constexpr Cache kPredicatedCache = PredicatedCache_;
+
+    // Restate this schedule with a different predicated policy, leaving every other parameter where
+    // it is rather than respelling it - and its default with it - at the point of use.
+    template <Cache Policy>
+    using with_predicated_cache =
+        W8RowSplitMmaGemmSchedule<BM_, BN_, WM_, WN_, MIN_BLOCKS_, STAGES_, BK_, ACTIVATION_STAGES_,
+                                  Policy>;
 
     static_assert(BM % WM == 0 && BN % WN == 0);
     static_assert(WM % 16 == 0 && WN % 8 == 0);
@@ -132,7 +156,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                ninfer::ops::cp_async_zfill<16>(
+                // cp.async.cg needs the source naturally aligned to 16 B. kk steps by 8 and x is
+                // bf16, so that holds exactly when k is a multiple of 8. The full path gets this
+                // from its own (k % BK) == 0 test; the predicated path has no such guarantee, so
+                // launch_route checks it for any schedule that asks for cg.
+                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -156,8 +184,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             } else {
                 const bool valid_row  = output_tile.valid(grow, m);
                 const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
-                                                valid_row ? 16 : 0);
+                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                    dst, &codes[gi * 32 + chunk * 16], valid_row ? 16 : 0);
             }
         }
         if ((kt % SCALE_CACHE_TILES) == 0) {
@@ -173,7 +201,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
+                    // gi steps by kg, and scales are 2 B, so 16 B alignment here needs kg to be
+                    // a multiple of 8. launch_route checks that alongside k.
+                    ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
+                                                                           valid_scales * 2);
                 }
             }
         }

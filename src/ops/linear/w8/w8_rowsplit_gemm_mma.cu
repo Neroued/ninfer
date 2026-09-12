@@ -30,6 +30,16 @@ template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const bool full = (w.n % Schedule::BM) == 0 && (x.ne[1] % Schedule::BN) == 0 &&
                       w.k == w.padded_shape[1] && (w.k % Schedule::BK) == 0;
+    // cp.async.cg requires a 16 B-aligned source. On the predicated path the activation source
+    // steps by 8 bf16 and the scale source by kg = padded_k / 32 two-byte scales, so the encoding
+    // is legal only when both are multiples of 8. The full path inherits this from (w.k % BK) == 0
+    // above; a schedule that asks for cg on the predicated path has to be checked here.
+    if constexpr (Schedule::kPredicatedCache == Cache::cg) {
+        if (!full && ((w.k % 8) != 0 || ((w.padded_shape[1] / 32) % 8) != 0)) {
+            throw std::invalid_argument(
+                "w8 rowsplit mma: predicated cg needs k and the group count to be multiples of 8");
+        }
+    }
     for_each_token_slice(x.ne[1], Schedule::BN, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor out_slice     = out.slice(1, offset, count);
@@ -77,7 +87,10 @@ using MmaR48C112 = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
 using MmaR48C128 = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
 using MmaR64C96  = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
 using MmaR64C112 = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
-using MmaR64C128 = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+// The wide route of the linear family is the one schedule measured to want cg on the predicated
+// path; every other schedule keeps the inherited ca.
+using MmaR64C128 =
+    W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>::with_predicated_cache<Cache::cg>;
 using MmaR96C96  = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
 using MmaR128C64 = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
 using MmaR128C80 = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;

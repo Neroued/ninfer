@@ -71,9 +71,26 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
+
+    // MSVC rejects over-aligned kernel parameters (C2711), so the descriptors are
+    // passed to the kernel by device pointer instead of by value on Windows only.
+#if defined(_MSC_VER)
+    Nvfp4W4a4TmaDescriptors* device_descriptors = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_descriptors, sizeof(Nvfp4W4a4TmaDescriptors)));
+    CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(Nvfp4W4a4TmaDescriptors),
+                               cudaMemcpyHostToDevice, stream));
+#endif
+#if defined(_MSC_VER)
+    nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(device_descriptors, alpha, output);
+#else
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
         <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+#endif
     CUDA_CHECK(cudaGetLastError());
+#if defined(_MSC_VER)
+    CUDA_CHECK(cudaFreeAsync(device_descriptors, stream));
+#endif
 }
 
 } // namespace ninfer::ops::detail

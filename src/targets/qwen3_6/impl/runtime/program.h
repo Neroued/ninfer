@@ -275,15 +275,19 @@ AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(
     : impl_(std::move(impl)) {}
 
 template <>
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(AdmissionCandidate&&) noexcept =
-    default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(
+    AdmissionCandidate&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>&
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&&) noexcept = default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() = default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() noexcept {}
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
@@ -292,15 +296,18 @@ CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
-    CapturePressureCandidate&&) noexcept = default;
+    CapturePressureCandidate&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>&
-CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&&) noexcept =
-    default;
+CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
-CapturePressureCandidate<NINFER_QWEN36_VARIANT>::~CapturePressureCandidate() = default;
+CapturePressureCandidate<NINFER_QWEN36_VARIANT>::~CapturePressureCandidate() noexcept {}
 
 template <>
 const runtime::RequestPlanSummary&

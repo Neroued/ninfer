@@ -174,6 +174,37 @@ GPU residency is fixed at process startup. `--spec` selects speculative decoding
 `--vision` independently selects Vision residency. Qwen3.6-35B-A3B DFlash can be combined with
 Vision; it accelerates generated-text decode after multimodal prefill, not Vision encode itself.
 
+## Optional compiler cache
+
+For repeated source builds, install [ccache](https://ccache.dev/) and configure CMake's
+[compiler launchers](https://cmake.org/cmake/help/latest/variable/CMAKE_LANG_COMPILER_LAUNCHER.html):
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+cmake --build build -j
+ccache --show-stats
+```
+
+These commands run directly on the host; no container tooling is required. Keep the `build/`
+directory for incremental builds: Ninja skips unchanged targets, while ccache can reuse C, C++,
+and CUDA compiler outputs when compilation is needed again. ccache uses its normal per-user
+cache; `CCACHE_DIR` and `CCACHE_MAXSIZE` can override its location and size limit. Statistics are
+cumulative, and an unchanged Ninja build adds no compiler-cache calls.
+
+The ordinary build above does not require ccache. To disable it in a build directory previously
+configured with these launchers, clear the cached CMake settings:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_C_COMPILER_LAUNCHER= \
+  -DCMAKE_CXX_COMPILER_LAUNCHER= \
+  -DCMAKE_CUDA_COMPILER_LAUNCHER=
+cmake --build build -j
+```
+
 ## Docker
 
 Build the runtime image on a host with the NVIDIA Container Toolkit:
@@ -181,6 +212,19 @@ Build the runtime image on a host with the NVIDIA Container Toolkit:
 ```bash
 docker build --tag ninfer:local .
 ```
+
+The Dockerfile enables the same compiler launchers automatically and uses
+[build cache mounts](https://docs.docker.com/build/cache/optimize/#use-cache-mounts) for both the
+CMake/Ninja build tree and ccache (limited to 20 GiB). Use Docker BuildKit or another builder that
+supports `RUN --mount=type=cache`. After source edits, Ninja rebuilds only affected targets; ccache
+can reuse compiler outputs when compilation is needed again. The build prints cumulative ccache
+statistics, which do not count work skipped by Ninja.
+
+Source synchronization compares contents and removes deleted files, so restored files with older
+timestamps still rebuild correctly. The mutable build-tree cache is locked during each build and
+uses separate build directories for different installed toolchain/library versions. Missing or
+evicted caches cause a normal rebuild. Finished binaries are copied out of the cache into the image;
+ccache and the synchronization tool are only installed in the build stage.
 
 Mount the downloaded model and run the same example server profile:
 

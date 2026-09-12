@@ -314,6 +314,10 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+if(WIN32)
+  # utf8proc.h defaults to __declspec(dllimport); force static linkage.
+  target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
+endif()
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)

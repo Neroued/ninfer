@@ -28,6 +28,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(WIN32)
+  # windows.h defines min/max macros that corrupt std::min/std::max and the CUDA
+  # headers; NOMINMAX is required for every translation unit on Windows.
+  add_compile_definitions(NOMINMAX)
+  # CCCL (bundled with CUDA 13) hard-requires the conforming MSVC preprocessor,
+  # and spdlog/fmt requires UTF-8 source encoding.
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
   set(CMAKE_JOB_POOL_LINK cuda_link)
@@ -55,13 +66,44 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-if(NINFER_BUILD_MEDIA_ACQUIRE)
-  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
-endif()
 find_package(Threads REQUIRED)
+
+if(WIN32)
+  # --- FFmpeg (Windows, vcpkg) ---------------------------------------------
+  # Dependencies are declared in vcpkg.json; the vcpkg toolchain (activated via
+  # -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake) provides
+  # the Find module.  See README for setup instructions.
+  find_package(FFMPEG REQUIRED)
+  message(STATUS "FFmpeg: ${FFMPEG_VERSION}")
+  if(NOT TARGET PkgConfig::FFMPEG)
+    add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
+    set_target_properties(PkgConfig::FFMPEG PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}")
+    # FFMPEG_LIBRARIES from select_library_configurations may contain
+    # optimized/debug keywords; target_link_libraries handles them correctly.
+    target_link_libraries(PkgConfig::FFMPEG INTERFACE ${FFMPEG_LIBRARIES})
+  endif()
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+endif()
+
+if(NINFER_BUILD_MEDIA_ACQUIRE)
+  if(WIN32)
+    # --- libcurl (Windows, vcpkg) ------------------------------------------
+    # vcpkg installs curl with Schannel (SSPI) TLS; see vcpkg.json.
+    find_package(CURL REQUIRED)
+    message(STATUS "libcurl: ${CURL_VERSION_STRING}")
+    if(NOT TARGET PkgConfig::LIBCURL)
+      add_library(PkgConfig::LIBCURL INTERFACE IMPORTED)
+      set_target_properties(PkgConfig::LIBCURL PROPERTIES
+        INTERFACE_LINK_LIBRARIES CURL::libcurl)
+    endif()
+  else()
+    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  endif()
+endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   # Product operational logging is an offline, repository-pinned dependency. Core-only builds do

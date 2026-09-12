@@ -74,9 +74,11 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
 
     // MSVC rejects over-aligned kernel parameters (C2711), so the descriptors are
     // passed to the kernel by device pointer instead of by value on Windows only.
+    // cudaMallocAsync keeps the entire alloc-copy-launch-free cycle stream-ordered;
+    // the stream memory pool reuses the same slot on subsequent launches.
 #if defined(_MSC_VER)
     Nvfp4W4a4TmaDescriptors* device_descriptors = nullptr;
-    CUDA_CHECK(cudaMalloc(&device_descriptors, sizeof(Nvfp4W4a4TmaDescriptors)));
+    CUDA_CHECK(cudaMallocAsync(&device_descriptors, sizeof(Nvfp4W4a4TmaDescriptors), stream));
     CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(Nvfp4W4a4TmaDescriptors),
                                cudaMemcpyHostToDevice, stream));
 #endif

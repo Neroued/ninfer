@@ -182,8 +182,13 @@ class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
 #if defined(_WIN32)
+        // FILE_FLAG_NO_BUFFERING makes ReadFile bypass the system cache, matching the
+        // POSIX O_DIRECT semantics.  It has no effect on MapViewOfFile, which uses the
+        // OS paging system independently.  The 4096-byte alignment contract enforced in
+        // read_direct() satisfies the flag's sector-alignment requirements.
         const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                          OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
             throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
                                     "open " + path.string());

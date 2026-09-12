@@ -11,8 +11,8 @@ using ninfer::test::linear_pair::ShapeCase;
 int w8_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array<std::int32_t, 2> kK5120RouteStarts{5, 57};
-    constexpr std::array<std::int32_t, 3> kK5120RouteInteriors{2, 24, 128};
+    constexpr std::array<std::int32_t, 2> kK5120RouteStarts{86, 961};
+    constexpr std::array<std::int32_t, 3> kK5120RouteInteriors{24, 512, 1024};
     failures += ninfer::test::linear_pair::run_w8_a16_shape(
         "W8_A16 LinearPair", ShapeCase{5120, 431U, kK5120RouteStarts, kK5120RouteInteriors});
 

@@ -7,9 +7,11 @@
 
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
+#include "ops/common/score_id_order.cuh"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 
 #include <cuda_bf16.h>
 #include <climits>
@@ -22,9 +24,37 @@ using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
 using SamplingGroupSort =
     cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock, kSamplerGroupItemsPerThread>;
+inline constexpr int kSamplingTileWarps              = kSamplerBlock / 32;
+inline constexpr int kSamplingTileIndexBits          = 9;
+inline constexpr unsigned int kSamplingTileIndexMask = (1u << kSamplingTileIndexBits) - 1u;
+static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
+
+using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, kSamplerItemsPerThread>;
+using SamplingBf16TileWarpSort = cub::WarpMergeSort<unsigned int, kSamplerItemsPerThread>;
+
+struct SamplingTileTopKStorage {
+    typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
+    unsigned long long candidates[kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+struct SamplingBf16TileTopKStorage {
+    typename SamplingBf16TileWarpSort::TempStorage warp[kSamplingTileWarps];
+    unsigned int candidates[kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+union SamplingPartialTopKStorage {
+    SamplingTileTopKStorage fp32;
+    SamplingBf16TileTopKStorage bf16;
+};
 
 struct SamplingKeyGreater {
     __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
+        return a > b;
+    }
+};
+
+struct SamplingUintGreater {
+    __device__ __forceinline__ bool operator()(unsigned int a, unsigned int b) const {
         return a > b;
     }
 };
@@ -82,29 +112,35 @@ __device__ __forceinline__ bool sampling_worse_than(float v, int i, float pv, in
     return pv > v || (pv == v && pi < i);
 }
 
-__device__ __forceinline__ unsigned int sampling_ordered_float(float v) {
-    // Numeric equality, including +0 == -0, must reach the token-id tie break.
-    // Canonicalizing zero prevents the IEEE sign bit from ranking +0 above -0.
-    if (v == 0.0f) { v = 0.0f; }
-    const unsigned int bits = __float_as_uint(v);
-    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+__device__ __forceinline__ unsigned long long sampling_sort_key(float v, int idx) {
+    return score_id_order_key(v, idx);
 }
 
-__device__ __forceinline__ unsigned long long sampling_sort_key(float v, int idx) {
-    if (idx == INT_MAX) { return 0ull; }
-    return (static_cast<unsigned long long>(sampling_ordered_float(v)) << 32) |
-           static_cast<unsigned int>(0xffffffffu - static_cast<unsigned int>(idx));
+__device__ __forceinline__ unsigned int sampling_bf16_tile_sort_key(__nv_bfloat16 v,
+                                                                    int tile_index) {
+    unsigned int bits = __bfloat16_as_ushort(v);
+    if ((bits & 0x7fffu) == 0u) { bits = 0u; }
+    const unsigned int ordered = (bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u);
+    return (ordered << kSamplingTileIndexBits) |
+           (kSamplingTileIndexMask - static_cast<unsigned int>(tile_index));
+}
+
+__device__ __forceinline__ unsigned long long sampling_expand_bf16_tile_sort_key(unsigned int key,
+                                                                                 int tile_start) {
+    if (key == 0u) { return 0ull; }
+    const unsigned int ordered = key >> kSamplingTileIndexBits;
+    const unsigned int bits    = (ordered & 0x8000u) ? (ordered ^ 0x8000u) : ((~ordered) & 0xffffu);
+    const int token            = tile_start + static_cast<int>(kSamplingTileIndexMask) -
+                      static_cast<int>(key & kSamplingTileIndexMask);
+    return sampling_sort_key(__uint_as_float(bits << 16), token);
 }
 
 __device__ __forceinline__ float sampling_key_float(unsigned long long key) {
-    const unsigned int ordered = static_cast<unsigned int>(key >> 32);
-    const unsigned int bits    = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
-    return __uint_as_float(bits);
+    return score_from_order_key(key);
 }
 
 __device__ __forceinline__ int sampling_key_index(unsigned long long key) {
-    if (key == 0ull) { return INT_MAX; }
-    return static_cast<int>(0xffffffffu - static_cast<unsigned int>(key));
+    return id_from_order_key(key);
 }
 
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
@@ -120,6 +156,80 @@ __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
 __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& workspace, int col,
                                                        int partial, int j) {
     return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
+}
+
+__device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamplerItemsPerThread],
+                                                int cap, SamplingWorkspace workspace, int col,
+                                                int partial, SamplingTileTopKStorage& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    SamplingTileWarpSort(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
+#pragma unroll
+    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+        const int rank = lane * kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) { return; }
+    if (lane < kSamplingTileWarps) {
+        constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
+        int position                      = 0;
+        for (int rank = 0; rank < cap; ++rank) {
+            const unsigned long long key =
+                storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned int high     = static_cast<unsigned int>(key >> 32);
+            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
+            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int winners =
+                __ballot_sync(kMergeMask, high == max_high && low == max_low);
+            const int source = __ffs(static_cast<int>(winners)) - 1;
+            if (lane == 0) {
+                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] =
+                    (static_cast<unsigned long long>(max_high) << 32) | max_low;
+            }
+            if (lane == source) { ++position; }
+        }
+    }
+}
+
+__device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSamplerItemsPerThread],
+                                                     int cap, int tile_start,
+                                                     SamplingWorkspace workspace, int col,
+                                                     int partial,
+                                                     SamplingBf16TileTopKStorage& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    SamplingBf16TileWarpSort(storage.warp[warp]).Sort(keys, SamplingUintGreater{});
+#pragma unroll
+    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+        const int rank = lane * kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) { return; }
+    if (lane < kSamplingTileWarps) {
+        constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
+        int position                      = 0;
+        for (int rank = 0; rank < cap; ++rank) {
+            const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int winners = __ballot_sync(kMergeMask, key == best);
+            const int source           = __ffs(static_cast<int>(winners)) - 1;
+            if (lane == 0) {
+                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] = sampling_expand_bf16_tile_sort_key(best, tile_start);
+            }
+            if (lane == source) { ++position; }
+        }
+    }
 }
 
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {

@@ -16,8 +16,9 @@ import shlex
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -193,6 +194,8 @@ def build_points(
             backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target != "qwen3_6_35b_a3b":
                 raise corpus.CampaignError("DFlash measurements require the 35B-A3B target")
+            if backend == "dflash2" and target != "qwen3_8_27b":
+                raise corpus.CampaignError("DFlash2 measurements require Qwen3.8-27B")
             for suite in args.suite:
                 for concurrency in args.concurrency:
                     points.append(
@@ -406,7 +409,10 @@ def parse_client_response(
 
 
 def run_clients(
-    point: Point, jobs: Sequence[Job], port: int
+    point: Point,
+    jobs: Sequence[Job],
+    port: int,
+    on_result: Callable[[ClientResult, dict[str, Any]], None] | None = None,
 ) -> tuple[list[ClientResult], float, float]:
     pending: queue.Queue[Job] = queue.Queue()
     for job in jobs:
@@ -450,6 +456,11 @@ def run_clients(
                     return
                 try:
                     payload = request_payload(point, job)
+                    if point.concurrency == 1:
+                        print(
+                            f"request {job.index + 1}/{len(jobs)} {job.fixture.name} seed={job.seed}",
+                            flush=True,
+                        )
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
@@ -467,6 +478,8 @@ def run_clients(
                         response = corpus.post_json(connection, payload)
                     finished_at = time.monotonic()
                     result = parse_client_response(job, response, started_at, finished_at)
+                    if on_result is not None:
+                        on_result(result, response)
                 except Exception as exc:
                     record_failure(exc)
                     return
@@ -769,7 +782,61 @@ def run_point(
     with corpus.RunningServer(command, "127.0.0.1", args.port, server_log) as server:
         server_start = server.wait_until_ready()
         server_instance_id, weights_id = validate_server_start(server_start, point, args)
-        results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
+        if point.suite == "corpus-makespan" and point.concurrency == 1:
+            # Persist full responses and the existing per-request metrics off the HTTP send path.
+            # C=1 gives one unambiguous request_done sequence; the measured end is still the final
+            # HTTP response, before this collector is joined.
+            detail_dir = output_dir / "corpus" / point.key
+            detail_dir.mkdir(parents=True, exist_ok=True)
+            records: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
+            with (
+                (detail_dir / "results.jsonl").open("w", encoding="utf-8") as handle,
+                ThreadPoolExecutor(max_workers=1) as collector,
+            ):
+                def save(result: ClientResult, response: dict[str, Any]) -> None:
+                    job = result.job
+                    event = server.wait_for_request_done(server_instance_id)
+                    spec = corpus.RunSpec(
+                        target=point.target,
+                        model_id=point.model_id,
+                        artifact=point.artifact,
+                        speculative_mode=point.speculative_mode,
+                        speculative_backend=point.speculative_backend,
+                        draft_tokens=point.draft_tokens,
+                        sampling_mode=point.sampling_mode,
+                        fixture=job.fixture,
+                        seed=job.seed,
+                    )
+                    record = corpus.build_result_record(
+                        spec, weights_id, request_payload(point, job), response, event
+                    )
+                    corpus.append_record(handle, record)
+                    records[corpus.record_key(record)] = record
+                    metrics = record["metrics"]
+                    rate = metrics["decode_tok_s"]
+                    rate_text = f"{rate:.2f}" if rate is not None else "n/a"
+                    print(
+                        f"done {job.index + 1}/{len(jobs)} {job.fixture.name} "
+                        f"tokens={result.completion_tokens} decode={rate_text}tok/s",
+                        flush=True,
+                    )
+
+                pending_records = []
+
+                def enqueue(result: ClientResult, response: dict[str, Any]) -> None:
+                    if pending_records and pending_records[-1].done():
+                        pending_records[-1].result()
+                    pending_records.append(collector.submit(save, result, response))
+
+                results, campaign_start, campaign_end = run_clients(point, jobs, args.port, enqueue)
+                for future in pending_records:
+                    future.result()
+            rows = corpus.build_summary_rows(
+                records, (point.target,), (point.speculative_mode,), point.sampling_mode
+            )
+            corpus.write_summaries(rows, detail_dir)
+        else:
+            results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
 
     events = load_server_events(server_log, server_instance_id)
     report = analyze_point(

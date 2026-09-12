@@ -19,12 +19,24 @@ enum class Category : std::uint32_t {
     PostMixer,
     Moe,
     Control,
+    Graph,
+    Vision,
+    Scoring,
 };
 
 enum class Name : std::size_t {
     Generate,
     Prefill,
     Decode,
+    EngineBoundary,
+    ProgramSubmit,
+    DeviceWait,
+    ProgramPost,
+    EngineCommitOutput,
+    EngineMaintenance,
+    AdmissionPolicy,
+    ContextProgress,
+    StatsPublication,
     DecodeMtpRound,
     DecodeOrdinaryRound,
     DecodeMtpSubmit,
@@ -49,6 +61,33 @@ enum class Name : std::size_t {
     SparseMoePrefill,
     SparseMoeSmallT,
     SparseMoeDecode,
+    EngineLoad,
+    FrontendPrepare,
+    Score,
+    ControlBatch,
+    CudaGraphPrepare,
+    CudaGraphCapture,
+    CudaGraphInstantiate,
+    CudaGraphUpdate,
+    CudaGraphUpload,
+    CudaGraphLaunch,
+    DecodeEager,
+    VisionEncode,
+    VisionPatchEmbedding,
+    VisionLayer,
+    VisionAttention,
+    VisionMlp,
+    VisionMerge,
+    MtpForward,
+    MtpProposal,
+    DecodeMtpTarget,
+    DecodeMtpDraft,
+    DFlashContextAppend,
+    DFlashProposal,
+    DFlashLayer,
+    DFlashAttention,
+    DFlashMlp,
+    DecodeDFlashTarget,
     Count,
 };
 
@@ -74,6 +113,12 @@ enum class Name : std::size_t {
         return 0xffb07aa1u;
     case Category::Control:
         return 0xff9c9c9cu;
+    case Category::Graph:
+        return 0xff79706eu;
+    case Category::Vision:
+        return 0xff86bcb6u;
+    case Category::Scoring:
+        return 0xffff9da7u;
     }
     return 0xff9c9c9cu;
 }
@@ -91,16 +136,28 @@ enum class Name : std::size_t {
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::PostMixer), "post-mixer");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Moe), "moe");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Control), "control");
+        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Graph), "cuda-graph");
+        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Vision), "vision");
+        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Scoring), "scoring");
         return out;
     }();
     return handle;
 }
 
 [[nodiscard]] inline nvtxStringHandle_t registered_message(Name name) noexcept {
-    static constexpr std::array<const char*, static_cast<std::size_t>(Name::Count)> names{
+    static constexpr auto names = std::to_array<const char*>({
         "generate",
         "prefill",
         "decode",
+        "engine.boundary",
+        "program.submit",
+        "device.wait",
+        "program.post",
+        "engine.commit_output",
+        "engine.maintenance",
+        "engine.admission_policy",
+        "engine.context_progress",
+        "engine.stats_publication",
         "decode.mtp_round",
         "decode.ordinary_round",
         "decode.mtp.submit",
@@ -125,7 +182,35 @@ enum class Name : std::size_t {
         "sparse_moe.prefill",
         "sparse_moe.small_t",
         "sparse_moe.decode",
-    };
+        "engine.load",
+        "frontend.prepare",
+        "score",
+        "engine.control_batch",
+        "cuda_graph.prepare",
+        "cuda_graph.capture",
+        "cuda_graph.instantiate",
+        "cuda_graph.update",
+        "cuda_graph.upload",
+        "cuda_graph.launch",
+        "decode.eager",
+        "vision.encode",
+        "vision.patch_embedding",
+        "vision.layer",
+        "vision.attention",
+        "vision.mlp",
+        "vision.merge",
+        "mtp.forward",
+        "mtp.proposal",
+        "decode.mtp.target",
+        "decode.mtp.draft",
+        "dflash.context_append",
+        "dflash.proposal",
+        "dflash.layer",
+        "dflash.attention",
+        "dflash.mlp",
+        "decode.dflash.target",
+    });
+    static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {
         std::array<nvtxStringHandle_t, names.size()> out{};
         for (std::size_t i = 0; i < names.size(); ++i) {
@@ -136,21 +221,27 @@ enum class Name : std::size_t {
     return handles[static_cast<std::size_t>(name)];
 }
 
+[[nodiscard]] inline nvtxEventAttributes_t attributes(Name name, Category category,
+                                                      std::uint64_t payload) noexcept {
+    nvtxEventAttributes_t result{};
+    result.version            = NVTX_VERSION;
+    result.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    result.category           = static_cast<std::uint32_t>(category);
+    result.colorType          = NVTX_COLOR_ARGB;
+    result.color              = color(category);
+    result.payloadType        = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
+    result.payload.ullValue   = payload;
+    result.messageType        = NVTX_MESSAGE_TYPE_REGISTERED;
+    result.message.registered = registered_message(name);
+    return result;
+}
+
 class ScopedRange {
 public:
     explicit ScopedRange(Name name, Category category, std::uint64_t payload = 0) noexcept
         : domain_(domain()) {
-        nvtxEventAttributes_t attributes{};
-        attributes.version            = NVTX_VERSION;
-        attributes.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-        attributes.category           = static_cast<std::uint32_t>(category);
-        attributes.colorType          = NVTX_COLOR_ARGB;
-        attributes.color              = color(category);
-        attributes.payloadType        = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
-        attributes.payload.ullValue   = payload;
-        attributes.messageType        = NVTX_MESSAGE_TYPE_REGISTERED;
-        attributes.message.registered = registered_message(name);
-        nvtxDomainRangePushEx(domain_, &attributes);
+        const nvtxEventAttributes_t event = attributes(name, category, payload);
+        nvtxDomainRangePushEx(domain_, &event);
     }
 
     ScopedRange(const ScopedRange&)            = delete;
@@ -162,6 +253,28 @@ public:
 
 private:
     nvtxDomainHandle_t domain_;
+};
+
+// Process ranges can begin and end on different threads. Use this only for ownership lifetimes;
+// nested execution phases belong on ScopedRange so their stack hierarchy remains explicit.
+class ScopedAsyncRange {
+public:
+    explicit ScopedAsyncRange(Name name, Category category, std::uint64_t payload = 0) noexcept
+        : domain_(domain()) {
+        const nvtxEventAttributes_t event = attributes(name, category, payload);
+        id_                               = nvtxDomainRangeStartEx(domain_, &event);
+    }
+
+    ScopedAsyncRange(const ScopedAsyncRange&)            = delete;
+    ScopedAsyncRange& operator=(const ScopedAsyncRange&) = delete;
+    ScopedAsyncRange(ScopedAsyncRange&&)                 = delete;
+    ScopedAsyncRange& operator=(ScopedAsyncRange&&)      = delete;
+
+    ~ScopedAsyncRange() noexcept { nvtxDomainRangeEnd(domain_, id_); }
+
+private:
+    nvtxDomainHandle_t domain_;
+    nvtxRangeId_t id_{};
 };
 
 } // namespace ninfer::nvtx

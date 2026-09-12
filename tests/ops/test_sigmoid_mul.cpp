@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
@@ -31,7 +32,7 @@ std::vector<double> sigmoid_mul_oracle(const std::vector<float>& gate,
     return expected;
 }
 
-int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed, bool graph = false) {
     const std::size_t count = static_cast<std::size_t>(rows) * columns;
     std::vector<float> gate(count), x(count);
     fill_uniform(gate, seed, -12.0f, 12.0f);
@@ -51,6 +52,26 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
     Tensor x_tensor(device_x.data(), DType::BF16, {rows, columns});
     ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
     cuda_synchronize();
+
+    if (graph) {
+        cudaStream_t stream;
+        cudaGraph_t captured;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        ops::sigmoid_mul(gate_tensor, x_tensor, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+            CUDA_CHECK(cudaMemcpyAsync(device_x.data(), x_bits.data(), device_x.bytes(),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(captured));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
 
     int failures = verify_pointwise(label, from_device_bf16(device_x.data(), count), expected,
                                     sigmoid_mul_bf16_criterion());
@@ -101,7 +122,8 @@ int main() {
 
     int failures = 0;
     failures += run_case("sigmoid_mul [6144,1]", 6144, 1, 101u);
-    failures += run_case("sigmoid_mul [6144,48]", 6144, 48, 102u);
+    for (int columns : {2, 8, 16, 48, 64, 128})
+        failures += run_case("sigmoid_mul target", 6144, columns, 102u + columns, columns == 128);
     failures += run_case("sigmoid_mul [4096,17]", 4096, 17, 201u);
     failures += run_case("sigmoid_mul [4096,128]", 4096, 128, 301u);
     failures += run_edge_case();

@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "ninfer/ops/position.h"
 #include "ops/op_tester.h"
 
@@ -73,6 +74,64 @@ int offset_case(std::int32_t count, std::int32_t delta_value, bool in_place) {
     return failures;
 }
 
+int lane_offset_case(int width, int batch, int axes, bool in_place) {
+    const int lane_size = width * axes;
+    std::vector<std::int32_t> source(lane_size * batch), delta(batch), expected(source.size());
+    for (int b = 0; b < batch; ++b) {
+        delta[b] = 512 * b - 37;
+        for (int i = 0; i < lane_size; ++i) source[b * lane_size + i] = 131072 + 7 * b + 3 * i;
+    }
+    GuardedDeviceBuffer input(source.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer offsets(delta.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(input.bytes());
+    input.copy_from_host(source.data(), input.bytes());
+    offsets.copy_from_host(delta.data(), offsets.bytes());
+    output.fill(0xcd);
+    auto* destination = in_place ? input.data() : output.data();
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cuda_synchronize();
+    const auto launch = [&] {
+        for (int b = 0; b < batch; ++b) {
+            Tensor src(static_cast<std::int32_t*>(input.data()) + b * lane_size, DType::I32, {lane_size});
+            Tensor dst(static_cast<std::int32_t*>(destination) + b * lane_size, DType::I32, {lane_size});
+            Tensor d(static_cast<std::int32_t*>(offsets.data()) + b, DType::I32, {1});
+            ops::offset_i32_positions(src, d, dst, stream);
+        }
+    };
+    launch();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (width == 16 && batch == 8) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        launch();
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+            for (auto& value : delta) value += 7;
+            CUDA_CHECK(cudaMemcpyAsync(input.data(), source.data(), input.bytes(), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(offsets.data(), delta.data(), offsets.bytes(), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (int b = 0; b < batch; ++b)
+        for (int i = 0; i < lane_size; ++i)
+            expected[b * lane_size + i] = source[b * lane_size + i] + delta[b];
+    int failures = verify_exact("lane offsets", from_device<std::int32_t>(destination, expected.size()), expected);
+    if (!in_place)
+        failures += verify_exact("lane source unchanged", from_device<std::int32_t>(input.data(), source.size()), source);
+    failures += verify_exact("lane delta unchanged", from_device<std::int32_t>(offsets.data(), delta.size()), delta);
+    failures += input.verify_guards("lane source");
+    failures += output.verify_guards("lane destination");
+    failures += offsets.verify_guards("lane deltas");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -82,6 +141,11 @@ int main() {
     }
 
     int failures = 0;
+    for (int width = 2; width <= 16; ++width)
+        for (int batch : {1, 8})
+            for (int axes : {1, 3})
+                for (bool in_place : {false, true})
+                    failures += lane_offset_case(width, batch, axes, in_place);
     failures += fill_case(1, 0);
     failures += fill_case(6, 262144);
     failures += fill_case(1024, 131072);

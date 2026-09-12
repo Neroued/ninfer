@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
@@ -229,7 +230,7 @@ int verify_padding(const std::string& label, const std::vector<std::uint16_t>& s
 }
 
 int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_position,
-                  int q_padding = 0, int k_padding = 0) {
+                  int q_padding = 0, int k_padding = 0, int lane_width = 0, bool graph = false) {
     constexpr std::uint16_t kPadding = 0x3f81U;
     const int q_dense_per_token      = geometry.head_dim * q_heads;
     const int k_dense_per_token      = geometry.head_dim * k_heads;
@@ -246,7 +247,13 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
         make_strided_storage(q_before, q_dense_per_token, q_stride, geometry.tokens, kPadding);
     const auto k_storage =
         make_strided_storage(k_before, k_dense_per_token, k_stride, geometry.tokens, kPadding);
-    const auto positions  = make_positions(geometry.axes, geometry.tokens, first_position);
+    auto positions = make_positions(geometry.axes, geometry.tokens, first_position);
+    if (lane_width != 0) {
+        for (int axis = 0; axis < geometry.axes; ++axis)
+            for (int t = 0; t < geometry.tokens; ++t)
+                positions[axis * geometry.tokens + t] = first_position +
+                    1009 * (t / lane_width) + 97 * axis + (2 * axis + 1) * (t % lane_width);
+    }
     const auto q_expected = rope_oracle(q, positions, geometry, q_heads);
     const auto k_expected = rope_oracle(k, positions, geometry, k_heads);
 
@@ -265,6 +272,28 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
 
     ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, nullptr);
     cuda_synchronize();
+
+    if (graph) {
+        cudaStream_t stream;
+        cudaGraph_t captured;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+            CUDA_CHECK(cudaMemcpyAsync(q_device.data(), q_storage.data(), q_device.bytes(),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(k_device.data(), k_storage.data(), k_device.bytes(),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(captured));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
 
     const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
     const auto k_got        = from_device<std::uint16_t>(k_device.data(), k_storage.size());
@@ -421,6 +450,15 @@ int main() {
     int failures = 0;
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
+    for (int axes : {1, 3}) {
+        for (int width : {2, 7, 16}) {
+            for (int batch : {1, 8}) {
+                failures += run_pair_case({"27b dflash2 lanes", 256, 64, axes, width * batch, kTextTheta},
+                    24, 4, 131072, batch == 8 ? 16 : 0, batch == 8 ? 8 : 0,
+                    width, width == 16 && batch == 8);
+            }
+        }
+    }
     failures += run_pair_case({"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);
     failures += run_pair_case({"27b text mrope prefill", 256, 64, 3, 128, kTextTheta}, 24, 4, 4096);
     failures +=

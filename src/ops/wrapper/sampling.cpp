@@ -59,4 +59,20 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                 scratch, stream);
 }
 
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {
+    if (token_ids.dtype != DType::I32 || token_ids.ne[0] <= 0 || token_ids.ne[1] != 1 ||
+        token_ids.ne[2] != 1 || token_ids.ne[3] != 1 || !token_ids.is_contiguous() ||
+        token_ids.data == nullptr) {
+        throw std::invalid_argument(
+            "increment_token_counts: token_ids must be a contiguous non-empty I32 vector");
+    }
+    if (token_counts.dtype != DType::I32 || token_counts.ne[0] <= 0 || token_counts.ne[1] != 1 ||
+        token_counts.ne[2] != 1 || token_counts.ne[3] != 1 || !token_counts.is_contiguous() ||
+        token_counts.data == nullptr) {
+        throw std::invalid_argument(
+            "increment_token_counts: token_counts must be a contiguous non-empty I32 vector");
+    }
+    detail::increment_token_counts_launch(token_ids, token_counts, stream);
+}
+
 } // namespace ninfer::ops

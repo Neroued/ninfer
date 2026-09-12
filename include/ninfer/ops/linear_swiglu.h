@@ -46,6 +46,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   T may be any positive value. The registered profiles are:
  *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
  *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
+ *   - W8G32_F16S weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16S RowScale weight [34816,5120], x [5120,T], out [17408,T].
  *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16, NVFP4 scales are E4M3FN, and
@@ -58,8 +59,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   storage rounding belongs to LinearSwiGLU's named activation-compute criterion, not the oracle.
  *   Production routes may fuse or materialize gate/up and may choose their natural accumulator,
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
- *   Under AllowA8, row-scaled FP8 resolves T=1 and every T>=3 to A8 and T=2 to fused A16 SIMT;
- *   A16Only uses fused A16 kernels for every positive T.
+ *   AllowA8 permits FP8 activation quantization; route thresholds are implementation choices.
  *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.

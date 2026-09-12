@@ -6,8 +6,10 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -39,78 +41,120 @@ void test_topology() {
     }
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
+q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
         .capacity                  = 129,
         .kv_heads                  = 2,
-        .attention_head_dim        = 64,
-        .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .attention_head_dim        = 256,
+        .kv_storage                = storage,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
-        .linear_attention =
-            {
-                .layers         = 3,
-                .conv_channels  = 10,
-                .conv_width     = 3,
-                .value_heads    = 4,
-                .value_head_dim = 5,
-                .key_head_dim   = 6,
-                .slot_count     = 4,
-                .conv_dtype     = ninfer::DType::BF16,
-            },
     };
 }
 
 void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
-    const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
+    const q36::DecoderStateLayout bf16 = q36::plan_decoder_state(
+        bf16_builder, decoder_spec(ninfer::KvCacheStorage::BFloat16, false));
     (void)bf16_builder.finish(256);
-    expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
-    expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
-               bf16.text_kv.pool.spec.logical_page_capacity == 3 &&
-               bf16.text_kv.pool.spec.table_rows == 1,
+    expect(bf16.text_kv.pages.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
+    expect(bf16.text_kv.pages.spec.page_group_count == 5 &&
+               bf16.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
+               bf16.text_kv.execution_tables.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
-    expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
-                       [](const ninfer::PagedKVPlaneLayout& plane) {
-                           return plane.spec.dtype == ninfer::DType::BF16;
-                       }),
-           "BF16 KV has no scale planes");
+    expect(bf16.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::BF16 &&
+               bf16.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::FP16 &&
+               bf16.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::BF16 &&
+               bf16.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
+           "BF16 KV has BF16 K and FP16 V without scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
-    expect(bf16.linear_attention.conv.size() == 3 && bf16.linear_attention.recurrent.size() == 3,
-           "Linear Attention layer storage");
-    expect(bf16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
     ninfer::LayoutBuilder int8_builder;
-    const q36::DecoderStateLayout int8 =
-        q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
+    const q36::DecoderStateLayout int8 = q36::plan_decoder_state(
+        int8_builder, decoder_spec(ninfer::KvCacheStorage::Int8Group64, true));
     (void)int8_builder.finish(256);
-    expect(int8.text_kv.pool.planes.size() == 8 &&
-               int8.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.text_kv.pool.planes[3].spec.dtype == ninfer::DType::FP16,
+    expect(int8.text_kv.pages.planes.size() == 8 &&
+               int8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               int8.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
            "INT8 Text KV has code and scale planes per layer");
     expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
-               int8.mtp_kv->pool.planes.size() == 4 &&
-               int8.mtp_kv->pool.spec.page_group_count == 4 &&
-               int8.mtp_kv->pool.spec.logical_page_capacity == 3,
+               int8.mtp_kv->pages.planes.size() == 4 &&
+               int8.mtp_kv->pages.spec.page_group_count == 4 &&
+               int8.mtp_kv->execution_tables.spec.logical_page_capacity == 3,
            "enabled MTP has one paged KV layer");
-    expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
+    expect(int8.mtp_kv && int8.mtp_kv->pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               int8.mtp_kv->pages.planes[3].geometry.dtype == ninfer::DType::FP16,
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
+    ninfer::LayoutBuilder fp8_builder;
+    const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
+    (void)fp8_builder.finish(256);
+    expect(fp8.text_kv.pages.planes.size() == 8 &&
+               fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               fp8.text_kv.pages.planes[2].geometry.leading_extent == 1,
+           "FP8 Text KV has row-scaled code and scale planes per layer");
+    expect(fp8.mtp_kv && fp8.mtp_kv->pages.planes.size() == 4 &&
+               fp8.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 1,
+           "FP8 MTP KV has row-scaled code and scale planes");
+    expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
+           "FP8 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder nvfp4_builder;
+    const q36::DecoderStateLayout nvfp4 = q36::plan_decoder_state(
+        nvfp4_builder, decoder_spec(ninfer::KvCacheStorage::Nvfp4Group16, true));
+    (void)nvfp4_builder.finish(256);
+    expect(nvfp4.text_kv.pages.planes.size() == 8 &&
+               nvfp4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[0].geometry.leading_extent == 128 &&
+               nvfp4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[2].geometry.leading_extent == 16,
+           "NVFP4 Text KV has packed E2M1 code and E4M3 scale planes");
+    constexpr std::size_t nvfp4_vector_bytes = 128 + 16;
+    constexpr std::size_t text_vectors       = 2ULL * 5ULL * 64ULL * 2ULL;
+    constexpr std::size_t mtp_vectors        = 1ULL * 4ULL * 64ULL * 2ULL;
+    expect(nvfp4.text_kv.payload_bytes() == 2ULL * nvfp4_vector_bytes * text_vectors &&
+               nvfp4.mtp_kv &&
+               nvfp4.mtp_kv->payload_bytes() == 2ULL * nvfp4_vector_bytes * mtp_vectors,
+           "NVFP4 Text/MTP physical payload bytes");
+
+    ninfer::LayoutBuilder k8v4_builder;
+    const q36::DecoderStateLayout k8v4 = q36::plan_decoder_state(
+        k8v4_builder, decoder_spec(ninfer::KvCacheStorage::Fp8KeyNvfp4Value, true));
+    (void)k8v4_builder.finish(256);
+    expect(k8v4.text_kv.pages.planes.size() == 8 &&
+               k8v4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               k8v4.text_kv.pages.planes[0].geometry.leading_extent == 256 &&
+               k8v4.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[1].geometry.leading_extent == 128 &&
+               k8v4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               k8v4.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
+               k8v4.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[3].geometry.leading_extent == 16,
+           "K8V4 Text KV preserves independent key/value code and scale geometry");
+    constexpr std::size_t k8_vector_bytes = 256 + 2;
+    constexpr std::size_t v4_vector_bytes = 128 + 16;
+    expect(k8v4.text_kv.payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * text_vectors &&
+               k8v4.mtp_kv &&
+               k8v4.mtp_kv->payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * mtp_vectors,
+           "K8V4 Text/MTP asymmetric physical payload bytes");
 }
 
 void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
-        builder, q36::RoundStateSpec{
-                     .hidden = 32, .output_rows = 128, .draft_window = 5, .enable_mtp = true});
+        builder, q36::RoundStateSpec{.hidden       = 32,
+                                     .output_rows  = 128,
+                                     .draft_window = 5,
+                                     .backend      = ninfer::SpeculativeBackend::Mtp});
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
@@ -131,9 +175,10 @@ void test_round_layout() {
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
-        speculative_builder,
-        q36::RoundStateSpec{
-            .hidden = 32, .output_rows = 128, .draft_window = 15, .enable_dflash = true});
+        speculative_builder, q36::RoundStateSpec{.hidden       = 32,
+                                                 .output_rows  = 128,
+                                                 .draft_window = 15,
+                                                 .backend = ninfer::SpeculativeBackend::DFlash});
     q36::complete_round_state_layout(speculative_builder, dflash);
     (void)speculative_builder.finish(256);
     expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
@@ -189,12 +234,12 @@ void test_vision_control() {
                                  .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
-    const q36::VisionControl control = q36::build_vision_control(prompt);
+    const q36::VisionControlPlan plan = q36::plan_vision_control(prompt);
+    const q36::VisionControl control  = q36::build_vision_control(prompt, plan, 0);
     expect(control.items.size() == 2, "Vision per-item control count");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
                control.items[0].segment_count == 1 &&
-               control.items[0].cu_seqlens == std::vector<std::int32_t>({0, 4}) &&
                control.items[0].scatter_indices == std::vector<std::int32_t>({1}) &&
                control.items[0].position_ids.size() == 8 &&
                control.items[0].position_table_indices.size() == 16 &&
@@ -203,12 +248,18 @@ void test_vision_control() {
     expect(control.items[1].patch_begin == 4 && control.items[1].patch_count == 8 &&
                control.items[1].merged_count == 2 && control.items[1].segment_length == 4 &&
                control.items[1].segment_count == 2 &&
-               control.items[1].cu_seqlens == std::vector<std::int32_t>({0, 4, 8}) &&
                control.items[1].scatter_indices == std::vector<std::int32_t>({3, 5}) &&
                control.items[1].position_ids.size() == 16 &&
                control.items[1].position_table_indices.size() == 32 &&
                control.items[1].position_table_weights.size() == 32,
            "video item control offsets");
+
+    const q36::VisionControl suffix = q36::build_vision_control(prompt, plan, 1);
+    expect(suffix.prepared_item_begin == 1 && suffix.items.size() == 1 &&
+               suffix.items[0].patch_begin == control.items[1].patch_begin &&
+               suffix.items[0].scatter_indices == control.items[1].scatter_indices &&
+               suffix.items[0].position_ids == control.items[1].position_ids,
+           "Vision suffix control contents");
 }
 
 q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
@@ -248,8 +299,11 @@ void test_prefix_identity() {
     q36::PreparedPromptData original    = identity_prompt();
     std::vector<ninfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
+    q36::detail::PrefixShortlistDigests digests;
     resident.reserve(16);
     resident.assign(original);
+    digests.reserve(16);
+    digests.assign(original);
 
     expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
            "identical multimodal prefix identity");
@@ -269,17 +323,98 @@ void test_prefix_identity() {
                                         changed_position.token_ids.size()),
            "different MRoPE positions must not reuse resident state");
 
+    q36::PreparedPromptData changed_decomposition              = identity_prompt();
+    changed_decomposition.identity.rewrite_execution_frontiers = {1};
+    expect(!q36::detail::prefix_matches(changed_decomposition, ledger, resident,
+                                        changed_decomposition.token_ids.size()),
+           "different GDN execution decomposition must not reuse resident state");
+    changed_decomposition.identity.rewrite_execution_frontiers = {4};
+    expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident, 3),
+           "execution decomposition wholly after the frontier changed prefix identity");
+
+    q36::PreparedPromptData resident_future              = identity_prompt();
+    resident_future.identity.rewrite_execution_frontiers = {1, 4};
+    q36::detail::ResidentPrefixIdentity resident_with_future;
+    resident_with_future.assign(resident_future);
+    q36::PreparedPromptData incoming_future              = identity_prompt();
+    incoming_future.identity.rewrite_execution_frontiers = {1, 3};
+    expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 1),
+           "resident execution decomposition after the frontier changed prefix identity");
+    expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
+           "different execution decomposition inside the frontier reused resident state");
+
+    q36::detail::PrefixShortlistDigests future_digest;
+    future_digest.assign(resident_future);
+    q36::detail::PrefixShortlistDigests incoming_digest;
+    incoming_digest.assign(incoming_future);
+    expect(future_digest.at(1) == incoming_digest.at(1),
+           "future execution boundaries changed an earlier content shortlist");
+    expect(future_digest.at(3) != incoming_digest.at(3),
+           "different in-prefix execution boundaries shared a shortlist digest");
+
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
+    const std::array<ninfer::TokenId, 1> generated{12};
+    digests.append_generated(generated, original.rope_delta);
     append_text_token(original, 12, 4);
+    q36::detail::PrefixShortlistDigests rebuilt;
+    rebuilt.assign(original);
+    expect(digests.at(ledger.size()) == rebuilt.at(ledger.size()),
+           "incremental generated-token shortlist diverged from a full rebuild");
     expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
            "generated multimodal continuation identity");
 
+    q36::PreparedPromptData accepted_rebuild = identity_prompt();
+    const std::array<ninfer::TokenId, 3> proposed{20, 21, 22};
+    const std::span<const ninfer::TokenId> accepted(proposed.data(), 2);
+    std::vector<ninfer::TokenId> accepted_ledger = accepted_rebuild.token_ids;
+    accepted_ledger.insert(accepted_ledger.end(), accepted.begin(), accepted.end());
+    q36::detail::ResidentPrefixIdentity accepted_resident;
+    q36::detail::PrefixShortlistDigests accepted_digests;
+    accepted_resident.assign(accepted_rebuild);
+    accepted_digests.assign(accepted_rebuild);
+    accepted_resident.append_generated(accepted.size(), accepted_rebuild.rope_delta, 1);
+    accepted_digests.append_generated(accepted, accepted_rebuild.rope_delta, 1);
+    append_text_token(accepted_rebuild, accepted[0], 4);
+    append_text_token(accepted_rebuild, accepted[1], 5);
+    accepted_rebuild.identity.rewrite_execution_frontiers = {5};
+    q36::detail::PrefixShortlistDigests rebuilt_accepted_digests;
+    rebuilt_accepted_digests.assign(accepted_rebuild);
+    expect(q36::detail::prefix_matches(accepted_rebuild, accepted_ledger, accepted_resident,
+                                       accepted_ledger.size()) &&
+               accepted_digests.at(accepted_ledger.size()) ==
+                   rebuilt_accepted_digests.at(accepted_ledger.size()),
+           "accepted generated prefix and rebuilt history formed different cache identities");
+
     const q36::PreparedPromptData prompt_only = identity_prompt();
     resident.truncate(prompt_only.token_ids.size());
+    digests.truncate(prompt_only.token_ids.size());
     ledger.resize(prompt_only.token_ids.size());
+    q36::detail::PrefixShortlistDigests prompt_digest;
+    prompt_digest.assign(prompt_only);
+    expect(digests.at(ledger.size()) == prompt_digest.at(ledger.size()),
+           "truncated shortlist did not restore the original frontier digest");
     expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
            "truncated multimodal continuation identity");
+}
+
+void test_rebuild_work_prompt_frontier_boundary() {
+    constexpr std::uint32_t prompt_tokens = 100;
+    constexpr std::uint32_t prefill_chunk = 2048;
+    std::uint32_t tail_begin              = 0;
+    q36::runtime_support::include_rebuild_boundary(tail_begin, prompt_tokens, prompt_tokens);
+    expect(tail_begin == prompt_tokens,
+           "prompt-frontier rebuild boundary was not retained for continuation growth");
+
+    ninfer::runtime::PrefillWork work =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens, 0, 0, prefill_chunk);
+    q36::runtime_support::advance_segmented_rebuild_work(work, tail_begin, prompt_tokens,
+                                                         prompt_tokens + 1, prefill_chunk);
+    const ninfer::runtime::PrefillWork exact =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens + 1, 0, 0, prefill_chunk);
+    expect(work.chunks == 2 && work.tokens == exact.tokens &&
+               work.attention_pairs == exact.attention_pairs,
+           "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
 } // namespace
@@ -291,6 +426,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_rebuild_work_prompt_frontier_boundary();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

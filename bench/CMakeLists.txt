@@ -14,27 +14,36 @@ ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES ops/silu_mul_bench.cu)
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES ops/residual_add_bench.cu)
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES ops/sigmoid_mul_bench.cu)
 ninfer_add_op_bench(ninfer_rmsnorm_bench SOURCES ops/rmsnorm_bench.cu)
+ninfer_add_op_bench(ninfer_rmsnorm_pack_tail_bench SOURCES ops/rmsnorm_pack_tail_bench.cu)
 ninfer_add_op_bench(ninfer_l2norm_bench SOURCES ops/l2norm_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES ops/gdn_gating_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES ops/gdn_gating_proj_bench.cu)
+ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
+  SOURCES ops/dynamic_grouped_conv_prepare_bench.cu)
+ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
+  SOURCES ops/linear_dynamic_grouped_conv_add_bench.cu)
 ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES ops/gated_delta_net_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES ops/gdn_replay_bench.cu)
-ninfer_add_op_bench(ninfer_gdn_layer_bench SOURCES ops/gdn_layer_bench.cu)
 ninfer_add_op_bench(ninfer_rope_bench SOURCES ops/rope_bench.cu)
+ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES ops/rmsnorm_rope_bench.cu)
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES ops/add_bias_bench.cu)
 ninfer_add_op_bench(ninfer_gelu_bench SOURCES ops/gelu_bench.cu)
 ninfer_add_op_bench(ninfer_layer_norm_bench SOURCES ops/layer_norm_bench.cu)
 ninfer_add_op_bench(ninfer_vision_pos_embed_bench SOURCES ops/vision_pos_embed_bench.cu)
 ninfer_add_op_bench(ninfer_scatter_bench SOURCES ops/scatter_bench.cu)
+ninfer_add_op_bench(ninfer_scatter_bf16_batch_bench SOURCES ops/scatter_bf16_batch_bench.cu)
 ninfer_add_op_bench(ninfer_packed_softmax_attention_bench
   SOURCES ops/packed_softmax_attention_bench.cu)
+ninfer_add_op_bench(ninfer_prepare_ragged_prefix_bench
+  SOURCES ops/prepare_ragged_prefix_bench.cu)
 ninfer_add_op_bench(ninfer_embedding_bench SOURCES ops/embedding_bench.cu)
 ninfer_add_op_bench(ninfer_position_bench SOURCES ops/position_bench.cu)
 ninfer_add_op_bench(ninfer_cast_bench SOURCES ops/cast_bench.cu)
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES ops/argmax_bench.cu)
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES ops/causal_conv1d_silu_bench.cu)
 ninfer_add_op_bench(ninfer_linear_bench SOURCES ops/linear_bench.cu)
-ninfer_add_op_bench(ninfer_output_stage_bench SOURCES ops/output_stage_bench.cu)
+ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES ops/linear_topk_bench.cu)
+ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES ops/candidate_selector_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES ops/gdn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
@@ -60,6 +69,8 @@ ninfer_add_op_bench(ninfer_prepare_masked_block_bench
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_bench.cu)
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
+ninfer_add_op_bench(ninfer_context_kv_materialize_bench
+  SOURCES ops/context_kv_materialize_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
 
@@ -72,6 +83,27 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
+
+# Static context-cost calibrator. Transfer measurements call production Paged-KV copy primitives,
+# then release their synthetic fixtures before the public Engine optionally loads one real artifact
+# for text/Vision prefill measurements.
+add_executable(ninfer_context_cost_bench
+  context_cost/context_cost_bench.cpp
+  context_cost/context_cost_measure.cpp
+  context_cost/qwen3_6_context_fixture.cpp)
+target_include_directories(ninfer_context_cost_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/context_cost
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+target_compile_definitions(ninfer_context_cost_bench PRIVATE
+  NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+target_link_libraries(ninfer_context_cost_bench PRIVATE
+  ninfer_engine ninfer_core CUDA::cudart)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.

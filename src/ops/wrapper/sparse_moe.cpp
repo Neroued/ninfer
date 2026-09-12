@@ -191,6 +191,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+    sparse_moe(x, weights, epilogue, destination, SparseMoeHints{}, workspace, stream);
+}
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
+                cudaStream_t stream) {
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -252,13 +258,14 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
 
     const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
-        weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        weights.routed_gate_up.qtype, weights.routed_down.qtype, hints);
     const detail::SparseMoeDecodeWorkspace views =
         detail::allocate_sparse_moe_decode_workspace(workspace);
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream);
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, plan, views,
+                                         stream);
     }
 }
 

@@ -1,16 +1,13 @@
-// Cold-cache benchmark and candidate tuner for the Qwen3.6-35B-A3B W8 LinearSwiGLU Op.
+// Complete public-Op benchmark for the registered W8 LinearSwiGLU profiles.
 
-#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/silu_mul.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
-#include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
-#include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -28,26 +25,33 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kGateUpRows = 12288;
-constexpr std::int32_t kOutputRows = 6144;
-constexpr std::int32_t kHidden     = 2048;
-constexpr std::size_t kFlushBytes  = 256ULL << 20;
+constexpr std::size_t kFlushBytes = 256ULL << 20;
+
+struct Problem {
+    const char* name;
+    std::int32_t gate_up_rows;
+    std::int32_t output_rows;
+    std::int32_t hidden;
+};
+
+constexpr Problem kCompanion{"companion", 12288, 6144, 2048};
+constexpr Problem kDFlash2{"dflash2", 34816, 17408, 5120};
 
 struct Options {
-    std::vector<std::int32_t> t_sweep{
-        1,  2,  3,  4,  5,  6,  7,  8,  9,  10,  11,  12,  13,  14,  15,  16,  17,  24,  31,  32,
-        33, 48, 63, 64, 65, 80, 95, 96, 97, 127, 128, 129, 192, 256, 384, 512, 768, 896, 1024};
+    std::vector<std::int32_t> t_sweep;
     int warmup = 5;
     int repeat = 30;
     std::string csv_out;
-    bool profile         = false;
-    bool production_only = false;
+    std::string problem = kCompanion.name;
+    bool profile        = false;
+    bool graph          = false;
 };
 
 struct Result {
-    std::string path;
     std::int32_t t;
     bench::ColdTiming timing;
+    std::size_t workspace_bytes;
+    std::size_t graph_nodes;
 };
 
 std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
@@ -79,6 +83,8 @@ Options parse_options(int argc, char** argv) {
         };
         if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+        } else if (arg == "--problem") {
+            options.problem = next("--problem value");
         } else if (arg == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
@@ -87,11 +93,15 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--profile") {
             options.profile = true;
-        } else if (arg == "--production-only") {
-            options.production_only = true;
+        } else if (arg == "--execution") {
+            const auto mode = next("--execution value");
+            if (mode != "eager" && mode != "graph")
+                throw std::invalid_argument("execution must be eager or graph");
+            options.graph = mode == "graph";
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
-                        "[--csv-out PATH] [--profile] [--production-only]\n",
+            std::printf("Usage: %s [--problem companion|dflash2] [--t-sweep 1,2,...] "
+                        "[--warmup N] [--repeat N] [--csv-out PATH] [--profile] "
+                        "[--execution eager|graph]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -101,169 +111,126 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
+    if (options.problem != kCompanion.name && options.problem != kDFlash2.name) {
+        throw std::invalid_argument("--problem must be companion or dflash2");
+    }
+    if (options.t_sweep.empty()) {
+        if (options.problem == kDFlash2.name) {
+            options.t_sweep = {1,  8,  16, 32, 40, 41, 51, 52,  63,  64,
+                               65, 80, 81, 88, 89, 96, 97, 128, 129, 1024};
+        } else {
+            options.t_sweep = {
+                1,  2,  3,  4,   5,   6,   7,   8,   9,   10,  11,  12,  13,
+                14, 15, 16, 17,  24,  31,  32,  33,  48,  63,  64,  65,  80,
+                95, 96, 97, 127, 128, 129, 192, 256, 384, 512, 768, 896, 1024,
+            };
+        }
+    }
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
+    if (options.profile && !options.csv_out.empty())
+        throw std::invalid_argument("--profile does not write timing CSV");
     return options;
 }
 
-void append(std::vector<Result>& results, const char* path, std::int32_t t,
-            bench::ColdTiming timing, std::size_t weight_bytes) {
-    const double useful_flops = 2.0 * kGateUpRows * kHidden * static_cast<double>(t);
-    const double useful_bytes =
-        static_cast<double>(weight_bytes) + 2.0 * static_cast<double>((kHidden + kOutputRows) * t);
-    const double tflops = useful_flops / timing.median_us / 1.0e6;
-    const double gbs    = useful_bytes / timing.median_us / 1.0e3;
-    std::printf("T=%-4d %-24s median=%8.3f us  useful=%7.2f TFLOP/s %7.1f GB/s\n", t, path,
-                timing.median_us, tflops, gbs);
-    results.push_back({path, t, timing});
+void append(std::vector<Result>& results, const Problem& problem, int t, bench::ColdTiming timing,
+            std::size_t weight_bytes, std::size_t workspace_bytes, std::size_t graph_nodes,
+            bool graph) {
+    const double flops = 2.0 * problem.gate_up_rows * problem.hidden * t;
+    const double bytes = static_cast<double>(weight_bytes) +
+                         2.0 * (static_cast<double>(problem.hidden) + problem.output_rows) * t;
+    std::printf("entry=linear_swiglu problem=%s T=%d execution=%s graph_nodes=%zu workspace=%zu "
+                "median=%.3f us min=%.3f us p95=%.3f us logical=%.1f GB/s math=%.2f TFLOP/s\n",
+                problem.name, t, graph ? "graph" : "eager", graph_nodes, workspace_bytes,
+                timing.median_us, timing.min_us, timing.p95_us, bytes / timing.median_us / 1e3,
+                flops / timing.median_us / 1e6);
+    results.push_back({t, timing, workspace_bytes, graph_nodes});
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
-    if (options.csv_out.empty()) { return; }
+    if (options.csv_out.empty()) return;
     const std::filesystem::path path(options.csv_out);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     std::ofstream out(path);
-    out << "path,T,median_us,min_us,p95_us,warmup,repeat\n";
-    for (const Result& result : results) {
-        out << result.path << ',' << result.t << ',' << result.timing.median_us << ','
-            << result.timing.min_us << ',' << result.timing.p95_us << ',' << options.warmup << ','
-            << options.repeat << '\n';
+    if (!out) throw std::runtime_error("cannot open timing CSV");
+    out << "problem,entry,T,execution,workspace_bytes,graph_nodes,median_us,min_us,p95_us,warmup,"
+           "repeat,flush_bytes\n";
+    for (const auto& r : results) {
+        out << options.problem << ",linear_swiglu," << r.t << ','
+            << (options.graph ? "graph" : "eager") << ',' << r.workspace_bytes << ',';
+        if (r.graph_nodes) out << r.graph_nodes;
+        out << ',' << r.timing.median_us << ',' << r.timing.min_us << ',' << r.timing.p95_us << ','
+            << options.warmup << ',' << options.repeat << ',' << kFlushBytes << '\n';
     }
 }
-
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse_options(argc, argv);
-        const std::int32_t max_t =
-            *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
-
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        ninfer::DeviceBuffer flush(kFlushBytes);
-        ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        ninfer::DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * 2);
-        ninfer::DeviceBuffer gate_up(static_cast<std::size_t>(kGateUpRows) * max_t * 2);
-        bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::W8G32_F16S, kGateUpRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
-        WorkspaceArena workspace(1);
+        const Options options  = parse_options(argc, argv);
+        const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
+        DeviceContext context;
+        const cudaStream_t stream = context.stream;
+        std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.props.name,
+                    context.props.major, context.props.minor, CUDART_VERSION);
+        const auto [minimum, maximum] =
+            std::minmax_element(options.t_sweep.begin(), options.t_sweep.end());
+        DeviceBuffer flush(kFlushBytes);
+        DeviceBuffer input =
+            bench::make_bf16(static_cast<std::size_t>(problem.hidden) * (*maximum));
+        DeviceBuffer output(static_cast<std::size_t>(problem.output_rows) * (*maximum) * 2);
+        auto packed =
+            bench::make_row_split_weight(QType::W8G32_F16S, problem.gate_up_rows, problem.hidden,
+                                         problem.hidden, {0x31, 0x00, 0x3c00});
+        const auto capacity = ops::linear_swiglu_workspace_capacity_bytes(
+            QType::W8G32_F16S, problem.gate_up_rows, problem.hidden, ops::LinearPolicy::A16Only,
+            *minimum, *maximum);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
         std::vector<Result> results;
-
-        for (const std::int32_t t : options.t_sweep) {
-            Tensor x(input.p, DType::BF16, {kHidden, t});
-            Tensor out(output.p, DType::BF16, {kOutputRows, t});
-            Tensor parent(gate_up.p, DType::BF16, {kGateUpRows, t});
-            const auto plan = ops::detail::w8_linear_swiglu_resolve_plan(
-                {kGateUpRows, kOutputRows, kHidden, kHidden, t});
-
+        for (const auto t : options.t_sweep) {
+            Tensor x(input.p, DType::BF16, {problem.hidden, t});
+            Tensor out(output.p, DType::BF16, {problem.output_rows, t});
+            const auto body = [&](cudaStream_t launch_stream) {
+                ops::linear_swiglu(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
+                                   launch_stream);
+            };
+            bench::TimedGraph graph;
+            if (options.graph) graph.capture(stream, body);
             if (options.profile) {
-                ops::linear_swiglu(x, packed.weight, out, workspace, stream);
+                const auto launch = [&] {
+                    if (options.graph)
+                        graph.launch(stream);
+                    else
+                        body(stream);
+                };
+                for (int i = 0; i < options.warmup; ++i) {
+                    bench::flush_l2(flush, stream);
+                    launch();
+                }
+                bench::flush_l2(flush, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                std::printf("profile T=%d route=%s\n", t,
-                            ops::detail::w8_linear_swiglu_schedule_name(plan.schedule));
+                std::printf(
+                    "PROFILE entry=linear_swiglu problem=%s T=%d execution=%s graph_nodes=%zu\n",
+                    problem.name, t, options.graph ? "graph" : "eager", graph.nodes());
+                CUDA_CHECK(cudaProfilerStart());
+                launch();
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaProfilerStop());
                 continue;
             }
-
-            const auto run = [&](const char* path, auto&& launch) {
-                append(results, path, t,
-                       bench::measure_cold_launch(launch, flush, stream, options.warmup,
-                                                  options.repeat),
-                       packed.storage.bytes);
-            };
-            run(ops::detail::w8_linear_swiglu_schedule_name(plan.schedule),
-                [&](cudaStream_t candidate_stream) {
-                    ops::linear_swiglu(x, packed.weight, out, workspace, candidate_stream);
-                });
-            if (options.production_only) { continue; }
-
-            run("composed.linear+silu", [&](cudaStream_t candidate_stream) {
-                ops::linear(x, packed.weight, parent, candidate_stream);
-                ops::silu_mul(parent.slice(0, 0, kOutputRows),
-                              parent.slice(0, kOutputRows, kOutputRows), out, candidate_stream);
-            });
-            if (t == 1) {
-                run("decode_pair_r4", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_swiglu_decode_pair_r4_launch(x, packed.weight, out,
-                                                                        candidate_stream);
-                });
-                run("decode_pair_r8", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_swiglu_decode_pair_launch(x, packed.weight, out,
-                                                                     candidate_stream);
-                });
-                run("decode_pair_r16", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_swiglu_decode_pair_r16_launch(x, packed.weight, out,
-                                                                         candidate_stream);
-                });
-            }
-            if (t >= 2 && t <= 48) {
-                run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_swiglu_splitk_exact_t_launch(x, packed.weight, out,
-                                                                        candidate_stream);
-                });
-            }
-            run("mma_r32_c32", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c32_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r32_c48", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c48_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r32_c64", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c64_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r32_c80", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c80_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r32_c96", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c96_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r32_c128", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r32_c128_launch(x, packed.weight, out,
-                                                                  candidate_stream);
-            });
-            run("mma_r64_c32", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c32_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r64_c48", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c48_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r64_c64", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c64_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r64_c80", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c80_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r64_c96", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c96_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-            });
-            run("mma_r64_c128", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r64_c128_launch(x, packed.weight, out,
-                                                                  candidate_stream);
-            });
-            run("mma_r128_c64", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r128_c64_launch(x, packed.weight, out,
-                                                                  candidate_stream);
-            });
-            run("mma_r128_c80", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_swiglu_mma_r128_c80_launch(x, packed.weight, out,
-                                                                  candidate_stream);
-            });
+            const auto timing = options.graph
+                                    ? bench::measure_cold_graph(graph, flush, stream,
+                                                                options.warmup, options.repeat)
+                                    : bench::measure_cold_launch(body, flush, stream,
+                                                                 options.warmup, options.repeat);
+            const auto exact  = ops::linear_swiglu_workspace_capacity_bytes(
+                QType::W8G32_F16S, problem.gate_up_rows, problem.hidden, ops::LinearPolicy::A16Only,
+                t, t);
+            append(results, problem, t, timing, packed.model_weight_bytes(), exact, graph.nodes(),
+                   options.graph);
         }
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
         write_csv(options, results);
-        CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer_w8_linear_swiglu_bench: %s\n", error.what());

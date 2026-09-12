@@ -55,7 +55,7 @@ struct W8RowSplitMmaGemmSchedule {
     static_assert(STAGES == 2, "W8G32 MMA uses a two-stage cp.async pipeline");
     static_assert(ACTIVATION_STAGES == 1 || ACTIVATION_STAGES == STAGES,
                   "W8G32 MMA activation staging is single-buffered or follows the pipeline");
-    static_assert(SMEM_BYTES <= 48 * 1024);
+    static_assert(SMEM_BYTES <= 99 * 1024, "sm_120a per-CTA shared memory limit");
 };
 
 __device__ __forceinline__ int w8g32_swz64(int row, int col) {
@@ -182,43 +182,33 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     auto dequant_w = [&](int kt) {
         constexpr int GROUPS            = BK / 32;
         constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
-        const int scale_pair_offset     = (kt % SCALE_CACHE_TILES) * GROUPS * 2;
-        const int half                  = lane >> 4;
-        const int half_lane             = lane & 15;
-        for (int row_pair = warp * 2; row_pair < BM; row_pair += Cfg::WARPS * 2) {
-            const int row = row_pair + half;
-            unsigned scale_pair0;
-            unsigned scale_pair1 = 0;
-            if constexpr (GROUPS == 2) {
-                scale_pair0 = half_lane == 0
-                                  ? *reinterpret_cast<const std::uint32_t*>(
-                                        &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset])
-                                  : 0;
-                scale_pair0 = __shfl_sync(0xffffffffu, scale_pair0, half * 16);
-            } else {
-                static_assert(GROUPS == 4);
-                const unsigned lane_scale_pair =
-                    half_lane < 2
-                        ? *reinterpret_cast<const std::uint32_t*>(
-                              &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset + half_lane * 4])
-                        : 0;
-                scale_pair0 = __shfl_sync(0xffffffffu, lane_scale_pair, half * 16);
-                scale_pair1 = __shfl_sync(0xffffffffu, lane_scale_pair, half * 16 + 1);
-            }
+        // w8g32_swz64 permutes whole eight-element runs, so eight codes are the widest chunk
+        // contiguous in As for every row. BK % 32 keeps gg inside GROUPS and the row stride
+        // aligned for the vector store; 8 % GROUPS keeps the scale cache a whole number of tiles.
+        constexpr int kChunksPerRow = BK / 8;
+        static_assert(BK % 32 == 0 && (8 % GROUPS) == 0,
+                      "an eight-code chunk must lie inside one W8G32 group and the scale cache "
+                      "must hold whole tiles");
+        const int scale_tile_offset = (kt % SCALE_CACHE_TILES) * GROUPS * 2;
+        for (int item = tid; item < BM * kChunksPerRow; item += Cfg::THREADS) {
+            const int row   = item / kChunksPerRow;
+            const int chunk = item - row * kChunksPerRow;
+            const int col   = chunk * 8;
+            const int gg    = col >> 5;
+            const float scale =
+                __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                    &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_tile_offset + gg * 2])));
+            const uint2 packed = *reinterpret_cast<const uint2*>(&Cr[row * BK + col]);
+            W8Bf16x8Bits decoded;
 #pragma unroll
-            for (int gg = 0; gg < GROUPS; ++gg) {
-                const unsigned scale_pair = gg < 2 ? scale_pair0 : scale_pair1;
-                const unsigned scale_bits = (scale_pair >> ((gg & 1) * 16)) & 0xffffu;
-                const float scale         = __half2float(__ushort_as_half(scale_bits));
-                const int col             = gg * 32 + half_lane * 2;
-                const std::uint16_t packed =
-                    *reinterpret_cast<const std::uint16_t*>(&Cr[row * BK + col]);
-                const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
-                const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
-                const __nv_bfloat162 values = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                                                    static_cast<float>(q1) * scale);
-                store_vec(&As[row * BK + w8g32_swz64(row, col)], values);
+            for (int pair = 0; pair < 4; ++pair) {
+                const unsigned word = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
+                const int q0        = static_cast<int>(static_cast<std::int8_t>(word & 0xffu));
+                const int q1 = static_cast<int>(static_cast<std::int8_t>((word >> 8) & 0xffu));
+                decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                           static_cast<float>(q1) * scale);
             }
+            store_vec(&As[row * BK + w8g32_swz64(row, col)], decoded.raw);
         }
     };
 
@@ -335,6 +325,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         } else {
             static_assert(Cfg::WARPS_M == 2);
+            static_assert(BM <= Cfg::ACTIVATION_STAGES * BK,
+                          "FP32 up tile must fit in the activation staging storage");
             auto* up_shared = reinterpret_cast<float*>(Bs);
             __syncthreads();
             if (wm == 1) {
@@ -401,7 +393,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         }
     } else if constexpr (Epilogue == W8Epilogue::Residual) {
-        static_assert(BM <= Cfg::STAGES * BK && (BM % 8) == 0,
+        static_assert(BM <= Cfg::ACTIVATION_STAGES * BK && (BM % 8) == 0,
                       "W8 residual epilogue reuses the x pipeline as a BF16 output tile");
         __syncthreads();
         __nv_bfloat16* projected_shared = Bs[0];

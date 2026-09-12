@@ -73,73 +73,35 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
     }
 }
 
-template <int Tokens>
-__global__ void
-sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __restrict__ token_ids,
-                             float* __restrict__ token_alpha, float* __restrict__ shared_scale) {
-    static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
-    __shared__ float scores[Tokens][kRouterRows];
-    __shared__ float selected_logits[Tokens][kTopK];
-    const int tid = static_cast<int>(threadIdx.x);
+// S2 runs one CTA per token: the router scores of a single token take 1 060 B of shared
+// memory, so the block no longer has to be wide enough to hold the whole decode window.
+constexpr int kS2Threads = 128;
+
+__global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores,
+                                             int* __restrict__ token_ids,
+                                             float* __restrict__ token_alpha,
+                                             float* __restrict__ shared_scale) {
+    __shared__ float scores[kRouterRows];
+    __shared__ float selected_logits[kTopK];
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int token = static_cast<int>(blockIdx.x);
     if (tid == 0) { pdl::trigger_dependents(); }
     pdl::wait_for_dependencies();
-    for (int index = tid; index < Tokens * kRouterRows; index += static_cast<int>(blockDim.x)) {
+    for (int row = tid; row < kRouterRows; row += kS2Threads) {
         float sum = 0.0f;
 #pragma unroll
         for (int partition = 0; partition < kRouterPartitions; ++partition) {
-            sum += partial_scores[static_cast<std::int64_t>(index) * kRouterPartitions + partition];
+            sum += partial_scores[((static_cast<std::int64_t>(token) * kRouterRows + row) *
+                                   kRouterPartitions) +
+                                  partition];
         }
-        reinterpret_cast<float*>(scores)[index] = sum;
+        scores[row] = sum;
     }
     __syncthreads();
 
-    const int resident_warps = static_cast<int>(blockDim.x) >> 5;
-    for (int token = tid >> 5; token < Tokens; token += resident_warps) {
-        sparse_moe_select_top8_warp(scores[token], token_ids + token * kTopK,
-                                    token_alpha + token * kTopK, shared_scale + token,
-                                    selected_logits[token]);
-    }
-}
-
-template <int Tokens>
-__global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__ partial_scores,
-                                                       int* __restrict__ token_ids,
-                                                       float* __restrict__ token_alpha,
-                                                       float* __restrict__ shared_scale) {
-    static_assert(Tokens >= 45 && Tokens <= kSparseMoeSmallTMax);
-    constexpr int kBatchTokens = 32;
-    __shared__ float scores[kBatchTokens][kRouterRows];
-    __shared__ float selected_logits[kBatchTokens][kTopK];
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    if (tid == 0) { pdl::trigger_dependents(); }
-    pdl::wait_for_dependencies();
-
-#pragma unroll
-    for (int token_begin = 0; token_begin < Tokens; token_begin += kBatchTokens) {
-        const int batch_tokens = min(kBatchTokens, Tokens - token_begin);
-        for (int index = tid; index < batch_tokens * kRouterRows; index += kBatchTokens * 32) {
-            const int token = index / kRouterRows;
-            const int row   = index - token * kRouterRows;
-            float sum       = 0.0f;
-#pragma unroll
-            for (int partition = 0; partition < kRouterPartitions; ++partition) {
-                sum +=
-                    partial_scores[((static_cast<std::int64_t>(token_begin + token) * kRouterRows +
-                                     row) *
-                                    kRouterPartitions) +
-                                   partition];
-            }
-            scores[token][row] = sum;
-        }
-        __syncthreads();
-        if (warp < batch_tokens) {
-            const int token = token_begin + warp;
-            sparse_moe_select_top8_warp(scores[warp], token_ids + token * kTopK,
-                                        token_alpha + token * kTopK, shared_scale + token,
-                                        selected_logits[warp]);
-        }
-        __syncthreads();
+    if (tid < 32) {
+        sparse_moe_select_top8_warp(scores, token_ids + token * kTopK, token_alpha + token * kTopK,
+                                    shared_scale + token, selected_logits);
     }
 }
 
@@ -152,19 +114,11 @@ void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* parti
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int Tokens>
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
-               cudaStream_t stream) {
-    constexpr int kThreads = (Tokens < 32 ? Tokens : 32) * 32;
-    if constexpr (Tokens <= 44) {
-        CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
-                                         sparse_moe_small_t_s2_kernel<Tokens>, partial_scores,
-                                         token_ids, token_alpha, shared_scale));
-    } else {
-        CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
-                                         sparse_moe_small_t_s2_two_batch_kernel<Tokens>,
-                                         partial_scores, token_ids, token_alpha, shared_scale));
-    }
+               std::int32_t tokens, cudaStream_t stream) {
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned int>(tokens)), dim3(kS2Threads), 0, stream},
+        sparse_moe_small_t_s2_kernel, partial_scores, token_ids, token_alpha, shared_scale));
 }
 
 void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
@@ -340,11 +294,11 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
                           static_cast<float*>(workspace.scratch.data), stream);
-        launch_s2<Tokens>(static_cast<const float*>(workspace.scratch.data),
-                          static_cast<int*>(workspace.token_ids.data),
-                          static_cast<float*>(workspace.token_alpha.data),
-                          static_cast<float*>(workspace.shared_scale.data), stream);
     });
+    launch_s2(static_cast<const float*>(workspace.scratch.data),
+              static_cast<int*>(workspace.token_ids.data),
+              static_cast<float*>(workspace.token_alpha.data),
+              static_cast<float*>(workspace.shared_scale.data), plan.tokens, stream);
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }

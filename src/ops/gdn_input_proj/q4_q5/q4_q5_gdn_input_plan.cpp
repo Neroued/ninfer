@@ -26,8 +26,8 @@ struct RouteSpec {
 };
 
 constexpr std::array<RouteSpec, 2> kRoutes{{
-    {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+    {{1, 15}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{16, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {

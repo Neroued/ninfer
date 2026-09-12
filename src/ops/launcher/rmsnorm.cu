@@ -11,6 +11,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Past this many blocks the gated epilogue gives up its hoisted loads. Below one block per SM the
+// prefetch is the only source of overlap and those kernels run at 0.83x to 0.96x; above it a
+// second resident block already supplies that overlap and only the register cost is left (35 -> 50
+// on the warp kernel), which measures 1.02x to 1.14x. Swept over grid size on both gated shapes
+// the crossing sits between 176 and 192 blocks; this is the 170 SMs of this part, a literal
+// because nothing in the tree queries the device, so it is not portable.
+constexpr std::int64_t kRmsPrefetchBlocks = 170;
+
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
@@ -20,6 +28,36 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
 
+    // The hoisted weight and gate cost registers. Measured at 512-thread blocks, only the
+    // gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48, both
+    // three blocks to two, while every other instantiation stays at three. So only that epilogue
+    // consults the grid, and the un-prefetched instantiation is compiled only where it is reached.
+    constexpr bool kGateOnGrid = Epilogue == RmsEpilogue::Gated;
+
+    if constexpr (Epilogue != RmsEpilogue::Gated) {
+        if (aligned2 && d == 5120) {
+            // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
+            // with hoisted gains wins the hidden-row sweep through prefill.
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 10, true, 5120>
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
+    }
+    if constexpr (Epilogue == RmsEpilogue::Offset) {
+        if (aligned2 && d == 256) {
+            // One warp per row, four rows per CTA across both query and key projections.
+            constexpr int block = 128;
+            rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>
+                <<<static_cast<unsigned>((rows + 3) / 4), block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
+    }
     if (aligned2 && d == 128 && Epilogue == RmsEpilogue::Plain) {
         // Plain per-head D128 is latency-bound for Q32/KV8 rows. Four rows per CTA follows the
         // measured lower envelope from T=1 through the 1024-token prefill point.
@@ -35,7 +73,17 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kBlock         = 512;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock><<<blocks, kBlock, 0, stream>>>(
+        if constexpr (kGateOnGrid) {
+            if (blocks > kRmsPrefetchBlocks) {
+                rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false><<<blocks, kBlock, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                return;
+            }
+        }
+        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, true><<<blocks, kBlock, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
@@ -49,14 +97,27 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
     } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6>
+        // 30 -> 34 registers at Block=256, which is 6 blocks per SM either way under the
+        // 1536-thread cap, so this route pays no occupancy for the prefetch and is not gated.
+        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6, true>
             <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
                 reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8>
+        if constexpr (kGateOnGrid) {
+            if (rows > kRmsPrefetchBlocks) {
+                rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>
+                    <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                        reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                        reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                return;
+            }
+        }
+        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, true>
             <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),

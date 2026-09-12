@@ -36,13 +36,17 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
  * Scatter compact request-major BF16 blocks into lane-owned fixed storage.
  *
  * source is contiguous [D,W,B], lanes and valid_columns are contiguous I32 [B], and destination
- * is a possibly row-sliced [D,W,C] view. For each b and j<valid_columns[b]:
+ * is a possibly row-sliced [D,W,C] view with dense rows and explicit column/lane strides.
+ * C is lane capacity, independent of B; a feature slice retains its parent storage strides.
+ * For each b and j<valid_columns[b]:
  *
  *   destination[:,j,lanes[b]] = source[:,j,b]
  *
- * Columns j>=valid_columns[b] and every unselected lane remain unchanged. The caller guarantees
- * 0<=valid_columns[b]<=W and 0<=lanes[b]<C. D is divisible by eight and all column starts are
- * 16-byte aligned. Inputs and destination do not alias.
+ * Columns j>=valid_columns[b], every unselected lane and rows outside the destination slice
+ * remain unchanged. The caller supplies distinct lanes in [0,C), valid_columns in [0,W], and
+ * strides describing disjoint columns/lanes. D is divisible by eight and all column starts are
+ * 16-byte aligned. Inputs and destination do not alias. There is no workspace; device zero
+ * counts leave the corresponding lane unchanged without reading source values.
  */
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
                         Tensor& destination, cudaStream_t stream);

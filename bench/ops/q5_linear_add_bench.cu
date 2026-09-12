@@ -4,8 +4,8 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
-#include "quantized_weight.cuh"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
+#include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
 
@@ -28,7 +28,7 @@ constexpr std::size_t kFlushBytes = 256ULL << 20;
 
 struct Options {
     std::int32_t hidden = 0;
-    std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 24, 25, 32, 48};
+    std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 24, 25, 32, 48, 49, 56, 64, 192, 193};
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;

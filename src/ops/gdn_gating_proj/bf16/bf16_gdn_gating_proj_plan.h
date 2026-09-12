@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
@@ -37,6 +38,7 @@ struct Bf16GdnGatingPlan {
 };
 
 enum class Bf16GdnNormGatingScheduleId {
+    FusedSimt27,
     Composed,
     MmaCooperativeSplit32,
 };
@@ -66,18 +68,18 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                  Tensor& g, Tensor& beta, cudaStream_t stream);
+                                  Tensor& g, Tensor& beta, DeviceExecutionView execution);
 void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const Tensor& x,
                                        const Weight& a_weight, const Weight& b_weight,
                                        const Tensor& A_log, const Tensor& dt_bias,
                                        WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                                       cudaStream_t stream);
+                                       DeviceExecutionView execution);
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                              Tensor& g, Tensor& beta, cudaStream_t stream);
+                              Tensor& g, Tensor& beta, DeviceExecutionView execution);
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, cudaStream_t stream);
+                                   Tensor& g, Tensor& beta, DeviceExecutionView execution);
 
 } // namespace ninfer::ops::detail

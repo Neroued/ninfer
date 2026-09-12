@@ -34,9 +34,27 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, First + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kVocabularyLaunchers =
-    make_launchers<W8VocabularyProjectionGeometry, kW8VocabularyFirstSmallT>(
-        std::make_index_sequence<kW8VocabularyLastSmallT - kW8VocabularyFirstSmallT + 1>{});
+template <int Capacity>
+void launch_vocabulary_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Geometry = W8VocabularyProjectionGeometry;
+    using Schedule = W8SmallTMmaSchedule<Capacity <= 32 ? 8 : 4, Capacity, 2,
+                                         W8SmallTMmaScaleAccess::Shared>;
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
+                          W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
+        <<<Geometry::kOutputRows / 16, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
+            W8SmallTMmaIdentityRows{}, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <std::size_t... I>
+constexpr auto vocabulary_launchers(std::index_sequence<I...>) {
+    return std::array<W8Launch, sizeof...(I)>{&launch_vocabulary_tile<8 * (static_cast<int>(I) + 1)>...};
+}
+constexpr auto kVocabularyLaunchers = vocabulary_launchers(std::make_index_sequence<5>{});
 constexpr auto kMtpInputLaunchers =
     make_launchers<W8MtpInputProjectionGeometry, kW8MtpInputFirstSmallT>(
         std::make_index_sequence<kW8MtpInputLastSmallT - kW8MtpInputFirstSmallT + 1>{});
@@ -56,6 +74,9 @@ constexpr auto kMtpDownLaunchers =
 constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeometry,
                                                            kW835bMtpProjectionFirstSmallT>(
     std::make_index_sequence<kW835bMtpProjectionLastSmallT - kW835bMtpProjectionFirstSmallT + 1>{});
+constexpr auto kDFlash2AttentionLaunchers = make_launchers<W8DFlash2AttentionProjectionGeometry,
+                                                           kW8DFlash2AttentionFirstSmallT>(
+    std::make_index_sequence<kW8DFlash2AttentionLastSmallT - kW8DFlash2AttentionFirstSmallT + 1>{});
 
 } // namespace
 
@@ -64,7 +85,7 @@ void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaS
         weight.k == W8VocabularyProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8VocabularyProjectionGeometry::kInputRows &&
         x.ne[1] >= kW8VocabularyFirstSmallT && x.ne[1] <= kW8VocabularyLastSmallT) {
-        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8VocabularyFirstSmallT);
+        const std::size_t index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
         kVocabularyLaunchers[index](x, weight, out, stream);
         return;
     }
@@ -116,6 +137,15 @@ void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaS
         const std::size_t index =
             static_cast<std::size_t>(x.ne[1] - kW835bMtpProjectionFirstSmallT);
         k35bMtpProjectionLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2AttentionProjectionGeometry::kOutputRows &&
+        weight.k == W8DFlash2AttentionProjectionGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2AttentionProjectionGeometry::kInputRows &&
+        x.ne[1] >= kW8DFlash2AttentionFirstSmallT && x.ne[1] <= kW8DFlash2AttentionLastSmallT) {
+        const std::size_t index =
+            static_cast<std::size_t>(x.ne[1] - kW8DFlash2AttentionFirstSmallT);
+        kDFlash2AttentionLaunchers[index](x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("W8 Linear small-T: unsupported exact problem");

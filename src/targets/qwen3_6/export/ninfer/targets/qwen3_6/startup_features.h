@@ -4,6 +4,10 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+[[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+}
+
 struct StartupFeatures {
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
@@ -18,6 +22,14 @@ struct StartupFeatures {
     [[nodiscard]] bool mtp() const noexcept { return speculative == SpeculativeBackend::Mtp; }
 
     [[nodiscard]] bool dflash() const noexcept { return speculative == SpeculativeBackend::DFlash; }
+
+    [[nodiscard]] bool dflash2() const noexcept {
+        return speculative == SpeculativeBackend::DFlash2;
+    }
+
+    [[nodiscard]] bool masked_draft() const noexcept {
+        return is_masked_draft_backend(speculative);
+    }
 
     [[nodiscard]] bool optimized_proposal() const noexcept {
         return speculative_enabled() && proposal_head == ProposalHead::Optimized;

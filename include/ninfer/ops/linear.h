@@ -61,10 +61,12 @@ enum class LinearPolicy : std::uint8_t {
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
- * problems register the five non-vocabulary FP8 geometries and accept every positive T. Text and
- * MTP packed-weight problems accept every positive column extent T. Registered Vision problems
- * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
- * not inherently represent a text token. FP32_CTRL is unsupported.
+ * problems register the five non-vocabulary FP8 geometries and accept every positive T. W8 also
+ * registers `[5120,25600]` at every positive T. BF16_CTRL registers `[14336,5120]`,
+ * `[5120,6144]`, and `[256,5120]` at every positive T. Text and MTP packed-weight problems accept
+ * every positive column extent T. Registered Vision problems accept raw-patch P in
+ * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
+ * represent a text token. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

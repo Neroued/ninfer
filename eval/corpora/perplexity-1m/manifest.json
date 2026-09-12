@@ -1,0 +1,111 @@
+{
+  "corpus_id": "ninfer-ppl-1m-v1",
+  "streams": [
+    {
+      "id": "wikitext-00",
+      "domain": "english_reference",
+      "path": "data/wikitext/00.txt"
+    },
+    {
+      "id": "wikitext-01",
+      "domain": "english_reference",
+      "path": "data/wikitext/01.txt"
+    },
+    {
+      "id": "wikitext-02",
+      "domain": "english_reference",
+      "path": "data/wikitext/02.txt"
+    },
+    {
+      "id": "wikitext-03",
+      "domain": "english_reference",
+      "path": "data/wikitext/03.txt"
+    },
+    {
+      "id": "pg19-00",
+      "domain": "english_long_form",
+      "path": "data/pg19/00.txt"
+    },
+    {
+      "id": "pg19-01",
+      "domain": "english_long_form",
+      "path": "data/pg19/01.txt"
+    },
+    {
+      "id": "pg19-02",
+      "domain": "english_long_form",
+      "path": "data/pg19/02.txt"
+    },
+    {
+      "id": "pg19-03",
+      "domain": "english_long_form",
+      "path": "data/pg19/03.txt"
+    },
+    {
+      "id": "zhwiki-00",
+      "domain": "chinese_reference",
+      "path": "data/zhwiki/00.txt"
+    },
+    {
+      "id": "zhwiki-01",
+      "domain": "chinese_reference",
+      "path": "data/zhwiki/01.txt"
+    },
+    {
+      "id": "zhwiki-02",
+      "domain": "chinese_reference",
+      "path": "data/zhwiki/02.txt"
+    },
+    {
+      "id": "zhwiki-03",
+      "domain": "chinese_reference",
+      "path": "data/zhwiki/03.txt"
+    },
+    {
+      "id": "ninfer-00",
+      "domain": "ninfer_code",
+      "path": "data/ninfer/00.txt"
+    },
+    {
+      "id": "ninfer-01",
+      "domain": "ninfer_code",
+      "path": "data/ninfer/01.txt"
+    },
+    {
+      "id": "ninfer-02",
+      "domain": "ninfer_code",
+      "path": "data/ninfer/02.txt"
+    },
+    {
+      "id": "ninfer-03",
+      "domain": "ninfer_code",
+      "path": "data/ninfer/03.txt"
+    }
+  ],
+  "modes": {
+    "quick": [
+      "wikitext-00",
+      "pg19-00",
+      "zhwiki-00",
+      "ninfer-00"
+    ],
+    "full": [
+      "wikitext-00",
+      "wikitext-01",
+      "wikitext-02",
+      "wikitext-03",
+      "pg19-00",
+      "pg19-01",
+      "pg19-02",
+      "pg19-03",
+      "zhwiki-00",
+      "zhwiki-01",
+      "zhwiki-02",
+      "zhwiki-03",
+      "ninfer-00",
+      "ninfer-01",
+      "ninfer-02",
+      "ninfer-03"
+    ]
+  }
+}

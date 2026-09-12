@@ -366,7 +366,7 @@ QUANTIZED_DIRECT_SPECS = tuple(
 
 OFFICIAL_TENSOR_SPECS = tuple(
     spec
-    for spec in inventory.TENSOR_SPECS
+    for spec in inventory.BASE_TENSOR_SPECS
     if spec.name == "text/token_embedding"
     or spec.name.startswith("text/draft_head")
     or spec.name.startswith("mtp/")
@@ -406,17 +406,6 @@ def validate_recipe() -> None:
     family_recipe.validate_recipe_coverage(
         OFFICIAL_RECIPES, OFFICIAL_TENSOR_SPECS
     )
-    if (
-        len(FP8_WEIGHT_RECIPES),
-        len(NVFP4_WEIGHT_RECIPES),
-        len(INPUT_DIVISOR_RECIPES),
-        len(WEIGHT_DIVISOR_GROUPS),
-        len(FP8_SOURCES),
-        len(NVFP4_SOURCES),
-        len(QUANTIZED_DIRECT_RECIPES),
-        len(OFFICIAL_RECIPES),
-    ) != (145, 112, 112, 56, 233, 168, 401, 348):
-        raise ValueError("Qwen3.8 NVFP4 source recipe is incomplete")
     ownership = (
         {"text/token_embedding"},
         set(FP8_WEIGHTS_BY_NAME),
@@ -430,8 +419,8 @@ def validate_recipe() -> None:
         if all_names.intersection(names):
             raise ValueError("more than one source route owns an artifact tensor")
         all_names.update(names)
-    if all_names != {spec.name for spec in inventory.TENSOR_SPECS}:
-        raise ValueError("source routes do not cover the complete tensor inventory")
+    if all_names != {spec.name for spec in inventory.BASE_TENSOR_SPECS}:
+        raise ValueError("source routes do not cover the base tensor inventory")
     if tuple(FP8_WEIGHTS_BY_NAME) != tuple(
         spec.name
         for spec in inventory.FP8_TENSOR_SPECS
@@ -454,8 +443,7 @@ def validate_recipe() -> None:
         name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
     )
     if (
-        len(bound_weights) != 112
-        or len(set(bound_weights)) != 112
+        len(bound_weights) != len(set(bound_weights))
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents once")

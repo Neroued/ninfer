@@ -29,10 +29,6 @@ constexpr std::array<std::byte, 8> kMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
     std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
 };
-constexpr std::array<std::byte, 8> kV1Magic = {
-    std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
-    std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{1},
-};
 constexpr std::uint64_t kPrefixBytes      = 16;
 constexpr std::uint64_t kPayloadAlignment = 4096;
 
@@ -273,10 +269,6 @@ struct Reader::Impl {
     explicit Impl(const std::filesystem::path& path) : file(path) {
         if (file.size() < kPrefixBytes) {
             throw ArtifactError("artifact is shorter than the v2 prefix");
-        }
-        if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
-            throw ArtifactError("NInfer artifact v1 is no longer supported; migrate it with: "
-                                "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>");
         }
         if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
             throw ArtifactError("artifact magic is not NInfer v2");

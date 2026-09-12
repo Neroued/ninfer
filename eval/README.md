@@ -2,8 +2,8 @@
 
 `eval/` contains the repository-local capability evaluation coordinator. It can evaluate this
 project's server, another local OpenAI-compatible service, or a remote online model. The inference
-engine is only one possible target; its single-sequence limitation is represented by
-`max_concurrency: 1`, not built into the framework.
+engine is only one possible target; each target and job declares the concurrency admitted by that
+particular server run instead of baking an Engine policy into the framework.
 
 EvalScope is the first real evaluation backend. The coordinator, configuration, logging, progress,
 resume, and result contracts do not import or depend on EvalScope. The deterministic `mock` backend
@@ -28,6 +28,13 @@ Qwen model or create a `.ninfer` artifact.
 See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the initial AIME25,
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
+
+The published Qwen3.6 reasoning runs retain their exact configurations in
+[`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml),
+[`configs/qwen3_6_35b_aime.yaml`](configs/qwen3_6_35b_aime.yaml), and
+[`configs/qwen3_6_35b_gpqa.yaml`](configs/qwen3_6_35b_gpqa.yaml). The Qwen3.8 groupwise-int and
+NVFP4 campaigns use their format-specific reasoning configurations and managed scripts documented
+below.
 
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
@@ -62,8 +69,9 @@ Concurrency has two levels:
 - optional job `max_concurrency` caps how many target slots one job may reserve.
 
 For EvalScope, the granted job slots become `eval_batch_size`. Multiple jobs sharing a target can
-never reserve more slots than the target capacity. Set the local `ninfer-serve` target to one; set a
-larger explicit value for an online service that supports it.
+never reserve more slots than the target capacity. For `ninfer-serve`, match the target capacity to
+the server's startup `--max-concurrency`; an individual long-output job may set a lower concurrency
+when its KV entitlement requires it.
 
 Portable generation settings live under `generation`. Evaluator-specific controls live under
 `backend_args`; unknown fields are rejected rather than silently ignored.
@@ -239,6 +247,32 @@ Every run is stored below `eval/runs/<timestamp>-<config-hash>/`:
 
 The sample-retention policy is recorded in the manifest. API keys and known secret values are
 redacted from coordinator events and task snapshots.
+
+## Historical Qwen3.6-27B reasoning profile
+
+The published Qwen3.6-27B scores and per-dataset correct/total counts are recorded in the
+[groupwise-int model card](../model-cards/Qwen3.6-27B-NInfer/README.md#evaluation) and
+[NVFP4 model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md#evaluation).
+Those runs used EvalScope 1.9.0, one sample per problem, and the sampling settings recorded on
+the cards. The current pinned evaluation environment is newer; rerunning the commands below
+reproduces the workload on the selected environment, not the historical score automatically.
+
+The NVFP4 serving command was:
+
+```bash
+build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 18080 \
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+Run the configured reasoning suite in a separate shell using the evaluation environment above:
+
+```bash
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/qwen3_6_27b_reasoning.yaml \
+  --suite reasoning_full
+```
 
 ## Scores
 

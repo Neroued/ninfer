@@ -10,6 +10,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/pressure_planner.h"
 #include "targets/qwen3_6/impl/runtime/api_impl.h"
 
 #include "targets/qwen3_6/impl/runtime/layouts_impl.h"

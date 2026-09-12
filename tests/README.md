@@ -20,22 +20,28 @@ benchmark-report, and external protocol behavior. Repository verification princi
   alignment, Vision control, and family runtime mechanisms;
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix test;
+  prefix test and causal-scoring State/KV isolation test;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
-- `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
-  activation alignment, rejection, and peak semantics;
-- `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
-  `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
-  Responses Item/state/SSE behavior, and incremental tool-call behavior;
-- `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
-  preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
-- `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
-- `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_openai_schema.cpp`, `test_openai_responses.cpp`,
+  `test_openai_responses_store.cpp`, `test_anthropic_schema.cpp`, and
+  `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
+  schema-guided tool-argument normalization, structural fallback, and chunk-invariant incremental
+  tool-call behavior;
+- `test_materialization_budget.cpp` — deterministic planning-budget and shared admission-boundary behavior;
+- `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
+  representative Serve request/throughput pretty records, failure severity, zero-field elision,
+  and exclusion of arbitrary client error text;
+- `test_pretty_logging.cpp` — observable Service/Tool prefixes and separation of executable identity
+  from the human-readable record body;
+- `test_http_error_handler.cpp` — protocol-shaped payload-limit errors and application-error
+  preservation;
+- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v14 reports;
+- `test_bench_matrix.py` — schema-v14 report consumption by the Python matrix summarizer;
+- `test_serve_corpus.py` — current serving request-log identity at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -68,12 +74,17 @@ Enable uniform floating-point error records when establishing or reviewing an Op
 
 ```bash
 NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|gqa_attention)_test$'
+  ctest --test-dir build -V -R '^ninfer_(rmsnorm|softmax_attention)_test$'
 ```
 
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
+
+The variable-width DFlash2 target-attention subset can be run with
+`./build/tests/ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
+cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
+updates. The default executable also runs the existing attention geometries and prefill tests.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
@@ -98,15 +109,16 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/convert \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
-artifact. The 35B-A3B reference binding test follows the same rule with
-`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
-target tests still run without either artifact.
+The Python suites cover generic artifact framing and exact converter inventories, source recipes,
+encoders, and payload verification. Model execution and real-artifact binding are tested through
+the C++ target and Engine suites below; there is no Python inference implementation. The two
+official source-resource preflight checks are opt-in: set `NINFER_QWEN3_6_27B_MODEL` and/or
+`NINFER_QWEN3_6_35B_A3B_MODEL` to the corresponding source checkpoint directory. Only those
+source-dependent checks are skipped when their variable is absent.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
@@ -114,6 +126,14 @@ runs the real engine:
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
+The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
+score tile, overlapping target suffixes, and repeated-window State/KV isolation:
+
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_score_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:
@@ -179,3 +199,36 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## DFlash2 Engine integration
+
+The real test uses one explicit companion artifact and compares a fixed greedy fixture and its
+penalty-count variant with ordinary decoding. It also checks compact batches with unequal output
+budgets, same-seed stochastic replay, retained/fresh prefix behavior, and absence of a full backend
+KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
+boundary, stops after one target column at token 64, and checks the exact retained frontier and
+subsequent generation with and without reuse.
+The KV Store test checks exact mapping and reservation accounting for the same transition.
+K>=7 also exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
+local ring wrap, and the logical context-capacity tail. Optional Vision runs image/video capture
+and prefix restore. Zero extra Device StateImage slots exercise Host snapshot/restore.
+
+```bash
+cmake --build build -j --target ninfer_qwen3_8_27b_dflash2_real_test
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
+  build/tests/ninfer_qwen3_8_27b_dflash2_real_test 15 1 1 8
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
+  build/tests/ninfer_qwen3_8_27b_dflash2_real_test 7 1 0 2 bf16 1 0
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/ninfer_qwen3_8_27b_dflash2_real_test 2 0 0 2 int8
+```
+
+Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16` or `int8`),
+Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
+integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
+the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
+
+The old/new Qwen3.8 binding matrix uses `out/qwen3_8_27b_old.ninfer` and
+`out/qwen3_8_27b_nvfp4_old.ninfer` for the legacy inventories, and the canonical filenames above
+for the companion artifacts. The legacy paths may be overridden with
+`NINFER_QWEN3_8_27B_OLD_WEIGHTS` and `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`.

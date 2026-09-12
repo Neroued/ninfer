@@ -30,6 +30,7 @@ struct Invocation {
     std::int32_t t;
     CallForm call_form       = CallForm::Policy;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    bool graph_replay        = false;
 };
 
 struct ShapeCase {

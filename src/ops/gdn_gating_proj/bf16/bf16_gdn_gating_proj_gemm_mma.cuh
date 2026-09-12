@@ -9,8 +9,8 @@
 // 64 (35B) tokens.
 // Split-K routes use a tuned eight- or sixteen-warp specialization and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
-// eight warps for more independent MMA accumulators. Both preserve a single
-// kernel launch.
+// eight warps for more independent MMA accumulators. One cooperative launch remains fused, while
+// its launcher may submit independent token-tile slices when the whole grid cannot reside.
 
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"

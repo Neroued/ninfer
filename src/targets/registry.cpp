@@ -4,7 +4,9 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/startup.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_cost.h"
 
 #include <chrono>
 #include <cstdint>
@@ -62,10 +64,6 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
-artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
-    return artifact::LoadProgress{.callback = progress.callback};
-}
-
 std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
@@ -90,9 +88,18 @@ template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
+    StartupPhaseScope target_plan_phase(options.startup_observer, StartupPhase::TargetPlan);
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
+    const runtime::ContextCostIdentity context_cost_identity{
+        .hardware_class = runtime::context_cost_hardware_class(
+            device.props.name, device.props.major, device.props.minor),
+        .model_id   = identity.model_id,
+        .weights_id = identity.weights_id,
+    };
+    runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
+        context_cost_identity, options.context_cost.preset_path);
 
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
@@ -101,12 +108,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+    target_plan_phase.complete();
 
-    auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                              progress.callback ? &progress : nullptr);
+                                              &options.startup_observer);
     const artifact::MaterializationStats stats = materialized.stats();
 
+    StartupPhaseScope target_finalize_phase(options.startup_observer, StartupPhase::TargetFinalize);
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
@@ -116,10 +124,18 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model), options);
-    auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
-                                               std::move(sequence_plan), device);
+    target_finalize_phase.complete();
+
+    StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
+    auto loaded = std::make_unique<Loaded>(std::move(model), options);
+    frontend_phase.complete();
+
+    StartupPhaseScope program_phase(options.startup_observer, StartupPhase::ProgramInitialize);
+    auto instance =
+        std::make_unique<Instance>(std::move(loaded), capacity_resolution, std::move(sequence_plan),
+                                   device, options.startup_observer);
     device.synchronize();
+    program_phase.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 
     LoadSummary summary;
@@ -133,9 +149,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
+    summary.context_cost         = context_cost.summary;
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
-                             .sampling_defaults = sampling_defaults};
+                             .sampling_defaults = sampling_defaults,
+                             .context_cost      = std::move(context_cost.model)};
 }
 
 } // namespace
@@ -149,11 +167,12 @@ LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
-                                         DeviceContext& device)
+                                         DeviceContext& device,
+                                         const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device,
+                                          startup_observer)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -166,11 +185,12 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               DeviceContext& device)
+                                               DeviceContext& device,
+                                               const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
+                                             startup_observer)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
@@ -178,7 +198,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     validate_options(options);
     const auto load_start = Clock::now();
 
+    StartupPhaseScope inspect_phase(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
+    inspect_phase.complete();
     const auto& identity = reader.identity();
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(

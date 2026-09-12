@@ -1,4 +1,5 @@
 #include "ninfer/ops/gated_rmsnorm.h"
+#include "core/device.h"
 #include "ops/norm_test_common.h"
 
 #include <cmath>
@@ -42,16 +43,18 @@ std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
 }
 
 int run_case(const char* label, const Shape& shape, std::uint32_t seed, float input_scale = 4.0F,
-             bool bf16x2_unaligned = false) {
+             bool bf16x2_unaligned = false, bool graph = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d), gate(count);
     fill_uniform(input, seed, -input_scale, input_scale);
     fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
     fill_uniform(gate, seed + 2U, -5.0F, 5.0F);
+    gate.front() = 0.0F;
+    gate.back() = -0.0F;
     round_to_bf16(input);
     round_to_bf16(weight);
     round_to_bf16(gate);
-    const std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+    std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape);
 
     DeviceInput device_input  = make_input(input, bf16x2_unaligned);
     DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
@@ -67,6 +70,31 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     Tensor output_tensor = tensor_for(output_data, shape);
     ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, nullptr);
     cuda_synchronize();
+
+    if (graph) {
+        cudaStream_t stream;
+        cudaGraph_t captured;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (std::size_t i = 0; i < gate.size(); ++i) {
+            gate[i] = -gate[i];
+            device_gate.expected[i + leading / sizeof(std::uint16_t)] = f32_to_bf16(gate[i]);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(device_gate.storage.p, device_gate.expected.data(),
+            device_gate.storage.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(captured));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+    }
 
     int failures = verify_reduction(label, from_device_bf16(output_data, count), reference,
                                     gated_rmsnorm_bf16_criterion());
@@ -87,7 +115,11 @@ int main() {
 
     int failures = 0;
     failures += run_case("gated_rmsnorm [128,48,1]", {128, 48}, 1401U);
-    failures += run_case("gated_rmsnorm [128,48,48]", {128, 48, 48}, 1406U);
+    for (int columns : {2, 7, 16, 48, 56, 57, 64, 96, 128}) {
+        const std::string label = "gated_rmsnorm target [128,48," + std::to_string(columns) + "]";
+        failures += run_case(label.c_str(), {128, 48, columns}, 1420U + columns,
+                             4.0F, false, columns == 56 || columns == 57 || columns == 128);
+    }
     failures += run_case("gated_rmsnorm [128,32,7]", {128, 32, 7}, 1402U);
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);

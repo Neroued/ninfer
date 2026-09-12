@@ -88,7 +88,7 @@ bool private_ipv4(std::uint32_t address) {
     const std::uint32_t a = ntohl(address);
     return (a >> 24U) == 0 || (a >> 24U) == 10 || (a >> 24U) == 127 || (a >> 16U) == 0xa9fe ||
            (a >> 20U) == 0xac1 || (a >> 16U) == 0xc0a8 || (a >> 22U) == 0x0191 ||
-           (a >> 17U) == 0x633f || (a >> 24U) >= 224;
+           (a >> 17U) == 0x6309 || (a >> 24U) >= 224;
 }
 
 bool private_address(const sockaddr* address) {

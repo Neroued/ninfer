@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "core/nvtx.h"
+
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -13,6 +15,7 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
         }
         executable->launch(state.execution.device.stream);
     } else {
+        nvtx::ScopedRange eager_range(nvtx::Name::DecodeEager, nvtx::Category::Decode);
         body();
     }
 }

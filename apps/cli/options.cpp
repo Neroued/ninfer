@@ -55,6 +55,9 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
+    if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -77,19 +80,23 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
+           "N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-cuda-graph]\n"
+           "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
+           "toward --max-new.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -143,6 +150,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--thinking-budget") {
+            options.thinking_budget = parse_u32(value(arg), "thinking-budget");
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
@@ -170,9 +179,7 @@ Options parse_options(int argc, char** argv) {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-                throw std::invalid_argument("--top-k exceeds INT32_MAX");
-            }
+            if (top_k > 20) { throw std::invalid_argument("--top-k must be in [0,20]"); }
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);
@@ -186,6 +193,8 @@ Options parse_options(int argc, char** argv) {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--log-level") {
+            options.log_level = product::parse_log_level(value(arg));
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
@@ -208,11 +217,11 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
-    }
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
+    }
+    if (!options.enable_thinking && options.thinking_budget) {
+        throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
     return options;

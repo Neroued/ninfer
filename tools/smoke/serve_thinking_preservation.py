@@ -190,13 +190,13 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     paths = [item.get("result", {}).get("prefix_reuse_path") for item in chat_done]
     require(
         paths == [
-            "full_reset",
-            "restore_turn_checkpoint",
-            "restore_turn_checkpoint",
-            "full_reset",
-            "full_reset",
-            "restore_turn_checkpoint",
-            "full_reset",
+            "root",
+            "private_turn_closure",
+            "private_turn_closure",
+            "root",
+            "root",
+            "private_turn_closure",
+            "root",
         ],
         f"unexpected Chat reuse paths: {paths}",
     )
@@ -244,7 +244,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     ]
     require(
         response_paths
-        == ["full_reset", "restore_response_checkpoint", "full_reset"],
+        == ["root", "private_response_replay", "root"],
         f"unexpected Responses reuse paths: {response_paths}",
     )
 

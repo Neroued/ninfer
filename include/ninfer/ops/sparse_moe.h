@@ -23,6 +23,20 @@ enum class SparseMoeEpilogue : std::uint8_t {
 };
 
 /**
+ * Optional per-call execution hints. Every field is a pure cache hint with no numeric effect:
+ * the same call with a default-constructed SparseMoeHints produces bit-identical output.
+ *
+ * next_weight_prefetch names a weight span the next decode-step consumer will stream; the decode
+ * D4 epilogue issues fire-and-forget L2 prefetches over its first bytes. The span is caller-owned
+ * and read once, inside the call: the Op keeps no state between calls, and no hidden channel
+ * carries it.
+ */
+struct SparseMoeHints {
+    const void* next_weight_prefetch       = nullptr;
+    std::size_t next_weight_prefetch_bytes = 0;
+};
+
+/**
  * Returns the transient capacity required by SparseMoe for every T in the inclusive
  * [min_tokens,max_tokens] interval. The routed QTypes are the fixed implementation profile.
  * Invalid profiles or intervals throw.
@@ -61,5 +75,13 @@ enum class SparseMoeEpilogue : std::uint8_t {
  */
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * The same Op with caller-supplied execution hints. Semantics, workspace requirement and output
+ * are exactly those of the overload above; hints only steer cache warming.
+ */
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
+                cudaStream_t stream);
 
 } // namespace ninfer::ops

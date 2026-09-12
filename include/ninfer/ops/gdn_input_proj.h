@@ -195,14 +195,17 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * Op: gdn_input_proj_conv_record
  *
  * For each batch row, evaluates the registered projection, width-four causal convolution, SiLU,
- * and q/k/value/z split from the BF16 history selected by initial_state_slots. It writes the BF16
- * represented projection column consumed by the convolution to conv_record [C,T,B]. Query, key,
+ * and q/k/value/z split from the BF16 history selected by initial_state_slots. It writes each BF16
+ * newest history column to conv_record [C,T,B]. Query, key,
  * and value are zero in each row's invalid tail; z is projected for every physical column.
  *
  * The execution domain is B=1..8 and T=2..16. valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
- * modified. Only the valid prefix of conv_record is semantically defined.
+ * modified. Only the valid prefix of conv_record is semantically defined. Outputs and valid
+ * record columns are bit-identical to the corresponding snapshot execution from the same initial
+ * history, inputs, physical T/B, format and policy; records equal its newest history columns.
+ * A private convolution intermediate need not be rounded to BF16 before use.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
@@ -217,9 +220,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 /**
  * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048], NVFP4
  * [16384,5120], and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only, NVFP4 admits
- * A16Only/AllowA4, and FP8 admits A16Only/AllowA8. For FP8 B=1, A16 is fused at W=2..3 and
- * W=7..10 and materialized otherwise; AllowA8 uses A8 from W=10. Batched AllowA8 uses A8 when
- * B*W>=8. Every tensor operand, the complete FP8 parent, and live workspace must be mutually
+ * A16Only/AllowA4, and FP8 admits A16Only/AllowA8. Record and snapshot share arithmetic route
+ * selection. Every tensor operand, the complete FP8 parent, and live workspace must be mutually
  * non-overlapping.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

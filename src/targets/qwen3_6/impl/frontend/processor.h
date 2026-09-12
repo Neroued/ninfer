@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <optional>
@@ -22,6 +23,8 @@ class MediaPreprocessCache;
 
 enum class ProcessorErrorKind {
     BudgetExceeded,
+    ContextLengthExceeded,
+    InvalidMedia,
 };
 
 class ProcessorError final : public std::runtime_error {
@@ -33,11 +36,6 @@ public:
 
 private:
     ProcessorErrorKind kind_;
-};
-
-enum class Modality : std::uint8_t {
-    Image = 1,
-    Video = 2,
 };
 
 struct VisionGrid {
@@ -93,8 +91,8 @@ struct ProcessorOptions {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
-    std::uint64_t max_raw_patches          = kMaximumVisionRawPatches;
-    std::uint64_t max_vision_tokens        = kMaximumVisionTokens;
+    std::uint64_t max_raw_patches          = kMaximumPromptVisionRawPatches;
+    std::uint64_t max_vision_tokens        = kMaximumPromptVisionTokens;
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;
     int video_max_frames                   = 768;
@@ -110,6 +108,9 @@ struct ProcessedInput {
     // One immutable row-major [raw_patches, 1536] payload per Vision item.
     std::vector<std::shared_ptr<const qwen3_6::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::vector<std::uint32_t> rewrite_execution_frontiers;
+    std::vector<std::optional<std::uint32_t>> message_boundaries;
+    std::vector<std::optional<std::uint32_t>> cache_boundaries;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -117,18 +118,38 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
+
+    struct MediaTokenRun {
+        TokenSpan tokens;
+        Modality modality       = Modality::Image;
+        std::size_t item_index  = 0;
+        std::size_t frame_index = 0;
+    };
+
+    std::vector<MediaTokenRun> media_token_runs;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::vector<std::uint32_t> rewrite_execution_frontiers;
+    std::vector<std::optional<std::uint32_t>> message_boundaries;
+    std::vector<std::optional<std::uint32_t>> cache_boundaries;
 };
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
+EncodedChat
+encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                     std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max());
 
 class Processor {
 public:
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
 
-    ProcessedInput process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
-                           const PreparationControl& control = {}) const;
+    [[nodiscard]] std::size_t count_tokens(std::vector<ChatMessage> messages,
+                                           ChatRenderOptions render_options  = {},
+                                           const PreparationControl& control = {}) const;
+
+    ProcessedInput
+    process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
+            const PreparationControl& control = {},
+            std::size_t maximum_prompt_tokens = std::numeric_limits<std::size_t>::max()) const;
 
 private:
     const Tokenizer& tokenizer_;

@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
@@ -333,6 +334,25 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         try {
             ops::linear_add(input, weight, residual_out, workspace, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
+            if (t == 128 && format == WeightFormat::Q5G64F16S) {
+                cudaStream_t stream;
+                cudaGraph_t graph;
+                cudaGraphExec_t executable;
+                CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+                ops::linear_add(input, weight, residual_out, workspace, stream);
+                CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+                for (int replay = 0; replay < 2; ++replay) {
+                    CUDA_CHECK(cudaMemcpyAsync(output.data(), residual.data(), output.bytes(),
+                        cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+                CUDA_CHECK(cudaGraphExecDestroy(executable));
+                CUDA_CHECK(cudaGraphDestroy(graph));
+                CUDA_CHECK(cudaStreamDestroy(stream));
+            }
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
             ++failures;

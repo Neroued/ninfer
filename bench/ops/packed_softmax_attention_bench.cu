@@ -1,7 +1,7 @@
 // Public-Op benchmark for plain/uniform and packed dense Softmax Attention.
-// Tile selection and launch decomposition remain private to vision_attention().
+// Tile selection and launch decomposition remain private to packed_softmax_attention().
 
-#include "ninfer/ops/vision_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -29,8 +29,10 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHeadDim     = 72;
-constexpr std::int32_t kHeads       = 16;
+constexpr std::int32_t kHeadDim = 72;
+constexpr std::int32_t kHeads   = 16;
+constexpr float kScale          = 0.11785113019775792073F;
+constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kHeads, kHeads};
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
 constexpr double kDenseBf16TcTflops = 209.5;
 constexpr double kRtx5090DramGBs    = 1792.0;
@@ -205,8 +207,8 @@ public:
           v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_)),
           cu_seqlens_((segment_lengths_.size() + 1) * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_ * 2)),
-          workspace_bytes_(ops::vision_attention_workspace_capacity_bytes(
-              tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
+          workspace_bytes_(ops::packed_softmax_attention_workspace_capacity_bytes(
+              kGeometry, tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
               static_cast<std::int32_t>(segment_lengths_.size()))),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),
@@ -225,11 +227,16 @@ public:
 
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Uniform) {
-            ops::vision_attention(q_tensor_, k_tensor_, v_tensor_, segment_lengths_.front(),
-                                  output_tensor_, stream);
+            if (segment_lengths_.size() == 1) {
+                ops::softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
+                                       workspace_, output_tensor_, stream);
+            } else {
+                ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
+                                              segment_lengths_.front(), output_tensor_, stream);
+            }
         } else {
-            ops::vision_attention(q_tensor_, k_tensor_, v_tensor_, cu_tensor_, workspace_,
-                                  output_tensor_, stream);
+            ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
+                                          cu_tensor_, workspace_, output_tensor_, stream);
         }
     }
 

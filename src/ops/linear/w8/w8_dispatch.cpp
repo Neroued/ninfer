@@ -1,4 +1,5 @@
 #include "ops/linear/w8/w8_dispatch.h"
+#include "ops/linear/w8/w8_feature.h"
 
 #include <stdexcept>
 
@@ -21,8 +22,10 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r32_c128;
         case 6144:
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            // Exact-T schedules own the DFlash2 decode interval. R32/C64 is the single bridge;
+            // R64/C128 is the measured T=1024 prefill winner.
+            if (t <= 53) { return launch_w8_small_t; }
+            if (t <= 192) { return launch_w8_mma_r32_c64; }
             return launch_w8_mma_r64_c128;
         case 14336:
             if (t <= 48) { return launch_w8_small_t; }
@@ -30,11 +33,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 34816:
             if (t <= 40) { return launch_w8_small_t; }
             if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
+            if (t <= 52) { return launch_w8_small_t; }
+            if (t <= 64) { return launch_w8_mma_r128_c64; }
             return launch_w8_mma_r64_c128;
         case 248320:
             if (t <= 33) { return launch_w8_small_t; }
             if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
-            if (t <= 64) { return launch_w8_mma_r32_c64; }
+            if (t <= 64) { return launch_w8_mma_r64x32_c64_k128_a1; }
+            if (t <= 96) { return launch_w8_mma_r64_c96; }
             return launch_w8_mma_r64_c128;
         default:
             break;
@@ -49,6 +55,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     case 17408:
         if (n == 5120) {
             if (t <= 48) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
+    case 25600:
+        if (n == 5120) {
+            if (t <= 56) { return launch_w8_feature_small_t; }
+            if (t <= 64) { return launch_w8_feature_r16_c64; }
+            if (t <= 128) { return launch_w8_feature_r32_c64; }
             return launch_w8_mma_r64_c128;
         }
         break;

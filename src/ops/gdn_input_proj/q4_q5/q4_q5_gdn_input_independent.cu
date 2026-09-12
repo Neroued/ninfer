@@ -70,11 +70,11 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
         launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
         return;
     }
-    if (x.ne[1] <= 16) {
+    if (x.ne[1] <= 15) {
         launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
         return;
     }
-    throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
+    throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,15]");
 }
 
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
@@ -161,11 +161,11 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 16) {
+    if (x.ne[1] <= 15) {
         launch_q5_simt_r8_c8(x, weight, value, z, stream);
         return;
     }
-    throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
+    throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,15]");
 }
 
 void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,

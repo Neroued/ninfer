@@ -16,6 +16,18 @@ bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
 } // namespace
 
 std::string normalize_nfc(std::string_view text) {
+    // Every byte below 0x80 is a starter with combining class zero and takes part in no canonical
+    // composition, so pure ASCII is already in NFC and utf8proc has nothing to do with it. The
+    // scan is one pass the compiler vectorises against utf8proc's decode, map and recompose.
+    bool ascii_only = true;
+    for (const char byte : text) {
+        if (static_cast<unsigned char>(byte) >= 0x80u) {
+            ascii_only = false;
+            break;
+        }
+    }
+    if (ascii_only) { return std::string(text); }
+
     utf8proc_uint8_t* mapped = nullptr;
     const utf8proc_ssize_t result =
         utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
@@ -30,22 +42,31 @@ std::string normalize_nfc(std::string_view text) {
     return normalized;
 }
 
+CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
+                                std::string_view context) {
+    if (offset >= text.size()) {
+        throw std::out_of_range("UTF-8 codepoint offset exceeds " + std::string(context));
+    }
+    utf8proc_int32_t codepoint = 0;
+    const utf8proc_ssize_t length =
+        utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + offset),
+                         static_cast<utf8proc_ssize_t>(text.size() - offset), &codepoint);
+    if (length < 0) {
+        throw std::invalid_argument("invalid UTF-8 in " + std::string(context) + ": " +
+                                    utf8proc_errmsg(length));
+    }
+    if (length == 0) {
+        throw std::invalid_argument("truncated UTF-8 sequence in " + std::string(context));
+    }
+    return CodepointSpan{codepoint, offset, static_cast<std::size_t>(length)};
+}
+
 std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_view context) {
     std::vector<CodepointSpan> codepoints;
     for (std::size_t offset = 0; offset < text.size();) {
-        utf8proc_int32_t codepoint = 0;
-        const utf8proc_ssize_t length =
-            utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + offset),
-                             static_cast<utf8proc_ssize_t>(text.size() - offset), &codepoint);
-        if (length < 0) {
-            throw std::invalid_argument("invalid UTF-8 in " + std::string(context) + ": " +
-                                        utf8proc_errmsg(length));
-        }
-        if (length == 0) {
-            throw std::invalid_argument("truncated UTF-8 sequence in " + std::string(context));
-        }
-        codepoints.push_back(CodepointSpan{codepoint, offset, static_cast<std::size_t>(length)});
-        offset += static_cast<std::size_t>(length);
+        const CodepointSpan codepoint = utf8_codepoint_at(text, offset, context);
+        codepoints.push_back(codepoint);
+        offset += codepoint.length;
     }
     return codepoints;
 }

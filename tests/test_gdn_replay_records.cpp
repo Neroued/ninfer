@@ -176,26 +176,22 @@ int main() {
     auto state_backing            = make_backing(state_bytes);
     ninfer::LinearAttentionStatePool state({state_backing.get(), state_bytes}, state_layout);
     const auto all = state.all_layers_view();
-    failures += expect(all.conv_layer0.data == state.conv[0].data, "conv layer-0 base differs");
-    failures += expect(all.recurrent_layer0.data == state.recurrent[0].data,
+    failures +=
+        expect(all.conv_layer0.data == state.layer_view(0).conv.data, "conv layer-0 base differs");
+    failures += expect(all.recurrent_layer0.data == state.layer_view(0).recurrent.data,
                        "recurrent layer-0 base differs");
     failures += expect_size(static_cast<std::size_t>(all.conv_layer_stride_bytes),
-                            static_cast<std::byte*>(state.conv[1].data) -
-                                static_cast<std::byte*>(state.conv[0].data),
+                            static_cast<std::byte*>(state.layer_view(1).conv.data) -
+                                static_cast<std::byte*>(state.layer_view(0).conv.data),
                             "conv layer stride");
     failures += expect_size(static_cast<std::size_t>(all.recurrent_layer_stride_bytes),
-                            static_cast<std::byte*>(state.recurrent[1].data) -
-                                static_cast<std::byte*>(state.recurrent[0].data),
+                            static_cast<std::byte*>(state.layer_view(1).recurrent.data) -
+                                static_cast<std::byte*>(state.layer_view(0).recurrent.data),
                             "recurrent layer stride");
     failures +=
         expect_size(static_cast<std::size_t>(all.spec.slot_count), 7, "all-layer slot count");
     failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
                             "independent record capacity");
-
-    const ninfer::Tensor saved = state.conv[1];
-    state.conv[1].data         = state.conv[0].data;
-    failures += expect_throw([&] { (void)state.all_layers_view(); }, "invalid layer stride");
-    state.conv[1] = saved;
 
     return failures == 0 ? 0 : fail("GDN replay record storage test failed");
 }

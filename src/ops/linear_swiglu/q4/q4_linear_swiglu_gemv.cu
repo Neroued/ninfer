@@ -51,14 +51,15 @@ struct Q4SwiGluSmallTRows {
 
 struct Q4SwiGluSmallTEpilogue {
     __nv_bfloat16* out;
+    int columns;
 
     template <int ActiveCols>
     __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
-        if (col0 < ActiveCols) {
+        if (col0 < columns) {
             out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
                 __float2bfloat16_rn(silu(projected.x) * projected.z);
         }
-        if (col0 + 1 < ActiveCols) {
+        if (col0 + 1 < columns) {
             out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
                 __float2bfloat16_rn(silu(projected.y) * projected.w);
         }
@@ -72,23 +73,23 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
     constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
-    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data)};
+    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows>
+                          Q4SwiGluSmallTRows, true>
         <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{});
+            epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<2 + static_cast<int>(Offsets)>...};
+        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets))>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<31>{});
+constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<4>{});
 
 __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
                                                    uint4 (*__restrict__ s_scale)[2],
@@ -214,12 +215,12 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
+void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

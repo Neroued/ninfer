@@ -68,20 +68,22 @@ void launch_exact_tail(W8Launch prefix_launch, const Tensor& x, const Weight& w,
     }
 }
 
-using MmaR32C64          = W8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
-using MmaR32C96          = W8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
-using MmaR32C128         = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
-using MmaR48C64          = W8RowSplitMmaGemmSchedule<48, 64, 48, 16, 3>;
-using MmaR48C96          = W8RowSplitMmaGemmSchedule<48, 96, 48, 16, 2>;
-using MmaR48C112         = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
-using MmaR48C128         = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
-using MmaR64C96          = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
-using MmaR64C112         = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
-using MmaR64C128         = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
-using MmaR96C96          = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
-using MmaR128C64         = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
-using MmaR128C80         = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
+using MmaR32C64  = W8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
+using MmaR32C96  = W8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
+using MmaR32C128 = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
+using MmaR48C64  = W8RowSplitMmaGemmSchedule<48, 64, 48, 16, 3>;
+using MmaR48C96  = W8RowSplitMmaGemmSchedule<48, 96, 48, 16, 2>;
+using MmaR48C112 = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
+using MmaR48C128 = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
+using MmaR64C96  = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
+using MmaR64C112 = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
+using MmaR64C128 = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+using MmaR96C96  = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
+using MmaR128C64 = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
+using MmaR128C80 = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
+// Full-vocabulary cold-cache winners on either side of the 48-column frontier.
 using MmaR64x16C48K128A1 = W8RowSplitMmaGemmSchedule<64, 48, 16, 24, 2, 2, 128, 1>;
+using MmaR64x32C64K128A1 = W8RowSplitMmaGemmSchedule<64, 64, 32, 16, 2, 2, 128, 1>;
 
 } // namespace
 
@@ -104,6 +106,7 @@ NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r96_c96, MmaR96C96)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c64, MmaR128C64)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c80, MmaR128C80)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x16_c48_k128_a1, MmaR64x16C48K128A1)
+NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x32_c64_k128_a1, MmaR64x32C64K128A1)
 
 #undef NINFER_W8_MMA_LAUNCHER
 

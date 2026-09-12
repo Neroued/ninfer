@@ -1,3 +1,5 @@
+#include "core/device.h"
+#include <algorithm>
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ops/op_tester.h"
 
@@ -68,46 +70,64 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
     return failures;
 }
 
-int run_batch_case() {
-    constexpr std::int32_t width = 4;
-    constexpr std::int32_t batch = 2;
-    const std::vector<std::int32_t> anchors{9173, 100007};
-    const std::vector<std::int32_t> lengths{37, 900};
-    const std::vector<std::int32_t> valid{4, 2};
-    const std::vector<std::int32_t> expected_ids{
-        anchors[0], kMaskId, kMaskId, kMaskId, anchors[1], kMaskId, kMaskId, kMaskId,
-    };
-    const std::vector<std::int32_t> expected_positions{
-        37, 38, 39, 40, 900, 901, 901, 901,
-    };
-
+int run_batch_case(int width, int batch, bool dense) {
+    constexpr int mask = 248070;
+    std::vector<std::int32_t> anchors(batch), lengths(batch), valid(batch);
+    for (int b = 0; b < batch; ++b) {
+        anchors[b] = 9173 + 111 * b;
+        lengths[b] = 37 + 1009 * b;
+        valid[b] = dense ? width : 1 + (3 * b) % width;
+    }
     DeviceBuffer device_anchors = to_device(anchors);
     DeviceBuffer device_lengths = to_device(lengths);
-    DeviceBuffer device_valid   = to_device(valid);
+    DeviceBuffer device_valid = to_device(valid);
     GuardedDeviceBuffer ids(static_cast<std::size_t>(width * batch) * sizeof(std::int32_t));
-    GuardedDeviceBuffer positions(static_cast<std::size_t>(width * batch) * sizeof(std::int32_t));
+    GuardedDeviceBuffer positions(ids.bytes());
     ids.fill(0xcd);
     positions.fill(0xef);
-
-    Tensor anchors_tensor(device_anchors.p, DType::I32, {batch});
-    Tensor lengths_tensor(device_lengths.p, DType::I32, {batch});
-    Tensor valid_tensor(device_valid.p, DType::I32, {batch});
-    Tensor ids_tensor(ids.data(), DType::I32, {width, batch});
-    Tensor positions_tensor(positions.data(), DType::I32, {width, batch});
-    ops::prepare_masked_block(anchors_tensor, lengths_tensor, valid_tensor, kMaskId, ids_tensor,
-                              positions_tensor, nullptr);
+    Tensor a(device_anchors.p, DType::I32, {batch});
+    Tensor l(device_lengths.p, DType::I32, {batch});
+    Tensor v(device_valid.p, DType::I32, {batch});
+    Tensor out(ids.data(), DType::I32, {width, batch});
+    Tensor pos(positions.data(), DType::I32, {width, batch});
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     cuda_synchronize();
-
-    int failures =
-        verify_exact("prepare_masked_block B=2 ids",
-                     from_device<std::int32_t>(ids.data(), static_cast<std::size_t>(width * batch)),
-                     expected_ids);
-    failures += verify_exact(
-        "prepare_masked_block B=2 positions",
-        from_device<std::int32_t>(positions.data(), static_cast<std::size_t>(width * batch)),
-        expected_positions);
-    failures += ids.verify_guards("prepare_masked_block B=2 ids guards");
-    failures += positions.verify_guards("prepare_masked_block B=2 positions guards");
+    const auto launch = [&] { ops::prepare_masked_block(a, l, v, mask, out, pos, stream); };
+    launch();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (width == 16 && batch == 8) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        launch();
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int b = 0; b < batch; ++b) { anchors[b] += 11; lengths[b] += 7; valid[b] = 1 + valid[b] % width; }
+        CUDA_CHECK(cudaMemcpyAsync(device_anchors.p, anchors.data(), device_anchors.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_lengths.p, lengths.data(), device_lengths.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid.data(), device_valid.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
+    for (int b = 0; b < batch; ++b)
+        for (int j = 0; j < width; ++j) {
+            expected_ids[b * width + j] = j == 0 ? anchors[b] : mask;
+            expected_positions[b * width + j] = lengths[b] + std::min(j, valid[b] - 1);
+        }
+    int failures = verify_exact("DFlash2 masked ids", from_device<std::int32_t>(ids.data(), expected_ids.size()), expected_ids);
+    failures += verify_exact("DFlash2 masked positions", from_device<std::int32_t>(positions.data(), expected_positions.size()), expected_positions);
+    failures += verify_exact("anchors unchanged", from_device<std::int32_t>(device_anchors, batch), anchors);
+    failures += verify_exact("lengths unchanged", from_device<std::int32_t>(device_lengths, batch), lengths);
+    failures += verify_exact("valid unchanged", from_device<std::int32_t>(device_valid, batch), valid);
+    failures += ids.verify_guards("masked ids");
+    failures += positions.verify_guards("masked positions");
     return failures;
 }
 
@@ -125,7 +145,10 @@ int main() {
         failures += run_case(block_size, 100000 + block_size,
                              std::numeric_limits<std::int32_t>::max() - (block_size - 1));
     }
-    failures += run_batch_case();
+    for (int width = 2; width <= 16; ++width)
+        for (int batch : {1, 8})
+            for (bool dense : {false, true}) failures += run_batch_case(width, batch, dense);
+    failures += run_batch_case(7, 3, false);
 
     if (failures != 0) {
         std::cerr << "prepare_masked_block failures=" << failures << '\n';

@@ -1,4 +1,4 @@
-// Cold-cache CUDA Graph benchmark for the public DFlash LinearPair contract.
+// Cold-cache benchmark for the two registered public W8 LinearPair geometries.
 
 #include "ninfer/ops/linear_pair.h"
 
@@ -28,12 +28,15 @@ constexpr std::int32_t kParentRows  = 6144;
 constexpr std::int32_t kFirstRow    = 4096;
 constexpr std::int32_t kSecondRow   = 5120;
 constexpr std::int32_t kRows        = 1024;
-constexpr std::int32_t kHidden      = 2048;
 constexpr double kRtx5090ReadGBs    = 1674.5;
 constexpr double kRtx5090Bf16Tflops = 209.5;
 
+enum class Execution : std::uint8_t { Eager, Graph };
+
 struct Options {
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 32, 48, 64, 96, 128};
+    std::int32_t k            = 0;
+    Execution execution       = Execution::Graph;
     int warmup                = 5;
     int repeat                = 30;
     std::uint64_t flush_bytes = 256ULL << 20;
@@ -125,6 +128,19 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--sweep") {
             options.tokens = parse_sweep(next("--sweep value"));
             have_sweep     = true;
+        } else if (argument == "--k") {
+            options.k = parse_positive_i32(next("--k value"), "K");
+            if (options.k != 2048 && options.k != 5120) {
+                throw std::invalid_argument("--k must be 2048 or 5120");
+            }
+        } else if (argument == "--execution") {
+            const std::string_view value = next("--execution value");
+            if (value == "eager")
+                options.execution = Execution::Eager;
+            else if (value == "graph")
+                options.execution = Execution::Graph;
+            else
+                throw std::invalid_argument("--execution must be eager or graph");
         } else if (argument == "--warmup") {
             options.warmup = parse_nonnegative_int(next("--warmup value"), "warmup");
         } else if (argument == "--repeat") {
@@ -136,8 +152,9 @@ Options parse_options(int argc, char** argv) {
             }
             options.flush_bytes = mib << 20;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--tokens 1,2,... | --sweep START:END[:STEP]] "
-                        "[--warmup N] [--repeat N] [--flush-mib N]\n",
+            std::printf("Usage: %s --k 2048|5120 "
+                        "[--tokens 1,2,... | --sweep START:END[:STEP]] "
+                        "[--execution eager|graph] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -147,24 +164,25 @@ Options parse_options(int argc, char** argv) {
     if (have_tokens && have_sweep) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
     }
+    if (options.k == 0) { throw std::invalid_argument("--k is required"); }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     return options;
 }
 
-std::uint64_t pair_weight_bytes() {
-    constexpr std::uint64_t kCodesPerWeight = static_cast<std::uint64_t>(kRows) * kHidden;
-    constexpr std::uint64_t kScalesPerWeight =
-        static_cast<std::uint64_t>(kRows) * (kHidden / 32) * sizeof(std::uint16_t);
-    return 2 * (kCodesPerWeight + kScalesPerWeight);
+std::uint64_t pair_weight_bytes(std::int32_t k) {
+    const std::uint64_t codes_per_weight = static_cast<std::uint64_t>(kRows) * k;
+    const std::uint64_t scales_per_weight =
+        static_cast<std::uint64_t>(kRows) * (k / 32) * sizeof(std::uint16_t);
+    return 2 * (codes_per_weight + scales_per_weight);
 }
 
-double useful_bytes(std::int32_t tokens) {
-    return static_cast<double>(pair_weight_bytes()) +
-           2.0 * static_cast<double>((kHidden + 2 * kRows) * tokens);
+double useful_bytes(std::int32_t k, std::int32_t tokens) {
+    return static_cast<double>(pair_weight_bytes(k)) +
+           2.0 * static_cast<double>((k + 2 * kRows) * tokens);
 }
 
-double useful_flops(std::int32_t tokens) {
-    return 4.0 * static_cast<double>(kRows) * kHidden * tokens;
+double useful_flops(std::int32_t k, std::int32_t tokens) {
+    return 4.0 * static_cast<double>(kRows) * k * tokens;
 }
 
 } // namespace
@@ -183,37 +201,46 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
         DeviceBuffer flush(options.flush_bytes);
-        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * maximum_tokens);
+        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(options.k) * maximum_tokens);
         DeviceBuffer first_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         DeviceBuffer second_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-            QType::W8G32_F16S, kParentRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
+            QType::W8G32_F16S, kParentRows, options.k, options.k, {0x31, 0x00, 0x3c00});
         const Weight first_weight  = bench::row_view(parent.weight, kFirstRow, kRows);
         const Weight second_weight = bench::row_view(parent.weight, kSecondRow, kRows);
 
-        std::printf("# gpu=%s public=linear_pair shape=two_adjacent_W8[1024,2048] "
-                    "execution=graph_replay cache=cold read_reference=%.1f_GB/s "
+        std::printf("# gpu=%s public=linear_pair shape=two_adjacent_W8[1024,%d] "
+                    "execution=%s cache=cold read_reference=%.1f_GB/s "
                     "bf16_tc_reference=%.1f_TFLOP/s\n",
-                    properties.name, kRtx5090ReadGBs, kRtx5090Bf16Tflops);
+                    properties.name, options.k,
+                    options.execution == Execution::Graph ? "graph_replay" : "eager",
+                    kRtx5090ReadGBs, kRtx5090Bf16Tflops);
 
         double t1_median = std::numeric_limits<double>::quiet_NaN();
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
+            Tensor x(input.p, DType::BF16, {options.k, tokens});
             Tensor first(first_output.p, DType::BF16, {kRows, tokens});
             Tensor second(second_output.p, DType::BF16, {kRows, tokens});
-            bench::TimedGraph graph;
-            graph.capture(stream, [&](cudaStream_t capture_stream) {
-                ops::linear_pair(x, first_weight, second_weight, first, second, capture_stream);
-            });
-            graph.launch(stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            const bench::ColdTiming timing =
-                bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+            const auto launch = [&](cudaStream_t launch_stream) {
+                ops::linear_pair(x, first_weight, second_weight, first, second, launch_stream);
+            };
+            bench::ColdTiming timing;
+            if (options.execution == Execution::Graph) {
+                bench::TimedGraph graph;
+                graph.capture(stream, launch);
+                graph.launch(stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                timing =
+                    bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+            } else {
+                timing = bench::measure_cold_launch(launch, flush, stream, options.warmup,
+                                                    options.repeat);
+            }
             if (tokens == 1) { t1_median = timing.median_us; }
 
             const double seconds       = timing.median_us * 1.0e-6;
-            const double gbs           = useful_bytes(tokens) / seconds / 1.0e9;
-            const double tflops        = useful_flops(tokens) / seconds / 1.0e12;
+            const double gbs           = useful_bytes(options.k, tokens) / seconds / 1.0e9;
+            const double tflops        = useful_flops(options.k, tokens) / seconds / 1.0e12;
             const double extrapolation = std::isnan(t1_median)
                                              ? std::numeric_limits<double>::quiet_NaN()
                                              : tokens * t1_median / timing.median_us;

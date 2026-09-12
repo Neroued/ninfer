@@ -5,6 +5,8 @@
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include <cstdint>
+#include <array>
+#include <ninfer/types.h>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
@@ -71,23 +73,34 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr bool supported     = false;
-    static constexpr int local_layers   = 0;
-    static constexpr int local_capacity = 0;
-    static constexpr int kv_heads       = 0;
-    static constexpr int head_dim       = 0;
-    static constexpr int feature_rows   = 0;
-    static constexpr int hidden         = 0;
-    static constexpr int intermediate   = 0;
-    static constexpr int query_size     = 0;
-    static constexpr int kv_size        = 0;
+    static constexpr bool supported             = true;
+    static constexpr SpeculativeBackend backend = SpeculativeBackend::DFlash2;
+    static constexpr bool coherent_selector     = true;
+    static constexpr int layers                 = 5;
+    static constexpr int local_layers           = 5;
+    static constexpr int full_layers            = 0;
+    static constexpr int local_capacity         = 2048;
+    static constexpr int feature_layers         = 5;
+    static constexpr int feature_rows           = 25600;
+    static constexpr int hidden                 = 5120;
+    static constexpr int intermediate           = 17408;
+    static constexpr int query_heads            = 32;
+    static constexpr int kv_heads               = 8;
+    static constexpr int head_dim               = 128;
+    static constexpr int query_size             = 4096;
+    static constexpr int kv_size                = 1024;
+    static constexpr int mask_token             = 248070;
+    static constexpr float rms_epsilon          = 1.0e-6F;
+    static constexpr float rope_theta           = 1.0e7F;
+    static constexpr float attention_scale      = 0.08838834764831845F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

@@ -86,39 +86,15 @@ void w8_pair_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& first_w
     launch_two_simt<4>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-void w8_pair_simt_r8_c8_launch(bool full, const Tensor& x, const Weight& first_weight,
-                               const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                               cudaStream_t stream) {
-    launch_two_simt<8>(full, x, first_weight, second_weight, first_out, second_out, stream);
-}
-
 void w8_pair_gemm_mma_r32_c64_launch(bool full, const Tensor& x, const Weight& first_weight,
                                      const Weight& second_weight, Tensor& first_out,
                                      Tensor& second_out, cudaStream_t stream) {
     launch_tile<64>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-void w8_pair_gemm_mma_r32_c80_launch(bool full, const Tensor& x, const Weight& first_weight,
-                                     const Weight& second_weight, Tensor& first_out,
-                                     Tensor& second_out, cudaStream_t stream) {
-    launch_tile<80>(full, x, first_weight, second_weight, first_out, second_out, stream);
-}
-
-void w8_pair_gemm_mma_r32_c96_launch(bool full, const Tensor& x, const Weight& first_weight,
-                                     const Weight& second_weight, Tensor& first_out,
-                                     Tensor& second_out, cudaStream_t stream) {
-    launch_tile<96>(full, x, first_weight, second_weight, first_out, second_out, stream);
-}
-
-void w8_pair_gemm_mma_r32_c112_launch(bool full, const Tensor& x, const Weight& first_weight,
+void w8_pair_gemm_mma_r32_c128_launch(bool full, const Tensor& x, const Weight& first_weight,
                                       const Weight& second_weight, Tensor& first_out,
                                       Tensor& second_out, cudaStream_t stream) {
-    launch_tile<112>(full, x, first_weight, second_weight, first_out, second_out, stream);
-}
-
-void w8_pair_gemm_mma_launch(bool full, const Tensor& x, const Weight& first_weight,
-                             const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                             cudaStream_t stream) {
     launch_tile<128>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 

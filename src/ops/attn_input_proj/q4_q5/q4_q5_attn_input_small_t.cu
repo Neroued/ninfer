@@ -78,17 +78,13 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     case 10:
     case 11:
     case 12:
-    case 13:
-    case 14:
-    case 15:
         launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
         return;
     case 8:
-    case 16:
         launch_q4_simt_route<Q4AttnSimtR8C8Schedule>(x, weight, q, key, stream);
         return;
     default:
-        throw std::invalid_argument("attention Q4 split-output requires T in [1,16]");
+        throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");
     }
 }
 
@@ -175,11 +171,11 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
     }
-    if (x.ne[1] <= 16) {
+    if (x.ne[1] <= 12) {
         launch_q5_simt<4>(x, weight, gate, value, stream);
         return;
     }
-    throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");
+    throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
 }
 
 } // namespace

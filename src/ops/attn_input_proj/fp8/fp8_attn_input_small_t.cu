@@ -44,13 +44,13 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kFp8AttnInputLastSimtT - kFp8FirstSmallT + 1>{});
 
 } // namespace
 
 void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
+    if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8AttnInputLastSimtT) {
         throw std::invalid_argument("fp8 attn_input_proj small-T: unsupported T");
     }
     kLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](x, weight, q, gate, k, v,

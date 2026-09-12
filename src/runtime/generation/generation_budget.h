@@ -21,10 +21,6 @@ public:
 
     [[nodiscard]] FinishReason limit_reason() const noexcept { return limit_reason_; }
 
-    [[nodiscard]] RoundBudget round_budget() const noexcept {
-        return RoundBudget{.generated_tokens_remaining = remaining_};
-    }
-
     void commit(std::uint32_t tokens) noexcept {
         if (tokens > remaining_) { std::abort(); }
         remaining_ -= tokens;

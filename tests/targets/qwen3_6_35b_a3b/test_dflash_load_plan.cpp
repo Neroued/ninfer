@@ -16,11 +16,11 @@ std::filesystem::path artifact_path() {
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out/qwen3_6_35b_a3b.ninfer";
 }
 
-ninfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
+ninfer::targets::qwen3_6::StartupFeatures load_features(bool vision,
+                                                        ninfer::SpeculativeBackend speculative) {
     return {
-        .vision = !dflash,
-        .speculative =
-            dflash ? ninfer::SpeculativeBackend::DFlash : ninfer::SpeculativeBackend::Mtp,
+        .vision        = vision,
+        .speculative   = speculative,
         .proposal_head = ninfer::ProposalHead::Optimized,
     };
 }
@@ -37,27 +37,41 @@ int main() {
     ninfer::artifact::Reader reader(path);
     {
         ninfer::artifact::Binder binder(reader);
-        const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(false));
+        const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
+            binder, load_features(true, ninfer::SpeculativeBackend::Mtp));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
             plan.materialization.device_capacity_bytes != 22'360'207'360ULL ||
             plan.bindings.dflash.feature_projection.index != 889 ||
             plan.bindings.dflash.final_norm.index != 939) {
-            std::cerr << "DFlash-disabled materialization plan changed resident weights\n";
+            std::cerr << "MTP+Vision materialization plan changed resident weights\n";
             return 1;
         }
     }
     {
         ninfer::artifact::Binder binder(reader);
-        const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(true));
+        const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
+            binder, load_features(false, ninfer::SpeculativeBackend::DFlash));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 586 ||
             plan.materialization.host_objects.size() != 6 ||
             plan.materialization.device_capacity_bytes != 21'591'653'888ULL) {
-            std::cerr << "DFlash-enabled materialization plan is incomplete: device_objects="
+            std::cerr << "DFlash-only materialization plan is incomplete: device_objects="
+                      << plan.materialization.device_objects.size()
+                      << " device_bytes=" << plan.materialization.device_capacity_bytes << '\n';
+            return 1;
+        }
+    }
+    {
+        ninfer::artifact::Binder binder(reader);
+        const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
+            binder, load_features(true, ninfer::SpeculativeBackend::DFlash));
+        if (plan.materialization.object_count != 940 ||
+            plan.materialization.device_objects.size() != 919 ||
+            plan.materialization.host_objects.size() != 6 ||
+            plan.materialization.device_capacity_bytes != 21'872'326'656ULL) {
+            std::cerr << "DFlash+Vision materialization plan is incomplete: device_objects="
                       << plan.materialization.device_objects.size()
                       << " device_bytes=" << plan.materialization.device_capacity_bytes << '\n';
             return 1;

@@ -27,7 +27,9 @@ key is a source/build identity and is not serialized.
 
 Every conforming artifact is one complete product image containing Text, the optimized proposal
 head, MTP, Vision, DFlash, and the six frontend resources in this document. DFlash is part of the
-same artifact and does not define a second artifact or an optional artifact profile.
+same artifact and does not define a second artifact or an optional artifact profile. Vision and
+DFlash residency may be selected together at startup; MTP remains nonresident when DFlash is the
+selected speculative backend.
 
 The first 889 objects retain the existing sequence. The 51 DFlash tensor objects are appended
 after the Vision merger objects. Existing object names, order, shapes, formats, layouts,

@@ -14,6 +14,8 @@ struct CodepointSpan {
 };
 
 std::string normalize_nfc(std::string_view text);
+CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
+                                std::string_view context);
 std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_view context);
 std::string codepoint_to_utf8(std::int32_t codepoint);
 

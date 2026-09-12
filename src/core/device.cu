@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer {
 namespace {
@@ -51,10 +52,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
     if (device_id < 0 || device_id >= count) { throw std::runtime_error("invalid CUDA device id"); }
 
-    err = cudaSetDevice(device_id);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
-    }
+    bind_to_current_thread();
 
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {
@@ -73,62 +71,75 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     if (err != cudaSuccess) {
         destroy_stream(compute);
         throw std::runtime_error(
-            cuda_error_message("cudaStreamCreateWithFlags(load_stream) failed", err));
+            cuda_error_message("cudaStreamCreateWithFlags(transfer_stream) failed", err));
     }
 
-    stream      = compute;
-    load_stream = load;
+    stream          = compute;
+    transfer_stream = load;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || load_stream != nullptr) {
-        log_cuda_error("cudaSetDevice", cudaSetDevice(device));
-    }
-    destroy_stream(load_stream);
+    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    destroy_stream(transfer_stream);
     destroy_stream(stream);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
-    : device(other.device), stream(other.stream), load_stream(other.load_stream),
+    : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
       props(other.props) {
-    other.stream      = nullptr;
-    other.load_stream = nullptr;
+    other.stream          = nullptr;
+    other.transfer_stream = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || load_stream != nullptr) {
-        log_cuda_error("cudaSetDevice", cudaSetDevice(device));
-    }
-    destroy_stream(load_stream);
+    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    destroy_stream(transfer_stream);
     destroy_stream(stream);
 
-    device      = other.device;
-    props       = other.props;
-    stream      = other.stream;
-    load_stream = other.load_stream;
+    device          = other.device;
+    props           = other.props;
+    stream          = other.stream;
+    transfer_stream = other.transfer_stream;
 
-    other.stream      = nullptr;
-    other.load_stream = nullptr;
+    other.stream          = nullptr;
+    other.transfer_stream = nullptr;
     return *this;
 }
 
-int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
+void DeviceContext::bind_to_current_thread() const {
+    const cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+    }
+}
+
+void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
+    log_cuda_error("cudaSetDevice", cudaSetDevice(device));
+}
+
+int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
+
+int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
+
+DeviceExecutionView DeviceContext::execution_view() const noexcept {
+    return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+}
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
-CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : stream_(ctx.stream) {
-    cudaError_t err = cudaSetDevice(ctx.device);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaSetDevice(timer) failed", err));
-    }
+CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
+
+CudaEventTimer::CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream) : stream_(stream) {
+    if (stream == nullptr) { throw std::invalid_argument("CUDA timer stream is null"); }
+    ctx.bind_to_current_thread();
 
     cudaEvent_t start = nullptr;
     cudaEvent_t stop  = nullptr;
-    err               = cudaEventCreate(&start);
+    cudaError_t err   = cudaEventCreate(&start);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaEventCreate(start) failed", err));
     }
@@ -185,6 +196,55 @@ float CudaEventTimer::stop_ms() {
     record_stop();
     CUDA_CHECK(cudaEventSynchronize(stop_));
     return elapsed_ms();
+}
+
+CudaCompletionEvent::CudaCompletionEvent(const DeviceContext& ctx) : device_(ctx.device) {
+    ctx.bind_to_current_thread();
+    const cudaError_t err = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventCreateWithFlags failed", err));
+    }
+}
+
+CudaCompletionEvent::~CudaCompletionEvent() { destroy_event(event_); }
+
+CudaCompletionEvent::CudaCompletionEvent(CudaCompletionEvent&& other) noexcept
+    : device_(other.device_), event_(std::exchange(other.event_, nullptr)) {}
+
+CudaCompletionEvent& CudaCompletionEvent::operator=(CudaCompletionEvent&& other) noexcept {
+    if (this == &other) { return *this; }
+    destroy_event(event_);
+    device_ = other.device_;
+    event_  = std::exchange(other.event_, nullptr);
+    return *this;
+}
+
+void CudaCompletionEvent::record(cudaStream_t stream) {
+    if (event_ == nullptr || stream == nullptr) {
+        throw std::logic_error("CUDA completion event is not recordable");
+    }
+    CUDA_CHECK(cudaEventRecord(event_, stream));
+}
+
+void CudaCompletionEvent::wait(cudaStream_t stream) const {
+    if (event_ == nullptr || stream == nullptr) {
+        throw std::logic_error("CUDA completion event is not waitable");
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(stream, event_, 0));
+}
+
+bool CudaCompletionEvent::ready() const {
+    if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
+    const cudaError_t status = cudaEventQuery(event_);
+    if (status == cudaSuccess) { return true; }
+    if (status == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(status);
+    return false;
+}
+
+void CudaCompletionEvent::synchronize() const {
+    if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
+    CUDA_CHECK(cudaEventSynchronize(event_));
 }
 
 } // namespace ninfer

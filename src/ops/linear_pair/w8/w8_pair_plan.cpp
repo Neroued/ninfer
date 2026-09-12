@@ -22,9 +22,9 @@ struct W8PairRouteSpec {
 };
 
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
-    {1, 4, W8PairScheduleId::TwoSimtR8C4},
-    {5, 56, W8PairScheduleId::TwoSimtR8C8},
-    {57, kAnyCols, W8PairScheduleId::DualMmaR32C128},
+    {1, 85, W8PairScheduleId::TwoSimtR8C4},
+    {86, 960, W8PairScheduleId::DualMmaR32C64},
+    {961, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
 
 constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
@@ -144,7 +144,7 @@ bool is_concat_schedule(W8PairScheduleId schedule) noexcept {
 }
 
 bool uses_mma(W8PairScheduleId schedule) noexcept {
-    return schedule != W8PairScheduleId::TwoSimtR8C4 && schedule != W8PairScheduleId::TwoSimtR8C8 &&
+    return schedule != W8PairScheduleId::TwoSimtR8C4 &&
            schedule != W8PairScheduleId::DualDecodeR4 &&
            schedule != W8PairScheduleId::DualDecodeR8 &&
            schedule != W8PairScheduleId::DualDecodeR16;
@@ -153,12 +153,8 @@ bool uses_mma(W8PairScheduleId schedule) noexcept {
 std::int32_t schedule_rows(W8PairScheduleId schedule) {
     switch (homogeneous_schedule(schedule)) {
     case W8PairScheduleId::TwoSimtR8C4:
-    case W8PairScheduleId::TwoSimtR8C8:
         return 8;
     case W8PairScheduleId::DualMmaR32C64:
-    case W8PairScheduleId::DualMmaR32C80:
-    case W8PairScheduleId::DualMmaR32C96:
-    case W8PairScheduleId::DualMmaR32C112:
     case W8PairScheduleId::DualMmaR32C128:
     case W8PairScheduleId::ConcatMmaR32C64:
     case W8PairScheduleId::ConcatMmaR32C80:
@@ -193,8 +189,6 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
     switch (homogeneous_schedule(schedule)) {
     case W8PairScheduleId::TwoSimtR8C4:
         return 4;
-    case W8PairScheduleId::TwoSimtR8C8:
-        return 8;
     case W8PairScheduleId::DualDecodeR4:
     case W8PairScheduleId::DualDecodeR8:
     case W8PairScheduleId::DualDecodeR16:
@@ -209,7 +203,6 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
     case W8PairScheduleId::ConcatMmaR96C64:
     case W8PairScheduleId::ConcatMmaR128C64:
         return 64;
-    case W8PairScheduleId::DualMmaR32C80:
     case W8PairScheduleId::DualSplitKMediumC80:
     case W8PairScheduleId::ConcatMmaR32C80:
     case W8PairScheduleId::ConcatMmaR64C80:
@@ -219,7 +212,6 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
     case W8PairScheduleId::DualSplitKMediumC88:
         return 88;
     case W8PairScheduleId::DualSplitKMediumC96:
-    case W8PairScheduleId::DualMmaR32C96:
     case W8PairScheduleId::ConcatMmaR32C96:
     case W8PairScheduleId::ConcatMmaR48C96:
     case W8PairScheduleId::ConcatMmaR64C96:
@@ -228,7 +220,6 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
     case W8PairScheduleId::DualSplitKMediumC104:
         return 104;
     case W8PairScheduleId::DualSplitKMediumC112:
-    case W8PairScheduleId::DualMmaR32C112:
     case W8PairScheduleId::ConcatMmaR32C112:
     case W8PairScheduleId::ConcatMmaR48C112:
     case W8PairScheduleId::ConcatMmaR96C112:
@@ -322,8 +313,6 @@ const char* w8_pair_schedule_name(W8PairScheduleId schedule) {
     switch (schedule) {
     case W8PairScheduleId::TwoSimtR8C4:
         return "w8_pair.two_simt.r8.c4";
-    case W8PairScheduleId::TwoSimtR8C8:
-        return "w8_pair.two_simt.r8.c8";
     case W8PairScheduleId::DualDecodeR4:
         return "w8_pair.dual_decode.k2048.r4";
     case W8PairScheduleId::DualDecodeR8:
@@ -358,12 +347,6 @@ const char* w8_pair_schedule_name(W8PairScheduleId schedule) {
         return "w8_pair.splitk2.mma.r16.c256";
     case W8PairScheduleId::DualMmaR32C64:
         return "w8_pair.dual_mma.r32.c64";
-    case W8PairScheduleId::DualMmaR32C80:
-        return "w8_pair.dual_mma.r32.c80";
-    case W8PairScheduleId::DualMmaR32C96:
-        return "w8_pair.dual_mma.r32.c96";
-    case W8PairScheduleId::DualMmaR32C112:
-        return "w8_pair.dual_mma.r32.c112";
     case W8PairScheduleId::DualMmaR32C128:
         return "w8_pair.dual_mma.r32.c128";
     case W8PairScheduleId::ConcatMmaR32C64:
@@ -452,9 +435,7 @@ namespace {
 bool tiled_use_full(W8PairScheduleId schedule, const W8PairProblem& problem) {
     const bool tile_aligned = (problem.rows % schedule_rows(schedule)) == 0 &&
                               (problem.cols % schedule_cols(schedule)) == 0;
-    if (schedule == W8PairScheduleId::TwoSimtR8C4 || schedule == W8PairScheduleId::TwoSimtR8C8) {
-        return tile_aligned;
-    }
+    if (schedule == W8PairScheduleId::TwoSimtR8C4) { return tile_aligned; }
     return tile_aligned && problem.k == problem.padded_k && (problem.k % 64) == 0;
 }
 
@@ -471,29 +452,13 @@ void launch_tiled(W8PairScheduleId schedule, bool full, const Tensor& x, const W
             w8_pair_simt_r8_c4_launch(full, x_slice, first_weight, second_weight, first_slice,
                                       second_slice, stream);
             return;
-        case W8PairScheduleId::TwoSimtR8C8:
-            w8_pair_simt_r8_c8_launch(full, x_slice, first_weight, second_weight, first_slice,
-                                      second_slice, stream);
-            return;
         case W8PairScheduleId::DualMmaR32C64:
             w8_pair_gemm_mma_r32_c64_launch(full, x_slice, first_weight, second_weight, first_slice,
                                             second_slice, stream);
             return;
-        case W8PairScheduleId::DualMmaR32C80:
-            w8_pair_gemm_mma_r32_c80_launch(full, x_slice, first_weight, second_weight, first_slice,
-                                            second_slice, stream);
-            return;
-        case W8PairScheduleId::DualMmaR32C96:
-            w8_pair_gemm_mma_r32_c96_launch(full, x_slice, first_weight, second_weight, first_slice,
-                                            second_slice, stream);
-            return;
-        case W8PairScheduleId::DualMmaR32C112:
-            w8_pair_gemm_mma_r32_c112_launch(full, x_slice, first_weight, second_weight,
-                                             first_slice, second_slice, stream);
-            return;
         case W8PairScheduleId::DualMmaR32C128:
-            w8_pair_gemm_mma_launch(full, x_slice, first_weight, second_weight, first_slice,
-                                    second_slice, stream);
+            w8_pair_gemm_mma_r32_c128_launch(full, x_slice, first_weight, second_weight,
+                                             first_slice, second_slice, stream);
             return;
         default:
             if (is_concat_schedule(schedule)) {

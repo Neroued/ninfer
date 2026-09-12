@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 
 #include "ops/op_tester.h"
+#include "core/decode_graph.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,9 +34,11 @@ constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
 constexpr ReductionCriterion kGdnNormOutputBf16{/*relative_l2=*/1.75e-3,
                                                 /*gross_absolute=*/1.0e-4,
                                                 /*gross_relative_to_max_reference=*/4.0e-3};
+// FP32 public controls permit 16-bit private operands/materialization. The gross cap includes
+// propagated BF16 staging error; relative L2 remains the accuracy gate for the full formula.
 constexpr ReductionCriterion kGdnNormControlFp32{/*relative_l2=*/8.0e-4,
                                                  /*gross_absolute=*/1.5e-4,
-                                                 /*gross_relative_to_max_reference=*/1.05e-3};
+                                                 /*gross_relative_to_max_reference=*/2.0e-3};
 
 double softplus(double value) {
     return std::max(value, 0.0) + std::log1p(std::exp(-std::abs(value)));
@@ -215,7 +218,8 @@ int verify_inputs_unchanged(const std::string& label, const DeviceBuffer& device
     return failures;
 }
 
-int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
+int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
+                        DeviceExecutionView execution) {
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> a_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
     std::vector<float> b_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
@@ -264,12 +268,12 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
         ops::gdn_gating_proj(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace, tensor_g,
-                             tensor_beta, nullptr);
+                             tensor_beta, execution);
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
         ops::gdn_gating_proj(tensor_x, weight_a, weight_b, tensor_a_log, tensor_dt_bias, workspace,
-                             tensor_g, tensor_beta, nullptr);
+                             tensor_g, tensor_beta, execution);
     }
     cuda_synchronize();
 
@@ -300,101 +304,135 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     return failures;
 }
 
-int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
-    constexpr float kEps = 1.0e-6F;
-    std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
-    std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
-    std::vector<float> a_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
-    std::vector<float> b_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
+int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
+                             DeviceExecutionView execution, bool replay = false, int mode = 0) {
+    constexpr float kEps               = 1.0e-6f;
+    const std::size_t h_elements       = std::size_t(geometry.hidden) * tokens;
+    const std::size_t control_elements = std::size_t(geometry.heads) * tokens;
+    std::vector<float> x(h_elements), norm_weight(geometry.hidden);
+    std::vector<float> a_weight(std::size_t(geometry.heads) * geometry.hidden),
+        b_weight(a_weight.size());
     std::vector<float> a_log(geometry.heads), dt_bias(geometry.heads);
-    fill_uniform(x, seed, -1.0F, 1.0F);
-    fill_uniform(norm_weight, seed + 1u, -0.2F, 0.2F);
-    fill_uniform(a_weight, seed + 2u, -0.015F, 0.015F);
-    fill_uniform(b_weight, seed + 3u, -0.015F, 0.015F);
-    fill_uniform(a_log, seed + 4u, -2.0F, 1.0F);
-    fill_uniform(dt_bias, seed + 5u, -1.0F, 1.0F);
+    fill_uniform(x, seed, -1.0f, 1.0f);
+    fill_uniform(norm_weight, seed + 1, -0.2f, 0.2f);
+    fill_uniform(a_weight, seed + 2, -0.015f, 0.015f);
+    fill_uniform(b_weight, seed + 3, -0.015f, 0.015f);
+    fill_uniform(a_log, seed + 4, -2.0f, 1.0f);
+    fill_uniform(dt_bias, seed + 5, -1.0f, 1.0f);
+    norm_weight[0] = -1.0f;
+    norm_weight[1] = -1.5f;
+    if (mode == 1) std::fill(x.begin(), x.end(), 0.0f);
+    if (mode == 2)
+        for (auto& v : x) v *= 1.0e-5f;
+    if (mode == 3)
+        for (auto& v : x) v *= 512.0f;
+    if (mode == 4) std::fill(norm_weight.begin(), norm_weight.end(), -1.0f);
     round_to_bf16(x);
     round_to_bf16(norm_weight);
     round_to_bf16(a_weight);
     round_to_bf16(b_weight);
-
-    std::vector<double> reference_h, reference_g, reference_beta;
-    norm_projection_oracle(geometry, x, norm_weight, a_weight, b_weight, a_log, dt_bias, tokens,
-                           kEps, reference_h, reference_g, reference_beta);
-
-    const std::vector<std::uint16_t> x_bits           = bf16_bits(x);
-    const std::vector<std::uint16_t> norm_weight_bits = bf16_bits(norm_weight);
-    std::vector<std::uint16_t> weight_bits            = bf16_bits(a_weight);
-    const std::vector<std::uint16_t> b_weight_bits    = bf16_bits(b_weight);
-    if (geometry.parent_weight) {
+    auto x_bits = bf16_bits(x), norm_weight_bits = bf16_bits(norm_weight),
+         weight_bits         = bf16_bits(a_weight);
+    const auto b_weight_bits = bf16_bits(b_weight);
+    if (geometry.parent_weight)
         weight_bits.insert(weight_bits.end(), b_weight_bits.begin(), b_weight_bits.end());
-    }
-    DeviceBuffer device_x           = to_device(x_bits);
-    DeviceBuffer device_norm_weight = to_device(norm_weight_bits);
-    DeviceBuffer device_weight      = to_device(weight_bits);
+    DeviceBuffer device_x = to_device(x_bits), device_norm_weight = to_device(norm_weight_bits),
+                 device_weight = to_device(weight_bits);
     DeviceBuffer device_b_weight;
-    if (!geometry.parent_weight) { device_b_weight = to_device(b_weight_bits); }
-    DeviceBuffer device_a_log          = to_device(a_log);
-    DeviceBuffer device_dt_bias        = to_device(dt_bias);
-    const std::size_t h_elements       = static_cast<std::size_t>(geometry.hidden) * tokens;
-    const std::size_t control_elements = static_cast<std::size_t>(geometry.heads) * tokens;
-    GuardedDeviceBuffer device_h(h_elements * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_g(control_elements * sizeof(float));
-    GuardedDeviceBuffer device_beta(control_elements * sizeof(float));
-    device_h.fill(0xff);
-    device_g.fill(0xff);
-    device_beta.fill(0xff);
-
-    Tensor tensor_x(device_x.p, DType::BF16, {geometry.hidden, tokens});
-    Tensor tensor_norm_weight(device_norm_weight.p, DType::BF16, {geometry.hidden});
-    Tensor tensor_h(device_h.data(), DType::BF16, {geometry.hidden, tokens});
-    Tensor tensor_a_log(device_a_log.p, DType::FP32, {geometry.heads});
-    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
-    Tensor tensor_g(device_g.data(), DType::FP32, {geometry.heads, tokens});
-    Tensor tensor_beta(device_beta.data(), DType::FP32, {geometry.heads, tokens});
-    const std::size_t workspace_bytes = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+    if (!geometry.parent_weight) device_b_weight = to_device(b_weight_bits);
+    DeviceBuffer device_a_log = to_device(a_log), device_dt_bias = to_device(dt_bias);
+    GuardedDeviceBuffer device_h(h_elements * 2), device_g(control_elements * 4),
+        device_beta(control_elements * 4);
+    Tensor tx(device_x.p, DType::BF16, {geometry.hidden, tokens}),
+        tn(device_norm_weight.p, DType::BF16, {geometry.hidden});
+    Tensor th(device_h.data(), DType::BF16, {geometry.hidden, tokens}),
+        tg(device_g.data(), DType::FP32, {geometry.heads, tokens}),
+        tb(device_beta.data(), DType::FP32, {geometry.heads, tokens});
+    Tensor ta(device_a_log.p, DType::FP32, {geometry.heads}),
+        td(device_dt_bias.p, DType::FP32, {geometry.heads});
+    const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
         geometry.heads, geometry.hidden, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-
-    if (geometry.parent_weight) {
-        Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
-        ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, parent, tensor_a_log,
-                                  tensor_dt_bias, workspace, tensor_h, tensor_g, tensor_beta,
-                                  nullptr);
-    } else {
-        Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
-        Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
-        ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, weight_a, weight_b,
-                                  tensor_a_log, tensor_dt_bias, workspace, tensor_h, tensor_g,
-                                  tensor_beta, nullptr);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
+    const auto wa = bf16_weight(device_weight.p, (geometry.parent_weight ? 2 : 1) * geometry.heads,
+                                geometry.hidden);
+    const auto wb = geometry.parent_weight
+                        ? Weight{}
+                        : bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
+    const auto launch = [&] {
+        if (geometry.parent_weight)
+            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, ta, td, workspace, th, tg, tb, execution);
+        else
+            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, wb, ta, td, workspace, th, tg, tb,
+                                      execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    if (replay) {
+        launch();
+        cuda_synchronize(execution.stream);
     }
-    cuda_synchronize();
-
-    const std::string label =
-        std::string("gdn_norm_gating_proj ") + geometry.label + " T=" + std::to_string(tokens);
     int failures = 0;
-    failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements),
-                                reference_h, kGdnNormOutputBf16);
-    failures += verify_normwise(label + " g", read_fp32(device_g.data(), control_elements),
-                                reference_g, kGdnNormControlFp32);
-    failures += verify_normwise(label + " beta", read_fp32(device_beta.data(), control_elements),
-                                reference_beta, kGdnNormControlFp32);
-    failures += device_h.verify_guards((label + " h").c_str());
-    failures += device_g.verify_guards((label + " g").c_str());
-    failures += device_beta.verify_guards((label + " beta").c_str());
-    failures += verify_inputs_unchanged(label, device_x, x_bits, device_weight, weight_bits,
-                                        device_a_log, a_log, device_dt_bias, dt_bias);
-    failures += verify_exact(
-        (label + " norm_weight immutable").c_str(),
-        from_device<std::uint16_t>(device_norm_weight, norm_weight_bits.size()), norm_weight_bits);
-    if (!geometry.parent_weight) {
-        failures += verify_exact((label + " b_weight immutable").c_str(),
-                                 from_device<std::uint16_t>(device_b_weight, b_weight_bits.size()),
-                                 b_weight_bits);
-    }
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
-        ++failures;
+    for (int phase = 0; phase < (replay ? 3 : 1); ++phase) {
+        if (phase) {
+            for (auto& v : x) v *= -0.5f;
+            for (auto& v : norm_weight) v = -v;
+            for (auto& v : a_log) v += 0.125f;
+            for (auto& v : dt_bias) v = -v;
+            round_to_bf16(x);
+            round_to_bf16(norm_weight);
+            x_bits           = bf16_bits(x);
+            norm_weight_bits = bf16_bits(norm_weight);
+            device_x.copy_from_host(x_bits.data(), x_bits.size() * 2);
+            device_norm_weight.copy_from_host(norm_weight_bits.data(), norm_weight_bits.size() * 2);
+            device_a_log.copy_from_host(a_log.data(), a_log.size() * 4);
+            device_dt_bias.copy_from_host(dt_bias.data(), dt_bias.size() * 4);
+        }
+        device_h.fill(0xff);
+        device_g.fill(0xff);
+        device_beta.fill(0xff);
+        scratch.fill(0xff);
+        cuda_synchronize();
+        if (replay && phase == 0) {
+            definition.capture(execution.stream, launch);
+            graph.instantiate(definition);
+        }
+        if (replay)
+            graph.launch(execution.stream);
+        else
+            launch();
+        cuda_synchronize(execution.stream);
+        std::vector<double> rh, rg, rb;
+        norm_projection_oracle(geometry, x, norm_weight, a_weight, b_weight, a_log, dt_bias, tokens,
+                               kEps, rh, rg, rb);
+        const std::string label = std::string("gdn_norm_gating_proj ") + geometry.label +
+                                  " T=" + std::to_string(tokens) + " mode=" + std::to_string(mode) +
+                                  " phase=" + std::to_string(phase);
+        failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements), rh,
+                                    kGdnNormOutputBf16);
+        failures += verify_normwise(label + " g", read_fp32(device_g.data(), control_elements), rg,
+                                    kGdnNormControlFp32);
+        failures +=
+            verify_normwise(label + " beta", read_fp32(device_beta.data(), control_elements), rb,
+                            kGdnNormControlFp32);
+        failures += device_h.verify_guards((label + " h").c_str());
+        failures += device_g.verify_guards((label + " g").c_str());
+        failures += device_beta.verify_guards((label + " beta").c_str());
+        failures += scratch.verify_guards((label + " scratch").c_str());
+        failures += verify_inputs_unchanged(label, device_x, x_bits, device_weight, weight_bits,
+                                            device_a_log, a_log, device_dt_bias, dt_bias);
+        failures +=
+            verify_exact((label + " norm weight immutable").c_str(),
+                         from_device<std::uint16_t>(device_norm_weight, norm_weight_bits.size()),
+                         norm_weight_bits);
+        if (!geometry.parent_weight)
+            failures += verify_exact(
+                (label + " b weight immutable").c_str(),
+                from_device<std::uint16_t>(device_b_weight, b_weight_bits.size()), b_weight_bits);
+        if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+            std::cerr << label << ": workspace query/peak mismatch\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -414,15 +452,18 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
         std::cerr << geometry.label << ": GDN control interval missed a route endpoint\n";
         ++failures;
     }
-    const std::size_t norm_interval =
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
-    const std::size_t norm_witness = std::max(
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 16, 16),
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
-                                                           64));
-    if (norm_interval != norm_witness) {
-        std::cerr << geometry.label << ": GDN norm/control interval missed a route endpoint\n";
-        ++failures;
+    for (const auto bounds :
+         std::vector<std::pair<int, int>>{{1, 42}, {40, 43}, {1, 128}, {120, 129}, {1, 256}}) {
+        std::size_t witness = 0;
+        for (int t = bounds.first; t <= bounds.second; ++t)
+            witness = std::max(witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                            geometry.heads, geometry.hidden, t, t));
+        const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+            geometry.heads, geometry.hidden, bounds.first, bounds.second);
+        if (capacity != witness) {
+            std::cerr << geometry.label << ": norm/control interval missed an extent\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -435,33 +476,52 @@ int main() {
         return 77;
     }
 
+    DeviceContext device;
+    const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
+    const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = 0;
     failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
-        failures +=
-            run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
+        failures += run_projection_case(kQwen27, tokens,
+                                        0x1000u + static_cast<std::uint32_t>(tokens), execution);
     }
     // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
     // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
-    failures += run_projection_case(kQwen38Parent, 1, 0x1801u);
+    failures += run_projection_case(kQwen38Parent, 1, 0x1801u, execution);
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
-        failures +=
-            run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
+        failures += run_projection_case(kQwen35, tokens,
+                                        0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }
 
-    // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
-    failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
-    failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
-    failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
-    failures += run_norm_projection_case(kQwen38Parent, 1, 0x3801u);
-    failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
-    failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
-    failures += run_norm_projection_case(kQwen35, 17, 0x4011u);
-    failures += run_norm_projection_case(kQwen35, 64, 0x4040u);
+    // Direct complete norm/control oracles across variable widths and the existing 35B profile.
+    failures += run_norm_projection_case(kQwen27, 1, 0x3001u, norm_execution);
+    failures += run_norm_projection_case(kQwen27, 9, 0x3009u, norm_execution);
+    failures += run_norm_projection_case(kQwen27, 64, 0x3040u, norm_execution);
+    for (int tokens = 1; tokens <= 128; ++tokens)
+        failures +=
+            run_norm_projection_case(kQwen38Parent, tokens, 0x3800u + tokens, norm_execution);
+    for (int tokens : {1, 2, 3, 8, 9, 14, 15, 16, 28, 29, 32, 42, 43, 64, 96, 128, 129, 256})
+        failures +=
+            run_norm_projection_case(kQwen38Parent, tokens, 0x4800u + tokens, norm_execution, true);
+    for (int mode : {1, 2, 3, 4})
+        failures +=
+            run_norm_projection_case(kQwen38Parent, 16, 0x5800u + mode, norm_execution, true, mode);
+    failures += run_norm_projection_case(kQwen35, 1, 0x4001u, norm_execution);
+    failures += run_norm_projection_case(kQwen35, 16, 0x4010u, norm_execution);
+    failures += run_norm_projection_case(kQwen35, 17, 0x4011u, norm_execution);
+    failures += run_norm_projection_case(kQwen35, 64, 0x4040u, norm_execution);
+
+    // Requalify the retained BF16-staging profile at every prefill reduction boundary.
+    for (int tokens : {1024, 1025, 2048, 2049, 4097})
+        failures +=
+            run_norm_projection_case(kQwen38Parent, tokens, 0x6800u + tokens, norm_execution);
+    for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
+        failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
+                                             tokens == 15);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

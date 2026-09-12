@@ -4,8 +4,8 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
-#include "runtime/engine/request_memory.h"
 
 #include <algorithm>
 #include <array>
@@ -17,11 +17,13 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -130,46 +132,46 @@ struct RoundMeasurement {
     float gpu_ms                  = 0.0F;
     double wall_ms                = 0.0;
     std::uint32_t licensed_tokens = 0;
+    std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> stats{};
 };
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
+                               std::span<const target::Package::SequenceHandle> sequences,
                                std::uint32_t batch_size, std::uint32_t draft_tokens) {
-    std::array<std::uint32_t, ninfer::kMaximumConcurrency> lanes{};
     std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
-        lanes[row]   = row;
         budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
     }
-    const auto lane_span = std::span<const std::uint32_t>(lanes.data(), batch_size);
     const auto budget_span =
         std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
     ninfer::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
-    const auto round = program.decode_batch(lane_span, budget_span);
-    if (round.row_counts.size() != batch_size) {
+    auto pending = program.decode(sequences, budget_span);
+    if (pending.row_counts().size() != batch_size) {
         throw std::runtime_error("DFlash benchmark round returned invalid row counts");
     }
-    std::array<std::uint32_t, ninfer::kMaximumConcurrency> accepted{};
-    std::array<std::uint8_t, ninfer::kMaximumConcurrency> terminal{};
-    std::array<std::uint8_t, ninfer::kMaximumConcurrency> cancelled{};
+    std::array<ninfer::runtime::CommitDecision, ninfer::kMaximumConcurrency> decisions{};
     std::uint32_t licensed = 0;
     for (std::uint32_t row = 0; row < batch_size; ++row) {
-        const std::int32_t count = round.row_counts[row];
+        const std::int32_t count = pending.row_counts()[row];
         if (count <= 0 || count > static_cast<std::int32_t>(draft_tokens + 1U)) {
             throw std::runtime_error("DFlash benchmark round returned an invalid row extent");
         }
-        accepted[row] = static_cast<std::uint32_t>(count);
-        licensed += accepted[row];
+        decisions[row].accepted_tokens = static_cast<std::uint32_t>(count);
+        licensed += decisions[row].accepted_tokens;
     }
-    program.resolve_pending_batch(lane_span,
-                                  std::span<const std::uint32_t>(accepted.data(), batch_size),
-                                  std::span<const std::uint8_t>(terminal.data(), batch_size),
-                                  std::span<const std::uint8_t>(cancelled.data(), batch_size));
+    const auto committed = program.commit(
+        std::move(pending),
+        std::span<const ninfer::runtime::CommitDecision>(decisions.data(), batch_size));
     const float gpu_ms = timer.stop_ms();
     const double wall_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
-    return {.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
+    RoundMeasurement result{.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        result.stats[row] = committed.rows[row].speculative;
+    }
+    return result;
 }
 
 template <class T>
@@ -237,51 +239,87 @@ int run(const Options& options) {
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend                      = target::Package::make_frontend(*model, engine);
-    const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
-    ninfer::runtime::RequestMemory request_memory(device, request_capacity);
+    auto frontend = target::Package::make_frontend(*model, engine);
+    const ninfer::StartupObserver startup_observer;
+    auto program =
+        target::Package::create_program(*model, std::move(sequence), device, startup_observer);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
+    std::array<target::Package::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
-        auto request_base = program->plan_request_base(prompt, execution);
-        auto request_plan = program->plan_request_for_lane(lane, prompt, request_base);
-        request_memory.activate(request_plan.summary().transient_bytes,
-                                request_plan.summary().transient_alignment);
-        auto prefill = program->start_prefill_lane(lane, std::move(prompt), std::move(request_plan),
-                                                   request_memory.region());
-        while (!prefill.complete) { prefill = program->advance_prefill_lane(lane); }
-        request_memory.deactivate();
-        if (prefill.round.tokens.size() != 1) {
+        auto request_base = program->plan_request(prompt, execution);
+        auto request_plan =
+            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
+                                       nullptr, std::nullopt, false);
+        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+        auto resource_plan = program->seal_identity(*request_plan, prompt, {});
+        if (!resource_plan) {
+            throw std::runtime_error("benchmark root resources were not sealed");
+        }
+        const auto reserved =
+            program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+        if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
+            throw std::runtime_error("benchmark root materialization was not reserved");
+        }
+        std::optional<target::Package::MaterializationResult> published;
+        for (;;) {
+            auto transaction = program->progress_context_transaction({});
+            if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(
+                    transaction)) {
+                continue;
+            }
+            if (!std::holds_alternative<target::Package::MaterializationResult>(transaction)) {
+                program->finalize_context_transaction();
+                throw std::runtime_error("benchmark root returned the wrong transaction result");
+            }
+            published.emplace(
+                std::get<target::Package::MaterializationResult>(std::move(transaction)));
+            break;
+        }
+        if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
+            !published->published) {
+            program->finalize_context_transaction();
+            throw std::runtime_error("benchmark root materialization was not published");
+        }
+        auto started = std::move(*published->published);
+        program->finalize_context_transaction();
+        active_sequences[lane] = started.sequence;
+        std::optional<target::Package::PrefillProgress> progress;
+        progress.emplace(program->advance_prefill(active_sequences[lane]));
+        while (!progress->complete) {
+            progress.reset();
+            progress.emplace(program->advance_prefill(active_sequences[lane]));
+        }
+        if (!progress->pending || progress->pending->tokens().size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");
         }
-        program->resolve_prefill_lane(lane, false);
+        const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
+            ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
+        (void)program->commit(std::move(*progress->pending), begin_decision);
     }
 
+    const auto active_span = std::span<const target::Package::SequenceHandle>(
+        active_sequences.data(), options.batch_size);
+    RoundMeasurement warmup_state;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
-        (void)measure_round(*program, device, options.batch_size, options.draft_tokens);
-    }
-    std::vector<ninfer::SpeculativeStats> before;
-    before.reserve(options.batch_size);
-    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
-        before.push_back(program->speculative_stats_lane(lane));
+        warmup_state =
+            measure_round(*program, device, active_span, options.batch_size, options.draft_tokens);
     }
 
     std::vector<RoundMeasurement> measurements;
     measurements.reserve(static_cast<std::size_t>(options.repetitions));
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
         measurements.push_back(
-            measure_round(*program, device, options.batch_size, options.draft_tokens));
+            measure_round(*program, device, active_span, options.batch_size, options.draft_tokens));
     }
-    std::vector<ninfer::SpeculativeStats> after;
-    after.reserve(options.batch_size);
+    const auto& before = warmup_state.stats;
+    const auto& after  = measurements.back().stats;
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
-        after.push_back(program->speculative_stats_lane(lane));
-        if (after.back().rounds - before[lane].rounds !=
+        if (after[lane].rounds - before[lane].rounds !=
                 static_cast<std::uint64_t>(options.repetitions) ||
-            after.back().fallback_steps != before[lane].fallback_steps) {
+            after[lane].fallback_steps != before[lane].fallback_steps) {
             throw std::runtime_error("benchmark left the complete DFlash round path");
         }
     }
@@ -304,6 +342,12 @@ int run(const Options& options) {
         for (std::size_t position = 0; position < options.draft_tokens; ++position) {
             accepted_per_position[position] += after[lane].accepted_per_position[position] -
                                                before[lane].accepted_per_position[position];
+        }
+    }
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const auto aborted = program->abort(active_sequences[lane]);
+        if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
+            throw std::runtime_error("benchmark could not release an active sequence");
         }
     }
     const double mean_gpu_ms  = mean(gpu_ms);

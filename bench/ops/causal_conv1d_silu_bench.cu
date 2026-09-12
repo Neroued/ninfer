@@ -7,6 +7,7 @@
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "ninfer/ops/scatter.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 
@@ -23,6 +24,8 @@ using namespace ninfer::bench;
 
 namespace {
 
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+
 struct Options {
     std::int32_t channels     = 8192;
     std::int32_t tokens       = 1024;
@@ -30,11 +33,45 @@ struct Options {
     std::int32_t initial_slot = 6;
     std::int32_t batch        = 1;
     std::vector<std::int32_t> valid_columns;
+    std::vector<std::int32_t> token_list;
     bool decode   = false;
     bool prefill  = false;
     bool distinct = false;
     bool snapshot = false;
+    bool split    = false;
+    bool legacy   = false;
+    bool cold     = false;
 };
+
+// The candidate partition for a channel extent. Which partitions are registered is the entry's
+// business, not the benchmark's: this builds the obvious one and lets the entry accept or reject it.
+constexpr std::int32_t kSplitKeyDim = 2048;
+
+bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t& value_dim) {
+    key_dim   = kSplitKeyDim;
+    value_dim = channels - 2 * kSplitKeyDim;
+    return value_dim > 0;
+}
+
+Result time_stage(const Options& options, const launch_fn& launch, double bytes_moved) {
+    if (!options.cold) { return bench_loop(launch, bytes_moved); }
+    constexpr int kColdWarmup = 20;
+    constexpr int kColdRepeat = 40;
+    DeviceBuffer flush(kFlushBytes);
+    const ColdTiming timing = measure_cold_launch(launch, flush, nullptr, kColdWarmup, kColdRepeat);
+    Result result;
+    result.n_runs        = kColdRepeat;
+    result.median_us     = timing.median_us;
+    result.min_us        = timing.min_us;
+    result.p95_us        = timing.p95_us;
+    const double seconds = timing.median_us * 1e-6;
+    result.gbs           = seconds > 0.0 ? bytes_moved / seconds / 1e9 : 0.0;
+    return result;
+}
+
+std::string cache_tag(const Options& options, const char* entry) {
+    return options.cold ? std::string(entry) + "-cold" : std::string(entry);
+}
 
 __global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
     const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -66,14 +103,14 @@ void copy_bytes_launch(const DeviceBuffer& src, DeviceBuffer& dst, std::size_t c
     CUDA_CHECK(cudaGetLastError());
 }
 
-void run_copy_baseline(double bytes, const char* tag) {
+void run_copy_baseline(const Options& options, double bytes, const char* tag) {
     const auto copy_bytes   = static_cast<std::size_t>(bytes / 2.0);
     const auto padded_bytes = (copy_bytes + sizeof(uint4) - 1u) & ~(sizeof(uint4) - 1u);
     DeviceBuffer src        = make_varied_bf16(padded_bytes / 2u, 0xc001c0deU);
     DeviceBuffer dst        = make_zeros(padded_bytes);
 
-    const Result r =
-        bench_loop([&](cudaStream_t s) { copy_bytes_launch(src, dst, copy_bytes, s); }, bytes);
+    const Result r = time_stage(
+        options, [&](cudaStream_t s) { copy_bytes_launch(src, dst, copy_bytes, s); }, bytes);
     print_result(tag, r);
 }
 
@@ -103,7 +140,8 @@ void run_prefill(const Options& options, bool distinct) {
     // Informational compulsory traffic: x/out, the four-tap weight, and state read/write. NCU
     // counters remain the performance authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = bench_loop(
+    const Result r     = time_stage(
+        options,
         [&](cudaStream_t s) {
             if (distinct) {
                 ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, s);
@@ -112,8 +150,99 @@ void run_prefill(const Options& options, bool distinct) {
             }
         },
         bytes);
+    const std::string tag = shape_tag(cache_tag(options, distinct ? "distinct" : "prefill").c_str(),
+                                      options.channels, options.tokens);
+    print_result(tag.c_str(), r);
+}
+
+// Split-output prefill. The destinations partition the channel extent the way the GDN caller
+// does: two key-sized ranges followed by the value range.
+void run_split(const Options& options) {
+    std::int32_t key_dim   = 0;
+    std::int32_t value_dim = 0;
+    if (!split_partition(options.channels, key_dim, value_dim)) {
+        std::printf("SKIP: --channels %d leaves no value rows\n", options.channels);
+        return;
+    }
+    const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
+    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer state_out = make_zeros(state_n * 2u);
+    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
+
+    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
+    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
+    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
+    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
+    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
+    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
+
+    // x in, q+k+v out, the four-tap weight and both states. NCU counters remain the performance
+    // authority.
+    const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
+    const Result r     = time_stage(
+        options,
+        [&](cudaStream_t s) {
+            ops::causal_conv1d_silu_split(tx, tw, tin, tout_state, tq, tk, tv, s);
+        },
+        bytes);
     const std::string tag =
-        shape_tag(distinct ? "distinct" : "prefill", options.channels, options.tokens);
+        shape_tag(cache_tag(options, "split").c_str(), options.channels, options.tokens);
+    print_result(tag.c_str(), r);
+}
+
+// The stage the split entry replaced: one packed convolution into a [C,T] plane, then three
+// column extractions out of it. Temporary, for the implementation decision only.
+void run_legacy_stage(const Options& options) {
+    std::int32_t key_dim   = 0;
+    std::int32_t value_dim = 0;
+    if (!split_partition(options.channels, key_dim, value_dim)) {
+        std::printf("SKIP: --channels %d leaves no value rows\n", options.channels);
+        return;
+    }
+    const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
+    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer state_out = make_zeros(state_n * 2u);
+    DeviceBuffer packed    = make_zeros(n * 2u);
+    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
+
+    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
+    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
+    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
+    Tensor tpacked(packed.p, DType::BF16, {options.channels, options.tokens});
+    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
+    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
+    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
+
+    // The convolution moves x in and the packed plane out; the three extractions read that plane
+    // back and write the same bytes again.
+    const double bytes = 8.0 * static_cast<double>(n) + 20.0 * options.channels;
+    const Result r     = time_stage(
+        options,
+        [&](cudaStream_t s) {
+            ops::causal_conv1d_silu(tx, tw, tin, tout_state, tpacked, s);
+            ops::extract_bf16_columns(tpacked, 0, tq, s);
+            ops::extract_bf16_columns(tpacked, key_dim, tk, s);
+            ops::extract_bf16_columns(tpacked, 2 * key_dim, tv, s);
+        },
+        bytes);
+    const std::string tag =
+        shape_tag(cache_tag(options, "legacy-stage").c_str(), options.channels, options.tokens);
     print_result(tag.c_str(), r);
 }
 
@@ -131,11 +260,11 @@ void run_decode(const Options& options) {
     Tensor tout(out.p, DType::BF16, {options.channels, 1});
 
     const double bytes = 24.0 * options.channels;
-    const Result r =
-        bench_loop([&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
-    const std::string tag = shape_tag("decode", options.channels, 1);
+    const Result r     = time_stage(
+        options, [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
+    const std::string tag = shape_tag(cache_tag(options, "decode").c_str(), options.channels, 1);
     print_result(tag.c_str(), r);
-    run_copy_baseline(bytes, "copy same-byte decode baseline");
+    run_copy_baseline(options, bytes, cache_tag(options, "copy same-byte decode baseline").c_str());
 }
 
 void run_snapshot(const Options& options) {
@@ -191,22 +320,25 @@ void run_snapshot(const Options& options) {
     // and publishes three BF16 state columns.
     const double bytes = 8.0 * options.channels + 6.0 * options.channels * options.batch +
                          10.0 * static_cast<double>(n);
-    const Result r = bench_loop(
+    const Result r     = time_stage(
+        options,
         [&](cudaStream_t s) {
             ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, s);
         },
         bytes);
-    const std::string tag =
-        shape_tag(options.valid_columns.empty() ? "snapshot dense" : "snapshot masked",
+    const std::string tag = shape_tag(
+        cache_tag(options, options.valid_columns.empty() ? "snapshot dense" : "snapshot masked")
+            .c_str(),
                   options.channels, options.tokens, options.batch);
     print_result(tag.c_str(), r);
 }
 
 void print_usage(const char* program) {
     std::fprintf(stderr,
-                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] "
-                 "[--channels C] [--tokens T] [--batch B] [--valid-columns V0,V1,...] "
-                 "[--slots S] [--initial-slot I]\n",
+                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
+                 "[--legacy-stage] [--cache warm|cold] [--channels C] [--tokens T[,T...]] "
+                 "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
+                 "[--initial-slot I]\n",
                  program);
 }
 
@@ -242,6 +374,19 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.distinct = true;
         } else if (!std::strcmp(argv[i], "--snapshot")) {
             options.snapshot = true;
+        } else if (!std::strcmp(argv[i], "--split")) {
+            options.split = true;
+        } else if (!std::strcmp(argv[i], "--legacy-stage")) {
+            options.legacy = true;
+        } else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (!std::strcmp(value, "cold")) {
+                options.cold = true;
+            } else if (!std::strcmp(value, "warm")) {
+                options.cold = false;
+            } else {
+                return false;
+            }
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
             if (!parse_valid_columns(argv[++i], options.valid_columns)) { return false; }
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
@@ -253,9 +398,19 @@ bool parse_options(int argc, char** argv, Options& options) {
                 const long parsed = std::strtol(argv[i], nullptr, 10);
                 if (parsed < 0 || parsed > INT32_MAX) { return false; }
                 options.initial_slot = static_cast<std::int32_t>(parsed);
+            } else if (!std::strcmp(flag, "--tokens")) {
+                options.token_list.clear();
+                const char* cursor = argv[i];
+                while (*cursor != 0) {
+                    char* end         = nullptr;
+                    const long parsed = std::strtol(cursor, &end, 10);
+                    if (end == cursor || parsed <= 0 || parsed > INT32_MAX) { return false; }
+                    options.token_list.push_back(static_cast<std::int32_t>(parsed));
+                    cursor = (*end == ',') ? end + 1 : end;
+                }
+                if (options.token_list.empty()) { return false; }
             } else {
                 std::int32_t* destination = !std::strcmp(flag, "--channels") ? &options.channels
-                                            : !std::strcmp(flag, "--tokens") ? &options.tokens
                                             : !std::strcmp(flag, "--batch")  ? &options.batch
                                                                              : &options.slots;
                 if (!parse_positive(argv[i], *destination)) { return false; }
@@ -264,20 +419,26 @@ bool parse_options(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot) {
+    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
+        !options.split && !options.legacy) {
         options.decode = options.prefill = true;
     }
-    if (options.batch > 8 || (options.batch > 1 && options.tokens > 16) ||
+    if (options.batch > 8 ||
         ((!options.snapshot) && (options.batch != 1 || !options.valid_columns.empty())) ||
         (!options.valid_columns.empty() &&
          options.valid_columns.size() != static_cast<std::size_t>(options.batch))) {
         return false;
     }
-    for (const std::int32_t valid : options.valid_columns) {
-        if (valid > options.tokens) return false;
+    for (const std::int32_t tokens : options.token_list.empty()
+                                        ? std::vector<std::int32_t>{options.tokens}
+                                        : options.token_list) {
+        if (options.batch > 1 && tokens > 16) { return false; }
+        if (options.snapshot && options.batch == 1 && tokens > options.slots) { return false; }
+        for (const std::int32_t valid : options.valid_columns) {
+            if (valid > tokens) { return false; }
+        }
     }
-    return !options.snapshot || options.batch > 1 ||
-           (options.initial_slot < options.slots && options.tokens <= options.slots);
+    return !options.snapshot || options.batch > 1 || options.initial_slot < options.slots;
 }
 
 } // namespace
@@ -295,9 +456,17 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (options.decode) run_decode(options);
-    if (options.prefill) run_prefill(options, false);
-    if (options.distinct) run_prefill(options, true);
-    if (options.snapshot) run_snapshot(options);
+    std::vector<std::int32_t> tokens = options.token_list;
+    if (tokens.empty()) { tokens.push_back(options.tokens); }
+    for (const std::int32_t t : tokens) {
+        Options point = options;
+        point.tokens  = t;
+        if (point.decode) run_decode(point);
+        if (point.prefill) run_prefill(point, false);
+        if (point.distinct) run_prefill(point, true);
+        if (point.snapshot) run_snapshot(point);
+        if (point.legacy) run_legacy_stage(point);
+        if (point.split) run_split(point);
+    }
     return 0;
 }

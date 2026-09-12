@@ -1,10 +1,12 @@
 #include "options.h"
-#include "product/load_progress/load_progress.h"
+#include "product/logging/logging.h"
+#include "product/logging/pretty_format.h"
+#include "product/logging/startup_log.h"
 #include "product/prompt_input/prompt_input.h"
+#include "product/speculative_options.h"
 
 #include "ninfer/engine.h"
 
-#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -13,47 +15,27 @@
 #include <string>
 #include <string_view>
 
+#include <spdlog/logger.h>
+
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
 std::string format_seconds(double seconds) {
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(3) << seconds << " s";
-    return output.str();
+    return ninfer::product::format_pretty_duration(seconds);
 }
 
 std::string format_rate(double tokens, double seconds) {
     if (tokens <= 0.0 || seconds <= 0.0) { return "n/a"; }
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(2) << tokens / seconds << " tok/s";
-    return output.str();
+    return ninfer::product::format_pretty_rate(tokens / seconds, "tok");
 }
 
 std::string format_percent(std::uint64_t numerator, std::uint64_t denominator) {
     if (denominator == 0) { return "n/a"; }
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(2)
-           << 100.0 * static_cast<double>(numerator) / static_cast<double>(denominator) << '%';
-    return output.str();
+    return ninfer::product::format_pretty_percent(static_cast<double>(numerator) /
+                                                  static_cast<double>(denominator));
 }
 
 std::string format_bytes(std::uint64_t bytes) {
-    constexpr double kKiB = 1024.0;
-    constexpr double kMiB = 1024.0 * kKiB;
-    constexpr double kGiB = 1024.0 * kMiB;
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(2);
-    if (bytes >= static_cast<std::uint64_t>(kGiB)) {
-        output << static_cast<double>(bytes) / kGiB << " GiB";
-    } else if (bytes >= static_cast<std::uint64_t>(kMiB)) {
-        output << static_cast<double>(bytes) / kMiB << " MiB";
-    } else if (bytes >= static_cast<std::uint64_t>(kKiB)) {
-        output << static_cast<double>(bytes) / kKiB << " KiB";
-    } else {
-        output << bytes << " B";
-    }
-    return output.str();
+    return ninfer::product::format_pretty_bytes(bytes);
 }
 
 std::string format_arena_used(const ninfer::ArenaMemorySummary& arena) {
@@ -93,7 +75,19 @@ std::string format_finish(ninfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16:
+        return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+        return "fp8-e4m3-row256";
+    case ninfer::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    }
+    return "unknown";
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
@@ -111,6 +105,12 @@ void print_metric(std::string_view label, std::string_view value) {
 
 class StreamingSink final : public ninfer::OutputSink {
 public:
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
     void publish(ninfer::OutputDelta delta) override {
         std::ostream& output =
             delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;
@@ -125,8 +125,12 @@ public:
         }
     }
 
-    void finish_streams() const {
-        if (!content_seen_ || !content_ends_in_newline_) { std::cout << '\n'; }
+    void finish_streams(bool successful = true) {
+        if (finished_) { return; }
+        finished_ = true;
+        if ((successful && !content_seen_) || (content_seen_ && !content_ends_in_newline_)) {
+            std::cout << '\n';
+        }
         std::cout.flush();
         if (reasoning_seen_ && !reasoning_ends_in_newline_) { std::cerr << '\n'; }
     }
@@ -136,20 +140,8 @@ private:
     bool content_ends_in_newline_   = false;
     bool reasoning_seen_            = false;
     bool reasoning_ends_in_newline_ = false;
+    bool finished_                  = false;
 };
-
-void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
-    print_stage("load", "engine construction", wall_seconds);
-    print_stage("load", "artifact/materialize", load.load_seconds);
-    print_stage("load", "host to device", load.upload_seconds);
-    print_metric("target", load.target);
-    print_metric("weights", load.weights_id);
-    print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
-    print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
-    print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
-    print_metric("tensors/resources",
-                 std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
-}
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
@@ -169,6 +161,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
     print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
     print_metric("generated tokens", std::to_string(generated));
+    if (result.thinking.configured_budget) {
+        print_metric("thinking budget", std::to_string(*result.thinking.configured_budget));
+        print_metric("model thinking tokens",
+                     std::to_string(result.thinking.model_thinking_tokens));
+        print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
+        print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));
@@ -195,14 +194,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
-    print_metric("CUDA Graph memory", format_bytes(memory.cuda_graph_observed_bytes) + " / " +
-                                          format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
-        const std::string backend =
-            speculative.backend == ninfer::SpeculativeBackend::DFlash ? "dflash" : "mtp";
+        const std::string backend = ninfer::product::speculative_backend_name(speculative.backend);
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
@@ -232,12 +229,27 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    ninfer::cli::Options cli;
     try {
-        const ninfer::cli::Options cli = ninfer::cli::parse_options(argc, argv);
-        if (cli.help_requested) {
-            std::cout << ninfer::cli::usage_text(argv[0]);
-            return 0;
-        }
+        cli = ninfer::cli::parse_options(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        std::cerr << ninfer::cli::usage_text(argv[0]);
+        return 1;
+    }
+    if (cli.help_requested) {
+        std::cout << ninfer::cli::usage_text(argv[0]);
+        return 0;
+    }
+
+    ninfer::product::LoggingRuntime logging(
+        {.logger_name  = "ninfer",
+         .level        = cli.log_level,
+         .presentation = ninfer::product::LogPresentation::Tool});
+    const std::shared_ptr<spdlog::logger> logger = logging.logger();
+    ninfer::product::StartupLogRenderer startup_log(logging);
+
+    try {
 
         ninfer::PromptInput input =
             cli.messages_path.empty()
@@ -249,13 +261,11 @@ int main(int argc, char** argv) {
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
+        request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
 
-        std::cerr << "phase       detail                      elapsed/progress\n";
-        ninfer::product::LoadProgressRenderer load_progress(
-            std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
@@ -266,22 +276,33 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        // One CLI invocation owns exactly one request, so retained cross-request context has no
+        // consumer and must not reserve an extra Device StateImage or run terminal capture.
+        engine_options.context_cache.enabled                = false;
+        engine_options.context_cache.host_state_slots       = 0;
+        engine_options.context_cache.host_kv_capacity_bytes = 0;
+        engine_options.startup_observer                     = startup_log.observer();
 
-        const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
-        const double load_wall = std::chrono::duration<double>(Clock::now() - load_started).count();
-        print_load_summary(engine.load_summary(), load_wall);
+        startup_log.engine_ready(engine.load_summary());
         engine.reset_memory_peaks();
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
+        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            ninfer::OutputConsumerMode::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
-        const ninfer::GenerationResult result             = generation.wait(&sink);
-        sink.finish_streams();
+        ninfer::GenerationResult result;
+        try {
+            result = generation.wait(&sink);
+            sink.finish_streams();
+        } catch (...) {
+            sink.finish_streams(false);
+            throw;
+        }
 
+        std::cerr << "phase       detail                      elapsed/progress\n";
         if (cli.print_token_ids) {
             std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";
             for (std::size_t i = 0; i < result.generated_token_ids.size(); ++i) {
@@ -293,8 +314,7 @@ int main(int argc, char** argv) {
         print_generation_summary(result, sampling, engine.memory_summary());
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "error: " << error.what() << '\n';
-        std::cerr << ninfer::cli::usage_text(argv[0]);
+        logger->error("{}", ninfer::product::format_pretty_text(error.what()));
         return 1;
     }
 }

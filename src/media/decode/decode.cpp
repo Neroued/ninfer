@@ -35,9 +35,13 @@ std::string av_error(int code) {
     return text.data();
 }
 
+[[noreturn]] void throw_invalid_media(std::string message) {
+    throw Error(ErrorKind::InvalidInput, std::move(message));
+}
+
 void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }
-    if (bytes.empty()) { throw std::invalid_argument("media bytes are empty"); }
+    if (bytes.empty()) { throw_invalid_media("media bytes are empty"); }
     if (bytes.size() > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
     }
@@ -185,22 +189,20 @@ public:
             AVFormatContext* raw = format_;
             int rc               = avformat_open_input(&raw, nullptr, nullptr, nullptr);
             format_              = raw;
-            if (rc < 0) { throw std::invalid_argument("failed to open media: " + av_error(rc)); }
+            if (rc < 0) { throw_invalid_media("failed to open media: " + av_error(rc)); }
             if ((rc = avformat_find_stream_info(format_, nullptr)) < 0) {
-                throw std::invalid_argument("failed to inspect media: " + av_error(rc));
+                throw_invalid_media("failed to inspect media: " + av_error(rc));
             }
             stream_index_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-            if (stream_index_ < 0) {
-                throw std::invalid_argument("media has no decodable video stream");
-            }
+            if (stream_index_ < 0) { throw_invalid_media("media has no decodable video stream"); }
             stream_              = format_->streams[stream_index_];
             const AVCodec* codec = avcodec_find_decoder(stream_->codecpar->codec_id);
-            if (codec == nullptr) { throw std::invalid_argument("media codec is not supported"); }
+            if (codec == nullptr) { throw_invalid_media("media codec is not supported"); }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
             if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
                 (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
-                throw std::invalid_argument("failed to open media codec: " + av_error(rc));
+                throw_invalid_media("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
             frame_  = av_frame_alloc();
@@ -234,14 +236,14 @@ public:
                 const int rc = avcodec_receive_frame(codec_, frame_);
                 if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { return true; }
                 if (rc < 0) {
-                    throw std::runtime_error("failed to decode media frame: " + av_error(rc));
+                    throw_invalid_media("failed to decode media frame: " + av_error(rc));
                 }
                 if (frame_->crop_top != 0 || frame_->crop_bottom != 0 || frame_->crop_left != 0 ||
                     frame_->crop_right != 0) {
                     const int crop = av_frame_apply_cropping(frame_, 0);
                     if (crop < 0) {
-                        throw std::runtime_error("failed to apply media display crop: " +
-                                                 av_error(crop));
+                        throw_invalid_media("failed to apply media display crop: " +
+                                            av_error(crop));
                     }
                 }
                 const bool keep_decoding = callback(index++, frame_);
@@ -252,12 +254,12 @@ public:
         while (true) {
             const int rc = av_read_frame(format_, packet_);
             if (rc == AVERROR_EOF) { break; }
-            if (rc < 0) { throw std::runtime_error("failed while reading media: " + av_error(rc)); }
+            if (rc < 0) { throw_invalid_media("failed while reading media: " + av_error(rc)); }
             if (packet_->stream_index == stream_index_) {
                 const int send = avcodec_send_packet(codec_, packet_);
                 if (send < 0 && send != AVERROR(EAGAIN)) {
                     av_packet_unref(packet_);
-                    throw std::runtime_error("failed to submit media packet: " + av_error(send));
+                    throw_invalid_media("failed to submit media packet: " + av_error(send));
                 }
                 if (!receive()) {
                     av_packet_unref(packet_);
@@ -268,7 +270,7 @@ public:
         }
         const int flush = avcodec_send_packet(codec_, nullptr);
         if (flush < 0 && flush != AVERROR_EOF) {
-            throw std::runtime_error("failed to flush media decoder: " + av_error(flush));
+            throw_invalid_media("failed to flush media decoder: " + av_error(flush));
         }
         (void)receive();
     }
@@ -277,7 +279,7 @@ public:
         const int width  = frame->width;
         const int height = frame->height;
         if (width <= 0 || height <= 0) {
-            throw std::invalid_argument("decoded media dimensions are invalid");
+            throw_invalid_media("decoded media dimensions are invalid");
         }
         if (static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
             throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
@@ -415,6 +417,18 @@ int orientation_from_rotation(int rotation) {
     return 1;
 }
 
+ImageInfo frame_info(const AVFrame* frame, int orientation, std::uint64_t max_decoded_pixels) {
+    const int width  = frame->width;
+    const int height = frame->height;
+    if (width <= 0 || height <= 0) { throw_invalid_media("decoded media dimensions are invalid"); }
+    if (static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) >
+        max_decoded_pixels) {
+        throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+    }
+    const bool swap = orientation >= 5;
+    return ImageInfo{.width = swap ? height : width, .height = swap ? width : height};
+}
+
 double fps_of(const AVStream* stream) {
     double fps = av_q2d(stream->avg_frame_rate);
     if (!(fps > 0.0) || !std::isfinite(fps)) { fps = av_q2d(stream->r_frame_rate); }
@@ -456,7 +470,135 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
     return indices;
 }
 
+struct VideoPlan {
+    int total_frames   = 0;
+    int minimum_frames = 0;
+    double fps         = 0.0;
+    double duration    = 0.0;
+    int orientation    = 1;
+    std::vector<int> indices;
+};
+
+VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& policy,
+                          double target_fps, int min_frames, int max_frames) {
+    Decoder probe(bytes, policy.max_decoded_pixels);
+    VideoPlan plan;
+    plan.fps          = fps_of(probe.stream());
+    plan.total_frames = probe.stream()->nb_frames > 0 &&
+                                probe.stream()->nb_frames <= std::numeric_limits<int>::max()
+                            ? static_cast<int>(probe.stream()->nb_frames)
+                            : 0;
+    plan.duration     = probe.duration_seconds();
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
+    }
+    if (plan.duration > policy.max_video_duration_seconds) {
+        throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
+    if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }
+    if (plan.total_frames > policy.max_video_source_frames) {
+        throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
+    }
+    plan.indices = sample_indices(plan.total_frames, plan.fps, target_fps, min_frames, max_frames);
+    const std::uint64_t coded_pixels =
+        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
+        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
+    if (coded_pixels != 0 && plan.indices.size() > policy.max_decoded_video_pixels / coded_pixels) {
+        throw Error(ErrorKind::BudgetExceeded,
+                    "sampled source video pixels exceed processor limit");
+    }
+    plan.minimum_frames = std::min(min_frames, plan.total_frames);
+    plan.orientation    = orientation_from_rotation(rotation_of(probe.stream()));
+    return plan;
+}
+
+struct VideoScan {
+    ImageInfo first_frame;
+    int sampled_frames = 0;
+};
+
+template <typename Retain>
+VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                     const VideoPlan& plan, Retain&& retain) {
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    VideoScan scan;
+    std::size_t wanted            = 0;
+    int decoded                   = 0;
+    std::uint64_t retained_pixels = 0;
+    decoder.frames([&](int index, const AVFrame* frame) {
+        if (policy.checkpoint) { policy.checkpoint(); }
+        decoded = index + 1;
+        if (wanted < plan.indices.size() && index == plan.indices[wanted]) {
+            const ImageInfo info = frame_info(frame, plan.orientation, policy.max_decoded_pixels);
+            const std::uint64_t pixels = static_cast<std::uint64_t>(frame->width) *
+                                         static_cast<std::uint64_t>(frame->height);
+            if (retained_pixels > policy.max_decoded_video_pixels ||
+                pixels > policy.max_decoded_video_pixels - retained_pixels) {
+                throw Error(ErrorKind::BudgetExceeded,
+                            "sampled source video pixels exceed processor limit");
+            }
+            retained_pixels += pixels;
+            if (wanted == 0) { scan.first_frame = info; }
+            retain(decoder, frame, plan.orientation);
+            ++wanted;
+        }
+        return wanted != plan.indices.size();
+    });
+    if (wanted < static_cast<std::size_t>(plan.minimum_frames)) {
+        throw_invalid_media("video decoder produced fewer than the minimum sampled frames");
+    }
+    for (std::size_t index = wanted; index < plan.indices.size(); ++index) {
+        if (plan.indices[index] < decoded) {
+            throw_invalid_media("video decoder skipped a requested internal frame");
+        }
+    }
+    scan.sampled_frames = static_cast<int>(wanted);
+    return scan;
+}
+
 } // namespace
+
+ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
+    validate_input(bytes, policy);
+    if (policy.checkpoint) { policy.checkpoint(); }
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    int orientation = exif_orientation(bytes);
+    if (orientation == 1) {
+        orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    }
+    ImageInfo result;
+    decoder.frames([&](int index, const AVFrame* frame) {
+        if (policy.checkpoint) { policy.checkpoint(); }
+        if (index == 0) {
+            result = frame_info(frame, orientation, policy.max_decoded_pixels);
+            return false;
+        }
+        return true;
+    });
+    if (result.width == 0 || result.height == 0) {
+        throw_invalid_media("image contains no decoded frame");
+    }
+    return result;
+}
+
+VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        double target_fps, int min_frames, int max_frames) {
+    validate_input(bytes, policy);
+    if (policy.checkpoint) { policy.checkpoint(); }
+    VideoPlan plan       = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    const VideoScan scan = scan_video(bytes, policy, plan, [](Decoder&, const AVFrame*, int) {});
+    VideoInfo out;
+    out.width          = scan.first_frame.width;
+    out.height         = scan.first_frame.height;
+    out.total_frames   = plan.total_frames;
+    out.sampled_frames = scan.sampled_frames;
+    out.fps            = plan.fps;
+    out.duration =
+        plan.duration > 0.0 ? plan.duration : static_cast<double>(plan.total_frames) / plan.fps;
+    out.indices = std::move(plan.indices);
+    return out;
+}
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
@@ -475,7 +617,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
         }
         return true;
     });
-    if (result.rgb.empty()) { throw std::invalid_argument("image contains no decoded frame"); }
+    if (result.rgb.empty()) { throw_invalid_media("image contains no decoded frame"); }
     return result;
 }
 
@@ -483,69 +625,20 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
                    int min_frames, int max_frames) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    Decoder probe(bytes, policy.max_decoded_pixels);
-    const double fps      = fps_of(probe.stream());
-    int total             = probe.stream()->nb_frames > 0 &&
-                        probe.stream()->nb_frames <= std::numeric_limits<int>::max()
-                                ? static_cast<int>(probe.stream()->nb_frames)
-                                : 0;
-    const double duration = probe.duration_seconds();
-    if (total == 0 && duration > 0.0) { total = static_cast<int>(std::nearbyint(duration * fps)); }
-    if (duration > policy.max_video_duration_seconds) {
-        throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
-    }
-    if (total == 0) { total = count_frames(bytes, policy); }
-    if (total > policy.max_video_source_frames) {
-        throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
-    }
-    const std::vector<int> indices = sample_indices(total, fps, target_fps, min_frames, max_frames);
-    const std::uint64_t coded_pixels =
-        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
-        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
-    if (coded_pixels != 0 && indices.size() > policy.max_decoded_video_pixels / coded_pixels) {
-        throw Error(ErrorKind::BudgetExceeded,
-                    "sampled source video pixels exceed processor limit");
-    }
-
-    Decoder decoder(bytes, policy.max_decoded_pixels);
-    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    VideoPlan plan = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
     Video out;
-    out.total_frames = total;
-    out.fps          = fps;
-    out.duration     = duration > 0.0 ? duration : static_cast<double>(total) / fps;
-    out.indices      = indices;
-    out.frames.reserve(indices.size());
-    std::size_t wanted            = 0;
-    int decoded                   = 0;
-    std::uint64_t retained_pixels = 0;
-    decoder.frames([&](int index, const AVFrame* frame) {
-        if (policy.checkpoint) { policy.checkpoint(); }
-        decoded = index + 1;
-        if (wanted < indices.size() && index == indices[wanted]) {
-            const std::uint64_t pixels = static_cast<std::uint64_t>(std::max(frame->width, 0)) *
-                                         static_cast<std::uint64_t>(std::max(frame->height, 0));
-            if (retained_pixels > policy.max_decoded_video_pixels ||
-                pixels > policy.max_decoded_video_pixels - retained_pixels) {
-                throw Error(ErrorKind::BudgetExceeded,
-                            "sampled source video pixels exceed processor limit");
-            }
-            retained_pixels += pixels;
+    out.total_frames = plan.total_frames;
+    out.fps          = plan.fps;
+    out.duration =
+        plan.duration > 0.0 ? plan.duration : static_cast<double>(plan.total_frames) / plan.fps;
+    out.frames.reserve(plan.indices.size());
+    const VideoScan scan = scan_video(
+        bytes, policy, plan, [&](Decoder& decoder, const AVFrame* frame, int orientation) {
             out.frames.push_back(decoder.rgb(frame, orientation, true));
-            ++wanted;
-        }
-        return wanted != indices.size();
-    });
-    const std::size_t required = static_cast<std::size_t>(std::min(min_frames, total));
-    if (out.frames.size() < required) {
-        throw std::runtime_error("video decoder produced fewer than the minimum sampled frames");
-    }
-    for (std::size_t i = wanted; i < indices.size(); ++i) {
-        if (indices[i] < decoded) {
-            throw std::runtime_error("video decoder skipped a requested internal frame");
-        }
-    }
-    out.width  = out.frames.front().width;
-    out.height = out.frames.front().height;
+        });
+    out.width   = scan.first_frame.width;
+    out.height  = scan.first_frame.height;
+    out.indices = std::move(plan.indices);
     return out;
 }
 

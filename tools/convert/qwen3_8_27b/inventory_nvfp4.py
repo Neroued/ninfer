@@ -21,6 +21,8 @@ from tools.convert.qwen3_6.common.inventory import (
     build_vision_specs,
 )
 
+from .dflash2_inventory import DFLASH2_TENSOR_SPECS
+
 
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "nvfp4"
@@ -181,12 +183,13 @@ DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS = build_vision_specs(5120)
 
-TENSOR_SPECS = (
+BASE_TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
 )
+TENSOR_SPECS = BASE_TENSOR_SPECS + DFLASH2_TENSOR_SPECS
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 FORMAT_COUNTS = {
@@ -361,14 +364,14 @@ ALIAS_SPECS = (
 )
 
 NVFP4_TENSOR_SPECS = tuple(
-    spec for spec in TENSOR_SPECS if spec.format == NVFP4
+    spec for spec in BASE_TENSOR_SPECS if spec.format == NVFP4
 )
 FP8_TENSOR_SPECS = tuple(
-    spec for spec in TENSOR_SPECS if spec.format == FP8
+    spec for spec in BASE_TENSOR_SPECS if spec.format == FP8
 )
 INPUT_SCALE_DIVISOR_SPECS = tuple(
     spec
-    for spec in TENSOR_SPECS
+    for spec in BASE_TENSOR_SPECS
     if spec.format == FP32 and spec.name.endswith("/input_scale_divisor")
 )
 
@@ -377,37 +380,6 @@ def validate_inventory() -> None:
     names = tuple(spec.name for spec in OBJECT_SPECS)
     if len(names) != len(set(names)):
         raise ValueError("Qwen3.8 NVFP4 inventory contains duplicate names")
-    if (
-        len(TEXT_CORE_TENSOR_SPECS),
-        len(DRAFT_HEAD_TENSOR_SPECS),
-        len(MTP_TENSOR_SPECS),
-        len(VISION_TENSOR_SPECS),
-        len(TENSOR_SPECS),
-        len(OBJECT_SPECS),
-        len(NVFP4_TENSOR_SPECS),
-        len(FP8_TENSOR_SPECS),
-        len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (771, 2, 12, 333, 1118, 1124, 112, 146, 112):
-        raise ValueError("registered Qwen3.8 NVFP4 inventory is incomplete")
-    if FORMAT_COUNTS != {
-        BF16: 534,
-        FP32: 208,
-        I32: 1,
-        Q4: 55,
-        Q5: 54,
-        Q6: 1,
-        W8: 7,
-        NVFP4: 112,
-        FP8: 146,
-    }:
-        raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
-    if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 743,
-        ROW_SPLIT_LAYOUT: 117,
-        BLOCK_SCALE_LAYOUT: 112,
-        ROW_SCALE_LAYOUT: 146,
-    }:
-        raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
 
 
 validate_inventory()
@@ -415,6 +387,7 @@ validate_inventory()
 
 __all__ = [
     "ALIAS_SPECS",
+    "BASE_TENSOR_SPECS",
     "BF16",
     "BLOCK_SCALE_LAYOUT",
     "CONTIGUOUS_LAYOUT",

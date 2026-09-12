@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from tools.convert.qwen3_6_27b import inventory as qwen3_6_inventory
 
+from .dflash2_inventory import DFLASH2_TENSOR_SPECS
+
 
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "groupwise-int"
@@ -47,12 +49,13 @@ DRAFT_HEAD_TENSOR_SPECS = qwen3_6_inventory.DRAFT_HEAD_TENSOR_SPECS
 MTP_TENSOR_SPECS = qwen3_6_inventory.MTP_TENSOR_SPECS
 VISION_TENSOR_SPECS = qwen3_6_inventory.VISION_TENSOR_SPECS
 
-TENSOR_SPECS = (
+BASE_TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
 )
+TENSOR_SPECS = BASE_TENSOR_SPECS + DFLASH2_TENSOR_SPECS
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 FORMAT_COUNTS = {

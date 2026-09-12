@@ -1,7 +1,24 @@
 # tools/bench
 
-Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
-under [`tools/parity`](../parity).
+Maintainer orchestration for the public `ninfer_bench` throughput tool, serving corpus/concurrency
+runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
+[`tests/`](../../tests/README.md).
+
+## External Serve TTFT
+
+[`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner
+uses frozen text/media requests and public streaming protocols without calling Engine. A separate
+controller manages the fixed Qwen3.8-27B NVFP4/FP8 Serve profiles and fresh-process isolation.
+
+```bash
+python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
+```
+
+The controller chooses the profile, starts and stops Serve for every sample, runs the external
+client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve artifacts below
+`profiles/bench/ttft/`, records structured per-request Serve diagnostics, and writes Markdown,
+JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
+are documented in the dedicated README.
 
 ## Corpus baker
 
@@ -109,43 +126,52 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+Each raw report must be `ninfer_bench_report` schema v14. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
-load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
-allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
+load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
+inside the unified workspace and CUDA Graph allowance, per-test planned logical and
+allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
 rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
 
-`run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
-artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
-`--mode mtp3` to run only that suite. The 35B-A3B-only `--mode dflash7` route runs the same
-decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
-`--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
-Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
-schema-v9 serving startup record. The stochastic route pins its complete
+## Serving corpus benchmark
+
+[Published coverage and model results](../../docs/performance.md) identify the recorded runs.
+The [serving methodology](../../docs/performance/methodology.md) owns workload definitions,
+metric boundaries, aggregation, comparison rules, and publication format. This section describes
+runner usage and output files.
+
+`run_serve_corpus.py` accepts explicit `--artifact TARGET=PATH` entries for the registered targets.
+Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
+Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
+in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
+Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
+
+The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under
+`server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
+category summaries. The output directory is supplied explicitly with `--output`.
+
+Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
+exposure, and decode Host/Device-wait time per round received from the schema-v20 serving records.
+Request exposure is a latency distribution value and is never summed across concurrent requests;
+worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 
 ## Concurrent serving benchmark
 
-`run_serve_concurrency.py` measures two separate concurrency properties through real loopback
-Chat Completions requests:
+`run_serve_concurrency.py` selects `--suite decode-saturation` or `--suite corpus-makespan`.
+Their distinct time boundaries and workload dispatch are defined in the
+[serving methodology](../../docs/performance/methodology.md#workloads-and-measurement-boundaries).
+Repeat `--concurrency` to select C points; each point starts a fresh server. The point report
+records the actual Engine configuration, automatic KV capacity, shuffle seed where applicable,
+dispatch method, and per-request positions.
 
-- `decode-saturation` submits one long-decode wave and uses only complete one-second intervals in
-  which every decode round has exactly the configured batch size. Ramp-up, prefill, and drain
-  intervals are excluded.
-- `corpus-makespan` shuffles the existing mode-specific corpus once with the fixed seed `20260811`,
-  then runs that same order with exactly `N` persistent client workers. A worker submits the next
-  request only after its current response completes, and makespan ends when the final response has
-  been read. Request bodies are sent in shuffled-order sequence while response waits remain fully
-  concurrent, removing client-thread arrival races without serializing inference.
-
-Each concurrency point starts a fresh server because its execution graphs and memory plan are
-startup-fixed. Prefix reuse is disabled, startup and warmup are outside both measurements, and the
-runner writes per-point JSON, raw serving JSONL, and combined JSON/CSV/Markdown summaries.
-The point report records the shuffle seed, dispatch method, shuffled position, and canonical corpus
-position for every request.
+Outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+`summary.md`. Corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
+per-request phase summaries in that directory; older campaigns may have only point reports and
+server logs. Historical model pages identify the report directory associated with each table.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \

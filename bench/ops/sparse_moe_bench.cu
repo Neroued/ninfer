@@ -825,9 +825,10 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
         const double peak_memory_gbps = theoretical_memory_gbps(context.device);
-        std::printf("# gpu=%s sm=%d execution=%s timed_scope=full_sparse_moe_device_body "
-                    "cold_flush_mib=%llu theoretical_memory=%.1f GB/s\n",
-                    context.props.name, context.sm(),
+        std::printf("# gpu=%s compute_capability=%d execution=%s "
+                    "timed_scope=full_sparse_moe_device_body cold_flush_mib=%llu "
+                    "theoretical_memory=%.1f GB/s\n",
+                    context.props.name, context.compute_capability(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
                     static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);

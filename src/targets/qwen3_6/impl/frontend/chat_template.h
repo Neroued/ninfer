@@ -1,5 +1,7 @@
 #pragma once
 
+#include "targets/qwen3_6/impl/frontend/tokenizer.h"
+
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/types.h>
 
@@ -7,10 +9,13 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
+
+inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
 
 struct ToolCall {
     std::string id;
@@ -24,10 +29,35 @@ enum class ChatPartKind {
     Video,
 };
 
+enum class Modality : std::uint8_t {
+    Image = 1,
+    Video = 2,
+};
+
+struct MediaPlaceholderByteSpec {
+    ByteSpan bytes;
+    Modality modality      = Modality::Image;
+    std::size_t item_index = 0;
+};
+
+struct MediaTokenRunByteSpec {
+    ByteSpan bytes;
+    Modality modality       = Modality::Image;
+    std::size_t item_index  = 0;
+    std::size_t frame_index = 0;
+};
+
+struct RenderedFragment {
+    std::string text;
+    std::vector<ByteSpan> literal_spans;
+    std::vector<MediaPlaceholderByteSpec> media_placeholders;
+};
+
 struct MediaData {
     std::vector<std::uint8_t> bytes;
     std::string media_type;
     std::string source_name;
+    ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
 };
 
 struct ChatPart {
@@ -64,18 +94,23 @@ struct ChatMessage {
     std::string tool_call_id;
 
     [[nodiscard]] bool has_media() const noexcept;
-    [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
-                                               int* image_count   = nullptr,
-                                               int* video_count   = nullptr) const;
+    [[nodiscard]] RenderedFragment
+    rendered_content(bool add_vision_id = false, int* image_count = nullptr,
+                     int* video_count = nullptr, std::size_t* media_count = nullptr,
+                     std::vector<std::size_t>* part_boundaries = nullptr) const;
 };
 
 struct ChatRenderOptions {
+    PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
+    // Internal renderer control used by frontend qualification. Product PromptInput always
+    // selects either a new assistant turn or continuation of the final assistant.
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
     std::optional<ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    std::vector<PromptCacheMarker> cache_markers;
 };
 
 struct RewriteCheckpointByteSpec {
@@ -85,7 +120,17 @@ struct RewriteCheckpointByteSpec {
 
 struct RenderedChat {
     std::string text;
+    std::vector<ByteSpan> literal_spans;
+    std::vector<MediaPlaceholderByteSpec> media_placeholders;
+    std::vector<MediaTokenRunByteSpec> media_token_runs;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> rewrite_execution_boundaries;
+    // Index n is the exact byte frontier after serializing the first n input messages. A missing
+    // value means the template has no independent boundary there (for example, before a leading
+    // instruction message folded into the system preamble).
+    std::vector<std::optional<std::size_t>> message_boundaries;
+    // One rendered byte boundary per requested cache marker.
+    std::vector<std::optional<std::size_t>> cache_boundaries;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

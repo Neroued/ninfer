@@ -166,15 +166,12 @@ def test_reader_rejects_invalid_framing_schema_and_geometry(tmp_path):
         Artifact.open(path)
 
 
-def test_reader_rejects_v1_with_the_migration_command(tmp_path):
-    path = tmp_path / "legacy.ninfer"
+def test_reader_rejects_unknown_magic(tmp_path):
+    path = tmp_path / "unknown.ninfer"
     _write_raw(
         path,
         {"model_id": "test-model", "objects": [{"unused": True}]},
-        magic=b"NINFER\x00\x01",
+        magic=b"INVALID!",
     )
-    with pytest.raises(
-        ArtifactError,
-        match=r"python3 -m tools\.artifact\.migrate_v1_to_v2 <artifact>",
-    ):
+    with pytest.raises(ArtifactError, match="artifact magic is not NInfer v2"):
         Artifact.open(path)

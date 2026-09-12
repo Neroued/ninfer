@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
         }
         ninfer::bench::validate_prompt_lengths(tests, corpus.size());
         const std::uint32_t max_context = ninfer::bench::resolve_max_context(
-            tests, options.max_context, options.mtp_draft_tokens, options.use_cuda_graph);
+            tests, options.max_context, options.speculative, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path = options.artifact_path;
@@ -154,11 +154,8 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
-        engine_options.speculative.backend       = options.mtp_draft_tokens == 0
-                                                       ? ninfer::SpeculativeBackend::None
-                                                       : ninfer::SpeculativeBackend::Mtp;
-        engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
-        engine_options.speculative.proposal_head = options.proposal_head;
+        engine_options.context_cache.enabled     = false;
+        engine_options.speculative               = options.speculative;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
 
         ninfer::bench::BenchEnvironment env;
@@ -167,8 +164,7 @@ int main(int argc, char** argv) {
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
-        env.mtp_draft_tokens         = options.mtp_draft_tokens;
-        env.proposal_head            = options.proposal_head;
+        env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
@@ -176,7 +172,7 @@ int main(int argc, char** argv) {
         env.corpus_tokens            = corpus.size();
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.mtp_draft_tokens);
+                ninfer::bench::decode_graph_prime_output_tokens(options.speculative);
         }
 
         std::cerr << "[ninfer_bench] loading " << options.artifact_path

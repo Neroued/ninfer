@@ -1,0 +1,896 @@
+{
+  "artifact_type": "ninfer_serve_ttft_corpus",
+  "schema_version": 1,
+  "tokenizer": {
+    "identity": "Qwen/Qwen3.6-family",
+    "local_qualification_path_name": "base-hf-bf16",
+    "enable_thinking": false,
+    "add_generation_prompt": true
+  },
+  "shapes": {
+    "short-32": {
+      "path": "examples/cli/messages/text_smoke_zh.json",
+      "sha256": "c5d5a16e3dd26a47c67a5da30b803739404611dafe1e753a9ccb982befb3ac7a",
+      "prompt_tokens": 30,
+      "max_output_tokens": 32
+    },
+    "long-8k-16": {
+      "path": "examples/cli/messages/long_niah_8k.json",
+      "sha256": "3080d984516f2917aacf159aab6b4b42d3f7d1abe8ab39e0dadbaf1f05d8ae99",
+      "prompt_tokens": 7680,
+      "max_output_tokens": 16
+    },
+    "long-8k-32": {
+      "path": "examples/cli/messages/long_niah_8k.json",
+      "sha256": "3080d984516f2917aacf159aab6b4b42d3f7d1abe8ab39e0dadbaf1f05d8ae99",
+      "prompt_tokens": 7680,
+      "max_output_tokens": 32
+    },
+    "long-8k-independent-32": {
+      "path": "bench/fixtures/ttft/text/long_8k_independent.json",
+      "sha256": "7a9f7d7a8bae3597b7fa755ed7495a00860da378786916439d249b08dc784630",
+      "prompt_tokens": 7680,
+      "max_output_tokens": 32,
+      "seed_common_prefix_tokens": 3
+    },
+    "long-64k-32": {
+      "path": "examples/cli/messages/long_niah_64k.json",
+      "sha256": "7160fdf1aff52cd79b5e35efa829e7ef43004fe61aa86136a3bf0adef9cc03f4",
+      "prompt_tokens": 64512,
+      "max_output_tokens": 32
+    },
+    "long-64k-independent-32": {
+      "path": "bench/fixtures/ttft/text/long_64k_independent.json",
+      "sha256": "360f235f326a987e5a7347657731cb49315da5fa18c742f9587db4a8fa459572",
+      "prompt_tokens": 64512,
+      "max_output_tokens": 32,
+      "seed_common_prefix_tokens": 3
+    },
+    "rotation-55k-0": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_0.json",
+      "sha256": "b00be51579f76f06bdd4d3641d185bfb43350d71a75858f8eae83ec32492dbe6",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "OMEGA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-1": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_1.json",
+      "sha256": "4170d17d17733ca23c9d52449d58232fe72c79356f991577a39f5d8591d8dcb8",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "SIGMA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-2": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_2.json",
+      "sha256": "1274f6f889e233189a6b870e03de63b7237ec9c1c407b48c4fc94f95415496d9",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "VIOLET",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-3": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_3.json",
+      "sha256": "5bfe7c1c610640e785391153f6680e7178c057fdc2026dbbff356f8499e366d1",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "THETA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-4": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_4.json",
+      "sha256": "23829a48cfe472ce35e79b1b9b9558d05af7ed8fbe58956f894736f459270099",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "APPLE",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-5": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_5.json",
+      "sha256": "747ab03b82f70f542b6d45828e4345ecf192139a0043d994cf7ffae522f3cab9",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "CHARLIE",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "long-256k-32": {
+      "path": "examples/cli/messages/long_niah_256k.json",
+      "sha256": "73278973a82c80f5be8bcc7d4c89afd8bdd3edfe82e8900952cb4a7660cd9644",
+      "prompt_tokens": 260096,
+      "max_output_tokens": 32
+    },
+    "interferer-256": {
+      "path": "examples/cli/messages/scenario_story_zh_scifi.json",
+      "sha256": "acbd46f48862d36b116f79f98bf6b6e61d177cbee1b48831bca25438293f9cf7",
+      "prompt_tokens": 127,
+      "max_output_tokens": 256
+    },
+    "holder-4096": {
+      "path": "examples/cli/messages/scenario_story_zh_scifi.json",
+      "sha256": "acbd46f48862d36b116f79f98bf6b6e61d177cbee1b48831bca25438293f9cf7",
+      "prompt_tokens": 127,
+      "max_output_tokens": 4096
+    },
+    "medium-3000": {
+      "path": "examples/cli/messages/text_smoke_zh.json",
+      "sha256": "c5d5a16e3dd26a47c67a5da30b803739404611dafe1e753a9ccb982befb3ac7a",
+      "prompt_tokens": 30,
+      "max_output_tokens": 3000
+    },
+    "context-exact": {
+      "path": "bench/fixtures/ttft/text/context_exact.json",
+      "sha256": "946a56a8461593299713f24e1eae2b20482431bfcb5f4da3ad83bc0added753f",
+      "prompt_tokens": 8129,
+      "max_output_tokens": 64
+    },
+    "context-over": {
+      "path": "bench/fixtures/ttft/text/context_over.json",
+      "sha256": "b9ddc7bebf507257254903de9d65fc6892166cad0d8990e8818247f16ddf7584",
+      "prompt_tokens": 8193
+    },
+    "unmarked-common-a": {
+      "path": "bench/fixtures/ttft/text/unmarked_common_a.json",
+      "sha256": "1ee4fbadfc9ccfa0271cf242f30a1d8deec7002b5c1e67354d2a977179f5e60d",
+      "prompt_tokens": 4321,
+      "common_prefix_tokens": 4306,
+      "max_output_tokens": 32
+    },
+    "unmarked-common-b": {
+      "path": "bench/fixtures/ttft/text/unmarked_common_b.json",
+      "sha256": "f84eb0c439c24b6ba21634e5ca5d3533a3663e201ae48d825cc30e0697459029",
+      "prompt_tokens": 4321,
+      "common_prefix_tokens": 4306,
+      "max_output_tokens": 32
+    }
+  },
+  "shared": {
+    "system-a": {
+      "path": "bench/fixtures/ttft/text/shared_system_a.txt",
+      "sha256": "79c05e8339e8fad4bcb9ae424ee6cf68f49add59081841825f37aef1d0e3f7c3",
+      "marked_frontier_tokens": 4149,
+      "example_prompt_tokens": 4173
+    },
+    "system-b": {
+      "path": "bench/fixtures/ttft/text/shared_system_b.txt",
+      "sha256": "721f2a9ae56b5ec4e10de7bd74a9e57f4baecff2a767915e9d700f5d230a5775",
+      "marked_frontier_tokens": 4149,
+      "example_prompt_tokens": 4173
+    },
+    "client-tools-32": {
+      "path": "bench/fixtures/ttft/text/client_tools_32.json",
+      "sha256": "f10ecf085995464ceb95334ec221c48c0ecd05d48d4b03195eb395d37bf0660f",
+      "count": 32,
+      "marked_frontier_tokens": 5074,
+      "example_prompt_tokens": 5276
+    }
+  },
+  "media": {
+    "source-files": [
+      {
+        "path": "examples/cli/media/visual_chart.png",
+        "sha256": "883447ef5351409870c788537ecf188319b63481f1cfed74fd08cd98fc27ed8f"
+      },
+      {
+        "path": "examples/cli/media/natural_scene.png",
+        "sha256": "ac42db805c5b6b693f2dd078a64f6e013570de483491278ba945b3ecbbc340f4"
+      },
+      {
+        "path": "examples/cli/media/compare_left.png",
+        "sha256": "c6d333bda85ca3508e5cd3e400a7da95cbc3e6835093ee60dcc1b9a637eac5f0"
+      },
+      {
+        "path": "examples/cli/media/compare_right.png",
+        "sha256": "3e2b57e2825fa222b05521036353c72cc829a613c0615b4b028e6f6f0e35cd7b"
+      },
+      {
+        "path": "examples/cli/media/temporal_events.mp4",
+        "sha256": "32e5686c16c2326a0953807fc76fb0db7bf21b6241ca99ed621979212faa5511"
+      }
+    ],
+    "image-chart": {
+      "path": "examples/cli/messages/image_chart.json",
+      "sha256": "c8272be8df15fd8022e964c0ce7cdc8d09c6b539d16526f23ea5d5f59b7d09ea",
+      "prompt_tokens": 428,
+      "media_paths": [
+        "examples/cli/media/visual_chart.png"
+      ]
+    },
+    "image-video": {
+      "path": "examples/cli/messages/mixed_image_video.json",
+      "sha256": "3e710164cf001d78d828f99fda7946099e987cb578ad0ec71c9bc03eaa8a6396",
+      "prompt_tokens": 1575,
+      "media_paths": [
+        "examples/cli/media/visual_chart.png",
+        "examples/cli/media/temporal_events.mp4"
+      ]
+    },
+    "many-image-28-a": {
+      "path": "bench/fixtures/ttft/text/many_image_28_a.json",
+      "sha256": "5a0254ba3747e1bea02a673b86caa83f18a67cd94de6705e4b1868c14f2eb53c",
+      "media_items": 28,
+      "vision_tokens": 28672,
+      "expanded_prompt_tokens": 28752,
+      "encoded_media_bytes": 1142267,
+      "image_paths": [
+        "bench/fixtures/ttft/media/load_00.png",
+        "bench/fixtures/ttft/media/load_01.png",
+        "bench/fixtures/ttft/media/load_02.png",
+        "bench/fixtures/ttft/media/load_03.png",
+        "bench/fixtures/ttft/media/load_04.png",
+        "bench/fixtures/ttft/media/load_05.png",
+        "bench/fixtures/ttft/media/load_06.png",
+        "bench/fixtures/ttft/media/load_07.png",
+        "bench/fixtures/ttft/media/load_08.png",
+        "bench/fixtures/ttft/media/load_09.png",
+        "bench/fixtures/ttft/media/load_10.png",
+        "bench/fixtures/ttft/media/load_11.png",
+        "bench/fixtures/ttft/media/load_12.png",
+        "bench/fixtures/ttft/media/load_13.png",
+        "bench/fixtures/ttft/media/load_14.png",
+        "bench/fixtures/ttft/media/load_15.png",
+        "bench/fixtures/ttft/media/load_16.png",
+        "bench/fixtures/ttft/media/load_17.png",
+        "bench/fixtures/ttft/media/load_18.png",
+        "bench/fixtures/ttft/media/load_19.png",
+        "bench/fixtures/ttft/media/load_20.png",
+        "bench/fixtures/ttft/media/load_21.png",
+        "bench/fixtures/ttft/media/load_22.png",
+        "bench/fixtures/ttft/media/load_23.png",
+        "bench/fixtures/ttft/media/load_24.png",
+        "bench/fixtures/ttft/media/load_25.png",
+        "bench/fixtures/ttft/media/load_26.png",
+        "bench/fixtures/ttft/media/load_27.png"
+      ]
+    },
+    "many-image-28-b": {
+      "path": "bench/fixtures/ttft/text/many_image_28_b.json",
+      "sha256": "918a574cde3833e5f6db7963f5f9fcc20a5870f712e695fe48e63a762dfc1099",
+      "media_items": 28,
+      "vision_tokens": 28672,
+      "expanded_prompt_tokens": 28752,
+      "encoded_media_bytes": 1143048,
+      "image_paths": [
+        "bench/fixtures/ttft/media/load_28.png",
+        "bench/fixtures/ttft/media/load_29.png",
+        "bench/fixtures/ttft/media/load_30.png",
+        "bench/fixtures/ttft/media/load_31.png",
+        "bench/fixtures/ttft/media/load_32.png",
+        "bench/fixtures/ttft/media/load_33.png",
+        "bench/fixtures/ttft/media/load_34.png",
+        "bench/fixtures/ttft/media/load_35.png",
+        "bench/fixtures/ttft/media/load_36.png",
+        "bench/fixtures/ttft/media/load_37.png",
+        "bench/fixtures/ttft/media/load_38.png",
+        "bench/fixtures/ttft/media/load_39.png",
+        "bench/fixtures/ttft/media/load_40.png",
+        "bench/fixtures/ttft/media/load_41.png",
+        "bench/fixtures/ttft/media/load_42.png",
+        "bench/fixtures/ttft/media/load_43.png",
+        "bench/fixtures/ttft/media/load_44.png",
+        "bench/fixtures/ttft/media/load_45.png",
+        "bench/fixtures/ttft/media/load_46.png",
+        "bench/fixtures/ttft/media/load_47.png",
+        "bench/fixtures/ttft/media/load_48.png",
+        "bench/fixtures/ttft/media/load_49.png",
+        "bench/fixtures/ttft/media/load_50.png",
+        "bench/fixtures/ttft/media/load_51.png",
+        "bench/fixtures/ttft/media/load_52.png",
+        "bench/fixtures/ttft/media/load_53.png",
+        "bench/fixtures/ttft/media/load_54.png",
+        "bench/fixtures/ttft/media/load_55.png"
+      ]
+    },
+    "many-image-33": {
+      "path": "bench/fixtures/ttft/text/many_image_33.json",
+      "sha256": "167434984db287547c09f50180ce579f5e7689352b20f25dc4c5e7352b7dff8c",
+      "media_items": 33,
+      "vision_tokens": 33792,
+      "expanded_prompt_tokens": 33880,
+      "encoded_media_bytes": 1346453,
+      "image_paths": [
+        "bench/fixtures/ttft/media/load_00.png",
+        "bench/fixtures/ttft/media/load_01.png",
+        "bench/fixtures/ttft/media/load_02.png",
+        "bench/fixtures/ttft/media/load_03.png",
+        "bench/fixtures/ttft/media/load_04.png",
+        "bench/fixtures/ttft/media/load_05.png",
+        "bench/fixtures/ttft/media/load_06.png",
+        "bench/fixtures/ttft/media/load_07.png",
+        "bench/fixtures/ttft/media/load_08.png",
+        "bench/fixtures/ttft/media/load_09.png",
+        "bench/fixtures/ttft/media/load_10.png",
+        "bench/fixtures/ttft/media/load_11.png",
+        "bench/fixtures/ttft/media/load_12.png",
+        "bench/fixtures/ttft/media/load_13.png",
+        "bench/fixtures/ttft/media/load_14.png",
+        "bench/fixtures/ttft/media/load_15.png",
+        "bench/fixtures/ttft/media/load_16.png",
+        "bench/fixtures/ttft/media/load_17.png",
+        "bench/fixtures/ttft/media/load_18.png",
+        "bench/fixtures/ttft/media/load_19.png",
+        "bench/fixtures/ttft/media/load_20.png",
+        "bench/fixtures/ttft/media/load_21.png",
+        "bench/fixtures/ttft/media/load_22.png",
+        "bench/fixtures/ttft/media/load_23.png",
+        "bench/fixtures/ttft/media/load_24.png",
+        "bench/fixtures/ttft/media/load_25.png",
+        "bench/fixtures/ttft/media/load_26.png",
+        "bench/fixtures/ttft/media/load_27.png",
+        "bench/fixtures/ttft/media/load_28.png",
+        "bench/fixtures/ttft/media/load_29.png",
+        "bench/fixtures/ttft/media/load_30.png",
+        "bench/fixtures/ttft/media/load_31.png",
+        "bench/fixtures/ttft/media/load_32.png"
+      ]
+    },
+    "load-images": [
+      {
+        "path": "bench/fixtures/ttft/media/load_00.png",
+        "sha256": "18a6325a9b2f75988385f84492bbb520591ba8cf51ef998317644906dc4606a8",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_01.png",
+        "sha256": "f7fb020c599089967ae40e561ac80e1c16f28fe79e451ec92d220a3ef935dc70",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_02.png",
+        "sha256": "33d66f1e16156298c053f0a56ae202d05fb274b1cc1d6e7a942c4fe2cd1f72f3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_03.png",
+        "sha256": "0d3dbc13b08d3853ab759d33461f94ae0197bd6ef1b12a4043a858024efbeba3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_04.png",
+        "sha256": "7eb9b1d4ea2123e7a216d99cbcb84cd036450723584e3a62c35c14396b9d5b74",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_05.png",
+        "sha256": "4c037c9f5213d679d44842c33bf1e8af8f2f755cc40a8cd271618fcf2769d621",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_06.png",
+        "sha256": "17a3a3969350624de9372c9a33ee3404bf449a999ed89b4ce080993c633e00d5",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_07.png",
+        "sha256": "9ce2e9212403fb89c8674f1868d9c44fe68bd3fc4195e14aa59dda733bb09aed",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_08.png",
+        "sha256": "b4e902719b4e8e2016cc4de22e440eb5b02bf9078ce0f73ff5229dfa1ebc2f6d",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_09.png",
+        "sha256": "04ef5b24438f7049ba53db04dc76a38528f28d3c97381ae6d5f1b5429b6cfcf3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_10.png",
+        "sha256": "17c97a4d8f2fbb8a696780f64432fbef8eff56a9072b03014d39910780377542",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_11.png",
+        "sha256": "ec1f2add8890e8f1552fd47c9d974553561c657dcbdab5586afcad41c3e82649",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_12.png",
+        "sha256": "a42968569e1d2b9ebe46171df8d4bca537f4bfe52d0a57c6b4c2b8b27c2d2762",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_13.png",
+        "sha256": "39df76a342794a143fe8015d76fadb88409cfade976bd6f41526bed4cdbf5249",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_14.png",
+        "sha256": "9cfe35a4fc37bc5ba15256fad7f76fb7ee2762b1cb2e97fe2c07709b152404ff",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_15.png",
+        "sha256": "6e4137d50a6872fac263ae1a694a9268918d285a12cf701ce811dd3a1d5f74c8",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_16.png",
+        "sha256": "f12e555fe4680fc346d315b46db0917b896ae091324a5181bfe2c794812943ad",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_17.png",
+        "sha256": "13f1df570b052a154fc589879212f69bb387cb8a7ee85daf4dd9585db10898da",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_18.png",
+        "sha256": "1930652b5ac3cdf45fde2b5fd4f07b0937ce766f7eece9dc9e78d47bd473cfce",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_19.png",
+        "sha256": "198b11894d108020039b7392f64ca4706b76bc778d064a1a1352943d68d0783e",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_20.png",
+        "sha256": "54fe6ff208a0eb598c27cb4a8aacddeb9585234317052f8379674b5af4ca2bd3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_21.png",
+        "sha256": "4b84157102e3560ea326e19657af3a88a172ab14a2d398188e8018f0b0af2c99",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_22.png",
+        "sha256": "df2c9d8ffa86b66771ae4df9e01c0e1e997fca4867f4b63ae7e3fc30d978745b",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_23.png",
+        "sha256": "cace4a6b87ed1f59748d6f5cc67112b707bd5dc25cdbaa2762057382d4801b90",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_24.png",
+        "sha256": "3839f0635af075839a77db18fa620241f9db5aa2d1e0d21071bf45182b71f27b",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_25.png",
+        "sha256": "4cbafdaae13e54a0b0d30e8508a1fb3a688b848c91ffd050fa9a990460922ff3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_26.png",
+        "sha256": "07a7f4ab7b3cc4c43b637638d0d3c5d42972ad81c4bee229f4d6e3e4328297e7",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_27.png",
+        "sha256": "711464e36ac57b44c56fbe9fa81767516cdfd424c1bd4f517795a025bce3d7ae",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_28.png",
+        "sha256": "1471d4c5c6e71285e473150dbff0d493cc5307fab9f785d3561009aa237a6979",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_29.png",
+        "sha256": "85bc2961eae3d1f561d122cad3eeb47d2bd5909ccfc89ed6d81d6aa91826b4b6",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_30.png",
+        "sha256": "b0c29ccd82a5d7e1eb65499088d8fe04666e017d0c588b8e1e4af2e4c2de9887",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_31.png",
+        "sha256": "e8754f45b01ef4b6b996e7407896db402276a014bc40c8af06324f6a31a0925d",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_32.png",
+        "sha256": "d780dc9e0005c9460ac198ccb323be020dfdc84a268f25bede4cd7b8e75e2067",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_33.png",
+        "sha256": "a66a0387d8d04415290f9a93b027651b7013211f3f033ad21f4ab46a430e91e3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_34.png",
+        "sha256": "95e113fa3a0e0ee8d861160ed5171bfb533bcdde536a870550301fc2f334cd97",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_35.png",
+        "sha256": "e15a5059853e72ce4b279a5314a8aea2c9c48caed06054c26e871ba3b094041a",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_36.png",
+        "sha256": "433786a81f46db48af2b79ec6f9517e2e55fc4a35b379296af373cf3cc8a1112",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_37.png",
+        "sha256": "ba7e3f5c196d45ae0dddfb464fde4dc3806bd9ab5f73c06fea33e2924fdbaf05",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_38.png",
+        "sha256": "80d0fa6f49dc52463710660f52d13ae4eefcbb978eab43837fe8a50f7fbc923d",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_39.png",
+        "sha256": "79f871317fde7b3eecd8b2d916e4df72f09c4427e449ea38de5f6e277e105ac3",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_40.png",
+        "sha256": "16ab008eb3a0f47d094d4c9c37ccc8f4f08fdd236d28a65f7d72f227f013c55a",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_41.png",
+        "sha256": "f21fb635f23d58abe3f8545a3af8960309eaf056119c5d2e6ecc86c67c0c46f4",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_42.png",
+        "sha256": "828c197d37ea08d730ed0054298dc0652c22c14f7955d84988f12632198319fb",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_43.png",
+        "sha256": "4b1d99660b2d02992696cd15e574df90305833d13c07acb8c1dfa1955e9606c6",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_44.png",
+        "sha256": "381421fc804825ee91cd248f5cc0530cdb2289921242487122d6c85a6f972a92",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_45.png",
+        "sha256": "0a73e6350d516a6fea21b9c319a787dfc160d11441c3f5b0886f6413a27f199e",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_46.png",
+        "sha256": "f445615e7a4322daff1e12f006eba6b4df0d96f437192cfd737a7e24749f5d79",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_47.png",
+        "sha256": "b9b70e2e3feaf27045d8ecee8d80b3451735397799beb0a0026eb07342e2fab4",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_48.png",
+        "sha256": "ae37df861df3e62333ffa5a0040863627a90648847615095ce78455a3540a320",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_49.png",
+        "sha256": "fb1619456c8327a7dfe967180415190729bd635fa0dd80f8fa4110af7e89f783",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_50.png",
+        "sha256": "b0d4e19f1b7838aacf574b57b55ebce19194fc0b9e2a8d71db31762e51dd9c6f",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_51.png",
+        "sha256": "e71de084f2990a55a7fbbbfea203cd75b63f2ba4bda5b7408a5e0976fbdd0fc4",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_52.png",
+        "sha256": "bc6d1c7357123e34be981cbb3a213d3d32bc23ed0a3b12daea954dc2551ad976",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_53.png",
+        "sha256": "f6913e8ac25c37246768af2519be27d89785ff9dda78004a2c12710e226af8fe",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_54.png",
+        "sha256": "c6fa0479eccee56df8ed5d00e399e70b865331a0ab5d2e77245da4aaa8ded21f",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      },
+      {
+        "path": "bench/fixtures/ttft/media/load_55.png",
+        "sha256": "5618af2c358f806ed03d6ca76efe45760071eb6fd5f1aef71e83d7a2f62bad50",
+        "dimensions": [
+          1024,
+          1024
+        ],
+        "vision_tokens": 1024,
+        "raw_patch_payload_bytes": 12582912
+      }
+    ]
+  }
+}

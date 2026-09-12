@@ -1,4 +1,5 @@
 #include "ninfer/ops/linear_add.h"
+#include "core/device.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -89,7 +90,7 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
-    const std::array invocations{
+    std::vector<Invocation> invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{26, ops::LinearPolicy::A16Only},
@@ -98,7 +99,17 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{48, ops::LinearPolicy::AllowA8},
         Invocation{65, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
+        Invocation{8, ops::LinearPolicy::AllowA8},
+        Invocation{16, ops::LinearPolicy::AllowA8},
+        Invocation{32, ops::LinearPolicy::AllowA8},
+        Invocation{64, ops::LinearPolicy::AllowA8},
+        Invocation{96, ops::LinearPolicy::AllowA8},
+        Invocation{128, ops::LinearPolicy::AllowA8},
+        Invocation{129, ops::LinearPolicy::AllowA8},
     };
+    for (int columns = 2; columns <= 24; ++columns) {
+        invocations.push_back({columns, ops::LinearPolicy::A16Only});
+    }
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
@@ -127,6 +138,26 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
+
+        if (invocation.tokens == 128) {
+            cudaStream_t stream;
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            for (int replay = 0; replay < 2; ++replay) {
+                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
+                    cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaGraphLaunch(executable, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+            CUDA_CHECK(cudaGraphExecDestroy(executable));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+        }
 
         const bool a8 =
             invocation.policy == ops::LinearPolicy::AllowA8 && invocation.tokens >= first_a8;

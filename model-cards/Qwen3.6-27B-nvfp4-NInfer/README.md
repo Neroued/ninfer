@@ -115,9 +115,9 @@ printf '%s  %s\n' \
 - CUDA Toolkit 13.1 or newer.
 
 NInfer does not provide an install target or packaged binary. See the
-[repository README](https://github.com/Neroued/ninfer#build) for source-build dependencies.
+[repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
 
-## Download and run
+## Download and run a CLI example
 
 ```bash
 hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
@@ -126,14 +126,42 @@ hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
 
 ./build/apps/ninfer models/qwen3_6_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
-  --max-context 16384 \
-  --max-new 256 \
+  --max-context 32768 \
+  --max-new 8192 \
+  --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
-For images, videos, structured chat history, and HTTP serving, see the
-[NInfer documentation](https://github.com/Neroued/ninfer/tree/master/docs).
+For images, videos, and structured chat history, see the
+[CLI guide](https://github.com/Neroued/ninfer/blob/master/docs/cli.md).
+
+## Start a local server
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_27b_nvfp4.ninfer \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --max-context 240000 \
+  --kv-capacity 240000 \
+  --max-concurrency 2 \
+  --kv-dtype fp8 \
+  --device-state-slots 2 \
+  --host-state-slots 8 \
+  --host-kv-mib 8192 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft \
+  --preserve-thinking
+```
+
+Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool admits
+two active requests when their combined completion reservations fit; either request may use the
+full pool while running alone. Two extra Device checkpoint slots, eight pinned Host State slots,
+and 8 GiB of pinned Host KV retain reusable continuations under resource pressure.
+
+See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
+API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
+for cache and admission semantics.
 
 ## Supported use
 
@@ -142,11 +170,11 @@ The artifact supports:
 - text generation in thinking and non-thinking modes;
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
-- BF16 and INT8 group-64 KV cache;
+- BF16, INT8, FP8, NVFP4, and K8V4 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
-- OpenAI Chat Completions and Anthropic Messages serving.
+- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages serving.
 
 ## Performance
 
@@ -164,7 +192,7 @@ request. Each concurrency point starts a fresh server with MTP3, INT8 group-64 K
 only complete one-second intervals whose actual decode batch remains equal to C. Each row is one
 sustained wave.
 
-| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+| C | Steady decode (tok/s) | Speedup vs. C1 | Wave makespan |
 |---:|---:|---:|---:|
 | 1 | 202.4 | 1.00× | 40.46 s |
 | 2 | 399.7 | 1.97× | 41.82 s |
@@ -175,7 +203,7 @@ At C=8, the profile sustains **1,146.9 aggregate decode tok/s**, or **5.67×** i
 
 ### Long-context baseline (MTP disabled)
 
-| Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+| Prompt tokens | Prefill phase (tok/s) | Server TTFT (ms) | Decode phase (tok/s) |
 |---:|---:|---:|---:|
 | 7,680 | 11,191.5 ± 70.2 | 692.5 ± 4.3 | 86.4 ± 0.5 |
 | 64,512 | 6,298.5 ± 97.6 | 10,288.6 ± 159.3 | 78.0 ± 1.2 |
@@ -189,7 +217,7 @@ at 260,096 prompt tokens it is 1.55×.
 
 Thinking was enabled and the output limit was 65,536 tokens.
 
-| AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+| AIME 2026 fixture | Completion tokens | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
 | Problem 1 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
 | Problem 15 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
@@ -200,7 +228,7 @@ Thinking was enabled and the output limit was 65,536 tokens.
 Each category contains three fixtures and five seeds per fixture (15 samples). Thinking was
 disabled and the output limit was 4,096 tokens.
 
-| Category | Decode tok/s | MTP acceptance | MTP tokens/round |
+| Category | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
 | Code | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
 | Story | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
@@ -208,10 +236,14 @@ disabled and the output limit was 4,096 tokens.
 | Structured output | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
 
 See the
-[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
+[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.6-27b.md),
 including metric definitions, comparison data, and the exact reproduction command.
 
 ## Evaluation
+
+The historical serving revision was `b3d4d0f50b868711c62432bbd68e746217a2f49a`.
+See the [evaluation workflow](https://github.com/Neroued/ninfer/blob/master/eval/README.md#historical-qwen36-27b-reasoning-profile)
+for the serving and runner commands.
 
 The artifact was evaluated through NInfer's OpenAI-compatible serving route with thinking enabled,
 MTP=3, and a 262,144-token context limit. EvalScope 1.9.0 used 0-shot prompts, rule-based scoring,

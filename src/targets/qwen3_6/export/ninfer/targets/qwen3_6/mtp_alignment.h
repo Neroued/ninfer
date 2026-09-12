@@ -48,14 +48,8 @@ struct MtpVisualOverlap {
 [[nodiscard]] inline MtpVisualOverlap
 shifted_visual_overlap(std::span<const std::int32_t> scatter_indices, std::uint32_t prompt_tokens,
                        const MtpAlignmentWindow& window) {
-    if (!std::is_sorted(scatter_indices.begin(), scatter_indices.end()) ||
-        std::adjacent_find(scatter_indices.begin(), scatter_indices.end()) !=
-            scatter_indices.end()) {
-        throw std::invalid_argument("MTP visual scatter indices must be sorted and unique");
-    }
-    if (!scatter_indices.empty() && scatter_indices.front() < 0) {
-        throw std::invalid_argument("MTP visual scatter index is negative");
-    }
+    // VisionControl construction owns the sorted, unique, nonnegative scatter invariant. This
+    // helper runs for every MTP prefill chunk and only resolves the dynamic shifted window.
     if (window.columns == 0 || window.shifted_embedding_begin > prompt_tokens ||
         window.columns > prompt_tokens - window.hidden_begin ||
         window.shifted_embedding_begin != window.hidden_begin + 1) {

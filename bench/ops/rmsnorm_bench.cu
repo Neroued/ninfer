@@ -1,370 +1,226 @@
-// Performance bench for the registered Qwen3.6 RMSNorm domains.
-//
-// Default matrix:
-//   decode / verification T=1..16
-//   prefill chunk T=1024
-//
-// Narrow one-case profiling examples:
-//   ./ninfer_rmsnorm_bench --kind dflash_hidden --tokens 1024
-//   ./ninfer_rmsnorm_bench --kind dflash_q --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
-//   ncu ... ./ninfer_rmsnorm_bench --kind dflash_k --tokens 16 --profile
-#include "ninfer/ops/gated_rmsnorm.h"
+// Measures public RMSNorm and GatedRMSNorm calls with represented BF16 inputs.
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/gated_rmsnorm.h"
+#include "core/device.h"
 #include "ninfer_bench_common.h"
-#include "ops/kernel/rmsnorm.cuh"
 
+#include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
-
-#include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace ninfer;
-using namespace ninfer::bench;
 
 namespace {
-
-struct Shape {
-    const char* name;
-    int d;
-    int rows_per_token;
-    bool unit_offset;
-    bool gated;
-    bool dflash_default;
+struct Options {
+    int warmup = 10, repeat = 100, graph_calls = 1;
+    std::vector<int> tokens{1, 2, 8, 16, 32, 64, 96, 128, 256, 1024, 2048};
+    std::string kind = "dflash2_hidden", execution = "graph", cache = "cold", csv;
+    bool profile = false;
 };
 
-enum class Route {
-    Production,
-    CandidateB128,
-    CandidateB256,
-    CandidateB512,
-    CandidateB1024,
-    Payload,
-};
-
-constexpr Shape kShapes[] = {
-    {"dflash_hidden", 2048, 1, false, false, true},
-    {"dflash_q", 128, 32, false, false, true},
-    {"dflash_k", 128, 8, false, false, true},
-    {"target_hidden35", 2048, 1, true, false, false},
-    {"target_q35", 256, 16, true, false, false},
-    {"target_k35", 256, 2, true, false, false},
-    {"gated35", 128, 32, false, true, false},
-    {"gated27", 128, 48, false, true, false},
-    {"hidden27", 5120, 1, true, false, false},
-    {"target_q27", 256, 24, true, false, false},
-    {"target_k27", 256, 4, true, false, false},
-};
-
-template <int Block, bool Gated>
-__global__ void rmsnorm_warp_payload_control(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                             const __nv_bfloat162* z, __nv_bfloat162* out, int d,
-                                             std::int64_t rows) {
-    constexpr int kWarpsPerBlock = Block / 32;
-    const int lane               = static_cast<int>(threadIdx.x) & 31;
-    const int warp               = static_cast<int>(threadIdx.x) >> 5;
-    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    if (row >= rows) { return; }
-
-    const int pairs             = d / 2;
-    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
-    for (int pair = lane; pair < pairs; pair += 32) {
-        const float2 xf = __bfloat1622float2(x[row_base + pair]);
-        const float2 wf = __bfloat1622float2(weight[pair]);
-        float2 value{xf.x + wf.x, xf.y + wf.y};
-        if constexpr (Gated) {
-            const float2 zf = __bfloat1622float2(z[row_base + pair]);
-            value.x += zf.x;
-            value.y += zf.y;
-        }
-        out[row_base + pair] = __floats2bfloat162_rn(value.x, value.y);
-    }
+int integer(const std::string& text, int lower, int upper) {
+    std::size_t end = 0;
+    const int value = std::stoi(text, &end);
+    if (end != text.size() || value < lower || value > upper)
+        throw std::invalid_argument("integer out of range");
+    return value;
 }
 
-template <int Block, bool Gated>
-__global__ void rmsnorm_cta_payload_control(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                            const __nv_bfloat162* z, __nv_bfloat162* out, int d,
-                                            std::int64_t rows) {
-    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
-    if (row >= rows) { return; }
-    const int pairs             = d / 2;
-    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
-    for (int pair = static_cast<int>(threadIdx.x); pair < pairs; pair += Block) {
-        const float2 xf = __bfloat1622float2(x[row_base + pair]);
-        const float2 wf = __bfloat1622float2(weight[pair]);
-        float2 value{xf.x + wf.x, xf.y + wf.y};
-        if constexpr (Gated) {
-            const float2 zf = __bfloat1622float2(z[row_base + pair]);
-            value.x += zf.x;
-            value.y += zf.y;
-        }
-        out[row_base + pair] = __floats2bfloat162_rn(value.x, value.y);
-    }
-}
-
-DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
-    std::vector<std::uint16_t> host(n);
-    std::uint32_t state = seed;
-    for (std::size_t i = 0; i < n; ++i) {
-        state         = state * 1664525u + 1013904223u;
-        const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
-        host[i]       = f32_to_bf16(2.0f * u - 1.0f);
-    }
-    DeviceBuffer device(n * 2);
-    cudaMemcpy(device.p, host.data(), n * 2, cudaMemcpyHostToDevice);
-    return device;
-}
-
-const Shape& find_shape(const char* name) {
-    for (const Shape& shape : kShapes) {
-        if (!std::strcmp(name, shape.name)) { return shape; }
-    }
-    std::fprintf(stderr, "unknown --kind %s\n", name);
-    std::exit(2);
-}
-
-std::vector<int> parse_t_sweep(const char* value) {
+std::vector<int> list(const std::string& text, int upper) {
     std::vector<int> result;
-    const std::string input(value);
-    std::size_t begin = 0;
-    while (begin <= input.size()) {
-        const std::size_t end = input.find(',', begin);
-        const std::string token =
-            input.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-        if (token.empty()) { throw std::invalid_argument("empty --t-sweep element"); }
-        char* tail        = nullptr;
-        const long parsed = std::strtol(token.c_str(), &tail, 10);
-        if (*tail != '\0' || parsed <= 0 || parsed > 1024) {
-            throw std::invalid_argument("--t-sweep values must be in [1,1024]");
-        }
-        result.push_back(static_cast<int>(parsed));
-        if (end == std::string::npos) { break; }
-        begin = end + 1;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        const auto end = text.find(',', start);
+        result.push_back(integer(text.substr(start, end - start), 1, upper));
+        if (end == std::string::npos) break;
+        start = end + 1;
     }
+    if (result.empty()) throw std::invalid_argument("empty extent list");
     return result;
 }
 
-const char* production_route(const Shape& shape, int rows) {
-    (void)rows;
-    if (!shape.unit_offset && !shape.gated && shape.d == 128) { return "fixed-d128-bf16x2-b128"; }
-    if (!shape.unit_offset && !shape.gated && shape.d == 2048) { return "fixed-d2048-bf16x2-b512"; }
-    if (shape.d <= 256) { return "warp-bf16x2-b512"; }
-    if (shape.d <= 3072) { return "cta-bf16x2-b256"; }
-    return "cta-bf16x2-b512";
-}
-
-template <int Block>
-void launch_plain_candidate(const Shape& shape, const void* x, const void* weight, void* out,
-                            int rows, cudaStream_t stream) {
-    if (shape.d == 128) {
-        ops::rmsnorm_warp_bf16x2_kernel<ops::RmsEpilogue::Plain, Block>
-            <<<static_cast<unsigned int>((rows + Block / 32 - 1) / (Block / 32)), Block, 0,
-               stream>>>(static_cast<const __nv_bfloat162*>(x),
-                         static_cast<const __nv_bfloat162*>(weight), nullptr,
-                         static_cast<__nv_bfloat162*>(out), shape.d, rows, 1.0e-6f);
-    } else if (shape.d == 2048) {
-        constexpr int kMaxPairsPerThread = 1024 / Block;
-        ops::rmsnorm_cta_bf16x2_kernel<ops::RmsEpilogue::Plain, Block, kMaxPairsPerThread>
-            <<<static_cast<unsigned int>(rows), Block, 0, stream>>>(
-                static_cast<const __nv_bfloat162*>(x), static_cast<const __nv_bfloat162*>(weight),
-                nullptr, static_cast<__nv_bfloat162*>(out), shape.d, rows, 1.0e-6f);
-    } else {
-        throw std::invalid_argument("RMSNorm candidate requires plain D128 or D2048");
-    }
-}
-
-void run(const Shape& shape, int tokens, Route route, bool profile) {
-    const int rows      = shape.rows_per_token * tokens;
-    const auto n        = static_cast<std::size_t>(shape.d) * static_cast<std::size_t>(rows);
-    DeviceBuffer x      = make_varied_bf16(n, 0x1234abcdU);
-    DeviceBuffer weight = make_varied_bf16(static_cast<std::size_t>(shape.d), 0x9876fedcU);
-    DeviceBuffer z      = make_varied_bf16(n, 0x31415926U);
-    DeviceBuffer out    = make_zeros(n * 2);
-
-    Tensor tx(x.p, DType::BF16, {shape.d, rows});
-    Tensor tw(weight.p, DType::BF16, {shape.d});
-    Tensor tz(z.p, DType::BF16, {shape.d, rows});
-    Tensor tout(out.p, DType::BF16, {shape.d, rows});
-
-    // Weight is reused across rows and excluded. Gated RMSNorm additionally reads z.
-    const double bytes = static_cast<double>(shape.gated ? 3 : 2) * static_cast<double>(n) * 2.0;
-    const auto launch  = [&](cudaStream_t stream) {
-        if (route == Route::Payload) {
-            const auto* x2 = static_cast<const __nv_bfloat162*>(x.p);
-            const auto* w2 = static_cast<const __nv_bfloat162*>(weight.p);
-            const auto* z2 = static_cast<const __nv_bfloat162*>(z.p);
-            auto* out2     = static_cast<__nv_bfloat162*>(out.p);
-            if (shape.d == 128 && !shape.unit_offset && !shape.gated) {
-                constexpr int block = 128;
-                const unsigned grid = static_cast<unsigned>((rows + block / 32 - 1) / (block / 32));
-                rmsnorm_warp_payload_control<block, false>
-                    <<<grid, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-            } else if (shape.d <= 256) {
-                constexpr int block = 512;
-                const unsigned grid = static_cast<unsigned>((rows + block / 32 - 1) / (block / 32));
-                if (shape.gated) {
-                    rmsnorm_warp_payload_control<block, true>
-                        <<<grid, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                } else {
-                    rmsnorm_warp_payload_control<block, false>
-                        <<<grid, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                }
-            } else if (shape.d == 2048 && !shape.unit_offset && !shape.gated) {
-                rmsnorm_cta_payload_control<512, false>
-                    <<<rows, 512, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-            } else if (shape.d <= 3072) {
-                if (shape.gated) {
-                    rmsnorm_cta_payload_control<256, true>
-                        <<<rows, 256, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                } else {
-                    rmsnorm_cta_payload_control<256, false>
-                        <<<rows, 256, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                }
-            } else {
-                constexpr int block = 512;
-                if (shape.gated) {
-                    rmsnorm_cta_payload_control<block, true>
-                        <<<rows, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                } else {
-                    rmsnorm_cta_payload_control<block, false>
-                        <<<rows, block, 0, stream>>>(x2, w2, z2, out2, shape.d, rows);
-                }
-            }
-        } else if (route == Route::CandidateB128) {
-            launch_plain_candidate<128>(shape, x.p, weight.p, out.p, rows, stream);
-        } else if (route == Route::CandidateB256) {
-            launch_plain_candidate<256>(shape, x.p, weight.p, out.p, rows, stream);
-        } else if (route == Route::CandidateB512) {
-            launch_plain_candidate<512>(shape, x.p, weight.p, out.p, rows, stream);
-        } else if (route == Route::CandidateB1024) {
-            launch_plain_candidate<1024>(shape, x.p, weight.p, out.p, rows, stream);
-        } else if (shape.gated) {
-            ops::gated_rmsnorm(tx, tw, tz, 1.0e-6f, tout, stream);
-        } else {
-            ops::rmsnorm(tx, tw, 1.0e-6f, shape.unit_offset, tout, stream);
+Options parse(int argc, char** argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--profile") {
+            o.profile = true;
+            continue;
         }
-    };
-    if (profile) {
-        launch(nullptr);
-        cudaDeviceSynchronize();
-        std::printf("profile rmsnorm %s T=%d [D=%d,rows=%d]\n", shape.name, tokens, shape.d, rows);
-        return;
+        if (arg == "--help") {
+            std::puts("usage: ninfer_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
+                      "target_k27|dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
+                      "target_k35|gated35|gated27] [--tokens T,...] [--execution eager|graph] "
+                      "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
+                      "[--csv-out PATH] [--profile]");
+            std::exit(0);
+        }
+        if (++i >= argc) throw std::invalid_argument("missing option value");
+        const std::string value = argv[i];
+        if (arg == "--kind")
+            o.kind = value;
+        else if (arg == "--tokens")
+            o.tokens = list(value, 65536);
+        else if (arg == "--execution")
+            o.execution = value;
+        else if (arg == "--cache")
+            o.cache = value;
+        else if (arg == "--graph-calls")
+            o.graph_calls = integer(value, 1, 64);
+        else if (arg == "--warmup")
+            o.warmup = integer(value, 0, 10000);
+        else if (arg == "--repeat")
+            o.repeat = integer(value, 1, 10000);
+        else if (arg == "--csv-out")
+            o.csv = value;
+        else
+            throw std::invalid_argument("unknown option: " + arg);
     }
-    const Result result = bench_loop(launch, bytes);
-
-    char tag[160];
-    const char* route_name = production_route(shape, rows);
-    if (route == Route::CandidateB128) {
-        route_name = "candidate-bf16x2-b128";
-    } else if (route == Route::CandidateB256) {
-        route_name = "candidate-bf16x2-b256";
-    } else if (route == Route::CandidateB512) {
-        route_name = "candidate-bf16x2-b512";
-    } else if (route == Route::CandidateB1024) {
-        route_name = "candidate-bf16x2-b1024";
-    } else if (route == Route::Payload) {
-        route_name = "payload-control";
-    }
-    std::snprintf(tag, sizeof(tag), "%s %-8s T=%-4d [D=%d,rows=%d] route=%s",
-                  route == Route::Payload ? "control" : "rmsnorm", shape.name, tokens, shape.d,
-                  rows, route_name);
-    print_result(tag, result);
+    if ((o.execution != "eager" && o.execution != "graph") ||
+        (o.cache != "cold" && o.cache != "warm"))
+        throw std::invalid_argument("invalid workload or execution mode");
+    if (o.graph_calls > 1 && (o.execution != "graph" || o.profile))
+        throw std::invalid_argument("bundles require Graph and no profiling");
+    if (o.profile && o.tokens.size() != 1) throw std::invalid_argument("profile one shape");
+    return o;
 }
 
+struct Shape {
+    const char* name;
+    int d, heads;
+    bool offset, gated;
+};
+
+constexpr Shape shapes[]{
+    {"dflash2_hidden", 5120, 1, false, false}, {"hidden27", 5120, 1, true, false},
+    {"target_q27", 256, 24, true, false},      {"target_k27", 256, 4, true, false},
+    {"dflash_hidden", 2048, 1, false, false},  {"dflash_q", 128, 32, false, false},
+    {"dflash_k", 128, 8, false, false},        {"target_hidden35", 2048, 1, true, false},
+    {"target_q35", 256, 16, true, false},      {"target_k35", 256, 2, true, false},
+    {"gated35", 128, 32, false, true},         {"gated27", 128, 48, false, true}};
+
+const Shape& find_shape(const std::string& name) {
+    for (const auto& shape : shapes)
+        if (name == shape.name) return shape;
+    throw std::invalid_argument("unknown norm kind: " + name);
+}
+
+DeviceBuffer varied(std::size_t n, unsigned seed) {
+    std::vector<__nv_bfloat16> values(n);
+    for (auto& v : values) {
+        seed = seed * 1664525U + 1013904223U;
+        v    = __float2bfloat16(static_cast<float>(seed >> 8) * (2.0f / 16777216.0f) - 1.0f);
+    }
+    DeviceBuffer buffer(n * 2);
+    CUDA_CHECK(cudaMemcpy(buffer.p, values.data(), n * 2, cudaMemcpyHostToDevice));
+    return buffer;
+}
+
+struct Case {
+    Shape shape;
+    DeviceBuffer source, weight, gate, output;
+    Tensor x, w, z, y;
+
+    Case(const Shape& s, int t)
+        : shape(s), source(varied(std::size_t(s.d) * s.heads * t, 1234)), weight(varied(s.d, 9876)),
+          gate(s.gated ? varied(std::size_t(s.d) * s.heads * t, 321) : DeviceBuffer()),
+          output(std::size_t(s.d) * s.heads * t * 2), x(source.p, DType::BF16, {s.d, s.heads, t}),
+          w(weight.p, DType::BF16, {s.d}), z(gate.p, DType::BF16, {s.d, s.heads, t}),
+          y(output.p, DType::BF16, {s.d, s.heads, t}) {}
+
+    void launch(cudaStream_t stream) {
+        if (shape.gated)
+            ops::gated_rmsnorm(x, w, z, 1.e-6f, y, stream);
+        else
+            ops::rmsnorm(x, w, 1.e-6f, shape.offset, y, stream);
+    }
+};
 } // namespace
 
 int main(int argc, char** argv) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        std::printf("SKIP: no usable CUDA device\n");
+    try {
+        const Options o = parse(argc, argv);
+        int devices     = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&devices));
+        if (!devices) return 77;
+        DeviceContext device;
+        DeviceBuffer flush(std::size_t{256} << 20);
+        std::ofstream csv;
+        if (!o.csv.empty()) {
+            csv.open(o.csv);
+            if (!csv) throw std::runtime_error("cannot open CSV output");
+            csv << "kind,D,heads,T,execution,cache,graph_nodes,graph_calls,workspace_bytes,logical_"
+                   "bytes,median_us,min_us,p95_us\n";
+        }
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+        std::printf("GPU=%s CUDART=%d\n", prop.name, CUDART_VERSION);
+        const Shape& shape = find_shape(o.kind);
+        for (const int t : o.tokens) {
+            Case data(shape, t);
+            bench::TimedGraph graph;
+            if (o.execution == "graph") {
+                data.launch(device.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                graph.capture(device.stream, [&](cudaStream_t stream) {
+                    for (int call = 0; call < o.graph_calls; ++call) data.launch(stream);
+                });
+            }
+            const auto launch = [&](cudaStream_t stream) { data.launch(stream); };
+            if (o.profile) {
+                for (int i = 0; i < o.warmup; ++i) {
+                    if (o.execution == "graph")
+                        graph.launch(device.stream);
+                    else
+                        data.launch(device.stream);
+                }
+                if (o.cache == "cold") bench::flush_l2(flush, device.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                CUDA_CHECK(cudaProfilerStart());
+                if (o.execution == "graph")
+                    graph.launch(device.stream);
+                else
+                    data.launch(device.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                CUDA_CHECK(cudaProfilerStop());
+                return 0;
+            }
+            bench::ColdTiming time;
+            if (o.execution == "graph")
+                time =
+                    o.cache == "cold"
+                        ? bench::measure_cold_graph(graph, flush, device.stream, o.warmup, o.repeat)
+                        : bench::measure_graph(graph, device.stream, o.warmup, o.repeat);
+            else
+                time = o.cache == "cold"
+                           ? bench::measure_cold_launch(launch, flush, device.stream, o.warmup,
+                                                        o.repeat)
+                           : bench::measure_launch(launch, device.stream, o.warmup, o.repeat);
+            time.median_us /= o.graph_calls;
+            time.min_us /= o.graph_calls;
+            time.p95_us /= o.graph_calls;
+            const std::size_t bytes =
+                std::size_t(shape.d) * 2 * ((shape.gated ? 3 : 2) * shape.heads * t + 1);
+            const auto nodes = o.execution == "graph" ? graph.nodes() : 0;
+            std::printf("%s T=%d D=%d H=%d execution=%s cache=%s nodes=%zu calls=%d scratch=0 "
+                        "median=%.3f min=%.3f p95=%.3f us\n",
+                        shape.name, t, shape.d, shape.heads, o.execution.c_str(), o.cache.c_str(),
+                        nodes, o.graph_calls, time.median_us, time.min_us, time.p95_us);
+            if (csv)
+                csv << shape.name << ',' << shape.d << ',' << shape.heads << ',' << t << ','
+                    << o.execution << ',' << o.cache << ',' << nodes << ',' << o.graph_calls
+                    << ",0," << bytes << ',' << time.median_us << ',' << time.min_us << ','
+                    << time.p95_us << '\n';
+        }
         return 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "rmsnorm_bench: %s\n", error.what());
+        return 1;
     }
-
-    const char* selected_kind = nullptr;
-    int selected_tokens       = 0;
-    std::vector<int> selected_sweep;
-    bool decode  = false;
-    bool prefill = false;
-    bool profile = false;
-    Route route  = Route::Production;
-    for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--kind") && i + 1 < argc) {
-            selected_kind = argv[++i];
-        } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
-            selected_tokens = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--t-sweep") && i + 1 < argc) {
-            selected_sweep = parse_t_sweep(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--decode")) {
-            decode = true;
-        } else if (!std::strcmp(argv[i], "--prefill")) {
-            prefill = true;
-        } else if (!std::strcmp(argv[i], "--control")) {
-            route = Route::Payload;
-        } else if (!std::strcmp(argv[i], "--candidate-b128")) {
-            route = Route::CandidateB128;
-        } else if (!std::strcmp(argv[i], "--candidate-b256")) {
-            route = Route::CandidateB256;
-        } else if (!std::strcmp(argv[i], "--candidate-b512")) {
-            route = Route::CandidateB512;
-        } else if (!std::strcmp(argv[i], "--candidate-b1024")) {
-            route = Route::CandidateB1024;
-        } else if (!std::strcmp(argv[i], "--profile")) {
-            profile = true;
-        } else {
-            std::fprintf(stderr,
-                         "usage: %s [--decode] [--prefill] "
-                         "[--kind dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                         "target_k35|gated35|gated27|hidden27|target_q27|target_k27 "
-                         "(--tokens T|--t-sweep 1,2,...,1024)] "
-                         "[--control|--candidate-b128|--candidate-b256|--candidate-b512|"
-                         "--candidate-b1024] [--profile]\n",
-                         argv[0]);
-            return 2;
-        }
-    }
-
-    if (selected_kind != nullptr) {
-        if ((selected_tokens > 0) == !selected_sweep.empty()) {
-            std::fprintf(stderr, "--kind requires exactly one of --tokens or --t-sweep\n");
-            return 2;
-        }
-        const Shape& shape   = find_shape(selected_kind);
-        const bool candidate = route == Route::CandidateB128 || route == Route::CandidateB256 ||
-                               route == Route::CandidateB512 || route == Route::CandidateB1024;
-        if (candidate &&
-            (shape.gated || shape.unit_offset || (shape.d != 128 && shape.d != 2048))) {
-            std::fprintf(stderr, "candidate routes require plain D128 or D2048\n");
-            return 2;
-        }
-        if (profile && (selected_tokens <= 0 || !selected_sweep.empty())) {
-            std::fprintf(stderr, "--profile requires one --tokens value\n");
-            return 2;
-        }
-        if (selected_tokens > 0) {
-            run(shape, selected_tokens, route, profile);
-        } else {
-            for (const int tokens : selected_sweep) { run(shape, tokens, route, false); }
-        }
-        return 0;
-    }
-    if (profile) {
-        std::fprintf(stderr, "--profile requires --kind and --tokens\n");
-        return 2;
-    }
-
-    if (!decode && !prefill) { decode = prefill = true; }
-    for (const Shape& shape : kShapes) {
-        if (!shape.dflash_default) { continue; }
-        if (decode) {
-            for (int tokens = 1; tokens <= 16; ++tokens) { run(shape, tokens, route, false); }
-        }
-        if (prefill) {
-            for (const int tokens : {128, 1024}) { run(shape, tokens, route, false); }
-        }
-    }
-    return 0;
 }

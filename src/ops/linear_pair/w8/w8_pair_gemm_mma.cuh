@@ -29,8 +29,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
     constexpr int WARPS             = WARPS_N;
     constexpr int THREADS           = WARPS * 32;
     constexpr int SCALE_CACHE_BYTES = 16;
-    static_assert(TileCols == 64 || TileCols == 80 || TileCols == 96 || TileCols == 112 ||
-                  TileCols == 128);
+    static_assert(TileCols == 64 || TileCols == 128);
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[2][BN * BK];

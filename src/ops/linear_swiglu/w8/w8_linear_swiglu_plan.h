@@ -21,6 +21,12 @@ enum class W8LinearSwiGluScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
+    DFlash2SmallT,
+    DFlash2MmaR32C64K128,
+    DFlash2MmaR64C64K128,
+    DFlash2MmaR64C80K128,
+    DFlash2MmaR64C96K128,
+    DFlash2MmaR64C128,
 };
 
 struct W8LinearSwiGluProblem {

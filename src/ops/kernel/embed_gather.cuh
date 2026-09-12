@@ -31,15 +31,10 @@ __launch_bounds__(Threads) __global__
     static_assert(kValuesPerBlock % 4 == 0);
     constexpr int kWordsPerBlock = kValuesPerBlock / 4;
 
-    const int token = static_cast<int>(blockIdx.x) / BlocksPerToken;
-    const int split = static_cast<int>(blockIdx.x) - token * BlocksPerToken;
-    __shared__ int row;
-    __shared__ float scale;
-    if (threadIdx.x == 0) {
-        row   = ids[token];
-        scale = __bfloat162float(scales[row]);
-    }
-    __syncthreads();
+    const int token   = static_cast<int>(blockIdx.x) / BlocksPerToken;
+    const int split   = static_cast<int>(blockIdx.x) - token * BlocksPerToken;
+    const int row     = ids[token];
+    const float scale = __bfloat162float(scales[row]);
 
     const int split_offset = split * kValuesPerBlock;
     const auto* code_row   = codes + static_cast<std::int64_t>(row) * kEmbedGatherFp8D;
@@ -159,6 +154,41 @@ __global__ void embed_gather_w8_kernel(const std::int32_t* ids, const std::uint8
         const float scale = __half2float(__ushort_as_half(scale_bits));
         const auto code = static_cast<std::int8_t>(codes[group_index * kEmbedGatherW8Group + lane]);
         out[i]          = __float2bfloat16(static_cast<float>(code) * scale);
+    }
+}
+
+template <int Blocks, int Threads, bool PairStore>
+__launch_bounds__(Threads) __global__
+    void embed_gather_w8_packed_5120_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                            const std::uint8_t* scales, __nv_bfloat16* out) {
+    constexpr int D = 5120, Values = D / Blocks, Words = Values / 4;
+    static_assert(D % Blocks == 0 && Values % 32 == 0);
+    const int token      = static_cast<int>(blockIdx.x) / Blocks;
+    const int split      = static_cast<int>(blockIdx.x) % Blocks;
+    const int row        = ids[token];
+    const auto* code_row = codes + static_cast<std::int64_t>(row) * D;
+    auto* output         = out + static_cast<std::int64_t>(token) * D;
+#pragma unroll
+    for (int item = threadIdx.x; item < Words; item += Threads) {
+        const int d      = split * Values + item * 4;
+        const auto group = static_cast<std::int64_t>(row) * (D / 32) + d / 32;
+        const auto sb    = static_cast<std::uint16_t>(scales[group * 2]) |
+                        (static_cast<std::uint16_t>(scales[group * 2 + 1]) << 8);
+        const float scale = __half2float(__ushort_as_half(sb));
+        const auto word   = *reinterpret_cast<const std::uint32_t*>(code_row + d);
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const auto q0    = static_cast<std::int8_t>((word >> (pair * 16)) & 255u);
+            const auto q1    = static_cast<std::int8_t>((word >> (pair * 16 + 8)) & 255u);
+            const auto value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                     static_cast<float>(q1) * scale);
+            if constexpr (PairStore)
+                reinterpret_cast<__nv_bfloat162*>(output + d)[pair] = value;
+            else {
+                output[d + pair * 2]     = value.x;
+                output[d + pair * 2 + 1] = value.y;
+            }
+        }
     }
 }
 

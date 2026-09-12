@@ -31,6 +31,7 @@ SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
     "mtp3": ("mtp", 3),
     "dflash7": ("dflash", 7),
+    "dflash2_7": ("dflash2", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
@@ -81,9 +82,9 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 5
+RUN_SCHEMA_VERSION = 6
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 9
+SERVER_LOG_SCHEMA_VERSION = 20
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -366,7 +367,7 @@ def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
     if speculative_backend == "none":
         return NIAH_FIXTURES
-    if speculative_backend in {"mtp", "dflash"}:
+    if speculative_backend in {"mtp", "dflash", "dflash2"}:
         return (*LONG_DECODE_FIXTURES, *scenarios)
     raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
@@ -383,6 +384,8 @@ def build_specs(
             backend, draft_tokens = SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target != "qwen3_6_35b_a3b":
                 raise CampaignError("DFlash corpus measurements require the 35B-A3B target")
+            if backend == "dflash2" and target != "qwen3_8_27b":
+                raise CampaignError("DFlash2 corpus measurements require Qwen3.8-27B")
             for fixture_name in block_fixture_names(backend):
                 for seed in SEEDS:
                     specs.append(
@@ -531,6 +534,9 @@ def build_result_record(
     result = server_event.get("result", {})
     timings = server_event.get("timings_seconds", {})
     speculative = server_event.get("speculative", {})
+    engine_timing = server_event.get("engine_timing", {})
+    host_exposed = engine_timing.get("host_exposed_seconds", {})
+    decode_engine = engine_timing.get("decode", {})
 
     expected_request = {
         "model": spec.model_id,
@@ -562,8 +568,33 @@ def build_result_record(
         drafted_tokens = int(speculative["drafted_tokens"])
         accepted_tokens = int(speculative["accepted_tokens"])
         fallback_steps = int(speculative["fallback_steps"])
+        queue_wait_seconds = float(engine_timing["queue_wait_seconds"])
+        engine_boundary_exposed_seconds = float(host_exposed["engine_boundary"])
+        program_submit_exposed_seconds = float(host_exposed["program_submit"])
+        program_post_exposed_seconds = float(host_exposed["program_post"])
+        engine_commit_output_exposed_seconds = float(host_exposed["engine_commit_output"])
+        engine_maintenance_exposed_seconds = float(host_exposed["engine_maintenance"])
+        engine_host_exposed_seconds = float(host_exposed["total"])
+        device_wait_exposed_seconds = float(engine_timing["device_wait_exposed_seconds"])
+        decode_host_exposed_seconds = float(decode_engine["host_exposed_seconds"])
+        decode_device_wait_exposed_seconds = float(
+            decode_engine["device_wait_exposed_seconds"]
+        )
+        decode_rounds = int(decode_engine["rounds"])
     except (KeyError, TypeError, ValueError) as exc:
         raise CampaignError(f"request_done is missing required metrics: {exc}") from exc
+
+    host_phase_sum = (
+        engine_boundary_exposed_seconds
+        + program_submit_exposed_seconds
+        + program_post_exposed_seconds
+        + engine_commit_output_exposed_seconds
+        + engine_maintenance_exposed_seconds
+    )
+    if not math.isclose(
+        host_phase_sum, engine_host_exposed_seconds, rel_tol=1.0e-12, abs_tol=1.0e-12
+    ):
+        raise CampaignError("request_done engine Host phase total is inconsistent")
 
     if backend != spec.speculative_backend:
         raise CampaignError(
@@ -600,6 +631,27 @@ def build_result_record(
             1.0 + accepted_tokens / speculative_rounds if speculative_rounds > 0 else None
         ),
         "fallback_steps": fallback_steps,
+        # Request values are latency exposure, not worker cost. They are valid for distribution
+        # and per-request normalization but must not be summed across concurrent requests.
+        "queue_wait_seconds": queue_wait_seconds,
+        "engine_boundary_exposed_seconds": engine_boundary_exposed_seconds,
+        "program_submit_exposed_seconds": program_submit_exposed_seconds,
+        "program_post_exposed_seconds": program_post_exposed_seconds,
+        "engine_commit_output_exposed_seconds": engine_commit_output_exposed_seconds,
+        "engine_maintenance_exposed_seconds": engine_maintenance_exposed_seconds,
+        "engine_host_exposed_seconds": engine_host_exposed_seconds,
+        "device_wait_exposed_seconds": device_wait_exposed_seconds,
+        "decode_host_exposed_seconds": decode_host_exposed_seconds,
+        "decode_device_wait_exposed_seconds": decode_device_wait_exposed_seconds,
+        "decode_rounds": decode_rounds,
+        "queue_wait_ms": queue_wait_seconds * 1000.0,
+        "engine_host_exposed_ms": engine_host_exposed_seconds * 1000.0,
+        "decode_host_us_per_round": safe_ratio(
+            decode_host_exposed_seconds * 1.0e6, float(decode_rounds)
+        ),
+        "decode_device_wait_us_per_round": safe_ratio(
+            decode_device_wait_exposed_seconds * 1.0e6, float(decode_rounds)
+        ),
     }
     return {
         "artifact_type": RUN_ARTIFACT_TYPE,
@@ -854,6 +906,14 @@ SUMMARY_FIELDS = (
     "completion_tokens_stddev",
     "decode_tok_s_mean",
     "decode_tok_s_stddev",
+    "queue_wait_ms_mean",
+    "queue_wait_ms_stddev",
+    "engine_host_exposed_ms_mean",
+    "engine_host_exposed_ms_stddev",
+    "decode_host_us_per_round_mean",
+    "decode_host_us_per_round_stddev",
+    "decode_device_wait_us_per_round_mean",
+    "decode_device_wait_us_per_round_stddev",
     "speculative_acceptance_mean",
     "speculative_acceptance_stddev",
     "speculative_tokens_per_round_mean",
@@ -899,6 +959,15 @@ def summary_row(
     set_stats(row, "server_ttft_ms", records, "server_ttft_ms")
     set_stats(row, "completion_tokens", records, "completion_tokens")
     set_stats(row, "decode_tok_s", records, "decode_tok_s")
+    set_stats(row, "queue_wait_ms", records, "queue_wait_ms")
+    set_stats(row, "engine_host_exposed_ms", records, "engine_host_exposed_ms")
+    set_stats(row, "decode_host_us_per_round", records, "decode_host_us_per_round")
+    set_stats(
+        row,
+        "decode_device_wait_us_per_round",
+        records,
+        "decode_device_wait_us_per_round",
+    )
     set_stats(row, "speculative_acceptance", records, "speculative_acceptance")
     set_stats(
         row,
@@ -1021,6 +1090,8 @@ def mode_display_name(mode_name: str) -> str:
         return "MTP3"
     if mode_name == "dflash7":
         return "DFlash block=8 (k=7)"
+    if mode_name == "dflash2_7":
+        return "DFlash2 block=8 (k=7)"
     raise CampaignError(f"unsupported summary mode: {mode_name}")
 
 
@@ -1058,6 +1129,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                     "Prefill tok/s",
                     "Server TTFT ms",
                     "Decode tok/s",
+                    "Host exposure ms",
+                    "Decode Host us/round",
                 ),
                 [
                     (
@@ -1069,6 +1142,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "prefill_tok_s"),
                         format_mean_stddev(row, "server_ttft_ms"),
                         format_mean_stddev(row, "decode_tok_s"),
+                        format_mean_stddev(row, "engine_host_exposed_ms"),
+                        format_mean_stddev(row, "decode_host_us_per_round"),
                     )
                     for row in context_rows
                 ],
@@ -1084,6 +1159,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                     "n",
                     "Completion tokens",
                     "Decode tok/s",
+                    "Decode Host us/round",
+                    "Device wait us/round",
                     "Spec acceptance",
                     "Spec tokens/round",
                 ),
@@ -1095,6 +1172,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         str(row["samples"]),
                         format_mean_stddev(row, "completion_tokens"),
                         format_mean_stddev(row, "decode_tok_s"),
+                        format_mean_stddev(row, "decode_host_us_per_round"),
+                        format_mean_stddev(row, "decode_device_wait_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
                         format_mean_stddev(
                             row, "speculative_tokens_per_round", digits=2
@@ -1113,6 +1192,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                     "Category",
                     "n",
                     "Decode tok/s",
+                    "Decode Host us/round",
+                    "Device wait us/round",
                     "Spec acceptance",
                     "Spec tokens/round",
                 ),
@@ -1123,6 +1204,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         row["group"],
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),
+                        format_mean_stddev(row, "decode_host_us_per_round"),
+                        format_mean_stddev(row, "decode_device_wait_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
                         format_mean_stddev(
                             row, "speculative_tokens_per_round", digits=2

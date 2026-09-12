@@ -28,11 +28,12 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block>
+template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                    std::int64_t rows, float eps) {
+                                    const __nv_bfloat162* z, __nv_bfloat162* out,
+                                    std::int32_t input_d, std::int64_t rows, float eps) {
+    const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
     constexpr int kMaxPairsPerLane = 4;
@@ -44,13 +45,19 @@ __launch_bounds__(Block) __global__
     const int pairs             = d / 2;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[kMaxPairsPerLane];
+    __nv_bfloat162 weights[kMaxPairsPerLane];
+    __nv_bfloat162 gates[kMaxPairsPerLane];
     float sum = 0.0f;
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
-            values[k]       = x[row_base + pair];
+            values[k] = x[row_base + pair];
+            if constexpr (Prefetch) {
+                weights[k] = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -65,11 +72,18 @@ __launch_bounds__(Block) __global__
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
-            float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
-                zf = __bfloat1622float2(z[row_base + pair]);
+            __nv_bfloat162 w_pair;
+            __nv_bfloat162 z_pair{};
+            if constexpr (Prefetch) {
+                w_pair = weights[k];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = gates[k]; }
+            } else {
+                w_pair = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = z[row_base + pair]; }
             }
+            const float2 wf = __bfloat1622float2(w_pair);
+            float2 zf{0.0f, 0.0f};
+            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -123,11 +137,12 @@ __launch_bounds__(Block) __global__
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps) {
+                                   const __nv_bfloat162* z, __nv_bfloat162* out,
+                                   std::int32_t input_d, std::int64_t rows, float eps) {
+    const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
@@ -136,13 +151,23 @@ __launch_bounds__(Block) __global__
     const int pairs_per_thread  = pairs / Block;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[MaxPairsPerThread];
+    // Neither the weight nor the gate depends on the sum of squares, so under Prefetch both
+    // are issued in the same pass as x and the two trips to memory overlap instead of running
+    // back to back across the reduction. They cost registers, so the launcher turns this off
+    // once the grid is wide enough that occupancy is worth more than the overlap.
+    __nv_bfloat162 weights[MaxPairsPerThread];
+    __nv_bfloat162 gates[MaxPairsPerThread];
     float sum = 0.0f;
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
         if (k < pairs_per_thread) {
-            const int pair  = static_cast<int>(threadIdx.x) + k * Block;
-            values[k]       = x[row_base + pair];
+            const int pair = static_cast<int>(threadIdx.x) + k * Block;
+            values[k]      = x[row_base + pair];
+            if constexpr (Prefetch) {
+                weights[k] = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+            }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
         }
@@ -160,11 +185,18 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
-            float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
-                zf = __bfloat1622float2(z[row_base + pair]);
+            __nv_bfloat162 w_pair;
+            __nv_bfloat162 z_pair{};
+            if constexpr (Prefetch) {
+                w_pair = weights[k];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = gates[k]; }
+            } else {
+                w_pair = weight[pair];
+                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = z[row_base + pair]; }
             }
+            const float2 wf = __bfloat1622float2(w_pair);
+            float2 zf{0.0f, 0.0f};
+            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));

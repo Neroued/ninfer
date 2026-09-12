@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 11
+REPORT_SCHEMA_VERSION = 14
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -64,8 +64,7 @@ def pair_list(values: Iterable[tuple[int, int]]) -> str:
 
 
 def mtp_args(k: int) -> tuple[str, ...]:
-    args = ("--mtp-draft-tokens", str(k))
-    return (*args, "--lm-head-draft") if k > 0 else args
+    return ("--spec", "mtp", "--draft-tokens", str(k), "--lm-head-draft") if k > 0 else ()
 
 
 def shell_join(command: Sequence[str]) -> str:
@@ -269,7 +268,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
     weights_memory = memory.get("weights", {})
     sequence_memory = memory.get("sequence", {})
     workspace_memory = memory.get("workspace", {})
-    request_transient_memory = memory.get("request_transient", {})
+    vision_workspace = memory.get("vision_workspace") or {}
     rows = []
     for test in report.get("tests", []):
         speculative = test.get("speculative", {})
@@ -289,7 +288,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "kv_capacity": memory.get("kv_capacity"),
             "prefill_chunk": config.get("prefill_chunk"),
             "kv_cache": config.get("kv_cache"),
-            "mtp_draft_tokens": config.get("mtp_draft_tokens"),
+            "speculative_backend": config.get("speculative_backend"),
+            "draft_tokens": config.get("draft_tokens"),
             "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
@@ -307,7 +307,10 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "weights_capacity_bytes": weights_memory.get("capacity_bytes"),
             "sequence_capacity_bytes": sequence_memory.get("capacity_bytes"),
             "workspace_capacity_bytes": workspace_memory.get("capacity_bytes"),
-            "request_transient_capacity_bytes": request_transient_memory.get("capacity_bytes"),
+            "workspace_general_capacity_bytes": vision_workspace.get(
+                "general_capacity_bytes", workspace_memory.get("capacity_bytes")
+            ),
+            "vision_handoff_capacity_bytes": vision_workspace.get("handoff_capacity_bytes"),
             "cuda_graph_allowance_bytes": memory.get("cuda_graph_allowance_bytes"),
             "workspace_peak_bytes": test.get("workspace_peak_bytes"),
             "workspace_allocator_peak_bytes": test.get("workspace_allocator_peak_bytes"),

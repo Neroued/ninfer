@@ -149,10 +149,18 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
     expected.reserve(selected.size() * static_cast<std::size_t>(tokens));
     for (const std::int32_t local_row : selected) {
+        // Decode each represented coefficient once; every token still evaluates the full
+        // naive FP64 dot product, without production staging or intermediate rounding.
+        std::vector<double> decoded(hidden);
+        for (std::int32_t column = 0; column < hidden; ++column)
+            decoded[column] = quantized_weight::logical_weight_fp64(
+                weight, weight_row_offset + local_row, column);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            expected.push_back(quantized_weight::dot_fp64(
-                weight, weight_row_offset + local_row,
-                activation.data() + static_cast<std::size_t>(token) * hidden, hidden));
+            const float* input = activation.data() + static_cast<std::size_t>(token) * hidden;
+            double sum         = 0.0;
+            for (std::int32_t column = 0; column < hidden; ++column)
+                sum += decoded[column] * static_cast<double>(input[column]);
+            expected.push_back(sum);
         }
     }
     return expected;

@@ -8,15 +8,25 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6 {
 
+namespace frontend_internal {
+struct ToolCallOutputContract;
+}
+
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
-inline constexpr std::uint64_t kMaximumVisionTokens       = 32'768;
-inline constexpr std::uint64_t kMaximumVisionRawPatches =
-    kMaximumVisionTokens * kRawPatchesPerVisionToken;
+// Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
+// media items are retained by one prepared prompt but pass through the Vision tower sequentially.
+inline constexpr std::uint64_t kMaximumPromptVisionTokens = 32'768;
+inline constexpr std::uint64_t kMaximumPromptVisionRawPatches =
+    kMaximumPromptVisionTokens * kRawPatchesPerVisionToken;
+inline constexpr std::uint64_t kMaximumVisionItemTokens = 16'384;
+inline constexpr std::uint64_t kMaximumVisionItemRawPatches =
+    kMaximumVisionItemTokens * kRawPatchesPerVisionToken;
 
 struct PreparedMediaPayload {
     // Exact row-major BF16 input consumed by the Vision patch projection.
@@ -73,6 +83,40 @@ struct RewriteCheckpointSpec {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    // Exact token frontiers at which this serialization can agree with a typed rewrite captured
+    // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
+    // same GDN decomposition; they are not capture requests by themselves.
+    std::vector<std::uint32_t> rewrite_execution_frontiers;
+};
+
+inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
+
+struct PreparedSessionKey {
+    std::uint16_t size = 0;
+    std::array<char, kPreparedSessionKeyCapacity> bytes{};
+
+    [[nodiscard]] std::string_view view() const noexcept { return {bytes.data(), size}; }
+
+    [[nodiscard]] friend bool operator==(const PreparedSessionKey&,
+                                         const PreparedSessionKey&) noexcept = default;
+};
+
+struct PreparedCacheOpportunity {
+    PromptCacheMarkerKind kind       = PromptCacheMarkerKind::SharedStablePrefix;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+    std::uint32_t frontier           = 0;
+    std::uint32_t input_order        = 0;
+
+    [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
+                                         PreparedCacheOpportunity) noexcept = default;
+};
+
+struct PreparedContextCache {
+    std::optional<PreparedSessionKey> session_key;
+    runtime::RetentionClass retention = runtime::RetentionClass::RecentPrivate;
+    std::vector<PreparedCacheOpportunity> opportunities;
+    // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
+    bool update_session_index = true;
 };
 
 struct PrepareStats {
@@ -102,6 +146,8 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
+    PreparedContextCache context_cache;
+    std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

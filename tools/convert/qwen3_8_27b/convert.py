@@ -4,6 +4,7 @@ Canonical invocation::
 
     python3 -m tools.convert.qwen3_8_27b.convert \
       --model /path/to/Qwen3.8-27B \
+      --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
       --out out/qwen3_8_27b.ninfer
 """
 
@@ -23,13 +24,17 @@ from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactW
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
+from tools.convert.qwen3_6.common import recipe as family_recipe
 from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
 from tools.convert.qwen3_6_27b import draft_head, recipe
 
-from . import inventory
+from . import dflash2_recipe, inventory
+from .dflash2_inventory import DFLASH2_TENSOR_SPECS
 
 
-RECIPE_ID = "qwen3_8_27b-v1"
+RECIPE_ID = "qwen3_8_27b-v2"
+BASE_REPOSITORY = "Qwen/Qwen3.8-27B"
+BASE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 
 OFFICIAL_RESOURCE_SHA256 = {
     "frontend/tokenizer.json": (
@@ -59,8 +64,11 @@ ObjectPlan = family_conversion.ObjectPlan
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
     model_dir: Path
-    config_summary: dict[str, object]
-    source: recipe.SourcePreflight
+    dflash2_model_dir: Path
+    base_config_summary: dict[str, object]
+    dflash2_config_summary: dict[str, object]
+    base_source: recipe.SourcePreflight
+    dflash2_source: recipe.SourcePreflight
     resources: tuple[ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
     object_plan: ObjectPlan
@@ -71,17 +79,10 @@ def _repo_root() -> Path:
 
 
 def preflight_inventory() -> None:
-    if (
-        len(inventory.RESOURCE_SPECS),
-        len(inventory.TEXT_CORE_TENSOR_SPECS),
-        len(inventory.DRAFT_HEAD_TENSOR_SPECS),
-        len(inventory.MTP_TENSOR_SPECS),
-        len(inventory.VISION_TENSOR_SPECS),
-        len(inventory.TENSOR_SPECS),
-        len(inventory.OBJECT_SPECS),
-    ) != (6, 771, 2, 12, 333, 1118, 1124):
-        raise ValueError("registered inventory is incomplete")
-    recipe.validate_recipe_coverage()
+    family_recipe.validate_recipe_coverage(
+        recipe.RECIPE_SPECS, inventory.BASE_TENSOR_SPECS
+    )
+    dflash2_recipe.validate_recipe_coverage()
 
 
 def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
@@ -116,12 +117,24 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return resources
 
 
-def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
+def preflight_conversion(
+    model_dir: str | Path,
+    dflash2_model_dir: str | Path,
+) -> ConversionPreflight:
     model = Path(model_dir)
-    config = family_conversion.load_json(model / "config.json")
-    config_summary = qwen3_6_convert.validate_config(config)
+    dflash2_model = Path(dflash2_model_dir)
+    base_config_summary = qwen3_6_convert.validate_config(
+        family_conversion.load_json(model / "config.json")
+    )
+    dflash2_config_summary = dflash2_recipe.validate_config(
+        family_conversion.load_json(dflash2_model / "config.json")
+    )
+    dflash2_recipe.validate_base_compatibility(
+        base_config_summary, dflash2_config_summary
+    )
     preflight_inventory()
-    source = recipe.preflight_sources(model)
+    base_source = recipe.preflight_sources(model)
+    dflash2_source = dflash2_recipe.preflight_sources(dflash2_model)
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map)
@@ -129,8 +142,11 @@ def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
         model_dir=model,
-        config_summary=config_summary,
-        source=source,
+        dflash2_model_dir=dflash2_model,
+        base_config_summary=base_config_summary,
+        dflash2_config_summary=dflash2_config_summary,
+        base_source=base_source,
+        dflash2_source=dflash2_source,
         resources=resources,
         draft=draft,
         object_plan=object_plan,
@@ -156,17 +172,20 @@ def encode_tensor_payload(
 def build_conversion_report(
     *,
     model_dir: str | Path,
+    dflash2_model_dir: str | Path,
     out_path: str | Path,
     arguments: Mapping[str, object],
-    config_summary: Mapping[str, object],
-    source_preflight: recipe.SourcePreflight,
+    base_config_summary: Mapping[str, object],
+    dflash2_config_summary: Mapping[str, object],
+    base_source_preflight: recipe.SourcePreflight,
+    dflash2_source_preflight: recipe.SourcePreflight,
     objects: Sequence[ArtifactObject],
     elapsed_seconds: float,
     final_bytes: int,
     device: torch.device,
     ranking_path: str | Path,
 ) -> dict[str, object]:
-    return family_conversion.build_conversion_report(
+    report = family_conversion.build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
@@ -174,18 +193,50 @@ def build_conversion_report(
         model_dir=model_dir,
         out_path=out_path,
         arguments=arguments,
-        config_summary=config_summary,
-        source_preflight=source_preflight,
+        config_summary={
+            "base": dict(base_config_summary),
+            "dflash2": dict(dflash2_config_summary),
+        },
+        source_preflight=base_source_preflight,
         objects=objects,
         elapsed_seconds=elapsed_seconds,
         final_bytes=final_bytes,
         device=device,
         ranking_path=ranking_path,
     )
+    report["source"] = {
+        "base": {
+            "repository": BASE_REPOSITORY,
+            "revision": BASE_REVISION,
+            "model_path": str(Path(model_dir).resolve()),
+        },
+        "dflash2": {
+            "repository": dflash2_recipe.REPOSITORY,
+            "revision": dflash2_recipe.REVISION,
+            "model_path": str(Path(dflash2_model_dir).resolve()),
+        },
+        "ranking_path": str(Path(ranking_path).resolve()),
+    }
+    report["source_preflight"] = {
+        "base": {
+            "recipes": base_source_preflight.recipe_count,
+            "tensors": base_source_preflight.source_tensor_count,
+            "shards": base_source_preflight.source_shard_count,
+            "dtypes": dict(base_source_preflight.source_dtype_counts),
+        },
+        "dflash2": {
+            "recipes": dflash2_source_preflight.recipe_count,
+            "tensors": dflash2_source_preflight.source_tensor_count,
+            "shards": dflash2_source_preflight.source_shard_count,
+            "dtypes": dict(dflash2_source_preflight.source_dtype_counts),
+        },
+    }
+    return report
 
 
 def convert(
     model_dir: str | Path,
+    dflash2_model_dir: str | Path,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
@@ -195,51 +246,77 @@ def convert(
     output = Path(out_path)
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(model)
+    preflight = preflight_conversion(model, dflash2_model_dir)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
-        f"{preflight.source.source_tensor_count} source tensors, device={resolved_device}",
+        f"{preflight.base_source.source_tensor_count} base and "
+        f"{preflight.dflash2_source.source_tensor_count} DFlash2 source tensors, "
+        f"device={resolved_device}",
         flush=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(model) as reader:
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            preflight.object_plan.specs,
-        ) as writer:
-            if writer.objects != preflight.object_plan.objects:
-                raise RuntimeError("writer object plan differs from completed preflight")
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
-                if isinstance(spec, inventory.ResourceSpec):
-                    payload = resources[spec.name]
-                else:
-                    tensor = materialize_tensor(spec, reader, preflight.draft)
-                    payload = encode_tensor_payload(tensor, spec, resolved_device)
-                    del tensor
+    total = len(inventory.OBJECT_SPECS)
+    index = 0
+    with ArtifactWriter(
+        output,
+        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        preflight.object_plan.specs,
+    ) as writer:
+        if writer.objects != preflight.object_plan.objects:
+            raise RuntimeError("writer object plan differs from completed preflight")
+
+        for spec in inventory.RESOURCE_SPECS:
+            index += 1
+            writer.write(spec.name, resources[spec.name])
+            print(f"[{index}/{total}] {spec.name}", flush=True)
+
+        with ShardReader(model) as base_reader:
+            for spec in inventory.BASE_TENSOR_SPECS:
+                index += 1
+                tensor = materialize_tensor(spec, base_reader, preflight.draft)
+                payload = encode_tensor_payload(tensor, spec, resolved_device)
+                del tensor
                 writer.write(spec.name, payload)
                 del payload
                 print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                    f"[{index}/{total}] {spec.name}",
                     flush=True,
                 )
+
+        with ShardReader.from_file(
+            preflight.dflash2_model_dir / "model.safetensors"
+        ) as dflash2_reader:
+            for spec in DFLASH2_TENSOR_SPECS:
+                index += 1
+                tensor = dflash2_recipe.materialize_tensor(
+                    spec.name, dflash2_reader
+                )
+                payload = encode_tensor_payload(tensor, spec, resolved_device)
+                del tensor
+                writer.write(spec.name, payload)
+                del payload
+                print(f"[{index}/{total}] {spec.name}", flush=True)
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     arguments = {
         "model": str(model_dir),
+        "dflash2_model": str(dflash2_model_dir),
         "out": str(out_path),
         "device": requested_device,
     }
     report = build_conversion_report(
         model_dir=model,
+        dflash2_model_dir=preflight.dflash2_model_dir,
         out_path=output,
         arguments=arguments,
-        config_summary=preflight.config_summary,
-        source_preflight=preflight.source,
+        base_config_summary=preflight.base_config_summary,
+        dflash2_config_summary=preflight.dflash2_config_summary,
+        base_source_preflight=preflight.base_source,
+        dflash2_source_preflight=preflight.dflash2_source,
         objects=preflight.object_plan.objects,
         elapsed_seconds=elapsed,
         final_bytes=final_bytes,
@@ -260,10 +337,11 @@ def convert(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--dflash2-model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.dflash2_model, args.out, device=args.device)
 
 
 if __name__ == "__main__":

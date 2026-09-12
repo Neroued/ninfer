@@ -42,6 +42,31 @@ struct Q4SimtDecodeAtom {
 };
 
 struct Q4MmaDecodeAtom {
+    // Eight packed codes -> four bf16 pairs, in weight order; out[i] holds the pair for
+    // lane = 4 * chunk + i. A nibble n decodes to the integer (n ^ 8) - 8, which lies in [-8, 7]
+    // and which bf16 represents exactly, so forming 128 + (n ^ 8) and subtracting 136 lands on it.
+    // The values are unscaled: callers of this overload fold the group scale into the
+    // accumulation, unlike decode_pair below.
+    static __device__ __forceinline__ void decode_eight(unsigned word, unsigned (&out)[4]) {
+        const unsigned kBias  = 0x43084308u; // bf16 136.0 in both halves
+        const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
+        word ^= 0x88888888u;
+        const unsigned lo        = word & 0x0f0f0f0fu;
+        const unsigned hi        = (word >> 4) & 0x0f0f0f0fu;
+        const unsigned even      = __byte_perm(lo, hi, 0x5140);
+        const unsigned odd       = __byte_perm(lo, hi, 0x7362);
+        const unsigned biased[4] = {
+            __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+            __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __nv_bfloat162 value =
+                __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
+                        *reinterpret_cast<const __nv_bfloat162*>(&kBias));
+            out[i] = *reinterpret_cast<const unsigned*>(&value);
+        }
+    }
+
     static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* codes,
                                                                  const std::uint8_t* scale_ptr,
                                                                  std::int64_t group_index,

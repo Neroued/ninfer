@@ -1,0 +1,123 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_28.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_29.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_30.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_31.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_32.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_33.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_34.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_35.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_36.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_37.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_38.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_39.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_40.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_41.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_42.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_43.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_44.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_45.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_46.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_47.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_48.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_49.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_50.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_51.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_52.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_53.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_54.png"
+      },
+      {
+        "type": "image",
+        "image": "bench/fixtures/ttft/media/load_55.png"
+      },
+      {
+        "type": "text",
+        "text": "Compare all images and answer with the smallest visible image number."
+      }
+    ]
+  }
+]

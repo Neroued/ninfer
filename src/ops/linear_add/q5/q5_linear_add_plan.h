@@ -14,7 +14,8 @@ enum class Q5LinearAddScheduleId {
     Split2ExactResidual,
     MmaResidualR64C16,
     MmaResidualR64C24,
-    MmaResidualR64C64,
+    MmaResidualR64C32S3,
+    MmaResidualR64C32S4,
     MmaResidualR64C128,
 };
 

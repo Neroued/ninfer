@@ -361,7 +361,12 @@ common reporting behavior belong in [`tests/README.md`](../../tests/README.md).
 
 ### 6.1 Oracle
 
-Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over the logical
+Choose the reference and comparison from the observable promise of the Op. A tensor's floating-point
+dtype alone does not determine its acceptance test. Identify the outputs, state effects, explicit
+representation boundaries, and the realistic failure that the check must detect before selecting
+an oracle.
+
+For an Op whose promise is a mathematical computation, use one independent naive FP32/FP64 oracle over the logical
 values represented by its public inputs. Test-owned fixture code independently decodes packed
 values before invoking the oracle. The oracle evaluates the complete formula at high precision and
 retains that result. It does not reproduce a production route's staging casts, activation
@@ -370,8 +375,17 @@ output.
 
 Exact transforms and codecs use an independent exact oracle. A fused oracle evaluates the complete
 fused formula instead of composing production Ops. A stateful oracle computes both output and new
-state. Another GPU route, target reference, generated model output, or pairwise implementation
-parity is supplementary evidence, never a second oracle.
+state. For such mathematical contracts, another GPU route, generated model output, or pairwise
+implementation parity is supplementary evidence, not the mathematical oracle.
+
+When the contract instead requires exact equivalence to a specified execution, that execution is
+the reference. ReplaySSM record/fold must preserve the corresponding snapshot outputs and committed
+state bit for bit. Compare the same initial state, physical block, inputs, and arithmetic policy;
+for each committed prefix, select the corresponding snapshot from that same block. Re-running a
+shorter projection can choose different arithmetic and is not an equivalent reference. Check raw
+record copies, untouched state, invalid tails, and zero-commit effects according to their contracts.
+A separate FP64 recurrence does not establish this equivalence and is not required for its acceptance.
+If the snapshot computation itself changes, validate its mathematical contract separately.
 
 The oracle determines correctness but does not prescribe production arithmetic. Private precision,
 instruction operands, reduction association, staging, workspace representation, and kernel
@@ -498,7 +512,8 @@ larger than measurement uncertainty and must not introduce an avoidable latency 
 a universal percentage threshold: the task records the timing conditions and the scale needed to
 distinguish its candidates.
 
-Review and report the pointwise curve, not only its minimum, maximum, average, or selected route.
+When the deliverable covers a latency-sensitive interval, review and report its pointwise curve,
+not only its minimum, maximum, average, or selected route.
 At minimum, identify the largest adjacent-extent increase and every route or schedule seam in the
 measured interval. An unexplained material jump blocks a claim that the interval is smooth: either
 change the kernel or dispatch, or record why the complete candidate matrix shows that the jump is
@@ -513,14 +528,12 @@ policy does not prove that a particular accelerator route ran, so roofline evide
 and measure the implementation that production dispatch actually selects. These are completion
 requirements for the large-extent region, not a mandatory position in the development order.
 
-When a valid simple Op is the development surface for a related fused Op or epilogue, tune the
-shared computation across the current registered problem's required extent domain and performance
-regions before adapting it. Make the selected kernel bodies parameterizable at their output
-boundary, then immediately adapt them to the actual complete Op before moving to another problem.
-Do not enter the fused Op with only a provisional route, and do not turn this into a
-repository-wide simple-Op phase. The complete public fused Op, including its epilogue, post work,
-workspace traffic, outputs, and state effects, may still change the final fused route and supplies
-its own completion evidence.
+Choose the development surface from the requested complete Op. A related simple Op can help
+isolate shared computation when that answers a live design question, but completing a separate
+simple-Op tuning campaign is not a prerequisite for a fused Op. Reuse suitable kernel bodies at
+their output boundary when useful, and evaluate plausible routes through the complete public fused
+Op. Its epilogue, post work, workspace traffic, outputs, and state effects determine its selected
+route and completion evidence; an isolated contraction result cannot substitute for them.
 
 Before timing, qualify each candidate arithmetic profile against the independent oracle. After
 encoding the selected instances and boundaries in production dispatch, requalify boundary and
@@ -546,7 +559,9 @@ Preserve only the context needed to interpret the result, as required by `AGENTS
 
 ## 8. Change checklist
 
-For a new or changed device transformation:
+For a new or changed device transformation, apply the relevant contract checks below. They do not
+require separate artifacts or a fixed execution order, and unchanged contracts need not be
+rewritten:
 
 1. classify the complete semantic boundary and reject schedule decisions, raw transfers,
    container lifecycle operations, and partial implementation helpers;

@@ -19,5 +19,7 @@ using Bf16Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t)
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+void launch_bf16_n256_k5120(const Tensor& x, const Weight& weight, Tensor& out,
+                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -4,6 +4,7 @@
 #include "core/device.h"
 
 #include <cstdint>
+#include <algorithm>
 
 namespace ninfer::ops::detail {
 
@@ -35,8 +36,10 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
 void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
                                const Tensor& valid_columns, Tensor& destination,
                                cudaStream_t stream) {
-    constexpr int block = 128;
-    const dim3 grid(source.ne[1], source.ne[2], 1);
+    constexpr int block = kScatterBatchThreads;
+    // Keep a grid-stride feature loop beyond CUDA's z-dimension limit.
+    const int feature_tiles = std::min((source.ne[0] / 8 + block - 1) / block, 65535);
+    const dim3 grid(source.ne[1], source.ne[2], feature_tiles);
     scatter_bf16_batch_kernel<<<grid, block, 0, stream>>>(
         static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(lanes.data),
         static_cast<const std::int32_t*>(valid_columns.data), static_cast<uint4*>(destination.data),

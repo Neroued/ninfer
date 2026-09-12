@@ -78,7 +78,7 @@ Options parse_options(int argc, char** argv) {
                 options.t_sweep = {1, 4, 8, 16};
             } else if (value == "a4") {
                 options.policy  = ops::LinearPolicy::AllowA4;
-                options.t_sweep = {17, 128, 1024};
+                options.t_sweep = {5, 48, 49, 56, 64, 65, 96, 97, 128, 256, 1024};
             } else {
                 throw std::invalid_argument("--policy must be a16 or a4");
             }

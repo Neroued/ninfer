@@ -266,10 +266,17 @@ y = o_projection(a)                       # [2048,T]
 ```
 
 Each KV head serves eight query heads. Prefill appends all K/V columns and evaluates causal
-attention over the chunk. Decode appends one column and attends over the resident prefix. A cache
-backend may page or quantize K/V, but those are representation choices rather than model math.
-The persistent cache boundary is the offset-normalized, MRoPE-rotated K and the directly projected
-V; raw K, Q, and the output gate are not cached.
+attention over the chunk. Decode appends one column and attends over the resident prefix. Runtime
+KV storage may be BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, or K8V4; paging and
+quantization are representation choices rather than model math. The logical persistent boundary is
+the offset-normalized, MRoPE-rotated K and directly projected V. Raw K, Q, and the output gate are
+not cached.
+
+The production append-and-attend and cached-only entries are `causal_softmax_attention` and
+`causal_softmax_attention_cached`; standalone population uses `kv_cache_append`. Their exact
+repository-internal contracts are defined by
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) and
+[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h).
 
 Only 64 of each 256-dimensional Q/K head are rotated. They contain 32 complex frequency pairs split
 across temporal, height, and width MRoPE sections `[11,11,10]`. The checkpoint sets
@@ -596,6 +603,11 @@ The query rows therefore attend bidirectionally to one another while also attend
 context K/V. This all-non-causal mask is the single model contract and numerical oracle; a causal
 draft mask computes a different head and is not a supported execution profile.
 
+Production layers 0 through 4 use `sliding_window_attention`; layer 5 uses
+`context_softmax_attention`. The corresponding exact repository-internal contracts are defined by
+[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h) and
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h).
+
 The companion consumes target Text residual features and owns no Vision component. Its query and
 context positions are scalar one-dimensional positions. This model-side contract does not by
 itself claim a product execution route for image/video prompts.
@@ -747,14 +759,13 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
   matrix. Proposal selection may use the existing full `lm_head` or the artifact's existing
   optimized proposal head; neither is a private companion parameter.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
-  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
-  formats remain real persistent representation boundaries.
+  In particular, GDN recurrent matrices and decay controls are FP32.
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
   transforms and codecs use exact oracles.
-- Hugging Face, vLLM, llama.cpp, and the artifact-native Python route are execution/parity profiles,
-  not Op oracles. Their choices to cast attention probabilities, GDN controls, gated-norm values,
-  MoE route weights, expert activations, or convolution history do not bind NInfer kernels.
+- Hugging Face, vLLM, and llama.cpp are external execution profiles, not Op oracles. Their choices
+  to cast attention probabilities, GDN controls, gated-norm values, MoE route weights, expert
+  activations, or convolution history do not bind NInfer kernels.
 - NInfer kernels may select their natural accumulator precision, operand staging, intermediate
   materialization, workspace dtype, and reduction association. Each route is accepted directly
   against the one Op oracle with its own documented tolerance; the oracle precision does not become
@@ -772,25 +783,24 @@ Let `C=max_concurrency` and `P=min(prefill_chunk,max_context)`.
 
 The Program-owned memory classes are:
 
-| State | Shape basis | BF16/FP32 payload at 262144 context | Lifetime |
-|---|---|---:|---|
-| Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16 | active sequence |
-| MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16 | active sequence when MTP enabled |
-| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes | about 160 MiB × `C` BF16 | Program lifetime when DFlash enabled |
-| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
-| GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C` | 1.406 MiB × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
-| GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C` | 60 MiB × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
-| ReplaySSM records | 30 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | backend/window dependent | Program lifetime with MTP or DFlash; one pending round |
-| Continuation hidden | current and turn-checkpoint `[2048,C]` BF16 stores | 8 KiB × `C` BF16 | Program lifetime |
-| DFlash prefill target features/positions | `[16384,P]` BF16 plus `[P]` I32 | about 32 KiB × `P` | Program lifetime; one prefill unit |
-| DFlash pending target features | `[16384,draft_window+1,C]` BF16 | window dependent | Program lifetime; one pending round |
-| multimodal continuation | `rope_delta` and logical positions | negligible | active sequence |
-| MoE route data | token × 8 ids and weights plus grouping/reduction workspace | implementation-dependent | operator scope |
-| Program scratch | Text/MTP/DFlash/Vision phase temporaries | implementation-dependent | one phase in the shared workspace arena |
-| Vision request transient | encoded Vision output `[8192,V]` | `V<=min(max_context,32768)` | active prefix during request begin |
+| State | Shape basis | Lifetime |
+|---|---|---|
+| Text GQA K and V | 10 layers × context × 2 heads × D256 K/V | active sequence |
+| MTP K and V | 1 layer × context × 2 heads × D256 K/V | active sequence when MTP enabled |
+| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × D128 K/V × `C` lanes | Program lifetime when DFlash enabled |
+| DFlash full context K and V | 1 layer × context × 8 heads × D128 K/V | active sequence when DFlash enabled |
+| GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
+| GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
+| ReplaySSM records | 30 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime with MTP or DFlash; one pending round |
+| Continuation hidden | current and turn-checkpoint `[2048,C]` BF16 stores | Program lifetime |
+| DFlash prefill target features/positions | `[16384,P]` BF16 plus `[P]` I32 | Program lifetime; one prefill unit |
+| DFlash pending target features | `[16384,draft_window+1,C]` BF16 | Program lifetime; one pending round |
+| multimodal continuation | `rope_delta` and logical positions | active sequence |
+| MoE route data | token × 8 ids and weights plus grouping/reduction workspace | operator scope |
+| Unified Program workspace | Text/MTP/DFlash/Vision phase temporaries plus fixed Vision handoff `[2048,V]` | one physical allocation; `V<=min(max_context,16384)` per item |
 
-Payload estimates exclude allocator alignment and paging metadata; the table separately identifies
-Program scratch and request transient because they are independently frozen allocations.
+Vision encode scratch and its output handoff are logical lifetimes within the one frozen Program
+workspace, not independent allocations.
 The GDN pool always contains exactly the `2C` current/turn-checkpoint slots and is independent of
 the speculative window. Enabling MTP or DFlash adds the separate ReplaySSM arena, which scales with
 `C*(draft_window+1)` rather than full state images. Target full-attention KV, MTP KV, and the final
@@ -801,22 +811,25 @@ last 4095 committed context positions according to its absolute position; a reta
 distance 4096 is outside the mask. These caches do not grow with total context.
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family computes named
-Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains and
-reserves their maximum as one pure scratch arena; sequential phases and scoped child Ops reuse the
-same addresses. DFlash target features and positions survive between target verification and
-proposal/context publication, so their prefill and pending-round buffers live in the Program
-persistent arena rather than shared phase scratch. Pending features do not become committed
-sequence state before the resolve transaction succeeds. Prefill columns use
-`min(prefill_chunk,max_context)`.
+Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains. The one
+workspace preserves a general execution prefix while a Vision item output is live; before that
+output is produced, Vision encode may reuse the complete backing according to checked
+patch/position, attention, MLP, and merger lifetimes. The registered Frontend retains an aggregate
+prompt budget of `min(max_context,32768)` Vision tokens, while the sequential Vision tower and
+`[2048,V]` handoff use the registered single-item bound `V<=min(max_context,16384)`. Multiple items
+reuse the same handoff after the previous scatter span is complete. DFlash target features and
+positions survive between target verification and proposal/context publication, so their prefill
+and pending-round buffers live in the Program persistent arena rather than shared phase scratch.
+Pending features do not become committed sequence state before the resolve transaction succeeds.
+Prefill columns use `min(prefill_chunk,max_context)`.
 
-Vision encoded output uses a separate startup-frozen request-transient allocation and is not
-dynamically grown by a request. A disabled speculative backend has no proposal model state or
-optimized proposal-head view. MTP and DFlash each load the optimized proposal head only when that
-head route is selected; DFlash never loads MTP decoder weights or MTP KV state. With Vision
-disabled, the Program has no Vision weight view, Vision scratch phase, or request-transient
-allocation; media is rejected by the matching Frontend. CUDA Graph driver allowance remains a
-separate budget item. The complete artifact inventory is still validated before these resident
-views are published.
+A disabled speculative backend has no proposal model state or optimized proposal-head view. MTP and
+DFlash each load the optimized proposal head only when that head route is selected; DFlash never
+loads MTP decoder weights or MTP KV state. With Vision disabled, the Program has no Vision weight
+view or Vision-specific workspace extent; media is rejected by the matching Frontend. CUDA Graph
+driver allowance remains a separate budget item. `MemorySummary.vision_workspace` describes
+logical regions inside `MemorySummary.workspace` and is not an additional allocation. The complete
+artifact inventory is still validated before these resident views are published.
 
 ## 17. Base-checkpoint tensor layout
 
@@ -939,21 +952,24 @@ The registered implementation maps these concerns as follows:
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
-| artifact-native diagnostic reference | `tools/reference/qwen3_6_35b_a3b/` |
 
 The registered 35B Public Engine conditionally materializes the DFlash companion when DFlash is the
-selected speculative backend. It runs through the same `.ninfer` Engine route as ordinary and MTP
-generation, is text-only, and is mutually exclusive with Vision and MTP. The family runtime owns
-its persistent state, workspace, proposal execution, context commit, target verification and
-acceptance, and CUDA Graph lifecycle. When DFlash is not selected, its weights and state remain
-nonresident.
+selected speculative backend and independently materializes Vision when Vision is enabled. DFlash
+and Vision may therefore coexist; MTP and DFlash remain mutually exclusive backend selections.
+After Vision embeddings are scattered into the Text input, DFlash captures the same target decoder
+hidden features as it does for a text prompt. Target multimodal prefill retains its three-axis
+MRoPE, DFlash context/proposal attention uses one-dimensional logical token positions, and target
+verification of generated text uses the logical cache position plus the sequence `rope_delta`.
+DFlash runs through the same `.ninfer` Engine route as ordinary and MTP generation. The family
+runtime owns its persistent state, workspace, proposal execution, context commit, target
+verification and acceptance, and CUDA Graph lifecycle. When DFlash is not selected, its weights and
+state remain nonresident. DFlash does not accelerate Vision encode or the target prefill phase.
 
-The Python reference is diagnostic evidence, not a generated-token golden. Each production Op path
-is checked against its independent mathematical oracle; equality between different numerical or
-execution paths is not a runtime acceptance contract.
+Each production Op path is checked against its independent mathematical oracle; equality between
+different numerical or execution paths is not a runtime acceptance contract.
 
-As descriptive provenance for the checkpoint inspected by this reference, the local `config.json`
-SHA-256 is
+As descriptive provenance for the checkpoint used to establish this model contract, the local
+`config.json` SHA-256 is
 `93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99`, and the local
 `model.safetensors.index.json` SHA-256 is
 `41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83`. The index and all shard

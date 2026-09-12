@@ -915,12 +915,12 @@ int main(int argc, char** argv) {
                                         : options.format == Format::W8    ? "w8"
                                                                           : "all";
         std::printf(
-            "# op=gdn_input_proj_conv form=%s format=%s nvfp4_policy=%s fp8_policy=%s gpu=%s sm=%d "
-            "batch=%d execution=%s "
+            "# op=gdn_input_proj_conv form=%s format=%s nvfp4_policy=%s fp8_policy=%s gpu=%s "
+            "compute_capability=%d batch=%d execution=%s "
             "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
             options.form == Form::Both ? "both" : form_name(options.form), configured_format,
             policy_name(options.nvfp4_policy), policy_name(options.fp8_policy), context.props.name,
-            context.sm(), options.batch,
+            context.compute_capability(), options.batch,
             options.execution == Execution::Both ? "both" : execution_name(options.execution),
             static_cast<unsigned long long>(options.flush_bytes >> 20));
 

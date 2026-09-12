@@ -1,7 +1,7 @@
 #pragma once
 
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
-// installed ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
+// public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
 
 #include "ninfer/types.h"
 
@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 11;
+inline constexpr int kSchemaVersion                   = 14;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -25,7 +25,6 @@ inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
-inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
 
@@ -47,7 +46,7 @@ struct BenchTest {
     }
 
     [[nodiscard]] std::uint32_t requested_output_tokens() const;
-    [[nodiscard]] std::uint32_t required_context(std::uint32_t mtp_draft_tokens) const;
+    [[nodiscard]] std::uint32_t required_context(const SpeculativeOptions& speculative) const;
 };
 
 enum class OutputFormat { Table, Json, Csv };
@@ -63,8 +62,7 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
-    std::uint32_t mtp_draft_tokens = 0;
-    ProposalHead proposal_head     = ProposalHead::Full;
+    SpeculativeOptions speculative;
     int device                     = 0;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
@@ -106,8 +104,7 @@ struct BenchEnvironment {
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
-    std::uint32_t mtp_draft_tokens                 = 0;
-    ProposalHead proposal_head                     = ProposalHead::Full;
+    SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
@@ -123,14 +120,14 @@ std::string usage_text(std::string_view program);
 std::vector<BenchTest> expand_tests(const BenchOptions& options);
 std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
                                   std::optional<std::uint32_t> override_max_context,
-                                  std::uint32_t mtp_draft_tokens, bool use_cuda_graph);
+                                  const SpeculativeOptions& speculative, bool use_cuda_graph);
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
-std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens);
-std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens);
-std::uint32_t decode_graph_prime_required_context(std::uint32_t mtp_draft_tokens);
+std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative);
+std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative);
+std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& speculative);
 
 Stats compute_stats(const std::vector<double>& values);
 std::vector<double> prefill_tok_s_series(const TestResult& result);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/math_util.h"
 #include "core/nvtx.h"
 #include "core/transfer_work.h"
 #include "ninfer/types.h"
@@ -244,15 +245,24 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    // attention_pairs = min(max64, prefix*suffix + suffix*(suffix+1)/2), computed with
+    // u128 limbs so the 128-bit sum saturates at max64 exactly as the old __int128 code did.
+    std::uint64_t linear_high = 0;
+    const std::uint64_t linear_low = core::u128_mul(prefix_tokens, suffix_tokens, &linear_high);
+    // One of suffix and suffix+1 is even, so halve before multiplying to stay in 64 bits.
+    // suffix+1 wraps only for suffix == max64 (odd), whose half is 2^63 and must be special-cased.
+    const bool suffix_even          = (suffix_tokens & 1U) == 0U;
+    const std::uint64_t first       = suffix_even ? suffix_tokens / 2U : suffix_tokens;
+    const std::uint64_t second      = suffix_even
+                                          ? suffix_tokens + 1U
+                                          : (suffix_tokens == std::numeric_limits<std::uint64_t>::max()
+                                                 ? (std::numeric_limits<std::uint64_t>::max() >> 1U) + 1U
+                                                 : (suffix_tokens + 1U) / 2U);
+    std::uint64_t triangular_high = 0;
+    const std::uint64_t triangular_low = core::u128_mul(first, second, &triangular_high);
+    const std::uint64_t sum_low  = linear_low + triangular_low;
+    const std::uint64_t sum_high = linear_high + triangular_high + (sum_low < linear_low ? 1U : 0U);
+    result.attention_pairs = sum_high != 0 ? std::numeric_limits<std::uint64_t>::max() : sum_low;
     return result;
 }
 

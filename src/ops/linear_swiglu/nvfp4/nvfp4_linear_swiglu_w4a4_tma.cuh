@@ -46,17 +46,30 @@ template <class Geometry, class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
-        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
-                                                                  float alpha,
-                                                                  __nv_bfloat16* __restrict__ output) {
+        kMinBlocksPerSm)
+#if defined(_MSC_VER)
+// MSVC rejects the over-aligned (alignas(128)) descriptors as a by-value kernel parameter
+// (C2711), so they travel as a device pointer on Windows; other compilers keep the
+// __grid_constant__ by-value parameter. The body dereferences them identically.
+void nvfp4_linear_swiglu_w4a4_tma_kernel(const Nvfp4W4a4TmaDescriptors* descriptors, float alpha,
+                                         __nv_bfloat16* __restrict__ output) {
+#else
+void nvfp4_linear_swiglu_w4a4_tma_kernel(
+    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+    __nv_bfloat16* __restrict__ output) {
+#endif
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert(Schedule::kBlockN == 128);
     static_assert(Schedule::kWarpsN == 2);
     static_assert(Schedule::kMmaN == 8);
+
+#if defined(_MSC_VER)
+    const Nvfp4W4a4TmaDescriptors& tma = *descriptors;
+#else
+    const Nvfp4W4a4TmaDescriptors& tma = descriptors;
+#endif
 
     constexpr int kIntermediate = Geometry::kOutputRows / 2;
     constexpr int kPairN        = Schedule::kBlockN / 2;
@@ -109,17 +122,17 @@ __global__ __launch_bounds__(
                                                           : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &tma.a_codes,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                nvfp4_tma_load_2d(tensors.b_codes[stage], &tma.b_codes,
                                   k_tile * Schedule::kCodeRowBytes, pair_begin,
                                   &shared.full[stage]);
                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
-                                  &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                  &tma.b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales,
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &tma.a_scales,
                                       (k_tile / 2) * 16, token_begin, &shared.full[stage]);
                 }
 
@@ -130,9 +143,9 @@ __global__ __launch_bounds__(
                     (((pair_begin + kIntermediate) / 128) * Geometry::kScaleTilesPerRow +
                      k_tile * Schedule::kK64PerStage) *
                     32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &tma.b_scales, 0,
                                   gate_scale_row, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &tma.b_scales, 0,
                                   up_scale_row, &shared.full[stage]);
             }
         }

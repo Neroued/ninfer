@@ -9,6 +9,12 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+// Emit UTF-8 bytes to the console regardless of the legacy ANSI code page. The
+// activeCodePage=UTF-8 manifest fixes argv input; this fixes console display.
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -163,7 +169,12 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
+#ifdef _WIN32
+    // gmtime_s swaps argument order relative to POSIX gmtime_r.
+    gmtime_s(&utc, &now);
+#else
     gmtime_r(&now, &utc);
+#endif
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();
@@ -432,6 +443,18 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 }
 
 } // namespace
+
+#ifdef _WIN32
+namespace {
+struct ConsoleUtf8Setup {
+    ConsoleUtf8Setup() {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+};
+const ConsoleUtf8Setup console_utf8_setup;
+} // namespace
+#endif
 
 int main(int argc, char** argv) {
     Options options;

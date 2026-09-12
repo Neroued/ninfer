@@ -22,7 +22,7 @@ tokenizer, chat template, and media frontend resources required by its registere
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
+NInfer requires 64-bit Linux (or Windows), an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
 newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
 `libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
@@ -36,6 +36,27 @@ cd ninfer
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+On Windows, dependencies (FFmpeg and libcurl with Schannel TLS) are managed with
+[vcpkg](https://vcpkg.io) in manifest mode — no GStreamer runtime or prebuilt curl
+packages are needed:
+
+```powershell
+git clone https://github.com/Neroued/ninfer.git
+cd ninfer
+
+# One-time setup (or use an existing vcpkg installation)
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg && .\bootstrap-vcpkg.bat && cd ..
+$env:VCPKG_ROOT = "$PWD\vcpkg"
+
+# Configure through the vcpkg toolchain; dependencies install automatically
+cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_BUILD_TYPE=Release
+cmake --build build-win -j
+```
+
+On first configuration vcpkg compiles FFmpeg and curl from source (about 15 minutes);
+subsequent configurations restore them from the local binary cache in seconds.
 
 Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
 target or packaged binary distribution; run NInfer from its source build tree.

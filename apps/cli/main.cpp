@@ -17,6 +17,13 @@
 
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+// Emit UTF-8 bytes to the console regardless of the legacy ANSI code page (e.g.
+// 936/GBK). The activeCodePage=UTF-8 manifest fixes argv input; this fixes display
+// of UTF-8 output on code-page-936 consoles. Redirected pipes keep raw UTF-8 bytes.
+#include <windows.h>
+#endif
+
 namespace {
 
 std::string format_seconds(double seconds) {
@@ -227,6 +234,20 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 }
 
 } // namespace
+
+#ifdef _WIN32
+namespace {
+// Set once before any output; harmless when stdout is redirected (it only affects
+// how the attached console decodes the byte stream).
+struct ConsoleUtf8Setup {
+    ConsoleUtf8Setup() {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+};
+const ConsoleUtf8Setup console_utf8_setup;
+} // namespace
+#endif
 
 int main(int argc, char** argv) {
     ninfer::cli::Options cli;

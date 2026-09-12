@@ -275,6 +275,51 @@ void test_schema_validation() {
         "empty machine cost entry was accepted");
 }
 
+void test_weights_fallback() {
+    // A registered model with no row of its own resolves to the row of another model in the same
+    // weight format, and an unregistered format still reaches the generic profile.
+    constexpr const char* kMachine = "nvidia-geforce-rtx-5090-sm120";
+    const auto resolve             = [](std::string model, std::string weights) {
+        return ninfer::runtime::resolve_context_machine_cost(ninfer::runtime::ContextCostIdentity{
+                        .hardware_class = kMachine,
+                        .model_id       = std::move(model),
+                        .weights_id     = std::move(weights),
+        });
+    };
+
+    const auto nvfp4_row      = resolve("qwen3.8-27b", "nvfp4");
+    const auto int_row        = resolve("qwen3.6-27b", "groupwise-int");
+    const auto fallback       = resolve("qwen3.6-27b", "nvfp4");
+    const auto unknown_format = resolve("qwen3.6-27b", "unmeasured-weights");
+
+    expect(nvfp4_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+               int_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+               !(nvfp4_row.model.prefill == int_row.model.prefill),
+           "the two compiled rows this test compares are not distinguishable");
+
+    expect(fallback.model.prefill == nvfp4_row.model.prefill &&
+               fallback.summary.prefill_source ==
+                   ninfer::ContextCostPresetSource::CompiledWeightsFallback,
+           "a model with no row of its own did not take the coefficients of the same weights "
+           "format");
+
+    expect(!(fallback.model.prefill == int_row.model.prefill),
+           "the weights fallback picked a row of a different weight format");
+
+    // Precedence is asserted through the source rather than through the coefficients. No weight
+    // format carries two compiled rows, so both lookups return the same row and comparing costs
+    // could not tell them apart; the reported source can, and it moves the moment the fallback is
+    // consulted first.
+    expect(nvfp4_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault &&
+               int_row.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault,
+           "an exact (model, weights) row no longer wins over the same-weights fallback");
+
+    expect(unknown_format.summary.prefill_source ==
+                   ninfer::ContextCostPresetSource::GenericDefault &&
+               !(unknown_format.model.prefill == nvfp4_row.model.prefill),
+           "an unregistered weight format must still fall through to the generic profile");
+}
+
 void test_resolution_and_atomic_upserts() {
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() /
@@ -363,6 +408,7 @@ int main() {
     test_exact_evaluation();
     test_kv_physical_work();
     test_schema_validation();
+    test_weights_fallback();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -965,6 +965,10 @@ struct RuntimeStats {
 enum class ContextCostPresetSource : std::uint8_t {
     GenericDefault,
     CompiledDefault,
+    // Compiled coefficients measured for another model in the same weight format, not for this
+    // one. Reported apart from CompiledDefault so a reader can tell a borrowed profile from a
+    // measured one.
+    CompiledWeightsFallback,
     External,
 };
 
@@ -975,6 +979,8 @@ context_cost_preset_source_name(ContextCostPresetSource source) noexcept {
         return "generic-default";
     case ContextCostPresetSource::CompiledDefault:
         return "compiled-default";
+    case ContextCostPresetSource::CompiledWeightsFallback:
+        return "compiled-weights-fallback";
     case ContextCostPresetSource::External:
         return "external";
     }

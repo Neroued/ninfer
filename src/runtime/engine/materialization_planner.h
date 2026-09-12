@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/math_util.h"
 #include "runtime/engine/context_cost.h"
 #include "runtime/engine/context_portfolio_value.h"
 #include "runtime/engine/materialization_budget.h"
@@ -924,9 +925,11 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
-            if (left != right) { return left < right; }
+            std::uint64_t left_high = 0, right_high = 0;
+            const auto left_low = core::u128_mul(delta(cost), b, &left_high);
+            const auto right_low = core::u128_mul(delta(prior), a, &right_high);
+            if (left_high != right_high) { return left_high < right_high; }
+            if (left_low != right_low) { return left_low < right_low; }
         }
         return cost.key() < prior.key();
     }

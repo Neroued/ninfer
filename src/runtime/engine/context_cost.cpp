@@ -1,5 +1,7 @@
 #include "runtime/engine/context_cost.h"
 
+#include "core/math_util.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -12,7 +14,12 @@
 #include <system_error>
 #include <utility>
 
+#if defined(_WIN32)
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -23,7 +30,6 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -36,18 +42,23 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
+    return core::saturating_u64_mul(left, right);
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+    std::uint64_t high = 0;
+    const std::uint64_t low = core::u128_mul(coefficient, units, &high);
+    // product >= (max64 << 32) saturates.
+    constexpr std::uint64_t kHighLimit  = std::numeric_limits<std::uint32_t>::max();
+    constexpr std::uint64_t kLowLimit   = std::numeric_limits<std::uint64_t>::max() << 32U;
+    if (high > kHighLimit || (high == kHighLimit && low >= kLowLimit)) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    // (product + kContextCostQ32One - 1U) >> 32U computed limb-wise.
+    const std::uint64_t low_plus = low + (kContextCostQ32One - 1U);
+    const std::uint64_t carry    = low_plus < low ? 1ULL : 0ULL;
+    return ((high + carry) << 32U) | (low_plus >> 32U);
 }
 
 void require_object(const Json& value, std::string_view context) {

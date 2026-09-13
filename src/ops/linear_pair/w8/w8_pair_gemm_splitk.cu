@@ -74,10 +74,20 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     const W8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
     const W8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
+    constexpr std::size_t kDynamicBytes =
+        w8_small_t_mma_dynamic_bytes<Schedule, false, ActiveCols>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                                  W8PairExactTEpilogue, W8PairExactTRows>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput, W8PairExactTEpilogue,
-                          W8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
-        W8PairExactTRows{});
+                          W8PairExactTRows>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, kDynamicBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored,
+            epilogue, W8PairExactTRows{});
 }
 
 template <std::size_t... Offsets>
@@ -101,8 +111,17 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
     }
     const PairOutput output{static_cast<__nv_bfloat16*>(first_out.data),
                             static_cast<__nv_bfloat16*>(second_out.data)};
+    constexpr std::size_t kDynamicBytes =
+        w8_rowsplit_medium_t_splitk_dynamic_bytes<KSplits, TileCols, NGroups>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_rowsplit_medium_t_splitk_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks,
+                                              PairOutput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     w8_rowsplit_medium_t_splitk_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
+        <<<(2 * kRows) / 16, KSplits * NGroups * 32, kDynamicBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
 }
 

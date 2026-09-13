@@ -67,6 +67,17 @@ struct Nvfp4W4a4SharedStorage {
         std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
 };
 
+// Toolchains before CUDA 13 cap statically allocated shared memory at 48 KiB. An instantiation whose
+// staged storage exceeds that cap stages it in dynamic shared memory, so every launch site requests
+// the size reported here and raises the block limit before launching.
+inline constexpr std::size_t kNvfp4W4a4StaticSharedBytes = 48 * 1024;
+
+template <class Schedule>
+__host__ __device__ constexpr std::size_t nvfp4_w4a4_mma_dynamic_bytes() {
+    constexpr std::size_t kStorageBytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
+    return kStorageBytes > kNvfp4W4a4StaticSharedBytes ? kStorageBytes : 0;
+}
+
 template <class Schedule>
 __device__ __forceinline__ int nvfp4_w4a4_swizzled_byte(int row, int logical_byte) {
     static_assert((Schedule::kSegmentsPerRow & (Schedule::kSegmentsPerRow - 1)) == 0);
@@ -213,7 +224,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    constexpr std::size_t kDynamicBytes = nvfp4_w4a4_mma_dynamic_bytes<Schedule>();
+    constexpr bool kDynamicShared       = kDynamicBytes != 0;
+    __shared__ __align__(16) unsigned char
+        static_shared[kDynamicShared ? 1 : sizeof(Nvfp4W4a4SharedStorage<Schedule>)];
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(
+        kDynamicShared ? dynamic_shared : static_shared);
     const int token_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
     const int row_begin         = static_cast<int>(blockIdx.x) * kRowsPerBlock;

@@ -40,12 +40,13 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     using Geometry            = W8LinearGeometry<kRows, InputRows>;
     using Schedule            = W8SmallTMmaSchedule<Warps, TileColumns, Warps == 8 ? 2 : 3,
                                                     W8SmallTMmaScaleAccess::Shared, Activation>;
-    constexpr int SharedBytes = TileColumns > 64 ? sizeof(W8SmallTMmaSharedStorage<Schedule>) : 0;
-    if constexpr (SharedBytes > 0) {
+    constexpr std::size_t kDynamicBytes =
+        w8_small_t_mma_dynamic_bytes<Schedule, true, TileColumns>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
         static const cudaError_t attribute = cudaFuncSetAttribute(
             w8_small_t_mma_kernel<Geometry, TileColumns, Schedule, W8ContiguousOutput,
                                   W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
         CUDA_CHECK(attribute);
     }
     const int columns = x.ne[1];
@@ -53,7 +54,7 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     const dim3 grid(kRows / 16, (columns + TileColumns - 1) / TileColumns);
     w8_small_t_mma_kernel<Geometry, TileColumns, Schedule, W8ContiguousOutput,
                           W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
-        <<<grid, Schedule::kThreads, SharedBytes, stream>>>(
+        <<<grid, Schedule::kThreads, kDynamicBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},

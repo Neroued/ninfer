@@ -71,11 +71,20 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4SwiGluRows row_policy{};
     const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    constexpr std::size_t kDynamicBytes = nvfp4_w4a4_mma_dynamic_bytes<Schedule>();
+    if constexpr (kDynamicBytes > kNvfp4W4a4StaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
+                                  Nvfp4SwiGluRows, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads, 0, stream>>>(
-        activation, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-        output, row_policy);
+                          Nvfp4SwiGluRows, true>
+        <<<grid, Schedule::kThreads, kDynamicBytes, stream>>>(
+            activation, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+            Nvfp4IdentityEpilogue{}, output, row_policy);
     CUDA_CHECK(cudaGetLastError());
 }
 

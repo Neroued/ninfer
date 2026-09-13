@@ -10,6 +10,7 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
+#include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -62,6 +63,23 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+// Staged activations, weight codes and scales for one row-split MMA tile. The layout matches the
+// separate shared arrays this core used while the staged storage fits the static cap; both the
+// kernel and its launch sites size it through the helper below.
+template <class Cfg>
+struct W8RowSplitMmaGemmSharedStorage {
+    alignas(16) __nv_bfloat16 As[Cfg::BM * Cfg::BK];
+    alignas(16) __nv_bfloat16 Bs[Cfg::ACTIVATION_STAGES][Cfg::BN * Cfg::BK];
+    alignas(16) std::uint8_t Cr[Cfg::BM * Cfg::BK];
+    alignas(16) std::uint8_t Sr[Cfg::BM * Cfg::SCALE_CACHE_BYTES];
+};
+
+template <class Cfg>
+__host__ __device__ constexpr std::size_t w8_rowsplit_gemm_mma_dynamic_bytes() {
+    constexpr std::size_t kStorageBytes = sizeof(W8RowSplitMmaGemmSharedStorage<Cfg>);
+    return kStorageBytes > kW8SmallTMmaStaticSharedBytes ? kStorageBytes : 0;
+}
+
 template <class Cfg, bool Full, W8Epilogue Epilogue = W8Epilogue::Store,
           class Output = W8ContiguousOutput>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
@@ -82,10 +100,17 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
                   "SwiGLU supports warp-local or shared-memory row pairing");
 
-    __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::ACTIVATION_STAGES][BN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[BM * BK];
-    __shared__ __align__(16) std::uint8_t Sr[BM * Cfg::SCALE_CACHE_BYTES];
+    using SharedStorage = W8RowSplitMmaGemmSharedStorage<Cfg>;
+    constexpr std::size_t kStorageBytes = sizeof(SharedStorage);
+    constexpr bool kDynamicShared = kStorageBytes > kW8SmallTMmaStaticSharedBytes;
+    __shared__ __align__(16) unsigned char static_shared[kDynamicShared ? 1 : kStorageBytes];
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
+    auto& As = shared.As;
+    auto& Bs = shared.Bs;
+    auto& Cr = shared.Cr;
+    auto& Sr = shared.Sr;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;

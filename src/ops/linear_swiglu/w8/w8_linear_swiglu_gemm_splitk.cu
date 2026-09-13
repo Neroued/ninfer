@@ -37,9 +37,19 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
     const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluDirectEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const RowPolicy row_policy{};
+    constexpr std::size_t kDynamicBytes =
+        w8_small_t_mma_dynamic_bytes<Schedule, false, ActiveCols>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                                  W8SwiGluDirectEpilogue, RowPolicy, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
                           W8SwiGluDirectEpilogue, RowPolicy, true>
-        <<<kIntermediate / RowPolicy::kOutputRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<kIntermediate / RowPolicy::kOutputRowsPerCta, Schedule::kThreads, kDynamicBytes,
+           stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
 }

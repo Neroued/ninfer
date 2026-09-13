@@ -13,6 +13,27 @@
 
 namespace ninfer::ops::detail {
 
+// Staged weight codes and activations for one medium-T split-K tile. The layout matches the separate
+// shared arrays this core used while the staged storage fits the static cap; both the kernel and its
+// launch sites size it through the helper below.
+template <int KSplits, int TileCols, int NGroups>
+struct W8RowSplitMediumTSplitKSharedStorage {
+    static constexpr int kTileK    = 64;
+    static constexpr int kMmaRows  = 16;
+    static constexpr int kGroupK   = KSplits * kTileK;
+    static constexpr int kWarpCols = TileCols / NGroups;
+
+    alignas(16) std::uint8_t code_shared[kMmaRows][kGroupK];
+    alignas(16) __nv_bfloat16 b_shared[KSplits * NGroups][kWarpCols * kTileK];
+};
+
+template <int KSplits, int TileCols, int NGroups>
+__host__ __device__ constexpr std::size_t w8_rowsplit_medium_t_splitk_dynamic_bytes() {
+    constexpr std::size_t kStorageBytes =
+        sizeof(W8RowSplitMediumTSplitKSharedStorage<KSplits, TileCols, NGroups>);
+    return kStorageBytes > kW8SmallTMmaStaticSharedBytes ? kStorageBytes : 0;
+}
+
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
           bool AddResidual = false>
 __global__
@@ -32,8 +53,15 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    using SharedStorage = W8RowSplitMediumTSplitKSharedStorage<KSplits, TileCols, NGroups>;
+    constexpr std::size_t kStorageBytes = sizeof(SharedStorage);
+    constexpr bool kDynamicShared = kStorageBytes > kW8SmallTMmaStaticSharedBytes;
+    __shared__ __align__(16) unsigned char static_shared[kDynamicShared ? 1 : kStorageBytes];
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
+    auto& code_shared = shared.code_shared;
+    auto& b_shared    = shared.b_shared;
 
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;

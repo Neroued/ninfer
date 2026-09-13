@@ -2,9 +2,15 @@
 
 #include "ops/common/memory.cuh"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// Toolchains before CUDA 13 cap statically allocated shared memory at 48 KiB. A W8 kernel whose
+// staged storage exceeds that cap stages it in dynamic shared memory instead: the kernel and every
+// launch site size it through the matching dynamic-bytes helper.
+inline constexpr std::size_t kW8SmallTMmaStaticSharedBytes = 48 * 1024;
 
 enum class W8SmallTMmaScaleAccess : std::uint8_t {
     Direct,

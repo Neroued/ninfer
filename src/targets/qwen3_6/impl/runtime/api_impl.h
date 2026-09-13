@@ -166,11 +166,33 @@ PressurePlanningSession<Variant>::root_maximal_target(runtime::PlanningCandidate
 }
 
 template <>
-std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_closure_target(
-    runtime::PlanningCandidateId candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
-    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->guided_closure_target(candidate, preferred_owner_ids);
+PressureTargetHandle
+PressurePlanningSession<Variant>::maximal_target(runtime::PlanningCandidateId candidate) {
+    return impl_->maximal_target(candidate);
+}
+
+template <>
+PressureConstructionCursor
+PressurePlanningSession<Variant>::begin_construction(PressureTargetHandle target, bool restore) {
+    return impl_->begin_construction(target, restore);
+}
+
+template <>
+runtime::PressureConstructionStep
+PressurePlanningSession<Variant>::next_construction_option(PressureConstructionCursor& cursor) {
+    return impl_->next_construction_option(cursor);
+}
+
+template <>
+void PressurePlanningSession<Variant>::choose_construction(
+    PressureConstructionCursor& cursor, runtime::PressureConstructionOptionId option) {
+    impl_->choose_construction(cursor, option);
+}
+
+template <>
+std::optional<PressureTargetHandle>
+PressurePlanningSession<Variant>::construction_target(const PressureConstructionCursor& cursor) {
+    return impl_->construction_target(cursor);
 }
 
 template <>
@@ -189,9 +211,10 @@ PressurePlanningSession<Variant>::assess(PressureTargetHandle target) {
 
 template <>
 PreparedPressureExpansion<Variant>
-PressurePlanningSession<Variant>::prepare_expansion(PressureTargetHandle parent) {
+PressurePlanningSession<Variant>::prepare_expansion(PressureTargetHandle parent,
+                                                    std::uint32_t maximum_owners) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->prepare_expansion(parent);
+    return impl_->prepare_expansion(parent, maximum_owners);
 }
 
 template <>

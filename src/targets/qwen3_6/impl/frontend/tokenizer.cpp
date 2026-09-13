@@ -322,12 +322,15 @@ std::uint64_t merge_pair_key(int left, int right) noexcept {
            static_cast<std::uint32_t>(right);
 }
 
-std::unordered_map<std::uint64_t, BpeMergeRule>
-load_bpe_merge_rules(const Json& model, std::string_view label,
-                     const std::unordered_map<std::string, int>& token_to_id) {
+BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
+                                   const std::unordered_map<std::string, int>& token_to_id) {
     const Json& merges = require_array_field(model, "merges", label);
-    std::unordered_map<std::uint64_t, BpeMergeRule> rules;
-    rules.reserve(merges.size());
+    BpeMergeTable rules;
+    rules.reset(merges.size());
+    // Rank order matters here and is not incidental: linear probing lets the first claimant keep
+    // a slot, and a low rank is a merge the encoder performs often, so walking model.merges in
+    // order hands the frequent rules their home slot. Filling the table out of an unordered
+    // container instead is measurably slower.
     int rank = 0;
     for (const Json& item : merges) {
         std::string left;
@@ -357,9 +360,9 @@ load_bpe_merge_rules(const Json& model, std::string_view label,
             throw std::invalid_argument("model.merges references a symbol outside model.vocab in " +
                                         std::string(label));
         }
-        const auto [_, inserted] =
-            rules.emplace(merge_pair_key(left_id->second, right_id->second),
-                          BpeMergeRule{.rank = rank++, .result = result_id->second});
+        const bool inserted =
+            rules.insert(merge_pair_key(left_id->second, right_id->second),
+                         BpeMergeRule{.rank = rank++, .result = result_id->second});
         if (!inserted) { throw std::invalid_argument("duplicate merge pair in model.merges"); }
     }
     return rules;
@@ -546,7 +549,7 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
 }
 
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
-                               const std::unordered_map<std::uint64_t, BpeMergeRule>& merge_rules,
+                               const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                std::vector<std::size_t>* token_ends = nullptr,
                                std::vector<BpeWordEnd>* word_ends   = nullptr) {
@@ -576,15 +579,15 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
             if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) { return; }
             const int right = nodes[static_cast<std::size_t>(left)].next;
             if (right < 0) { return; }
-            const auto rule =
+            const BpeMergeEntry* rule =
                 merge_rules.find(merge_pair_key(nodes[static_cast<std::size_t>(left)].symbol,
                                                 nodes[static_cast<std::size_t>(right)].symbol));
-            if (rule == merge_rules.end()) { return; }
+            if (rule == nullptr) { return; }
             queue.push(BpeCandidate{
-                .rank             = rule->second.rank,
+                .rank             = rule->rank,
                 .left             = left,
                 .right            = right,
-                .result           = rule->second.result,
+                .result           = rule->result,
                 .left_generation  = nodes[static_cast<std::size_t>(left)].generation,
                 .right_generation = nodes[static_cast<std::size_t>(right)].generation,
             });
@@ -638,7 +641,7 @@ struct IndexedByteBoundary {
 
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
-                          const std::unordered_map<std::uint64_t, BpeMergeRule>& merge_rules,
+                          const BpeMergeTable& merge_rules,
                           const std::array<int, 256>& byte_token_ids, std::size_t max_tokens) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {

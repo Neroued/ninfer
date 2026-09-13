@@ -1230,7 +1230,7 @@ private:
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
-                                 std::uint32_t backend_tokens = 0);
+                                   std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
@@ -1280,8 +1280,9 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         std::uint32_t victim_choice_offset = 0;
         std::uint32_t victim_choice_count  = 0;
         std::optional<detail::PhysicalResources> assessed_residual;
-        std::uint32_t stable_ordinal = 0;
-        bool root_maximal            = false;
+        std::uint32_t next_expansion_owner = 0;
+        std::uint32_t stable_ordinal       = 0;
+        bool root_maximal                  = false;
     };
 
     struct CandidateVictimOptions {
@@ -1310,6 +1311,25 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         bool leased              = false;
     };
 
+    struct ConstructionOption {
+        std::size_t victim = 0;
+        PressureDecision decision;
+        bool identity = false;
+    };
+
+    struct ConstructionSlot {
+        std::vector<std::uint16_t> choices;
+        std::vector<ConstructionOption> options;
+        std::size_t next_owner        = 0;
+        std::size_t next_option       = 0;
+        std::uint32_t candidate_index = 0;
+        std::uint32_t generation      = 0;
+        std::uint32_t scan_generation = 1;
+        detail::PhysicalResources residual;
+        bool restore = false;
+        bool leased  = false;
+    };
+
     PressurePlanningSessionImpl(
         Core& owner, std::span<const PhysicalCandidateBinding> physical_candidates,
         std::span<const runtime::PlanningCandidateId> admission_candidate_ids,
@@ -1323,14 +1343,33 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_6::PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    [[nodiscard]] qwen3_6::PressureTargetHandle
+    maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] qwen3_6::PressureConstructionCursor
+    begin_construction(qwen3_6::PressureTargetHandle target, bool restore = false);
+    [[nodiscard]] runtime::PressureConstructionStep
+    next_construction_option(qwen3_6::PressureConstructionCursor& cursor);
+    void choose_construction(qwen3_6::PressureConstructionCursor& cursor,
+                             runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
-    guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    construction_target(const qwen3_6::PressureConstructionCursor& cursor);
+    [[nodiscard]] ConstructionSlot&
+    construction_slot(const qwen3_6::PressureConstructionCursor& cursor);
+    static void release_construction(const void*, std::uint32_t, std::uint32_t) noexcept;
+    [[nodiscard]] runtime::PressureTargetGuidance
+    guidance_choices(std::uint32_t candidate_index, std::span<const std::uint16_t> choices,
+                     std::uint32_t ordinal,
+                     std::optional<std::size_t> override_owner = std::nullopt,
+                     const PressureDecision* override_decision = nullptr);
+    [[nodiscard]] detail::PhysicalResources
+    construction_residual(std::uint32_t candidate_index,
+                          std::span<const std::uint16_t> choices) const;
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>
-    prepare_expansion(qwen3_6::PressureTargetHandle parent);
+    prepare_expansion(qwen3_6::PressureTargetHandle parent,
+                      std::uint32_t maximum_owners = std::numeric_limits<std::uint32_t>::max());
     [[nodiscard]] qwen3_6::PressureExpansionView
     commit_expansion(qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>&& prepared);
     void discard_expansion(
@@ -1401,8 +1440,13 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     std::vector<runtime::CheckpointRecoveryAlternativeWork> assessment_recovery_alternatives;
     typename Core::PressureRecoveryScratch recovery_scratch;
     std::vector<runtime::PressureOwnerOutcome> guidance_outcomes;
+    std::vector<runtime::PressureCheckpointOutcome> guidance_checkpoint_changes;
+    std::vector<runtime::PressureOwnerRecoveryGuidance> guidance_recovery;
+    std::array<ConstructionSlot, 4> construction_slots;
+    std::uint32_t construction_generation = 0;
     std::array<AssessmentSlot, 2> assessment_slots;
     std::uint32_t prepared_new_count = 0;
+    std::uint32_t prepared_owner_end = 0;
     std::size_t scratch_choice_mark  = 0;
     bool scratch_live                = false;
 };

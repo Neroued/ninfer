@@ -92,7 +92,9 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     const std::int32_t max_route_jobs = assignments / 32 + 256;
     out.route_job_experts             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
-    out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
+    // [0] is the job count, negative when the scan hands the extent to the decode path;
+    // [1] is how many experts the route touched, which picks the gate/up pipeline depth.
+    out.route_job_count = arena.alloc(DType::I32, {2}, 256);
 
     out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});

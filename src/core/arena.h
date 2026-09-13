@@ -28,6 +28,8 @@ public:
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
     void fill(int byte_value = 0);
+    // Completes the upload before returning. Callers must first order any prior device
+    // accesses to the destination range.
     void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const;
 

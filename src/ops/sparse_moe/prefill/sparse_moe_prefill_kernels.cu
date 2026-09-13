@@ -215,6 +215,7 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         scan[expert] += add;
         __syncthreads();
     }
+    const int touched   = __syncthreads_count(count > 0);
     const int job_begin = expert == 0 ? 0 : scan[expert - 1];
     const int jobs      = (count + job_bn - 1) / job_bn;
     for (int job = 0; job < jobs; ++job) {
@@ -224,7 +225,8 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
     if (expert == kExperts - 1) {
         const int jobs = scan[expert];
         // Above 3.5 grouped jobs per token, fixed token work wins by avoiding sparse expert tiles.
-        *route_job_count = adaptive && jobs * 2 > 7 * tokens ? -jobs : jobs;
+        route_job_count[0] = adaptive && jobs * 2 > 7 * tokens ? -jobs : jobs;
+        route_job_count[1] = touched;
     }
 }
 
@@ -274,23 +276,57 @@ sparse_moe_prefill_index_kernel(const int* __restrict__ ids, const int* __restri
     packed_token[packed]     = token;
 }
 
-constexpr int kExpertBM                = 64;
-constexpr int kExpertBN                = 64;
-constexpr int kExpertBK                = 64;
-constexpr int kExpertStages            = 2;
-constexpr int kExpertWarps             = 8;
-constexpr int kExpertThreads           = 32 * kExpertWarps;
-constexpr int kRtx5090SmCount          = 170;
-constexpr int kPrefillBlocksPerSm      = 3;
-constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
+constexpr int kExpertBM     = 64;
+constexpr int kExpertBN     = 64;
+constexpr int kExpertBK     = 64;
+constexpr int kExpertStages = 2;
+// The narrow routed gate/up walks 32 k-tiles per job and stages a 32-column B tile, so six
+// stages still fit the 48 KiB static shared limit (49 152 B exactly). The routed down walks
+// 8 tiles and the wide plan stages 64 columns; neither has room or reason for more, so both
+// keep the two-stage default.
+constexpr int kGateUpNarrowStages = 6;
+constexpr int kExpertWarps        = 8;
+constexpr int kExpertThreads      = 32 * kExpertWarps;
+constexpr int kRtx5090SmCount     = 170;
+// Upper bound on the persistent grid. The routed GEMMs stride their work list by gridDim.x,
+// so any grid is correct; this caps the launch when the work list is long.
+constexpr int kPrefillMaxBlocksPerSm = 32;
+constexpr int kPrefillMaxBlocks      = kPrefillMaxBlocksPerSm * kRtx5090SmCount;
 
-template <int ExpertWarps, int ExpertBN>
+// The narrow routed gate/up ships in both depths and the route picks one. A job is one nonempty
+// column tile of one expert, so more than one job per touched expert means an expert's rows
+// outgrow a tile and its neighbouring jobs re-read the weights it already pulled in. Those reads
+// hit L2, there is no latency left to hide, and the deep pipeline is left paying its 24 KiB of
+// extra shared memory, which cuts the blocks resident on an SM from three to two. Both counts
+// are built on the device by the scan, so the choice is made there: both shapes are launched
+// over the same work list and each leaves at once unless the route picked it. The adaptive path
+// below already dispatches off this same counter.
+enum class GateUpRoute { Any, Spread, Packed };
+// Where the two depths swap is measured, and it is measured on the server rather than on the
+// operator fixture, because the two disagree by about six times. A round-robin fixture that
+// walks the ratio continuously from 1.0 to 2.0 puts the crossing at 1.56 to 1.58 with a warm
+// L2 and at 1.68 to 1.95 with a cold one, over expert counts 64, 96, 128 and 176. The server
+// sits on the cold side: sweeping the threshold through the product at 1.5, 1.5625, 1.625,
+// 1.75 and 2.0, prefill is fastest at 7/4, and the two warm-cache candidates are the worst of
+// the five. Against 2/1 the move is worth 0.10 to 0.17 points of server prefill on prompts below
+// the wide-plan bound, over two four-pass runs, against +0.01 to +0.02 above it, which is the
+// null control the same runs carry.
+constexpr int kGateUpDeepJobsNum = 7;
+constexpr int kGateUpDeepJobsDen = 4;
+
+template <int ExpertWarps, int ExpertBN, int Stages = kExpertStages,
+          GateUpRoute Route = GateUpRoute::Any>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
     const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ activation) {
+    if constexpr (Route != GateUpRoute::Any) {
+        const bool spread =
+            route_job_count[0] * kGateUpDeepJobsDen < kGateUpDeepJobsNum * route_job_count[1];
+        if (spread != (Route == GateUpRoute::Spread)) { return; }
+    }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = kHidden / 64;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
@@ -301,8 +337,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     static_assert(StageIters * ExpertThreads == ExpertBN * StageChunks,
                   "the staging loop is unrolled, so every thread must take the same column count");
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
-    __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * 32];
+    __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Cr[Stages][kExpertBM * 32];
     __shared__ __align__(16) std::uint8_t Sr[kExpertBM * GroupsPerRow * 2];
 
     const int tid  = static_cast<int>(threadIdx.x);
@@ -401,15 +437,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         stage_scales();
         cp_commit();
 #pragma unroll
-        for (int stage = 0; stage < kExpertStages; ++stage) {
+        for (int stage = 0; stage < Stages; ++stage) {
             stage_inputs(stage, stage);
             cp_commit();
         }
 
 #pragma unroll 1
         for (int kt = 0; kt < kHidden / kExpertBK; ++kt) {
-            const int stage = kt & 1;
-            cp_wait<kExpertStages - 1>();
+            const int stage = kt % Stages;
+            cp_wait<Stages - 1>();
             __syncthreads();
             decode_weight(stage);
             __syncthreads();
@@ -469,7 +505,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             }
 
             __syncthreads();
-            const int next = kt + kExpertStages;
+            const int next = kt + Stages;
             if (next < kHidden / kExpertBK) { stage_inputs(stage, next); }
             cp_commit();
         }
@@ -1203,6 +1239,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
         const int route_job_bn = wide_plan ? 64 : 32;
+        // The scan emits one route job per nonempty column tile of an expert, so it cannot
+        // emit more than one job per full tile of assignments plus one tail per expert --
+        // the same bound the workspace is sized by. Each job expands into row blocks, and
+        // sizing the grid from that product keeps a persistent block on one work item while
+        // there are fewer work items than the cap, instead of a fixed count that has to
+        // iterate. The exact job count only exists on the device.
+        const int max_route_jobs     = assignments / route_job_bn + kExperts;
+        const int routed_gate_work   = max_route_jobs * (kIntermediate / (kExpertBM / 2));
+        const int routed_down_work   = max_route_jobs * (kHidden / kExpertBM);
+        const int routed_gate_blocks = std::min(routed_gate_work, kPrefillMaxBlocks);
+        const int routed_down_blocks = std::min(routed_down_work, kPrefillMaxBlocks);
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive);
@@ -1237,12 +1284,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         if (routed_gate_up_q4) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
-                sparse_moe_prefill_q4_gate_up_kernel<4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kExpertStages, GateUpRoute::Packed>
+                    <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
+                        input, packed_token, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kGateUpNarrowStages,
+                                                     GateUpRoute::Spread>
+                    <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
             }
@@ -1276,13 +1328,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
@@ -1291,13 +1343,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);

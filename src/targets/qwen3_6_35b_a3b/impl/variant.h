@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
+#include "ninfer/ops/sparse_moe.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -26,6 +27,16 @@ struct Variant {
     using MtpPostMixerWeights            = detail::SparseMoePayload;
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
+
+    static ::ninfer::ops::SparseMoeHints
+    projection_prefetch_hints(const FullAttentionProjectionWeights& weights) {
+        return {weights.query_key_gate_value.qdata, std::size_t{9216} * 2048};
+    }
+
+    static ::ninfer::ops::SparseMoeHints
+    projection_prefetch_hints(const GdnProjectionWeights& weights) {
+        return {weights.query_key_value_z.qdata, std::size_t{12288} * 2048};
+    }
 
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
@@ -86,8 +97,8 @@ struct Variant {
                                             WorkspaceArena& workspace,
                                             DeviceExecutionView execution);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                           qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream);
+                           qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
+                           WorkspaceArena& workspace, cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

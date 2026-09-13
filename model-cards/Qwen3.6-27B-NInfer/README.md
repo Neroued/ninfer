@@ -176,7 +176,7 @@ INT8 group-64 KV, CUDA Graphs, a 16,384-token per-request context limit, and pre
 Aggregate throughput includes only complete one-second intervals whose actual decode batch remains
 equal to C. Each row is one sustained wave.
 
-| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+| C | Steady decode (tok/s) | Speedup vs. C1 | Wave makespan |
 |---:|---:|---:|---:|
 | 1 | 185.8 | 1.00× | 44.23 s |
 | 2 | 247.0 | 1.33× | 66.67 s |
@@ -185,7 +185,7 @@ equal to C. Each row is one sustained wave.
 
 ### Long-context baseline (MTP disabled)
 
-| Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+| Prompt tokens | Prefill phase (tok/s) | Server TTFT (ms) | Decode phase (tok/s) |
 |---:|---:|---:|---:|
 | 7,680 | 3,218.1 ± 4.3 | 2,392.4 ± 3.0 | 77.6 ± 0.1 |
 | 64,512 | 2,655.9 ± 2.9 | 24,335.7 ± 25.2 | 70.7 ± 0.1 |
@@ -196,7 +196,7 @@ equal to C. Each row is one sustained wave.
 
 Thinking was enabled and the output limit was 65,536 tokens.
 
-| AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+| AIME 2026 fixture | Completion tokens | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
 | Problem 1 | 10,686.2 ± 553.8 | 175.4 ± 1.0 | 77.9% ± 0.9% | 3.34 ± 0.03 |
 | Problem 15 | 61,604.2 ± 5,677.9 | 161.9 ± 2.8 | 73.4% ± 1.7% | 3.20 ± 0.05 |
@@ -207,7 +207,7 @@ Thinking was enabled and the output limit was 65,536 tokens.
 Each category contains three fixtures and five seeds per fixture (15 samples). Thinking was
 disabled and the output limit was 4,096 tokens.
 
-| Category | Decode tok/s | MTP acceptance | MTP tokens/round |
+| Category | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
 | Code | 167.0 ± 5.4 | 72.3% ± 3.5% | 3.17 ± 0.11 |
 | Story | 112.6 ± 9.4 | 37.8% ± 5.9% | 2.13 ± 0.18 |
@@ -215,7 +215,7 @@ disabled and the output limit was 4,096 tokens.
 | Structured output | 193.0 ± 18.8 | 88.7% ± 11.7% | 3.66 ± 0.35 |
 
 See the
-[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
+[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.6-27b.md),
 including metric definitions and the exact reproduction command.
 
 ## Evaluation

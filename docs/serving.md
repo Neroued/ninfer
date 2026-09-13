@@ -868,13 +868,6 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
 `trailing_content`. These counters contain no tool arguments or generated text.
 
-`request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
-future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
-the budget-exhausted flag; selected degradation units; and whether the selected target was the maximal root fallback.
-Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and
-`value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
-Aborted planning attempts are not published.
-
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be

@@ -407,6 +407,14 @@ int main() {
                           .budget_exhausted           = false,
                           .selected_degradation_units = 2,
                           .selected_maximal_fallback  = false,
+                          .initial_predicted_total_ns = 500000,
+                          .first_improvement_ns       = 2000,
+                          .incumbent_improvements     = 2,
+                          .search_work                = 42,
+                          .search_granted_ns          = 8000,
+                          .search_renewals            = 1,
+                          .search_discovery_used      = true,
+                          .search_overshoot_ns        = 0,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -414,6 +422,12 @@ int main() {
                                                    .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
+                          done.at("materialization").at("first_improvement_ns") == 2000 &&
+                          done.at("materialization").at("search_granted_ns") == 8000 &&
+                          done.at("materialization").at("search_renewals") == 1 &&
+                          done.at("materialization").at("search_discovery_used") == true,
+                      "materialization search quality or cumulative budget diagnostics missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");

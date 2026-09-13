@@ -2,6 +2,7 @@
 
 #include "runtime/engine/context_cost.h"
 #include "runtime/engine/context_portfolio_value.h"
+#include "runtime/engine/materialization_budget.h"
 #include "runtime/engine/resource_search.h"
 
 #include <algorithm>
@@ -37,7 +38,7 @@ struct MaterializationOwnerPolicy {
     bool explicit_shared_credit            = false;
 };
 
-template <class Package>
+template <class Package, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
 public:
     using Program                = typename Package::Program;
@@ -48,7 +49,7 @@ public:
     using SharedPrefixHandle     = typename Package::SharedPrefixHandle;
     using PressureTargetHandle   = typename Package::PressureTargetHandle;
     using AssessedPressureTarget = typename Package::AssessedPressureTarget;
-    using Clock                  = std::chrono::steady_clock;
+    using Clock                  = SearchClock;
 
     struct CandidateInput {
         AdmissionCandidate* candidate = nullptr;
@@ -83,10 +84,7 @@ public:
     MaterializationPlanner() : target_ledger_(kTargetBudget + 17U) {
         queue_.reserve(kTargetBudget);
         pending_.reserve(kTargetBudget);
-        guided_.reserve(kTargetBudget);
         identity_costs_.reserve(16);
-        candidate_guided_steps_.reserve(16);
-        candidate_seed_complete_.reserve(16);
         impact_scratch_.reserve(32);
         portfolio_owner_scratch_.reserve(32);
         portfolio_checkpoint_scratch_.reserve(64);
@@ -98,7 +96,7 @@ public:
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
          LogicalGoalFn&& logical_goal, FinalScheduleFn&& final_schedule,
-         Clock::time_point planning_started) {
+         Clock::time_point planning_started, PlanningAllowance allowance = {}) {
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
@@ -113,16 +111,14 @@ public:
         }
         queue_.clear();
         pending_.clear();
-        guided_.clear();
         const std::size_t frontier_capacity = candidates.size() + 1U + kTargetBudget;
         queue_.reserve(frontier_capacity);
         pending_.reserve(frontier_capacity);
-        guided_.reserve(frontier_capacity);
         identity_costs_.clear();
-        candidate_guided_steps_.assign(candidates.size(), 0);
-        candidate_seed_complete_.assign(candidates.size(), false);
         target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
 
+        // The mandatory root-maximal fallback does not count as an ordinary feasible seed.
+        std::vector<bool> candidate_seeded(candidates.size(), false);
         std::optional<Incumbent> identity_best;
         std::vector<IdentityRoot> roots;
         roots.reserve(candidates.size());
@@ -147,7 +143,7 @@ public:
                     .cost             = cost,
                 };
             }
-            if (goal) { candidate_seed_complete_[index] = true; }
+            candidate_seeded[index] = goal.has_value();
             const bool needs_pressure =
                 !goal.has_value() &&
                 (identity.physical_status == MaterializationPhysicalStatus::Feasible ||
@@ -167,7 +163,10 @@ public:
             const bool needs_optional_search =
                 std::any_of(roots.begin(), roots.end(),
                             [](const IdentityRoot& root) { return root.expandable; });
-            if (!needs_optional_search) {
+            const bool no_allowance =
+                allowance.remaining(planning_now_ns<Clock>()) == 0 ||
+                identity_best->cost.total_ns / 20U / std::max(1U, allowance.affected_requests) == 0;
+            if (!needs_optional_search || no_allowance) {
                 const CandidateInput& selected = candidates[identity_best->candidate_index];
                 const auto price_split         = [&](std::span<const std::uint32_t> frontiers) {
                     const std::uint64_t baseline =
@@ -186,8 +185,16 @@ public:
                 if (!sealed) { return std::nullopt; }
                 MaterializationDiagnostics diagnostics = complete_diagnostics(
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
-                    projection_work, planning_started, MaterializationStopReason::NoPressure,
+                    projection_work, planning_started,
+                    needs_optional_search ? MaterializationStopReason::TimeBudget
+                                          : MaterializationStopReason::NoPressure,
                     false);
+                diagnostics.budget_exhausted  = needs_optional_search;
+                diagnostics.search_stop_phase = needs_optional_search
+                                                    ? MaterializationSearchPhase::Setup
+                                                    : MaterializationSearchPhase::None;
+                diagnostics.search_boundary_limited =
+                    needs_optional_search && allowance.remaining(planning_now_ns<Clock>()) == 0;
                 Result result;
                 result.plan             = std::move(*sealed);
                 result.candidate        = candidates[identity_best->candidate_index].id;
@@ -198,6 +205,7 @@ public:
             }
         }
 
+        typename Clock::time_point search_started = Clock::now();
         std::vector<const AdmissionCandidate*> candidate_handles;
         std::vector<PlanningCandidateId> candidate_ids;
         candidate_handles.reserve(candidates.size());
@@ -253,15 +261,47 @@ public:
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
-        const Clock::time_point search_started = Clock::now();
-        const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
-        std::uint64_t maximum_step_ns          = 0;
-        std::uint32_t optional_targets         = 0;
-        std::uint32_t guided_assessments       = 0;
-        MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
-        bool budget_exhausted                  = false;
+        if (!identity_best) { search_started = Clock::now(); }
+        const auto search_origin_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(search_started.time_since_epoch())
+                .count());
+        MaterializationSearchBudget search_budget(allowance, search_origin_ns,
+                                                  incumbent.cost.total_ns);
+        const auto initial_cost_ns = incumbent.cost.total_ns;
+        std::optional<std::uint64_t> first_improvement_ns;
+        std::uint32_t incumbent_improvements = 0;
+        std::uint64_t option_step_ns = 1'000, assessment_step_ns = 20'000,
+                      expansion_step_ns = 20'000;
+        std::uint64_t search_work       = 0;
+        const auto work_limit           = static_cast<std::uint64_t>(kTargetBudget) *
+                                (16U + 16ULL * pressure.owner_policy.size());
+        std::uint32_t optional_targets        = 0;
+        MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
+        bool budget_exhausted                 = false;
+        auto search_phase                     = MaterializationSearchPhase::Setup;
+        const auto allow_work = [&](std::uint64_t operation, std::uint64_t completion,
+                                    std::uint64_t gain, bool complete,
+                                    bool discovery_eligible = true) {
+            if (search_work >= work_limit) {
+                stop_reason      = MaterializationStopReason::WorkBudget;
+                budget_exhausted = true;
+                return false;
+            }
+            if (!search_budget.allow(planning_now_ns<Clock>(), operation, completion, gain,
+                                     complete, search_work, discovery_eligible)) {
+                stop_reason      = search_budget.stop_reason();
+                budget_exhausted = stop_reason == MaterializationStopReason::TimeBudget;
+                return false;
+            }
+            stop_reason      = MaterializationStopReason::QueueExhausted;
+            budget_exhausted = false;
+            return true;
+        };
+        const auto observe_step = [&](std::uint64_t& estimate, Clock::time_point started) {
+            const auto sample = elapsed_ns(started, Clock::now());
+            estimate          = std::max<std::uint64_t>(1, estimate / 2 + sample / 2);
+        };
+
 
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
@@ -279,18 +319,6 @@ public:
             entry.stable_target_ordinal = root.candidate_index;
             mark_target(entry.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             queue_push(entry);
-            const PressureTargetGuidance guidance = session.guidance(entry.target);
-            if (guidance.candidate != candidates[root.candidate_index].id) {
-                throw std::logic_error("pressure guidance changed admission candidate");
-            }
-            guided_insert(GuidedEntry{
-                .target          = entry.target,
-                .candidate_index = root.candidate_index,
-                .lower_bound_ns  = root.lower_bound_ns,
-                .guidance        = fold_guidance(candidates[root.candidate_index], guidance,
-                                                 pressure.owner_policy, machine_cost),
-                .already_assessed_expandable = true,
-            });
         }
 
         const auto make_queue_entry = [](PressureTargetHandle target, std::uint32_t candidate_index,
@@ -336,14 +364,20 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (goal && !assessment.root_maximal) {
-                candidate_seed_complete_[expected_candidate] = true;
+            if (goal) {
+                mark_target(assessment.stable_target_ordinal, kTargetFeasible);
+                candidate_seeded[expected_candidate] = true;
             }
             if (goal && cost.less(incumbent.cost)) {
+                if (cost.total_ns < initial_cost_ns && !first_improvement_ns) {
+                    first_improvement_ns = elapsed_ns(search_started, Clock::now());
+                }
+                ++incumbent_improvements;
                 incumbent = make_incumbent(target, expected_candidate, assessment,
                                            std::move(assessed), cost, *goal);
             }
             if (!assessment.expandable) { return std::nullopt; }
+            mark_target(assessment.stable_target_ordinal, kTargetExpandable);
             QueueEntry entry = make_queue_entry(target, expected_candidate, assessment, cost);
             queue_push(entry);
             return entry;
@@ -352,14 +386,18 @@ public:
         const auto expand_target = [&](const QueueEntry& parent) {
             if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
             if (optional_targets >= kTargetBudget) { return false; }
-            auto prepared = session.prepare_expansion(parent.target);
+            auto prepared = session.prepare_expansion(parent.target, 8);
             if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
                 session.discard_expansion(std::move(prepared));
                 return false;
             }
             const auto children = session.commit_expansion(std::move(prepared));
             optional_targets += children.new_canonical_count;
-            mark_target(parent.stable_target_ordinal, kTargetExpanded);
+            if (children.complete) {
+                mark_target(parent.stable_target_ordinal, kTargetExpanded);
+            } else {
+                queue_push(parent);
+            }
             for (const PressureTargetHandle child : children.children) {
                 const PressureTargetGuidance guidance = session.guidance(child);
                 if (guidance.candidate != candidates[parent.candidate_index].id) {
@@ -370,8 +408,12 @@ public:
                 mark_target(guidance.stable_target_ordinal, kTargetDiscovered);
                 const std::uint64_t lower_bound_ns = std::max(
                     identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
-                const GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
-                                                        pressure.owner_policy, machine_cost);
+                GuidanceCost cost =
+                    fold_guidance(candidates[candidate_index], guidance, pressure.owner_policy,
+                                  pressure.checkpoint_policy, machine_cost);
+                cost.logical_ready = logical_goal(candidates[candidate_index].id,
+                                                  guidance.source_mode, guidance.owner_outcomes)
+                                         .has_value();
                 PendingEntry pending{
                     .target          = child,
                     .candidate_index = candidate_index,
@@ -379,137 +421,220 @@ public:
                     .guidance        = cost,
                 };
                 pending_push(pending);
-                if (!candidate_seed_complete_[candidate_index]) {
-                    guided_insert(GuidedEntry{
-                        .target          = child,
-                        .candidate_index = candidate_index,
-                        .lower_bound_ns  = lower_bound_ns,
-                        .guidance        = cost,
-                    });
-                }
             }
             return true;
         };
 
-        const auto candidate_needs_seed = [&](std::uint32_t candidate_index) {
-            return candidate_index < roots.size() && roots[candidate_index].expandable &&
-                   !candidate_seed_complete_[candidate_index];
+        using Cursor = decltype(session.begin_construction(incumbent.target));
+
+        struct ConstructionPath {
+            std::optional<Cursor> cursor;
+            std::uint32_t candidate_index = 0;
+            bool feasibility_first        = false;
+            bool repair                   = false;
+            bool restore                  = false;
+            GuidanceCost parent;
+            std::optional<GuidanceCost> best;
+            PressureConstructionOptionId best_option;
+            std::vector<std::uint32_t> visited;
         };
-        const auto has_open_seed = [&] {
-            return std::any_of(roots.begin(), roots.end(), [&](const IdentityRoot& root) {
-                return candidate_needs_seed(root.candidate_index);
-            });
+
+        std::array<ConstructionPath, 4> paths;
+        std::vector<std::uint32_t> order;
+        for (const auto& root : roots) {
+            if (root.expandable) { order.push_back(root.candidate_index); }
+        }
+        std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+            return identity_costs_[a].lower_bound_ns < identity_costs_[b].lower_bound_ns;
+        });
+        const auto rank_guidance = [&](std::uint32_t index, const PressureTargetGuidance& guide) {
+            auto cost = fold_guidance(candidates[index], guide, pressure.owner_policy,
+                                      pressure.checkpoint_policy, machine_cost);
+            cost.logical_ready =
+                logical_goal(candidates[index].id, guide.source_mode, guide.owner_outcomes)
+                    .has_value();
+            if (!cost.logical_ready) {
+                ++cost.unsatisfied_constraints;
+                cost.normalized_residual_q20 += 1ULL << 20U;
+                cost.estimated_remaining_steps = std::max(1U, cost.estimated_remaining_steps);
+            }
+            return cost;
         };
+        const auto start_path = [&](ConstructionPath& path, std::uint32_t candidate,
+                                    PressureTargetHandle target, bool feasibility, bool restore) {
+            path.cursor.reset();
+            path.candidate_index   = candidate;
+            path.feasibility_first = feasibility;
+            path.restore           = restore;
+            path.best.reset();
+            path.visited.clear();
+            path.visited.reserve(kTargetBudget);
+            path.parent = rank_guidance(candidate, session.guidance(target));
+            path.repair = path.parent.requires_exact_feedback;
+            path.visited.push_back(path.parent.stable_target_ordinal);
+            path.cursor.emplace(session.begin_construction(target, restore));
+        };
+        std::size_t next_path  = 0;
+        bool search_stopped    = false;
+        bool rescue_done       = false;
+        bool refinement_seeded = false;
+        const auto have_paths  = [&] {
+            return std::any_of(paths.begin(), paths.end(),
+                                [](const auto& path) { return bool(path.cursor); });
+        };
+        while (!search_stopped &&
+               (next_path < 2U * order.size() || have_paths() || !refinement_seeded)) {
+            if (next_path == 2U * order.size() && !have_paths()) {
+                if (!rescue_done) {
+                    rescue_done = true;
+                    const auto promising =
+                        std::find_if(order.begin(), order.end(), [&](auto candidate) {
+                            return !candidate_seeded[candidate] &&
+                                   identity_costs_[candidate].lower_bound_ns <
+                                       incumbent.cost.total_ns;
+                        });
+                    if (promising != order.end() && optional_targets < kTargetBudget) {
+                        const auto candidate = *promising;
+                        const auto gain =
+                            incumbent.cost.total_ns - identity_costs_[candidate].lower_bound_ns;
+                        search_phase = MaterializationSearchPhase::Assessment;
+                        if (allow_work(assessment_step_ns, assessment_step_ns, gain, false)) {
+                            const auto rescue = session.maximal_target(candidates[candidate].id);
+                            const auto guide  = session.guidance(rescue);
+                            if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
+                                if (!target_marked(guide.stable_target_ordinal,
+                                                   kTargetDiscovered)) {
+                                    ++optional_targets;
+                                }
+                                const auto started = Clock::now();
+                                (void)assess_target(rescue, candidate, guide.stable_target_ordinal);
+                                observe_step(assessment_step_ns, started);
+                                ++search_work;
+                            }
+                        }
+                    }
+                }
+                refinement_seeded = true;
+                if (incumbent.degradation_units != 0) {
+                    start_path(paths[0], incumbent.candidate_index, incumbent.target, false, true);
+                }
+                if (!have_paths()) { break; }
+            }
+            for (auto& path : paths) {
+                if (!path.cursor && next_path < 2U * order.size()) {
+                    const auto candidate = order[next_path / 2];
+                    start_path(path, candidate, session.identity_target(candidates[candidate].id),
+                               (next_path % 2) != 0, false);
+                    ++next_path;
+                }
+                if (!path.cursor) { continue; }
+                for (unsigned slice = 0; slice < 8 && path.cursor; ++slice) {
+                    const auto& forecast  = path.best ? *path.best : path.parent;
+                    const auto optimistic = identity_costs_[path.candidate_index].lower_bound_ns;
+                    const bool complete =
+                        forecast.unsatisfied_constraints == 0 && forecast.recovery_complete;
+                    const auto estimate = complete ? forecast.estimated_total_ns : optimistic;
+                    const auto gain =
+                        incumbent.cost.total_ns > estimate ? incumbent.cost.total_ns - estimate : 0;
+                    const auto steps =
+                        std::min<std::uint64_t>(64, 1ULL + forecast.estimated_remaining_steps);
+                    const auto completion =
+                        assessment_step_ns +
+                        option_step_ns * steps *
+                            std::max<std::size_t>(1, pressure.owner_policy.size());
+                    search_phase = path.restore ? MaterializationSearchPhase::Refinement
+                                                : MaterializationSearchPhase::Construction;
+                    if (!allow_work(option_step_ns, completion, gain, complete,
+                                    !candidate_seeded[path.candidate_index])) {
+                        search_stopped = search_work >= work_limit ||
+                                         allowance.remaining(planning_now_ns<Clock>()) == 0;
+                        path.cursor.reset();
+                        break;
+                    }
+                    const auto step_started = Clock::now();
+                    const auto step         = session.next_construction_option(*path.cursor);
+                    observe_step(option_step_ns, step_started);
+                    ++search_work;
+                    if (step.guidance) {
+                        auto cost = rank_guidance(path.candidate_index, *step.guidance);
+                        if (construction_option_better(path.parent, path.best, cost,
+                                                       path.feasibility_first, path.restore)) {
+                            path.best        = cost;
+                            path.best_option = step.option;
+                        }
+                    }
+                    if (!step.exhausted) { continue; }
+                    if (!path.best || optional_targets >= kTargetBudget) {
+                        path.cursor.reset();
+                        break;
+                    }
+                    session.choose_construction(*path.cursor, path.best_option);
+                    const auto target = session.construction_target(*path.cursor);
+                    if (!target) {
+                        stop_reason      = MaterializationStopReason::ExpansionCapacity;
+                        budget_exhausted = search_stopped = true;
+                        break;
+                    }
+                    auto chosen = rank_guidance(path.candidate_index, session.guidance(*target));
+                    if (std::find(path.visited.begin(), path.visited.end(),
+                                  chosen.stable_target_ordinal) != path.visited.end()) {
+                        path.cursor.reset();
+                        break;
+                    }
+                    path.visited.push_back(chosen.stable_target_ordinal);
+                    if (!target_marked(chosen.stable_target_ordinal, kTargetDiscovered)) {
+                        mark_target(chosen.stable_target_ordinal, kTargetDiscovered);
+                        ++optional_targets;
+                        pending_push({.target          = *target,
+                                      .candidate_index = path.candidate_index,
+                                      .lower_bound_ns  = optimistic,
+                                      .guidance        = chosen});
+                    }
+                    path.parent = chosen;
+                    path.best.reset();
+                    if (chosen.unsatisfied_constraints != 0 && !path.repair && !path.restore) {
+                        continue;
+                    }
+                    if (!target_marked(chosen.stable_target_ordinal, kTargetAssessed)) {
+                        const auto target_gain =
+                            incumbent.cost.total_ns > chosen.estimated_total_ns
+                                ? incumbent.cost.total_ns - chosen.estimated_total_ns
+                                : 0;
+                        search_phase = MaterializationSearchPhase::Assessment;
+                        if (!allow_work(assessment_step_ns, assessment_step_ns,
+                                        chosen.recovery_complete ? target_gain : gain,
+                                        chosen.recovery_complete &&
+                                            chosen.unsatisfied_constraints == 0,
+                                        !candidate_seeded[path.candidate_index])) {
+                            search_stopped = search_work >= work_limit ||
+                                             allowance.remaining(planning_now_ns<Clock>()) == 0;
+                            path.cursor.reset();
+                            break;
+                        }
+                        const auto started = Clock::now();
+                        (void)assess_target(*target, path.candidate_index,
+                                            chosen.stable_target_ordinal);
+                        observe_step(assessment_step_ns, started);
+                        ++search_work;
+                    }
+                    const bool feasible =
+                        target_marked(chosen.stable_target_ordinal, kTargetFeasible);
+                    path.cursor.reset();
+                    if (!feasible && !path.restore &&
+                        target_marked(chosen.stable_target_ordinal, kTargetExpandable)) {
+                        // The Program resumes from its exact residual/geometry evidence.
+                        path.cursor.emplace(session.begin_construction(*target));
+                        path.repair = true;
+                    }
+                }
+                if (search_stopped) { break; }
+            }
+        }
+        for (auto& path : paths) { path.cursor.reset(); }
 
-        std::vector<const MaterializationOwnerPolicy*> preferred_owners;
-        preferred_owners.reserve(pressure.owner_policy.size());
-        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
-            preferred_owners.push_back(&policy);
-        }
-        std::sort(preferred_owners.begin(), preferred_owners.end(),
-                  [](const auto* left, const auto* right) {
-                      return std::tuple{
-                                 left->selected_hit_count,
-                                 left->explicit_shared_credit ? 1U : 0U,
-                                 left->private_retention_weight,
-                                 left->last_hit_epoch,
-                                 left->owner.value,
-                             } < std::tuple{
-                                     right->selected_hit_count,
-                                     right->explicit_shared_credit ? 1U : 0U,
-                                     right->private_retention_weight,
-                                     right->last_hit_epoch,
-                                     right->owner.value,
-                                 };
-                  });
-        std::vector<PlanningOwnerId> preferred_owner_ids;
-        preferred_owner_ids.reserve(preferred_owners.size());
-        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
-            preferred_owner_ids.push_back(policy->owner);
-        }
-
-        std::vector<IdentityRoot> closure_order;
-        closure_order.reserve(roots.size());
-        for (const IdentityRoot& root : roots) {
-            if (candidate_needs_seed(root.candidate_index)) { closure_order.push_back(root); }
-        }
-        std::sort(closure_order.begin(), closure_order.end(),
-                  [](const IdentityRoot& left, const IdentityRoot& right) {
-                      return std::tuple{left.lower_bound_ns, left.candidate_index} <
-                             std::tuple{right.lower_bound_ns, right.candidate_index};
-                  });
-        for (const IdentityRoot& root : closure_order) {
-            if (!candidate_needs_seed(root.candidate_index) ||
-                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
-                optional_targets >= kTargetBudget) {
-                continue;
-            }
-            const Clock::time_point step_started              = Clock::now();
-            const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
-                candidates[root.candidate_index].id, preferred_owner_ids);
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            if (!closure) { continue; }
-            const PressureTargetGuidance closure_guidance = session.guidance(*closure);
-            if (closure_guidance.candidate != candidates[root.candidate_index].id) {
-                throw std::logic_error("guided closure changed admission candidate");
-            }
-            if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
-                continue;
-            }
-            if (!target_marked(closure_guidance.stable_target_ordinal, kTargetDiscovered)) {
-                mark_target(closure_guidance.stable_target_ordinal, kTargetDiscovered);
-                ++optional_targets;
-            }
-            const Clock::time_point assessment_started = Clock::now();
-            (void)assess_target(*closure, root.candidate_index,
-                                closure_guidance.stable_target_ordinal);
-            ++guided_assessments;
-            maximum_step_ns =
-                std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
-        }
-
-        // Build one ordinary feasible seed per expandable candidate. Estimated machine cost orders
-        // independent beams but never excludes a candidate or certifies an incumbent.
-        while (has_open_seed() && !guided_.empty() &&
-               guided_assessments < kGuidedAssessmentBudget) {
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
-            const GuidedEntry next = guided_pop();
-            if (!candidate_needs_seed(next.candidate_index) ||
-                target_marked(next.guidance.stable_target_ordinal, kTargetExpanded)) {
-                continue;
-            }
-            std::optional<QueueEntry> exact;
-            if (next.already_assessed_expandable) {
-                exact = QueueEntry{
-                    .target          = next.target,
-                    .candidate_index = next.candidate_index,
-                    .lower_bound_ns  = next.lower_bound_ns,
-                    .remaining_prefill =
-                        identity_costs_[next.candidate_index].remaining_text_prefill,
-                    .remaining_vision_prefill =
-                        identity_costs_[next.candidate_index].remaining_vision_prefill,
-                    .reused_prompt_tokens =
-                        identity_costs_[next.candidate_index].reused_prompt_tokens,
-                    .current_session_binding =
-                        identity_costs_[next.candidate_index].current_session_binding,
-                    .candidate_ordinal = identity_costs_[next.candidate_index].candidate_ordinal,
-                    .stable_target_ordinal = next.guidance.stable_target_ordinal,
-                };
-            } else if (!target_marked(next.guidance.stable_target_ordinal, kTargetAssessed)) {
-                const Clock::time_point step_started = Clock::now();
-                exact = assess_target(next.target, next.candidate_index,
-                                      next.guidance.stable_target_ordinal);
-                ++guided_assessments;
-                maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            }
-            if (!exact || !candidate_needs_seed(next.candidate_index)) { continue; }
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
-            const Clock::time_point step_started = Clock::now();
-            if (!expand_target(*exact)) { break; }
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-        }
-
+        // Ordinary alternatives remain available: construction heuristics are not pruning proofs.
         for (;;) {
+            if (search_stopped) { break; }
             while (!queue_.empty() &&
                    target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
                 (void)queue_pop();
@@ -519,54 +644,56 @@ public:
                 target_marked(pending_.front().guidance.stable_target_ordinal, kTargetAssessed)) {
                 (void)pending_pop();
             }
-            if (queue_.empty() && pending_.empty()) {
-                stop_reason = MaterializationStopReason::QueueExhausted;
-                break;
-            }
-            const std::uint64_t queue_bound   = queue_.empty()
-                                                    ? std::numeric_limits<std::uint64_t>::max()
-                                                    : queue_.front().lower_bound_ns;
-            const std::uint64_t pending_bound = pending_.empty()
-                                                    ? std::numeric_limits<std::uint64_t>::max()
-                                                    : pending_.front().lower_bound_ns;
-            const std::uint64_t next_bound    = std::min(queue_bound, pending_bound);
-            const std::uint64_t elapsed       = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
-                stop_reason      = MaterializationStopReason::TimeBudget;
-                budget_exhausted = true;
-                break;
-            }
-            const std::uint64_t possible_improvement =
-                incumbent.cost.total_ns > next_bound ? incumbent.cost.total_ns - next_bound : 0;
-            if (possible_improvement != 0 && maximum_step_ns != 0 &&
-                maximum_step_ns >= possible_improvement) {
-                stop_reason = MaterializationStopReason::ValueOfNextExpansion;
-                break;
-            }
-
+            if (queue_.empty() && pending_.empty()) { break; }
             const bool assess_pending =
-                !pending_.empty() && (queue_.empty() || pending_bound <= queue_bound);
-            const Clock::time_point step_started = Clock::now();
-            if (assess_pending) {
-                const PendingEntry next = pending_pop();
-                if (!target_marked(next.guidance.stable_target_ordinal, kTargetAssessed)) {
-                    (void)assess_target(next.target, next.candidate_index,
-                                        next.guidance.stable_target_ordinal);
+                !pending_.empty() && (queue_.empty() || pending_.front().lower_bound_ns <=
+                                                            queue_.front().lower_bound_ns);
+            const auto estimate = assess_pending ? pending_.front().guidance.estimated_total_ns
+                                                 : queue_.front().lower_bound_ns;
+            const auto gain =
+                incumbent.cost.total_ns > estimate ? incumbent.cost.total_ns - estimate : 0;
+            const auto predicted_step = assess_pending ? assessment_step_ns : expansion_step_ns;
+            search_phase              = assess_pending ? MaterializationSearchPhase::Assessment
+                                                       : MaterializationSearchPhase::Expansion;
+            if (!allow_work(predicted_step,
+                            predicted_step + (assess_pending ? 0 : assessment_step_ns), gain,
+                            assess_pending && pending_.front().guidance.recovery_complete &&
+                                pending_.front().guidance.unsatisfied_constraints == 0 &&
+                                pending_.front().guidance.logical_ready,
+                            !candidate_seeded[assess_pending ? pending_.front().candidate_index
+                                                             : queue_.front().candidate_index])) {
+                if (search_work >= work_limit ||
+                    allowance.remaining(planning_now_ns<Clock>()) == 0) {
+                    break;
                 }
+                // A forecast that cannot justify another window must not starve a different source.
+                if (assess_pending) {
+                    (void)pending_pop();
+                } else {
+                    (void)queue_pop();
+                }
+                continue;
+            }
+            const auto started = Clock::now();
+            if (assess_pending) {
+                const auto next = pending_pop();
+                (void)assess_target(next.target, next.candidate_index,
+                                    next.guidance.stable_target_ordinal);
+                observe_step(assessment_step_ns, started);
             } else {
                 if (optional_targets >= kTargetBudget) {
                     stop_reason      = MaterializationStopReason::TargetBudget;
                     budget_exhausted = true;
                     break;
                 }
-                const QueueEntry parent = queue_pop();
-                if (!expand_target(parent)) {
+                if (!expand_target(queue_pop())) {
                     stop_reason      = MaterializationStopReason::ExpansionCapacity;
                     budget_exhausted = true;
                     break;
                 }
+                observe_step(expansion_step_ns, started);
             }
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+            ++search_work;
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
@@ -598,6 +725,18 @@ public:
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
 
+        diagnostics.initial_predicted_total_ns = initial_cost_ns;
+        diagnostics.first_improvement_ns       = first_improvement_ns;
+        diagnostics.incumbent_improvements     = incumbent_improvements;
+        diagnostics.search_work                = search_work;
+        diagnostics.search_granted_ns          = search_budget.granted_ns();
+        diagnostics.search_renewals            = search_budget.renewals();
+        diagnostics.search_discovery_used      = search_budget.discovery_used();
+        diagnostics.search_stop_phase          = search_phase;
+        diagnostics.search_boundary_limited    = search_budget.boundary_limited();
+        diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
+                                                     ? search_elapsed_ns - search_budget.granted_ns()
+                                                     : 0;
         Result result;
         result.plan                = std::move(*sealed);
         result.candidate           = candidates[incumbent.candidate_index].id;
@@ -614,19 +753,18 @@ public:
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
-         LogicalGoalFn&& logical_goal, Clock::time_point planning_started) {
+         LogicalGoalFn&& logical_goal, Clock::time_point planning_started,
+         PlanningAllowance allowance = {}) {
         const auto no_optional_schedule = [](PlanningCandidateId, const RequestPlanSummary&,
                                              const auto&) { return std::vector<std::uint32_t>{}; };
         return plan(program, prompt, machine_cost, candidates, root_candidate_index,
                     std::forward<PressureInputsFn>(pressure_inputs),
                     std::forward<LogicalGoalFn>(logical_goal), no_optional_schedule,
-                    planning_started);
+                    planning_started, allowance);
     }
 
 private:
-    static constexpr std::uint32_t kTargetBudget           = 4096;
-    static constexpr std::uint32_t kGuidedBeamWidth        = 16;
-    static constexpr std::uint32_t kGuidedAssessmentBudget = 32;
+    static constexpr std::uint32_t kTargetBudget = 4096;
 
     struct FoldedCost {
         std::uint64_t now_ns                    = 0;
@@ -707,6 +845,10 @@ private:
     };
 
     struct GuidanceCost {
+        std::uint64_t estimated_total_ns        = 0;
+        bool recovery_complete                  = false;
+        bool requires_exact_feedback            = false;
+        bool logical_ready                      = false;
         std::uint32_t estimated_remaining_steps = 0;
         std::uint32_t unsatisfied_constraints   = 0;
         std::uint64_t normalized_residual_q20   = 0;
@@ -729,6 +871,7 @@ private:
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
+                estimated_total_ns,
                 affected_selected_hits,
                 explicit_shared_losses,
                 owner_evictions,
@@ -752,19 +895,47 @@ private:
         }
     };
 
+    [[nodiscard]] static bool construction_option_better(const GuidanceCost& parent,
+                                                         const std::optional<GuidanceCost>& best,
+                                                         const GuidanceCost& cost,
+                                                         bool feasibility_first,
+                                                         bool restore) noexcept {
+        if (!best) { return true; }
+        const auto& prior         = *best;
+        const bool complete       = cost.unsatisfied_constraints == 0;
+        const bool prior_complete = prior.unsatisfied_constraints == 0;
+        if (restore || (complete && prior_complete)) { return cost.key() < prior.key(); }
+        if (feasibility_first) {
+            if (complete != prior_complete) { return complete; }
+            return std::tuple{cost.estimated_remaining_steps, cost.normalized_residual_q20,
+                              cost.key()} < std::tuple{prior.estimated_remaining_steps,
+                                                       prior.normalized_residual_q20, prior.key()};
+        }
+        const auto relief = [&](const GuidanceCost& item) {
+            return parent.normalized_residual_q20 > item.normalized_residual_q20
+                       ? parent.normalized_residual_q20 - item.normalized_residual_q20
+                       : 0;
+        };
+        const auto a = relief(cost), b = relief(prior);
+        if ((a != 0) != (b != 0)) { return a != 0; }
+        if (a && b) {
+            const auto delta = [&](const GuidanceCost& item) {
+                return item.estimated_total_ns > parent.estimated_total_ns
+                           ? item.estimated_total_ns - parent.estimated_total_ns
+                           : 0;
+            };
+            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
+            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+            if (left != right) { return left < right; }
+        }
+        return cost.key() < prior.key();
+    }
+
     struct PendingEntry {
         PressureTargetHandle target{};
         std::uint32_t candidate_index = 0;
         std::uint64_t lower_bound_ns  = 0;
         GuidanceCost guidance;
-    };
-
-    struct GuidedEntry {
-        PressureTargetHandle target{};
-        std::uint32_t candidate_index = 0;
-        std::uint64_t lower_bound_ns  = 0;
-        GuidanceCost guidance;
-        bool already_assessed_expandable = false;
     };
 
     struct CombinedImpact {
@@ -828,13 +999,15 @@ private:
     [[nodiscard]] GuidanceCost
     fold_guidance(const CandidateInput& candidate, const PressureTargetGuidance& guidance,
                   std::span<const MaterializationOwnerPolicy> owner_policies,
-                  const ContextMachineCostModel& machine_cost) const {
+                  std::span<const MaterializationCheckpointPolicy> checkpoint_policies,
+                  const ContextMachineCostModel& machine_cost) {
         const PricedMaterializationMachineWork priced =
             price_materialization_machine_work(machine_cost, guidance.estimated_machine_work);
         GuidanceCost cost;
         cost.estimated_remaining_steps = guidance.physical.estimated_remaining_steps;
         cost.unsatisfied_constraints   = guidance.physical.unsatisfied_constraints;
         cost.normalized_residual_q20   = guidance.physical.normalized_residual_q20;
+        cost.requires_exact_feedback   = guidance.physical.requires_exact_feedback;
         cost.checkpoint_drops          = guidance.dropped_checkpoints;
         cost.degradation_units         = guidance.degradation_units;
         cost.estimated_immediate_ns    = priced.immediate_ns;
@@ -865,6 +1038,58 @@ private:
             planning_saturating_add(cost.retention_weight, policy->private_retention_weight);
             if (policy->explicit_shared_credit) { ++cost.explicit_shared_losses; }
         }
+        portfolio_owner_scratch_.clear();
+        for (const auto& policy : owner_policies) {
+            portfolio_owner_scratch_.push_back(
+                {.owner                    = policy.owner,
+                 .private_retention_weight = policy.private_retention_weight,
+                 .explicit_shared_credit   = policy.explicit_shared_credit});
+        }
+        portfolio_checkpoint_scratch_.clear();
+        for (const auto& checkpoint : checkpoint_policies) {
+            const auto outcome =
+                std::find_if(guidance.owner_outcomes.begin(), guidance.owner_outcomes.end(),
+                             [&](const auto& item) { return item.owner == checkpoint.owner; });
+            const auto change =
+                std::find_if(guidance.checkpoint_changes.begin(), guidance.checkpoint_changes.end(),
+                             [&](const auto& item) {
+                                 return item.owner == checkpoint.owner &&
+                                        item.checkpoint == checkpoint.checkpoint;
+                             });
+            std::uint64_t recovery = checkpoint.baseline_recovery_ns;
+            if ((outcome != guidance.owner_outcomes.end() &&
+                 outcome->disposition == VictimDisposition::Evicted) ||
+                (change != guidance.checkpoint_changes.end() && !change->survives)) {
+                recovery = checkpoint.rebuild_ns;
+            } else {
+                const auto estimate = std::find_if(
+                    guidance.recovery_estimates.begin(), guidance.recovery_estimates.end(),
+                    [&](const auto& item) { return item.owner == checkpoint.owner; });
+                if (estimate != guidance.recovery_estimates.end()) {
+                    for (std::size_t direction = 0; direction < 3; ++direction) {
+                        planning_saturating_add(
+                            recovery, machine_cost.transfer_ns(
+                                          static_cast<ContextTransferDirection>(direction),
+                                          estimate->additional_restore[direction]));
+                    }
+                }
+            }
+            portfolio_checkpoint_scratch_.push_back(
+                {.owner                = checkpoint.owner,
+                 .demand_mask          = checkpoint.demand_mask,
+                 .rebuild_ns           = checkpoint.rebuild_ns,
+                 .baseline_recovery_ns = checkpoint.baseline_recovery_ns,
+                 .target_recovery_ns   = recovery});
+        }
+        const auto value =
+            portfolio_value_.fold(portfolio_owner_scratch_, portfolio_checkpoint_scratch_);
+        cost.estimated_total_ns = priced.immediate_ns;
+        planning_saturating_add(cost.estimated_total_ns,
+                                value.baseline_public_value > value.target_public_value
+                                    ? value.baseline_public_value - value.target_public_value
+                                    : 0);
+        planning_saturating_add(cost.estimated_total_ns, value.private_transition_loss);
+        cost.recovery_complete = guidance.recovery_estimate_complete && !value.saturated;
         return cost;
     }
 
@@ -1058,90 +1283,8 @@ private:
         return result;
     }
 
-    [[nodiscard]] static bool guidance_dominates(const GuidanceCost& left,
-                                                 const GuidanceCost& right) noexcept {
-        const std::array<std::uint64_t, 13> left_dimensions{
-            left.estimated_remaining_steps, left.unsatisfied_constraints,
-            left.normalized_residual_q20,   left.affected_selected_hits,
-            left.newest_affected_hit_epoch, left.explicit_shared_losses,
-            left.retention_weight,          left.owner_evictions,
-            left.checkpoint_drops,          left.estimated_immediate_ns,
-            left.degradation_units,         left.copy_operations,
-            left.transferred_bytes,
-        };
-        const std::array<std::uint64_t, 13> right_dimensions{
-            right.estimated_remaining_steps, right.unsatisfied_constraints,
-            right.normalized_residual_q20,   right.affected_selected_hits,
-            right.newest_affected_hit_epoch, right.explicit_shared_losses,
-            right.retention_weight,          right.owner_evictions,
-            right.checkpoint_drops,          right.estimated_immediate_ns,
-            right.degradation_units,         right.copy_operations,
-            right.transferred_bytes,
-        };
-        bool strict = false;
-        for (std::size_t index = 0; index < left_dimensions.size(); ++index) {
-            if (left_dimensions[index] > right_dimensions[index]) { return false; }
-            strict = strict || left_dimensions[index] < right_dimensions[index];
-        }
-        return strict;
-    }
-
-    void guided_insert(GuidedEntry entry) {
-        if (std::any_of(guided_.begin(), guided_.end(), [&](const GuidedEntry& existing) {
-                return existing.candidate_index == entry.candidate_index &&
-                       existing.lower_bound_ns <= entry.lower_bound_ns &&
-                       guidance_dominates(existing.guidance, entry.guidance);
-            })) {
-            return;
-        }
-        std::erase_if(guided_, [&](const GuidedEntry& existing) {
-            return existing.candidate_index == entry.candidate_index &&
-                   entry.lower_bound_ns <= existing.lower_bound_ns &&
-                   guidance_dominates(entry.guidance, existing.guidance);
-        });
-        guided_.push_back(std::move(entry));
-        const std::uint32_t candidate_index = guided_.back().candidate_index;
-        const std::size_t candidate_size    = static_cast<std::size_t>(
-            std::count_if(guided_.begin(), guided_.end(), [&](const GuidedEntry& item) {
-                return item.candidate_index == candidate_index;
-            }));
-        if (candidate_size <= kGuidedBeamWidth) { return; }
-        auto worst = guided_.end();
-        for (auto item = guided_.begin(); item != guided_.end(); ++item) {
-            if (item->candidate_index != candidate_index) { continue; }
-            if (worst == guided_.end() ||
-                std::tuple{worst->lower_bound_ns, worst->guidance.key()} <
-                    std::tuple{item->lower_bound_ns, item->guidance.key()}) {
-                worst = item;
-            }
-        }
-        if (worst == guided_.end()) {
-            throw std::logic_error("candidate guided beam accounting is inconsistent");
-        }
-        guided_.erase(worst);
-    }
-
-    [[nodiscard]] GuidedEntry guided_pop() {
-        const auto key = [&](const GuidedEntry& entry) {
-            if (entry.candidate_index >= candidate_guided_steps_.size()) {
-                throw std::logic_error("guided target candidate index is invalid");
-            }
-            return std::tuple{
-                candidate_guided_steps_[entry.candidate_index] == 0 ? 0U : 1U,
-                entry.lower_bound_ns,
-                entry.guidance.key(),
-            };
-        };
-        const auto best    = std::min_element(guided_.begin(), guided_.end(),
-                                              [&](const GuidedEntry& left, const GuidedEntry& right) {
-                                               return key(left) < key(right);
-                                           });
-        GuidedEntry result = std::move(*best);
-        guided_.erase(best);
-        ++candidate_guided_steps_[result.candidate_index];
-        return result;
-    }
-
+    static constexpr std::uint8_t kTargetFeasible   = 8U;
+    static constexpr std::uint8_t kTargetExpandable = 16U;
     static constexpr std::uint8_t kTargetDiscovered = BoundedTargetLedger::Discovered;
     static constexpr std::uint8_t kTargetAssessed   = BoundedTargetLedger::Assessed;
     static constexpr std::uint8_t kTargetExpanded   = BoundedTargetLedger::Expanded;
@@ -1180,15 +1323,13 @@ private:
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,
             .selected_maximal_fallback  = maximal_fallback,
+            .initial_predicted_total_ns = cost.total_ns,
         };
     }
 
     std::vector<QueueEntry> queue_;
     std::vector<PendingEntry> pending_;
-    std::vector<GuidedEntry> guided_;
     std::vector<FoldedCost> identity_costs_;
-    std::vector<std::uint32_t> candidate_guided_steps_;
-    std::vector<std::uint8_t> candidate_seed_complete_;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

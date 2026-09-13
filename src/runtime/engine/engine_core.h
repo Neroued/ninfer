@@ -1432,9 +1432,15 @@ private:
         }
     }
 
-    [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
+    [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request,
+                                                       PlanningAllowance allowance) {
+        allowance.cancellation = &request->cancelled;
+        allowance.control_deadline_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           request->deadline.time_since_epoch())
+                                           .count());
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order);
+                                  request->publication_order, allowance);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1646,6 +1652,12 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
+        const auto other_runnable = static_cast<std::uint32_t>(
+            std::count_if(slots_.begin(), slots_.end(), [](const auto& request) {
+                return request && !request->capture_pending &&
+                       (request->is_decode_ready() || request->is_prefilling());
+            }));
+        const PlanningAllowance allowance = PlanningAllowance::boundary(other_runnable);
         DetailScope detail(*this, &RuntimeHostWorkStats::admission_policy_ns,
                            &RuntimeHostWorkStats::admission_policy_invocations,
                            nvtx::Name::AdmissionPolicy);
@@ -1684,7 +1696,7 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head);
+            auto head_inspection = inspect_admission(head, allowance);
             if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -1758,7 +1770,7 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate);
+                auto candidate_inspection = inspect_admission(candidate, allowance);
                 if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(

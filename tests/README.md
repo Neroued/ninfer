@@ -31,6 +31,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
   schema-guided tool-argument normalization, structural fallback, and chunk-invariant incremental
   tool-call behavior;
+- `test_materialization_budget.cpp` — deterministic planning-budget and shared admission-boundary behavior;
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
   representative Serve request/throughput pretty records, failure severity, zero-field elision,
   and exclusion of arbitrary client error text;

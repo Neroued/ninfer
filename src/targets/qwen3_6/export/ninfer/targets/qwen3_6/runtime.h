@@ -420,6 +420,33 @@ private:
     friend class PressurePlanningSession;
 };
 
+class PressureConstructionCursor {
+public:
+    PressureConstructionCursor(PressureConstructionCursor&& other) noexcept
+        : session_(std::exchange(other.session_, nullptr)), slot_(other.slot_),
+          generation_(other.generation_), release_(other.release_) {}
+
+    PressureConstructionCursor& operator=(PressureConstructionCursor&&)      = delete;
+    PressureConstructionCursor(const PressureConstructionCursor&)            = delete;
+    PressureConstructionCursor& operator=(const PressureConstructionCursor&) = delete;
+
+    ~PressureConstructionCursor() {
+        if (session_) { release_(session_, slot_, generation_); }
+    }
+
+private:
+    PressureConstructionCursor(const void* session, std::uint32_t slot, std::uint32_t generation,
+                               void (*release)(const void*, std::uint32_t, std::uint32_t) noexcept)
+        : session_(session), slot_(slot), generation_(generation), release_(release) {}
+
+    const void* session_;
+    std::uint32_t slot_;
+    std::uint32_t generation_;
+    void (*release_)(const void*, std::uint32_t, std::uint32_t) noexcept;
+    template <class Variant>
+    friend struct detail::PressurePlanningSessionImpl;
+};
+
 template <class Variant>
 class AssessedPressureTarget {
 public:
@@ -533,6 +560,7 @@ private:
 struct PressureExpansionView {
     std::span<const PressureTargetHandle> children;
     std::uint32_t new_canonical_count = 0;
+    bool complete                     = true;
 };
 
 template <class Variant>
@@ -549,12 +577,20 @@ public:
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
+                                                                bool restore = false);
+    [[nodiscard]] runtime::PressureConstructionStep
+    next_construction_option(PressureConstructionCursor& cursor);
+    void choose_construction(PressureConstructionCursor& cursor,
+                             runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<PressureTargetHandle>
-    guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    construction_target(const PressureConstructionCursor& cursor);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget<Variant> assess(PressureTargetHandle target);
-    [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);
+    [[nodiscard]] PreparedPressureExpansion<Variant>
+    prepare_expansion(PressureTargetHandle parent,
+                      std::uint32_t maximum_owners = std::numeric_limits<std::uint32_t>::max());
     [[nodiscard]] PressureExpansionView
     commit_expansion(PreparedPressureExpansion<Variant>&& prepared);
     void discard_expansion(PreparedPressureExpansion<Variant>&& prepared) noexcept;

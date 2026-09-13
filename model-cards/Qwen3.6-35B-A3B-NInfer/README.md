@@ -185,82 +185,90 @@ The artifact supports:
 
 ## Performance
 
-The single-request serving measurements below were collected on an NVIDIA GeForce RTX 5090 with
-CUDA 13.1 compile/runtime. The refreshed MTP3 measurements use CUDA driver API 13.3. Requests were
-submitted serially to a persistent `ninfer-serve` process with CUDA Graph enabled, a 1,024-token
-prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each single-request value is the
-arithmetic mean ± sample standard deviation over five fixed seeds; server warm-up is excluded.
+Measured on 2026-09-07 at NInfer revision `487f89773f07cb18a2fb841fe0971ec9634d409b` through the public HTTP
+serving route on one RTX 5090. The Release build uses CUDA 13.1 compile/runtime and CUDA driver
+API 13.3, INT8 group-64 KV, CUDA Graphs, 1,024-token prefill chunks, and disabled prefix reuse.
+Each measurement point starts a fresh server and excludes startup warmup.
 
-### Concurrent MTP=3 decode saturation
+### Long-context baseline
 
-The concurrent campaign uses CUDA driver API 13.3 and one 293-token prompt followed by an
-8,192-token generation per active request. Each concurrency point starts a fresh server with MTP3,
-INT8 group-64 KV, CUDA Graphs, a 16,384-token per-request context limit, and prefix reuse disabled.
-Aggregate throughput includes only complete one-second intervals whose actual decode batch remains
-equal to C. Each row is one sustained wave.
+No speculative backend; context ceiling 262,144 tokens; five fixed seeds per prompt length.
+Values are arithmetic mean ± sample standard deviation.
 
-| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
-|---:|---:|---:|---:|
-| 1 | 593.0 | 1.00× | 13.75 s |
-| 2 | 877.7 | 1.48× | 18.87 s |
-| 4 | 1,166.0 | 1.97× | 28.43 s |
-| 8 | 1,313.8 | 2.22× | 50.20 s |
+| Prompt tokens | Prefill phase (tok/s) | Server TTFT (ms) | Decode phase (tok/s) |
+| --- | --- | --- | --- |
+| 7,680 | 17,705.4 ± 234.6 | 437.7 ± 6.0 | 338.3 ± 5.5 |
+| 64,512 | 11,758.0 ± 122.3 | 5,510.0 ± 57.3 | 298.1 ± 2.0 |
+| 130,048 | 8,317.1 ± 109.3 | 15,685.1 ± 208.0 | 260.6 ± 4.4 |
+| 260,096 | 5,247.0 ± 30.1 | 49,657.3 ± 283.0 | 213.0 ± 3.3 |
 
-At C=8, the profile sustains **1,313.8 aggregate decode tok/s**.
+### MTP3 single-request decode
 
-### Long-context baseline (MTP disabled)
+Three draft tokens, optimized proposal head, stochastic sampling. The C=1 corpus point supplies
+five samples per reasoning fixture and fifteen per scenario category. Reasoning enables thinking
+with a 65,536-token output budget; other scenarios disable thinking with a 4,096-token budget.
 
-| Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
-|---:|---:|---:|---:|
-| 7,680 | 15,544.3 ± 242.4 | 500.2 ± 7.8 | 271.1 ± 3.6 |
-| 64,512 | 10,809.0 ± 95.3 | 6,009.9 ± 52.6 | 242.9 ± 1.3 |
-| 130,048 | 7,828.4 ± 34.1 | 16,693.3 ± 71.2 | 219.4 ± 1.6 |
-| 260,096 | 5,157.1 ± 52.4 | 50,598.8 ± 519.7 | 188.2 ± 2.1 |
+| Fixture | Completion tokens | Decode phase (tok/s) | Spec acceptance | Spec tokens/round |
+| --- | --- | --- | --- | --- |
+| `long_decode_aime26_01` | 8,407.2 ± 2,764.1 | 750.6 ± 22.4 | 83.5% ± 3.8% | 3.50 ± 0.11 |
+| `long_decode_aime26_15` | 64,860.2 ± 1,511.1 | 636.5 ± 9.2 | 72.0% ± 1.0% | 3.16 ± 0.03 |
+| `long_decode_aime26_30` | 55,354.6 ± 7,132.4 | 683.3 ± 4.0 | 79.2% ± 1.1% | 3.38 ± 0.03 |
 
-### MTP=3 long-reasoning decode
+| Category | Decode phase (tok/s) | Spec acceptance | Spec tokens/round |
+| --- | --- | --- | --- |
+| Code | 677.2 ± 25.6 | 70.5% ± 3.6% | 3.12 ± 0.11 |
+| Story | 465.2 ± 36.3 | 37.8% ± 5.5% | 2.14 ± 0.16 |
+| Translation | 659.0 ± 35.1 | 67.7% ± 5.8% | 3.03 ± 0.17 |
+| Structured | 779.6 ± 44.3 | 87.5% ± 7.1% | 3.63 ± 0.21 |
 
-Thinking was enabled and the output limit was 65,536 tokens.
+### MTP3 corpus makespan
 
-| AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
-|---|---:|---:|---:|---:|
-| Problem 1 | 8,223.0 ± 2,224.1 | 726.2 ± 22.9 | 82.8% ± 3.4% | 3.48 ± 0.10 |
-| Problem 15 | 65,536.0 ± 0.0 | 620.3 ± 8.1 | 72.7% ± 1.4% | 3.18 ± 0.04 |
-| Problem 30 | 52,977.8 ± 11,849.6 | 671.9 ± 8.8 | 80.1% ± 2.7% | 3.40 ± 0.08 |
+Each C runs the same 75-request corpus. Rates use the full makespan, including prefill, workload
+transitions, and drain. The per-request context ceiling is 262,144 tokens and KV capacity is automatic.
 
-### MTP=3 cross-scenario decode
+| C | Decode tokens | Makespan (s) | Requests/s | Corpus decode (tok/s) | Avg batch | MTP acceptance |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 831,378 | 1,279.40 | 0.0586 | 649.8 | 1.00 | 72.2% |
+| 2 | 827,334 | 898.13 | 0.0835 | 921.2 | 2.00 | 73.2% |
+| 4 | 807,280 | 737.87 | 0.1016 | 1,094.1 | 3.45 | 71.7% |
+| 8 | 861,416 | 679.61 | 0.1104 | 1,267.5 | 6.48 | 73.3% |
 
-Each category contains three fixtures and five seeds per fixture (15 samples). Thinking was
-disabled and the output limit was 4,096 tokens.
+### DFlash K=7 single-request decode
 
-| Category | Decode tok/s | MTP acceptance | MTP tokens/round |
-|---|---:|---:|---:|
-| Code | 657.6 ± 34.3 | 70.3% ± 5.5% | 3.11 ± 0.16 |
-| Story | 456.2 ± 36.6 | 38.0% ± 6.0% | 2.14 ± 0.18 |
-| Translation | 649.7 ± 33.0 | 67.6% ± 5.1% | 3.03 ± 0.15 |
-| Structured output | 770.9 ± 29.3 | 89.1% ± 4.9% | 3.67 ± 0.15 |
+Seven draft tokens, optimized proposal head, and the same corpus and context ceiling. Values below
+use stochastic sampling and per-request decode-phase timings.
 
-### DFlash block=8 (`k=7`) decode
+| Fixture | Completion tokens | Decode phase (tok/s) | Spec acceptance | Spec tokens/round |
+| --- | --- | --- | --- | --- |
+| `long_decode_aime26_01` | 8,536.2 ± 3,506.4 | 866.8 ± 47.4 | 66.4% ± 4.0% | 5.65 ± 0.28 |
+| `long_decode_aime26_15` | 65,325.0 ± 471.8 | 641.6 ± 62.4 | 49.7% ± 6.2% | 4.48 ± 0.43 |
+| `long_decode_aime26_30` | 53,756.4 ± 5,693.8 | 732.6 ± 13.3 | 58.1% ± 1.4% | 5.07 ± 0.10 |
 
-These stochastic-sampling measurements use the same fixtures, sampling parameters, and output
-limits as MTP3. Different speculative backends consume random values differently, so this is a
-fixed-workload comparison rather than a token-identical output comparison.
+| Category | Decode phase (tok/s) | Spec acceptance | Spec tokens/round |
+| --- | --- | --- | --- |
+| Code | 620.6 ± 43.3 | 42.6% ± 4.1% | 3.98 ± 0.28 |
+| Story | 291.6 ± 58.8 | 12.2% ± 5.4% | 1.85 ± 0.38 |
+| Translation | 547.5 ± 74.5 | 35.2% ± 6.8% | 3.47 ± 0.48 |
+| Structured | 906.4 ± 127.3 | 69.7% ± 12.5% | 5.88 ± 0.88 |
 
-| Workload | Decode tok/s | DFlash acceptance | DFlash tokens/round | Change vs. MTP3 |
-|---|---:|---:|---:|---:|
-| AIME 2026 problem 1 | 764.1 ± 55.6 | 65.2% ± 5.4% | 5.56 ± 0.38 | +5.2% |
-| AIME 2026 problem 15 | 584.0 ± 33.3 | 51.1% ± 3.7% | 4.58 ± 0.26 | -5.9% |
-| AIME 2026 problem 30 | 638.3 ± 15.8 | 56.4% ± 2.5% | 4.95 ± 0.17 | -5.0% |
-| Code | 562.3 ± 36.2 | 43.0% ± 3.7% | 4.01 ± 0.26 | -14.5% |
-| Story | 261.7 ± 51.1 | 12.1% ± 5.3% | 1.85 ± 0.37 | -42.6% |
-| Translation | 490.8 ± 62.6 | 34.8% ± 6.3% | 3.44 ± 0.44 | -24.5% |
-| Structured output | 786.4 ± 124.7 | 66.5% ± 13.5% | 5.66 ± 0.94 | +2.0% |
+### MTP3 decode saturation
 
-DFlash throughput is acceptance-sensitive: block=8 leads on AIME problem 1 and structured output,
-while MTP3 remains faster on the other measured long-reasoning and cross-scenario cases.
+One 8,192-token generation per active request, a 16,384-token context ceiling, and one wave per C.
+Steady rates include only complete intervals with a full decode batch; acceptance covers the full wave.
 
-See the
-[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
-including metric definitions and the exact reproduction command.
+| C | Steady decode (tok/s) | MTP acceptance (wave) | Wave makespan (s) |
+| --- | --- | --- | --- |
+| 1 | 642.5 | 68.6% | 12.70 |
+| 2 | 907.2 | 66.3% | 18.03 |
+| 4 | 1,213.5 | 69.6% | 27.27 |
+| 8 | 1,380.7 | 68.0% | 47.94 |
+
+All 485 formal requests across the 11 measurement points completed without request, CUDA, or
+out-of-memory failures. No obvious short-cycle repetition was found in the 225 C=1 speculative
+responses. Output-limit samples remain in the reported results.
+
+See the [complete performance report](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.6-35b-a3b.md)
+for DFlash greedy results, corpus token totals, termination counts, resource settings, and commands.
 
 ## Evaluation
 

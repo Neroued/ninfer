@@ -328,6 +328,19 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
+        {"first_improvement_ns", diagnostics.first_improvement_ns
+                                     ? Json(*diagnostics.first_improvement_ns)
+                                     : Json(nullptr)},
+        {"incumbent_improvements", diagnostics.incumbent_improvements},
+        {"search_work", diagnostics.search_work},
+        {"search_granted_ns", diagnostics.search_granted_ns},
+        {"search_renewals", diagnostics.search_renewals},
+        {"search_discovery_used", diagnostics.search_discovery_used},
+        {"search_overshoot_ns", diagnostics.search_overshoot_ns},
+        {"search_stop_phase",
+         ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
+        {"search_boundary_limited", diagnostics.search_boundary_limited},
     };
 }
 

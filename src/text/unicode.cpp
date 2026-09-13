@@ -16,6 +16,18 @@ bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
 } // namespace
 
 std::string normalize_nfc(std::string_view text) {
+    // Every byte below 0x80 is a starter with combining class zero and takes part in no canonical
+    // composition, so pure ASCII is already in NFC and utf8proc has nothing to do with it. The
+    // scan is one pass the compiler vectorises against utf8proc's decode, map and recompose.
+    bool ascii_only = true;
+    for (const char byte : text) {
+        if (static_cast<unsigned char>(byte) >= 0x80u) {
+            ascii_only = false;
+            break;
+        }
+    }
+    if (ascii_only) { return std::string(text); }
+
     utf8proc_uint8_t* mapped = nullptr;
     const utf8proc_ssize_t result =
         utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),

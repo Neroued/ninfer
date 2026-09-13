@@ -698,17 +698,13 @@ Selected source 的合法 `ConsumedToActive` 是 ownership transfer，不计作 
 
 ### 8.4 排序提示不是证明
 
-Program 为未 assessment 的 target 返回 physical residual、预计剩余步数、transfer work 和稳定 ordinal。
-ResourceManager 将其与 selected hits、retention weight、shared credit 和 hit epoch 合并成确定性 priority。
-这些值只决定先探索谁：
+Program 为未 assessment 的 target 返回 physical residual、预计剩余步数、transfer/recovery work 和
+稳定 ordinal。ResourceManager 将这些事实与 portfolio policy、logical publication 条件合并成 priority。
+构造目标同时包含物理容量和逻辑可采用性；物理缺口为零不能代替 publication slot 检查。
 
-- 不能标记 target feasible；
-- 不能排除 candidate 或 target；
-- 不能证明 incumbent 最优；
-- 不能参与 physical readiness。
-
-只有完整 exact assessment 与 logical-adoption check 可以产生可采用方案。日志不再发布
-`model_optimal`、remaining lower bound 或 bound gap。
+这些值只决定探索顺序及 optional 额度边界是否值得继续搜索：不能标记 target feasible，不能证明
+incumbent 最优，不能参与 physical readiness。组合动作可能取消拷贝，预测成本不是可用于剪枝的
+数学下界。只有完整 exact assessment 与 logical-adoption check 可以产生可采用方案。
 
 ### 8.5 无压力路径
 
@@ -739,33 +735,34 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
 ### 8.7 有界 heuristic search
 
-Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证 identity
-或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
+identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
 
 一次 planning problem 中：
 
-1. ResourceManager mint `PlanningCandidateId`、`PlanningOwnerId` 并保留到 catalog capability 的唯一映射；
-2. Program 为每个 candidate 建立只包含 eligible victims 的 domain，source 结构性缺席；
-3. target 是 Program-owned opaque handle；runner 不构造 State/KV action；
-4. guidance 只排列 frontier；
-5. Program exact evaluator 从完整联合 post-state 结算 unique State/KV identity、alias、placement、Move/Fork、
-   COW、Host geometry 和 stage peak；
-6. ResourceManager 按 owner ID 判断 logical adoption 与 future value；
-7. budget 耗尽时返回最佳已验证 incumbent。
+1. ResourceManager mint candidate/owner IDs，保留到 catalog capability 的唯一映射；Program 为每个
+   candidate 建立 selected source 结构性缺席的 eligible victim domain。
+2. Program 持有 opaque targets 与分片构造状态；Runtime 按预计完整 J 和缺口改善排列合法选项，
+   兼顾价值与尽快形成可行方案，不构造 State/KV action。
+3. 优先评估完整候选，失败后根据精确物理与逻辑反馈继续修复。Host geometry 等不能由总字节量
+   证明的条件需要更早的 exact feedback。局部构造以外保留普通 alternatives。
+4. 完整联合 post-state 结算 unique objects、alias、Move/Fork、COW、Host geometry 与 stage peak。
+   只有物理可行且 logical adoption 成功的结果参与最终 J 与稳定 tie-break 比较。
+5. 任意 optional 时间、工作或容量预算耗尽，返回最佳已验证 incumbent。
 
-普通 expansion、guided closure、root maximal 与 seal 使用同一 candidate-specific domain 和同一 exact
-evaluator。不存在另一套 source/victim eligibility 规则，也不存在 synthetic capture
-`AdmissionCandidate` 跨越 common planner 边界。
+构造、修复、普通 expansion、maximal target 与 seal 共用 candidate-specific domain 和 exact evaluator。
+游标、target arena 与借用摘要只在同一 planning session/revision 内有效；批次停止或丢弃不能产生
+真实资源 mutation。结束搜索后不跨 decode/prefill 恢复旧状态。
 
-Search management 使用 ordinal-indexed `BoundedTargetLedger`。Program target choices 存放在
-planning-session-owned flat arena；每个 target 只保存 offset/count，canonical lookup 使用 flat hash。Prepare
-expansion 在 arena 尾部建立 scratch，commit 只保留新 canonical targets，discard 回卷到原 mark。Session
-开始时按固定 target/owner 上限取得容器容量；capacity exhaustion 返回已有 incumbent，不能改变 correctness。
+Engine 提供 admission boundary 共享的 optional 时间额度，head/backfill inspections 不能各自重置。
+预算考虑其他 runnable 请求及本 boundary 已花费的时间。Planner 先用短窗口搜索，再根据尚可获得
+的预计改善和完成成本决定是否续额；不完整预测只有受限探索机会，已实现收益不能反复用于续额。
+Target、工作量和 session storage 仍独立有界。
 
-Target budget 同时约束 canonical targets 与 exact assessments。Materialization 另在不可分的 Program
-operation 之间检查 wall/value budget；identity assessments 和 root maximal correctness assessment 不计
-optional budget。Shared capture 以固定 target budget 约束工作量，incumbent 始终为 Skip。任何 budget 只影响
-cache quality，不改变 mandatory request readiness。
+Identity 与 root maximal correctness assessment 不因 optional 额度耗尽而取消。时间在 Program
+operation 之间检查，估计误差可造成单步越界；最终 seal 仍必须完成。因此预算只影响 cache quality，
+不改变 mandatory readiness，也不承诺整个 planning 调用可在任意时刻中断。
+Shared capture 维持独立的固定 target budget 与 Skip incumbent。
 
 ### 8.8 目标函数与确定性
 
@@ -791,7 +788,8 @@ machine cost model 统一定价并比较。成本模型不会进入 Program API�
 6. candidate 与 target 的稳定 ordinal。
 
 停止原因只描述实际边界：`no_pressure`、`queue_exhausted`、`target_budget`、
-`expansion_capacity`、`time_budget` 或 `value_of_next_expansion`。它们不声明当前 target graph 或真实
+`expansion_capacity`、`time_budget`、`work_budget` 或 `insufficient_expected_gain`。
+`time_budget` 也包括预计下一不可分操作无法放入余量的情况。它们不声明当前 target graph 或真实
 TTFT 的全局最优性。
 
 ### 8.9 Readiness

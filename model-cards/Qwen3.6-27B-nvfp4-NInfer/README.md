@@ -192,7 +192,7 @@ request. Each concurrency point starts a fresh server with MTP3, INT8 group-64 K
 only complete one-second intervals whose actual decode batch remains equal to C. Each row is one
 sustained wave.
 
-| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+| C | Steady decode (tok/s) | Speedup vs. C1 | Wave makespan |
 |---:|---:|---:|---:|
 | 1 | 202.4 | 1.00× | 40.46 s |
 | 2 | 399.7 | 1.97× | 41.82 s |
@@ -203,7 +203,7 @@ At C=8, the profile sustains **1,146.9 aggregate decode tok/s**, or **5.67×** i
 
 ### Long-context baseline (MTP disabled)
 
-| Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+| Prompt tokens | Prefill phase (tok/s) | Server TTFT (ms) | Decode phase (tok/s) |
 |---:|---:|---:|---:|
 | 7,680 | 11,191.5 ± 70.2 | 692.5 ± 4.3 | 86.4 ± 0.5 |
 | 64,512 | 6,298.5 ± 97.6 | 10,288.6 ± 159.3 | 78.0 ± 1.2 |
@@ -217,7 +217,7 @@ at 260,096 prompt tokens it is 1.55×.
 
 Thinking was enabled and the output limit was 65,536 tokens.
 
-| AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+| AIME 2026 fixture | Completion tokens | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
 | Problem 1 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
 | Problem 15 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
@@ -228,7 +228,7 @@ Thinking was enabled and the output limit was 65,536 tokens.
 Each category contains three fixtures and five seeds per fixture (15 samples). Thinking was
 disabled and the output limit was 4,096 tokens.
 
-| Category | Decode tok/s | MTP acceptance | MTP tokens/round |
+| Category | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
 | Code | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
 | Story | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
@@ -236,10 +236,14 @@ disabled and the output limit was 4,096 tokens.
 | Structured output | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
 
 See the
-[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
+[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.6-27b.md),
 including metric definitions, comparison data, and the exact reproduction command.
 
 ## Evaluation
+
+The historical serving revision was `b3d4d0f50b868711c62432bbd68e746217a2f49a`.
+See the [evaluation workflow](https://github.com/Neroued/ninfer/blob/master/eval/README.md#historical-qwen36-27b-reasoning-profile)
+for the serving and runner commands.
 
 The artifact was evaluated through NInfer's OpenAI-compatible serving route with thinking enabled,
 MTP=3, and a 262,144-token context limit. EvalScope 1.9.0 used 0-shot prompts, rule-based scoring,

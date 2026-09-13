@@ -246,7 +246,7 @@ each, for 75 requests. Every concurrency point starts a fresh server and uses th
 and ordered HTTP send sequence. C=1 is the serial single-request corpus. Makespan includes prefill,
 decode, workload transitions, and final drain.
 
-| C | Requests | Decode tokens | Makespan | Requests/s | Decode tok/s | Avg batch | MTP acceptance | Speedup |
+| C | Requests | Decode tokens | Makespan | Requests/s | Corpus decode (tok/s) | Avg batch | MTP acceptance | Speedup |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | 75 | 752,160 | 4,670.27 s | 0.0161 | 161.1 | 1.00 | 60.8% | 1.00× |
 | 2 | 75 | 739,951 | 2,510.78 s | 0.0299 | 294.7 | 1.98 | 59.2% | 1.86× |
@@ -264,7 +264,7 @@ decode-token totals are shown above.
 Each value is the arithmetic mean ± sample standard deviation over five fixed seeds after server
 warm-up.
 
-| Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+| Prompt tokens | Prefill phase (tok/s) | Server TTFT (ms) | Decode phase (tok/s) |
 |---:|---:|---:|---:|
 | 7,680 | 8,340.4 ± 13.0 | 931.6 ± 1.6 | 71.2 ± 0.1 |
 | 64,512 | 5,297.9 ± 259.2 | 12,281.1 ± 561.5 | 65.7 ± 0.8 |
@@ -276,7 +276,7 @@ warm-up.
 The C=1 point supplies five samples for each fixture. Values are arithmetic mean ± sample standard
 deviation from server phase timings and speculative counters.
 
-| AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+| AIME 2026 fixture | Completion tokens | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
 | Problem 1 | 1,465.4 ± 417.3 | 195.2 ± 4.6 | 76.0% ± 2.4% | 3.28 ± 0.07 |
 | Problem 15 | 65,414.4 ± 271.9 | 151.4 ± 2.0 | 56.2% ± 1.1% | 2.69 ± 0.03 |
@@ -286,7 +286,7 @@ deviation from server phase timings and speculative counters.
 
 Each category contains three fixtures and five seeds per fixture, for 15 samples.
 
-| Category | Decode tok/s | MTP acceptance | MTP tokens/round |
+| Category | Decode phase (tok/s) | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
 | Code | 194.3 ± 6.1 | 76.4% ± 3.9% | 3.29 ± 0.12 |
 | Story | 126.1 ± 10.9 | 37.4% ± 5.8% | 2.12 ± 0.17 |
@@ -294,7 +294,7 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 | Structured output | 219.8 ± 8.6 | 90.8% ± 5.1% | 3.72 ± 0.15 |
 
 See the
-[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md)
+[full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.8-27b.md)
 for metric definitions and the exact reproduction command.
 
 ## Evaluation

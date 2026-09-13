@@ -68,6 +68,17 @@ union alignas(16) W8SmallTMmaSharedStorage {
     float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
 };
 
+// Toolchains before CUDA 13 cap statically allocated shared memory at 48 KiB. An instantiation whose
+// staged storage exceeds that cap stages it in dynamic shared memory, so every launch site requests
+// the size reported here and raises the block limit before launching.
+template <class Schedule, bool TiledColumns, int ActiveCols>
+__host__ __device__ constexpr std::size_t w8_small_t_mma_dynamic_bytes() {
+    constexpr std::size_t kStorageBytes = sizeof(W8SmallTMmaSharedStorage<Schedule>);
+    return kStorageBytes > kW8SmallTMmaStaticSharedBytes || (TiledColumns && ActiveCols > 64)
+               ? kStorageBytes
+               : 0;
+}
+
 struct W8SmallTMmaIdentityColumns {
     __device__ __forceinline__ int operator()(int column) const { return column; }
 };
@@ -99,9 +110,10 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
 
     using SharedStorage = W8SmallTMmaSharedStorage<Schedule>;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
-    __shared__ __align__(
-        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
+    constexpr std::size_t kDynamicBytes =
+        w8_small_t_mma_dynamic_bytes<Schedule, TiledColumns, ActiveCols>();
+    constexpr bool kDynamicShared = kDynamicBytes != 0;
+    __shared__ __align__(16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];
     auto& shared =
         *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);

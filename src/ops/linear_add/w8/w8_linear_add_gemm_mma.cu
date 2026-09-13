@@ -18,8 +18,15 @@ void launch_tt(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStrea
     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), rows};
+    constexpr std::size_t kDynamicBytes = w8_rowsplit_gemm_mma_dynamic_bytes<Schedule>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Residual, W8ContiguousOutput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Residual>
-        <<<grid, Schedule::THREADS, 0, stream>>>(
+        <<<grid, Schedule::THREADS, kDynamicBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
 }

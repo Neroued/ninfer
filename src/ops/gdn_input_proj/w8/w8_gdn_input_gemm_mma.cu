@@ -18,11 +18,19 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& 
     static_assert((8192 % Schedule::BM) == 0 && (4096 % Schedule::BM) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     const dim3 grid(kRows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+    constexpr std::size_t kDynamicBytes = w8_rowsplit_gemm_mma_dynamic_bytes<Schedule>();
+    if constexpr (kDynamicBytes > kW8SmallTMmaStaticSharedBytes) {
+        static const cudaError_t attribute = cudaFuncSetAttribute(
+            w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+        CUDA_CHECK(attribute);
+    }
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>
-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                 static_cast<const std::uint8_t*>(weight.qdata),
-                                                 static_cast<const std::uint8_t*>(weight.scales),
-                                                 output, kRows, kHidden, x.ne[1], kHidden);
+        <<<grid, Schedule::THREADS, kDynamicBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output, kRows, kHidden, x.ne[1],
+            kHidden);
 }
 
 } // namespace

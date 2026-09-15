@@ -22,8 +22,8 @@ enum class Nvfp4LinearSwiGluRoute {
     TmaFusedW4A4,
 };
 
-constexpr std::int32_t kTmaBlockM      = 256;
 constexpr std::int32_t kFusedMaxTokens = 128;
+constexpr std::int32_t kRaggedFloor    = kNvfp4TmaBlockM + kNvfp4TmaBlockM / 2;
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
@@ -38,7 +38,13 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= kFusedMaxTokens) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
-    if (tokens >= kTmaBlockM && (tokens % kTmaBlockM) == 0) {
+    // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
+    // own condition; the call site below forces the matching scale layout.
+    //
+    // It no longer needs a whole number of tiles, but a width just past one tile would pay for a
+    // second tile that is almost all padding - at 257 tokens that is a third of the work for one
+    // token of it. So: one whole tile, or one and a half and up.
+    if (tokens == kNvfp4TmaBlockM || tokens >= kRaggedFloor) {
         return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
     }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
@@ -95,19 +101,24 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
         maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
     }
-    if (max_tokens >= kTmaBlockM) {
-        const std::int32_t largest_fused = max_tokens - (max_tokens % kTmaBlockM);
-        if (largest_fused >= std::max(min_tokens, kTmaBlockM)) {
-            maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
+    // The fused TMA route is no longer confined to multiples of the tile, so the widest width that
+    // reaches it is max_tokens itself whenever the route admits it.
+    for (std::int32_t tokens = max_tokens; tokens >= std::max(min_tokens, kNvfp4TmaBlockM);
+         --tokens) {
+        if (resolve_route(policy, tokens) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
+            maximum = std::max(maximum, fused_workspace_bytes(tokens));
+            break;
         }
     }
 
-    std::int32_t last_baseline = max_tokens;
-    if (resolve_route(policy, last_baseline) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
-        --last_baseline;
-    }
-    if (last_baseline >= std::max(min_tokens, kFusedMaxTokens + 1)) {
-        maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
+    // Likewise the widest width that still falls through to the baseline route: scan down for it
+    // rather than assume it is one below max_tokens.
+    for (std::int32_t tokens = max_tokens; tokens >= std::max(min_tokens, kFusedMaxTokens + 1);
+         --tokens) {
+        if (resolve_route(policy, tokens) == Nvfp4LinearSwiGluRoute::LinearW4A4Post) {
+            maximum = std::max(maximum, baseline_workspace_bytes(tokens));
+            break;
+        }
     }
     return maximum;
 }
@@ -128,7 +139,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();
         const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+        launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled, stream);
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_linear_swiglu_w4a4_tma(
             scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),

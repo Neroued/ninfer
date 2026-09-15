@@ -37,8 +37,11 @@ Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t toke
     }
     const std::size_t code_bytes =
         nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 2);
-    const std::size_t scale_bytes =
-        nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 16);
+    // The tiled layout addresses whole tiles, so the scale plane is allocated for the padded token
+    // count: at most 255 tokens of scales, under 0.3 MiB on the widest registered K, and paid
+    // whichever layout the quantizer then writes.
+    const std::size_t scale_bytes = nvfp4_w4a4_checked_bytes(
+        nvfp4_w4a4_padded_tokens(tokens), static_cast<std::size_t>(input_rows) / 16);
     const DeviceSpan codes  = arena.alloc_bytes(code_bytes, 256);
     const DeviceSpan scales = arena.alloc_bytes(scale_bytes, 256);
     return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data)};
@@ -52,7 +55,7 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 }
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream);
+                                Nvfp4ScaleLayout layout, cudaStream_t stream);
 
 
 } // namespace ninfer::ops::detail

@@ -218,7 +218,12 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
+    // 1023 and 1025 straddle this projection's W4A4 TMA floor: the scale plane is written tiled
+    // at 1024 and row-major on either side, so a layout disagreeing with the selected route shows
+    // up here and nowhere else.
+    failures += run_nvfp4_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 1025, ops::LinearPolicy::AllowA4);
     return failures;
 }
 

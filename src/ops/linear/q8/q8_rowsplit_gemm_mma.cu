@@ -46,7 +46,11 @@ using MmaR32C96  = Q8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
 using MmaR32C128 = Q8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
 using MmaR48C64  = Q8RowSplitMmaGemmSchedule<48, 64, 48, 16, 3>;
 using MmaR64C96  = Q8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
-using MmaR64C128 = Q8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+// The wide route of the linear family is the one schedule measured to want cg on the predicated
+// path; every other schedule, here and in the six other Ops that instantiate this same tile, keeps
+// the inherited ca.
+using MmaR64C128 =
+    Q8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>::with_predicated_cache<Cache::cg>;
 using MmaR96C96  = Q8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
 using MmaR128C64 = Q8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
 using MmaR128C80 = Q8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;

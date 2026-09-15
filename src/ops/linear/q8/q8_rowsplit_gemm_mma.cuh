@@ -10,6 +10,7 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -26,8 +27,18 @@ union alignas(16) Q8Bf16x8Bits {
 
 static_assert(sizeof(Q8Bf16x8Bits) == 16);
 
+// The predicated loads below inherited Cache::ca from cp_async_zfill's default, while the full path
+// a few lines down spells cg. This parameter makes that a choice. It defaults to ca, so adding it
+// changes no instantiation, and it governs the predicated branch only - the full branch keeps its
+// own cg - which is why it is named for it.
+//
+// ca stays the default because whether cg pays is not a property of the schedule. Forced onto cg,
+// the two BM = 16 schedules in this tree cost +16.8 % and +21.0 % of the operation. It is not a
+// property of BM either: MmaR64x16C48K128A1, a BM = 64 tile, gains 3.3 % on [34816, 5120] and loses
+// 1.1 % on [248320, 5120]. So the policy is set per schedule, and only where it has been measured
+// across the shapes that reach it.
 template <int BM_, int BN_, int WM_, int WN_, int MIN_BLOCKS_, int STAGES_ = 2, int BK_ = 64,
-          int ACTIVATION_STAGES_ = STAGES_>
+          int ACTIVATION_STAGES_ = STAGES_, Cache PredicatedCache_ = Cache::ca>
 struct Q8RowSplitMmaGemmSchedule {
     static constexpr int BM                = BM_;
     static constexpr int BN                = BN_;
@@ -47,6 +58,16 @@ struct Q8RowSplitMmaGemmSchedule {
     static constexpr int SCALE_CACHE_BYTES = 16;
     static constexpr int SMEM_BYTES =
         BM * BK * 2 + ACTIVATION_STAGES * BN * BK * 2 + BM * BK + BM * SCALE_CACHE_BYTES;
+
+    // Cache policy for the predicated loads only; see the note above the template.
+    static constexpr Cache kPredicatedCache = PredicatedCache_;
+
+    // Restate this schedule with a different predicated policy, leaving every other parameter where
+    // it is rather than respelling it - and its default with it - at the point of use.
+    template <Cache Policy>
+    using with_predicated_cache =
+        Q8RowSplitMmaGemmSchedule<BM_, BN_, WM_, WN_, MIN_BLOCKS_, STAGES_, BK_, ACTIVATION_STAGES_,
+                                  Policy>;
 
     static_assert(BM % WM == 0 && BN % WN == 0);
     static_assert(WM % 16 == 0 && WN % 8 == 0);
@@ -146,7 +167,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                ninfer::ops::cp_async_zfill<16>(
+                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -170,8 +191,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
             } else {
                 const bool valid_row  = output_tile.valid(grow, m);
                 const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
-                                                valid_row ? 16 : 0);
+                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                    dst, &codes[gi * 32 + chunk * 16], valid_row ? 16 : 0);
             }
         }
         if ((kt % SCALE_CACHE_TILES) == 0) {
@@ -187,7 +208,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
+                    ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
+                                                                           valid_scales * 2);
                 }
             }
         }

@@ -86,7 +86,7 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
     auto scope = workspace.scope();
     const Nvfp4W4a4Workspace scratch =
         allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
-    launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
     launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
 }
 

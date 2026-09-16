@@ -100,9 +100,9 @@ __global__ __launch_bounds__(
                     Schedule::kBlockM * Schedule::kCodeRowBytes +
                     Schedule::kBlockN * Schedule::kCodeRowBytes + kScaleBytes +
                     2 * Schedule::kBlockN * Schedule::kK64PerStage * 4;
-                // TMA's innermost box cannot be narrower than 16 bytes and 16 bytes of
-                // activation scales cover two K tiles, so the box is fetched on the even tile
-                // only and the odd tile expects that many bytes fewer.
+                // A scale tile covers kNvfp4ScaleTileGroups groups, which is two K tiles, so the
+                // box is fetched on the even tile only and the odd tile expects that many bytes
+                // fewer.
                 const bool load_scales = (k_tile & 1) == 0;
                 cta_mbarrier_arrive_expect_tx(&shared.full[stage],
                                               load_scales ? kTransactionBytes
@@ -119,8 +119,14 @@ __global__ __launch_bounds__(
                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales,
-                                      (k_tile / 2) * 16, token_begin, &shared.full[stage]);
+                    // Tile-contiguous, so the box address is a tile index; see the shared W4A4
+                    // producer for the same addressing.
+                    constexpr int kScaleTilesPerPlane =
+                        Geometry::kGroupsPerRow / kNvfp4ScaleTileGroups;
+                    const int scale_tile =
+                        (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales, 0,
+                                      scale_tile * 16, &shared.full[stage]);
                 }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +

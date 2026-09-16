@@ -14,6 +14,14 @@ namespace ninfer::ops::detail {
 using Nvfp4A4Launch = void (*)(const Weight&, Tensor&, Nvfp4W4a4Workspace, std::int32_t,
                                cudaStream_t);
 
+// A selected A4 route: the GEMM to run, and the activation-scale layout that GEMM reads. They
+// travel together because the quantizer writes the plane before the GEMM runs and the two must
+// agree; a shape selects a route rather than selecting the two halves separately.
+struct Nvfp4A4Route {
+    Nvfp4A4Launch launch;
+    Nvfp4ScaleLayout scales;
+};
+
 template <class Geometry, class Schedule>
 void launch_nvfp4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
@@ -95,10 +103,23 @@ void launch_nvfp4_a4_tma(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace s
                                  static_cast<__nv_bfloat16*>(out.data), tokens, alpha, stream);
 }
 
-template <Nvfp4A4Launch (*Select)(std::int32_t)>
+// The TMA GEMM reads the tiled plane; every MMA GEMM reads the row-major one. Stating that here,
+// once per kind, is what keeps a shape from pairing them the other way round.
+template <Nvfp4GeometryId Geometry>
+constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
+    return {launch_nvfp4_a4_tma<Geometry>, Nvfp4ScaleLayout::Tiled};
+}
+
+template <class Geometry, class Schedule>
+constexpr Nvfp4A4Route nvfp4_a4_mma_route() {
+    return {launch_nvfp4_a4_mma<Geometry, Schedule>, Nvfp4ScaleLayout::RowMajor};
+}
+
+template <Nvfp4A4Route (*Select)(std::int32_t)>
 void launch_nvfp4_a4(const Tensor& x, const Weight& weight, Tensor& out, Nvfp4W4a4Workspace scratch,
                      cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
-    Select(x.ne[1])(weight, out, scratch, x.ne[1], stream);
+    const Nvfp4A4Route route = Select(x.ne[1]);
+    launch_nvfp4_w4a4_quantize(x, weight, scratch, route.scales, stream);
+    route.launch(weight, out, scratch, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

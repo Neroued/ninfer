@@ -52,7 +52,7 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 }
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream);
+                                Nvfp4ScaleLayout layout, cudaStream_t stream);
 
 
 } // namespace ninfer::ops::detail

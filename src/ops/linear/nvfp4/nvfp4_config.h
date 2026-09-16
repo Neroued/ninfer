@@ -2,6 +2,21 @@
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 
 namespace ninfer::ops::detail {
+// Tile the W4A4 TMA route reads activation scales in: kNvfp4TmaBlockM tokens by
+// kNvfp4ScaleTileGroups groups, written contiguously by the quantizer so one request covers the
+// whole tile. Sixteen groups are 16 bytes, which is two K tiles, which is why the scale box is
+// fetched on even k-tiles only. The layout is written by nvfp4_tiled_scale_offset in
+// nvfp4_w4a4_mma.cuh and read by the descriptors in nvfp4_w4a4_tma.cuh.
+inline constexpr std::int32_t kNvfp4TmaBlockM       = 256;
+inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
+
+// Which of the two layouts the quantizer writes. Named rather than passed as a bool so that a call
+// site forcing one of them says which.
+enum class Nvfp4ScaleLayout : std::uint8_t {
+    RowMajor,
+    Tiled,
+};
+
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
     Direct,

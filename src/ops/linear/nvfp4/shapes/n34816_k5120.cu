@@ -38,13 +38,13 @@ Nvfp4Launch select_a16(std::int32_t tokens) {
     throw std::logic_error("nvfp4 A16 chunk exceeds shape capacity");
 }
 
-Nvfp4A4Launch select_a4(std::int32_t tokens) {
-    if (tokens >= 256 && tokens % 256 == 0)
-        return launch_nvfp4_a4_tma<Nvfp4GeometryId::N34816K5120>;
-    if (tokens <= 32) return launch_nvfp4_a4_mma<Geometry, T32R128>;
-    if (tokens <= 64) return launch_nvfp4_a4_mma<Geometry, T64R128>;
-    if (tokens <= 128) return launch_nvfp4_a4_mma<Geometry, T128R128Pipelined>;
-    return launch_nvfp4_a4_mma<Geometry, T128R128Resident>;
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    if (tokens >= 256 && (tokens % kNvfp4TmaBlockM) == 0)
+        return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R128>();
+    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
 }
 
 bool uses_a4(std::int32_t, std::int32_t) { return true; }

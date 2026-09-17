@@ -82,7 +82,7 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor
                     cudaStream_t stream) {
     constexpr int kRowsPerBlock = 16;
     constexpr int kThreads      = kRowsPerBlock * 32;
-    q5_rowsplit_gemv_kernel<kValueZRows, kHidden, kRowsPerBlock, 2, true, false, true, kValueRows>
+    q5_rowsplit_gemv_kernel<kValueZRows, kHidden, kRowsPerBlock, 2, true, true, kValueRows>
         <<<kValueZRows / kRowsPerBlock, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),

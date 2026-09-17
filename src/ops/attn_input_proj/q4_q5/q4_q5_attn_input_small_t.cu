@@ -94,7 +94,7 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
     constexpr int kRowsPerBlock = 16;
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     constexpr int kGrid         = kParentRows / kRowsPerBlock;
-    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, false, true, kSplitRow>
+    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, true, kSplitRow>
         <<<kGrid, kBlockThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                               static_cast<const std::uint8_t*>(weight.qdata),
                                               static_cast<const std::uint8_t*>(weight.qhigh),

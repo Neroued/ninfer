@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -46,6 +47,24 @@ void launch_simt_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream
     });
 }
 
+// Exact one-column launch of the 4-warp split kernel. kStride names K itself, so the activation
+// block of a row is contiguous and 16-byte aligned; the four warps split that block four ways
+// instead of the single warp a tile kernel would give one column.
+template <int K>
+void launch_split4_c1(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    static_assert(K % 1024 == 0, "direct split4 needs whole 1024-wide K slabs");
+    if (x.ne[1] != 1) { throw std::invalid_argument("q5 split4 c1: exact one-column launch"); }
+    constexpr int kThreads = 4 * 32;
+    const dim3 grid(static_cast<unsigned>(out.ne[0]), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 1, K / 1024, K>
+        <<<grid, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(out.data), nullptr, out.ne[0], out.ne[0], K, 1,
+            w.padded_shape[1], K / 1024);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -54,6 +73,19 @@ void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStr
 
 void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_simt_route<8>(x, w, out, stream);
+}
+
+void launch_q5_split4_c1_k5120(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_split4_c1<5120>(x, w, out, stream);
+}
+
+void launch_q5_split4_c1_k6144(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_split4_c1<6144>(x, w, out, stream);
+}
+
+void launch_q5_split4_c1_k17408(const Tensor& x, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    launch_split4_c1<17408>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

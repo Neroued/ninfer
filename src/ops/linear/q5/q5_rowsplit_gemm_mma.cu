@@ -19,6 +19,17 @@ using MmaR64C64Schedule =
 using MmaR64C128Schedule =
     Q5RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
+// Narrow-column tiles: a 128-wide tile spends a whole wave per four column tiles regardless of how
+// many of its columns are live, so the row geometries whose T stays narrow are cheaper here.
+using MmaR64C16Schedule =
+    Q5RowSplitMmaGemmSchedule<64, 16, 64, 16, 8, 2, 3, Q5FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q5ScaleLoad::Pair32>;
+using MmaR64C32S3Schedule =
+    Q5RowSplitMmaGemmSchedule<64, 32, 64, 16, 16, 3, 2, Q5FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q5ScaleLoad::Pair32>;
+using MmaR32C128Schedule =
+    Q5RowSplitMmaGemmSchedule<32, 128, 64, 32, 32, 2, 1, Q5FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q5ScaleLoad::Pair32>;
 
 template <class Schedule, bool Full, Q5MmaEpilogue Epilogue>
 void launch_kernel(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -62,6 +73,18 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
 void launch_q5_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<MmaR64C64Schedule>(x, w, out, stream);
+}
+
+void launch_q5_mma_r64_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_route<MmaR64C16Schedule>(x, w, out, stream);
+}
+
+void launch_q5_mma_r64_c32_s3(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_route<MmaR64C32S3Schedule>(x, w, out, stream);
+}
+
+void launch_q5_mma_r32_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_route<MmaR32C128Schedule>(x, w, out, stream);
 }
 
 void launch_q5_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

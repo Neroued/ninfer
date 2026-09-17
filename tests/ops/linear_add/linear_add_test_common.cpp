@@ -86,6 +86,17 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
         }
         result.push_back(interior);
     }
+    if (shape.composite_offset > 0) {
+        // The composite resolves its tail through the same table, so every route start is a
+        // boundary of the composite as well - exactly one whole wave later.
+        for (const std::int32_t boundary : shape.route_starts) {
+            result.push_back(shape.composite_offset + boundary - 1);
+            result.push_back(shape.composite_offset + boundary);
+            if (boundary != std::numeric_limits<std::int32_t>::max()) {
+                result.push_back(shape.composite_offset + boundary + 1);
+            }
+        }
+    }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -301,9 +312,9 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
 
     const std::vector<std::int32_t> oracle_rows =
         shape.full_output ? all_indices(shape.n) : sampled_indices(shape.n);
-    const QType qtype                           = qtype_for(format);
-    const HostWeight host_weight                = make_weight(format, shape);
-    const std::vector<float> oracle_weight      = materialize_weight_rows(host_weight, oracle_rows);
+    const QType qtype                      = qtype_for(format);
+    const HostWeight host_weight           = make_weight(format, shape);
+    const std::vector<float> oracle_weight = materialize_weight_rows(host_weight, oracle_rows);
     const std::vector<std::uint16_t> activation =
         make_activation(shape.k, maximum_t, shape.seed + 1U);
     const std::vector<std::uint16_t> residual = make_residual(shape.n, maximum_t, shape.seed + 2U);

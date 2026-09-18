@@ -184,9 +184,9 @@ std::filesystem::path prepare_output_directory(const Options& options,
                                                const ninfer::LoadSummary& load,
                                                const CorpusSelection& corpus) {
     std::filesystem::path output = options.output.value_or(
-        std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
-        safe_component(load.weights_id) / kv_name(options.kv) / safe_component(corpus.corpus_id) /
-        safe_component(corpus.mode) / timestamp());
+        std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
+        safe_component(load.prefill_signature) / kv_name(options.kv) /
+        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
             std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
@@ -377,14 +377,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
 
     json report{
-        {"schema_version", 1},
+        {"schema_version", 2},
         {"metric",
          {{"name", "fixed-window truncated-context causal perplexity"}, {"log_base", "natural"}}},
         {"artifact",
          {{"path", std::filesystem::absolute(options.artifact).lexically_normal().string()},
-          {"target", load.target},
-          {"model_id", load.model_id},
-          {"weights_id", load.weights_id}}},
+          {"architecture", load.architecture},
+          {"name", load.model_name},
+          {"prefill_signature", load.prefill_signature},
+          {"formats", load.weight_formats}}},
         {"corpus",
          {{"id", corpus.corpus_id},
           {"mode", corpus.mode},
@@ -422,7 +423,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     std::filesystem::rename(temporary, final);
 
     std::cout << "Perplexity result\n"
-              << "artifact: " << load.model_id << " / " << load.weights_id << '\n'
+              << "artifact: " << load.model_name << '\n'
               << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
               << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
               << "\n\n";

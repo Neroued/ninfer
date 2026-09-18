@@ -83,7 +83,6 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
-    [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an

@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"

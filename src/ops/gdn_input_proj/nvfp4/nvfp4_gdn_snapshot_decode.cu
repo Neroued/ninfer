@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
@@ -12,8 +13,9 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
-    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    using Geometry = Nvfp4N16384K5120;
+    using Schedule =
+        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;

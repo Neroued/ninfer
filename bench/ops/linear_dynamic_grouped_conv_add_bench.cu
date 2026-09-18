@@ -1,7 +1,8 @@
+#include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ninfer_bench_common.h"
-#include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
+#include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -88,7 +89,7 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
     DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides);
     DeviceBuffer delta = make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8);
     DeviceBuffer residual        = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8);
-    PackedQuantizedWeight packed = make_row_split_weight(QType::W8G32_F16S, kHidden, input_rows,
+    PackedQuantizedWeight packed = make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows,
                                                          input_rows, {0x31U, 0x00U, 0x1800U});
     const std::size_t capacity =
         ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
@@ -122,7 +123,7 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
                             batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            const char* route = ops::detail::w8_linear_dynamic_grouped_conv_add_route_name(
+            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
                 input_rows, width, batch_size);
             measure(route, [&](cudaStream_t capture_stream) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,

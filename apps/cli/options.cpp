@@ -67,6 +67,10 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 }
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
+    if (text == "none") { return ReasoningEffort::None; }
+    if (text == "minimal") { return ReasoningEffort::Minimal; }
+    if (text == "high") { return ReasoningEffort::High; }
+    if (text == "max") { return ReasoningEffort::Max; }
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
     if (text == "xhigh") { return ReasoningEffort::XHigh; }
@@ -86,8 +90,9 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
+           "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
@@ -123,6 +128,8 @@ Options parse_options(int argc, char** argv) {
 
         if (arg == "--prompt") {
             options.prompt = value(arg);
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
@@ -217,10 +224,12 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (!options.enable_thinking && options.reasoning_effort) {
+    if (options.enable_thinking == false && options.reasoning_effort &&
+        *options.reasoning_effort != ReasoningEffort::None) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }
-    if (!options.enable_thinking && options.thinking_budget) {
+    if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
+    if (options.enable_thinking == false && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }

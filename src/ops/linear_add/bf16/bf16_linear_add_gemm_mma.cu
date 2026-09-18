@@ -1,9 +1,10 @@
+#include "core/weight.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/bf16/bf16_config.h"
-#include "ops/linear/bf16/bf16_gemm_mma_config.h"
+#include "ops/linear/bf16/bf16_gemm_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -36,7 +37,7 @@ struct Bf16LinearAddMmaOutput {
 
 template <class Schedule, bool FullTokens>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<5120, 6144>;
+    using Geometry = Bf16Geometry<5120, 6144>;
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
 
@@ -81,8 +82,9 @@ void bf16_linear_add_aggregate_mma_launch(const Tensor& x, const Weight& weight,
 
 void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<5120, 6144>;
-    using Schedule = Bf16MmaProductionSchedule<Geometry>;
+    using Geometry = Bf16Geometry<5120, 6144>;
+    using Schedule = Bf16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Cache::cg, Cache::cg,
+                                     Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
     if ((x.ne[1] % Schedule::kBlockCols) == 0) {
         launch_variant<Schedule, true>(x, weight, residual, stream);
     } else {

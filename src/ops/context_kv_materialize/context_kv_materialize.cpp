@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
@@ -38,7 +39,7 @@ void require_weight(const Weight& weight, const char* name) {
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
     constexpr std::uint64_t kScaleBytes =
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
         weight.ndim != 2 || weight.n != kKVSize || weight.k != kHidden ||
         weight.shape[0] != kKVSize || weight.shape[1] != kHidden ||

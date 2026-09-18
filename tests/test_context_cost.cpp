@@ -1,4 +1,4 @@
-#include "runtime/engine/context_cost.h"
+#include "runtime/engine/context_cache/context_cost.h"
 
 #include "core/host_kv_arena.h"
 
@@ -76,7 +76,7 @@ Json prefill_json(const ninfer::runtime::ContextPrefillCost& value) {
 }
 
 Json document(Json machines) {
-    return Json{{"schema_version", 2},
+    return Json{{"schema_version", 3},
                 {"artifact_type", "ninfer_context_cost_presets"},
                 {"machines", std::move(machines)}};
 }
@@ -87,11 +87,8 @@ Json machine(std::string hardware, Json transfer_value, Json prefill_values) {
                 {"prefill", std::move(prefill_values)}};
 }
 
-Json prefill_entry(std::string model, std::string weights,
-                   const ninfer::runtime::ContextPrefillCost& value) {
-    return Json{{"model_id", std::move(model)},
-                {"weights_id", std::move(weights)},
-                {"coefficients", prefill_json(value)}};
+Json prefill_entry(std::string signature, const ninfer::runtime::ContextPrefillCost& value) {
+    return Json{{"prefill_signature", std::move(signature)}, {"coefficients", prefill_json(value)}};
 }
 
 std::string read_file(const std::filesystem::path& path) {
@@ -230,7 +227,7 @@ void test_kv_physical_work() {
 
 void test_schema_validation() {
     Json entries = Json::array();
-    entries.push_back(prefill_entry("model", "weights", prefill()));
+    entries.push_back(prefill_entry("config-and-formats", prefill()));
     const Json valid =
         document(Json::array({machine("machine", transfer_json(transfer()), entries)}));
     const auto parsed = ninfer::runtime::parse_context_cost_presets(valid.dump(), "test");
@@ -283,20 +280,27 @@ void test_resolution_and_atomic_upserts() {
     const std::filesystem::path path = directory / "presets.json";
     try {
         const ninfer::runtime::ContextCostIdentity compiled_identity{
-            .hardware_class = "nvidia-geforce-rtx-5090-sm120",
-            .model_id       = "qwen3.6-27b",
-            .weights_id     = "groupwise-int",
+            .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+            .prefill_signature = "unmeasured-config-and-formats",
         };
         const auto compiled = ninfer::runtime::resolve_context_machine_cost(compiled_identity);
         expect(
             compiled.summary.transfer_source == ninfer::ContextCostPresetSource::CompiledDefault &&
-                compiled.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault,
+                compiled.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault,
             "compiled transfer and prefill defaults did not resolve independently");
 
+        const auto measured = ninfer::runtime::resolve_context_machine_cost({
+            .hardware_class    = compiled_identity.hardware_class,
+            .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
+        });
+        expect(measured.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::CompiledDefault &&
+                   measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
+               "measured bindings did not select their compiled prefill cost");
+
         const ninfer::runtime::ContextCostIdentity unknown{
-            .hardware_class = "unmeasured-machine",
-            .model_id       = "unmeasured-model",
-            .weights_id     = "unmeasured-weights",
+            .hardware_class    = "unmeasured-machine",
+            .prefill_signature = "unmeasured-config-and-formats",
         };
         const auto generic = ninfer::runtime::resolve_context_machine_cost(unknown);
         expect(
@@ -325,9 +329,8 @@ void test_resolution_and_atomic_upserts() {
                "independent external transfer/prefill entries did not compose");
 
         const ninfer::runtime::ContextCostIdentity other_model{
-            .hardware_class = unknown.hardware_class,
-            .model_id       = "other",
-            .weights_id     = "other",
+            .hardware_class    = unknown.hardware_class,
+            .prefill_signature = "other-config-and-formats",
         };
         const auto layered_miss = ninfer::runtime::resolve_context_machine_cost(other_model, path);
         expect(layered_miss.summary.transfer_source == ninfer::ContextCostPresetSource::External &&

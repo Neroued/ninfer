@@ -1,14 +1,19 @@
 {
   "schema": "ninfer.artifact-manifest",
-  "schema_version": 1,
+  "schema_version": 2,
   "artifact": {
     "filename": "qwen3_8_27b.ninfer",
-    "bytes": 20437336576,
-    "sha256": "0634abb07024221de141456cf04a42ab74b18bc38e1b781c6eb2e062a467eec3",
-    "container_version": 2,
-    "model_id": "qwen3.8-27b",
-    "weights_id": "groupwise-int",
-    "target_key": "qwen3_8_27b"
+    "bytes": 20437521664,
+    "sha256": "81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da",
+    "container_version": 3,
+    "architecture": "Qwen3_5ForCausalLM",
+    "name": "qwen3.8-27b",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
   },
   "source": {
     "base": {
@@ -24,9 +29,8 @@
     }
   },
   "conversion": {
-    "recipe_id": "qwen3_8_27b-v2",
+    "recipe_id": "qwen3_8_27b",
     "converter_repository": "https://github.com/Neroued/ninfer",
-    "converter_revision": "863aa8a5f1e866db74f29f8999b83b4021398dee",
     "ranking_input": {
       "path": "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64",
       "sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
@@ -34,7 +38,7 @@
   },
   "runtime": {
     "repository": "https://github.com/Neroued/ninfer",
-    "minimum_revision": "385b30ce1757bafe5a82680e9b5aeb940b14eec1",
+    "minimum_revision": "98dada0e03cb073fd07f905400b5904bc6e82759",
     "cuda_architecture": "sm_120a",
     "dflash2_draft_tokens": {
       "recommended": 7,
@@ -46,28 +50,30 @@
     "objects": 1190,
     "tensors": 1184,
     "resources": 6,
+    "bindings": 1513,
+    "uses": 844,
     "formats": {
-      "BF16": 627,
-      "FP32": 96,
-      "I32": 1,
-      "Q4G64_F16S": 183,
-      "Q5G64_F16S": 246,
-      "Q6G64_F16S": 1,
-      "W8G32_F16S": 30
+      "bf16": 627,
+      "fp32": 96,
+      "int32": 1,
+      "q4_g64_fp16": 183,
+      "q5_g64_fp16": 246,
+      "q6_g64_fp16": 1,
+      "q8_g32_fp16": 30
     },
     "layouts": {
-      "contiguous-le-v1": 724,
-      "row-split-k128-v1": 460
+      "contiguous_le_v1": 724,
+      "row_split_k128_v1": 460
     },
     "encodings": {
-      "raw-bytes-v1": 6
+      "raw_bytes_v1": 6
     },
     "bytes": {
       "tensor": 20424296864,
-      "resource": 12837177,
-      "object": 20437134041,
-      "payload_span": 20437148160,
-      "alignment": 14119
+      "resource": 12837937,
+      "object": 20437134801,
+      "payload_span": 20437148928,
+      "alignment": 14127
     }
   }
 }

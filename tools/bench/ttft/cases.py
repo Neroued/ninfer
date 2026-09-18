@@ -133,6 +133,45 @@ def _anonymous_hot(context: CaseContext, corpus: Corpus) -> None:
     context.require_success(continuation)
 
 
+def _state_probe(context: CaseContext, corpus: Corpus, label: str, turn: int) -> None:
+    request = context.start(
+        f"{label}{turn}", chat_request(context.model, corpus.state_messages(label, turn), 32)
+    )
+    context.require_success(request)
+
+
+def _shared_state_working_set(context: CaseContext, corpus: Corpus) -> None:
+    for turn in range(2):
+        for label in "abc":
+            _state_probe(context, corpus, label, turn)
+    _state_probe(context, corpus, "a", 2)
+    for turn in range(4):
+        for label in "def":
+            _state_probe(context, corpus, label, turn)
+    _state_probe(context, corpus, "a", 3)
+
+
+def _private_state_working_set(context: CaseContext, corpus: Corpus) -> None:
+    for labels, rounds in (("ab", 2), ("cd", 4)):
+        histories = {label: corpus.state_messages(label) for label in labels}
+        for turn in range(rounds):
+            for label in labels:
+                history = histories[label]
+                if turn:
+                    history.append({"role": "user", "content": "Continue with one more detail."})
+                response = context.start(f"{label}{turn}", chat_request(context.model, history, 32))
+                context.require_success(response)
+                history.append(_assistant(response))
+
+
+def _shared_state_hot_prefix(context: CaseContext, corpus: Corpus) -> None:
+    _state_probe(context, corpus, "a", 0)
+    _state_probe(context, corpus, "a", 1)
+    for turn, label in enumerate("bcdef", start=2):
+        _state_probe(context, corpus, label, 0)
+        _state_probe(context, corpus, "a", turn)
+
+
 def _session_hot(context: CaseContext, corpus: Corpus) -> None:
     source = _responses_shape(
         context, corpus, "long-8k-16", "source", store=True
@@ -1275,6 +1314,24 @@ def _definition(
 
 
 _DEFINITIONS = (
+    _definition(
+        "shared-state-working-set-shift", "openai_chat", "cache-state-working-set", "resource",
+        tuple(f"state-2k-{label}" for label in "abcdef"),
+        "Two three-conversation working sets in one process under State pressure, followed by repeated probes.",
+        _shared_state_working_set,
+    ),
+    _definition(
+        "private-state-working-set-shift", "openai_chat", "cache-private-working-set", "resource",
+        tuple(f"state-2k-{label}" for label in "abcd"),
+        "Two pairs of full-history conversations compete for private checkpoint State capacity.",
+        _private_state_working_set,
+    ),
+    _definition(
+        "shared-state-hot-prefix", "openai_chat", "cache-state-working-set", "resource",
+        tuple(f"state-2k-{label}" for label in "abcdef"),
+        "A frequently revisited prefix is interleaved with five one-use conversations.",
+        _shared_state_hot_prefix,
+    ),
     _definition("cold-short", "openai_chat", "text-cold-8k", "workload", ("short-32",), "Short cold TTFT baseline.", _cold_shape("short-32")),
     _definition("cold-long-8k", "openai_chat", "text-cold-8k", "workload", ("long-8k-32",), "8K cold prefill baseline.", _cold_shape("long-8k-32")),
     _definition("cold-long-64k", "openai_chat", "text-cold-64k", "workload", ("long-64k-32",), "64K legal long-context input.", _cold_shape("long-64k-32")),

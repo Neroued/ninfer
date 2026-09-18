@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/bf16/bf16_launch.h"
 

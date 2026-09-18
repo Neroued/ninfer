@@ -137,6 +137,8 @@ checkpoint capacity beyond active lanes.
 | `text-cold-8k` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
 | `text-cold-64k` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --no-prefix-reuse` |
 | `text-cold-256k` | `--max-context 262144 --kv-capacity 262144 --max-concurrency 1 --no-prefix-reuse` |
+| `cache-state-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 8 --host-state-slots 8 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 8 --max-long-anchors-per-continuation 0` |
+| `cache-private-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 2 --host-state-slots 2 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
 | `cache-hot` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
 | `cache-pressure-device` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
 | `cache-pressure-state-host` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 0 --host-state-slots 4 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
@@ -176,6 +178,9 @@ Baseline and cache cases:
 | `cold-long-256k` | `text-cold-256k` | One 260096-token, hardware-resident extreme input. |
 | `mixed-four-ordered` | `mixed-four` | Continuation, independent cold long, short, and image requests are submitted one by one after the preceding request is observably accepted by Serve. The two long prompts diverge at the first system-content token. |
 | `mixed-four-concurrent` | `mixed-four` | The same four heterogeneous requests are released through one barrier; no frontend or Engine submission order is assumed. |
+| `shared-state-working-set-shift` | `cache-state-working-set` | A/B/C then D/E/F, with three repeated probe rounds and a final A probe in the same process. |
+| `private-state-working-set-shift` | `cache-private-working-set` | Shared disabled: complete-history A/B conversations followed by four C/D rounds. |
+| `shared-state-hot-prefix` | `cache-state-working-set` | Repeated A probes interleaved with one-shot B–F conversations. |
 | `anonymous-hot-continuation` | `cache-hot` | Chat source then exact full-history continuation; private typed rewrite. |
 | `session-hot-continuation` | `cache-hot` | Stored Responses source then `previous_response_id` continuation. |
 | `session-alternating` | `cache-pressure-device` | `A1, B1, A2, B2` across two stored Responses lineages. |
@@ -257,8 +262,10 @@ python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
 
 `smoke` runs the short baseline. `resource` runs the six Device/Host/eviction/catalog comparisons,
 the 64K bidirectional Host-swap case, the original six-session 55K Host-rotation case, and its
-two-cohort concurrent-stream pressure case. `full` runs every audited case. `resource` is the
-default and `--samples` defaults to one.
+two-cohort concurrent-stream pressure case, plus the three State working-set/hot-prefix cases.
+The State profiles use DFlash2 K7, 32768-token KV capacity and no Host KV; their 2048-token roots
+accumulate checkpoint pressure within one sample process. `full` runs every audited case.
+`resource` is the default and `--samples` defaults to one.
 Repeat `--case NAME` instead of `--campaign` to run a focused subset through the same managed
 lifecycle, for example:
 

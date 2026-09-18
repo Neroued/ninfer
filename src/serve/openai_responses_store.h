@@ -38,7 +38,7 @@ struct StoredOpenAIResponse {
     nlohmann::json response;
     std::vector<nlohmann::json> input_items;
     OpenAIResponseContext context;
-    bool preserve_thinking = false;
+    std::optional<bool> preserve_thinking;
 };
 
 class OpenAIResponsesStore {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/resources.h"
 
 #include <array>
 #include <cstddef>

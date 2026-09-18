@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a16_gemm_mma.cuh"
@@ -10,7 +11,7 @@ namespace {
 template <class S, bool Full>
 void launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
             cudaStream_t stream) {
-    using G = Fp8AttnInputGeometry;
+    using G = Fp8N14336K5120;
     static_assert(6144 % S::kBlockRows == 0 && 1024 % S::kBlockRows == 0);
     static_assert(S::kSharedBytes <= 48 * 1024);
     const dim3 grid(G::kOutputRows / S::kBlockRows,

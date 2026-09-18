@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"

@@ -1,8 +1,9 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 
 #include "core/device.h"
-#include "ops/linear/fp8/fp8_a16_small_t_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_ksplit_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
@@ -19,17 +20,17 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
 
 template <int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                  Tensor& v, cudaStream_t stream) {
-    using Geometry      = Fp8AttnInputGeometry;
+                 Tensor& v, cudaStream_t stream) {
+    using Geometry      = Fp8N14336K5120;
     constexpr int tile  = Capacity;
     constexpr int warps = Capacity <= 8 ? 16 : Capacity <= 24 ? 8 : 4;
-    using Schedule      = Fp8A16SmallTMmaSchedule<warps, tile, warps == 16 ? 1 : 2>;
+    using Schedule      = Fp8A16KSplitSchedule<warps, tile, warps == 16 ? 1 : 2>;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    fp8_a16_small_t_mma_kernel<Geometry, Capacity, Schedule, Fp8AttentionInputOutput, true>
+    fp8_a16_ksplit_mma_kernel<Geometry, Capacity, Schedule, Fp8AttentionInputOutput, true>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),

@@ -1,14 +1,19 @@
 {
   "schema": "ninfer.artifact-manifest",
-  "schema_version": 1,
+  "schema_version": 2,
   "artifact": {
     "filename": "qwen3_8_27b_nvfp4.ninfer",
-    "bytes": 23719496192,
-    "sha256": "552c374c685dce302603b95fbe940fb04243c0cd44c083efc644ad3d980d462c",
-    "container_version": 2,
-    "model_id": "qwen3.8-27b",
-    "weights_id": "nvfp4",
-    "target_key": "qwen3_8_27b"
+    "bytes": 23719715844,
+    "sha256": "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82",
+    "container_version": 3,
+    "architecture": "Qwen3_5ForCausalLM",
+    "name": "qwen3.8-27b",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
   },
   "source": {
     "base": {
@@ -29,10 +34,9 @@
     }
   },
   "conversion": {
-    "recipe_id": "qwen3_8_27b_nvfp4-v2",
-    "embedding_encoder": "MAXABS_BF16S_RECIP_E4M3FN_RNE_V1",
+    "recipe_id": "qwen3_8_27b_nvfp4",
+    "embedding_encoder": "fp8_row_maxabs",
     "converter_repository": "https://github.com/Neroued/ninfer",
-    "converter_revision": "863aa8a5f1e866db74f29f8999b83b4021398dee",
     "ranking_input": {
       "path": "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64",
       "sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
@@ -40,7 +44,7 @@
   },
   "runtime": {
     "repository": "https://github.com/Neroued/ninfer",
-    "minimum_revision": "385b30ce1757bafe5a82680e9b5aeb940b14eec1",
+    "minimum_revision": "98dada0e03cb073fd07f905400b5904bc6e82759",
     "cuda_architecture": "sm_120a",
     "dflash2_draft_tokens": {
       "recommended": 7,
@@ -49,35 +53,37 @@
     }
   },
   "inventory": {
-    "objects": 1190,
-    "tensors": 1184,
+    "objects": 1246,
+    "tensors": 1240,
     "resources": 6,
+    "bindings": 1513,
+    "uses": 844,
     "formats": {
-      "BF16": 579,
-      "FP32": 208,
-      "FP8_E4M3FN_ROW_BF16S": 146,
-      "I32": 1,
-      "NVFP4": 112,
-      "Q4G64_F16S": 55,
-      "Q5G64_F16S": 54,
-      "Q6G64_F16S": 1,
-      "W8G32_F16S": 28
+      "bf16": 579,
+      "fp32": 264,
+      "fp8_e4m3fn_row_bf16": 146,
+      "int32": 1,
+      "nvfp4": 112,
+      "q4_g64_fp16": 55,
+      "q5_g64_fp16": 54,
+      "q6_g64_fp16": 1,
+      "q8_g32_fp16": 28
     },
     "layouts": {
-      "blockscale-k16-m128x4-v1": 112,
-      "contiguous-le-v1": 788,
-      "row-scale-v1": 146,
-      "row-split-k128-v1": 138
+      "block_scale_k16_m128x4_v1": 112,
+      "contiguous_le_v1": 844,
+      "row_scale_v1": 146,
+      "row_split_k128_v1": 138
     },
     "encodings": {
-      "raw-bytes-v1": 6
+      "raw_bytes_v1": 6
     },
     "bytes": {
-      "tensor": 23706400032,
-      "resource": 12837177,
-      "object": 23719237209,
-      "payload_span": 23719307776,
-      "alignment": 70567
+      "tensor": 23706400256,
+      "resource": 12837937,
+      "object": 23719238193,
+      "payload_span": 23719322628,
+      "alignment": 84435
     }
   }
 }

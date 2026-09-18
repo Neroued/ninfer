@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
@@ -78,7 +79,7 @@ void require_matrix_metadata(const Weight& weight, std::int32_t n, std::int32_t 
 void require_router(const Weight& weight, std::vector<AddressRange>& ranges) {
     require_matrix_metadata(weight, kRouterRows, kHidden, "router_shared_gate");
     const std::size_t bytes = static_cast<std::size_t>(kRouterRows) * kHidden * 2;
-    if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
+    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
         weight.qdata == nullptr || weight.qhigh != nullptr || weight.scales != nullptr ||
         weight.payload_bytes < bytes || !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(
@@ -95,13 +96,13 @@ struct QuantGeometry {
 
 QuantGeometry quant_geometry(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return {64, 32, 0};
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return {64, 32, 8};
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return {64, 32, 16};
-    case QType::W8G32_F16S:
+    case QType::Q8_G32_FP16:
         return {32, 32, 0};
     default:
         throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
@@ -138,18 +139,18 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
 
 void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, ranges);
-    if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
-        weights.routed_gate_up.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or W8");
+    if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
+        weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
+        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or Q8");
     }
-    if (weights.routed_down.qtype != QType::Q5G64_F16S &&
-        weights.routed_down.qtype != QType::Q6G64_F16S &&
-        weights.routed_down.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or W8");
+    if (weights.routed_down.qtype != QType::Q5_G64_FP16 &&
+        weights.routed_down.qtype != QType::Q6_G64_FP16 &&
+        weights.routed_down.qtype != QType::Q8_G32_FP16) {
+        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or Q8");
     }
-    if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
-        weights.shared_down.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: shared weights must be W8");
+    if (weights.shared_gate_up.qtype != QType::Q8_G32_FP16 ||
+        weights.shared_down.qtype != QType::Q8_G32_FP16) {
+        throw std::invalid_argument("sparse_moe: shared weights must be Q8");
     }
     require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
     require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
@@ -166,11 +167,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     }
     (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
 
-    const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+    const bool q8_profile =
+        routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
     const std::int32_t prefill_first =
-        w8_profile ? detail::kSparseMoePrefillW8W8Min
-                   : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
-                                                       : detail::kSparseMoePrefillQ4Q6Min);
+        q8_profile ? detail::kSparseMoePrefillQ8Q8Min
+                   : (routed_down == QType::Q5_G64_FP16 ? detail::kSparseMoePrefillQ4Q5Min
+                                                        : detail::kSparseMoePrefillQ4Q6Min);
 
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }

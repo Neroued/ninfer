@@ -13,7 +13,11 @@ state；它只记录驱动状态转移的 raw inputs。最终接受长度确定�
 > 等价公式。
 
 本文依次说明状态和 record 的数学定义、accepted-prefix replay、浮点漂移的来源、closed-loop
-bitwise clone 的条件、causal-conv history，以及 Qwen3.6 短窗口下的空间与计算特征。
+bitwise clone 的条件、causal-conv history，以及当前 Qwen3.5 模型实例的空间与计算特征。
+
+Record/Fold 的实现与合同见 [`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) 和
+[`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp)。模型配置决定 layer/head
+数量，Program 按启用的 MTP、DFlash 或 DFlash2 窗口预留 record capacity。
 
 ---
 
@@ -27,12 +31,12 @@ bitwise clone 的条件、causal-conv history，以及 Qwen3.6 短窗口下的�
 S\in\mathbb{R}^{V\times K}.
 \]
 
-Qwen3.6 使用 \(K=V=128\)。一个 value head 的 state 包含 16,384 个 FP32 元素，即 64 KiB。
+当前实例使用 \(K=V=128\)。一个 value head 的 state 包含 16,384 个 FP32 元素，即 64 KiB。
 乘上全部 GDN layers 和 value heads，一份完整 recurrent state image 为：
 
 | 模型 | GDN layers | value heads | 一份 recurrent state |
 |---|---:|---:|---:|
-| Qwen3.6-27B | 48 | 48 | 144 MiB |
+| Qwen3.6/3.8-27B | 48 | 48 | 144 MiB |
 | Qwen3.6-35B-A3B | 30 | 32 | 60 MiB |
 
 ### 1.2 Snapshot baseline
@@ -306,6 +310,10 @@ S_m^{fold}=S_m^{verify}
 可以是有限精度下的逐 bit 结论，而不只是实数域中的等价。它成立的前提是两条路径调用的是同一个
 deterministic floating-point transition，并消费相同的 record bits。
 
+这里比较的是同一个物理 verify block 的 recorded prefix。它不要求另起一次较短 verify、不同
+prefill 分块或另一套数值实现产生相同 inputs、logits 或 state。Record 之前的计算已确定本轮输入；
+Fold 要忠实提交这些输入形成的轨迹。
+
 ---
 
 ## 4. 数值核心：为什么“代数等价”仍会产生 state drift
@@ -446,8 +454,8 @@ ReplaySSM state reconstruction 应区分两个判据：
 
 2. **有限精度 clone**
 
-   对同一 \(S_0\)、同一 raw record bits 和同一 accepted prefix，fold 后的 FP32 state 与 sequential
-   verify/baseline 在每个 element 上逐 bit 相同。
+   对同一 \(S_0\)、同一 raw record bits 和同一 accepted prefix，fold 后的 FP32 state 与
+   同一物理 verify block 的对应 trajectory 在每个 element 上逐 bit 相同。
 
 验证 bitwise clone 时，最终文本或 BF16 output parity 都不够。直接证据应覆盖：
 
@@ -556,7 +564,7 @@ T(R+Q),
 T(P_{gdn}+P_{conv}).
 \]
 
-### 6.2 Qwen3.6 尺寸
+### 6.2 当前 Qwen 实例尺寸
 
 | 模型 | \(L_g\) | \(H_q\) | \(H_v\) | \(K/V\) | \(C_p\) | \(W\) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -582,6 +590,7 @@ T(P_{gdn}+P_{conv}).
 | 模型与窗口 | raw GDN records | conv records | 合计 |
 |---|---:|---:|---:|
 | 27B，\(T=6\) | 4.605469 MiB | 5.625000 MiB | 10.230469 MiB |
+| 27B，\(T=16\) | 12.281250 MiB | 15.000000 MiB | 27.281250 MiB |
 | 35B-A3B，\(T=6\) | 2.153320 MiB | 2.812500 MiB | 4.965820 MiB |
 | 35B-A3B，\(T=16\) | 5.742188 MiB | 7.500000 MiB | 13.242188 MiB |
 
@@ -598,7 +607,7 @@ Raw-input replay 保持 verify 的 serial recurrence，并在 commit 增加最�
 | rollback | 选择对应 snapshot | 只读取 accepted record prefix |
 | persistent numerical path | verify recurrence | verify recurrence 的 closed-loop clone |
 
-本场景的 token 维度很短：MTP 最多 \(T=6\)，DFlash 最多 \(T=16\)。沿单个 layer、value head
+本场景的 token 维度很短：MTP 最多 \(T=6\)，DFlash/DFlash2 最多 \(T=16\)。沿单个 layer、value head
 和 batch row，fold 有 \(m\) 次顺序 transition；不同 layers、heads 和 batch rows 之间相互独立。
 因此整体计算形态是大量彼此独立的短 recurrence。Fold 计算量随 accepted length \(m\) 线性增长，
 record traffic 随 verify length \(T\) 线性增长，最后只写一份 committed state。
@@ -627,7 +636,7 @@ GDN speculative ReplaySSM 的状态表示是
 4. rejected suffix 不被 fold 读取；
 5. fold closed-loop 重算每个 corrected value；
 6. fold 与 verify 使用相同的 normalization、gate、reduction、operation order 和 state-store boundary；
-7. committed state 直接与 sequential recurrent baseline 比较，而不是用 output plausibility 代替。
+7. committed state 直接与同一物理 verify block 的对应 state prefix 比较。
 
 Raw inputs 决定“可以重放什么”，verbatim recurrence 决定“重放后是否得到同一个有限精度 state”。
 前者解决 snapshot 容量，后者阻止跨轮 state drift；两者共同构成短窗口 GDN ReplaySSM。

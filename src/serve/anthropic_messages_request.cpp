@@ -1028,6 +1028,11 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
                     "provide",
                     "container", "container_not_supported");
     }
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        if (!body.at("chat_template_kwargs").is_object())
+            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+        request.chat_template_kwargs_json = body.at("chat_template_kwargs").dump();
+    }
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
             bad_request("preserve_thinking must be a boolean", "preserve_thinking");

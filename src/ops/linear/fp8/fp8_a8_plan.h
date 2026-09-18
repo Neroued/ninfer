@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/layout.h"
 #include "core/tensor.h"
@@ -48,7 +49,5 @@ inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream);
 
-void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
-                   cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

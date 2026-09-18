@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "core/device.h"
 #include "ops/common/memory.cuh"

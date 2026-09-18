@@ -1,9 +1,10 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/bf16/bf16_config.h"
-#include "ops/linear/bf16/bf16_gemm_mma_config.h"
+#include "ops/linear/bf16/bf16_gemm_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -36,8 +37,9 @@ struct Bf16AttentionInputMmaOutput {
 template <bool FullTokens>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                     Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<14336, 5120>;
-    using Schedule = Bf16MmaProductionSchedule<Geometry>;
+    using Geometry = Bf16Geometry<14336, 5120>;
+    using Schedule = Bf16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Cache::cg, Cache::cg,
+                                     Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((6144 % Schedule::kBlockRows) == 0);
@@ -70,8 +72,9 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ga
 
 void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<14336, 5120>;
-    using Schedule = Bf16MmaProductionSchedule<Geometry>;
+    using Geometry = Bf16Geometry<14336, 5120>;
+    using Schedule = Bf16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Cache::cg, Cache::cg,
+                                     Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
     if ((x.ne[1] % Schedule::kBlockCols) == 0) {
         launch_variant<true>(x, weight, q, gate, k, v, stream);
     } else {

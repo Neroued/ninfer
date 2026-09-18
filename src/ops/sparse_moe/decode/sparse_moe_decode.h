@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"

@@ -22,8 +22,8 @@ namespace ninfer::runtime {
 template <class Instance>
 class CausalScoreCore {
 public:
-    using Package        = typename Instance::Package;
-    using PreparedPrompt = typename Package::PreparedPrompt;
+    using ModelContract  = typename Instance::ModelContract;
+    using PreparedPrompt = typename ModelContract::PreparedPrompt;
 
     CausalScoreCore(Instance& instance, DeviceContext& device)
         : instance_(instance), device_(device) {

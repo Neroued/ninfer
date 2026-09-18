@@ -1,9 +1,12 @@
+#include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/weight_input.h"
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -68,7 +71,7 @@ int verify_normwise(const std::string& label, const std::vector<double>& actual,
 
 Weight bf16_weight(void* data, std::int32_t rows, std::int32_t hidden) {
     Weight weight{};
-    weight.qtype           = QType::BF16_CTRL;
+    weight.qtype           = QType::BF16;
     weight.layout          = QuantLayout::Contiguous;
     weight.payload         = data;
     weight.payload_bytes   = static_cast<std::uint64_t>(rows) * hidden * sizeof(std::uint16_t);
@@ -266,9 +269,20 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
-        Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
-        ops::gdn_gating_proj(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace, tensor_g,
-                             tensor_beta, execution);
+        // A/B use a contiguous reshape of the same stored words, with a different parent K.
+        const std::array shape{static_cast<std::uint64_t>(4 * geometry.heads),
+                               static_cast<std::uint64_t>(geometry.hidden / 2)};
+        const WeightParent parent{weight_geometry(QType::BF16, QuantLayout::Contiguous, shape),
+                                  static_cast<const std::byte*>(device_weight.p)};
+        const auto count = static_cast<std::uint64_t>(geometry.heads) * geometry.hidden;
+        const std::vector<std::uint64_t> logical_shape{static_cast<std::uint64_t>(geometry.heads),
+                                                       static_cast<std::uint64_t>(geometry.hidden)};
+        const WeightView a{logical_shape, {{&parent, 0, count}}};
+        const WeightView b{logical_shape, {{&parent, count, 2 * count}}};
+        const auto prepared =
+            std::get<ops::SingleProjectionWeight>(ops::prepare_gdn_gating_proj_weights({a}, {b}));
+        ops::gdn_gating_proj(tensor_x, prepared.weight, tensor_a_log, tensor_dt_bias, workspace,
+                             tensor_g, tensor_beta, execution);
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);

@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear/q6/q6_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -13,7 +14,6 @@ using SimtR8C4Schedule = Q6RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
 using SimtR8C5Schedule = Q6RowSplitSimtGemmSchedule<8, 5, 16, 2, Cache::ca, 1>;
 using SimtR8C6Schedule = Q6RowSplitSimtGemmSchedule<8, 6, 16, 2, Cache::ca, 1>;
 using SimtR8C7Schedule = Q6RowSplitSimtGemmSchedule<8, 7, 16, 2, Cache::ca, 1>;
-using SimtR8C8Schedule = Q6RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
 
 template <class Schedule>
 void launch_schedule(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -58,8 +58,5 @@ void launch_q6_simt_r8_c7(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch_route<SimtR8C7Schedule>(x, w, out, stream);
 }
 
-void launch_q6_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_route<SimtR8C8Schedule>(x, w, out, stream);
-}
 
 } // namespace ninfer::ops::detail

@@ -109,73 +109,89 @@ std::string render_tool_definition(const ToolDefinition& tool) {
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
-                                                 const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities) {
+                                                 const ServeOptions& server) {
+    using Json  = RequestJson;
+    Json kwargs = request.chat_template_kwargs_json.empty()
+                      ? Json::object()
+                      : Json::parse(request.chat_template_kwargs_json);
+    if (!kwargs.is_object())
+        invalid_prompt_option("chat_template_kwargs must be an object", "chat_template_kwargs",
+                              "invalid_template_option");
+    auto merge_boolean = [&](const char* key, std::optional<bool> typed) {
+        if (!kwargs.contains(key) || kwargs[key].is_null()) {
+            kwargs.erase(key);
+            return typed;
+        }
+        if (!kwargs[key].is_boolean())
+            invalid_prompt_option(std::string(key) + " must be a boolean", key,
+                                  "invalid_template_option");
+        const bool nested = kwargs[key].get<bool>();
+        if (typed && *typed != nested)
+            invalid_prompt_option(std::string("conflicting ") + key + " values", key,
+                                  "conflicting_template_option");
+        kwargs.erase(key);
+        return std::optional<bool>(nested);
+    };
+    auto thinking = merge_boolean("enable_thinking", request.enable_thinking);
+    auto preserve = merge_boolean("preserve_thinking", request.preserve_thinking);
+    auto effort   = request.reasoning_effort;
+    if (kwargs.contains("reasoning_effort") && !kwargs["reasoning_effort"].is_null()) {
+        if (!kwargs["reasoning_effort"].is_string())
+            invalid_prompt_option("reasoning_effort must be a string", "reasoning_effort",
+                                  "invalid_template_option");
+        const auto nested =
+            parse_requested_reasoning_effort(kwargs["reasoning_effort"].get<std::string>());
+        if (!nested)
+            invalid_prompt_option("invalid reasoning_effort", "reasoning_effort",
+                                  "invalid_template_option");
+        if (effort && effort != nested)
+            invalid_prompt_option("conflicting reasoning_effort values", "reasoning_effort",
+                                  "conflicting_template_option");
+        effort = nested;
+    }
+    kwargs.erase("reasoning_effort");
     ResolvedPromptSemantics result{
-        .enable_thinking            = request.enable_thinking.value_or(server.enable_thinking),
-        .reasoning_effort           = std::nullopt,
-        .effective_reasoning_effort = std::nullopt,
-        .preserve_thinking          = request.preserve_thinking.value_or(server.preserve_thinking),
+        .enable_thinking           = thinking ? thinking : server.enable_thinking,
+        .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
+        .chat_template_kwargs_json = kwargs.dump(),
     };
-    const auto complete = [&]() {
-        if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
-            result.enable_thinking) {
-            invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
-                                  "messages", "assistant_prefill_not_supported");
+    if (effort) {
+        const bool enables = *effort != RequestedReasoningEffort::None;
+        if (thinking && *thinking != enables)
+            invalid_prompt_option("reasoning effort conflicts with enable_thinking",
+                                  "reasoning_effort", "conflicting_template_option");
+        // A request effort overrides the server's thinking default.
+        result.enable_thinking = enables;
+        switch (*effort) {
+        case RequestedReasoningEffort::None:
+            result.reasoning_effort = ninfer::ReasoningEffort::None;
+            break;
+        case RequestedReasoningEffort::Minimal:
+            result.reasoning_effort = ninfer::ReasoningEffort::Minimal;
+            break;
+        case RequestedReasoningEffort::Low:
+            result.reasoning_effort = ninfer::ReasoningEffort::Low;
+            break;
+        case RequestedReasoningEffort::Medium:
+            result.reasoning_effort = ninfer::ReasoningEffort::Medium;
+            break;
+        case RequestedReasoningEffort::High:
+            result.reasoning_effort = ninfer::ReasoningEffort::High;
+            break;
+        case RequestedReasoningEffort::XHigh:
+            result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+            break;
+        case RequestedReasoningEffort::Max:
+            result.reasoning_effort = ninfer::ReasoningEffort::Max;
+            break;
         }
-        if (result.enable_thinking) {
-            result.effective_reasoning_effort = result.reasoning_effort
-                                                    ? result.reasoning_effort
-                                                    : capabilities.reasoning_effort.default_effort;
-        }
-        return result;
-    };
-    if (!request.reasoning_effort) { return complete(); }
-
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
-    const bool enables_thinking              = requested != RequestedReasoningEffort::None;
-    if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
-        invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",
-                              "conflicting_template_option");
     }
-    result.enable_thinking = enables_thinking;
-
-    if (requested == RequestedReasoningEffort::None) {
-        if (!capabilities.enable_thinking) {
-            invalid_prompt_option("the loaded chat template cannot disable thinking",
-                                  "reasoning_effort", "reasoning_effort_not_supported");
-        }
-        return complete();
+    if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+        result.enable_thinking == true) {
+        invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
+                              "messages", "assistant_prefill_not_supported");
     }
-
-    switch (requested) {
-    case RequestedReasoningEffort::Low:
-        result.reasoning_effort = ninfer::ReasoningEffort::Low;
-        break;
-    case RequestedReasoningEffort::Medium:
-        result.reasoning_effort = ninfer::ReasoningEffort::Medium;
-        break;
-    case RequestedReasoningEffort::XHigh:
-        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
-        break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              "reasoning_effort", "reasoning_effort_not_supported");
-    case RequestedReasoningEffort::None:
-        break;
-    }
-
-    if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              "reasoning_effort", "reasoning_effort_not_supported");
-    }
-    return complete();
+    return result;
 }
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
@@ -272,6 +288,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.enable_thinking                  = semantics.enable_thinking;
     input.options.reasoning_effort                 = semantics.reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
+    input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.add_vision_id                    = false;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
@@ -298,7 +315,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
-    if (semantics.enable_thinking) {
+    if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }

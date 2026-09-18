@@ -1,9 +1,10 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_simt.cuh"
 
 #include <array>
 #include <cstddef>
@@ -24,14 +25,19 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
                   const Tensor& conv_states, const Tensor& valid_columns,
                   const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                   Publish publish, cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
-    using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
+    using Geometry = Nvfp4N16384K5120;
+    using Schedule = Nvfp4SimtSchedule<4, 1, 2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16,
+                                       ActiveTokens, 1,
+                                       ActiveTokens == 2 ? Nvfp4SimtActivationAccess::SharedPhase
+                                                         : Nvfp4SimtActivationAccess::TokenPacked,
+                                       Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                       Nvfp4SimtBlockOrder::RowsContiguous, 1>;
     static_assert(Schedule::kTokenTile == ActiveTokens);
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
-                         GdnConvOutput<ActiveTokens, Publish>, Nvfp4SmallTFinalization::RowVector>
+    nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                      GdnConvOutput<ActiveTokens, Publish>, Nvfp4SimtFinalization::RowVector>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -70,18 +76,17 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_snapshot_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_snapshot_exact<2 + static_cast<int>(Offsets)>...};
 }
 
 template <std::size_t... Offsets>
 constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
     return std::array<RecordLaunch, sizeof...(Offsets)>{
-        &launch_record_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_record_exact<2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
-constexpr auto kRecordLaunchers =
-    make_record_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers       = make_launchers(std::make_index_sequence<16 - 2 + 1>{});
+constexpr auto kRecordLaunchers = make_record_launchers(std::make_index_sequence<16 - 2 + 1>{});
 
 } // namespace
 
@@ -90,7 +95,7 @@ void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& valid_columns, const Tensor& initial_slot,
                                        const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                        Tensor& value, Tensor& z, cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     kLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                       snapshot_base_slot, query, key, value, z, stream);
 }
@@ -100,7 +105,7 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                      Tensor& z, cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     kRecordLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                             conv_record, query, key, value, z, stream);
 }

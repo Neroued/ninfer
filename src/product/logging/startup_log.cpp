@@ -299,17 +299,20 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     const double total_seconds = impl_->engine_elapsed_ns != 0
                                      ? static_cast<double>(impl_->engine_elapsed_ns) * 1.0e-9
                                      : load.load_seconds;
-    impl_->logger->info("engine ready | {}/{} | total {} | weights {}",
-                        format_pretty_text(load.model_id), format_pretty_text(load.weights_id),
-                        format_pretty_duration(total_seconds),
+    impl_->logger->info("engine ready | {} | total {} | weights {}",
+                        format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes));
     impl_->logger->debug(
-        "load detail | target {} | artifact read {} | H2D {} | staging peak {} | tensors {} | "
-        "resources {}",
-        format_pretty_text(load.target), format_pretty_bytes(load.artifact_bytes_read),
+        "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
+        "objects {} | host objects {}",
+        format_pretty_text(load.architecture), format_pretty_bytes(load.artifact_bytes_read),
         format_pretty_bytes(load.host_to_device_bytes),
-        format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.tensor_count),
-        format_pretty_count(load.resource_count));
+        format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
+        format_pretty_count(load.host_object_count));
+    impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
+                         context_cost_preset_source_name(load.context_cost.transfer_source),
+                         context_cost_preset_source_name(load.context_cost.prefill_source),
+                         load.prefill_signature);
 }
 
 } // namespace ninfer::product

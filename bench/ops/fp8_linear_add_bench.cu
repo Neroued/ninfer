@@ -1,5 +1,6 @@
 // Cold-cache public Op benchmark for the registered row-scaled FP8 LinearAdd profiles.
 
+#include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
@@ -136,7 +137,7 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,tensor_peak_percent,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_add,FP8_E4M3FN_ROW_BF16S," << policy_name(options.policy) << ',' << kRows
+        out << "linear_add,FP8_E4M3FN_ROW_BF16," << policy_name(options.policy) << ',' << kRows
             << ',' << options.k << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',';
@@ -162,7 +163,7 @@ int main(int argc, char** argv) {
         DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
         bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kRows, options.k);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kRows, options.k, options.policy, min_t, max_t);
+            QType::FP8_E4M3FN_ROW_BF16, kRows, options.k, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {

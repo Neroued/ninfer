@@ -1,6 +1,8 @@
+#include "core/weight.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 
 #include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/weight_input.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -97,9 +99,9 @@ PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
     if (k == 5120) {
         return {
             false,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kOutputRows, k, seed,
                                                     options),
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kOutputRows, k, seed + 1U,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kOutputRows, k, seed + 1U,
                                                     options),
             0,
             0,
@@ -108,7 +110,7 @@ PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
     if (k == 2048) {
         return {
             true,
-            quantized_weight::make_patterned_weight(QType::W8G32_F16S, kDFlashParentRows, k, seed,
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kDFlashParentRows, k, seed,
                                                     options),
             {},
             kDFlashFirstRow,
@@ -233,7 +235,7 @@ int verify_preserved(const test::GuardedDeviceBuffer& device,
 
 bool cuda_available() { return !test::cuda_unavailable(); }
 
-int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
+int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
     const std::vector<std::int32_t> tokens = conformance_tokens(shape);
     if (tokens.empty()) { throw std::invalid_argument("linear_pair test: no token cases"); }
     const std::int32_t maximum_t = tokens.back();
@@ -267,10 +269,23 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
 
     void* const second_payload =
         fixture.shared_payload ? first_device_weight.data() : second_device_weight.data();
-    const Weight first_weight = fixture.first_storage.device_row_view(
-        first_device_weight.data(), fixture.first_row, kOutputRows);
-    const Weight second_weight =
-        second_storage.device_row_view(second_payload, fixture.second_row, kOutputRows);
+    const auto parent = [](const quantized_weight::PackedWeight& source, const void* payload) {
+        const std::array shape{static_cast<std::uint64_t>(source.weight.n),
+                               static_cast<std::uint64_t>(source.weight.k)};
+        return WeightParent{weight_geometry(source.weight.qtype, source.weight.layout, shape),
+                            static_cast<const std::byte*>(payload)};
+    };
+    const auto first_parent  = parent(fixture.first_storage, first_device_weight.data());
+    const auto second_parent = parent(second_storage, second_payload);
+    const auto region        = [](const WeightParent& storage, std::uint64_t row) {
+        const auto k = storage.geometry.shape[1];
+        return WeightView{{kOutputRows, k}, {{&storage, row * k, (row + kOutputRows) * k}}};
+    };
+    const auto first_view = region(first_parent, fixture.first_row);
+    const auto second_view =
+        region(fixture.shared_payload ? first_parent : second_parent, fixture.second_row);
+    const Weight first_weight  = ops::prepare_linear_weight({first_view}).weight;
+    const Weight second_weight = ops::prepare_linear_weight({second_view}).weight;
 
     int failures = 0;
     for (const std::int32_t t : tokens) {

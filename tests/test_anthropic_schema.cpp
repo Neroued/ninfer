@@ -60,20 +60,10 @@ std::string api_param(const std::function<void()>& action) {
     return {};
 }
 
-ninfer::PromptCapabilities capabilities() {
-    ninfer::PromptCapabilities result;
-    result.enable_thinking                 = true;
-    result.reasoning_effort.low            = true;
-    result.reasoning_effort.medium         = true;
-    result.reasoning_effort.xhigh          = true;
-    result.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
-    return result;
-}
-
 ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default_thinking = true) {
     ServeOptions options;
     options.enable_thinking = default_thinking;
-    return resolve_prompt_semantics(request, options, capabilities());
+    return resolve_prompt_semantics(request, options);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {

@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
 #include "core/device.h"
@@ -38,8 +39,10 @@ struct Bf16AttentionInputOutput {
 
 void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<14336, 5120>;
-    using Schedule = Bf16LinearDecodeSchedule<Geometry>;
+    using Geometry = Bf16Geometry<14336, 5120>;
+    using Schedule =
+        Bf16GemvSchedule<4, 1, 8, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
+                         Bf16PhaseOrder::RowSwizzled, 1, 1, 1, 2>;
     static_assert((6144 % Schedule::kRowsPerCta) == 0);
     static_assert((1024 % Schedule::kRowsPerCta) == 0);
 

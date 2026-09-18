@@ -1,4 +1,5 @@
 // ninfer::ops - embedding launcher: variant grid/block/stream setup.
+#include "core/weight.h"
 #include "ops/launcher/embed_gather.h"
 
 #include "ops/common/math.h"
@@ -13,8 +14,8 @@ namespace {
 
 constexpr int kBlock          = 128;
 constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlock;
-constexpr int kW8GroupedBlock = 32;
-constexpr int kW8RowBlock     = 256;
+constexpr int kQ8GroupedBlock = 32;
+constexpr int kQ8RowBlock     = 256;
 
 template <int BlocksPerToken, int Threads>
 void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
@@ -25,9 +26,9 @@ void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_
 }
 
 template <int Blocks, int Threads>
-void launch_w8_packed(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void launch_q8_packed(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const auto launch = [&]<bool PairStore>() {
-        embed_gather_w8_packed_5120_kernel<Blocks, Threads, PairStore>
+        embed_gather_q8_packed_5120_kernel<Blocks, Threads, PairStore>
             <<<ids.ne[0] * Blocks, Threads, 0, stream>>>(
                 static_cast<const std::int32_t*>(ids.data),
                 static_cast<const std::uint8_t*>(table.qdata),
@@ -54,31 +55,31 @@ int grid_for_q6_grouped(std::int32_t d, std::int32_t T) {
 
 } // namespace
 
-const char* w8_embed_route_name(W8EmbedRoute route) {
+const char* q8_embed_route_name(Q8EmbedRoute route) {
     switch (route) {
-    case W8EmbedRoute::Auto:
+    case Q8EmbedRoute::Auto:
         return "auto";
-    case W8EmbedRoute::Grouped:
+    case Q8EmbedRoute::Grouped:
         return "grouped-b32";
-    case W8EmbedRoute::Row:
+    case Q8EmbedRoute::Row:
         return "row-b256";
     }
     return "unknown";
 }
 
-void embed_gather_w8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
-                                 W8EmbedRoute route, cudaStream_t stream) {
+void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                 Q8EmbedRoute route, cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
-    if (route == W8EmbedRoute::Auto) { route = T <= 6 ? W8EmbedRoute::Grouped : W8EmbedRoute::Row; }
-    if (route == W8EmbedRoute::Grouped) {
-        const int grid = T * kEmbedGatherW8Groups;
-        embed_gather_w8_grouped_2048_kernel<<<grid, kW8GroupedBlock, 0, stream>>>(
+    if (route == Q8EmbedRoute::Auto) { route = T <= 6 ? Q8EmbedRoute::Grouped : Q8EmbedRoute::Row; }
+    if (route == Q8EmbedRoute::Grouped) {
+        const int grid = T * kEmbedGatherQ8Groups;
+        embed_gather_q8_grouped_2048_kernel<<<grid, kQ8GroupedBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), codes, scales,
             static_cast<__nv_bfloat16*>(out.data));
     } else {
-        embed_gather_w8_row_2048_kernel<<<T, kW8RowBlock, 0, stream>>>(
+        embed_gather_q8_row_2048_kernel<<<T, kQ8RowBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), codes, scales,
             static_cast<__nv_bfloat16*>(out.data));
     }
@@ -118,14 +119,14 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
+void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream) {
     const std::int32_t d = out.ne[0];
     const std::int32_t T = ids.ne[0];
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
-    if (d == kEmbedGatherW8D && table.padded_shape[1] == kEmbedGatherW8D) {
-        embed_gather_w8_2048_launch(ids, table, out, W8EmbedRoute::Auto, stream);
+    if (d == kEmbedGatherQ8D && table.padded_shape[1] == kEmbedGatherQ8D) {
+        embed_gather_q8_2048_launch(ids, table, out, Q8EmbedRoute::Auto, stream);
         return;
     }
 
@@ -134,15 +135,15 @@ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     if (d == 5120 && table.padded_shape[1] == 5120 &&
         reinterpret_cast<std::uintptr_t>(table.qdata) % 4 == 0) {
         if (T <= 128)
-            launch_w8_packed<10, 128>(ids, table, out, stream);
+            launch_q8_packed<10, 128>(ids, table, out, stream);
         else
-            launch_w8_packed<5, 128>(ids, table, out, stream);
+            launch_q8_packed<5, 128>(ids, table, out, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     const std::int64_t n = static_cast<std::int64_t>(d) * T;
-    embed_gather_w8_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+    embed_gather_q8_kernel<<<grid_for(n), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), codes, scales,
         static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
     CUDA_CHECK(cudaGetLastError());

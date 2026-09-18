@@ -1,0 +1,373 @@
+{
+  "components": {
+    "text": {
+      "config": {
+        "architectures": [
+          "Qwen3_5ForCausalLM"
+        ],
+        "model_type": "qwen3_5_text",
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 128,
+        "vocab_size": 248320,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1e-06,
+        "tie_word_embeddings": false,
+        "layer_types": [
+          "full_attention"
+        ],
+        "rope_parameters": {
+          "rope_theta": 10000000,
+          "partial_rotary_factor": 0.25,
+          "mrope_section": [
+            6,
+            5,
+            5
+          ]
+        }
+      },
+      "resources": {
+        "tokenizer.json": "r.tokenizer",
+        "tokenizer_config.json": "r.tokenizer_config",
+        "chat_template.jinja": "r.chat_template",
+        "generation_config.json": "r.generation_config"
+      }
+    }
+  },
+  "objects": [
+    {
+      "id": "r.tokenizer",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 0,
+      "bytes": 12809320
+    },
+    {
+      "id": "r.tokenizer_config",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 12809320,
+      "bytes": 17928
+    },
+    {
+      "id": "r.chat_template",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 12827248,
+      "bytes": 8952
+    },
+    {
+      "id": "r.generation_config",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 12836200,
+      "bytes": 202
+    },
+    {
+      "id": "w.embedding",
+      "kind": "tensor",
+      "shape": [
+        248320,
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 12836608,
+      "bytes": 63569920
+    },
+    {
+      "id": "w.final_norm",
+      "kind": "tensor",
+      "shape": [
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 76406528,
+      "bytes": 256
+    },
+    {
+      "id": "w.head",
+      "kind": "tensor",
+      "shape": [
+        248320,
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 76406784,
+      "bytes": 63569920
+    },
+    {
+      "id": "w.layer0.input_norm",
+      "kind": "tensor",
+      "shape": [
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 139976704,
+      "bytes": 256
+    },
+    {
+      "id": "w.layer0.post_attention_norm",
+      "kind": "tensor",
+      "shape": [
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 139976960,
+      "bytes": 256
+    },
+    {
+      "id": "w.layer0.attn_qk",
+      "kind": "tensor",
+      "shape": [
+        256,
+        128
+      ],
+      "format": "q4_g64_fp16",
+      "layout": "row_split_k128_v1",
+      "offset": 139977216,
+      "bytes": 17408
+    },
+    {
+      "id": "w.layer0.attn_gate_value",
+      "kind": "tensor",
+      "shape": [
+        256,
+        128
+      ],
+      "format": "q5_g64_fp16",
+      "layout": "row_split_k128_v1",
+      "offset": 139994624,
+      "bytes": 21504
+    },
+    {
+      "id": "w.layer0.query_norm",
+      "kind": "tensor",
+      "shape": [
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 140016128,
+      "bytes": 256
+    },
+    {
+      "id": "w.layer0.key_norm",
+      "kind": "tensor",
+      "shape": [
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 140016384,
+      "bytes": 256
+    },
+    {
+      "id": "w.layer0.attn_output",
+      "kind": "tensor",
+      "shape": [
+        128,
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 140016640,
+      "bytes": 32768
+    },
+    {
+      "id": "w.layer0.gate_up",
+      "kind": "tensor",
+      "shape": [
+        512,
+        128
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 140049408,
+      "bytes": 131072
+    },
+    {
+      "id": "w.layer0.down",
+      "kind": "tensor",
+      "shape": [
+        128,
+        256
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 140180480,
+      "bytes": 65536
+    }
+  ],
+  "bindings": {
+    "text/token_embedding": {
+      "object": "w.embedding"
+    },
+    "text/final_norm": {
+      "object": "w.final_norm"
+    },
+    "text/output_head": {
+      "object": "w.head"
+    },
+    "text/layers/0/input_norm": {
+      "object": "w.layer0.input_norm"
+    },
+    "text/layers/0/post_attention_norm": {
+      "object": "w.layer0.post_attention_norm"
+    },
+    "text/layers/0/attention/query": {
+      "parts": [
+        {
+          "object": "w.layer0.attn_qk",
+          "range": [
+            0,
+            16384
+          ]
+        }
+      ]
+    },
+    "text/layers/0/attention/key": {
+      "parts": [
+        {
+          "object": "w.layer0.attn_qk",
+          "range": [
+            16384,
+            32768
+          ]
+        }
+      ]
+    },
+    "text/layers/0/attention/gate": {
+      "parts": [
+        {
+          "object": "w.layer0.attn_gate_value",
+          "range": [
+            0,
+            16384
+          ]
+        }
+      ]
+    },
+    "text/layers/0/attention/value": {
+      "parts": [
+        {
+          "object": "w.layer0.attn_gate_value",
+          "range": [
+            16384,
+            32768
+          ]
+        }
+      ]
+    },
+    "text/layers/0/attention/query_norm": {
+      "object": "w.layer0.query_norm"
+    },
+    "text/layers/0/attention/key_norm": {
+      "object": "w.layer0.key_norm"
+    },
+    "text/layers/0/attention/output": {
+      "object": "w.layer0.attn_output"
+    },
+    "text/layers/0/mlp/gate": {
+      "parts": [
+        {
+          "object": "w.layer0.gate_up",
+          "range": [
+            0,
+            32768
+          ]
+        }
+      ]
+    },
+    "text/layers/0/mlp/up": {
+      "parts": [
+        {
+          "object": "w.layer0.gate_up",
+          "range": [
+            32768,
+            65536
+          ]
+        }
+      ]
+    },
+    "text/layers/0/mlp/down": {
+      "object": "w.layer0.down"
+    }
+  },
+  "uses": [
+    {
+      "parameter": "text/layers/0/attention/query",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/key",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/gate",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/value",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/output",
+      "input": "text/layers/0/attention/gated_output",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/gate",
+      "input": "text/layers/0/ffn_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/up",
+      "input": "text/layers/0/ffn_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/down",
+      "input": "text/layers/0/mlp/product",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/output_head",
+      "input": "text/final_hidden",
+      "activation_policy": "A16Only"
+    }
+  ],
+  "files": [
+    {
+      "path": null,
+      "payload_bytes": 63934464
+    },
+    {
+      "path": "artifact-v3-mixed-sharded.ninfer.part-0001",
+      "payload_bytes": 63995904
+    },
+    {
+      "path": "artifact-v3-mixed-sharded.ninfer.part-0002",
+      "payload_bytes": 12315648
+    }
+  ],
+  "metadata": {
+    "name": "v3-mixed-sharded-example",
+    "description": "Synthetic one-layer parameter directory for the v3 specification; payloads are not included."
+  },
+  "provenance": {
+    "resources": "Qwen3.8-27B/base-hf-bf16 local frontend files",
+    "parameters": "Synthetic instance; this directory does not assert qualified Op support."
+  }
+}

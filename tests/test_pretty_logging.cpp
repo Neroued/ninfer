@@ -132,23 +132,23 @@ int main() {
             observer.callback({.phase      = ninfer::StartupPhase::EngineStartup,
                                .status     = ninfer::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
-            startup.engine_ready({.model_id             = "qwen3.6-27b",
-                                  .weights_id           = "groupwise-int",
+            startup.engine_ready({.model_name           = "qwen3.6-27b",
+                                  .weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"},
                                   .host_to_device_bytes = 16ULL << 30});
             logging.flush();
         }
         startup_output = capture.finish();
     }
-    failures +=
-        check(line_count(startup_output) == 4 &&
-                  startup_output.find("starting engine") != std::string::npos &&
-                  startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
-                  startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
-                      std::string::npos &&
-                  startup_output.find("engine ready | qwen3.6-27b/groupwise-int | total 3.0s") !=
-                      std::string::npos &&
-                  startup_output.find("CUDA initialized") == std::string::npos,
-              "normal startup pretty output is noisy or incomplete");
+    failures += check(
+        line_count(startup_output) == 4 &&
+            startup_output.find("starting engine") != std::string::npos &&
+            startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
+            startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
+                std::string::npos &&
+            startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
+                std::string::npos &&
+            startup_output.find("CUDA initialized") == std::string::npos,
+        "normal startup pretty output is noisy or incomplete");
 
     std::string tool_output;
     {

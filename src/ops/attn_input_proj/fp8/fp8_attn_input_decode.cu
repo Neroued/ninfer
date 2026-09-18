@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 
 #include "core/device.h"
@@ -11,8 +12,8 @@ namespace ninfer::ops::detail {
 
 void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry        = Fp8AttnInputGeometry;
-    using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+    using Geometry        = Fp8N14336K5120;
+    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data),

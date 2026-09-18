@@ -267,15 +267,16 @@ qb::BenchEnvironment sample_environment() {
     env.device_id                = 0;
     env.artifact_path            = "model.ninfer";
     env.artifact_file_size_bytes = 17500000000ULL;
-    env.load                     = {.target               = "qwen3_6_27b",
-                                    .weights_id           = "groupwise-int",
+    env.load                     = {.architecture         = "Qwen3_5ForCausalLM",
+                                    .model_name           = "qwen3.6-27b",
+                                    .prefill_signature    = "groupwise-int",
                                     .load_seconds         = 2.5,
                                     .upload_seconds       = 2.0,
                                     .artifact_bytes_read  = 17500000000ULL,
                                     .host_to_device_bytes = 17400000000ULL,
                                     .peak_staging_bytes   = 134217728ULL,
-                                    .tensor_count         = 1118,
-                                    .resource_count       = 6};
+                                    .device_object_count  = 1118,
+                                    .host_object_count    = 6};
     env.memory.device            = 0;
     env.memory.max_context       = 4096;
     env.memory.kv_capacity       = 8192;
@@ -323,14 +324,16 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 14, "report schema v14");
+    failures += expect(report.at("schema_version") == 15, "report schema v15");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
-    failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
-    failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
+    failures +=
+        expect(report.at("load").at("architecture") == "Qwen3_5ForCausalLM", "load architecture");
+    failures +=
+        expect(report.at("load").at("prefill_signature") == "groupwise-int", "load weights id");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
@@ -386,8 +389,8 @@ int test_human_and_csv_reports() {
     const qb::BenchEnvironment env = sample_environment();
     const auto results             = sample_results();
     const std::string table        = qb::format_table(env, results);
-    failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
-    failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
+    failures += expect(table.find("Qwen3_5ForCausalLM") != std::string::npos, "table target");
+    failures += expect(table.find("qwen3.6-27b") != std::string::npos, "table model name");
     failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
@@ -395,15 +398,21 @@ int test_human_and_csv_reports() {
         expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
 
-    const std::string csv = qb::format_csv(env, results);
-    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target,weights_id"),
+    auto csv_env            = env;
+    csv_env.load.model_name = "trained, \"custom\"";
+    csv_env.artifact_path   = "/weights/user,model.ninfer";
+    const std::string csv   = qb::format_csv(csv_env, results);
+    failures += expect(csv.find("\"trained, \"\"custom\"\"\"") != std::string::npos &&
+                           csv.find("\"/weights/user,model.ninfer\"") != std::string::npos,
+                       "CSV preserves and escapes the actual training instance");
+    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,architecture,prefill_signature"),
                        "CSV identity columns");
     for (const std::string_view field :
-         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
-          "workspace_general_capacity_bytes", "vision_handoff_capacity_bytes",
-          "cuda_graph_allowance_bytes", "workspace_peak_bytes", "workspace_allocator_peak_bytes",
-          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
-          "total_seconds_mean"}) {
+         {"model_name", "artifact_path", "proposal_head", "kv_payload_bytes",
+          "load_host_to_device_bytes", "workspace_general_capacity_bytes",
+          "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
+          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
+          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

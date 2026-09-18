@@ -183,8 +183,11 @@ struct Q4SimtStoreEpilogue {
     }
 };
 
+// FullK permits complete quant-group stages even when the last output column tile is partial.
+// Existing callers default to the combined Full contract.
 template <class Schedule, bool Full, bool SplitOutput = false, int SplitRow = 0,
-          class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
+          class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
+          bool FullK = Full>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -234,7 +237,7 @@ __global__ __launch_bounds__(
     const int padded_groups = padded_k / Q4RowSplitStorage::kGroupK;
     const int groups        = k / Q4RowSplitStorage::kGroupK;
     const int stages =
-        kFull ? groups / kGroupsPerStage : (groups + kGroupsPerStage - 1) / kGroupsPerStage;
+        FullK ? groups / kGroupsPerStage : (groups + kGroupsPerStage - 1) / kGroupsPerStage;
 
     const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * padded_groups *
                                                Q4RowSplitStorage::kCodeBytesPerGroup;
@@ -249,8 +252,8 @@ __global__ __launch_bounds__(
     for (int prefetch = 0; prefetch < kPipelinePrefetch; ++prefetch) {
         if (prefetch < stages) {
             const int active_groups =
-                kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - prefetch * kGroupsPerStage);
-            q4_simt_issue_stage<Schedule, kFull>(shared_codes[warp][prefetch],
+                FullK ? kGroupsPerStage : min(kGroupsPerStage, groups - prefetch * kGroupsPerStage);
+            q4_simt_issue_stage<Schedule, FullK>(shared_codes[warp][prefetch],
                                                  shared_scales[warp][prefetch], code_row, scale_row,
                                                  prefetch, active_groups, lane);
         } else {
@@ -263,9 +266,9 @@ __global__ __launch_bounds__(
         const int fetch = stage + kPipelinePrefetch;
         if (fetch < stages) {
             const int active_groups =
-                kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - fetch * kGroupsPerStage);
+                FullK ? kGroupsPerStage : min(kGroupsPerStage, groups - fetch * kGroupsPerStage);
             const int buffer = fetch % kPipelineStages;
-            q4_simt_issue_stage<Schedule, kFull>(shared_codes[warp][buffer],
+            q4_simt_issue_stage<Schedule, FullK>(shared_codes[warp][buffer],
                                                  shared_scales[warp][buffer], code_row, scale_row,
                                                  fetch, active_groups, lane);
         } else {
@@ -276,9 +279,9 @@ __global__ __launch_bounds__(
         __syncwarp();
 
         const int active_groups =
-            kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - stage * kGroupsPerStage);
+            FullK ? kGroupsPerStage : min(kGroupsPerStage, groups - stage * kGroupsPerStage);
         const int buffer = stage % kPipelineStages;
-        q4_simt_consume_stage<Schedule, kFull, kFull>(x, k, col0, active_cols, stage, active_groups,
+        q4_simt_consume_stage<Schedule, FullK, kFull>(x, k, col0, active_cols, stage, active_groups,
                                                       shared_codes[warp][buffer],
                                                       shared_scales[warp][buffer], lane, acc);
         __syncwarp();

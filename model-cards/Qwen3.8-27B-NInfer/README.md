@@ -110,24 +110,24 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_8_27b.ninfer` |
-| Size | 20,437,336,576 bytes (19.03 GiB) |
-| SHA-256 | `0634abb07024221de141456cf04a42ab74b18bc38e1b781c6eb2e062a467eec3` |
-| Container version | 2 |
-| NInfer model ID | `qwen3.8-27b` |
-| NInfer weights ID | `groupwise-int` |
-| NInfer target key | `qwen3_8_27b` |
+| Size | 20,437,521,664 bytes (19.03 GiB) |
+| SHA-256 | `81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da` |
+| Container version | 3 |
+| Architecture | `Qwen3_5ForCausalLM` |
+| Public model name | `qwen3.8-27b` |
+| Chat template | [qwen3_8.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_8.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | Stored objects | 1,190 (1,184 tensors and 6 resources) |
 
-The Text body uses the registered Q4/Q5/Q6 groupwise allocation, while the token embedding and
-full output head use `W8G32_F16S`. The file also contains the registered Vision, MTP, DFlash2,
-proposal-head, tokenizer, chat-template, generation, and media-processor objects required by
-NInfer.
+The Text body uses Q4/Q5 projections, while the token embedding and full output head use
+`q8_g32_fp16`. The file also contains Vision, MTP, DFlash2, the optimized proposal head and
+frontend resources. Vision and speculative weights are loaded only when selected at startup.
 
 Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '0634abb07024221de141456cf04a42ab74b18bc38e1b781c6eb2e062a467eec3' \
+  '81f924d440c27261d820c19a9f8d45794c5aee410f8a68bd358133fa8c0375da' \
   'qwen3_8_27b.ninfer' | sha256sum --check
 ```
 
@@ -141,11 +141,14 @@ retain their stated MTP configurations and revisions.
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`385b30ce`](https://github.com/Neroued/ninfer/commit/385b30ce1757bafe5a82680e9b5aeb940b14eec1)
+  [`04350ba9`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - CUDA Toolkit 13.1 or newer.
+
+Already have the official v2 file? [Upgrade it locally](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#upgrade-an-existing-v2-artifact)
+without downloading the weights again.
 
 NInfer does not provide an install target or packaged binary. See the
 [repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
@@ -240,8 +243,6 @@ card reports no AIME results.
 
 ## Limits
 
-- The artifact is accepted only by NInfer revision `385b30ce` or later and the matching registered
-  target.
 - NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
   requests per Engine.
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
@@ -256,10 +257,9 @@ card reports no AIME results.
 | Source repository | `Qwen/Qwen3.8-27B` |
 | Source revision | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
 | Download source | `modelscope.cn/models/Qwen/Qwen3.8-27B` |
-| Conversion recipe | `qwen3_8_27b-v2` |
+| Conversion recipe | `qwen3_8_27b` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Converter revision | `863aa8a5f1e866db74f29f8999b83b4021398dee` |
-| Minimum runtime revision | `385b30ce1757bafe5a82680e9b5aeb940b14eec1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The local source configuration, tensor index, frontend resources, and published CRC32 inventory
@@ -269,7 +269,7 @@ publication.
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.8-27B-NInfer/blob/main/artifact-manifest.json).
 The exact storage contract is maintained in the
-[Qwen3.8-27B artifact reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/qwen3.8-27b-artifact.md).
+[v3 container reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/artifact-container.md).
 
 ## License
 

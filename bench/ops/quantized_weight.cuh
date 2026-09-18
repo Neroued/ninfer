@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
@@ -41,13 +42,13 @@ struct QuantizedGeometry {
 
 inline QuantizedGeometry quantized_geometry(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return {64, 0};
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return {64, 8};
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return {64, 16};
-    case QType::W8G32_F16S:
+    case QType::Q8_G32_FP16:
         return {32, 0};
     default:
         throw std::invalid_argument("unsupported benchmark quantized format");
@@ -256,7 +257,7 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k) {
     weight.payload          = result.storage.p;
     weight.payload_bytes    = payload_bytes;
     weight.high_plane_bytes = 0;
-    weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+    weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
     weight.layout           = QuantLayout::RowScale;
     weight.scale_dtype      = DType::BF16;
     weight.group_size       = static_cast<std::uint32_t>(k);

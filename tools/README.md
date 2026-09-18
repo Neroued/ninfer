@@ -1,55 +1,79 @@
-# NInfer maintainer tools
+# NInfer tools
 
-`tools/` contains the project-owner workflows for artifact conversion and inspection, benchmark
-orchestration, and serving smoke checks. These tools are not part of the public download-and-run
-path; normal users should start with the [project README](../README.md).
+`tools/` contains artifact conversion and inspection, benchmark orchestration, and serving smoke
+checks. To download and run an existing artifact, start with the [project README](../README.md).
+To build your own weights, use the [weight conversion guide](../docs/weight-conversion.md).
 
-Run commands from the repository root with a Python 3.11 environment containing the dependencies
-for the selected tool.
+Run commands from the repository root with a Python environment containing the dependencies
+for the selected tool. The maintained environment uses Python 3.11.
+
+Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 
 ## Task index
 
 | Task | Location |
 |---|---|
-| Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
-| Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
-| Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
+| Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
+
+## Standalone HBM probe
+
+This maintainer probe has an explicit standalone CUDA build, independent of the CMake benchmark
+targets. Build it with the project's CUDA toolkit and run it from the repository root:
+
+```bash
+mkdir -p build
+nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
+  -o build/hbm_bandwidth_probe
+./build/hbm_bandwidth_probe
+```
 
 ## Artifact workflow
 
-The converters consume their fixed local source checkpoints and write one complete `.ninfer`
-artifact. The paths below are placeholders for the maintainer's local checkpoint checkouts:
+The common converter reads selected local sources and writes a `.ninfer` artifact plus its
+`.conversion.json` report. These examples include the optional weights used by the official
+artifacts. The input paths are placeholders for local checkpoint checkouts:
 
 ```bash
-python3 -m tools.convert.qwen3_6_27b.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.6-27B \
+  --recipe qwen3_6_27b --components text,vision,mtp --proposal \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --name qwen3.6-27b \
   --out out/qwen3_6_27b.ninfer
 
-python3 -m tools.convert.qwen3_8_27b.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
-  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
+  --recipe qwen3_8_27b --components text,vision,mtp,dflash2 --proposal \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --name qwen3.8-27b \
   --out out/qwen3_8_27b.ninfer
 
-python3 -m tools.convert.qwen3_6_35b_a3b.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
-  --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
+  --recipe qwen3_6_35b_a3b --components text,vision,mtp,dflash --proposal \
+  --source dflash=/path/to/Qwen3.6-35B-A3B-DFlash \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
+  --name qwen3.6-35b-a3b \
   --out out/qwen3_6_35b_a3b.ninfer
 ```
 
-Inspect either result:
+Inspect a result:
 
 ```bash
 python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
 ```
 
-The exact source revisions, inventories, formats, and conversion recipes are recorded in
-[`docs/maintainer/`](../docs/maintainer/). Published users download the completed artifacts from
-Hugging Face instead of running these workflows.
+Recipes, mixed sources, custom methods, resources and sharding are described in the
+[conversion guide](../docs/weight-conversion.md). Numeric formats, layouts and framing are defined
+by the references linked from the [documentation map](../docs/README.md).
 
 ## Benchmark orchestration
 

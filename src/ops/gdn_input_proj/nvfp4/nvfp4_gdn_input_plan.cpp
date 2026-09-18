@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -16,14 +17,16 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
-    if (policy == LinearPolicy::AllowA4) { return Nvfp4GdnInputRoute::W4A4; }
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+        return Nvfp4GdnInputRoute::A16;
+    }
+    if (allows_a4(policy)) { return Nvfp4GdnInputRoute::W4A4; }
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                 cudaStream_t stream) {
-    constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
+    constexpr std::int32_t kChunk   = 32;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
@@ -55,7 +58,7 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
     }
     (void)resolve_route(policy, min_tokens);
     return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows)
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows)
                : 0;
 }
 

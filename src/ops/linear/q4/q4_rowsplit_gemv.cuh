@@ -98,7 +98,7 @@ using Q4GemvR4W1DirectSchedule =
                            Q4GemvLaneMapping::PackedWord8, Q4GemvDecodeMode::Fp16Mantissa,
                            Q4GemvCodeTransfer::AsyncVector16, Q4GemvScaleAccess::SharedPair32,
                            Cache::ca, 0, 1>;
-using Q4GemvR1W8DirectSchedule =
+using Q4GemvR1Q8DirectSchedule =
     Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
                            Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,

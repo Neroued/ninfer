@@ -1,10 +1,11 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
-#include "ops/linear/fp8/fp8_small_t.cuh"
+#include "ops/linear/fp8/fp8_simt.cuh"
 
 #include <array>
 #include <cstddef>
@@ -14,7 +15,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8GdnInputGeometry;
+using Geometry = Fp8N16384K5120;
 
 using SnapshotLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&, const Tensor&,
                                 const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
@@ -28,12 +29,16 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
                     const Tensor& conv_states, const Tensor& valid_columns,
                     const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
                     Tensor& z, Publish publish, cudaStream_t stream) {
-    using Schedule = typename Fp8LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
+    using Schedule =
+        Fp8SimtSchedule<8, 2, (ActiveTokens >= 5 && ActiveTokens <= 6) ? 8 : 16, ActiveTokens, 1,
+                        ActiveTokens <= 4 ? Fp8SimtActivationAccess::SharedPhase
+                                          : Fp8SimtActivationAccess::TokenPacked,
+                        Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
     static_assert(Schedule::kTokenTile == ActiveTokens);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     using Output          = GdnConvOutput<ActiveTokens, Publish>;
-    fp8_small_t_kernel<Geometry, ActiveTokens, Schedule, Output, Fp8IdentityEpilogue,
-                       Fp8GemvIdentityRows, false, Fp8SmallTFinalization::RowVector>
+    fp8_simt_kernel<Geometry, ActiveTokens, Schedule, Output, Fp8IdentityEpilogue,
+                    Fp8GemvIdentityRows, false, Fp8SimtFinalization::RowVector>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -74,7 +79,7 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
                             const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                             cudaStream_t stream) {
-    using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     fp8_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
@@ -90,19 +95,17 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
 template <std::size_t... Offsets>
 constexpr auto make_snapshot_launchers(std::index_sequence<Offsets...>) {
     return std::array<SnapshotLaunch, sizeof...(Offsets)>{
-        &launch_snapshot_small_t<kFp8FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_snapshot_small_t<2 + static_cast<int>(Offsets)>...};
 }
 
 template <std::size_t... Offsets>
 constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
     return std::array<RecordLaunch, sizeof...(Offsets)>{
-        &launch_record_small_t<kFp8FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_record_small_t<2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
-    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
-constexpr auto kRecordLaunchers = make_record_launchers(
-    std::make_index_sequence<kFp8LinearSmallTMax<Geometry> - kFp8FirstSmallT + 1>{});
+constexpr auto kSnapshotLaunchers = make_snapshot_launchers(std::make_index_sequence<10 - 2 + 1>{});
+constexpr auto kRecordLaunchers   = make_record_launchers(std::make_index_sequence<10 - 2 + 1>{});
 
 } // namespace
 
@@ -111,7 +114,7 @@ void fp8_gdn_snapshot_fused_launch(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    cudaStream_t stream) {
-    if (x.ne[2] != 1 || x.ne[1] <= 0 || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
+    if (x.ne[2] != 1 || x.ne[1] <= 0 || x.ne[1] > 10) {
         throw std::invalid_argument("fp8 GDN snapshot fused: unsupported B/W");
     }
     if (x.ne[1] == 1) {
@@ -119,7 +122,7 @@ void fp8_gdn_snapshot_fused_launch(const Tensor& x, const Weight& weight, const 
                                snapshot_base_slot, query, key, value, z, stream);
         return;
     }
-    kSnapshotLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
+    kSnapshotLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query,
         key, value, z, stream);
 }
@@ -128,10 +131,10 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
                                  const Tensor& conv_states, const Tensor& valid_columns,
                                  const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                                  Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
-    if (x.ne[2] != 1 || x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
+    if (x.ne[2] != 1 || x.ne[1] < 2 || x.ne[1] > 10) {
         throw std::invalid_argument("fp8 GDN record fused: unsupported B/W");
     }
-    kRecordLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
+    kRecordLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query, key,
         value, z, stream);
 }

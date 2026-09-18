@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include <stdexcept>

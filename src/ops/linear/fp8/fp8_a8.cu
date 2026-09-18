@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
@@ -67,48 +68,12 @@ __global__ __launch_bounds__(Threads,
     if (tid == 0) { scales[token] = scale; }
 }
 
-template <class Geometry, class Schedule, bool FullTokens>
-void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
-                cudaStream_t stream) {
-    static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
-    static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
-    const int row_tiles   = Geometry::kOutputRows / Schedule::kBlockRows;
-    const int token_tiles = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
-    const int blocks      = row_tiles * token_tiles;
-    const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-
-    if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
-                           Fp8ContiguousOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
-    }
-    fp8_mma_kernel<Geometry, Schedule, FullTokens>
-        <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
-            output);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
     constexpr int kThreads = 256;
     fp8_a8_quantize_kernel<ActivationGeometry, kThreads><<<x.ne[1], kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales);
     CUDA_CHECK(cudaGetLastError());
-}
-
-template <class Geometry>
-void launch_problem(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
-                    std::int32_t tokens, cudaStream_t stream) {
-    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
-    if ((tokens % Schedule::kBlockTokens) == 0) {
-        launch_mma<Geometry, Schedule, true>(weight, out, workspace, tokens, stream);
-    } else {
-        launch_mma<Geometry, Schedule, false>(weight, out, workspace, tokens, stream);
-    }
 }
 
 } // namespace
@@ -131,32 +96,6 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     default:
         throw std::invalid_argument("fp8 A8 quantize: unsupported K");
     }
-}
-
-void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
-                   cudaStream_t stream) {
-    launch_fp8_a8_quantize(x, weight, workspace, stream);
-    const std::int32_t tokens = x.ne[1];
-    switch (resolve_fp8_problem(weight.n, weight.k)) {
-    case Fp8Problem::AttnInput:
-        launch_problem<Fp8AttnInputGeometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Fp8Problem::GdnInput:
-        launch_problem<Fp8GdnInputGeometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Fp8Problem::MlpGateUp:
-        launch_problem<Fp8MlpGateUpGeometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Fp8Problem::Vocabulary:
-        break;
-    case Fp8Problem::Residual6144:
-        launch_problem<Fp8Residual6144Geometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Fp8Problem::Residual17408:
-        launch_problem<Fp8Residual17408Geometry>(weight, out, workspace, tokens, stream);
-        return;
-    }
-    throw std::logic_error("FP8 vocabulary has no A8 route");
 }
 
 } // namespace ninfer::ops::detail

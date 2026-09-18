@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include "core/device.h"
@@ -24,8 +25,10 @@ struct Bf16LinearAddDecodeEpilogue {
 
 void bf16_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                    cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<5120, 6144>;
-    using Schedule = Bf16LinearDecodeSchedule<Geometry>;
+    using Geometry = Bf16Geometry<5120, 6144>;
+    using Schedule =
+        Bf16GemvSchedule<8, 2, 2, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
+                         Bf16PhaseOrder::RowSwizzled, 1, 2, 1, 1>;
 
     const Bf16LinearAddDecodeOutput output{static_cast<__nv_bfloat16*>(residual.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;

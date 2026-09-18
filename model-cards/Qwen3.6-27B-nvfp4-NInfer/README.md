@@ -66,53 +66,55 @@ model-index:
 This model card is the version-controlled source for
 [neroued/Qwen3.6-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer).
 
-The repository contains the NVFP4 weight profile of
+The repository contains the NVFP4 representation of
 [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B), converted from the fixed packed weights in
 [rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm)
 to the native [NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format. The artifact is
 intended only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, or GGUF
 file.
 
-This is a second weight profile for the existing `qwen3_6_27b` target, not a separate model target.
-The version-2 artifact identity selects the NVFP4 binder and execution leaves. NInfer uses W4A4
-Tensor Core MMA for prefill and A16 NVFP4 kernels for decode while retaining the same Text, Vision,
-MTP, prefix-reuse, CLI, and serving paths as the groupwise-int profile.
+The artifact uses the Qwen3.5 Dense architecture with mixed NVFP4/BF16 weights. Actual bindings and
+activation permissions select the native execution paths, including W4A4 Tensor Core prefill and
+A16 NVFP4 decode. Text, Vision, MTP, prefix reuse, CLI and serving use the common Engine route.
 
 ## Artifact
 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b_nvfp4.ninfer` |
-| Size | 18,324,064,000 bytes (17.07 GiB) |
-| SHA-256 | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
-| Container version | 2 |
-| NInfer model ID | `qwen3.6-27b` |
-| NInfer weights ID | `nvfp4` |
-| NInfer target key | `qwen3_6_27b` |
-| Stored objects | 1,307 (1,301 tensors and 6 resources) |
+| Size | 18,324,354,820 bytes (17.07 GiB) |
+| SHA-256 | `0448262d15df2ae4fda761540c110bc19e7c3b4f43c0938e4d50474429cda083` |
+| Container version | 3 |
+| Architecture | `Qwen3_5ForCausalLM` |
+| Public model name | `qwen3.6-27b` |
+| Chat template | [qwen3_6.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_6.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; closed-turn reasoning omitted |
+| Stored objects | 1,545 (1,539 tensors and 6 resources) |
 | NVFP4 tensors | 247 |
 
-The file contains the registered Text, Vision, MTP, proposal-head, tokenizer, chat-template,
-generation, and media-processor objects required by NInfer. Text linears use the source repository's
-fixed mixed NVFP4/BF16 allocation; Vision, MTP, and frontend resources retain their registered
-NInfer formats.
+The file contains Text, Vision, MTP, the optimized proposal head, and frontend resources. Text
+linears use the source repository's mixed NVFP4/BF16 allocation; vocabulary and MTP projections
+use Q8. Vision and speculative weights are loaded only when selected at startup.
 
 Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  'bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a' \
+  '0448262d15df2ae4fda761540c110bc19e7c3b4f43c0938e4d50474429cda083' \
   'qwen3_6_27b_nvfp4.ninfer' | sha256sum --check
 ```
 
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`a85109c`](https://github.com/Neroued/ninfer/commit/a85109c4ef16b0b4a218c61e4641cfd0d11320fe)
+  [`98dada0`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - CUDA Toolkit 13.1 or newer.
+
+Already have the official v2 file? [Upgrade it locally](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#upgrade-an-existing-v2-artifact)
+without downloading the weights again.
 
 NInfer does not provide an install target or packaged binary. See the
 [repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
@@ -260,8 +262,6 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 ## Limits
 
-- The artifact is accepted only by NInfer revision `a85109c` or later and the matching registered
-  target.
 - NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
   requests per Engine.
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
@@ -277,16 +277,15 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | Base revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
 | NVFP4 source repository | `rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm` |
 | NVFP4 source revision | `9b5389d4a1e207daab2d47732efea57d7e946dcf` |
-| Conversion recipe | `qwen3_6_27b_nvfp4-v1` |
+| Conversion recipe | `qwen3_6_27b_nvfp4` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Converter revision | `a85109c4ef16b0b4a218c61e4641cfd0d11320fe` |
-| Minimum runtime revision | `a85109c4ef16b0b4a218c61e4641cfd0d11320fe` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer/blob/main/artifact-manifest.json).
 The exact storage contract is maintained in the
-[Qwen3.6-27B artifact reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/qwen3.6-27b-artifact.md).
+[v3 container reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/artifact-container.md).
 
 ## License
 

@@ -255,6 +255,73 @@ inline ColdTiming measure_cold_graph(const TimedGraph& graph, DeviceBuffer& flus
     return {percentile(0.50), samples.front(), percentile(0.95)};
 }
 
+// Cold measurement for an Op that updates its own input in place. `prepare` restores that input to
+// the same initial value before every warmup launch and every sample, so each timed call sees the
+// same operand; prepare and the L2 flush both run outside the timed interval.
+template <class Prepare, class Launch>
+ColdTiming measure_cold_launch_prepared(Prepare&& prepare, Launch&& launch, DeviceBuffer& flush,
+                                        cudaStream_t stream, int warmup, int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument(
+            "cold benchmark requires nonnegative warmup and positive repeat");
+    }
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop  = nullptr;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (int index = 0; index < warmup; ++index) {
+        prepare(stream);
+        flush_l2(flush, stream);
+        launch(stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) {
+        prepare(stream);
+        flush_l2(flush, stream);
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        launch(stream);
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return summarize_timings(std::move(samples));
+}
+
+template <class Prepare>
+ColdTiming measure_cold_graph_prepared(Prepare&& prepare, const TimedGraph& graph,
+                                       DeviceBuffer& flush, cudaStream_t stream, int warmup,
+                                       int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument(
+            "cold benchmark requires nonnegative warmup and positive repeat");
+    }
+    for (int index = 0; index < warmup; ++index) {
+        prepare(stream);
+        flush_l2(flush, stream);
+        graph.launch(stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) {
+        prepare(stream);
+        flush_l2(flush, stream);
+        samples.push_back(graph.launch_timed(stream));
+    }
+    return summarize_timings(std::move(samples));
+}
+
 struct Result {
     int n_runs       = 0;
     int inner_iters  = 1;

@@ -1,6 +1,7 @@
 // Public-Op benchmark for every registered GDN input-projection contract.
 // Production dispatch is owned exclusively by gdn_input_proj().
 
+#include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/device.h"
@@ -31,7 +32,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, W8, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -62,7 +63,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_gdn_input_proj_bench "
-                 "[--format q4q5|w8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
+                 "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
                  "[--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
@@ -110,8 +111,8 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--format requires a value"));
             if (value == "q4q5")
                 options.format = Format::Q4Q5;
-            else if (value == "w8")
-                options.format = Format::W8;
+            else if (value == "q8")
+                options.format = Format::Q8;
             else if (value == "nvfp4")
                 options.format = Format::Nvfp4;
             else if (value == "fp8")
@@ -119,7 +120,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, w8, nvfp4, fp8, or all");
+                usage("--format expects q4q5, q8, nvfp4, fp8, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -274,9 +275,9 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kOutputRows = kQkRows + kValueRows + kZRows;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
-        QType::Q4G64_F16S, kQkRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
+        QType::Q4_G64_FP16, kQkRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
     bench::PackedQuantizedWeight value_z = bench::make_row_split_weight(
-        QType::Q5G64_F16S, kValueRows + kZRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+        QType::Q5_G64_FP16, kValueRows + kZRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
@@ -294,7 +295,7 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
 }
 
-void run_w8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
+void run_q8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
             std::vector<Result>& results) {
     constexpr std::int32_t kHidden     = 2048;
     constexpr std::int32_t kQkvRows    = 8192;
@@ -302,7 +303,7 @@ void run_w8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-        QType::W8G32_F16S, kOutputRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
+        QType::Q8_G32_FP16, kOutputRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
@@ -316,9 +317,9 @@ void run_w8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     };
     const auto workspace_capacity = [](std::int32_t tokens) {
         return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::W8G32_F16S, kOutputRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
+            QType::Q8_G32_FP16, kOutputRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
     };
-    measure_points(options, "w8", "a16", kHidden, kOutputRows, parent.model_weight_bytes(),
+    measure_points(options, "q8", "a16", kHidden, kOutputRows, parent.model_weight_bytes(),
                    workspace_capacity, make_launch, flush, stream, results);
 }
 
@@ -363,7 +364,7 @@ void run_fp8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight parent = bench::make_fp8_weight(kOutputRows, kHidden);
     const std::size_t maximum_workspace = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kOutputRows, kHidden, options.fp8_policy, 1, max_tokens);
+        QType::FP8_E4M3FN_ROW_BF16, kOutputRows, kHidden, options.fp8_policy, 1, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
@@ -379,7 +380,7 @@ void run_fp8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     };
     const auto workspace_capacity = [&](std::int32_t tokens) {
         return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kOutputRows, kHidden, options.fp8_policy, tokens, tokens);
+            QType::FP8_E4M3FN_ROW_BF16, kOutputRows, kHidden, options.fp8_policy, tokens, tokens);
     };
     measure_points(options, "fp8", policy_name(options.fp8_policy), kHidden, kOutputRows,
                    parent.model_weight_bytes(), workspace_capacity, make_launch, flush, stream,
@@ -423,7 +424,7 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
 
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::W8)) { run_w8(options, flush, stream, results); }
+        if (selected(options.format, Format::Q8)) { run_q8(options, flush, stream, results); }
         if (selected(options.format, Format::Nvfp4)) { run_nvfp4(options, flush, stream, results); }
         if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
 

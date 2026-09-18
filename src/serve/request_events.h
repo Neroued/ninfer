@@ -25,8 +25,7 @@ struct RequestLogContext {
     bool enable_thinking  = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
-    std::optional<ninfer::ReasoningEffort> resolved_reasoning_effort;
-    bool preserve_thinking                 = false;
+    std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -63,8 +64,8 @@ struct SparseMoeHints {
  *
  * The five weights have the exact registered shapes: BF16 router/shared gate [257,2048], routed
  * gate/up [256*1024,2048], routed down [256*2048,512], shared gate/up [1024,2048], and shared down
- * [2048,512]. Admitted codec profiles are Q4+Q5, Q4+Q6, and W8+W8 for the two routed banks; both
- * shared banks are W8. Expert e directly selects its stored row spans; no selected-weight gather
+ * [2048,512]. Admitted codec profiles are Q4+Q5, Q4+Q6, and Q8+Q8 for the two routed banks; both
+ * shared banks are Q8. Expert e directly selects its stored row spans; no selected-weight gather
  * or repack occurs.
  *
  * Every positive T is supported.

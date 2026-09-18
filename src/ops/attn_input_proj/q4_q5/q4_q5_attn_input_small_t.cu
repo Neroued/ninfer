@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 
 #include "core/device.h"
@@ -24,7 +25,7 @@ using Q4AttnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca
 
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                     cudaStream_t stream) {
-    using Schedule = Q4GemvR1W8DirectSchedule;
+    using Schedule = Q4GemvR1Q8DirectSchedule;
     const dim3 grid(static_cast<unsigned>(div_up(kParentRows, Schedule::kRowsPerCta)), 1u, 1u);
     constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
     q4_rowsplit_gemv_kernel<Schedule, true, kSplitRow><<<grid, block, 0, stream>>>(
@@ -93,7 +94,7 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
     constexpr int kRowsPerBlock = 16;
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     constexpr int kGrid         = kParentRows / kRowsPerBlock;
-    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, false, true, kSplitRow>
+    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, true, kSplitRow>
         <<<kGrid, kBlockThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                               static_cast<const std::uint8_t*>(weight.qdata),
                                               static_cast<const std::uint8_t*>(weight.qhigh),

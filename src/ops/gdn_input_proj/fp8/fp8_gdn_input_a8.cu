@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
 #include "core/device.h"
@@ -13,8 +14,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8GdnInputGeometry;
-using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+using Geometry = Fp8N16384K5120;
+using Schedule = Fp8A8DefaultSchedule;
 
 static_assert((Fp8GdnInputOutput::kQkvRows % Schedule::kBlockRows) == 0);
 static_assert((Fp8GdnInputOutput::kZRows % Schedule::kBlockRows) == 0);

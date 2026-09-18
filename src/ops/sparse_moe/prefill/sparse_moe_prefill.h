@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -16,7 +17,7 @@ namespace ninfer::ops::detail {
 inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
-inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
+inline constexpr std::int32_t kSparseMoePrefillQ8Q8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
@@ -35,7 +36,7 @@ struct SparseMoePrefillWorkspace {
     // Selection writes one rank local to a routing tile. The gather must keep this source separate
     // from the final inverse map because all threads in an assignment block consume the rank while
     // thread 0 publishes the packed column. The index kernel does both from one thread per
-    // assignment, so the separation is there for the gather the W8 routed codec still takes.
+    // assignment, so the separation is there for the gather the Q8 routed codec still takes.
     Tensor local_rank;
     Tensor shared_scale;
     // Scan is the final consumer of tile_counts. Both maps below alias its dead prefix for the

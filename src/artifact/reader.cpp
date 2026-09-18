@@ -1,435 +1,86 @@
 #include "artifact/reader.h"
 
-#include <nlohmann/json.hpp>
+#include "artifact/file_io.h"
+#include "artifact/formats.h"
+#include "artifact/layouts.h"
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
-#include <cstring>
-#include <functional>
 #include <limits>
-#include <span>
-#include <string_view>
-#include <system_error>
-#include <type_traits>
-#include <unordered_map>
-#include <utility>
-
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 namespace ninfer::artifact {
-namespace {
-
-using Json = nlohmann::json;
-
-constexpr std::array<std::byte, 8> kMagic = {
-    std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
-    std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
-};
-constexpr std::uint64_t kPrefixBytes      = 16;
-constexpr std::uint64_t kPayloadAlignment = 4096;
-
-std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view label) {
-    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
-        throw ArtifactError(std::string(label) + " overflows u64");
-    }
-    return a + b;
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, std::string_view label) {
-    const auto biased = checked_add(value, alignment - 1, label);
-    return biased / alignment * alignment;
-}
-
-std::uint64_t read_u64_le(const std::byte* data) noexcept {
-    std::uint64_t value = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-        value |= std::uint64_t(std::to_integer<unsigned char>(data[i])) << (i * 8);
-    }
-    return value;
-}
-
-template <std::size_t N>
-void require_members(const Json& value, const std::array<const char*, N>& members,
-                     std::string_view label) {
-    if (!value.is_object() || value.size() != N) {
-        throw ArtifactError(std::string(label) + " has missing or extra members");
-    }
-    for (const char* member : members) {
-        if (!value.contains(member)) {
-            throw ArtifactError(std::string(label) + " has missing or extra members");
-        }
-    }
-}
-
-const std::string& require_string(const Json& value, std::string_view label) {
-    if (!value.is_string()) {
-        throw ArtifactError(std::string(label) + " must be a nonempty string");
-    }
-    const auto& result = value.get_ref<const std::string&>();
-    if (result.empty()) { throw ArtifactError(std::string(label) + " must be a nonempty string"); }
-    return result;
-}
-
-std::uint64_t require_unsigned(const Json& value, std::string_view label, bool positive) {
-    if (!value.is_number_unsigned()) {
-        throw ArtifactError(std::string(label) + " must be an integer");
-    }
-    const auto result = value.get<std::uint64_t>();
-    if (positive && result == 0) { throw ArtifactError(std::string(label) + " must be positive"); }
-    return result;
-}
-
-NumericFormat parse_format(std::string_view name) {
-    if (name == "BF16") { return NumericFormat::BF16; }
-    if (name == "FP32") { return NumericFormat::FP32; }
-    if (name == "I32") { return NumericFormat::I32; }
-    if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
-    if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
-    if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
-    if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
-    if (name == "NVFP4") { return NumericFormat::NVFP4; }
-    if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
-    throw ArtifactError("unknown tensor format: " + std::string(name));
-}
-
-StorageLayout parse_layout(std::string_view name) {
-    if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
-    if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
-    if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
-    if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
-    throw ArtifactError("unknown tensor layout: " + std::string(name));
-}
-
-ResourceEncoding parse_encoding(std::string_view name) {
-    if (name == "raw-bytes-v1") { return ResourceEncoding::RawBytesV1; }
-    throw ArtifactError("unknown resource encoding: " + std::string(name));
-}
-
-TensorDescriptor parse_tensor(const Json& value) {
-    static constexpr std::array members = {
-        "name", "kind", "shape", "format", "layout", "offset", "bytes",
-    };
-    require_members(value, members, "tensor entry");
-
-    const auto name        = require_string(value.at("name"), "tensor name");
-    const auto format      = parse_format(require_string(value.at("format"), "tensor format"));
-    const auto layout      = parse_layout(require_string(value.at("layout"), "tensor layout"));
-    const auto offset      = require_unsigned(value.at("offset"), "tensor offset", false);
-    const auto stored_size = require_unsigned(value.at("bytes"), "tensor bytes", true);
-
-    const auto& raw_shape = value.at("shape");
-    if (!raw_shape.is_array()) { throw ArtifactError("tensor shape must be an array"); }
-    std::vector<std::uint64_t> shape;
-    shape.reserve(raw_shape.size());
-    for (const auto& dim : raw_shape) {
-        shape.push_back(require_unsigned(dim, "shape dimension", true));
-    }
-
-    const auto expected_size = tensor_encoded_size(layout, format, shape);
-    if (stored_size != expected_size) {
-        throw ArtifactError("tensor " + name + " stores " + std::to_string(stored_size) +
-                            " bytes; layout requires " + std::to_string(expected_size));
-    }
-    return {name, std::move(shape), format, layout, offset, stored_size};
-}
-
-ResourceDescriptor parse_resource(const Json& value) {
-    static constexpr std::array members = {
-        "name", "kind", "encoding", "offset", "bytes",
-    };
-    require_members(value, members, "resource entry");
-    return {
-        require_string(value.at("name"), "resource name"),
-        parse_encoding(require_string(value.at("encoding"), "resource encoding")),
-        require_unsigned(value.at("offset"), "resource offset", false),
-        require_unsigned(value.at("bytes"), "resource bytes", true),
-    };
-}
-
-ObjectDescriptor parse_object(const Json& value) {
-    if (!value.is_object()) { throw ArtifactError("each object entry must be a JSON object"); }
-    const auto it = value.find("kind");
-    if (it == value.end() || !it->is_string()) {
-        throw ArtifactError("object kind must be 'tensor' or 'resource'");
-    }
-    const auto& kind = it->get_ref<const std::string&>();
-    if (kind == "tensor") { return parse_tensor(value); }
-    if (kind == "resource") { return parse_resource(value); }
-    throw ArtifactError("object kind must be 'tensor' or 'resource'");
-}
-
-struct TransparentStringHash {
-    using is_transparent = void;
-
-    std::size_t operator()(std::string_view value) const noexcept {
-        return std::hash<std::string_view>{}(value);
-    }
-
-    std::size_t operator()(const std::string& value) const noexcept {
-        return (*this)(std::string_view(value));
-    }
-};
-
-class MappedFile {
-public:
-    explicit MappedFile(const std::filesystem::path& path) {
-#if defined(_WIN32)
-        // FILE_FLAG_NO_BUFFERING makes ReadFile bypass the system cache, matching the
-        // POSIX O_DIRECT semantics.  It has no effect on MapViewOfFile, which uses the
-        // OS paging system independently.  The 4096-byte alignment contract enforced in
-        // read_direct() satisfies the flag's sector-alignment requirements.
-        const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                          OPEN_EXISTING,
-                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, nullptr);
-        if (file == INVALID_HANDLE_VALUE) {
-            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
-                                    "open " + path.string());
-        }
-
-        LARGE_INTEGER file_size{};
-        if (::GetFileSizeEx(file, &file_size) == 0) {
-            const int error = static_cast<int>(::GetLastError());
-            ::CloseHandle(file);
-            throw std::system_error(error, std::system_category(),
-                                    "fstat " + path.string());
-        }
-        if (file_size.QuadPart < 0 ||
-            static_cast<std::uintmax_t>(file_size.QuadPart) >
-                std::numeric_limits<std::size_t>::max()) {
-            ::CloseHandle(file);
-            throw ArtifactError("artifact size does not fit the process address space");
-        }
-
-        const auto size = static_cast<std::size_t>(file_size.QuadPart);
-        void* mapping   = nullptr;
-        if (size != 0) {
-            const HANDLE mapping_handle =
-                ::CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-            if (mapping_handle == nullptr) {
-                const int error = static_cast<int>(::GetLastError());
-                ::CloseHandle(file);
-                throw std::system_error(error, std::system_category(),
-                                        "mmap " + path.string());
-            }
-            mapping = ::MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0);
-            ::CloseHandle(mapping_handle);  // The view keeps the file object alive.
-            if (mapping == nullptr) {
-                const int error = static_cast<int>(::GetLastError());
-                ::CloseHandle(file);
-                throw std::system_error(error, std::system_category(),
-                                        "mmap " + path.string());
-            }
-        }
-        file_ = file;
-        data_ = static_cast<const std::byte*>(mapping);
-        size_ = size;
-#else
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd < 0) {
-            throw std::system_error(errno, std::generic_category(), "open " + path.string());
-        }
-
-        struct stat status {};
-
-        if (::fstat(fd, &status) != 0) {
-            const int error = errno;
-            ::close(fd);
-            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
-        }
-        if (status.st_size < 0 ||
-            static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
-            ::close(fd);
-            throw ArtifactError("artifact size does not fit the process address space");
-        }
-
-        const auto size = static_cast<std::size_t>(status.st_size);
-        void* mapping   = nullptr;
-        if (size != 0) {
-            mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (mapping == MAP_FAILED) {
-                const int error = errno;
-                ::close(fd);
-                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
-            }
-        }
-        fd_   = fd;
-        data_ = static_cast<const std::byte*>(mapping);
-        size_ = size;
-#endif
-    }
-
-    ~MappedFile() {
-#if defined(_WIN32)
-        if (data_ != nullptr) { ::UnmapViewOfFile(const_cast<std::byte*>(data_)); }
-        if (file_ != nullptr && file_ != INVALID_HANDLE_VALUE) { ::CloseHandle(file_); }
-#else
-        if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
-        if (fd_ >= 0) { ::close(fd_); }
-#endif
-    }
-
-    MappedFile(const MappedFile&)            = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
-
-    const std::byte* data() const noexcept { return data_; }
-
-    std::size_t size() const noexcept { return size_; }
-
-    std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
-        constexpr std::size_t alignment = Reader::direct_io_alignment;
-        if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
-            reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
-            throw ArtifactError("direct artifact read is not 4096-byte aligned");
-        }
-#if defined(_WIN32)
-        if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()) ||
-            destination.size() > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
-            throw ArtifactError("direct artifact read exceeds platform I/O limits");
-        }
-
-        OVERLAPPED overlapped{};
-        overlapped.Offset     = static_cast<DWORD>(absolute_offset & 0xFFFFFFFFULL);
-        overlapped.OffsetHigh = static_cast<DWORD>(absolute_offset >> 32U);
-        DWORD bytes           = 0;
-        if (::ReadFile(file_, destination.data(), static_cast<DWORD>(destination.size()), &bytes,
-                       &overlapped) == 0) {
-            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
-                                    "direct artifact read");
-        }
-        return static_cast<std::size_t>(bytes);
-#else
-        if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
-            destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
-            throw ArtifactError("direct artifact read exceeds platform I/O limits");
-        }
-
-        ssize_t bytes = -1;
-        do {
-            bytes = ::pread(fd_, destination.data(), destination.size(),
-                            static_cast<off_t>(absolute_offset));
-        } while (bytes < 0 && errno == EINTR);
-        if (bytes < 0) {
-            throw std::system_error(errno, std::generic_category(), "direct artifact read");
-        }
-        return static_cast<std::size_t>(bytes);
-#endif
-    }
-
-private:
-#if defined(_WIN32)
-    HANDLE file_            = nullptr;
-#else
-    int fd_                 = -1;
-#endif
-    const std::byte* data_ = nullptr;
-    std::size_t size_      = 0;
-};
-
-} // namespace
-
-std::string_view object_name(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) -> std::string_view { return descriptor.name; },
-                      object);
-}
-
-std::uint64_t object_offset(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) { return descriptor.offset; }, object);
-}
-
-std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) { return descriptor.bytes; }, object);
-}
 
 struct Reader::Impl {
-    explicit Impl(const std::filesystem::path& path) : file(path) {
-        if (file.size() < kPrefixBytes) {
-            throw ArtifactError("artifact is shorter than the v2 prefix");
-        }
-        if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
-            throw ArtifactError("artifact magic is not NInfer v2");
-        }
+    std::filesystem::path entry;
+    Directory directory;
+    ArtifactId id{};
+    std::uint64_t entry_payload_start = 0;
+    std::uint64_t file_bytes          = 0;
+    mutable std::vector<std::unique_ptr<InputFile>> files;
+    mutable std::vector<std::optional<WeightGeometry>> geometries;
 
-        const auto json_bytes = read_u64_le(file.data() + 8);
-        if (json_bytes == 0) { throw ArtifactError("json_bytes must be positive"); }
-        const auto metadata_end = checked_add(kPrefixBytes, json_bytes, "JSON range");
-        payload_start           = align_up(metadata_end, kPayloadAlignment, "payload offset");
-        if (metadata_end > file.size() || payload_start > file.size()) {
-            throw ArtifactError("declared JSON or payload start extends beyond the file");
-        }
-
-        Json directory;
-        try {
-            const auto* begin = reinterpret_cast<const char*>(file.data() + kPrefixBytes);
-            directory         = Json::parse(begin, begin + json_bytes);
-        } catch (const Json::exception& error) {
-            throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
-        }
-
-        static constexpr std::array root_members = {"identity", "objects"};
-        require_members(directory, root_members, "directory root");
-        const auto& raw_identity                     = directory.at("identity");
-        static constexpr std::array identity_members = {"model_id", "weights_id"};
-        require_members(raw_identity, identity_members, "artifact identity");
-        identity.model_id   = require_string(raw_identity.at("model_id"), "model_id");
-        identity.weights_id = require_string(raw_identity.at("weights_id"), "weights_id");
-
-        const auto& raw_objects = directory.at("objects");
-        if (!raw_objects.is_array() || raw_objects.empty()) {
-            throw ArtifactError("objects must be a nonempty array");
-        }
-        entries.reserve(raw_objects.size());
-        index.reserve(raw_objects.size());
-
-        const auto payload_bytes = static_cast<std::uint64_t>(file.size()) - payload_start;
-        std::uint64_t cursor     = 0;
-        for (const auto& raw_object : raw_objects) {
-            auto object          = parse_object(raw_object);
-            const auto name      = object_name(object);
-            const auto offset    = object_offset(object);
-            const auto bytes     = object_bytes(object);
-            const auto alignment = std::visit(
-                [](const auto& descriptor) {
-                    using Descriptor = std::decay_t<decltype(descriptor)>;
-                    if constexpr (std::is_same_v<Descriptor, TensorDescriptor>) {
-                        return tensor_alignment(descriptor.layout);
-                    } else {
-                        return resource_alignment(descriptor.encoding);
-                    }
-                },
-                object);
-
-            if (offset < cursor) {
-                throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
+    explicit Impl(const std::filesystem::path& path) : entry(path) {
+        auto file = std::make_unique<InputFile>(entry);
+        std::array<std::byte, kHeaderBytes> header{};
+        file->read_exact(0, header);
+        if (!std::equal(kEntryMagic.begin(), kEntryMagic.end(), header.begin())) {
+            if (std::equal(kEntryMagic.begin(), kEntryMagic.end() - 1, header.begin()) &&
+                header[kEntryMagic.size() - 1] == std::byte{2}) {
+                throw ArtifactError(
+                    entry.string() +
+                    ": NInfer v2 artifact is not supported. Upgrade to v3 with: "
+                    "python3 tools/upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer");
             }
-            if (offset % alignment != 0) {
-                throw ArtifactError("object " + std::string(name) + " is not " +
-                                    std::to_string(alignment) + "-byte aligned");
-            }
-            const auto end = checked_add(offset, bytes, "object payload range");
-            if (end > payload_bytes) {
-                throw ArtifactError("object " + std::string(name) + " extends beyond the file");
-            }
-            const auto object_index = entries.size();
-            auto [_, inserted]      = index.emplace(std::string(name), object_index);
-            if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
-            entries.push_back(std::move(object));
-            cursor = end;
+            throw ArtifactError(entry.string() + ": expected NInfer v3 entry magic");
         }
+        const auto json_bytes = read_u64_le(header.data() + 8);
+        if (!json_bytes || json_bytes > file->bytes() - kHeaderBytes ||
+            json_bytes > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError(entry.string() + ": invalid directory length");
+        }
+        std::copy_n(header.begin() + 16, id.size(), id.begin());
+        std::string text(static_cast<std::size_t>(json_bytes), '\0');
+        file->read_exact(kHeaderBytes, std::as_writable_bytes(std::span(text.data(), text.size())));
+        directory =
+            parse_directory(parse_json(text, "artifact directory"), entry.filename().string());
+        entry_payload_start = align_up(checked_add(kHeaderBytes, json_bytes, "metadata end"),
+                                       kPayloadAlignment, "entry payload start");
+        const auto expected =
+            checked_add(entry_payload_start, directory.files[0].payload_bytes, "entry length");
+        if (expected != file->bytes()) {
+            throw ArtifactError(entry.string() + ": entry length differs from directory");
+        }
+        file_bytes = checked_add(entry_payload_start, directory.payload_bytes, "file bytes");
+        file_bytes = checked_add(
+            file_bytes,
+            checked_mul(directory.files.size() - 1, kPayloadAlignment, "continuation headers"),
+            "file bytes");
+        files.resize(directory.files.size());
+        files[0] = std::move(file);
+        geometries.resize(directory.objects.size());
     }
 
-    MappedFile file;
-    ArtifactIdentity identity;
-    std::vector<ObjectDescriptor> entries;
-    std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
-    std::uint64_t payload_start = 0;
+    InputFile& file(std::size_t index) const {
+        if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
+        if (!files[index]) {
+            const auto& record = directory.files[index];
+            auto input         = std::make_unique<InputFile>(entry.parent_path() / *record.path);
+            std::array<std::byte, kHeaderBytes> header{};
+            input->read_exact(0, header);
+            if (!std::equal(kPartMagic.begin(), kPartMagic.end(), header.begin()) ||
+                read_u64_le(header.data() + 8) != index ||
+                !std::equal(id.begin(), id.end(), header.begin() + 16)) {
+                throw ArtifactError(*record.path +
+                                    ": continuation header does not belong to this entry");
+            }
+            if (input->bytes() !=
+                checked_add(kPayloadAlignment, record.payload_bytes, "part length")) {
+                throw ArtifactError(*record.path + ": continuation length differs from directory");
+            }
+            files[index] = std::move(input);
+        }
+        return *files[index];
+    }
 };
 
 Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
@@ -438,40 +89,89 @@ Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
-const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
+const Directory& Reader::directory() const noexcept { return impl_->directory; }
 
-const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
+const ArtifactId& Reader::artifact_id() const noexcept { return impl_->id; }
 
-const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
-    const auto it = impl_->index.find(name);
-    return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
+std::uint64_t Reader::file_bytes() const noexcept { return impl_->file_bytes; }
+
+ObjectHandle Reader::find(std::string_view id) const {
+    const auto found = directory().object_index.find(id);
+    if (found == directory().object_index.end()) {
+        throw ArtifactError("missing object " + std::string(id));
+    }
+    return found->second;
 }
 
-std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
-
-std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
-
-PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
-    const auto absolute =
-        checked_add(impl_->payload_start, object_offset(object), "absolute payload offset");
-    const auto end = checked_add(absolute, object_bytes(object), "absolute payload range");
-    if (end > impl_->file.size()) { throw ArtifactError("object payload extends beyond the file"); }
-    return {
-        absolute,
-        std::span<const std::byte>(impl_->file.data() + absolute,
-                                   static_cast<std::size_t>(object_bytes(object))),
-    };
+const WeightGeometry& Reader::geometry(ObjectHandle handle) const {
+    const auto& tensor = directory().tensor(handle);
+    auto& result       = impl_->geometries[handle.index];
+    if (!result) { result = describe_tensor(tensor); }
+    return *result;
 }
 
-PayloadSpan Reader::payload(std::string_view name) const {
-    const auto* object = find(name);
-    if (object == nullptr) { throw ArtifactError("unknown artifact object: " + std::string(name)); }
-    return payload(*object);
+void Reader::validate_object(ObjectHandle handle) const {
+    const auto& object = directory().object(handle);
+    if (std::holds_alternative<TensorObject>(object)) {
+        (void)geometry(handle);
+    } else if (std::get<ResourceObject>(object).encoding != kRawBytesEncoding) {
+        throw ArtifactError(object_id(object) + ": unsupported resource encoding");
+    }
 }
 
-std::size_t Reader::read_direct(std::uint64_t absolute_offset,
+std::vector<ReadSegment> Reader::segments(std::uint64_t offset, std::uint64_t bytes) const {
+    const auto& data = directory();
+    if (offset > data.payload_bytes || bytes > data.payload_bytes - offset) {
+        throw ArtifactError("read range exceeds logical payload");
+    }
+    std::vector<ReadSegment> result;
+    if (!bytes) { return result; }
+    const auto found     = std::upper_bound(data.files.begin(), data.files.end(), offset,
+                                            [](std::uint64_t position, const FileRecord& file) {
+                                            return position < file.logical_begin;
+                                        });
+    std::size_t index    = static_cast<std::size_t>(found - data.files.begin() - 1);
+    std::uint64_t copied = 0;
+    while (copied < bytes) {
+        const auto& file = data.files[index];
+        const auto local = offset + copied - file.logical_begin;
+        const auto count = std::min(bytes - copied, file.payload_bytes - local);
+        const auto start = index == 0 ? impl_->entry_payload_start : kPayloadAlignment;
+        result.push_back({index, checked_add(start, local, "file offset"), copied, count});
+        copied += count;
+        ++index;
+    }
+    return result;
+}
+
+void Reader::read_into(std::uint64_t offset, std::span<std::byte> destination) const {
+    for (const auto& segment : segments(offset, destination.size())) {
+        impl_->file(segment.file_index)
+            .read_exact(segment.file_offset,
+                        destination.subspan(static_cast<std::size_t>(segment.destination_offset),
+                                            static_cast<std::size_t>(segment.bytes)));
+    }
+}
+
+std::vector<std::byte> Reader::read_range(std::uint64_t offset, std::uint64_t bytes) const {
+    if (bytes > std::numeric_limits<std::size_t>::max()) {
+        throw ArtifactError("Host read size exceeds size_t");
+    }
+    (void)segments(offset, bytes);
+    std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+    read_into(offset, result);
+    return result;
+}
+
+std::vector<std::byte> Reader::read_object(ObjectHandle handle) const {
+    validate_object(handle);
+    const auto& object = directory().object(handle);
+    return read_range(object_offset(object), object_bytes(object));
+}
+
+std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offset,
                                 std::span<std::byte> destination) const {
-    return impl_->file.read_direct(absolute_offset, destination);
+    return impl_->file(file_index).read_direct(file_offset, destination);
 }
 
 } // namespace ninfer::artifact

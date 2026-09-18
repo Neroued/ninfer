@@ -20,6 +20,11 @@ The two-cohort stream case derives its second cohort by replacing each leading s
 a distinct same-length label. It therefore preserves the frozen long-request shape without adding
 a second copy of the large corpus, while still diverging at the first system-content token.
 
+`state_working_set_a.json` through `state_working_set_f.json` are six 2048-token Chat roots that
+split at the first system-content token. The manifest also fixes short user-suffix probes and their
+token counts. The State-pressure cases reuse these roots for cohort changes, complete-history
+private continuations, and a hot prefix interleaved with one-shot conversations.
+
 The generated media consists of 56 deterministic, byte-distinct 1024×1024 PNGs. The two legal
 heavy inputs use disjoint sets of 28 images each. Every image expands to a 12 MiB Vision
 preprocessing patch tensor (this is media payload, not KV storage), so the files exercise media

@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear/q6/q6_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -38,9 +39,6 @@ using MmaR64C72K128Schedule =
                               Cache::cg, Q6ScaleLoad::Pair32, 1>;
 using MmaR64C80Schedule =
     Q6RowSplitMmaGemmSchedule<64, 80, 128, 16, 40, 1, 2, Q6FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q6ScaleLoad::Pair32, 1>;
-using MmaR64C88K128Schedule =
-    Q6RowSplitMmaGemmSchedule<64, 88, 128, 16, 88, 1, 2, Q6FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q6ScaleLoad::Pair32, 1>;
 using MmaR64C96Schedule =
     Q6RowSplitMmaGemmSchedule<64, 96, 128, 16, 48, 1, 2, Q6FragmentPipeline::Serial, Cache::cg,
@@ -141,22 +139,17 @@ void launch_q6_mma_r64_c80(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     launch_route<MmaR64C80Schedule>(x, w, out, stream);
 }
 
-void launch_q6_mma_r64_c88_k128(const Tensor& x, const Weight& w, Tensor& out,
-                                cudaStream_t stream) {
-    launch_route<MmaR64C88K128Schedule>(x, w, out, stream);
-}
-
 void launch_q6_mma_r64_c96(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<MmaR64C96Schedule>(x, w, out, stream);
 }
 
-void launch_q6_mma_r64_c112_partial(const Tensor& x, const Weight& w, Tensor& out,
-                                    cudaStream_t stream) {
-    launch_route<MmaR64C112PartialSchedule>(x, w, out, stream);
-}
-
 void launch_q6_mma_r64_c112(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_route<MmaR64C112Schedule>(x, w, out, stream);
+    // A complete column tile uses a wider fragment mapping; tails retain the compact mapping.
+    if (x.ne[1] % 112 == 0) {
+        launch_route<MmaR64C112Schedule>(x, w, out, stream);
+    } else {
+        launch_route<MmaR64C112PartialSchedule>(x, w, out, stream);
+    }
 }
 
 void launch_q6_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

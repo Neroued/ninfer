@@ -1,11 +1,12 @@
 # NInfer Engine 架构
 
-本文定义 NInfer 从产品请求到模型执行与结果发布的顶层控制面。它是请求生命周期、调度顺序和跨模块
-提交关系的维护者权威。
+本文定义 NInfer 的模型实例、执行所有权与顶层控制面，说明权重如何进入固定模型实现，以及请求、
+资源和输出如何共同提交。它是全局架构、请求生命周期和跨模块提交关系的维护者权威。
 
 本文只规定长期稳定的边界：
 
 - 谁拥有请求、顺序、缓存策略和物理状态；
+- 架构代码、实例配置、权重表示与实际执行怎样相接；
 - 请求在哪些稳定状态之间转换；
 - 模型状态、输出状态和资源状态何时可以对外发布；
 - cancellation 和 failure 如何到达唯一终态。
@@ -29,10 +30,8 @@ Generation purpose 的 NInfer Engine 固定运行：
 
 Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
 MTP、DFlash 和 DFlash2 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
-Qwen3.8-27B 的 DFlash2 支持启动固定 K=1..15、full/optimized proposal head、Text/Vision 和
-exact-batch CUDA Graph。它复用 family-owned masked-draft 状态事务，五层 local context
-属于 StateImage，不分配 full backend KV；独立 context frontier 与 main frontier 的关系、
-条件 proposal q 和最终提交规则见 [DFlash2](qwen3.8-27b-dflash2.md)。
+Artifact 必须提供 Text；Vision、MTP、DFlash 和 DFlash2 的私有权重与资源可以缺省。
+启动独立选择 Vision，以及 none 或一个 spec 后端，只为所选功能及其共享依赖绑定和准备资源。
 
 同一个公共 Engine 还提供启动时固定的 CausalScoring purpose。它只服务离线文本评分：
 `CausalScoreCore` 串行调用 Program，窗口使用临时的空 State 与 Main KV，不创建请求、continuation、
@@ -46,6 +45,36 @@ inactive cache 的保留而丢失完成能力。
 本文不覆盖多 GPU placement、active request preemption、priority/QoS、跨 Engine context store
 或大规模 continuous batching。这些工作负载需要重新定义 admission 与公平性合同，不能直接从当前
 小并发模型外推。
+
+### 1.1 架构与权重实例
+
+模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
+分布和 expert 几何等实例参数。当前标准架构入口是 `Qwen3_5ForCausalLM` 与
+`Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
+
+V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
+Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
+验证、读取并上传原字节。相同架构和可处理的配置更换训练权重或组合已有表示，沿用同一模型代码。
+
+```mermaid
+flowchart LR
+    S["来源与 recipe"] --> C["Converter / Writer"]
+    C --> A["v3 artifact"]
+    A --> L["Reader / 语义绑定"]
+    L --> M["Materialization → Model"]
+    M --> P["Parameters / Frontend"]
+    P --> R["资源准备 → Program"]
+    R --> E["Engine"]
+    O["启动选项"] --> L
+    O --> R
+    D["实际设备预算"] --> R
+```
+
+`metadata.name` 提供公开实例名称，缺省使用架构名称；服务可以用 `--model-id` 覆盖公开别名。
+这些名称及转换 provenance 用于识别数据与来源。执行选择依据架构、配置和实际绑定。
+
+文件及引用合同见[容器规范](artifact-container.md)，权重的数值解释与 planes 分别见
+[数值格式](tensor-formats.md)和[存储布局](storage-layouts.md)。
 
 ---
 
@@ -108,15 +137,15 @@ Engine 理解请求、预算、finish reason 和可发布输出，不解释 tran
 
 ### 2.4 Program
 
-Program 是 exact target package 的唯一物理执行入口，拥有：
+Program 是模型实例的物理执行入口，拥有：
 
 - active sequence 与完整 continuation state；
 - State/KV stores、allocator、replica、reference 和 reservation；
-- prefill、ordinary decode、MTP/DFlash 和 forced control；
+- prefill、ordinary decode、MTP/DFlash/DFlash2 和 forced control；
 - provisional model state 及 accepted-prefix commit/rollback；
 - resident prefix identity、shortlist digest 及 committed execution provenance；
 - resource feasibility、物理 transition 和 `ResourceResult`；
-- workspace、CUDA Graph 和 target execution schedule；
+- workspace、CUDA Graph 和固定模型调用；
 - CausalScoring 窗口的临时 State/KV 与 `lm_head`/logprob staging。
 
 Program 不维护 FIFO、SessionIndex、cache retention 价值或用户可见输出。
@@ -127,6 +156,8 @@ Program 不维护 FIFO、SessionIndex、cache retention 价值或用户可见输
 
 | 事实或决策 | 唯一所有者 |
 |---|---|
+| config、绑定、Use、权重 backing 与只读资源 | Model |
+| 与绑定同源的原生执行参数 | ModelInstance 的 const Parameters；借用 Model |
 | 协议、连接、transport | Gateway |
 | prompt 与 output 语义 | Frontend |
 | waiting queue、request record、response event | EngineCore |
@@ -175,36 +206,43 @@ Program 中的真实 stores 与 allocators 是物理事实的唯一权威。Prog
 
 Program 不根据 session、FIFO 位置或用户身份决定缓存价值。
 
-### 3.4 Package 与 Engine lifetime
+### 3.4 模型实例与 Engine lifetime
 
-Engine 构造时读取 `.ninfer` identity，并从 closed registry 选择 exact compile-time package。Package 提供
-同一组 Frontend、request-plan、Program 和 execution-result 语义；target identity、artifact binding、模型
-view 与 execution leaves 保持 package-private。Qwen3.6 family 的共享 schedule 通过 compile-time Variant
-实例化，worker hot path 不执行 runtime family selection。
+Engine 按标准架构/config 解释所选功能的逻辑需求，binder 将它们对应到 artifact 的对象与 Use。
+Materializer 建立稳定 backing 并上传原字节，得到只读 Model。ModelInstance 持有 Model，
+从它形成 const Parameters，并将已解析的 tokenizer 等只读资源交给 Frontend。
 
-27B 与 35B-A3B package 是同一 identity-free Qwen3.6 family 的平级 Variant，任何一方都不以另一方
-的差异补丁定义。共享算法与实例存储的归属不同：
+Planner 与实际执行借用同一 Parameters。Planner 根据启动范围查询各层及所选后端的需求，
+建立容量曲线；结合权重驻留后的 Device 余量解析 KV 容量，再构造 Program 的最终布局。
+GenerationCore 或 CausalScoreCore 在实例准备完成后使用它。
 
-- `src/targets/qwen3_6` 拥有 `SequencePlan<Variant>`、`RequestPlan<Variant>` 和
-  `Program<Variant>` 算法，以及 Text/Vision/speculative schedule、state transaction、workspace
-  composition 和 CUDA Graph capture/replay 机制。Family 同时拥有 tokenizer/template、输出语义、
-  media preprocessing、MRoPE prompt construction、owning prepared-prompt/output-session 类型、
-  semantic weight-view schemas 和 passive Vision definitions。
-- 每个 `src/targets/<package>` 拥有注册 identity、storage profile、binder、`LoadedModel`、配置、
-  dimensions/storage facts、填充后的 immutable family model view、private leaf payload、diagnostics、
-  graph frontier values 和 Program instance bytes。Package alias 并实例化 family runtime 类型，不复制
-  Program、schedule、workspace composition、state transaction 或 graph-capture 算法。
-- Package 提供三类 execution leaves：attention projection、GDN projection/control、post-mixer。
-  Leaf 调用的闭合数学或状态变换仍由 `src/ops` 实现。
-
-Family 不拥有 target identity、registry entry、artifact binder、target leaf implementation 或 live
-Program instance storage；family schedule 内没有 runtime family selection 或 target-dependent branch。
-每个 Program 独占可变状态和
-device allocation。Prepared prompt 不携带 exact-target tag；各 artifact 的共同 frontend resources
-及具体清单由相应 artifact reference 定义。
+模型配置、绑定和权重地址在实例存活期间固定；每个 Program 独占自己的可变 State/KV、
+workspace 和 Graph。销毁时先结束 Engine core 和未决设备工作，再销毁实例的 Program、
+Frontend 和 Parameters，最后释放 Model backing。Reader 与上传 staging 属于加载生命周期。
 
 权重、State/KV backing、block-table matrices、workspace 与 CUDA Graph resources 在 Engine 开始接受请求前
 建立。运行期改变 ownership、mapping、frontier 与 replica placement，但不重建这些大块 Device allocations。
+
+### 3.5 固定执行与原生参数
+
+逻辑参数、物理对象和 Op 参数数量分别由数学、存储和实际入口决定。例如当前 Dense Attention
+投影的两种已实现写法：
+
+| 实际绑定 | 固定模型调用 |
+|---|---|
+| 一个 Q4 parent 保存 Q/K，另一个 Q5 parent 保存 gate/V | 准备两个权重参数，使用双权重投影入口 |
+| 一个完整 FP8 或 NVFP4 parent 按顺序保存 Q/K/gate/V | 准备一个权重参数，使用单权重投影入口 |
+
+View 保留完整 parent 的几何、planes 和元素范围；原生准备按入口要求解释这些引用。
+共享对象只驻留一次，各使用位置保留独立的 Use。激活许可为 `A16Only={A16}`、
+`AllowA8={A16,A8}`、`AllowA4={A16,A8,A4}`；融合调用取相关 Use 的许可交集并处理所需辅助值。
+
+模型代码直接维护有限调用写法、跨 Op 融合和阶段关系；闭合计算及其 shape/格式分派属于 Op。
+Reader、binder、原生参数准备、容量查询、warmup 和实际执行各自检查所消费的合同。
+合法 artifact 的可执行范围取决于实际消费者，转换不要求完整权重组合预先注册。
+
+数学公式、权重表示值和实现精度分别解释。不同量化、prefill、batch 或 speculative 路线可以
+产生不同结果；数值与状态正确性按[Op 合同](op-development.md)及对应的独立 oracle 验证。
 
 ---
 
@@ -491,6 +529,13 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域。
 
+容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
+顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text
+及所选 MTP 的最后消费者，speculative pending features 和 verify records 保留至对应提交边界。
+
+Prefill 成本按硬件类别与实际 Text/Vision 配置、绑定、Use 派生的 `prefill_signature` 选择测量值，
+没有匹配值时使用通用成本。成本用于规划选择，物理可行性仍由 Program 的实际布局与占用决定。
+
 Serve warmup 使用同一个公共 Engine 执行路径，但其 request-level context cache 固定关闭。Warmup 可以建立
 CUDA Graph、library 和 allocator 的运行时状态，结束后不得留下可供外部请求命中的 continuation 或占用
 checkpoint catalog。
@@ -519,11 +564,13 @@ checkpoint catalog。
 | 公共 Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
 | Engine worker 与 request lifecycle | `src/runtime/engine/engine_core.h`, `src/runtime/engine/request_record.h` |
 | Scheduler | `src/runtime/engine/scheduler.h`, `admission_policy.*` |
-| ResourceManager 与 materialization planner | `src/runtime/engine/resource_manager.h`, `materialization_planner.h` |
-| package-neutral runtime contracts | `src/runtime/contract/types.h` |
-| family Program algorithms | `src/targets/qwen3_6/impl/runtime/` |
-| family frontend semantics, owning prompt/output types, semantic model views | `src/targets/qwen3_6/` |
-| registered identities, binding, model views, execution leaves, Program instance storage | `src/targets/<package>/` |
+| 实例构造与有效期 | `src/runtime/engine/model_instance.*` |
+| ResourceManager 与 materialization planner | `src/runtime/engine/context_cache/` |
+| 请求、执行、资源与计时合同 | `src/runtime/contract/` |
+| 模型 config、绑定与只读数据 | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
+| 原生参数与固定模型调用 | `src/models/qwen3_5/execution/` |
+| Program 规划、存储与事务 | `src/models/qwen3_5/program/` |
+| Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |
 | semantic Ops | `src/ops/`, `include/ninfer/ops/` |
@@ -531,7 +578,8 @@ checkpoint catalog。
 | media URL/path/data acquisition | `src/product/media_acquire/`, CLI and serving |
 | media decode from already-owned bytes | `src/media/decode/` |
 | HTTP Gateway | `src/serve/` |
-| target-private inventories, source recipes, conversion, payload verification | `tools/convert/<target>/` |
+| 源适配、recipe 与转换方法 | `tools/convert/` |
+| Python 容器读取、编码输出与 writer | `tools/artifact/` |
 
 这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
@@ -541,9 +589,9 @@ repository-internal semantic Op contracts。`.ninfer` 是唯一 C++ 产品 artif
 兼容 shim 或第二套产品入口加载其他格式。CLI、server 和 inference benchmark 只通过公共 Engine
 推理；converter 不提供 Python model-inference route。
 
-Artifact 不解释 checkpoint execution semantics；runtime 不拥有模型数学或 target state；media
-acquisition 不链接到 target。每个语义闭合的 Op（包括 fused、fixed-shape 和 device-specialized
-实现）都归 `src/ops`，不按最初调用者或是否已跨 target 复用决定归属。
+Artifact 层拥有通用文件与驻留合同，模型实现拥有数学及状态操作，runtime 拥有公共运行合同与
+Engine 发布政策，product/serving 拥有输入获取及协议翻译。每个语义闭合的 Op（包括 fused、
+fixed-shape 和 device-specialized 实现）都归 `src/ops`。
 
 相邻文档：
 

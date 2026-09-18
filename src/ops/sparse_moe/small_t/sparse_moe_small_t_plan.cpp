@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include "core/layout.h"
@@ -25,10 +26,10 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
         throw std::invalid_argument("sparse_moe small-T: unsupported token count");
     }
     const bool main_profile =
-        routed_gate_up == QType::Q4G64_F16S &&
-        (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
+        routed_gate_up == QType::Q4_G64_FP16 &&
+        (routed_down == QType::Q5_G64_FP16 || routed_down == QType::Q6_G64_FP16);
     const bool mtp_profile =
-        routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+        routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
     if (!main_profile && !mtp_profile) {
         throw std::invalid_argument("sparse_moe small-T: unsupported routed codec profile");
     }
@@ -43,10 +44,20 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
     }
 
     plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
-    if (routed_down == QType::Q5G64_F16S) {
-        plan.d4_schedule = tokens <= 2   ? SparseMoeSmallTD4Schedule::Rows1
-                           : tokens <= 5 ? SparseMoeSmallTD4Schedule::Rows2
-                                         : SparseMoeSmallTD4Schedule::Rows4;
+    // Rows is only a grid split: (kHidden / Rows, tokens). Rows2 runs twice the blocks, so it has
+    // twice the parallelism to cover memory latency while the grid is small, and it re-reads the
+    // same per-expert activations in every block - +63 % L1 traffic, L2 flat (lts__t_bytes
+    // x1.004); dram__* is not exposed on this part. Those counters are from Q6 at T=17; the kernel
+    // is codec-parametric, so the mechanism is assumed to carry to Q5, not measured there.
+    //
+    // Below the crossover the parallelism wins; above it only the cost is left. Each codec keeps
+    // its own crossover, taken where Rows2 is weakest - every token sharing one set of eight
+    // experts. Neither value regresses at 1975 MHz or at 2810 MHz; the crossover moves right with
+    // SM clock because the cost is SM-side, so the lower-clocked card binds.
+    if (routed_down == QType::Q5_G64_FP16) {
+        plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
+                           : tokens <= 17 ? SparseMoeSmallTD4Schedule::Rows2
+                                          : SparseMoeSmallTD4Schedule::Rows4;
     } else {
         plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
                            : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2

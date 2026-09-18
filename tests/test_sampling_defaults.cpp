@@ -1,7 +1,6 @@
 #include "runtime/contract/sampling.h"
 
-#include <ninfer/targets/qwen3_6_27b/package.h>
-#include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include "models/qwen3_5/frontend/frontend.h"
 
 #include <cmath>
 #include <iostream>
@@ -30,25 +29,15 @@ bool throws_invalid(const auto& operation) {
     return false;
 }
 
-bool throws_runtime(const auto& operation) {
-    try {
-        operation();
-    } catch (const std::runtime_error&) { return true; }
-    return false;
-}
 
 } // namespace
 
 int main() {
-    using Dense27 = ninfer::targets::qwen3_6_27b::Package;
-    using Moe35   = ninfer::targets::qwen3_6_35b_a3b::Package;
-
-    int failures = 0;
-
-    const ninfer::ModelSamplingDefaults qwen3_6 = Dense27::sampling_defaults(Dense27::model_id);
-    const ninfer::ModelSamplingDefaults qwen3_8 =
-        Dense27::sampling_defaults(Dense27::qwen3_8_model_id);
-    const ninfer::ModelSamplingDefaults qwen3_6_35 = Moe35::sampling_defaults(Moe35::model_id);
+    using ninfer::models::Architecture;
+    using ninfer::models::qwen3_5::default_sampling;
+    int failures     = 0;
+    const auto dense = default_sampling(Architecture::Qwen3_5);
+    const auto moe   = default_sampling(Architecture::Qwen3_5Moe);
 
     const ninfer::SamplingPreset dense_thinking{
         .temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};
@@ -67,29 +56,24 @@ int main() {
         .presence_penalty = 1.5F,
     };
 
-    failures += check(same_preset(qwen3_6.thinking, dense_thinking),
-                      "Qwen3.6-27B thinking defaults mismatch");
-    failures += check(same_preset(qwen3_6.non_thinking, dense_non_thinking),
-                      "Qwen3.6-27B non-thinking defaults mismatch");
-    failures += check(same_preset(qwen3_8.thinking, dense_thinking) &&
-                          same_preset(qwen3_8.non_thinking, dense_non_thinking),
-                      "Qwen3.8-27B defaults mismatch");
-    failures += check(same_preset(qwen3_6_35.thinking, moe_thinking) &&
-                          same_preset(qwen3_6_35.non_thinking, dense_non_thinking),
-                      "Qwen3.6-35B-A3B defaults mismatch");
-    failures += check(throws_runtime([] { (void)Dense27::sampling_defaults("unknown"); }),
-                      "unknown model received dense-27B sampling defaults");
+    failures +=
+        check(same_preset(dense.thinking, dense_thinking), "Dense thinking defaults mismatch");
+    failures += check(same_preset(dense.non_thinking, dense_non_thinking),
+                      "Dense non-thinking defaults mismatch");
+    failures += check(same_preset(moe.thinking, moe_thinking) &&
+                          same_preset(moe.non_thinking, dense_non_thinking),
+                      "MoE mode defaults mismatch");
 
     const ninfer::ResolvedSamplingParameters thinking = ninfer::runtime::resolve_sampling(
-        qwen3_8, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
+        dense, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
     const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
-        qwen3_8, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
+        dense, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
     failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
-                      "omitted overrides did not select Qwen3.8 thinking defaults");
+                      "omitted overrides did not select Dense thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
                           non_thinking.presence_penalty == 1.5F,
-                      "omitted overrides did not select Qwen3.8 non-thinking defaults");
+                      "omitted overrides did not select Dense non-thinking defaults");
 
     ninfer::SamplingOverrides overrides;
     overrides.temperature       = 0.0F;
@@ -100,7 +84,7 @@ int main() {
     overrides.frequency_penalty = -1.0F;
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
-        ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
+        ninfer::runtime::resolve_sampling(dense, ninfer::SamplingMode::NonThinking, overrides);
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
@@ -109,7 +93,7 @@ int main() {
     overrides.top_k = 21;
     failures += check(throws_invalid([&] {
                           (void)ninfer::runtime::resolve_sampling(
-                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
+                              dense, ninfer::SamplingMode::Thinking, overrides);
                       }),
                       "top_k beyond the executable candidate domain was accepted");
     overrides.top_k = 0;
@@ -117,7 +101,7 @@ int main() {
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {
                           (void)ninfer::runtime::resolve_sampling(
-                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
+                              dense, ninfer::SamplingMode::Thinking, overrides);
                       }),
                       "non-finite sampling override was accepted");
 

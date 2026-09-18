@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
 #include "core/device.h"
@@ -11,8 +12,8 @@ namespace ninfer::ops::detail {
 
 void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  cudaStream_t stream) {
-    using Geometry        = Fp8GdnInputGeometry;
-    using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+    using Geometry        = Fp8N16384K5120;
+    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};

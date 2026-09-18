@@ -45,14 +45,14 @@ struct ShapeCase {
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,
                                                            std::uint32_t);
 
-quantized_weight::PackedWeight make_q4g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed);
-quantized_weight::PackedWeight make_q5g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed);
-quantized_weight::PackedWeight make_q6g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed);
-quantized_weight::PackedWeight make_w8g32_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed);
+quantized_weight::PackedWeight make_q4_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed);
+quantized_weight::PackedWeight make_q5_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed);
+quantized_weight::PackedWeight make_q6_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed);
+quantized_weight::PackedWeight make_q8_g32_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed);
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed);
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
@@ -64,5 +64,8 @@ bool cuda_available();
 
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape);
+
+// A declared token interval must reserve enough space for every public point it contains.
+int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k);
 
 } // namespace ninfer::test::linear

@@ -20,7 +20,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 20;
+inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

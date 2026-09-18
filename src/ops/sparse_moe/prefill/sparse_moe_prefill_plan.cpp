@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/layout.h"
@@ -9,12 +10,12 @@ namespace ninfer::ops::detail {
 namespace {
 
 std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcept {
-    if (routed_gate_up == QType::Q4G64_F16S) {
-        if (routed_down == QType::Q5G64_F16S) { return kSparseMoePrefillQ4Q5Min; }
-        if (routed_down == QType::Q6G64_F16S) { return kSparseMoePrefillQ4Q6Min; }
+    if (routed_gate_up == QType::Q4_G64_FP16) {
+        if (routed_down == QType::Q5_G64_FP16) { return kSparseMoePrefillQ4Q5Min; }
+        if (routed_down == QType::Q6_G64_FP16) { return kSparseMoePrefillQ4Q6Min; }
     }
-    if (routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S) {
-        return kSparseMoePrefillW8W8Min;
+    if (routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16) {
+        return kSparseMoePrefillQ8Q8Min;
     }
     return 0;
 }

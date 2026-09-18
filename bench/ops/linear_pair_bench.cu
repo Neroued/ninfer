@@ -1,5 +1,6 @@
-// Cold-cache benchmark for the two registered public W8 LinearPair geometries.
+// Cold-cache benchmark for the two registered public Q8 LinearPair geometries.
 
+#include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
 #include "core/device.h"
@@ -205,11 +206,11 @@ int main(int argc, char** argv) {
         DeviceBuffer first_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         DeviceBuffer second_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-            QType::W8G32_F16S, kParentRows, options.k, options.k, {0x31, 0x00, 0x3c00});
+            QType::Q8_G32_FP16, kParentRows, options.k, options.k, {0x31, 0x00, 0x3c00});
         const Weight first_weight  = bench::row_view(parent.weight, kFirstRow, kRows);
         const Weight second_weight = bench::row_view(parent.weight, kSecondRow, kRows);
 
-        std::printf("# gpu=%s public=linear_pair shape=two_adjacent_W8[1024,%d] "
+        std::printf("# gpu=%s public=linear_pair shape=two_adjacent_Q8[1024,%d] "
                     "execution=%s cache=cold read_reference=%.1f_GB/s "
                     "bf16_tc_reference=%.1f_TFLOP/s\n",
                     properties.name, options.k,

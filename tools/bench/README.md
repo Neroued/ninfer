@@ -126,8 +126,8 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v14. The flattened summary and schema-v3 matrix
-manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
+Each raw report must be `ninfer_bench_report` schema v15. The flattened summary and schema-v4 matrix
+manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and
 allocator-observed workspace peaks, KV capacity and
@@ -142,7 +142,8 @@ The [serving methodology](../../docs/performance/methodology.md) owns workload d
 metric boundaries, aggregation, comparison rules, and publication format. This section describes
 runner usage and output files.
 
-`run_serve_corpus.py` accepts explicit `--artifact TARGET=PATH` entries for the registered targets.
+`run_serve_corpus.py` accepts explicit `--artifact LABEL=PATH` entries. Labels identify report groups;
+the selected artifact supplies the architecture, public name and weight bindings.
 Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
 Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
 in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
@@ -152,8 +153,8 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 `server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
 category summaries. The output directory is supplied explicitly with `--output`.
 
-Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v20 serving records.
+Its schema-v7 result and flattened summaries retain the actual `prefill_signature`, request Host
+exposure, and decode Host/Device-wait time per round received from the schema-v21 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
@@ -168,7 +169,7 @@ Repeat `--concurrency` to select C points; each point starts a fresh server. The
 records the actual Engine configuration, automatic KV capacity, shuffle seed where applicable,
 dispatch method, and per-request positions.
 
-Outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+Schema-v3 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
 `summary.md`. Corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
 per-request phase summaries in that directory; older campaigns may have only point reports and
 server logs. Historical model pages identify the report directory associated with each table.

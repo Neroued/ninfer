@@ -1,5 +1,6 @@
 // Cold-cache benchmark and route crossover tuner for BF16 LinearAdd [5120,6144].
 
+#include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"

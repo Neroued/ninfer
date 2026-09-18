@@ -27,36 +27,42 @@ approval requirements beyond the user's instructions and the actual execution en
 
 ## Product and architecture
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance on explicitly
-registered artifacts. Current identities are `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`,
-`qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`.
-The implementation targets `sm_120a` and is tuned on NVIDIA GeForce RTX 5090.
+NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
+`Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
+use the same architecture, binding and execution path. The implementation targets `sm_120a` and
+is tuned on NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
 bounded FIFO ingress, no active-request preemption, and one compact decode batch per round.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
-`--help`. Additional models, execution platforms, large-scale/preemptive continuous batching, and
-priority/QoS require an explicit product change.
+`--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous
+batching, and priority/QoS require an explicit product change. Another training instance or mixture
+of existing representations does not require a checkpoint-specific execution registration.
 
-This is a local, single-owner project with trusted registered models, generated artifacts, and
+This is a local, single-owner project with trusted local models, generated artifacts, and
 local workflow. Do not derive requirements from a different deployment or trust model.
 
 Keep these ownership boundaries visible when selecting a design:
 
-- `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
+- v3 `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
   Engine. NInfer has no Python model-inference route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
-- The Qwen3.6 family owns shared frontend semantics and compile-time planning/Program algorithms.
-  The 27B and 35B-A3B packages are peer Variants owning their identities, bindings, execution leaves,
-  and Program instance storage. Programs share no mutable state or device allocation.
+- Models own fixed mathematics, config interpretation, logical parameter binding, frontend
+  semantics and finite execution composition. Immutable Model data owns selected weights and
+  resources; native Parameters supply the actual operands to planning and Program execution.
+  Program owns mutable state, workspace, context stores and CUDA Graphs. Programs share no mutable
+  state or device allocation.
+- Converter recipes choose sources, formats, packing and per-input activation permissions. The
+  loader validates, uploads and binds the stored representation. Native preparation, resource
+  queries and execution enforce actual Op support; there is no whole-artifact capability registry.
 - Runtime owns common execution contracts and Engine publication policy; product/serving own input
-  acquisition and protocol translation. Target packages do not acquire media or own transport.
+  acquisition and protocol translation. Model code does not acquire media or own transport.
 
-Detailed family/package responsibilities and source ownership are defined in
+Detailed model/runtime responsibilities and source ownership are defined in
 [Engine architecture](docs/maintainer/engine-architecture.md). Read the relevant boundary before
-changing it. Prefer explicit implementations for registered targets. Do not introduce generic model
+changing it. Prefer explicit implementations for supported architectures. Do not introduce generic model
 graphs, family base classes, plugin discovery, string-driven execution, hidden device allocation,
 runtime weight repacking, or placeholders for hypothetical targets without a product requirement.
 
@@ -124,9 +130,9 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Decision | Entry point |
 |---|---|
 | Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
-| Execution, family/package ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
+| Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
 | Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
-| Artifact, layout, codec, or exact target mathematics | model/artifact references linked from `docs/README.md` |
+| Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
 | In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |

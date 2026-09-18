@@ -504,7 +504,7 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const ninfer::LoadSummary load = service.load_summary();
-    public_model_id_               = resolve_public_model_id(options_, load.model_id);
+    public_model_id_               = resolve_public_model_id(options_, load.model_name);
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,

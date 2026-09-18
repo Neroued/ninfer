@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
 namespace ninfer::ops::detail {

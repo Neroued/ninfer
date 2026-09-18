@@ -89,8 +89,14 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+struct Q4MmaStoreEpilogue {
+    __device__ __forceinline__ void operator()(__nv_bfloat16* destination, float value) const {
+        *destination = __float2bfloat16_rn(value);
+    }
+};
+
 // clang-format off
-template <class Schedule_, bool Full>
+template <class Schedule_, bool Full, class Epilogue = Q4MmaStoreEpilogue>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q4_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -100,7 +106,7 @@ void q4_rowsplit_gemm_mma_kernel(
     std::int32_t rows,
     std::int32_t k,
     std::int32_t cols,
-    std::int32_t padded_k) {
+    std::int32_t padded_k, Epilogue epilogue = {}) {
     // clang-format on
     using Schedule       = Schedule_;
     constexpr bool kFull = Full;
@@ -379,33 +385,33 @@ void q4_rowsplit_gemm_mma_kernel(
             const int output_col1 = output_col0 + 1;
             const float* values   = accum[mi][ni];
             if constexpr (kFull) {
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                    __float2bfloat16_rn(values[0]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                    __float2bfloat16_rn(values[1]);
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                    __float2bfloat16_rn(values[2]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                    __float2bfloat16_rn(values[3]);
+                epilogue(out + static_cast<std::int64_t>(output_col0) * rows + output_row0,
+                         values[0]);
+                epilogue(out + static_cast<std::int64_t>(output_col1) * rows + output_row0,
+                         values[1]);
+                epilogue(out + static_cast<std::int64_t>(output_col0) * rows + output_row1,
+                         values[2]);
+                epilogue(out + static_cast<std::int64_t>(output_col1) * rows + output_row1,
+                         values[3]);
             } else {
                 if (output_row0 < rows) {
                     if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                            __float2bfloat16_rn(values[0]);
+                        epilogue(out + static_cast<std::int64_t>(output_col0) * rows + output_row0,
+                                 values[0]);
                     }
                     if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                            __float2bfloat16_rn(values[1]);
+                        epilogue(out + static_cast<std::int64_t>(output_col1) * rows + output_row0,
+                                 values[1]);
                     }
                 }
                 if (output_row1 < rows) {
                     if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                            __float2bfloat16_rn(values[2]);
+                        epilogue(out + static_cast<std::int64_t>(output_col0) * rows + output_row1,
+                                 values[2]);
                     }
                     if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                            __float2bfloat16_rn(values[3]);
+                        epilogue(out + static_cast<std::int64_t>(output_col1) * rows + output_row1,
+                                 values[3]);
                     }
                 }
             }

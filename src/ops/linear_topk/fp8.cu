@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
@@ -21,7 +22,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, std::int32_t valid_rows,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, int columns) {
-    constexpr int kHidden    = Fp8VocabularyGeometry::kInputRows;
+    constexpr int kHidden    = Fp8N248320K5120::kInputRows;
     constexpr int kTileK     = Schedule::kTileKPerWarp;
     constexpr int kWarps     = Schedule::kKWarps;
     constexpr int kRows      = Schedule::kRowsPerCta;
@@ -72,7 +73,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
                 cp_async_zfill<16, Cache::ca>(
                     &x_shared[warp][column * kTileK + fp8_a16_shared_col_64(column, k8 * 8)],
                     hidden + static_cast<std::int64_t>(source) * kHidden + group_k0 +
-                        warp * kTileK + k8 * 8, column < columns ? 16 : 0);
+                        warp * kTileK + k8 * 8,
+                    column < columns ? 16 : 0);
             }
         };
 
@@ -208,8 +210,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
             }
         }
         __syncthreads();
-        grouped_ksplit_topk_consume<Capacity, kTileCols, kWarps>(partial, topk,
-                                                                             row_begin, valid_rows, columns);
+        grouped_ksplit_topk_consume<Capacity, kTileCols, kWarps>(partial, topk, row_begin,
+                                                                 valid_rows, columns);
     }
 
     grouped_ksplit_topk_publish(topk, partial_keys, producer_groups, columns);
@@ -220,15 +222,15 @@ using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const Linear
 
 template <int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
-                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Schedule =
-        Fp8A16SmallTMmaSchedule<8, Capacity, 2>;
+                 const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+    using Schedule = Fp8A16KSplitSchedule<8, Capacity, 2>;
     fp8_grouped_ksplit_topk_kernel<Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
             static_cast<const std::uint8_t*>(head.qdata),
             static_cast<const __nv_bfloat16*>(head.scales), valid_rows,
-            static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups, hidden.ne[1]);
+            static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
+            hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

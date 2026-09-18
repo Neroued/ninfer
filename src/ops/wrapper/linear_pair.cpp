@@ -1,6 +1,7 @@
+#include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
-#include "ops/linear_pair/w8/w8_pair_plan.h"
+#include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include <array>
 #include <cstddef>
@@ -40,7 +41,7 @@ std::uint64_t required_payload_bytes(std::int32_t rows, std::int32_t k) {
 
 void require_weight(const Weight& weight, std::int32_t k, const char* label) {
     const std::uint64_t payload_bytes = required_payload_bytes(1024, k);
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
         weight.ndim != 2 || weight.n != 1024 || weight.k != k || weight.shape[0] != 1024 ||
         weight.shape[1] != k || weight.padded_shape[0] != 1024 || weight.padded_shape[1] != k ||
@@ -88,6 +89,18 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
 
 } // namespace
 
+std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
+                                                 const Weight& second_weight,
+                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens ||
+        (first_weight.k != 5120 && first_weight.k != 2048)) {
+        throw std::invalid_argument("linear_pair: unsupported weight/column geometry");
+    }
+    require_weight(first_weight, first_weight.k, "first weight");
+    require_weight(second_weight, first_weight.k, "second weight");
+    return 0;
+}
+
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
@@ -97,11 +110,13 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_matrix(x, x.ne[0], cols, "x");
     require_matrix(first_out, 1024, cols, "first output");
     require_matrix(second_out, 1024, cols, "second output");
-    require_weight(first_weight, x.ne[0], "first weight");
-    require_weight(second_weight, x.ne[0], "second weight");
+    if (first_weight.k != x.ne[0]) {
+        throw std::invalid_argument("linear_pair: weight K differs from input");
+    }
+    (void)linear_pair_workspace_capacity_bytes(first_weight, second_weight, cols, cols);
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);
 
-    detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
+    detail::q8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
 } // namespace ninfer::ops

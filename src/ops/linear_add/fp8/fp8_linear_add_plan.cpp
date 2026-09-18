@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
@@ -18,22 +19,20 @@ enum class Fp8LinearAddRoute : std::uint8_t {
 
 Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                 LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != Fp8Residual6144Geometry::kOutputRows ||
-        (input_rows != Fp8Residual6144Geometry::kInputRows &&
-         input_rows != Fp8Residual17408Geometry::kInputRows)) {
+    if (tokens <= 0 || output_rows != Fp8N5120K6144::kOutputRows ||
+        (input_rows != Fp8N5120K6144::kInputRows && input_rows != Fp8N5120K17408::kInputRows)) {
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Fp8LinearAddRoute::A16; }
-    if (policy != LinearPolicy::AllowA8) {
-        throw std::invalid_argument("fp8 linear_add: unsupported policy");
-    }
-    const std::int32_t first_a8 = input_rows == Fp8Residual6144Geometry::kInputRows ? 22 : 25;
+    if (!allows_a8(policy)) { throw std::invalid_argument("fp8 linear_add: unsupported policy"); }
+    const std::int32_t first_a8 = input_rows == Fp8N5120K6144::kInputRows ? 22 : 25;
     return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kFp8LastSmallT) {
-        const std::int32_t active = std::min(kFp8LastSmallT, x.ne[1] - token_begin);
+    for (std::int32_t token_begin = 0; token_begin < x.ne[1];
+         token_begin += kFp8LinearAddChunkTokens) {
+        const std::int32_t active = std::min(kFp8LinearAddChunkTokens, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(residual.data) +

@@ -172,6 +172,21 @@ class Corpus:
         if not 4 * rotation_entitlement <= 240000 < 5 * rotation_entitlement:
             raise CorpusError("55K rotation Device-KV pressure relation no longer holds")
 
+        for label in "abcdef":
+            record = shapes.get(f"state-2k-{label}", {})
+            counts = record.get("probe_prompt_tokens", [])
+            if (
+                record.get("prompt_tokens") != 2048
+                or record.get("max_output_tokens") != 32
+                or record.get("max_peer_common_prefix_tokens", 4) > 3
+                or not 1900 < record.get("system_frontier_tokens", 0) < 2048
+                or not isinstance(record.get("probe_suffix"), str)
+                or len(counts) != 7
+                or counts[0] != 2048
+                or any(not isinstance(count, int) or count + 31 > 32768 for count in counts)
+            ):
+                raise CorpusError(f"state working-set geometry is invalid for {label}")
+
         for name in ("system-a", "system-b"):
             frontier = self.manifest["shared"][name]["marked_frontier_tokens"]
             if frontier <= 4096 or frontier % 64 == 0:
@@ -216,6 +231,14 @@ class Corpus:
         except KeyError as error:
             raise CorpusError(f"unknown shared fixture: {name}") from error
         return self._path(record).read_text(encoding="utf-8")
+
+    def state_messages(self, label: str, turn: int = 0) -> list[dict[str, Any]]:
+        facts = self.shape(f"state-2k-{label}")
+        if not 0 <= turn < len(facts["probe_prompt_tokens"]):
+            raise CorpusError("state working-set turn exceeds the frozen sequence")
+        messages = self.shape_messages(f"state-2k-{label}")
+        messages[-1]["content"] += facts["probe_suffix"] * turn
+        return messages
 
     def client_tools(self, *, changed_first: bool = False) -> list[dict[str, Any]]:
         record = self.manifest["shared"]["client-tools-32"]

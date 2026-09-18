@@ -1,9 +1,27 @@
 #pragma once
-
-#include <cstdint>
-#include <stdexcept>
+#include "ops/linear/nvfp4/nvfp4_geometry.h"
 
 namespace ninfer::ops::detail {
+// Tile the W4A4 TMA route reads activation scales in: kNvfp4TmaBlockM tokens by
+// kNvfp4ScaleTileGroups groups, written contiguously by the quantizer so one request covers the
+// whole tile. Sixteen groups are 16 bytes, which is two K tiles, which is why the scale box is
+// fetched on even k-tiles only. The layout is written by nvfp4_tiled_scale_offset in
+// nvfp4_w4a4_mma.cuh and read by the descriptors in nvfp4_w4a4_tma.cuh.
+inline constexpr std::int32_t kNvfp4TmaBlockM       = 256;
+inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
+
+// Token extent the tiled scale plane is written over: the layout addresses whole tiles, so a ragged
+// token count is padded up to one and the padding is filled with zeroes.
+[[nodiscard]] inline constexpr std::int32_t nvfp4_w4a4_padded_tokens(std::int32_t tokens) {
+    return ((tokens + kNvfp4TmaBlockM - 1) / kNvfp4TmaBlockM) * kNvfp4TmaBlockM;
+}
+
+// Which of the two layouts the quantizer writes. Named rather than passed as a bool so that a call
+// site forcing one of them says which.
+enum class Nvfp4ScaleLayout : std::uint8_t {
+    RowMajor,
+    Tiled,
+};
 
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
@@ -15,38 +33,15 @@ enum class Nvfp4CodeCache : std::uint8_t {
     Streaming,
 };
 
-enum class Nvfp4SmallTActivationAccess : std::uint8_t {
+enum class Nvfp4SimtActivationAccess : std::uint8_t {
     PairStream,
     TokenPacked,
     SharedPhase,
 };
 
-enum class Nvfp4SmallTBlockOrder : std::uint8_t {
+enum class Nvfp4SimtBlockOrder : std::uint8_t {
     RowsContiguous,
     TokenTilesContiguous,
-};
-
-template <std::int32_t OutputRows, std::int32_t InputRows>
-struct Nvfp4GemvGeometry {
-    static_assert(OutputRows > 0 && InputRows > 0);
-    static_assert((OutputRows % 128) == 0);
-    static_assert((InputRows % 64) == 0);
-
-    static constexpr std::int32_t kOutputRows       = OutputRows;
-    static constexpr std::int32_t kInputRows        = InputRows;
-    static constexpr std::int32_t kGroupsPerRow     = InputRows / 16;
-    static constexpr std::int32_t kScaleTilesPerRow = InputRows / 64;
-    static constexpr std::int32_t kCodeBytesPerRow  = InputRows / 2;
-};
-
-template <std::int32_t InputRows>
-struct Nvfp4ActivationGeometry {
-    static_assert(InputRows > 0);
-    static_assert((InputRows % 64) == 0);
-
-    static constexpr std::int32_t kInputRows       = InputRows;
-    static constexpr std::int32_t kGroupsPerRow    = InputRows / 16;
-    static constexpr std::int32_t kCodeBytesPerRow = InputRows / 2;
 };
 
 template <int WarpsPerCta, int RowsPerWarp, int ValuesPerLane, int AccumulatorChains,
@@ -72,10 +67,10 @@ struct Nvfp4GemvSchedule {
 };
 
 template <int WarpsPerCta, int WarpsPerRow, int RowsPerWarp, int ValuesPerLane, int TokenTile,
-          int AccumulatorChains, Nvfp4SmallTActivationAccess ActivationAccess,
+          int AccumulatorChains, Nvfp4SimtActivationAccess ActivationAccess,
           Nvfp4ScaleAccess ScaleAccess, Nvfp4CodeCache CodeCache, int PhaseUnroll,
-          Nvfp4SmallTBlockOrder BlockOrder, int MinBlocksPerSm>
-struct Nvfp4SmallTSchedule {
+          Nvfp4SimtBlockOrder BlockOrder, int MinBlocksPerSm>
+struct Nvfp4SimtSchedule {
     static_assert(WarpsPerCta > 0 && WarpsPerCta <= 32);
     static_assert(WarpsPerRow > 0 && WarpsPerRow <= WarpsPerCta);
     static_assert((WarpsPerCta % WarpsPerRow) == 0);
@@ -103,135 +98,6 @@ struct Nvfp4SmallTSchedule {
     static constexpr int kRowGroupsPerCta   = WarpsPerCta / WarpsPerRow;
     static constexpr int kRowsPerCta        = kRowGroupsPerCta * RowsPerWarp;
     static constexpr int kPairsPerLane      = ValuesPerLane / 2;
-};
-
-using Nvfp4AttnInputGeometry     = Nvfp4GemvGeometry<14336, 5120>;
-using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
-using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
-using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
-using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
-
-using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
-using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
-using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
-
-enum class Nvfp4Problem : std::uint8_t {
-    AttnInput,
-    GdnInput,
-    MlpGateUp,
-    Residual6144,
-    Residual17408,
-};
-
-inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
-            input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
-           (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
-            input_rows == Nvfp4GdnInputGeometry::kInputRows) ||
-           (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
-            input_rows == Nvfp4MlpGateUpGeometry::kInputRows) ||
-           (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
-           (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
-}
-
-inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    if (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
-        input_rows == Nvfp4AttnInputGeometry::kInputRows) {
-        return Nvfp4Problem::AttnInput;
-    }
-    if (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
-        input_rows == Nvfp4GdnInputGeometry::kInputRows) {
-        return Nvfp4Problem::GdnInput;
-    }
-    if (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
-        input_rows == Nvfp4MlpGateUpGeometry::kInputRows) {
-        return Nvfp4Problem::MlpGateUp;
-    }
-    if (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
-        input_rows == Nvfp4Residual6144Geometry::kInputRows) {
-        return Nvfp4Problem::Residual6144;
-    }
-    if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-        input_rows == Nvfp4Residual17408Geometry::kInputRows) {
-        return Nvfp4Problem::Residual17408;
-    }
-    throw std::invalid_argument("unsupported NVFP4 problem");
-}
-
-// RTX 5090 cold-cache winner among the measured decode schedules.
-template <class Geometry>
-struct Nvfp4LinearDecodeProductionSchedule {
-    using Type =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-};
-
-inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
-inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
-
-// RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
-// through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
-// are measured occupancy/register crossovers, not semantic frontiers.
-template <class Geometry, int ActiveTokens>
-struct Nvfp4LinearSmallTProductionSchedule {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta   = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 13 ? 16 : 8);
-    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
-    static constexpr auto kActivationAccess = ActiveTokens <= 4
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-};
-
-// G1's wider N benefits from keeping four warps per CTA throughout the A16 policy boundary. Only
-// T=2 amortizes activation traffic enough for shared staging to win.
-template <int ActiveTokens>
-struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta       = 4;
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
-    static constexpr auto kActivationAccess = ActiveTokens == 2
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-};
-
-// At N=5120, R1 needs the larger CTA only for the last three A16 token counts. The unoptimized
-// A16-only tail keeps the established generic schedule.
-template <int ActiveTokens>
-struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta   = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
-    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
-    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-};
-
-// R2's longer K moves the stable four-to-sixteen-warp crossover to T=8.
-template <int ActiveTokens>
-struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
-    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
-    using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 } // namespace ninfer::ops::detail

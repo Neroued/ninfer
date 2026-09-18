@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/execution.h"
 #include "runtime/engine/admission_policy.h"
 
 #include <array>

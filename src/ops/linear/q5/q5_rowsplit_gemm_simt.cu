@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -46,63 +47,22 @@ void launch_simt_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream
     });
 }
 
-template <int Cols, int FullSlabs, int Stride>
-void launch_split2(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    constexpr int kThreads = 2 * 32;
-    const dim3 grid(static_cast<unsigned>(out.ne[0]), 1u, 1u);
-    q5_rowsplit_gemm_simt_split2_kernel<Q5RowSplitSimtSchedule, Cols, FullSlabs, Stride>
-        <<<grid, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1], w.padded_shape[1],
-            FullSlabs);
-}
-
-template <int Cols>
-void dispatch_split2_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    if (w.k == 6144) {
-        launch_split2<Cols, 6, 6144>(x, w, out, stream);
-    } else if (w.k == 17408) {
-        launch_split2<Cols, 17, 17408>(x, w, out, stream);
-    } else {
-        throw std::invalid_argument("q5 split2 SIMT: unsupported exact K");
-    }
-}
-
-template <int Cols>
-void launch_split4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+// Exact one-column launch of the 4-warp split kernel. kStride names K itself, so the activation
+// block of a row is contiguous and 16-byte aligned; the four warps split that block four ways
+// instead of the single warp a tile kernel would give one column.
+template <int K>
+void launch_split4_c1(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    static_assert(K % 1024 == 0, "direct split4 needs whole 1024-wide K slabs");
+    if (x.ne[1] != 1) { throw std::invalid_argument("q5 split4 c1: exact one-column launch"); }
     constexpr int kThreads = 4 * 32;
     const dim3 grid(static_cast<unsigned>(out.ne[0]), 1u, 1u);
-    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, 5120>
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 1, K / 1024, K>
         <<<grid, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<__nv_bfloat16*>(out.data), nullptr, out.ne[0], out_ld, x.ne[0], x.ne[1],
-            w.padded_shape[1], 5);
-}
-
-template <class Launch>
-void dispatch_exact_cols(std::int32_t cols, Launch&& launch) {
-    switch (cols) {
-    case 2:
-        launch.template operator()<2>();
-        return;
-    case 3:
-        launch.template operator()<3>();
-        return;
-    case 4:
-        launch.template operator()<4>();
-        return;
-    case 5:
-        launch.template operator()<5>();
-        return;
-    case 6:
-        launch.template operator()<6>();
-        return;
-    default:
-        throw std::invalid_argument("q5 exact SIMT: column count must be in [2,6]");
-    }
+            static_cast<__nv_bfloat16*>(out.data), nullptr, out.ne[0], out.ne[0], K, 1,
+            w.padded_shape[1], K / 1024);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
@@ -115,17 +75,17 @@ void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch_simt_route<8>(x, w, out, stream);
 }
 
-void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out,
-                                 cudaStream_t stream) {
-    dispatch_exact_cols(x.ne[1],
-                        [&]<int Cols>() { dispatch_split2_cols<Cols>(x, w, out, stream); });
-    CUDA_CHECK(cudaGetLastError());
+void launch_q5_split4_c1_k5120(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_split4_c1<5120>(x, w, out, stream);
 }
 
-void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out,
-                                 cudaStream_t stream) {
-    dispatch_exact_cols(x.ne[1], [&]<int Cols>() { launch_split4<Cols>(x, w, out, stream); });
-    CUDA_CHECK(cudaGetLastError());
+void launch_q5_split4_c1_k6144(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_split4_c1<6144>(x, w, out, stream);
+}
+
+void launch_q5_split4_c1_k17408(const Tensor& x, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    launch_split4_c1<17408>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

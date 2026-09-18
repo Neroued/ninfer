@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include "core/device.h"
@@ -15,7 +16,7 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
     const std::int64_t groups = weight.padded_shape[1] / weight.group;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
                         static_cast<std::int64_t>(weight_row_offset) * groups * 32;
-    const auto* high   = weight.qtype == QType::Q5G64_F16S
+    const auto* high   = weight.qtype == QType::Q5_G64_FP16
                              ? static_cast<const std::uint8_t*>(weight.qhigh) +
                                  static_cast<std::int64_t>(weight_row_offset) * groups * 8
                              : nullptr;
@@ -29,7 +30,7 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
         rows,
         out.ne[0],
         output_row_offset,
-        weight.qtype == QType::Q5G64_F16S,
+        weight.qtype == QType::Q5_G64_FP16,
     };
 }
 

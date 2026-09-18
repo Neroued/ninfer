@@ -34,6 +34,9 @@ HOST = "127.0.0.1"
 PORT = 18080
 
 RESOURCE_CASES = (
+    "shared-state-working-set-shift",
+    "private-state-working-set-shift",
+    "shared-state-hot-prefix",
     "resume-after-interference-device",
     "resume-after-interference-state-host",
     "resume-after-interference-kv-host",

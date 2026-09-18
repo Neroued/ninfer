@@ -27,9 +27,10 @@ replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-c
 | resource plan | Program 针对一个 target seal 的有序物理 transition |
 | placement | 一个完整 StateImage 或一个 KV logical page 的 Device/Host replica 状态 |
 
-本文后续简称 planning target 为 `target`；注册模型及其 package 写作 `model target`，两者不是同一概念。
+本文后续简称 planning target 为 `target`，表示一次资源决策的终态。
 
-Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但不改变模型语义、请求顺序或生成结果。
+Prefix reuse 是 admission 的一种来源选择。它复用具有完整身份和状态覆盖的已计算前缀，减少重复
+prefill，保持模型语义和请求顺序。不同 prefill 分块或数值路径之间不要求 logits 或生成 token 完全相同。
 
 当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8` 和非抢占 active requests。
 由此得到两个基本规则：
@@ -118,6 +119,9 @@ PhysicalCapacity = {
     Host KV arena bytes and allocator geometry,
 }
 ```
+
+容量依据加载后的模型配置、实际权重绑定、启用组件及启动选项推导。权重的物理表示影响执行
+workspace 和可用预算；KV/GDN 的数学状态、具体存储和容量由模型实现与 Program 分别负责。
 
 这些轴相互独立。一个资源轴的余量不能补偿另一个轴的缺口。Host KV 的总空闲字节也不能替代
 allocator 对具体 extent 几何的可分配性判断。
@@ -249,7 +253,7 @@ state 内容时，不改变全局可用容量，因此不推进 revision。
 
 ### 4.1 完整恢复条件
 
-当前 model targets 同时包含可分页 Full Attention KV 和不能从任意较晚状态无损回退的 recurrent state。
+当前 Qwen3.5 模型同时包含可分页 Full Attention KV 和不能从任意较晚状态无损回退的 recurrent state。
 因此某个 frontier 可以复用，当且仅当 Program 能证明：
 
 1. 存在该 frontier 的完整 StateImage；
@@ -622,6 +626,10 @@ AttentionPairs = B\,S+\frac{S(S+1)}{2}
 
 其中 \(B\) 是已复用 prefix tokens，\(S\) 是剩余 suffix tokens。Vision item/patch work 使用同一
 startup-resolved machine model 的独立分量。
+
+Transfer 系数按硬件选择，prefill 系数按硬件与实际 Text/Vision config、绑定结构和 Use 生成的
+`prefill_signature` 选择。签名不使用 checkpoint/release 名称，也不包含权重数值。两组系数独立
+解析；没有匹配的标定时使用对应的通用系数。成本只影响可行方案之间的排序，不是加载或执行门槛。
 
 ### 8.3 Portfolio value 与 future loss
 
@@ -1009,18 +1017,19 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 
 | 职责 | 主要位置 |
 |---|---|
-| logical catalog、claims、session policy | `src/runtime/engine/resource_manager.h` |
-| bounded target ledger 与 common search primitives | `src/runtime/engine/resource_search.h` |
-| cross-candidate bounded planner | `src/runtime/engine/materialization_planner.h` |
-| typed shared-capture bounded entrypoint | `src/runtime/engine/shared_capture_planner.h` |
-| shared/private portfolio value | `src/runtime/engine/context_portfolio_value.h` |
-| machine cost model | `src/runtime/engine/context_cost.*` |
-| common resource summaries | `src/runtime/contract/types.h` |
-| unique-object projection contract | `src/targets/qwen3_6/impl/runtime/resource_projection.h` |
-| target domain、projection 与 transaction | `src/targets/qwen3_6/impl/runtime/program*.h`、`pressure_planner.h` |
-| State stores | `src/targets/qwen3_6/impl/runtime/state_image_store.h` |
-| logical KV/address spaces | `src/targets/qwen3_6/impl/runtime/logical_kv_store.h` |
-| Host KV extents | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h` |
+| logical catalog、claims、session policy | `src/runtime/engine/context_cache/resource_manager.h` |
+| bounded target ledger 与 common search primitives | `src/runtime/engine/context_cache/resource_search.h` |
+| cross-candidate bounded planner | `src/runtime/engine/context_cache/materialization_planner.h` |
+| typed shared-capture bounded entrypoint | `src/runtime/engine/context_cache/shared_capture_planner.h` |
+| shared/private portfolio value | `src/runtime/engine/context_cache/context_portfolio_value.h` |
+| machine cost model | `src/runtime/engine/context_cache/context_cost.cpp` |
+| prefill measurement signature | `src/models/qwen3_5/measurement.cpp` |
+| common resource summaries | `src/runtime/contract/resources.h` |
+| unique-object projection contract | `src/models/qwen3_5/program/planning/resource_projection.h` |
+| target domain、projection 与 transaction | `src/models/qwen3_5/program/planning/`、`src/models/qwen3_5/program/transactions/` |
+| State stores | `src/models/qwen3_5/program/storage/state_store.h` |
+| logical KV/address spaces | `src/models/qwen3_5/program/storage/kv_store.h` |
+| Host KV extents | `src/models/qwen3_5/program/storage/host_kv_store.h` |
 | public capacity options | `include/ninfer/types.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。

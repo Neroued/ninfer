@@ -1,94 +1,38 @@
 #include "ops/linear/q5/q5_dispatch.h"
-
+#include "ops/linear/q5/q5_shapes.h"
+#include <array>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
+struct ShapeEntry {
+    std::int32_t n, k;
+    Q5Launch (*select)(std::int32_t);
+};
+
+constexpr std::array kShapes{
+    ShapeEntry{1024, 5120, select_q5_n1024_k5120},   ShapeEntry{6144, 5120, select_q5_n6144_k5120},
+    ShapeEntry{7168, 5120, select_q5_n7168_k5120},   ShapeEntry{5120, 6144, select_q5_n5120_k6144},
+    ShapeEntry{5120, 17408, select_q5_n5120_k17408}, ShapeEntry{1152, 1152, select_q5_n1152_k1152},
+    ShapeEntry{1152, 4304, select_q5_n1152_k4304},
+};
+} // namespace
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("q5 linear: unsupported shape or T"); }
-
-    switch (k) {
-    case 5120:
-        switch (n) {
-        case 1024:
-            if (t <= 4) { return launch_q5_simt_r8_c4; }
-            if (t <= 16) { return launch_q5_simt_r8_c8; }
-            return launch_q5_mma_r64_c128;
-        case 6144:
-            if (t == 1) { return launch_q5_gemv_r16_s2_x; }
-            if (t <= 6) { return launch_q5_simt_split4_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
-            if (t <= 64) { return launch_q5_mma_r64_c64; }
-            return launch_q5_mma_r64_c128;
-        case 7168:
-            if (t == 1) { return launch_q5_gemv_r16_s2_x; }
-            if (t <= 6) { return launch_q5_simt_split4_exact; }
-            if (t <= 16) { return launch_q5_simt_r8_c4; }
-            return launch_q5_mma_r64_c128;
-        default:
-            break;
-        }
-        break;
-    case 6144:
-        if (n == 5120) {
-            if (t == 1) { return launch_q5_simt_r8_c4; }
-            if (t <= 6) { return launch_q5_simt_split2_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
-            return launch_q5_mma_r64_c128;
-        }
-        break;
-    case 17408:
-        if (n == 5120) {
-            if (t == 1) { return launch_q5_simt_r8_c4; }
-            if (t <= 6) { return launch_q5_simt_split2_exact; }
-            if (t <= 24) { return launch_q5_simt_r8_c8; }
-            return launch_q5_mma_r64_c128;
-        }
-        break;
-    case 1152:
-        if (n == 1152 && t >= 4 && t <= 131072 && (t % 4) == 0) {
-            if (t <= 76) { return launch_q5_simt_r8_c4; }
-            if (t <= 636) { return launch_q5_mma_r64_c64; }
-            if (t <= 700) { return launch_q5_mma_r64_c128; }
-            if (t == 704) { return launch_q5_mma_r64_c64; }
-            if (t <= 828) { return launch_q5_mma_r64_c128; }
-            if (t == 832) { return launch_q5_mma_r64_c64; }
-            if (t <= 896) { return launch_q5_mma_r64_c128; }
-            if (t <= 960) { return launch_q5_mma_r64_c64; }
-            if (t <= 1024) { return launch_q5_mma_r64_c128; }
-            if (t <= 1088) { return launch_q5_mma_r64_c64; }
-            return launch_q5_mma_r64_c128;
-        }
-        break;
-    case 4304:
-        if (n == 1152 && t >= 4 && t <= 131072 && (t % 4) == 0) {
-            if (t <= 120) { return launch_q5_simt_r8_c4; }
-            if (t <= 1148) { return launch_q5_mma_r64_c64; }
-            return launch_q5_mma_r64_c128;
-        }
-        break;
-    default:
-        break;
+    if (t <= 0) throw std::invalid_argument("q5 linear: T must be positive");
+    for (const auto& entry : kShapes) {
+        if (entry.n == n && entry.k == k) return entry.select(t);
     }
-
-    throw std::invalid_argument("q5 linear: unsupported shape or T");
+    throw std::invalid_argument("q5 linear: unsupported shape");
 }
 
 Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
-    switch (policy) {
-    case LinearPolicy::A16Only:
-    case LinearPolicy::AllowA8:
-        return select_q5_a16_launch(n, k, t);
-    case LinearPolicy::AllowA4:
-        break;
-    }
-    throw std::invalid_argument("q5 linear: unsupported policy");
+    if (!valid_linear_policy(policy)) throw std::invalid_argument("q5 linear: unsupported policy");
+    return select_q5_a16_launch(n, k, t);
 }
 
-void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+void q5_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    const Q5Launch launch = select_q5_launch(w.n, w.k, x.ne[1], policy);
-    launch(x, w, out, stream);
+    select_q5_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
 }
-
 } // namespace ninfer::ops::detail

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -22,7 +23,7 @@ struct HostWeight {
         Weight weight{};
         weight.payload         = data;
         weight.payload_bytes   = bits.size() * sizeof(std::uint16_t);
-        weight.qtype           = QType::BF16_CTRL;
+        weight.qtype           = QType::BF16;
         weight.shape[0]        = n;
         weight.shape[1]        = k;
         weight.padded_shape[0] = n;

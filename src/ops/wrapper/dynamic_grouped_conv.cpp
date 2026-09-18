@@ -1,7 +1,8 @@
+#include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
-#include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
+#include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 
 #include <array>
 #include <cmath>
@@ -37,7 +38,7 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int
 void require_kernel_projection_weight(const Weight& weight) {
     constexpr std::uint64_t kPayloadBytes =
         static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
-    if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
+    if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
         weight.payload_bytes < kPayloadBytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
         weight.n != kCoefficientRows || weight.k != kHidden ||
         weight.shape[0] != kCoefficientRows || weight.shape[1] != kHidden ||
@@ -49,7 +50,7 @@ void require_kernel_projection_weight(const Weight& weight) {
     }
 }
 
-std::uint64_t required_w8_payload_bytes(std::int32_t input_rows) {
+std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
     const std::uint64_t rows       = kHidden;
     const std::uint64_t columns    = static_cast<std::uint64_t>(input_rows);
     const std::uint64_t code_bytes = rows * columns;
@@ -58,8 +59,8 @@ std::uint64_t required_w8_payload_bytes(std::int32_t input_rows) {
 }
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
-    const std::uint64_t payload_bytes = required_w8_payload_bytes(input_rows);
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
         weight.ndim != 2 || weight.n != kHidden || weight.k != input_rows ||
         weight.shape[0] != kHidden || weight.shape[1] != input_rows || weight.shape[2] != 1 ||
@@ -189,7 +190,7 @@ std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_
                                                                      std::int32_t max_width,
                                                                      std::int32_t min_batch_size,
                                                                      std::int32_t max_batch_size) {
-    return detail::w8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
         input_rows, min_width, max_width, min_batch_size, max_batch_size);
 }
 
@@ -216,7 +217,7 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     require_finish_projection_weight(projection_weight, input_rows);
     require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
 
-    detail::w8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
+    detail::q8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
                                                         finish_delta, residual, workspace, stream);
 }
 

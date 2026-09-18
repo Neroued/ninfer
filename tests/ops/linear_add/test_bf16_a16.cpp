@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
@@ -29,8 +30,8 @@ int bf16_a16_rejections() {
     int failures = 0;
     failures += expect_invalid(
         [] {
-            (void)ninfer::ops::linear_add_workspace_capacity_bytes(ninfer::QType::BF16_CTRL, 5120,
-                                                                   6143, 1, 32);
+            (void)ninfer::ops::linear_add_workspace_capacity_bytes(ninfer::QType::BF16, 5120, 6143,
+                                                                   1, 32);
         },
         "BF16_A16 LinearAdd workspace shape");
 
@@ -38,7 +39,7 @@ int bf16_a16_rejections() {
     ninfer::DeviceBuffer residual(static_cast<std::size_t>(5120) * sizeof(std::uint16_t));
     ninfer::DeviceBuffer weight_storage(256);
     ninfer::Weight weight{};
-    weight.qtype  = ninfer::QType::BF16_CTRL;
+    weight.qtype  = ninfer::QType::BF16;
     weight.layout = ninfer::QuantLayout::RowSplit;
     weight.qdata  = weight_storage.p;
     weight.n      = 5120;

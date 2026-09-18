@@ -15,6 +15,6 @@ struct ShapeCase {
 
 bool cuda_available();
 
-int run_w8_a16_shape(std::string_view label, const ShapeCase& shape);
+int run_q8_a16_shape(std::string_view label, const ShapeCase& shape);
 
 } // namespace ninfer::test::linear_pair

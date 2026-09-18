@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"

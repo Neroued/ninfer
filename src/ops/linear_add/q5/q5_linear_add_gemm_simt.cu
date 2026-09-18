@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"
@@ -41,6 +42,7 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
     case COLS:                                                                                     \
         launch.template operator()<COLS>();                                                        \
         return
+        NINFER_Q5_LINEAR_ADD_EXACT(1);
         NINFER_Q5_LINEAR_ADD_EXACT(2);
         NINFER_Q5_LINEAR_ADD_EXACT(3);
         NINFER_Q5_LINEAR_ADD_EXACT(4);
@@ -58,7 +60,7 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
         NINFER_Q5_LINEAR_ADD_EXACT(16);
 #undef NINFER_Q5_LINEAR_ADD_EXACT
     default:
-        throw std::invalid_argument("q5 linear_add split2: T must be in [2,16]");
+        throw std::invalid_argument("q5 linear_add split2: T must be in [1,16]");
     }
 }
 

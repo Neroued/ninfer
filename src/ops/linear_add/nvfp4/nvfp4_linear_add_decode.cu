@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/device.h"
@@ -10,7 +11,8 @@ namespace {
 
 template <class Geometry>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Schedule        = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    using Schedule =
+        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
@@ -26,16 +28,16 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
 
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream) {
-    switch (resolve_nvfp4_problem(weight.n, weight.k)) {
-    case Nvfp4Problem::Residual6144:
-        launch<Nvfp4Residual6144Geometry>(x, weight, residual, stream);
+    switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
+    case Nvfp4GeometryId::N5120K6144:
+        launch<Nvfp4N5120K6144>(x, weight, residual, stream);
         return;
-    case Nvfp4Problem::Residual17408:
-        launch<Nvfp4Residual17408Geometry>(x, weight, residual, stream);
+    case Nvfp4GeometryId::N5120K17408:
+        launch<Nvfp4N5120K17408>(x, weight, residual, stream);
         return;
-    case Nvfp4Problem::AttnInput:
-    case Nvfp4Problem::GdnInput:
-    case Nvfp4Problem::MlpGateUp:
+    case Nvfp4GeometryId::N14336K5120:
+    case Nvfp4GeometryId::N16384K5120:
+    case Nvfp4GeometryId::N34816K5120:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

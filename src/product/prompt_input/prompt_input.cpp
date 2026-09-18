@@ -222,7 +222,7 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
 
 } // namespace
 
-PromptInput prompt_from_text(std::string text, bool enable_thinking) {
+PromptInput prompt_from_text(std::string text, std::optional<bool> enable_thinking) {
     if (text.empty()) { throw std::invalid_argument("--prompt text is empty"); }
     MessagePart part;
     part.text = std::move(text);
@@ -235,8 +235,8 @@ PromptInput prompt_from_text(std::string text, bool enable_thinking) {
     return input;
 }
 
-PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_thinking,
-                                 bool vision_enabled) {
+PromptInput prompt_from_messages(const std::filesystem::path& path,
+                                 std::optional<bool> enable_thinking, bool vision_enabled) {
     std::ifstream stream(path);
     if (!stream) { throw std::runtime_error("failed to open messages JSON: " + path.string()); }
 

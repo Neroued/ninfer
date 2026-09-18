@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
@@ -15,11 +16,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Nvfp4MlpGateUpGeometry;
+using Geometry = Nvfp4N34816K5120;
 // Column tiles amortize gate/up decode over the complete speculative block.
-using M64N128 = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
+using M64N128  = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
 using M128N128 = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 4, 2, 1>;
-using M96N128 = Nvfp4W4a4MmaSchedule<96, 128, 256, 3, 4, 2, 1>;
+using M96N128  = Nvfp4W4a4MmaSchedule<96, 128, 256, 3, 4, 2, 1>;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
@@ -85,7 +86,7 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
     auto scope = workspace.scope();
     const Nvfp4W4a4Workspace scratch =
         allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
-    launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
     launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
 }
 

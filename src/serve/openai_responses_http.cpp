@@ -77,7 +77,8 @@ OpenAIResponseContext terminal_context(OpenAIResponseContext previous,
 
 void commit_stored_response(OpenAIResponsesStore& store, PendingResponseStorage pending,
                             std::string id, const Json& response,
-                            std::vector<ChatTurn> output_history, bool preserve_thinking) {
+                            std::vector<ChatTurn> output_history,
+                            std::optional<bool> preserve_thinking) {
     if (!pending.enabled) { return; }
     if (pending.session_key.empty()) {
         throw std::logic_error("stored Response has no Engine session key");

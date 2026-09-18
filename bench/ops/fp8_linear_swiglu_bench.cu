@@ -1,5 +1,6 @@
 // Cold-cache public Op benchmark for the registered row-scaled FP8 LinearSwiGLU profile.
 
+#include "core/weight.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
@@ -121,7 +122,7 @@ int main(int argc, char** argv) {
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kGateUpRows, kHidden, options.policy, min_t, max_t);
+            QType::FP8_E4M3FN_ROW_BF16, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {

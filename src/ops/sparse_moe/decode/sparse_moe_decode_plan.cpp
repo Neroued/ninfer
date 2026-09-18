@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include "core/layout.h"
@@ -20,10 +21,10 @@ std::size_t sparse_moe_decode_workspace_bytes() {
 SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up, QType routed_down,
                                                    const SparseMoeHints& hints) {
     const bool main_profile =
-        routed_gate_up == QType::Q4G64_F16S &&
-        (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
+        routed_gate_up == QType::Q4_G64_FP16 &&
+        (routed_down == QType::Q5_G64_FP16 || routed_down == QType::Q6_G64_FP16);
     const bool mtp_profile =
-        routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+        routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
     if (!main_profile && !mtp_profile) {
         throw std::invalid_argument("sparse_moe: unsupported routed codec profile");
     }

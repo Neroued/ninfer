@@ -383,6 +383,59 @@ def _file_record(path: Path, **facts: Any) -> dict[str, Any]:
     return {"path": _relative(path), "sha256": _sha256(path), **facts}
 
 
+def build_state_working_set(tokenizer: Any, source_ids: Sequence[int]) -> dict[str, Any]:
+    """Small, early-divergent systems with frozen append-only probe geometry."""
+    roots = []
+    records = {}
+    suffix = "\nInclude one more detail."
+    for label in "abcdef":
+        def candidate(take: int) -> list[dict[str, str]]:
+            body = tokenizer.decode(
+                list(source_ids[:take]), skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            return [
+                {"role": "system", "content": f"{label.upper()} reference.\n{body}"},
+                {"role": "user", "content": "Describe the reference in three short sentences."},
+            ]
+
+        low, high = 0, 2100
+        while low < high:
+            middle = (low + high) // 2
+            if _prompt_tokens(tokenizer, candidate(middle)) < 2048:
+                low = middle + 1
+            else:
+                high = middle
+        messages = candidate(low)
+        if _prompt_tokens(tokenizer, messages) != 2048:
+            raise RuntimeError(f"cannot fit state working-set root {label} to 2048 tokens")
+        roots.append(messages)
+        variants = []
+        for turn in range(7):
+            probe = copy.deepcopy(messages)
+            probe[-1]["content"] += suffix * turn
+            variants.append(_prompt_tokens(tokenizer, probe))
+        rendered = _render_template(tokenizer, messages)
+        system = messages[0]["content"]
+        frontier = _stable_frontier(tokenizer, rendered, rendered.index(system) + len(system))
+        path = TEXT_ROOT / f"state_working_set_{label}.json"
+        _write_json(path, messages)
+        records[f"state-2k-{label}"] = _file_record(
+            path, prompt_tokens=2048, max_output_tokens=32,
+            system_frontier_tokens=frontier, probe_suffix=suffix,
+            probe_prompt_tokens=variants,
+        )
+    common = max(
+        _common_rendered_tokens(tokenizer, left, right)
+        for i, left in enumerate(roots) for right in roots[i + 1:]
+    )
+    if common > 3:
+        raise RuntimeError("state working-set roots do not diverge at the first content token")
+    for record in records.values():
+        record["max_peer_common_prefix_tokens"] = common
+    return records
+
+
 def _existing_case(case_name: str, prompt_tokens: int, max_output_tokens: int) -> dict[str, Any]:
     path = REPO_ROOT / "examples" / "cli" / "messages" / f"{case_name}.json"
     return _file_record(
@@ -678,6 +731,7 @@ def build(tokenizer_path: Path) -> None:
             ],
         },
     }
+    manifest["shapes"].update(build_state_working_set(tokenizer, source_ids))
     _write_json(FIXTURE_ROOT / "manifest.json", manifest)
 
 

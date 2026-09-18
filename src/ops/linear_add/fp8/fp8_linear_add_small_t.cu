@@ -1,9 +1,10 @@
+#include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
-#include "ops/linear/fp8/fp8_small_t.cuh"
+#include "ops/linear/fp8/fp8_simt.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
 
 #include <array>
@@ -20,13 +21,13 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // with common register/load profiles and no per-shape cache hints or isolated token exceptions.
 template <class Geometry, int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule {
-    static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens <= 19 ? 8 : 4;
-    static constexpr int kRowsPerWarp = ActiveTokens <= 5 ? 1 : 2;
+    static_assert(ActiveTokens >= 2 && ActiveTokens <= kFp8LinearAddChunkTokens);
+    static constexpr int kWarpsPerCta   = ActiveTokens <= 19 ? 8 : 4;
+    static constexpr int kRowsPerWarp   = ActiveTokens <= 5 ? 1 : 2;
     static constexpr int kValuesPerLane = ActiveTokens <= 19 ? 16 : 8;
-    using Type = Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
-        Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
-        Fp8SmallTBlockOrder::RowsContiguous, 1>;
+    using Type = Fp8SimtSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
+                                 Fp8SimtActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
+                                 Fp8SimtBlockOrder::RowsContiguous, 1>;
 };
 
 template <class Geometry, int ActiveTokens>
@@ -35,26 +36,24 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     auto* output              = static_cast<__nv_bfloat16*>(residual.data);
-    fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales),
-            Fp8ContiguousOutput{output, Geometry::kOutputRows},
-            Fp8AddResidualEpilogue{output, Geometry::kOutputRows});
+    fp8_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales),
+        Fp8ContiguousOutput{output, Geometry::kOutputRows},
+        Fp8AddResidualEpilogue{output, Geometry::kOutputRows});
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<Geometry, kFp8FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, 2 + static_cast<int>(Offsets)>...};
 }
 
 template <class Geometry>
 const auto& launchers() {
     static constexpr auto kLaunchers =
-        make_launchers<Geometry>(std::make_index_sequence<kFp8LastSmallT - kFp8FirstSmallT + 1>{});
+        make_launchers<Geometry>(std::make_index_sequence<kFp8LinearAddChunkTokens - 2 + 1>{});
     return kLaunchers;
 }
 
@@ -62,21 +61,21 @@ const auto& launchers() {
 
 void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                    cudaStream_t stream) {
-    if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LastSmallT) {
+    if (x.ne[1] < 2 || x.ne[1] > kFp8LinearAddChunkTokens) {
         throw std::invalid_argument("fp8 linear_add small-T: unsupported T");
     }
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT);
-    switch (resolve_fp8_problem(weight.n, weight.k)) {
-    case Fp8Problem::Residual6144:
-        launchers<Fp8Residual6144Geometry>()[index](x, weight, residual, stream);
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
+    switch (resolve_fp8_geometry(weight.n, weight.k)) {
+    case Fp8GeometryId::N5120K6144:
+        launchers<Fp8N5120K6144>()[index](x, weight, residual, stream);
         return;
-    case Fp8Problem::Residual17408:
-        launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, stream);
+    case Fp8GeometryId::N5120K17408:
+        launchers<Fp8N5120K17408>()[index](x, weight, residual, stream);
         return;
-    case Fp8Problem::AttnInput:
-    case Fp8Problem::GdnInput:
-    case Fp8Problem::MlpGateUp:
-    case Fp8Problem::Vocabulary:
+    case Fp8GeometryId::N14336K5120:
+    case Fp8GeometryId::N16384K5120:
+    case Fp8GeometryId::N34816K5120:
+    case Fp8GeometryId::N248320K5120:
         break;
     }
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");

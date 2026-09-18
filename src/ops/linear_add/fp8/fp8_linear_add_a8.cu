@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
@@ -19,7 +20,7 @@ namespace {
 template <class Geometry, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace,
                 std::int32_t tokens, cudaStream_t stream) {
-    using Schedule          = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using Schedule          = Fp8A8DefaultSchedule;
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -44,7 +45,7 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    using Schedule = Fp8A8DefaultSchedule;
     if ((tokens % Schedule::kBlockTokens) == 0) {
         launch_mma<Geometry, true>(weight, residual, workspace, tokens, stream);
     } else {
@@ -59,17 +60,17 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     auto scope                   = workspace.scope();
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    switch (resolve_fp8_problem(weight.n, weight.k)) {
-    case Fp8Problem::Residual6144:
-        launch_problem<Fp8Residual6144Geometry>(weight, residual, scratch, x.ne[1], stream);
+    switch (resolve_fp8_geometry(weight.n, weight.k)) {
+    case Fp8GeometryId::N5120K6144:
+        launch_problem<Fp8N5120K6144>(weight, residual, scratch, x.ne[1], stream);
         return;
-    case Fp8Problem::Residual17408:
-        launch_problem<Fp8Residual17408Geometry>(weight, residual, scratch, x.ne[1], stream);
+    case Fp8GeometryId::N5120K17408:
+        launch_problem<Fp8N5120K17408>(weight, residual, scratch, x.ne[1], stream);
         return;
-    case Fp8Problem::AttnInput:
-    case Fp8Problem::GdnInput:
-    case Fp8Problem::MlpGateUp:
-    case Fp8Problem::Vocabulary:
+    case Fp8GeometryId::N14336K5120:
+    case Fp8GeometryId::N16384K5120:
+    case Fp8GeometryId::N34816K5120:
+    case Fp8GeometryId::N248320K5120:
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");

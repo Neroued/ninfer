@@ -169,8 +169,8 @@ int main() {
                           configured.context_cache.host_kv_capacity_bytes == 0,
                       "root-only server mode retained default Host capacities");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
-    failures +=
-        check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
+    failures += check(configured.preserve_thinking == true,
+                      "--preserve-thinking did not reach serving options");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -238,15 +238,10 @@ int main() {
                       "server accepted top_k beyond the executable candidate domain");
 
     GenerationRequest request;
-    request.max_tokens = 1;
-    ninfer::PromptCapabilities prompt_capabilities;
-    prompt_capabilities.enable_thinking                 = true;
-    prompt_capabilities.reasoning_effort.low            = true;
-    prompt_capabilities.reasoning_effort.xhigh          = true;
-    prompt_capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
-    const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
-    failures += check(!semantics.reasoning_effort &&
-                          semantics.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+    request.max_tokens   = 1;
+    const auto semantics = resolve_prompt_semantics(request, defaults);
+    failures += check(!semantics.reasoning_effort && !semantics.enable_thinking &&
+                          !semantics.reasoning_effort,
                       "omitted reasoning effort did not resolve to the template default");
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
@@ -269,9 +264,8 @@ int main() {
                 .execution.thinking.budget == 37,
         "thinking-enabled request did not inherit the server budget");
     request.enable_thinking = false;
-    const auto non_thinking =
-        resolve_prompt_semantics(request, thinking_budget, prompt_capabilities);
-    failures += check(!non_thinking.effective_reasoning_effort,
+    const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);
+    failures += check(!non_thinking.reasoning_effort,
                       "disabled thinking retained an effective reasoning effort");
     failures += check(!to_request_options(request, thinking_budget, non_thinking,
                                           thinking_budget.allow_prefix_reuse)
@@ -279,19 +273,16 @@ int main() {
                       "non-thinking request inherited the server thinking budget");
     request.enable_thinking.reset();
     request.reasoning_effort   = RequestedReasoningEffort::Low;
-    const auto explicit_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
-    failures +=
-        check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
-                  explicit_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
-              "explicit reasoning effort did not remain the effective effort");
+    const auto explicit_effort = resolve_prompt_semantics(request, defaults);
+    failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                          explicit_effort.enable_thinking == true,
+                      "explicit reasoning effort did not remain the effective effort");
     request.reasoning_effort.reset();
-    failures +=
-        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
-              "server preserve-thinking default was not resolved");
+    failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == true,
+                      "server preserve-thinking default was not resolved");
     request.preserve_thinking = false;
-    failures +=
-        check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
-              "request preserve-thinking override did not win");
+    failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == false,
+                      "request preserve-thinking override did not win");
 
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
@@ -325,9 +316,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
               "serve help omits external context-cost presets");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
-              "serve help omits the artifact-derived model id default");
+    failures += check(serve_usage_text("ninfer-serve").find("metadata.name") != std::string::npos,
+                      "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});

@@ -4,10 +4,10 @@
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "targets/registry.h"
+#include "runtime/engine/model_instance.h"
 
 #include <algorithm>
 #include <limits>
@@ -19,76 +19,6 @@
 
 namespace ninfer {
 namespace {
-
-EngineOptions normalize_engine_options(EngineOptions options) {
-    switch (options.purpose) {
-    case EnginePurpose::Generation:
-        break;
-    case EnginePurpose::CausalScoring:
-        options.max_concurrency      = 1;
-        options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
-        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
-        options.speculative          = {};
-        options.enable_vision        = false;
-        options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{.enabled = false};
-        break;
-    default:
-        throw std::invalid_argument("Engine purpose is invalid");
-    }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
-    }
-
-    ContextCacheOptions& cache      = options.context_cache;
-    const std::uint32_t concurrency = options.max_concurrency;
-    if (!cache.enabled) {
-        if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
-            (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
-            (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
-            (cache.max_long_anchors_per_continuation &&
-             *cache.max_long_anchors_per_continuation != 0)) {
-            throw std::invalid_argument("disabled context cache accepts only root-only capacities");
-        }
-        cache.device_state_slots                = 0;
-        cache.host_state_slots                  = 0;
-        cache.host_kv_capacity_bytes            = 0;
-        cache.max_private_continuations         = concurrency;
-        cache.max_shared_prefixes               = 0;
-        cache.max_long_anchors_per_continuation = 0;
-        return options;
-    }
-
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
-    const std::uint64_t default_private = 2ULL * concurrency;
-    cache.max_private_continuations =
-        cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
-        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
-    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
-
-    if (*cache.max_private_continuations < concurrency) {
-        throw std::invalid_argument(
-            "context cache max_private_continuations must cover every active request");
-    }
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
-    }
-    const std::uint64_t address_spaces =
-        static_cast<std::uint64_t>(*cache.max_private_continuations) + *cache.max_shared_prefixes;
-    if (address_spaces > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache address-space capacity exceeds uint32");
-    }
-    if (*cache.max_long_anchors_per_continuation != 0 &&
-        *cache.max_private_continuations >
-            std::numeric_limits<std::size_t>::max() / *cache.max_long_anchors_per_continuation) {
-        throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
-    }
-    return options;
-}
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
@@ -123,14 +53,14 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         models::qwen3_5::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    models::qwen3_5::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -216,41 +146,26 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Core27      = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
-    using Core35      = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
-    using ScoreCore27 = runtime::CausalScoreCore<targets::Qwen3_6_27BInstance>;
-    using ScoreCore35 = runtime::CausalScoreCore<targets::Qwen3_6_35BA3BInstance>;
-    using Core = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,
-                              std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
+    using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
+    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+    using Core =
+        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalize_engine_options(std::move(engine_options))),
+        : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = targets::construct_target(options, device);
-        active            = std::move(constructed.active);
+        auto constructed  = runtime::construct_model(options, device);
+        active            = std::move(constructed.instance);
         load              = std::move(constructed.load);
-        sampling_defaults = constructed.sampling_defaults;
+        sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        core = std::visit(
-            [&](auto& target_ptr) -> Core {
-                using Instance =
-                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore27>(*target_ptr, device);
-                    }
-                    return std::make_unique<Core27>(*target_ptr, device, options,
+        if (options.purpose == EnginePurpose::CausalScoring) {
+            core = std::make_unique<ScoringCore>(*active, device);
+        } else {
+            core = std::make_unique<GenerationCore>(*active, device, options,
                                                     std::move(constructed.context_cost));
-                } else {
-                    if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore35>(*target_ptr, device);
-                    }
-                    return std::make_unique<Core35>(*target_ptr, device, options,
-                                                    std::move(constructed.context_cost));
-                }
-            },
-            active);
+        }
         finalize_phase.complete();
     }
 
@@ -264,7 +179,7 @@ public:
 
     EngineOptions options;
     DeviceContext device;
-    targets::ActiveTarget active;
+    std::unique_ptr<runtime::ModelInstance> active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
@@ -284,21 +199,16 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    auto prepared      = impl_->active->frontend.prepare(std::move(input), control);
+    PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
-        input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
-            }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, sampling_mode, std::move(prepared)));
-        },
-        impl_->active);
+        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+    if (info.prompt_tokens > impl_->active->capacity) {
+        throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+    }
+    const PromptPreparationStats preparation = prepared.preparation_stats();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                                 std::move(prepared)));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -306,34 +216,24 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) -> PreparedPrompt {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            if (token_ids.size() > target_ptr->capacity) {
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   context_capacity_error(token_ids.size(), target_ptr->capacity));
-            }
-            auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
-                                                                             allow_prefix_identity);
-            PromptSummary info = prepared.summary();
-            if (info.prompt_tokens > target_ptr->capacity) {
-                throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
-            }
-            const PromptPreparationStats preparation = prepared.preparation_stats();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, preparation, SamplingMode::Thinking, std::move(prepared)));
-        },
-        impl_->active);
+    if (token_ids.size() > impl_->active->capacity) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           context_capacity_error(token_ids.size(), impl_->active->capacity));
+    }
+    auto prepared =
+        impl_->active->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    PromptSummary info = prepared.summary();
+    if (info.prompt_tokens > impl_->active->capacity) {
+        throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
+    }
+    const PromptPreparationStats preparation = prepared.preparation_stats();
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        info, preparation, SamplingMode::Thinking, std::move(prepared)));
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.tokenize_text(text);
-        },
-        impl_->active);
+    return impl_->active->frontend.tokenize_text(text);
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
@@ -354,8 +254,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -370,22 +269,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.count_tokens(std::move(input), control);
-        },
-        impl_->active);
-}
-
-PromptCapabilities Engine::prompt_capabilities() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.prompt_capabilities();
-        },
-        impl_->active);
+    return impl_->active->frontend.count_tokens(std::move(input), control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -450,8 +334,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
-            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
@@ -498,12 +381,7 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.media_cache_summary();
-        },
-        impl_->active);
+    return impl_->active->frontend.media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {

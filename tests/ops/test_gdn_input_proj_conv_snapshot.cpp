@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
@@ -514,9 +515,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 617U));
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 4096, kHidden, 617U));
     DevicePackedWeight value_z_weight(
-        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 619U));
+        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 619U));
     int failures = 0;
     // Cover every fixed Small-T specialization plus the first composed extent.
     for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7}) {
@@ -558,7 +559,7 @@ int run_q4_q5() {
     return failures;
 }
 
-int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot) {
+int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot) {
     constexpr std::int32_t kHidden           = 2048;
     constexpr std::int32_t kValueRows        = 4096;
     constexpr std::int32_t kZRows            = 4096;
@@ -611,7 +612,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
                 kHidden);
         });
     const std::vector<std::uint16_t> state_after = state.bits();
-    const std::string suffix                     = " W8 A16 T=" + std::to_string(tokens) +
+    const std::string suffix                     = " Q8 A16 T=" + std::to_string(tokens) +
                                " initial=" + std::to_string(initial_slot) +
                                " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
@@ -641,15 +642,15 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     return failures;
 }
 
-int run_w8() {
+int run_q8() {
     constexpr std::int32_t kHidden = 2048;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 727U));
+        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 727U));
     int failures = 0;
     // Representative registered T values around every current execution boundary.
     for (const std::int32_t tokens : {1, 2, 17}) {
         const std::int32_t initial_slot = tokens == 2 ? 0 : tokens + 1;
-        failures += run_w8_case(parent, tokens, initial_slot);
+        failures += run_q8_case(parent, tokens, initial_slot);
     }
     constexpr std::int32_t kValueRows = 4096;
     constexpr std::int32_t kZRows     = 4096;
@@ -661,7 +662,7 @@ int run_w8() {
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         kQueryRows, kKeyRows, kValueRows, kBatch, kWidth, kWidth);
     failures += run_batched_case(
-        "W8 A16 B=2 W=16 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+        "Q8 A16 B=2 W=16 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
         conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
         [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
             return quantized_weight::dot_fp64(
@@ -679,7 +680,7 @@ int run_w8() {
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
                                               snapshot_base, q, k, v, z, workspace, nullptr);
         });
-    failures += parent.verify_preserved("batched W8 parent weight");
+    failures += parent.verify_preserved("batched Q8 parent weight");
     return failures;
 }
 
@@ -866,7 +867,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, 1, tokens, tokens);
+        QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (convenience) {
@@ -933,7 +934,7 @@ int run_fp8() {
     constexpr std::int32_t kChannels  = 10240;
     constexpr std::int32_t kRows      = kChannels + kZRows;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 929U));
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 929U));
 
     int failures = 0;
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true, true);
@@ -953,7 +954,7 @@ int run_fp8() {
         const bool uses_a8                   = width * batch >= 9;
         const std::size_t workspace_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, batch,
+                QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, ops::LinearPolicy::AllowA8, batch,
                 width, width);
         return run_batched_case(
             "FP8 AllowA8 B=" + std::to_string(batch) + " W=" + std::to_string(width), kHidden,
@@ -1009,7 +1010,7 @@ int main() {
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
                                                                        17)) {
-        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
+        std::cerr << "Q8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1027,7 +1028,7 @@ int main() {
     const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                           std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, min_width, max_width);
+            QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, min_width, max_width);
     };
     const std::size_t fp8_a16_w4 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 4, 4);
     const std::size_t fp8_a16_w6 = fp8_snapshot_capacity(ops::LinearPolicy::A16Only, 1, 6, 6);
@@ -1045,7 +1046,7 @@ int main() {
         ++failures;
     }
     failures += run_q4_q5();
-    failures += run_w8();
+    failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";

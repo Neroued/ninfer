@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "core/device.h"
@@ -15,8 +16,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8MlpGateUpGeometry;
-using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+using Geometry = Fp8N34816K5120;
+using Schedule = Fp8A8DefaultSchedule;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 using Rows                  = Fp8SwiGluRows<Schedule::kBlockRows / 2, kIntermediate>;

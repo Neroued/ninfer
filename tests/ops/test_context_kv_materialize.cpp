@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "ops/op_tester.h"
@@ -102,9 +103,9 @@ struct Fixture {
         for (int layer = 0; layer < kLayers; ++layer) {
             LayerStorage& target = storage[static_cast<std::size_t>(layer)];
             target.key_host      = quantized_weight::make_patterned_weight(
-                QType::W8G32_F16S, kRows, kHidden, 0x310U + 2U * layer, weight_options);
+                QType::Q8_G32_FP16, kRows, kHidden, 0x310U + 2U * layer, weight_options);
             target.value_host = quantized_weight::make_patterned_weight(
-                QType::W8G32_F16S, kRows, kHidden, 0x311U + 2U * layer, weight_options);
+                QType::Q8_G32_FP16, kRows, kHidden, 0x311U + 2U * layer, weight_options);
             constexpr std::size_t parent_codes = 6144ULL * kHidden;
             target.parent_host.resize(parent_codes + 6144ULL * (kHidden / 32) * 2, 0x63);
             const auto put = [&](const quantized_weight::PackedWeight& weight, int row) {

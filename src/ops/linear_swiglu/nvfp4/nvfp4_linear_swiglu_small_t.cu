@@ -1,10 +1,11 @@
+#include "core/weight.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_simt.cuh"
 
 #include <cuda_bf16.h>
 
@@ -15,7 +16,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry              = Nvfp4MlpGateUpGeometry;
+using Geometry              = Nvfp4N34816K5120;
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
 template <int ActiveTokens, class Schedule>
@@ -35,7 +36,7 @@ __global__ __launch_bounds__(
     static_assert((Schedule::kWarpsPerCta % 4) == 0);
     static_assert((128 % Schedule::kWarpsPerCta) == 0);
 
-    __shared__ Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule> shared;
+    __shared__ Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
     const int block                               = static_cast<int>(blockIdx.x);
     const int m_tile                              = block / kCtasPerM128;
@@ -50,7 +51,7 @@ __global__ __launch_bounds__(
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
         {};
-    compute_nvfp4_small_t_rows<Geometry, ActiveTokens, Schedule>(
+    compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
         x, codes, scales, shared, inverse_weight_divisor, parent_rows,
         warp * Schedule::kRowsPerWarp, 0, 0, lane, accumulators);
 
@@ -77,12 +78,12 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     static constexpr auto kActivationAccess = ActiveTokens <= 4
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
+                                                  ? Nvfp4SimtActivationAccess::SharedPhase
+                                                  : Nvfp4SimtActivationAccess::TokenPacked;
     static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
-    using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
-                                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                         Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+    using Schedule = Nvfp4SimtSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
+                                       Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                       Nvfp4SimtBlockOrder::RowsContiguous, 1>;
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
@@ -97,17 +98,16 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+    return std::array<Launch, sizeof...(Offsets)>{&launch_exact<2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - 2 + 1>{});
 
 } // namespace
 
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     kLaunchers[index](x, weight, out, stream);
 }
 

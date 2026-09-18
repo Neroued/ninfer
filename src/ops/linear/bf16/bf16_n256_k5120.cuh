@@ -1,6 +1,6 @@
 #pragma once
 
-// Small-output BF16 x BF16 MMA for the exact [256,5120] selector projection. A CTA computes one
+// Small-output BF16 x BF16 MMA for the exact [256,5120] matrix. A CTA computes one
 // 16-row by 8/16-token tile. Sixteen/eight warps split K, double-buffer global-to-shared staging,
 // and reduce FP32 fragments in shared memory before the final BF16 store.
 

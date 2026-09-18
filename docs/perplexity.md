@@ -1,8 +1,9 @@
 # Perplexity evaluation
 
-`ninfer-perplexity` measures the causal perplexity produced by a registered `.ninfer` artifact.
+`ninfer-perplexity` measures the causal perplexity produced by a v3 `.ninfer` artifact.
 It uses the artifact's tokenizer, Text model, selected Main KV representation, final normalization,
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
+Only Text weights and resources are loaded; Vision and speculative components are not required.
 
 ## Run the fixed corpus
 
@@ -69,3 +70,6 @@ The corpus name is a workload scale, not an exact token count. Exact input and s
 are runtime results from the current artifact tokenizer and are recorded in each report. Reports
 contain unrounded NLL/PPL values for every window, stream, domain, and the token-weighted overall
 aggregate.
+
+The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
+and prefill signature alongside the workload and numerical results.

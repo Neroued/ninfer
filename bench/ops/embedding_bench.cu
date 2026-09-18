@@ -1,4 +1,5 @@
 // Public embedding benchmark: normal IDs and mask-heavy draft blocks at explicit matrix extents.
+#include "core/weight.h"
 #include "ninfer/ops/embedding.h"
 
 #include "core/device.h"
@@ -30,8 +31,8 @@ constexpr std::size_t kL2FlushBytes = 256ULL << 20;
 
 enum class Profile {
     Q6D5120,
-    W8D5120,
-    W8D2048,
+    Q8D5120,
+    Q8D2048,
     Fp8D5120,
 };
 
@@ -45,23 +46,23 @@ struct ProfileSpec {
 constexpr ProfileSpec profile_spec(Profile profile) {
     switch (profile) {
     case Profile::Q6D5120:
-        return {"q6-d5120", QType::Q6G64_F16S, 5120, 64};
-    case Profile::W8D5120:
-        return {"w8-d5120", QType::W8G32_F16S, 5120, 32};
-    case Profile::W8D2048:
-        return {"w8-d2048", QType::W8G32_F16S, 2048, 32};
+        return {"q6-d5120", QType::Q6_G64_FP16, 5120, 64};
+    case Profile::Q8D5120:
+        return {"q8-d5120", QType::Q8_G32_FP16, 5120, 32};
+    case Profile::Q8D2048:
+        return {"q8-d2048", QType::Q8_G32_FP16, 2048, 32};
     case Profile::Fp8D5120:
-        return {"fp8-d5120", QType::FP8_E4M3FN_ROW_BF16S, 5120, 5120};
+        return {"fp8-d5120", QType::FP8_E4M3FN_ROW_BF16, 5120, 5120};
     }
     throw std::logic_error("unknown embedding profile");
 }
 
 Profile parse_profile(const char* raw) {
     if (!std::strcmp(raw, "q6-d5120")) return Profile::Q6D5120;
-    if (!std::strcmp(raw, "w8-d5120")) return Profile::W8D5120;
-    if (!std::strcmp(raw, "w8-d2048")) return Profile::W8D2048;
+    if (!std::strcmp(raw, "q8-d5120")) return Profile::Q8D5120;
+    if (!std::strcmp(raw, "q8-d2048")) return Profile::Q8D2048;
     if (!std::strcmp(raw, "fp8-d5120")) return Profile::Fp8D5120;
-    throw std::invalid_argument("--format must be q6-d5120, w8-d5120, w8-d2048, or fp8-d5120");
+    throw std::invalid_argument("--format must be q6-d5120, q8-d5120, q8-d2048, or fp8-d5120");
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -82,13 +83,13 @@ PackedLayout packed_layout(const ProfileSpec& spec) {
     PackedLayout layout;
     layout.padded_d            = static_cast<std::int32_t>(align_up(spec.d, 128));
     const std::uint64_t groups = static_cast<std::uint64_t>(layout.padded_d / spec.group);
-    if (spec.qtype == QType::Q6G64_F16S) {
+    if (spec.qtype == QType::Q6_G64_FP16) {
         layout.code_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 32;
         layout.high_plane_offset = align_up(layout.code_plane_bytes, 256);
         layout.high_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 16;
         layout.scale_plane_offset =
             layout.high_plane_offset + align_up(layout.high_plane_bytes, 256);
-    } else if (spec.qtype == QType::W8G32_F16S) {
+    } else if (spec.qtype == QType::Q8_G32_FP16) {
         layout.code_plane_bytes =
             static_cast<std::uint64_t>(kVocab) * groups * static_cast<std::uint64_t>(spec.group);
         layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
@@ -109,8 +110,8 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* pa
     table.high_plane_bytes = layout.high_plane_bytes;
     table.qtype            = spec.qtype;
     table.layout =
-        spec.qtype == QType::FP8_E4M3FN_ROW_BF16S ? QuantLayout::RowScale : QuantLayout::RowSplit;
-    table.scale_dtype     = spec.qtype == QType::FP8_E4M3FN_ROW_BF16S ? DType::BF16 : DType::FP16;
+        spec.qtype == QType::FP8_E4M3FN_ROW_BF16 ? QuantLayout::RowScale : QuantLayout::RowSplit;
+    table.scale_dtype     = spec.qtype == QType::FP8_E4M3FN_ROW_BF16 ? DType::BF16 : DType::FP16;
     table.group_size      = spec.group;
     table.shape[0]        = kVocab;
     table.shape[1]        = spec.d;
@@ -118,12 +119,12 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* pa
     table.padded_shape[1] = layout.padded_d;
     table.ndim            = 2;
     table.qdata           = payload;
-    table.qhigh  = spec.qtype == QType::Q6G64_F16S ? bytes + layout.high_plane_offset : nullptr;
+    table.qhigh  = spec.qtype == QType::Q6_G64_FP16 ? bytes + layout.high_plane_offset : nullptr;
     table.scales = bytes + layout.scale_plane_offset;
     table.n      = kVocab;
     table.k      = spec.d;
     table.group  = spec.group;
-    if (spec.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+    if (spec.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         table.scale_ne[0] = kVocab;
         table.scale_nb[0] = 2;
         table.scale_nb[1] = static_cast<std::int64_t>(kVocab) * 2;
@@ -141,7 +142,7 @@ __device__ std::uint32_t fixture_hash(std::uint32_t x) {
     return x ^ (x >> 16);
 }
 
-// Mode 0/1: Q6 low/high planes; 2: W8; 3: finite E4M3FN. All codes obey the numeric format.
+// Mode 0/1: Q6 low/high planes; 2: Q8; 3: finite E4M3FN. All codes obey the numeric format.
 __global__ void initialize_codes(std::uint32_t* words, std::size_t size, int mode) {
     const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size) return;
@@ -177,7 +178,9 @@ __global__ void initialize_scales(std::uint16_t* scales, std::size_t count, bool
 void initialize_payload(const ProfileSpec& spec, const PackedLayout& layout,
                         DeviceBuffer& payload) {
     auto* base      = static_cast<std::uint8_t*>(payload.p);
-    const int mode  = spec.qtype == QType::Q6G64_F16S ? 0 : spec.qtype == QType::W8G32_F16S ? 2 : 3;
+    const int mode  = spec.qtype == QType::Q6_G64_FP16   ? 0
+                      : spec.qtype == QType::Q8_G32_FP16 ? 2
+                                                         : 3;
     const auto fill = [&](std::size_t offset, std::size_t bytes, int selected) {
         const auto words = bytes / 4;
         initialize_codes<<<(words + 255) / 256, 256>>>(
@@ -232,7 +235,7 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--help") {
             std::puts(
-                "usage: ninfer_embedding_bench [--format q6-d5120|w8-d5120|w8-d2048|fp8-d5120] "
+                "usage: ninfer_embedding_bench [--format q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
                 "[--tokens T,...] [--id-pattern normal|masked] [--block-width 2..16] [--execution "
                 "eager|graph] [--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                 "[--csv-out PATH] [--profile]");
@@ -264,7 +267,7 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option " + arg);
     }
     if (o.profiles.empty())
-        o.profiles = {Profile::Q6D5120, Profile::W8D5120, Profile::W8D2048, Profile::Fp8D5120};
+        o.profiles = {Profile::Q6D5120, Profile::Q8D5120, Profile::Q8D2048, Profile::Fp8D5120};
     if (o.tokens.empty())
         for (int t = 1; t <= 128; ++t) o.tokens.push_back(t);
     if ((o.execution != "eager" && o.execution != "graph") ||
@@ -280,7 +283,7 @@ Options parse_options(int argc, char** argv) {
 
 double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& layout) {
     const double encoded =
-        spec.qtype == QType::Q6G64_F16S ? layout.padded_d * 0.75 : layout.padded_d;
+        spec.qtype == QType::Q6_G64_FP16 ? layout.padded_d * 0.75 : layout.padded_d;
     return encoded + (layout.padded_d / spec.group) * 2 + spec.d * 2 + 4;
 }
 

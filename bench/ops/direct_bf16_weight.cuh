@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_bf16.h>
@@ -64,7 +65,7 @@ inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
     Weight& weight         = result.weight;
     weight.payload         = result.storage.p;
     weight.payload_bytes   = bytes;
-    weight.qtype           = QType::BF16_CTRL;
+    weight.qtype           = QType::BF16;
     weight.shape[0]        = n;
     weight.shape[1]        = k;
     weight.padded_shape[0] = n;

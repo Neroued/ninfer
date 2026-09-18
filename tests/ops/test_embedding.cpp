@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/embedding.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
@@ -25,13 +26,13 @@ constexpr std::int32_t kLastFrontendToken = 248076;
 constexpr std::int32_t kMaskToken         = 248077; // existing DFlash
 constexpr std::int32_t kDFlash2MaskToken  = 248070;
 constexpr std::int32_t kQ6D               = 5120;
-constexpr std::int32_t kW8VisionD         = 2048;
-constexpr std::int32_t kW8TextD           = 5120;
+constexpr std::int32_t kQ8VisionD         = 2048;
+constexpr std::int32_t kQ8TextD           = 5120;
 constexpr std::int32_t kFp8D              = 5120;
 constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kQ6Group           = 64;
-constexpr std::int32_t kW8Group           = 32;
+constexpr std::int32_t kQ8Group           = 32;
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
@@ -211,7 +212,7 @@ public:
     Weight weight() {
         auto* base = static_cast<std::uint8_t*>(payload_.data());
         Weight result{};
-        result.qtype            = QType::Q6G64_F16S;
+        result.qtype            = QType::Q6_G64_FP16;
         result.layout           = QuantLayout::RowSplit;
         result.scale_dtype      = DType::FP16;
         result.payload          = base;
@@ -325,16 +326,16 @@ private:
     std::vector<Q6Row> rows_;
 };
 
-struct W8Row {
+struct Q8Row {
     std::int32_t id;
     std::vector<std::uint8_t> codes;
     std::vector<std::uint8_t> scales;
 };
 
-class W8Table {
+class Q8Table {
 public:
-    explicit W8Table(std::int32_t d)
-        : d_(d), groups_(d / kW8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
+    explicit Q8Table(std::int32_t d)
+        : d_(d), groups_(d / kQ8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
           scale_offset_(align_up(code_plane_bytes_, 256)),
           payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
         for (const std::int32_t row : d == 5120 ? dflash2_fixture_ids() : repeated_ids(8)) {
@@ -345,7 +346,7 @@ public:
     Weight weight() {
         auto* base = static_cast<std::uint8_t*>(payload_.data());
         Weight result{};
-        result.qtype            = QType::W8G32_F16S;
+        result.qtype            = QType::Q8_G32_FP16;
         result.layout           = QuantLayout::RowSplit;
         result.scale_dtype      = DType::FP16;
         result.payload          = base;
@@ -354,8 +355,8 @@ public:
         result.qhigh            = nullptr;
         result.scales           = base + scale_offset_;
         result.high_plane_bytes = 0;
-        result.group_size       = kW8Group;
-        result.group            = kW8Group;
+        result.group_size       = kQ8Group;
+        result.group            = kQ8Group;
         result.ndim             = 2;
         result.shape[0]         = kVocab;
         result.shape[1]         = d_;
@@ -369,13 +370,13 @@ public:
     std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
         std::vector<double> result(static_cast<std::size_t>(d_) * ids.size());
         for (std::size_t t = 0; t < ids.size(); ++t) {
-            const W8Row* row = find(ids[t]);
-            if (row == nullptr) throw std::out_of_range("W8 oracle row was not materialized");
+            const Q8Row* row = find(ids[t]);
+            if (row == nullptr) throw std::out_of_range("Q8 oracle row was not materialized");
             for (std::int32_t d = 0; d < d_; ++d) {
                 const std::uint8_t raw = row->codes[d];
                 const int code = raw < 0x80u ? static_cast<int>(raw) : static_cast<int>(raw) - 256;
-                const double scale                           = static_cast<double>(f16_to_f32(
-                    load_u16_le(row->scales, static_cast<std::size_t>(d / kW8Group) * 2)));
+                const double scale     = static_cast<double>(f16_to_f32(
+                    load_u16_le(row->scales, static_cast<std::size_t>(d / kQ8Group) * 2)));
                 result[t * static_cast<std::size_t>(d_) + d] = static_cast<double>(code) * scale;
             }
         }
@@ -384,7 +385,7 @@ public:
 
     int verify_unchanged(const char* label) const {
         int failures = payload_.verify_guards(label);
-        for (const W8Row& row : rows_) {
+        for (const Q8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
             payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
@@ -397,14 +398,14 @@ public:
     }
 
 private:
-    const W8Row* find(std::int32_t id) const {
+    const Q8Row* find(std::int32_t id) const {
         const auto it = std::find_if(rows_.begin(), rows_.end(),
-                                     [id](const W8Row& row) { return row.id == id; });
+                                     [id](const Q8Row& row) { return row.id == id; });
         return it == rows_.end() ? nullptr : &*it;
     }
 
     void add_row(std::int32_t id) {
-        W8Row row{id, std::vector<std::uint8_t>(d_),
+        Q8Row row{id, std::vector<std::uint8_t>(d_),
                   std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
         for (std::int32_t group = 0; group < groups_; ++group) {
             const std::uint16_t scale =
@@ -413,14 +414,14 @@ private:
                     ? std::uint16_t{1}
                     : f32_to_f16(0.00091f + 0.00023f * static_cast<float>((id + group * 5) % 13));
             store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
-            for (std::int32_t lane = 0; lane < kW8Group; ++lane) {
+            for (std::int32_t lane = 0; lane < kQ8Group; ++lane) {
                 int code = ((id % 251 + group * 29 + lane * 17) % 255) - 127;
                 if (lane == 0) code = -127;
                 if (lane == 1) code = 127;
                 if (lane == 2) code = 0;
                 if (lane == 3) code = -1;
                 if (lane == 4) code = 1;
-                row.codes[static_cast<std::size_t>(group) * kW8Group + lane] =
+                row.codes[static_cast<std::size_t>(group) * kQ8Group + lane] =
                     static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
             }
         }
@@ -436,7 +437,7 @@ private:
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
-    std::vector<W8Row> rows_;
+    std::vector<Q8Row> rows_;
 };
 
 struct Fp8Row {
@@ -459,7 +460,7 @@ public:
     Weight weight() {
         auto* base = static_cast<std::uint8_t*>(payload_.data());
         Weight result{};
-        result.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+        result.qtype            = QType::FP8_E4M3FN_ROW_BF16;
         result.layout           = QuantLayout::RowScale;
         result.scale_dtype      = DType::BF16;
         result.payload          = base;
@@ -622,16 +623,16 @@ int test_q6() {
     return failures;
 }
 
-int test_w8() {
+int test_q8() {
     int failures = 0;
-    for (const std::int32_t d : {kW8VisionD, kW8TextD}) {
-        W8Table table(d);
+    for (const std::int32_t d : {kQ8VisionD, kQ8TextD}) {
+        Q8Table table(d);
         if (d == 5120) {
-            failures += qualify_dflash2("W8 [248320,5120]", table, 2);
+            failures += qualify_dflash2("Q8 [248320,5120]", table, 2);
             continue;
         }
         for (const std::size_t t : {1u, 6u, 16u, 1024u}) {
-            const std::string label = "embedding W8 [248320," + std::to_string(d) +
+            const std::string label = "embedding Q8 [248320," + std::to_string(d) +
                                       "] T=" + std::to_string(static_cast<unsigned long long>(t));
             failures += run_quantized_case(label.c_str(), table, repeated_ids(t), d);
         }
@@ -683,7 +684,7 @@ int test_dense() {
     output.fill(0x7d);
 
     Weight weight{};
-    weight.qtype           = QType::BF16_CTRL;
+    weight.qtype           = QType::BF16;
     weight.layout          = QuantLayout::Contiguous;
     weight.payload         = device_table.data();
     weight.payload_bytes   = device_table.bytes();
@@ -723,7 +724,7 @@ int main() {
     try {
         failures += test_dense();
         failures += test_q6();
-        failures += test_w8();
+        failures += test_q8();
         failures += test_fp8();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';

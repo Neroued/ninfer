@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
@@ -21,7 +22,7 @@ namespace ninfer::ops {
  * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
  * T may be any positive value.
  * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
- * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
+ * query_key is Q4_G64_FP16 and gate_value is Q5_G64_FP16. The oracle exact-decodes each row and
  * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
@@ -43,22 +44,22 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *
  * Registered parent forms are:
  *
- * - W8G32_F16S RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
+ * - Q8_G32_FP16 RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
  *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
- * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
+ * - BF16 Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
  * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
- *   BF16_CTRL.
- * - FP8_E4M3FN_ROW_BF16S RowScale `[14336,5120]`, with the same logical row and tensor shapes as
- *   BF16_CTRL.
+ *   BF16.
+ * - FP8_E4M3FN_ROW_BF16 RowScale `[14336,5120]`, with the same logical row and tensor shapes as
+ *   BF16.
  *
- * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
- * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private resolver to
- * select either a qualified A16 route or activation quantization to NVFP4 at every positive T.
- * FP8 admits A16Only and AllowA8 at every positive T. AllowA8 permits the resolver to choose a
- * qualified A16 route or private activation quantization followed by A8 Tensor Core computation.
- * A16Only preserves the represented BF16 activation at every positive T; tile and route cutoffs
- * are private implementation choices, independent of speculative block width.
+ * `T` is the positive token extent of the Op contract. All three policies permit the BF16
+ * and Q8_G32_FP16 A16 implementations. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the
+ * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
+ * positive T. FP8 accepts all policies at every positive T. AllowA8/AllowA4 permit the resolver to
+ * choose a qualified A16 route or private activation quantization followed by A8 Tensor Core
+ * computation. A16Only preserves the represented BF16 activation at every positive T; tile and
+ * route cutoffs are private implementation choices, independent of speculative block width.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16
@@ -84,7 +85,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
- * Three-output W8 specialization. The W8G32_F16S RowSplit parent stores rows in order
+ * Three-output Q8 specialization. The Q8_G32_FP16 RowSplit parent stores rows in order
  * [query 4096, key 1024, value 1024]. Registered parent forms are [6144,2048] with BF16
  * x [2048,T] for the Qwen3.6 companion and [6144,5120] with BF16 x [5120,T] for DFlash2.
  * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes the

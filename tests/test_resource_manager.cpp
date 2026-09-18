@@ -1,4 +1,4 @@
-#include "runtime/engine/resource_manager.h"
+#include "runtime/engine/context_cache/resource_manager.h"
 
 #include <algorithm>
 #include <array>
@@ -1781,7 +1781,7 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
                                        private_owner_ids, shared_owners, shared_owner_ids);
 }
 
-struct FakePackage {
+struct FakeModelContract {
     using Program                    = FakeProgram;
     using PreparedPrompt             = FakePreparedPrompt;
     using RequestBasePlan            = FakeRequestBasePlan;
@@ -1809,7 +1809,7 @@ struct FakePackage {
     using CacheSessionKey            = FakeCacheSessionKey;
 };
 
-using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
+using FakeManager = ninfer::runtime::ResourceManager<FakeModelContract>;
 
 FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity = 4,
                          std::uint32_t shared_capacity = 0, bool cache_enabled = true) {
@@ -1939,7 +1939,7 @@ void test_portfolio_demand_and_owner_aggregation() {
 }
 
 void test_shared_capture_subtracts_private_transition_loss() {
-    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
 
     FakeProgram program;
     program.required_pressure_actions             = 1;
@@ -1985,7 +1985,7 @@ void test_shared_capture_subtracts_private_transition_loss() {
 }
 
 void test_shared_capture_budget_bounds_committed_canonical_targets() {
-    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakeModelContract>;
 
     constexpr std::size_t private_owner_count = 16;
     constexpr std::size_t shared_owner_count  = 4;
@@ -2035,7 +2035,7 @@ void test_shared_capture_budget_bounds_committed_canonical_targets() {
 }
 
 void test_equal_lower_bound_does_not_short_circuit_tie_break() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
     FakeProgram program;
     program.required_pressure_actions         = 1;
@@ -2108,7 +2108,7 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
 }
 
 void test_machine_cost_changes_selection_without_changing_physical_assessment() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
     FakeProgram program;
     FakeAdmissionCandidate prefill_candidate;
@@ -2168,7 +2168,7 @@ void test_machine_cost_changes_selection_without_changing_physical_assessment() 
 }
 
 void test_candidate_search_prefers_deep_reuse_without_eviction() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
     FakeProgram program;
     program.required_pressure_actions         = 2;
@@ -2275,7 +2275,7 @@ void test_candidate_search_prefers_deep_reuse_without_eviction() {
 }
 
 void test_feasible_identity_expands_when_pressure_can_remove_copy() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
     FakeProgram program;
     program.pressure_action_immediate_ns          = 0;
@@ -2339,7 +2339,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
 }
 
 void test_dominating_identity_does_not_build_pressure_graph() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
 
     FakeProgram program;
     FakeAdmissionCandidate candidate;
@@ -3301,7 +3301,7 @@ void test_shortlist_collision_requires_program_exact_verification() {
 // Enumerates raw owner choices independently of the search frontier/generator and portfolio fold.
 // Each owner can keep its cache, spill it (one relief unit), or drop it (two relief units).
 void test_complete_search_against_small_exhaustive_oracle() {
-    using Planner              = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    using Planner              = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
     constexpr std::uint64_t ms = 1'000'000;
     const std::array<std::uint64_t, 3> rebuild{600 * ms, 200 * ms, 100 * ms};
     const std::array<std::uint64_t, 3> spill{40 * ms, 200 * ms, 10 * ms};

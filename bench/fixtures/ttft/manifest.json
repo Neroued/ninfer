@@ -148,6 +148,114 @@
       "prompt_tokens": 4321,
       "common_prefix_tokens": 4306,
       "max_output_tokens": 32
+    },
+    "state-2k-a": {
+      "path": "bench/fixtures/ttft/text/state_working_set_a.json",
+      "sha256": "9c265610226e9d56563f30aa69ba5508c44c6181cf34c5bece6bb64ec302401a",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-b": {
+      "path": "bench/fixtures/ttft/text/state_working_set_b.json",
+      "sha256": "16b6851f5f8edbbc6e5756e080cf95ca59ce071c82d49029c6b724b51c576321",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-c": {
+      "path": "bench/fixtures/ttft/text/state_working_set_c.json",
+      "sha256": "3459edcefb104777c94f53feac65cb98cac687c0463af84b7858eeca902d6f13",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-d": {
+      "path": "bench/fixtures/ttft/text/state_working_set_d.json",
+      "sha256": "dda66d2c124bea448f42dd58cc8f35b91837305efc945ebe42a1db2f2c8517bc",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-e": {
+      "path": "bench/fixtures/ttft/text/state_working_set_e.json",
+      "sha256": "31b3a1cbb298414e49aab10023cc0f5933f53a4be0b59d7529106fbeadc6eab9",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-f": {
+      "path": "bench/fixtures/ttft/text/state_working_set_f.json",
+      "sha256": "75cdd4d706492c3ed702e1a0f608478300269fe08767c91c631cf86644514e9e",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
     }
   },
   "shared": {

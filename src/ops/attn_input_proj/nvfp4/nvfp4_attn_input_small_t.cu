@@ -1,8 +1,9 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_simt.cuh"
 
 #include <array>
 #include <cstddef>
@@ -49,23 +50,23 @@ struct Nvfp4AttentionInputSmallTOutput {
 // so Attention owns this production mapping even though both routes share the compute body.
 template <int ActiveTokens>
 struct Nvfp4AttentionSmallTProductionSchedule {
-    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
-    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static_assert(ActiveTokens >= 2);
+    static_assert(ActiveTokens <= 32);
     static constexpr int kWarpsPerCta       = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 8 ? 16 : 8);
     static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = ActiveTokens <= 4
-                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
-                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
+                                                  ? Nvfp4SimtActivationAccess::SharedPhase
+                                                  : Nvfp4SimtActivationAccess::TokenPacked;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SimtSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+                          Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                          Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 };
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                   Tensor& v, cudaStream_t stream) {
-    using Geometry            = Nvfp4AttnInputGeometry;
+    using Geometry            = Nvfp4N14336K5120;
     using Schedule            = typename Nvfp4AttentionSmallTProductionSchedule<ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
@@ -77,29 +78,25 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
         static_cast<__nv_bfloat16*>(v.data),
     };
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-            Nvfp4IdentityEpilogue{}, output);
+    nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+        Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+    return std::array<Launch, sizeof...(Offsets)>{&launch_exact<2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers = make_launchers(std::make_index_sequence<32 - 2 + 1>{});
 
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+    kLaunchers[x.ne[1] - 2](x, weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

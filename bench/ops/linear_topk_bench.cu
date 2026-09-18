@@ -1,4 +1,5 @@
 // Public cold-cache benchmark for the three registered linear_topk profiles.
+#include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
 #include "ninfer_bench_common.h"
@@ -23,7 +24,7 @@ using namespace ninfer::bench;
 namespace {
 
 enum class Profile {
-    W8,
+    Q8,
     Fp8,
     Q4,
 };
@@ -62,7 +63,7 @@ __global__ void varied_scales(std::uint16_t* scales, std::uint64_t count, bool b
 }
 
 const char* profile_name(Profile profile) {
-    if (profile == Profile::W8) { return "w8-full"; }
+    if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
     return "q4-optimized";
 }
@@ -71,9 +72,9 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kTopK   = 16;
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
-    const QType qtype              = profile == Profile::W8    ? QType::W8G32_F16S
-                                     : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16S
-                                                               : QType::Q4G64_F16S;
+    const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
+                                     : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
+                                                               : QType::Q4_G64_FP16;
 
     PackedQuantizedWeight packed =
         profile == Profile::Fp8
@@ -135,10 +136,10 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
 }
 
 Profile parse_profile(std::string_view value) {
-    if (value == "w8-full") { return Profile::W8; }
+    if (value == "q8-full") { return Profile::Q8; }
     if (value == "fp8-full") { return Profile::Fp8; }
     if (value == "q4-optimized") { return Profile::Q4; }
-    throw std::invalid_argument("profile must be w8-full, fp8-full, or q4-optimized");
+    throw std::invalid_argument("profile must be q8-full, fp8-full, or q4-optimized");
 }
 
 } // namespace
@@ -157,7 +158,7 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|w8-full|fp8-full|q4-optimized] [--columns U,...] "
+                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--columns U,...] "
                     "[--warmup N] [--repeat N]\n",
                     argv[0]);
                 return 0;
@@ -187,7 +188,7 @@ int main(int argc, char** argv) {
         if (warmup < 0 || repeat < 1) throw std::invalid_argument("invalid timing counts");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = {Profile::W8, Profile::Fp8, Profile::Q4};
+            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4};
         else
             profiles = {parse_profile(profile)};
         std::puts(

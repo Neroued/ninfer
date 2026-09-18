@@ -39,7 +39,7 @@ a linked, confirmed Issue may be closed without detailed review.
 A bug report must contain enough information for the maintainer to locate and reason about the
 failure. Include, as applicable:
 
-- the exact NInfer commit or release and registered artifact identity;
+- the exact NInfer commit or release, artifact source, and recipe when using custom weights;
 - the GPU, driver, CUDA toolchain, build configuration, and relevant runtime options;
 - the complete command, request, or smallest practical reproduction;
 - the expected behavior and the observed behavior;
@@ -128,6 +128,10 @@ review is not a substitute for contributor debugging or engineering supervision.
 
 ## Pull request description
 
+Use the [PR template](.github/pull_request_template.md) to describe the problem and scope,
+implementation, and verification. One PR completes one agreed change, including its necessary
+implementation, verification and report; submit independent changes separately.
+
 A pull request description must include:
 
 - the linked Issue and the agreed scope;
@@ -136,6 +140,17 @@ A pull request description must include:
 - the exact verification commands and summarized results;
 - the workload, hardware, toolchain, and methodology for any performance claim; and
 - every relevant check that was not run and the resulting limitation.
+
+Choose the verification details relevant to your change:
+
+| Change | Evidence to include |
+|---|---|
+| Bug fix | The trigger, expected behavior, and verification of the fix. |
+| Recipe or conversion method | The source, target representation, conversion command, and which stages were actually verified: conversion, loading, or execution. |
+| New Op or shape | Supported inputs, independent numerical verification, and relevant boundaries. Follow [Op development](docs/maintainer/op-development.md). |
+| Performance tuning | Correctness evidence and a final performance report. Linear tuning follows the [existing report format](docs/maintainer/linear-tuning.md#4-report-format) and [Q4 example](docs/maintainer/examples/q4-linear.md). |
+| Runtime or interface change | Reproduction and verification of the affected behavior. |
+| Documentation, build, or tooling | Checks relevant to the change, such as links, affected build targets, or tool invocations. |
 
 ## Review policy
 

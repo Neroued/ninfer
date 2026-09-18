@@ -156,7 +156,8 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         resolved.parent = parent_record->context;
     }
 
-    const bool parent_preserve = parent_record ? parent_record->preserve_thinking : false;
+    const std::optional<bool> parent_preserve =
+        parent_record ? parent_record->preserve_thinking : std::nullopt;
     if (resolved.generation.preserve_thinking) {
         resolved.preserve_thinking_semantic_change =
             parent_record && *resolved.generation.preserve_thinking != parent_preserve;

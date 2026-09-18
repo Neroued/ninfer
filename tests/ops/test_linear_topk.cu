@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
 #include "core/device.h"
@@ -42,9 +43,9 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 }
 
 FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
-    const std::int32_t group         = qtype == QType::W8G32_F16S ? 32 : 64;
+    const std::int32_t group         = qtype == QType::Q8_G32_FP16 ? 32 : 64;
     const std::uint64_t groups       = static_cast<std::uint64_t>(rows) * (kHidden / group);
-    const std::uint64_t code_bytes   = qtype == QType::W8G32_F16S
+    const std::uint64_t code_bytes   = qtype == QType::Q8_G32_FP16
                                            ? static_cast<std::uint64_t>(rows) * kHidden
                                            : static_cast<std::uint64_t>(rows) * kHidden / 2;
     const std::uint64_t scale_offset = align_up(code_bytes, 256);
@@ -83,7 +84,7 @@ FixtureWeight make_fp8() {
     result.weight.payload          = result.payload.p;
     result.weight.payload_bytes    = result.payload.bytes;
     result.weight.high_plane_bytes = 0;
-    result.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+    result.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
     result.weight.group_size       = kHidden;
     result.weight.shape[0]         = kFullRows;
     result.weight.shape[1]         = kHidden;
@@ -123,7 +124,7 @@ float group_base_scale(std::int32_t group) {
 }
 
 std::int32_t rowsplit_code(QType qtype, std::int32_t k) {
-    const int value = 1 + k % (qtype == QType::W8G32_F16S ? 113 : 7);
+    const int value = 1 + k % (qtype == QType::Q8_G32_FP16 ? 113 : 7);
     return k % 5 == 0 ? -value : value;
 }
 
@@ -133,9 +134,9 @@ std::uint8_t fp8_code(std::int32_t k) {
 }
 
 void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, float factor) {
-    const std::size_t code_row_bytes = qtype == QType::W8G32_F16S ? kHidden : kHidden / 2;
+    const std::size_t code_row_bytes = qtype == QType::Q8_G32_FP16 ? kHidden : kHidden / 2;
     std::vector<std::uint8_t> codes(code_row_bytes);
-    if (qtype == QType::W8G32_F16S) {
+    if (qtype == QType::Q8_G32_FP16) {
         for (std::int32_t k = 0; k < kHidden; ++k) {
             codes[static_cast<std::size_t>(k)] = static_cast<std::uint8_t>(rowsplit_code(qtype, k));
         }
@@ -149,7 +150,7 @@ void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, f
     }
     fixture.payload.copy_from_host(codes.data(), codes.size(),
                                    static_cast<std::size_t>(row) * code_row_bytes);
-    const std::int32_t groups = kHidden / (qtype == QType::W8G32_F16S ? 32 : 64);
+    const std::int32_t groups = kHidden / (qtype == QType::Q8_G32_FP16 ? 32 : 64);
     std::vector<std::uint16_t> scales(static_cast<std::size_t>(groups));
     for (std::int32_t group = 0; group < groups; ++group) {
         scales[static_cast<std::size_t>(group)] =
@@ -193,12 +194,12 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
             double sum = 0;
             for (int k = 0; k < kHidden; ++k) {
                 double weight;
-                if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+                if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
                     weight =
                         quantized_weight::detail::decode_e4m3fn(fp8_code(k)) *
                         static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(factor))));
                 } else {
-                    const int group = k / (qtype == QType::W8G32_F16S ? 32 : 64);
+                    const int group = k / (qtype == QType::Q8_G32_FP16 ? 32 : 64);
                     const auto scale =
                         quantized_weight::detail::f32_to_f16(factor * group_base_scale(group));
                     weight = static_cast<double>(rowsplit_code(qtype, k)) *
@@ -314,15 +315,15 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
 int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
              const std::vector<double>& base_score) {
     FixtureWeight fixture =
-        qtype == QType::W8G32_F16S ? make_rowsplit(qtype, kFullRows) : make_fp8();
+        qtype == QType::Q8_G32_FP16 ? make_rowsplit(qtype, kFullRows) : make_fp8();
     for (std::size_t index = 0; index < kFullWinnerRows.size(); ++index) {
-        if (qtype == QType::W8G32_F16S) {
+        if (qtype == QType::Q8_G32_FP16) {
             patch_rowsplit_row(fixture, qtype, kFullWinnerRows[index], factor_for(index));
         } else {
             patch_fp8_row(fixture, kFullWinnerRows[index], factor_for(index));
         }
     }
-    if (qtype == QType::W8G32_F16S) {
+    if (qtype == QType::Q8_G32_FP16) {
         patch_rowsplit_row(fixture, qtype, kFullRows - 1, 64.0F);
     } else {
         patch_fp8_row(fixture, kFullRows - 1, 64.0F);
@@ -394,9 +395,9 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
 }
 
 int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
-    FixtureWeight fixture = make_rowsplit(QType::Q4G64_F16S, kShortRows);
+    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, kShortRows);
     for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
-        patch_rowsplit_row(fixture, QType::Q4G64_F16S, kShortWinnerRows[index], factor_for(index));
+        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, kShortWinnerRows[index], factor_for(index));
     }
     std::vector<std::int32_t> host_map(kShortRows);
     for (std::int32_t row = 0; row < kShortRows; ++row) { host_map[row] = kValidRows - 1 - row; }
@@ -405,7 +406,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     const auto expected = expected_order(kShortWinnerRows, &host_map);
 
     const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4G64_F16S, kShortRows, kHidden, 1, kMaxColumns);
+        QType::Q4_G64_FP16, kShortRows, kHidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -486,11 +487,11 @@ int main() {
         hidden.copy_from_host(host_hidden.data(), hidden.bytes);
 
         int failures = 0;
-        failures += run_full(QType::W8G32_F16S, "w8-full", hidden,
-                             base_scores(QType::W8G32_F16S, host_hidden));
-        failures += run_full(QType::FP8_E4M3FN_ROW_BF16S, "fp8-full", hidden,
-                             base_scores(QType::FP8_E4M3FN_ROW_BF16S, host_hidden));
-        failures += run_q4(hidden, base_scores(QType::Q4G64_F16S, host_hidden));
+        failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
+                             base_scores(QType::Q8_G32_FP16, host_hidden));
+        failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
+                             base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
+        failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

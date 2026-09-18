@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/layout.h"
@@ -30,11 +31,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
-    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("nvfp4 gdn conv: invalid compute policy");
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
-    if (policy == LinearPolicy::A16Only) {
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");

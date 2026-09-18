@@ -34,11 +34,16 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
 
 const char* causal_attention_route_name(CausalAttentionRoute route);
 
-void causal_attention_small_t_launch(
-    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+// A non-null gate is applied by the reduce epilogue at the store. Only the shared BF16/INT8
+// reducer accepts one; the caller keeps the standalone multiply for every other storage.
+void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     const Tensor& positions, const Tensor& valid_columns,
+                                     const Tensor& table_rows, float scale,
+                                     PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     std::int32_t column_begin, std::int32_t width,
+                                     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                     Tensor& out, cudaStream_t stream, const void* gate = nullptr);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,

@@ -2,9 +2,14 @@
 
 #include <curl/curl.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -276,7 +281,6 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
     }
     throw Error(ErrorKind::RemoteUnavailable, "too many media URL redirects");
 }
-
 std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) {
     check_control(policy);
     std::error_code ec;
@@ -287,7 +291,11 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
+#if defined(_WIN32)
+        if (ec || relative.empty() || relative.native().starts_with(L"..")) {
+#else
         if (ec || relative.empty() || relative.native().starts_with("..")) {
+#endif
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

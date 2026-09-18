@@ -9,6 +9,19 @@
 #include <optional>
 #include <algorithm>
 
+#if defined(_WIN32)
+// localtime_s swaps the argument order relative to POSIX localtime_r.
+#include <time.h>
+static bool jinja_localtime_r(const std::time_t* time, std::tm* out) {
+    return ::localtime_s(out, time) == 0;
+}
+#else
+#include <time.h>
+static bool jinja_localtime_r(const std::time_t* time, std::tm* out) {
+    return ::localtime_r(time, out) != nullptr;
+}
+#endif
+
 namespace jinja {
 
 // func_args method implementations
@@ -271,8 +284,8 @@ const func_builtins& global_builtins() {
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
              std::string format = args.get_pos(0)->as_string().str();
-             std::tm local{};
-             if (!localtime_r(&args.ctx.current_time, &local)) {
+            std::tm local{};
+            if (!jinja_localtime_r(&args.ctx.current_time, &local)) {
                  throw raised_exception("strftime_now: invalid time");
              }
              if (format.empty()) return mk_val<value_string>("");

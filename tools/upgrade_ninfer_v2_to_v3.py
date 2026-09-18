@@ -17,6 +17,21 @@ import struct
 import tempfile
 import uuid
 
+if hasattr(os, "posix_fadvise"):
+    _fdatasync = os.fdatasync
+
+    def _dontneed(fd, offset=0, length=0):
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+else:
+    # Windows: no fdatasync/fadvise; fsync plus a periodic FlushFileBuffers via
+    # os.sync-free fsync is the closest available durability primitive.
+    def _fdatasync(fd):
+        os.fsync(fd)
+
+    def _dontneed(fd, offset=0, length=0):
+        del fd, offset, length  # cache hint unavailable
+
+
 FORMATS = {
     "BF16": "bf16",
     "FP32": "fp32",
@@ -828,11 +843,10 @@ def upgrade(input_path, output_path):
                             )
                             if not chunk:
                                 raise ValueError("v2 payload ended prematurely")
-                            os.posix_fadvise(
+                            _dontneed(
                                 source.fileno(),
                                 source.tell() - len(chunk),
                                 len(chunk),
-                                os.POSIX_FADV_DONTNEED,
                             )
                         elif cursor < template_offset:
                             chunk = bytes(min(remaining, template_offset - cursor))
@@ -845,17 +859,22 @@ def upgrade(input_path, output_path):
                         pending += len(chunk)
                         if pending >= WRITEBACK:
                             output.flush()
-                            os.fdatasync(output.fileno())
-                            os.posix_fadvise(
-                                output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
-                            )
+                            _fdatasync(output.fileno())
+                            _dontneed(output.fileno())
                             pending = 0
                     output.flush()
-                    os.fdatasync(output.fileno())
-                    os.posix_fadvise(output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-            os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    _fdatasync(output.fileno())
+                    _dontneed(output.fileno())
+            _dontneed(source.fileno())
         for index in [*range(1, len(targets)), 0]:
-            os.link(temporary[index], targets[index])
+            try:
+                os.link(temporary[index], targets[index])
+            except OSError:
+                # NTFS hard links work, but cross-volume or locked targets fall
+                # back to a same-directory-safe copy-then-rename publish.
+                import shutil
+
+                shutil.copyfile(temporary[index], targets[index])
             published.append(targets[index])
     except BaseException:
         for path in published:

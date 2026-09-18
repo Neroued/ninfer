@@ -785,7 +785,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
-| `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
+| `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |

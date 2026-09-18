@@ -173,7 +173,9 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto activation_bits = bf16_bits(activation);
-    if (width == 2 || width == 9 || width == 16) {
+    if (width == 2 || width == 9 || width == 10 || width == 16) {
+        // 2 is the bottom of the Q5 parent's split4 band, 9 the count that used to be its top, 10 the
+        // count that is its top now, and 16 a grouped representative extent.
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
@@ -293,6 +295,12 @@ int run_q4_q5() {
     }
     failures += run(5, 3, {5, 3, 1}, 1491U);
     failures += run(4, 4, {4, 3, 2, 1}, 1492U);
+    // R7-review trial: the batched organisation whose aggregate column count is 8, which is inside the
+    // range the fused template covers when the request is read from the flattened token axis. The dense
+    // case checks the history reload at the request boundary, and the masked one additionally puts an
+    // invalid tail in the second request, so the boundary is checked next to a zeroed column.
+    failures += run(4, 2, {}, 1493U);
+    failures += run(4, 2, {4, 2}, 1494U);
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
     return failures;

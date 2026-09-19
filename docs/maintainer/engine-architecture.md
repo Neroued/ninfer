@@ -601,3 +601,27 @@ fixed-shape 和 device-specialized 实现）都归 `src/ops`。
   和 consumer address contract；
 - [Op development](op-development.md)：Op 正确性与性能准入；
 - [CLI](../cli.md)与 [HTTP serving](../serving.md)：外部行为。
+
+## Structured output transaction
+
+`StructuredOutputOptions` crosses the public Engine boundary as schema data. Frontend compiles it
+with a tokenizer-specific XGrammar compiler (bounded 256 MiB cache) and creates a request-owned
+`GrammarState`. Engine passes the same state through the base plan, admission plan, and request
+control. Sequence/checkpoint/cache state never owns it. OutputSession previews on a fork and
+moves the fork into the committed state only after Program commit succeeds. Cancellation before
+output preview advances no grammar state.
+
+Program reserves vocabulary bitsets in its planned persistent device arena and owns pinned host
+staging. Ordinary/prefill sampling uses the current mask. MTP supplies each current draft prefix
+to a forked matcher before launch. DFlash/DFlash2 must first generate device drafts: their graph
+captures D2H draft transfer, a CUDA host function that fills all reachable prefix masks, H2D mask
+transfer, then target verification. The host function calls no CUDA API; it captures exceptions
+for rethrow after stream synchronization and before any token can be published. All node addresses
+belong to Program and outlive graph replay.
+
+SamplingConfig carries an optional bitset pointer and column stride. Column i describes the
+grammar after drafts[0..i). The mask is applied before penalties and sampling filters. After an
+illegal draft or EOS, suffix columns are unreachable and need no grammar traversal. Every reachable
+mask must be nonempty. Raw-logit fast paths require a null mask. Draft proposal probabilities are
+unchanged; target p is constrained and normalized before the existing p/q and residual calculation.
+Existing KV, recurrence replay, token-count, and terminal-prefix commit rules remain authoritative.

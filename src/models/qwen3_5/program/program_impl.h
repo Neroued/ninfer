@@ -180,6 +180,7 @@ struct RequestBasePlanImpl {
     std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -244,6 +245,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::vector<CaptureGroup> capture_groups;
     std::vector<CaptureGroup> shared_candidates;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -401,6 +403,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    std::shared_ptr<text::GrammarState> grammar;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     detail::PhysicalResources active_resources;
@@ -601,6 +604,7 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    std::unique_ptr<qwen3_5::StructuredRound> structured_round;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;

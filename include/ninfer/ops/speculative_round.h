@@ -10,8 +10,9 @@
 namespace ninfer::ops {
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
-    // the general route remains valid for any supported mixture of greedy and stochastic rows.
+    // Execution promise: every row has temperature<=0, both penalties disabled, and no token mask.
+    // When false, the general route remains valid for any supported mixture of greedy and
+    // stochastic rows.
     bool all_rows_greedy_without_penalties = false;
 };
 
@@ -62,13 +63,13 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * Algorithm:
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
  *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
- *   bonus column). With both penalties disabled, target_tokens is the exact raw-logit fast path.
- *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
- *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
- *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft
- *   proposal distribution is one-hot at each greedy draft token.
- *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
- *   positions derived from the old length.
+ *   bonus column). With both penalties disabled and no token mask, target_tokens is the exact
+ * raw-logit fast path. Sampling mode applies configs[b] to each valid verification column, accepts
+ * draft i with target probability p_i(draft_i), samples from the residual distribution on first
+ * rejection, and samples a bonus from column Pcur[b] when every available draft is accepted. The
+ * draft proposal distribution is one-hot at each greedy draft token. RNG domains are the
+ * speculative accept/correction/bonus SamplePurpose values and logical positions derived from the
+ * old length.
  *
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
@@ -79,6 +80,9 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *
  * Numeric:
  *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
+ *   Token mask column i is conditioned on drafts[0..i), including the bonus column. It is
+ *   applied before truncation/normalization; the proposal q is unchanged. Rejection therefore
+ *   samples max(p_constrained-q,0), preserving the constrained target distribution.
  *
  * Effects:
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives

@@ -133,8 +133,13 @@ int test_envelope_and_field_policy() {
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    failures += check(parse(body).generation.structured_output.kind ==
+                          ninfer::StructuredOutputKind::JsonSchema,
+                      "Anthropic schema retained");
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_response_format",
                       "structured output was silently downgraded");
     body              = base_request();
     body["container"] = "container_1";

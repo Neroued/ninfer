@@ -150,6 +150,16 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         effort = nested;
     }
     kwargs.erase("reasoning_effort");
+    if (request.structured_output.kind != StructuredOutputKind::None) {
+        if (thinking == true || (effort && *effort != RequestedReasoningEffort::None) ||
+            request.thinking_budget || request.uses_tools() || !request.stop_strings.empty() ||
+            request.continuation != PromptContinuationMode::NewAssistantTurn) {
+            invalid_prompt_option("structured output requires thinking disabled, default stops, a "
+                                  "new assistant turn, and no active tools",
+                                  "response_format", "incompatible_structured_output");
+        }
+        thinking = false;
+    }
     ResolvedPromptSemantics result{
         .enable_thinking           = thinking ? thinking : server.enable_thinking,
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
@@ -315,13 +325,16 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
+    options.execution.structured_output       = request.structured_output;
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.output.preserve_special_tokens =
+        request.structured_output.kind == StructuredOutputKind::None &&
+        (request.uses_tools() || request.has_tool_history());
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));

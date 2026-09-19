@@ -280,3 +280,17 @@ from this one-request interface; the persistent Engine and server routes own cro
 optional Host backing.
 
 All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+
+## JSON and JSON Schema output
+
+`--json` constrains output to a JSON object. `--json-schema FILE` constrains it to the supported
+JSON Schema subset described in [serving](serving.md#structured-output). Both disable thinking.
+They are mutually exclusive and reject raw output, custom stops, thinking budgets, and enabled
+reasoning effort. They work with ordinary, MTP, DFlash and DFlash2 execution.
+
+```bash
+./build/apps/ninfer model.ninfer --prompt 'Return the city as JSON' --json --max-new 128
+./build/apps/ninfer model.ninfer --prompt 'Return a weather record' --json-schema weather.schema.json --max-new 128
+```
+
+Read the reported finish reason: an output/context limit or cancellation can truncate the JSON.

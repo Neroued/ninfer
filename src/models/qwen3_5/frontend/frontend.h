@@ -74,8 +74,9 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
-                        const OutputOptions& output            = {},
-                        const ThinkingControlOptions& thinking = {}) const;
+                        const OutputOptions& output               = {},
+                        const ThinkingControlOptions& thinking    = {},
+                        const StructuredOutputOptions& structured = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
 

@@ -247,6 +247,10 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    if (c.token_mask != nullptr &&
+        (c.token_mask[overlay_len * c.token_mask_stride + v / 32] & (1U << (v % 32))) == 0) {
+        return -CUDART_INF_F;
+    }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
@@ -317,7 +321,7 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
         float cum                = 0.0f;
         int support              = 0;
         for (int j = 0; j < n; ++j) {
-            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
+            if (prob[j] == 0.0f || (min_p_thresh >= 0.0f && prob[j] < min_p_thresh)) { break; }
             cum += prob[j];
             support = j + 1;
             if (top_p_active && cum >= top_p_target) { break; }

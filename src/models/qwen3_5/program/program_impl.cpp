@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -242,6 +243,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
+    }
+    if (plan.persistent.grammar_masks) {
+        structured_round = std::make_unique<qwen3_5::StructuredRound>(
+            plan.persistent.grammar_masks->bind(backing),
+            parameters.model.resources().public_token_count, draft_window + 1, max_concurrency);
+        io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }

@@ -37,18 +37,23 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-// The K-split MMA route streams the weights once per 32-column tile and stays ahead of the
-// 64-row GEMM tiles through two column tiles (measured crossover: T=60 at K=6144, T=64 at
-// K=17408); beyond that the wide tiles amortize better.
-constexpr std::array<RouteSpec, 4> kK6144Routes{{
-    {{1, 60}, Q5LinearAddScheduleId::KSplitMmaResidual},
+// T=1 keeps the split2 SIMT kernel: the K-split MMA route wastes most of a 32-column tile on a
+// single row, worth ~1% of ordinary (non-speculative) decode end to end on qwen3.8-27b/RTX 5090.
+// Speculative decode verifies at T>=2 and is unaffected. From T=2 the K-split
+// MMA route streams the weights once per 32-column tile and stays ahead of the 64-row GEMM tiles
+// through two column tiles (measured crossover: T=60 at K=6144, T=64 at K=17408); beyond that the
+// wide tiles amortize better.
+constexpr std::array<RouteSpec, 5> kK6144Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{2, 60}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{61, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
     {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
 
-constexpr std::array<RouteSpec, 4> kK17408Routes{{
-    {{1, 64}, Q5LinearAddScheduleId::KSplitMmaResidual},
+constexpr std::array<RouteSpec, 5> kK17408Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{2, 64}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{65, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
     {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
@@ -113,6 +118,8 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
     switch (schedule) {
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        return "linear_add.q5.simt.split2.exact.residual";
     case Q5LinearAddScheduleId::KSplitMmaResidual:
         return "linear_add.q5.mma.ksplit.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C32S3:
@@ -167,6 +174,9 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     (void)ws;
 
     switch (plan.schedule) {
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+        return;
     case Q5LinearAddScheduleId::KSplitMmaResidual:
         q5_linear_add_ksplit_mma_residual_launch(x, w, residual_out, stream);
         return;

@@ -37,20 +37,19 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 6> kK6144Routes{{
-    {{1, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+// The K-split MMA route streams the weights once per 32-column tile and stays ahead of the
+// 64-row GEMM tiles through two column tiles (measured crossover: T=60 at K=6144, T=64 at
+// K=17408); beyond that the wide tiles amortize better.
+constexpr std::array<RouteSpec, 4> kK6144Routes{{
+    {{1, 60}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{61, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
     {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408Routes{{
-    {{1, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+constexpr std::array<RouteSpec, 4> kK17408Routes{{
+    {{1, 64}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{65, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
     {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
@@ -114,12 +113,8 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
     switch (schedule) {
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C16:
-        return "linear_add.q5.mma.r64.c16.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C24:
-        return "linear_add.q5.mma.r64.c24.cta_collective_residual";
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        return "linear_add.q5.mma.ksplit.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C32S3:
         return "linear_add.q5.mma.r64.c32.s3.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C32S4:
@@ -172,14 +167,8 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     (void)ws;
 
     switch (plan.schedule) {
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
-        return;
-    case Q5LinearAddScheduleId::MmaResidualR64C16:
-        q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
-        return;
-    case Q5LinearAddScheduleId::MmaResidualR64C24:
-        q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        q5_linear_add_ksplit_mma_residual_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C32S3:
         q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);

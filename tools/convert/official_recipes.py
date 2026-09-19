@@ -54,7 +54,7 @@ def _optional(model, recipe):
                 recipe.share(prefix + "context_" + role, prefix + role)
 
 
-def _dense_groupwise(model, recipe, vocabulary):
+def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
@@ -66,14 +66,14 @@ def _dense_groupwise(model, recipe, vocabulary):
         if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.separate(name)
             continue
-        if name.endswith(
+        if name.endswith(("/mlp/gate", "/mlp/up")):
+            format = gate_up
+        elif name.endswith(
             (
                 "/attention/query",
                 "/attention/key",
                 "/gdn/query",
                 "/gdn/key",
-                "/mlp/gate",
-                "/mlp/up",
             )
         ):
             format = Q4
@@ -88,6 +88,10 @@ def qwen3_6_27b(model, recipe, sources):
 
 def qwen3_8_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8)
+
+
+def qwen3_8_27b_q6(model, recipe, sources):
+    _dense_groupwise(model, recipe, Q8, gate_up=Q6)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):
@@ -178,6 +182,7 @@ RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
+    "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
 }

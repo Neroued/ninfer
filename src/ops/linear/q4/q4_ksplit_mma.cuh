@@ -1,5 +1,18 @@
 #pragma once
 
+// Q4G64 RowSplit K-split MMA contraction for small column extents.
+//
+// Eight K-split warps cooperatively own one 16-row output tile; each warp evaluates a disjoint
+// 64-wide K slice of every 512-wide K group, then the CTA reduces FP32 partials in shared
+// memory. Codes are decoded to exact BF16 integers, contracted per 64-wide group on the tensor
+// cores, and each group's binary16 scale is applied once to the FP32 group accumulator.
+//
+// Staging is a cp.async ring of complete K groups (codes, scales and each warp's activation
+// tile). Q4 stores half a byte per weight, so a single-buffered CTA leaves too few bytes in
+// flight to reach DRAM bandwidth; with two stages the loads for group g+1 overlap the MMA work
+// on group g. Wide column tiles fall back to one stage because two would not fit the static
+// shared-memory limit.
+
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 
@@ -37,7 +50,36 @@ struct Q4KSplitMmaSchedule {
     static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
     static constexpr int kRowsPerCta        = 16;
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+    // Static shared memory available to one CTA for cp.async staging buffers.
+    static constexpr int kStaticSharedBudget = 48 * 1024;
 };
+
+// One cp.async staging buffer: the CTA's 16-row Q4 code slab for one 512-wide K group, each
+// K-split warp's activation tile, and the per-row group scales.
+template <int TileCols>
+struct alignas(16) Q4KSplitStage {
+    std::uint8_t codes[Q4KSplitMmaSchedule::kRowsPerCta][Q4KSplitMmaSchedule::kGroupK / 2];
+    __nv_bfloat16 activations[Q4KSplitMmaSchedule::kKWarps]
+                             [TileCols * Q4KSplitMmaSchedule::kTileKPerWarp];
+    std::uint16_t scales[Q4KSplitMmaSchedule::kRowsPerCta][Q4KSplitMmaSchedule::kKWarps];
+};
+
+// Pipeline depth: two stages when the ring fits the static shared-memory budget, else one.
+template <int TileCols>
+__host__ __device__ constexpr int q4_ksplit_stages() {
+    return 2 * static_cast<int>(sizeof(Q4KSplitStage<TileCols>)) <=
+                   Q4KSplitMmaSchedule::kStaticSharedBudget
+               ? 2
+               : 1;
+}
+
+// Two-stage residency is shared-memory bound (four 25 KiB CTAs per 100 KiB SM for 8-column
+// tiles, two 41 KiB CTAs for 16-column tiles), so the register cap follows that residency
+// instead of the single-stage six-CTA target.
+template <int TileCols>
+__host__ __device__ constexpr int q4_ksplit_min_blocks_per_sm() {
+    return q4_ksplit_stages<TileCols>() == 2 ? 4 : Q4KSplitMmaSchedule::kMinBlocksPerSm;
+}
 
 __device__ __forceinline__ int q4_ksplit_swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -58,7 +100,7 @@ __device__ __forceinline__ unsigned q4_ksplit_bf16_pair(std::uint8_t packed) {
 
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
           class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false>
-__launch_bounds__(256, 6) __global__
+__launch_bounds__(Q4KSplitMmaSchedule::kThreads, q4_ksplit_min_blocks_per_sm<TileCols>()) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ scales,
@@ -74,25 +116,23 @@ __launch_bounds__(256, 6) __global__
     constexpr int kCodeRowBytes = kHidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
+    constexpr int kStages       = q4_ksplit_stages<TileCols>();
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
+    static_assert(kStages == 1 || kStages == 2);
+
+    using Stage = Q4KSplitStage<kTileCols>;
+    static_assert(sizeof(Stage) % 16 == 0, "stage buffers must keep 16-byte cp.async alignment");
 
     union SharedStorage {
-        struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK / 2];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint16_t scales[kRowsPerCta][kWarps];
-        } staging;
-
+        Stage staging[kStages];
         float partial[kWarps * kNt * 32 * 4];
     };
+    static_assert(sizeof(SharedStorage) <= Q4KSplitMmaSchedule::kStaticSharedBudget);
 
     __shared__ __align__(16) SharedStorage shared;
-    auto& code_shared  = shared.staging.codes;
-    auto& x_shared     = shared.staging.activations;
-    auto& scale_shared = shared.staging.scales;
 
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
@@ -103,7 +143,8 @@ __launch_bounds__(256, 6) __global__
     const int row0         = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveCols;
 
-    const auto stage_x = [&](int group_k0) {
+    const auto stage_x = [&](int group_k0, Stage& stage) {
+        auto& x_shared               = stage.activations;
         constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
@@ -122,7 +163,9 @@ __launch_bounds__(256, 6) __global__
         }
     };
 
-    const auto stage_weight = [&](int group_k0) {
+    const auto stage_weight = [&](int group_k0, Stage& stage) {
+        auto& code_shared  = stage.codes;
+        auto& scale_shared = stage.scales;
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
@@ -148,16 +191,38 @@ __launch_bounds__(256, 6) __global__
     const int warp_koff = k_split * kTileK;
     float acc[kNt][4]   = {};
 
-    stage_weight(0);
-    stage_x(0);
+    stage_weight(0, shared.staging[0]);
+    stage_x(0, shared.staging[0]);
     cp_commit();
-    cp_wait<0>();
-    __syncthreads();
 
 #pragma unroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
-        const int group_k0      = group_index * kGroupK;
-        float group_acc[kNt][4] = {};
+        const int group_k0  = group_index * kGroupK;
+        const bool has_next = group_index + 1 < kGroups;
+
+        // Two stages: issue group g+1 into the other buffer before consuming group g, then
+        // wait for everything except that newest group. One stage: group g+1 is issued after
+        // this group's trailing barrier, so wait for all outstanding copies here.
+        if constexpr (kStages == 2) {
+            if (has_next) {
+                Stage& next = shared.staging[(group_index + 1) % kStages];
+                stage_weight(group_k0 + kGroupK, next);
+                stage_x(group_k0 + kGroupK, next);
+                cp_commit();
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+
+        const Stage& current     = shared.staging[group_index % kStages];
+        const auto& code_shared  = current.codes;
+        const auto& x_shared     = current.activations;
+        const auto& scale_shared = current.scales;
+        float group_acc[kNt][4]  = {};
 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -188,13 +253,15 @@ __launch_bounds__(256, 6) __global__
             acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
         }
 
-        if (group_index + 1 < kGroups) {
+        if (has_next) {
+            // Every warp has finished reading this buffer before it is refilled: by the
+            // single-stage issue below, or by the two-stage prefetch one iteration later.
             __syncthreads();
-            stage_weight(group_k0 + kGroupK);
-            stage_x(group_k0 + kGroupK);
-            cp_commit();
-            cp_wait<0>();
-            __syncthreads();
+            if constexpr (kStages == 1) {
+                stage_weight(group_k0 + kGroupK, shared.staging[0]);
+                stage_x(group_k0 + kGroupK, shared.staging[0]);
+                cp_commit();
+            }
         }
     }
 

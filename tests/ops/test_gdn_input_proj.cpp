@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
@@ -71,6 +72,83 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     return failures;
 }
 
+int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
+                         std::int32_t tokens) {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kQkRows    = 4096;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kRows      = kQkRows + kValueRows;
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    std::vector<float> activation = make_bf16_activation(kHidden, tokens, 701U + tokens);
+    std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation             = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor output     = qkv.tensor();
+    Tensor z_output   = z.tensor();
+    const auto launch = [&](cudaStream_t launch_stream) {
+        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output,
+                            launch_stream);
+    };
+    launch(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph          = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    launch(stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+
+    // Replay 1, checked on its own: the outputs are poisoned first, so a replay that skipped a
+    // range or wrote to a stale address is caught here rather than being masked by replay 2.
+    const auto verify_replay = [&](const std::vector<float>& expected, std::string_view tag) {
+        int bad = qkv.verify_guards(std::string("gdn qkv") + std::string(tag));
+        bad += z.verify_guards(std::string("gdn z") + std::string(tag));
+        bad += qkv.verify_fully_written(std::string("gdn qkv") + std::string(tag));
+        bad += z.verify_fully_written(std::string("gdn z") + std::string(tag));
+        bad += verify_output_range(std::string("gdn qk") + std::string(tag), qkv, kRows, 0, kQkRows,
+                                   query_key.host, 0, expected, kHidden, tokens);
+        bad += verify_output_range(std::string("gdn value") + std::string(tag), qkv, kRows, kQkRows,
+                                   kValueRows, value_z_weight.host, 0, expected, kHidden, tokens);
+        bad += verify_output_range(std::string("gdn z") + std::string(tag), z, kZRows, 0, kZRows,
+                                   value_z_weight.host, kValueRows, expected, kHidden, tokens);
+        return bad;
+    };
+    const std::string suffix = " Q4/Q5 A16 graph T=" + std::to_string(tokens);
+    qkv.repaint(stream);
+    z.repaint(stream);
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int failures = verify_replay(activation, suffix + " replay1");
+
+    // Replay 2 against a changed activation at the same captured address: a graph that baked its
+    // operands would keep reporting the first input here.
+    qkv.repaint(stream);
+    z.repaint(stream);
+    activation      = make_bf16_activation(kHidden, tokens, 811U + tokens);
+    activation_bits = bf16_bits(activation);
+    CUDA_CHECK(cudaMemcpyAsync(device_activation.p, activation_bits.data(),
+                               activation_bits.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    failures += verify_replay(activation, suffix + " replay2");
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += query_key.verify_preserved("gdn query/key weight" + suffix);
+    failures += value_z_weight.verify_preserved("gdn value/z weight" + suffix);
+    return failures;
+}
+
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
@@ -78,8 +156,16 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    // Every route boundary and both of its neighbours: the Q4/Q5 column catalog now hands 1..12 to
+    // the per-side small-column kernels (the K-split Q4 parent with the row-block Q5 side at 7/8 and
+    // the c4 SIMT Q5 side at 9..12), 13..32 to the 32x32 tile, 33..64 to the 32x64 tile, and 65
+    // upward to the 64x128 tile that also supplies the 128-column tail slices.
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 32, 33, 64, 65, 127, 128, 129, 193}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
+    }
+    // One captured replay per route, including a 128-column tail slice (129 = 128 + 1).
+    for (const std::int32_t tokens : {7, 8, 9, 12, 13, 33, 65, 129}) {
+        failures += run_q4_q5_graph_case(query_key, value_z_weight, tokens);
     }
     return failures;
 }

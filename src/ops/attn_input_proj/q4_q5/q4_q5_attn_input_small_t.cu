@@ -3,10 +3,13 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/q4/q4_ksplit_mma.cuh"
+#include "ops/linear/q4/q4_ksplit_strided_store.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#include "ops/linear/q5/q5_rowsplit_rowblock_small_t.cuh"
 
 #include <cuda_bf16.h>
 
@@ -64,25 +67,80 @@ void launch_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& q, Tens
     }
 }
 
+template <std::int32_t Capacity>
+void launch_q4_ksplit_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                            cudaStream_t stream) {
+    using Geometry = Q4LinearGeometry<kParentRows, kHidden>;
+    constexpr std::int32_t kTileCols = (Capacity + 7) / 8 * 8;
+    using Store = Q4KSplitStridedStore<true, kSplitRow>;
+    // The store's live-column count is the problem's actual column count: Capacity only sizes the
+    // tile, and the K-split kernel stages exactly the columns it is told are live.
+    const Store store{static_cast<__nv_bfloat16*>(q.data), q.ne[0],
+                      static_cast<__nv_bfloat16*>(key.data), key.ne[0], x.ne[1]};
+    q4_ksplit_mma_kernel<Geometry, kTileCols, Capacity, Store, Q4KSplitIdentityRows, true>
+        <<<kParentRows / Q4KSplitMmaSchedule::kRowsPerCta, Q4KSplitMmaSchedule::kThreads, 0,
+           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                     static_cast<const std::uint8_t*>(weight.qdata),
+                     static_cast<const std::uint8_t*>(weight.scales),
+                     static_cast<__nv_bfloat16*>(q.data), store, {}, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                           cudaStream_t stream) {
+    if (weight.padded_shape[1] != kHidden) {
+        throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
+    }
+    switch (x.ne[1]) {
+    case 7:
+        launch_q4_ksplit_exact<7>(x, weight, q, key, stream);
+        return;
+    case 8:
+        launch_q4_ksplit_exact<8>(x, weight, q, key, stream);
+        return;
+    case 9:
+        launch_q4_ksplit_exact<9>(x, weight, q, key, stream);
+        return;
+    case 10:
+        launch_q4_ksplit_exact<10>(x, weight, q, key, stream);
+        return;
+    case 11:
+        launch_q4_ksplit_exact<11>(x, weight, q, key, stream);
+        return;
+    case 12:
+        launch_q4_ksplit_exact<12>(x, weight, q, key, stream);
+        return;
+    default:
+        throw std::invalid_argument("attention Q4 K-split band covers T in [7,12]");
+    }
+}
+
 void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
     switch (x.ne[1]) {
     case 1:
         launch_q4_gemv(x, weight, q, key, stream);
+        return;
+    case 7:
+    case 8:
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+        // K-split for the Q4 parent across the whole parent-split range. Complete-op measurement
+        // (both parents launched, all four outputs, one graph, one probe run per column count):
+        // 73.0-77.6 us at T=9..12 against 100.1-105.7 us for the row-split SIMT that R0 used there,
+        // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
+        // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
+        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile, where
+        // a 16-wide K-split tile would waste more MMA work than it saves.
+        launch_q4_ksplit_band(x, weight, q, key, stream);
         return;
     case 2:
     case 3:
     case 4:
     case 5:
     case 6:
-    case 7:
-    case 9:
-    case 10:
-    case 11:
-    case 12:
         launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
-        return;
-    case 8:
-        launch_q4_simt_route<Q4AttnSimtR8C8Schedule>(x, weight, q, key, stream);
         return;
     default:
         throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");
@@ -94,7 +152,7 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
     constexpr int kRowsPerBlock = 16;
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     constexpr int kGrid         = kParentRows / kRowsPerBlock;
-    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, false, true, kSplitRow>
+    q5_rowsplit_gemv_kernel<kParentRows, kHidden, kRowsPerBlock, 2, true, true, kSplitRow>
         <<<kGrid, kBlockThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                               static_cast<const std::uint8_t*>(weight.qdata),
                                               static_cast<const std::uint8_t*>(weight.qhigh),
@@ -162,6 +220,27 @@ void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_q5_rowblock(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                        cudaStream_t stream) {
+    constexpr int kColsPerTile  = 8;
+    constexpr int kRowsPerBlock = 8;
+    constexpr int kStages       = 2;
+    constexpr int kThreads      = kRowsPerBlock * 32;
+    const std::int32_t cols     = x.ne[1];
+    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, kRowsPerBlock)),
+                    static_cast<unsigned>(div_up(cols, kColsPerTile)), 1u);
+    q5_rowsplit_rowblock_small_t_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock,
+                                        kStages, true, kSplitRow>
+        <<<grid, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data),
+            kParentRows, gate.ne[0], kHidden, cols, weight.padded_shape[1], kHidden / 1024);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                cudaStream_t stream) {
     if (x.ne[1] == 1) {
@@ -170,6 +249,13 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
     }
     if (x.ne[1] <= 6) {
         launch_q5_split4_exact(x, weight, gate, value, stream);
+        return;
+    }
+    if (x.ne[1] <= 8) {
+        // See the GDN sibling: at T=7/8 this side is bound by repeated activation loads, and staging
+        // the activation slab per block measured 42.2 us against 64.8 us at T=7 - the best of the
+        // candidates tried here.
+        launch_q5_rowblock(x, weight, gate, value, stream);
         return;
     }
     if (x.ne[1] <= 12) {

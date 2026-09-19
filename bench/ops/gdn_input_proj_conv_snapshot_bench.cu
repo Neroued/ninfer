@@ -120,6 +120,12 @@ struct Result {
     CacheState cache;
     Stats stats;
     std::size_t workspace_bytes;
+    // Filled from the executed call: the arena high-water the Op itself reported, and, for rows
+    // measured from a capture, the node count of that captured graph as `cudaGraphGetNodes` reports
+    // it. That count is the whole graph, so it includes the two timing event nodes; it is not the
+    // number of production kernels in the Op. Rows measured eagerly report 0.
+    std::size_t workspace_peak_bytes;
+    std::int32_t graph_nodes;
 };
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -671,6 +677,8 @@ public:
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
+    [[nodiscard]] std::size_t workspace_peak_bytes() const noexcept { return workspace_.peak_used(); }
+
     void prepare(CacheState cache, cudaStream_t stream) {
         if (cache == CacheState::Cold) { fixture_.flush(stream); }
     }
@@ -741,7 +749,10 @@ public:
         std::size_t nodes = 0;
         CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &nodes));
         if (nodes < 3) { throw std::runtime_error("GDN conv capture produced an empty graph"); }
+        nodes_ = static_cast<std::int32_t>(nodes);
     }
+
+    [[nodiscard]] std::int32_t nodes() const noexcept { return nodes_; }
 
     void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
 
@@ -760,6 +771,7 @@ private:
     cudaEvent_t body_start_ = nullptr;
     cudaEvent_t body_stop_  = nullptr;
     cudaEvent_t completion_ = nullptr;
+    std::int32_t nodes_     = 0;
 };
 
 Stats summarize(std::vector<double> samples) {
@@ -848,7 +860,8 @@ std::vector<Result> run_point(Fixture& fixture, Form form, std::int32_t tokens,
                     ? measure_graph(state, graph, cache, stream, options.warmup, options.repeat)
                     : measure_eager(state, cache, stream, options.warmup, options.repeat);
             results.push_back({state.profile(), state.form(), tokens, options.batch, execution,
-                               cache, stats, state.workspace_bytes()});
+                               cache, stats, state.workspace_bytes(), state.workspace_peak_bytes(),
+                               execution == Execution::Graph ? graph.nodes() : 0});
         }
     }
     return results;
@@ -856,10 +869,11 @@ std::vector<Result> run_point(Fixture& fixture, Form form, std::int32_t tokens,
 
 void print_result(const Result& result) {
     std::printf("%-10s %-8s T=%-3d B=%-2d %-12s %-4s median=%8.3f us min=%8.3f us "
-                "p95=%8.3f us workspace=%zu\n",
+                "p95=%8.3f us workspace=%zu peak=%zu nodes=%d\n",
                 result.profile, form_name(result.form), result.tokens, result.batch,
                 execution_name(result.execution), cache_name(result.cache), result.stats.median_us,
-                result.stats.min_us, result.stats.p95_us, result.workspace_bytes);
+                result.stats.min_us, result.stats.p95_us, result.workspace_bytes,
+                result.workspace_peak_bytes, result.graph_nodes);
 }
 
 void write_csv(const std::string& path, const std::vector<Result>& results, const Options& options,
@@ -874,14 +888,24 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
     stream << "profile,form,tokens,batch,execution,timed_scope,cache,median_us,min_us,p95_us,"
-              "workspace_bytes,warmup,repeat,flush_bytes,build_type,gpu,cuda_runtime\n";
+              "workspace_bytes,workspace_peak_bytes,graph_nodes,valid_columns,warmup,repeat,"
+              "flush_bytes,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
         stream << result.profile << ',' << form_name(result.form) << ',' << result.tokens << ','
                << result.batch << ',' << execution_name(result.execution)
                << ",full_gdn_input_proj_conv_device_body," << cache_name(result.cache) << ','
                << result.stats.median_us << ',' << result.stats.min_us << ',' << result.stats.p95_us
-               << ',' << result.workspace_bytes << ',' << options.warmup << ',' << options.repeat
-               << ',' << options.flush_bytes << ','
+               << ',' << result.workspace_bytes << ',' << result.workspace_peak_bytes << ','
+               << result.graph_nodes << ',';
+        if (options.valid_columns.empty()) {
+            stream << "dense";
+        } else {
+            for (std::size_t index = 0; index < options.valid_columns.size(); ++index) {
+                if (index != 0) { stream << '|'; }
+                stream << options.valid_columns[index];
+            }
+        }
+        stream << ',' << options.warmup << ',' << options.repeat << ',' << options.flush_bytes << ','
 #ifdef NDEBUG
                << "Release"
 #else

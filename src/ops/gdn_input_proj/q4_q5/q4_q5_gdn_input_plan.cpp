@@ -26,14 +26,19 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 2> kRoutes{{
-    {{1, 15}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{16, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+constexpr std::array<RouteSpec, 4> kRoutes{{
+    {{1, 12}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{13, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
+    {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4},
+    {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last == kAnyCols;
+    bool closed = kRoutes[0].cols.first == 1;
+    for (std::size_t index = 0; index + 1 < kRoutes.size(); ++index) {
+        closed = closed && (kRoutes[index].cols.last + 1 == kRoutes[index + 1].cols.first);
+    }
+    return closed && kRoutes[kRoutes.size() - 1].cols.last == kAnyCols;
 }
 
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
@@ -49,8 +54,12 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
     switch (schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         return "gdn_input_proj.q4_q5.independent_direct_fixed";
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r32.c32.s2";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r32.c64.s4";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128.s2";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -119,8 +128,11 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
+        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, plan.schedule,
+                                           stream);
         return;
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");

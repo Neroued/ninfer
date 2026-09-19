@@ -30,7 +30,15 @@ constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 /
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
 
-std::int32_t snapshot_sample_count(std::int32_t tokens) { return tokens <= 4 ? 32 : 7; }
+// The FP64 formula is complete either way; the sample count only decides how many output rows
+// and state channels are handed to the comparison. `full_reference` compares every row and
+// channel, which is what the column counts that reach a changed projection mechanism are
+// verified with (the surrounding sampled cases keep the smaller comparison set).
+inline constexpr std::int32_t kFullReferenceSamples = 1 << 20;
+std::int32_t snapshot_sample_count(std::int32_t tokens, bool full_reference = false) {
+    if (full_reference) { return kFullReferenceSamples; }
+    return tokens <= 4 ? 32 : 7;
+}
 
 double silu_fp64(double value) {
     if (value >= 0.0) { return value / (1.0 + std::exp(-value)); }
@@ -69,10 +77,11 @@ struct SnapshotOracle {
 template <class Projection>
 SnapshotOracle
 snapshot_oracle(std::int32_t value_rows, std::int32_t tokens, const std::vector<float>& conv_weight,
-                std::span<const std::uint16_t> initial_state, Projection&& projection) {
+                std::span<const std::uint16_t> initial_state, Projection&& projection,
+                bool full_reference = false) {
     const std::int32_t channels = kQueryRows + kKeyRows + value_rows;
     SnapshotOracle oracle;
-    const std::int32_t sample_count                = snapshot_sample_count(tokens);
+    const std::int32_t sample_count                = snapshot_sample_count(tokens, full_reference);
     const std::vector<std::int32_t> query_rows     = sampled_rows(kQueryRows, sample_count);
     const std::vector<std::int32_t> key_rows       = sampled_rows(kKeyRows, sample_count);
     const std::vector<std::int32_t> value_selected = sampled_rows(value_rows, sample_count);
@@ -115,7 +124,8 @@ snapshot_oracle(std::int32_t value_rows, std::int32_t tokens, const std::vector<
 
 std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::int32_t channels,
                                  std::int32_t value_rows, std::int32_t tokens,
-                                 std::int32_t snapshot_base_slot) {
+                                 std::int32_t snapshot_base_slot,
+                                 bool full_reference = false) {
     std::vector<double> gathered;
     const auto append = [&](std::int32_t global_row) {
         for (std::int32_t token = 0; token < tokens; ++token) {
@@ -127,7 +137,7 @@ std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::in
             }
         }
     };
-    const std::int32_t sample_count = snapshot_sample_count(tokens);
+    const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
     for (const std::int32_t row : sampled_rows(kQueryRows, sample_count)) { append(row); }
     for (const std::int32_t row : sampled_rows(kKeyRows, sample_count)) {
         append(kQueryRows + row);
@@ -168,9 +178,10 @@ int verify_snapshot_outputs(
     std::string_view suffix, const GuardedBf16Tensor& query, const GuardedBf16Tensor& key,
     const GuardedBf16Tensor& value, std::int32_t value_rows, std::int32_t tokens,
     const SnapshotOracle& oracle,
-    const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance) {
+    const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance,
+    bool full_reference = false) {
     int failures                    = 0;
-    const std::int32_t sample_count = snapshot_sample_count(tokens);
+    const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
     failures += query.verify_guards("snapshot query" + std::string(suffix));
     failures += key.verify_guards("snapshot key" + std::string(suffix));
     failures += value.verify_guards("snapshot value" + std::string(suffix));
@@ -386,6 +397,10 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     failures += compare(std::string(label) + " value", value_actual, value_expected, criterion);
     failures += compare(std::string(label) + " state", state_actual, state_expected, criterion);
     failures += compare(std::string(label) + " z", z_actual, z_expected, criterion);
+    std::cout << label << ": sampled FP64 reference over " << width << " columns x " << batch
+              << " batch rows (" << aggregate_columns << " aggregate columns), compared "
+              << (query_actual.size() + key_actual.size() + value_actual.size()) << " output values"
+              << " + " << state_actual.size() << " state values, failures " << failures << '\n';
 
     failures += query.verify_guards(std::string(label) + " query");
     failures += key.verify_guards(std::string(label) + " key");
@@ -423,7 +438,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens, std::int32_t initial_slot) {
+                   std::int32_t tokens, std::int32_t initial_slot,
+                   bool full_reference = false) {
     constexpr std::int32_t kHidden           = 5120;
     constexpr std::int32_t kValueRows        = 6144;
     constexpr std::int32_t kZRows            = 6144;
@@ -471,7 +487,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
                                                        3 * kChannels);
     const SnapshotOracle oracle = snapshot_oracle(
-        kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
+        kValueRows, tokens, conv_weight, initial_state,
+        [&](std::int32_t row, std::int32_t token) {
             const float* token_activation =
                 activation.data() + static_cast<std::size_t>(token) * kHidden;
             if (row < kQueryRows + kKeyRows) {
@@ -479,14 +496,19 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
             }
             return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
                                               token_activation, kHidden);
-        });
+        },
+        full_reference);
+    const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
                                " initial=" + std::to_string(initial_slot) +
                                " base=" + std::to_string(kSnapshotBaseSlot);
-    int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
+    int failures = verify_snapshot_outputs(
+        suffix, query, key, value, kValueRows, tokens, oracle, kGdnInputProjConvSnapshotA16Tolerance,
+        full_reference);
     failures += compare("snapshot state" + suffix,
-                        gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
+                        gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot,
+                                     full_reference),
                         oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
@@ -494,8 +516,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     failures += z.verify_guards("snapshot z" + suffix);
     failures += z.verify_fully_written("snapshot z" + suffix);
     failures += compare(
-        "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
-        projection_oracle(value_z_weight.host, kValueRows, kZRows, activation, kHidden, tokens),
+        "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens, sample_count),
+        projection_oracle(value_z_weight.host, kValueRows, kZRows, activation, kHidden, tokens,
+                          sample_count),
         kGdnInputProjConvSnapshotA16Tolerance);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
@@ -509,6 +532,14 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
         std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
+    // Record what was actually compared against the FP64 formula, so the run log distinguishes a
+    // complete-output reference from a sampled one without inferring it from the case list.
+    std::cout << "snapshot" << suffix << ": " << (full_reference ? "complete" : "sampled")
+              << " FP64 reference, compared "
+              << (oracle.query.size() + oracle.key.size() + oracle.value.size()) << " output values"
+              << " + " << oracle.state.size() << " state values, workspace capacity "
+              << workspace_bytes << " peak " << workspace.peak_used() << ", failures " << failures
+              << '\n';
     return failures;
 }
 
@@ -520,9 +551,24 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 619U));
     int failures = 0;
     // Cover every fixed Small-T specialization plus the first composed extent.
-    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7}) {
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6}) {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
+    }
+    // The column counts that reach a projection mechanism this change touched: W=7 is the first
+    // extent with a tail column, W=8 the first full row-block extent on the Q5 side, W=9 the first
+    // extent of the 9..12 band (K-split Q4 parent with the narrow c4 SIMT Q5 tile, which is a
+    // different Q5 mechanism from the row-block used at 7/8). These are compared against the complete
+    // FP64 formula for every output row and every state channel, so a mechanism that is wrong away
+    // from the sampled rows cannot pass.
+    for (const std::int32_t tokens : {7, 8, 9}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1, true);
+    }
+    // The rest of the admitted range keeps the sampled comparison: the same formula, a smaller
+    // comparison set. 32/33 and 64 are the group-band boundaries either side of the neighbouring
+    // routes.
+    for (const std::int32_t tokens : {32, 33, 64}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1);
     }
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
@@ -554,6 +600,45 @@ int run_q4_q5() {
                                               state, valid, initial, snapshot_base, q, k, v, z,
                                               workspace, nullptr);
         });
+
+    // One batched case with mixed valid prefixes whose aggregate column count is 48 (16 x 3). The
+    // projection is routed once for the whole call from that aggregate column count - so this case
+    // exercises the mixed valid prefixes and the exact-zero invalid tails, not three different
+    // projection routes for the three batch rows. Those per-row route cases are covered by the
+    // per-side test suite, which sweeps every column count of both parents.
+    constexpr std::int32_t kMixedWidth = 16;
+    constexpr std::int32_t kMixedBatch = 3;
+    const std::vector<std::int32_t> mixed_valid{16, 9, 4};
+    const std::size_t mixed_workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(kQueryRows, kKeyRows, kValueRows,
+                                                                  kMixedBatch, kMixedWidth,
+                                                                  kMixedWidth);
+    failures += run_batched_case(
+        "Q4/Q5 A16 B=3 W=16 masked", kHidden, kValueRows, kZRows, kMixedWidth, kMixedBatch,
+        mixed_valid, conv_weight, mixed_workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
+    failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
+    failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
     failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
     return failures;

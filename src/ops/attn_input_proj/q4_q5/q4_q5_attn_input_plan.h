@@ -12,6 +12,7 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5AttnInputScheduleId {
     ParentSplitFixed,
+    MixedR32C32S2,
     MixedR32C64S3,
     PairR32C64S3,
     MixedR64C128S2,

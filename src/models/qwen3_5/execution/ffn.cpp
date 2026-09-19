@@ -22,7 +22,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
-    if (mtp) {
+    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
         (void)layout.alloc(DType::BF16, {gu.n, last});
         {
             auto scope = layout.scope();
@@ -30,9 +30,15 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                 gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
         }
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-        (void)layout.alloc(DType::BF16, {down.n, last});
-        (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k,
-                                                                      p.down.policy, first, last));
+        if (mtp) {
+            (void)layout.alloc(DType::BF16, {down.n, last});
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                down.qtype, down.n, down.k, p.down.policy, first, last));
+        } else {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+                down.qtype, down.n, down.k, p.down.policy, first, last));
+        }
     } else {
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
         {
@@ -65,7 +71,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
-    if (mtp) {
+    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
         Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
         {
             auto call = workspace.scope();
@@ -74,9 +80,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
         ops::silu_mul(gate_up.slice(0, 0, gu.n / 2), gate_up.slice(0, gu.n / 2, gu.n / 2),
                       activation, stream);
-        Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
-        ops::linear(activation, down, delta, p.down.policy, workspace, stream);
-        ops::residual_add(delta, residual, stream);
+        if (mtp) {
+            Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
+            ops::linear(activation, down, delta, p.down.policy, workspace, stream);
+            ops::residual_add(delta, residual, stream);
+            return;
+        }
+        ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
         return;
     }
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});

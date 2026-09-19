@@ -10,6 +10,13 @@ namespace ninfer::text {
 // Reject unsupported constraints instead of letting a compiler silently weaken a schema.
 void validate_structured_output(const StructuredOutputOptions& options);
 
+// Model-owned framing around the final response. The alternate format is an XGrammar
+// structural-tag descriptor (e.g. a model's native tool-call serialization), not a user API.
+struct StructuredOutputEnvelope {
+    std::string reasoning_close;
+    std::string alternative_format;
+};
+
 class GrammarState {
 public:
     ~GrammarState();
@@ -30,7 +37,8 @@ class StructuredCompiler {
 public:
     StructuredCompiler(std::vector<std::string> decoded_vocab, std::vector<int> stop_tokens);
     ~StructuredCompiler();
-    std::shared_ptr<GrammarState> compile(const StructuredOutputOptions& options);
+    std::shared_ptr<GrammarState> compile(const StructuredOutputOptions& options,
+                                          const StructuredOutputEnvelope& envelope = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

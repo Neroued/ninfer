@@ -591,7 +591,11 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
-    impl_->preview_ready                    = true;
+    if (impl_->grammar) {
+        impl_->preview_grammar = impl_->grammar->fork();
+        impl_->preview_grammar->accept(tokens);
+    }
+    impl_->preview_ready = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
         .prefix_execution_split_after = impl_->preview_execution_split_after,

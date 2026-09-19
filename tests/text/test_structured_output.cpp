@@ -94,12 +94,91 @@ int main() {
         require(masks[drafts.size() * words + 8] & 1U, "bonus mask missing EOS");
         object->fill_masks(before, {});
         require(before[0] == masks[0], "draft traversal advanced committed grammar");
+        const auto tokens_for = [](std::string_view value) {
+            std::vector<TokenId> tokens;
+            for (unsigned char ch : value) { tokens.push_back(ch); }
+            return tokens;
+        };
+        const auto accepts_value = [&](const std::shared_ptr<GrammarState>& grammar,
+                                       const std::string& value) {
+            auto trial  = grammar->fork();
+            auto tokens = tokens_for(value);
+            tokens.push_back(256);
+            try {
+                trial->accept(tokens);
+                return true;
+            } catch (const std::logic_error&) { return false; }
+        };
+        auto rating = compiler.compile(
+            {StructuredOutputKind::JsonSchema, R"({"type":"number","minimum":0,"maximum":10})"});
+        require(accepts_value(rating, "0") && accepts_value(rating, "10") &&
+                    accepts_value(rating, "9.5"),
+                "inclusive number bounds lost valid values");
+        for (int i = -80; i <= 240; ++i) {
+            const double value  = i / 16.0;
+            const auto spelling = nlohmann::json(value).dump();
+            if (accepts_value(rating, spelling)) {
+                const double decoded = nlohmann::json::parse(spelling).get<double>();
+                require(decoded >= 0 && decoded <= 10, "number escaped independent range oracle");
+            }
+        }
+        auto exclusive = compiler.compile(
+            {StructuredOutputKind::JsonSchema,
+             R"({"type":"number","exclusiveMinimum":-0.25,"exclusiveMaximum":0.25})"});
+        require(accepts_value(exclusive, "0") && accepts_value(exclusive, "0.249999") &&
+                    !accepts_value(exclusive, "0.25") && !accepts_value(exclusive, "-0.25") &&
+                    !accepts_value(exclusive, "1e2"),
+                "exclusive number bounds weakened");
+        auto integer =
+            compiler.compile({StructuredOutputKind::JsonSchema,
+                              R"({"type":"integer","minimum":-2,"exclusiveMaximum":3})"});
+        for (int i = -10; i <= 10; ++i) {
+            require(accepts_value(integer, std::to_string(i)) == (i >= -2 && i < 3),
+                    "integer range disagrees with independent oracle");
+        }
+        require(!accepts_value(integer, "1.5"), "integer accepted a fraction");
+        auto tiny =
+            compiler.compile({StructuredOutputKind::JsonSchema,
+                              R"({"type":"number","minimum":0.000001,"maximum":0.000002})"});
+        require(accepts_value(tiny, "0.000001") && accepts_value(tiny, "0.000002") &&
+                    !accepts_value(tiny, "0") && !accepts_value(tiny, "0.000003"),
+                "number precision boundary escaped bounds");
+
+        auto reasoning = compiler.compile({StructuredOutputKind::JsonObject, {}},
+                                          {.reasoning_close = "</think>"});
+        reasoning->accept(tokens_for("reasoning with << overlap </thi"));
+        const auto crossing = tokens_for("nk>{\"ok\":true}");
+        std::vector<std::uint32_t> crossing_masks(words * (crossing.size() + 1));
+        reasoning->fill_masks(crossing_masks, crossing);
+        for (std::size_t i = 0; i < crossing.size(); ++i) {
+            require(crossing_masks[i * words + crossing[i] / 32] & (1U << (crossing[i] % 32)),
+                    "reasoning-to-JSON speculative transition masked a valid token");
+        }
+        require(!(crossing_masks[3 * words + 'p' / 32] & (1U << ('p' % 32))),
+                "reasoning grammar escaped into final prose");
+        require(crossing_masks[crossing.size() * words + 8] & 1U, "final bonus EOS missing");
+        require(accepts_value(reasoning, "nk>{}"), "draft masks advanced committed phase");
+        require(accepts_value(reasoning, "nk>\n\n{}"), "canonical close whitespace rejected");
+        require(!accepts_value(reasoning, "nk>plain text</think>{}"),
+                "a second reasoning close bypassed the first boundary");
+        auto mixed_vocab = vocab;
+        mixed_vocab.push_back("</think>{");
+        mixed_vocab.push_back("</think>prose");
+        StructuredCompiler mixed_compiler(mixed_vocab, {256});
+        auto mixed = mixed_compiler.compile({StructuredOutputKind::JsonObject, {}},
+                                            {.reasoning_close = "</think>"});
+        mixed->fill_masks(before, {});
+        require((before[8] & 2U) && !(before[8] & 4U),
+                "single token spanning reasoning and content escaped grammar");
+        mixed->accept(std::vector<TokenId>{257, '}', 256});
         for (const char* bad :
              {R"({"type":"array","uniqueItems":true})",
               R"({"$ref":"#/$defs/a~1b","$defs":{"a/b":{"const":1},"a~1b":{"const":2}}})",
               R"({"oneOf":[{},{}]})", R"({"$ref":"https://example.org/schema"})",
               R"({"const":1,"type":"string"})", R"({"anyOf":[{}],"type":"object"})",
-              R"({"type":"integer","minimum":0})"}) {
+              R"({"type":"integer","minimum":3,"maximum":2})", R"({"type":"number","minimum":"0"})",
+              R"({"type":"number","minimum":0.0000001,"maximum":0.0000002})", R"({"minimum":0})",
+              R"({"type":"number","minimum":1e30})"}) {
             bool failed = false;
             try {
                 compiler.compile({StructuredOutputKind::JsonSchema, bad});

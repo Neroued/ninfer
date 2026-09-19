@@ -109,6 +109,11 @@ int main() {
         check(structured.structured_output.kind == ninfer::StructuredOutputKind::JsonObject &&
                   structured.enable_thinking == false,
               "CLI JSON mode");
+    const auto structured_reasoning = parse(
+        {"ninfer", "model.ninfer", "--prompt", "hello", "--json", "--reasoning-effort", "medium"});
+    failures += check(structured_reasoning.enable_thinking != false &&
+                          structured_reasoning.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "CLI structured output preserves explicit reasoning");
     failures += check(
         rejects([] {
             (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});

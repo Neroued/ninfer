@@ -170,6 +170,122 @@ for mode in a.modes:
         check_json(chat())
         check_json(chat(temperature=0))
         check_json(chat({"type": "json_object"}), {"type": "object"})
+        # Reasoning and tools remain enabled throughout a real tool -> constrained-content
+        # exchange, matching clients that keep their global settings on every request.
+        weather_schema = {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "temperature": {"type": "number", "minimum": -100, "maximum": 100},
+            },
+            "required": ["city", "temperature"],
+            "additionalProperties": False,
+        }
+        weather_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "schema": weather_schema,
+                "strict": True,
+            },
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_code",
+                    "description": "Execute code when computation is needed.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "language": {"type": "string"},
+                            "code": {"type": "string"},
+                        },
+                        "required": ["language", "code"],
+                    },
+                },
+            }
+        )
+        tool_messages = [
+            {
+                "role": "user",
+                "content": "Use get_weather to obtain the current temperature in Tokyo, then return city and "
+                "temperature as JSON. You must call the tool; do not invent live weather.\n"
+                'Example format:\n```json\n{"city":"Paris","temperature":20}\n```',
+            }
+        ]
+        reasoning_kwargs = {
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "reasoning_effort": "medium",
+        }
+        first, _ = request(
+            chat(
+                weather_format,
+                messages=tool_messages,
+                tools=tools,
+                tool_choice="auto",
+                chat_template_kwargs=reasoning_kwargs,
+                temperature=0,
+                max_tokens=1024,
+            )
+        )
+        first_message = first["choices"][0]["message"]
+        calls = first_message.get("tool_calls", [])
+        assert calls and all(
+            c["function"]["name"] == "get_weather" for c in calls
+        ), first
+        tool_messages.append(
+            {
+                k: first_message[k]
+                for k in ("role", "content", "reasoning_content", "tool_calls")
+                if k in first_message
+            }
+        )
+        for call in calls:
+            assert json.loads(call["function"]["arguments"])["city"] == "Tokyo", call
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": '{"city":"Tokyo","temperature":28}',
+                }
+            )
+        final = check_json(
+            chat(
+                weather_format,
+                messages=tool_messages,
+                tools=tools,
+                tool_choice="auto",
+                chat_template_kwargs=reasoning_kwargs,
+                temperature=0,
+                max_tokens=1024,
+            ),
+            weather_schema,
+        )
+        assert final == {"city": "Tokyo", "temperature": 28}, final
+        check_json(chat(enable_thinking=True, max_tokens=1024))
+        print(
+            "PASS",
+            mode,
+            "reasoning, native tool envelope, bounded final JSON",
+            flush=True,
+        )
         # Same prompt, fresh grammar, prefix reuse and mixed compact batch membership.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             jobs = [pool.submit(check_json, chat(seed=25 + i)) for i in range(2)]
@@ -207,7 +323,6 @@ for mode in a.modes:
         short, _ = request(chat(max_tokens=2))
         assert short["choices"][0]["finish_reason"] == "length", short
         for bad in [
-            chat(enable_thinking=True),
             chat(stop=["}"]),
             chat(
                 {

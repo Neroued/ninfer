@@ -9,3 +9,7 @@ Regression: tests/text/test_structured_output.cpp. The additional-property exclu
 declared properties before divergence, preventing duplicate-key overwrites from bypassing a
 property schema. This restricts some otherwise valid key spellings.
 Other upstream sources are unmodified.
+
+Numeric-range correctness patch: GenerateNumber rejects the empty-range regex sentinel instead of
+interpreting it as an empty JSON number. This matters when the six-decimal generation grid contains
+no value inside an otherwise nonempty real interval. Covered by the structured-output grammar tests.

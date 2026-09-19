@@ -2361,8 +2361,13 @@ int32_t JSONSchemaConverter::GenerateNumber(const NumberSpec& spec, const std::s
     exclusive_end = true;
   }
   if (start.has_value() || end.has_value()) {
+    const auto regex =
+        GenerateFloatRangeRegex(start, end, /*precision=*/6, exclusive_start, exclusive_end);
+    if (regex == "^()$") {
+      throw std::invalid_argument("numeric range has no value at six decimal places");
+    }
     return RegexExpression(
-        GenerateFloatRangeRegex(start, end, /*precision=*/6, exclusive_start, exclusive_end),
+        regex,
         false,
         /*force_cfg_expansion=*/true
     );

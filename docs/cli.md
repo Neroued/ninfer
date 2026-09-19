@@ -284,9 +284,11 @@ All weight, sequence, workspace, and graph allocations are released when the Eng
 ## JSON and JSON Schema output
 
 `--json` constrains output to a JSON object. `--json-schema FILE` constrains it to the supported
-JSON Schema subset described in [serving](serving.md#structured-output). Both disable thinking.
-They are mutually exclusive and reject raw output, custom stops, thinking budgets, and enabled
-reasoning effort. They work with ordinary, MTP, DFlash and DFlash2 execution.
+JSON Schema subset described in [serving](serving.md#structured-output). Thinking defaults off;
+an explicit `--reasoning-effort` or `--thinking-budget` retains reasoning before the constrained answer.
+The two format flags are mutually exclusive and reject raw output and custom stops. The CLI adds
+the requested format/schema to the model's instructions before tokenization. They work with
+ordinary, MTP, DFlash and DFlash2 execution.
 
 ```bash
 ./build/apps/ninfer model.ninfer --prompt 'Return the city as JSON' --json --max-new 128

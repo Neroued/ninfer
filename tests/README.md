@@ -232,7 +232,7 @@ the fixed Engine fixture does not define bit parity across arbitrary floating-po
 The CPU grammar and protocol tests and the GPU sampling/speculative tests qualify this path:
 
 ```bash
-ctest --test-dir build --output-on-failure -R 'ninfer_(structured_output|sampling|speculative_round|openai_schema|openai_responses|anthropic_schema|cli_options)_test$'
+ctest --test-dir build --output-on-failure -R 'ninfer_(structured_output|sampling|speculative_round|openai_schema|openai_responses|anthropic_schema|cli_options|prompt_input|tool_call_parser|qwen3_5_frontend|qwen3_5_structured_round)_test$'
 ```
 
 `tests/test_structured_output_live.py` runs a temporary loopback server and validates completed
@@ -248,6 +248,10 @@ python tests/test_structured_output_live.py \
 
 It checks conflicting prompts, greedy and stochastic generation, schema versus JSON object mode,
 concurrent and mixed traffic, prefix reuse, SSE, token limits, disconnect cleanup, compile errors,
-Responses, and Anthropic Messages. `--concurrency 8 --draft-tokens 15 --modes dflash2` exercises
+Responses, and Anthropic Messages. It also runs a tool-result-to-bounded-JSON exchange while
+reasoning and multiple tools remain enabled, including a Markdown-formatted example in the prompt.
+CPU tests cover numeric endpoints, schema enforcement with tool alternatives, split and mixed-token
+reasoning transitions, speculative mask previews, injected thinking-budget closure, and prompt cache
+boundary preservation. `--concurrency 8 --draft-tokens 15 --modes dflash2` exercises
 the largest draft and batch dimensions. A separate DFlash-capable artifact can use `--modes dflash`.
 The server is terminated on success or failure. An occupied test port causes the test to stop.

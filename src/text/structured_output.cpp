@@ -2,7 +2,9 @@
 #include <xgrammar/xgrammar.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -16,11 +18,24 @@ void schema_check(const Json& s) {
     static const std::unordered_set<std::string> annotations = {
         "$schema",  "title",    "description", "default",
         "examples", "$comment", "$defs",       "definitions"};
-    static const std::unordered_set<std::string> supported = {
-        "type",      "properties",  "required", "additionalProperties",
-        "items",     "prefixItems", "minItems", "maxItems",
-        "minLength", "maxLength",   "enum",     "const",
-        "anyOf",     "$ref"};
+    static const std::unordered_set<std::string> supported = {"type",
+                                                              "properties",
+                                                              "required",
+                                                              "additionalProperties",
+                                                              "items",
+                                                              "prefixItems",
+                                                              "minItems",
+                                                              "maxItems",
+                                                              "minLength",
+                                                              "maxLength",
+                                                              "enum",
+                                                              "const",
+                                                              "anyOf",
+                                                              "$ref",
+                                                              "minimum",
+                                                              "maximum",
+                                                              "exclusiveMinimum",
+                                                              "exclusiveMaximum"};
     for (const auto& [key, value] : s.items()) {
         if (key == "$schema" && value != "https://json-schema.org/draft/2020-12/schema" &&
             value != "http://json-schema.org/draft-07/schema#") {
@@ -29,6 +44,19 @@ void schema_check(const Json& s) {
         if ((key == "minLength" || key == "maxLength" || key == "minItems" || key == "maxItems") &&
             (!value.is_number_integer() || value < 0 || value > 2147483647)) {
             throw std::invalid_argument(key + " must be a nonnegative 32-bit integer");
+        }
+        if (key == "minimum" || key == "maximum" || key == "exclusiveMinimum" ||
+            key == "exclusiveMaximum") {
+            // The pinned compiler represents bounds as doubles. Keep integer bounds exact
+            // and reject non-finite values before they reach its range arithmetic.
+            if (!value.is_number() || !std::isfinite(value.get<double>()) ||
+                std::abs(value.get<long double>()) > 9007199254740991.0L) {
+                throw std::invalid_argument(key + " requires a finite bound within +/- (2^53-1)");
+            }
+            if (!s.contains("type") || (s.at("type") != "integer" && s.at("type") != "number")) {
+                throw std::invalid_argument(
+                    "numeric bounds require explicit integer or number type");
+            }
         }
         if (!annotations.contains(key) && !supported.contains(key)) {
             throw std::invalid_argument("unsupported JSON schema keyword: " + key);
@@ -174,7 +202,9 @@ StructuredCompiler::StructuredCompiler(std::vector<std::string> vocab, std::vect
 
 StructuredCompiler::~StructuredCompiler() = default;
 
-std::shared_ptr<GrammarState> StructuredCompiler::compile(const StructuredOutputOptions& options) {
+std::shared_ptr<GrammarState>
+StructuredCompiler::compile(const StructuredOutputOptions& options,
+                            const StructuredOutputEnvelope& envelope) {
     validate_structured_output(options);
     if (options.kind == StructuredOutputKind::None) { return {}; }
     std::lock_guard lock(impl_->mutex);
@@ -184,6 +214,37 @@ std::shared_ptr<GrammarState> StructuredCompiler::compile(const StructuredOutput
             options.kind == StructuredOutputKind::JsonObject ? "{\"type\":\"object\"}"
                                                              : options.schema,
             true, std::nullopt, std::nullopt, false, 8);
+        if (!envelope.reasoning_close.empty() || !envelope.alternative_format.empty()) {
+            std::ostringstream ebnf;
+            ebnf << grammar.GetGrammar();
+            Json content{{"type", "grammar"}, {"grammar", ebnf.str()}};
+            // The schema root starts at the JSON value; Qwen's reasoning close is followed by
+            // whitespace (including the canonical budget-control suffix's two newlines).
+            content = Json{
+                {"type", "sequence"},
+                {"elements", Json::array({Json{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}},
+                                          content})}};
+            if (!envelope.alternative_format.empty()) {
+                content = Json{
+                    {"type", "or"},
+                    {"elements", Json::array({content, Json::parse(envelope.alternative_format)})}};
+            }
+            if (!envelope.reasoning_close.empty()) {
+                // any_text excludes the first closing delimiter, including split-token and
+                // overlapping prefixes. A wildcard repetition would allow reasoning to consume
+                // the delimiter and bypass the final-content constraint.
+                content =
+                    Json{{"type", "sequence"},
+                         {"elements",
+                          Json::array(
+                              {Json{{"type", "any_text"},
+                                    {"excludes", Json::array({envelope.reasoning_close})}},
+                               Json{{"type", "const_string"}, {"value", envelope.reasoning_close}},
+                               content})}};
+            }
+            grammar = impl_->compiler.CompileStructuralTag(
+                Json{{"type", "structural_tag"}, {"format", content}}.dump());
+        }
         return std::shared_ptr<GrammarState>(new GrammarState(std::make_unique<GrammarState::Impl>(
             xgrammar::GrammarMatcher(grammar), impl_->tokenizer.GetVocabSize())));
     } catch (const std::exception& e) {

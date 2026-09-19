@@ -611,6 +611,20 @@ control. Sequence/checkpoint/cache state never owns it. OutputSession previews o
 moves the fork into the committed state only after Program commit succeeds. Cancellation before
 output preview advances no grammar state.
 
+CLI and serving use the shared product prompt adapter to expose an explicit response format and
+schema as a leading instruction before preparation. It retains caller message contents and remaps
+explicit cache boundaries if a system message is inserted. This aligns model behavior with the
+constraint, especially when an automatic tool-call alternative remains available; enforcement
+still belongs to the matcher. Requests without a format are unchanged.
+
+The model frontend supplies its reasoning-close delimiter and native tool envelope. The text layer
+composes these with the final JSON grammar into one matcher. Thus a candidate token, or a speculative
+block, may cross from reasoning into tool calls or final JSON without an out-of-band phase switch.
+The first reasoning-close delimiter ends unrestricted reasoning. The model's tool grammar uses
+declared names and optional non-strict parameters in prompt declaration order. OutputSession also previews and
+commits forced thinking-control tokens through the matcher; the injected closure cannot leave the
+grammar in the reasoning phase. Framing and grammar state have identical rollback/commit ownership.
+
 Program reserves vocabulary bitsets in its planned persistent device arena and owns pinned host
 staging. Ordinary/prefill sampling uses the current mask. MTP supplies each current draft prefix
 to a forked matcher before launch. DFlash/DFlash2 must first generate device drafts: their graph

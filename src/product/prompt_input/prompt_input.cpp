@@ -273,4 +273,39 @@ PromptInput prompt_from_messages(const std::filesystem::path& path,
     return input;
 }
 
+void apply_structured_output_instruction(PromptInput& input,
+                                         const StructuredOutputOptions& options) {
+    if (options.kind == StructuredOutputKind::None) { return; }
+    MessagePart instruction;
+    instruction.text =
+        "\n\nThe response format is JSON. Return the final answer as raw JSON without Markdown "
+        "fences or surrounding text.";
+    if (!input.options.tool_jsons.empty()) {
+        instruction.text +=
+            " Tool calls remain available when needed to obtain information; do not call tools "
+            "merely to format JSON.";
+    }
+    if (options.kind == StructuredOutputKind::JsonSchema) {
+        instruction.text += "\nThe final answer must match this JSON Schema:\n" + options.schema;
+    } else {
+        instruction.text += " The final answer must be a JSON object.";
+    }
+    if (!input.messages.empty() && (input.messages.front().role == ChatRole::System ||
+                                    input.messages.front().role == ChatRole::Developer)) {
+        // Append a part so explicit boundaries inside the caller's instruction stay unchanged.
+        input.messages.front().parts.push_back(std::move(instruction));
+    } else {
+        ChatMessage system;
+        system.role = ChatRole::System;
+        system.parts.push_back(std::move(instruction));
+        input.messages.insert(input.messages.begin(), std::move(system));
+        for (auto& marker : input.context_cache.markers) {
+            if (marker.location == PromptCacheMarkerLocation::MessageBoundary ||
+                marker.location == PromptCacheMarkerLocation::MessagePartBoundary) {
+                ++marker.after_message_count;
+            }
+        }
+    }
+}
+
 } // namespace ninfer::product

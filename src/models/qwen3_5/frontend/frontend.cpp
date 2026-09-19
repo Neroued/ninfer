@@ -914,32 +914,32 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     std::shared_ptr<text::GrammarState> grammar;
     text::validate_structured_output(structured);
     if (structured.kind != StructuredOutputKind::None) {
-        if (prompt.data_->starts_in_reasoning || thinking.budget) {
-            throw std::invalid_argument("structured output requires thinking disabled");
-        }
         if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
             !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
             caller_stop.publish_stop_token) {
             throw std::invalid_argument(
                 "structured output requires default stops and decoded text output");
         }
-        if (prompt.data_->tool_call_output && !prompt.data_->tool_call_output->tools.empty()) {
-            throw std::invalid_argument(
-                "structured output cannot be combined with tool generation");
+        text::StructuredOutputEnvelope envelope;
+        if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
+        if (prompt.data_->tool_call_output) {
+            envelope.alternative_format =
+                fi::structured_tool_call_format(*prompt.data_->tool_call_output);
         }
         std::lock_guard lock(impl_->grammar_mutex);
         if (!impl_->grammar_compiler) {
             std::vector<std::string> vocab(impl_->tokenizer->vocab_size());
             for (std::size_t id = 0; id < vocab.size(); ++id) {
                 if (impl_->tokenizer->is_valid_token(id) &&
-                    !impl_->tokenizer->is_special_token(id)) {
+                    (!impl_->tokenizer->is_special_token(id) ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</think>")) {
                     vocab[id] = impl_->tokenizer->decode_token_bytes(id, false);
                 }
             }
             impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
                 std::move(vocab), impl_->tokenizer->default_stop_token_ids());
         }
-        grammar = impl_->grammar_compiler->compile(structured);
+        grammar = impl_->grammar_compiler->compile(structured, envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(

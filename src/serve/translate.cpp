@@ -1,5 +1,6 @@
 #include "serve/translate.h"
 #include "serve/request_json.h"
+#include "product/prompt_input/prompt_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -151,14 +152,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     }
     kwargs.erase("reasoning_effort");
     if (request.structured_output.kind != StructuredOutputKind::None) {
-        if (thinking == true || (effort && *effort != RequestedReasoningEffort::None) ||
-            request.thinking_budget || request.uses_tools() || !request.stop_strings.empty() ||
+        if (!request.stop_strings.empty() ||
             request.continuation != PromptContinuationMode::NewAssistantTurn) {
-            invalid_prompt_option("structured output requires thinking disabled, default stops, a "
-                                  "new assistant turn, and no active tools",
-                                  "response_format", "incompatible_structured_output");
+            invalid_prompt_option(
+                "structured output requires default stops and a new assistant turn",
+                "response_format", "incompatible_structured_output");
         }
-        thinking = false;
+        // Preserve explicit reasoning requests; retain the economical final-only default when
+        // the caller has not selected a reasoning mode or budget.
+        if (!thinking && !effort && !request.thinking_budget) { thinking = false; }
     }
     ResolvedPromptSemantics result{
         .enable_thinking           = thinking ? thinking : server.enable_thinking,
@@ -315,6 +317,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     }
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
+    product::apply_structured_output_instruction(input, request.structured_output);
     return input;
 }
 

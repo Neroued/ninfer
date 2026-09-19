@@ -91,10 +91,14 @@ reports that format in its Response object. Anthropic Messages accepts
 
 Supported schema constraints are `type`, `properties`, `required`, `additionalProperties`,
 `items`, `prefixItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `enum`, `const`,
-`anyOf`, `$defs`, `definitions`, and local fragment `$ref` (including recursive schemas).
+`anyOf`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `$defs`, `definitions`,
+and local fragment `$ref` (including recursive schemas).
 Annotations `$schema`, `title`, `description`, `default`, `examples`, and `$comment`
 do not impose generation constraints. Other keywords are rejected with HTTP 400: this includes
-numeric bounds, `multipleOf`, `pattern`, `format`, `oneOf`, `allOf`, `uniqueItems`, and conditionals.
+`multipleOf`, `pattern`, `format`, `oneOf`, `allOf`, `uniqueItems`, and conditionals.
+Numeric bounds require an explicit `integer` or `number` type and finite values within
+`+/- (2^53-1)`. Integer bounds must be whole numbers. Bounded numbers use ordinary decimal
+notation with at most six fractional digits; a range with no representable value is rejected.
 `$id` and external references are rejected. An explicit `$schema` must be JSON Schema 2020-12
 or draft-07. Local references use `#` or literal object paths such as `#/$defs/node`;
 escaped or empty path segments are rejected. Bounded strings use unescaped Unicode characters; escaped quotes, backslashes,
@@ -108,14 +112,29 @@ eight characters per run to prevent whitespace-only generation loops. Additional
 where necessary to prevent escaped aliases from overwriting declared typed properties.
 `strict:false` does not disable enforcement.
 
-Structured responses default to thinking disabled even if the server's ordinary default enables
-thinking. Explicit enabled thinking, a thinking budget, active tool generation, custom stops,
-and assistant-prefill continuation are rejected in combination with structured output. Strict
-tool argument generation and arbitrary grammar/regex aliases remain unsupported. Public C++
-callers select `ExecutionOptions::structured_output`, prepare a prompt with thinking disabled,
-and use default stops and decoded text output.
+Structured responses default to thinking disabled when no reasoning mode or budget is requested.
+Explicit thinking and thinking budgets are supported: reasoning is returned in its normal channel,
+and the first reasoning-close delimiter transitions to constrained final content. Active tools are
+also supported. After reasoning, a response can emit native Qwen tool calls or the final JSON value.
+The schema applies to final content, not reasoning or tool arguments. Tool responses have their normal
+tool-call finish reason and need not contain a JSON content value. Tool definitions and thinking
+settings may remain enabled on later requests after tool results are supplied.
 
-Only normal completed responses guarantee a complete JSON document satisfying the supported
+Serving also exposes the requested format and schema to the model as a leading instruction,
+asking for raw JSON without Markdown fences and retaining tools for information gathering.
+This helps the model choose the intended final-answer branch when tools remain enabled; the
+token grammar enforces validity independently. Tool selection and termination remain model
+decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
+Requests without an explicit response format receive no format instruction or grammar.
+
+The native tool envelope restricts calls to declared names and emits each declared parameter at most
+once, in the declaration order shown in the prompt. Parameter values remain non-strict; delimiter spellings that would make
+Qwen XML ambiguous are excluded. Strict tool argument generation and arbitrary grammar/regex aliases
+remain unsupported. Custom stops and assistant-prefill continuation are rejected with structured
+output. Public C++ callers select `ExecutionOptions::structured_output` and use default stops and
+decoded text output.
+
+Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
 schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
 partial document; inspect the finish reason or Responses status before parsing it as complete.
 SSE content deltas are ordinary partial JSON bytes; concatenate them before parsing. Constraints
@@ -711,7 +730,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
+moderation, non-empty `include`, background execution, compaction,
 files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
 accepted placeholders.
 
@@ -787,7 +806,7 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+Documents, Search Results, Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local

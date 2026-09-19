@@ -142,6 +142,11 @@ int test_structured_output() {
                       "JSON mode reaches Engine");
     failures += check(semantics(generation).enable_thinking == false,
                       "JSON mode disables thinking default");
+    const auto json_prompt = prompt(generation);
+    failures += check(json_prompt.messages.front().role == ninfer::ChatRole::System &&
+                          json_prompt.messages.front().parts.back().text.find("raw JSON") !=
+                              std::string::npos,
+                      "JSON response contract is visible to the model");
     body["response_format"] = Json{
         {"type", "json_schema"},
         {"json_schema", Json{{"name", "answer"},
@@ -151,11 +156,22 @@ int test_structured_output() {
                                              {"required", Json::array({"x"})},
                                              {"additionalProperties", false}}}}}};
     generation = parse(body).generation;
+    failures += check(prompt(generation)
+                              .messages.front()
+                              .parts.back()
+                              .text.find(generation.structured_output.schema) != std::string::npos,
+                      "API-only response schema reaches the prompt");
     failures += check(options(generation).execution.structured_output.kind ==
                           ninfer::StructuredOutputKind::JsonSchema,
                       "JSON schema reaches Engine");
-    for (const auto& extra : {Json{{"enable_thinking", true}}, Json{{"stop", "}"}},
-                              Json{{"reasoning_effort", "high"}}}) {
+    for (const auto& extra :
+         {Json{{"enable_thinking", true}}, Json{{"reasoning_effort", "high"}}}) {
+        auto enabled = body;
+        enabled.update(extra);
+        failures += check(semantics(parse(enabled).generation).enable_thinking == true,
+                          "structured output preserves explicit reasoning");
+    }
+    for (const auto& extra : {Json{{"stop", "}"}}}) {
         auto invalid = body;
         invalid.update(extra);
         failures +=

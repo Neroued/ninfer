@@ -103,7 +103,7 @@ std::string usage_text(const char* argv0) {
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--json constrains output to a JSON object; --json-schema FILE enforces a supported "
-           "JSON schema. Both disable thinking.\n"
+           "JSON schema. Thinking defaults off; an explicit effort or budget enables it.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
@@ -241,12 +241,13 @@ Options parse_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.structured_output.kind != StructuredOutputKind::None) {
         if (options.raw_output || !options.stop_strings.empty() ||
-            !options.stop_token_ids.empty() || options.thinking_budget ||
-            (options.reasoning_effort && options.reasoning_effort != ReasoningEffort::None)) {
+            !options.stop_token_ids.empty()) {
             throw std::invalid_argument(
-                "structured output requires decoded text, default stops, and thinking disabled");
+                "structured output requires decoded text and default stops");
         }
-        options.enable_thinking = false;
+        if (!options.reasoning_effort && !options.thinking_budget) {
+            options.enable_thinking = false;
+        }
     }
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {

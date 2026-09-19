@@ -7,11 +7,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <vector>
 #include <string>
 #include <tuple>
 
@@ -83,21 +83,25 @@ struct ReadSpan {
 float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
                    std::span<const std::byte> host, MaterializationStats& stats) {
     if (geometry.format != QType::NVFP4) { return 0.0F; }
-    std::array<std::byte, 4> word{};
+    const auto bytes = checked_mul(geometry.divisor_count, sizeof(float), "weight divisors");
+    std::vector<std::byte> words(bytes);
     if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
+        std::copy_n(host.data() + geometry.divisor_offset, bytes, words.data());
     } else {
         const auto& object = reader.directory().tensor(handle);
         reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
-                         word);
-        stats.read_bytes = checked_add(stats.read_bytes, word.size(), "read bytes");
+                         words);
+        stats.read_bytes = checked_add(stats.read_bytes, bytes, "read bytes");
     }
-    const auto value = std::bit_cast<float>(read_u32_le(word.data()));
-    if (!std::isfinite(value) || value <= 0) {
-        throw ArtifactError(reader.directory().tensor(handle).id +
-                            ": invalid NVFP4 weight divisor");
+    // Every divisor is read by a kernel, so every one is checked before anything binds.
+    for (std::uint64_t index = 0; index < geometry.divisor_count; ++index) {
+        const auto value = std::bit_cast<float>(read_u32_le(words.data() + index * sizeof(float)));
+        if (!std::isfinite(value) || value <= 0) {
+            throw ArtifactError(reader.directory().tensor(handle).id +
+                                ": invalid NVFP4 weight divisor");
+        }
     }
-    return value;
+    return std::bit_cast<float>(read_u32_le(words.data()));
 }
 
 } // namespace

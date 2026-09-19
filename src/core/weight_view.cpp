@@ -77,10 +77,14 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
 }
 
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape) {
+                               std::span<const std::uint64_t> shape, std::uint64_t divisors) {
+    if (divisors == 0 || (divisors != 1 && format != QType::NVFP4)) {
+        throw std::invalid_argument("only an NVFP4 plane carries more than one divisor");
+    }
     WeightGeometry out;
-    out.format = format;
-    out.layout = layout;
+    out.format        = format;
+    out.divisor_count = divisors;
+    out.layout        = layout;
     out.shape.assign(shape.begin(), shape.end());
     out.elements = weight_element_count(shape);
     if (layout == QuantLayout::Contiguous) {
@@ -148,8 +152,17 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     out.scale_bytes = mul(n, out.scale_bytes_per_row);
     out.bytes       = add(out.scale_offset, out.scale_bytes);
     if (format == QType::NVFP4) {
+        if (n % divisors) {
+            throw std::invalid_argument("divisor count must divide the plane's rows");
+        }
+        // Every other structural NVFP4 rule is checked here rather than left to the operator, and
+        // this one belongs with them: a divisor that covered part of a 128-row scale tile would
+        // make two rows of one tile disagree about which word they were quantised against.
+        if (divisors > 1 && (n / divisors) % 128) {
+            throw std::invalid_argument("each NVFP4 divisor must cover whole 128-row scale tiles");
+        }
         out.divisor_offset = out.bytes;
-        out.bytes          = add(out.bytes, 4);
+        out.bytes          = add(out.bytes, mul(divisors, 4));
     }
     return out;
 }
@@ -288,7 +301,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
-        out.scale_dtype = DType::FP8_E4M3FN;
+        out.scale_dtype         = DType::FP8_E4M3FN;
+        out.weight_divisors     = region.parent->data + g.divisor_offset;
+        out.weight_divisor_rows = dimension(g.shape[0] / g.divisor_count);
     }
     return out;
 }

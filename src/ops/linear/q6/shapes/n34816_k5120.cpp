@@ -11,6 +11,10 @@ Q6Launch select_q6_n34816_k5120(std::int32_t tokens) {
     if (tokens <= 24) return launch_q6_mma_r64_c24_k128;
     if (tokens <= 32) return launch_q6_mma_r64_c32_k128;
     if (tokens <= 48) return launch_q6_mma_r64_c48_k128;
+    if (tokens <= 56) return launch_q6_mma_r64_c56_k128;
+    if (tokens <= 64) return launch_q6_mma_r64_c64_k128;
+    if (tokens <= 80) return launch_q6_mma_r64_c80;
+    if (tokens <= 96) return launch_q6_mma_r64_c96;
     return launch_q6_mma_r64_c128;
 }
 

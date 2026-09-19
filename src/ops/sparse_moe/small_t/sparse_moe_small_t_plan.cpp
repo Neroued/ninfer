@@ -30,11 +30,24 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
         (routed_down == QType::Q5_G64_FP16 || routed_down == QType::Q6_G64_FP16);
     const bool mtp_profile =
         routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
-    if (!main_profile && !mtp_profile) {
+    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    if (!main_profile && !mtp_profile && !nvfp4_profile) {
         throw std::invalid_argument("sparse_moe small-T: unsupported routed codec profile");
     }
 
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(tokens)};
+    if (nvfp4_profile) {
+        // Swept over the whole [2,46] window against all nine pairs, cold, with the prefill
+        // frontier held open; the figures below are that sweep's, and the frontier comment in
+        // sparse_moe_prefill.h quotes a later one, so the two differ in the third digit. One path
+        // per warp and two output rows per block win everywhere NVFP4 keeps the window: 34.8 us at
+        // T=2 and 79.9 at T=8, against 38.4 and 90.1 for the three-path, one-row pair. Rows4
+        // overtakes Rows2 somewhere between T=16 and T=32, which is beyond the frontier this
+        // profile stops at, so it has no interval of its own.
+        plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths9;
+        plan.d4_schedule = SparseMoeSmallTD4Schedule::Rows2;
+        return plan;
+    }
     if (mtp_profile) {
         plan.d3_schedule =
             tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1 : SparseMoeSmallTD3Schedule::Paths9;

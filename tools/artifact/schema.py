@@ -66,6 +66,9 @@ class TensorSpec:
     shape: tuple[int, ...]
     format: str
     layout: str
+    # Source matrices stacked into this parent, each with its own NVFP4 divisor. One means the
+    # parent has a single divisor, which is every parent that is not such a stack.
+    divisors: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +86,16 @@ class TensorObject:
     layout: str
     offset: int
     bytes: int
+    divisors: int = 1
     kind: ClassVar[str] = "tensor"
 
     def to_json(self) -> dict:
-        return {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        out = {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        # The common parent has one divisor; saying so on every one of a hundred thousand
+        # objects would be a megabyte of directory that means nothing.
+        if self.divisors == 1:
+            del out["divisors"]
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +155,7 @@ def validate_encoding(obj: ArtifactObject) -> None:
             )
         return
     try:
-        size = encoded_size(obj.layout, obj.format, obj.shape)
+        size = encoded_size(obj.layout, obj.format, obj.shape, obj.divisors)
         alignment = get_layout(obj.layout).alignment
     except (TypeError, ValueError) as error:
         raise ArtifactError(f"{obj.id}: {error}") from error
@@ -171,10 +180,12 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             dims = shape(spec.shape, name)
             try:
                 start = align_up(offset, get_layout(spec.layout).alignment)
-                size = encoded_size(spec.layout, spec.format, dims)
+                size = encoded_size(spec.layout, spec.format, dims, spec.divisors)
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error
-            obj = TensorObject(name, dims, spec.format, spec.layout, start, size)
+            obj = TensorObject(
+                name, dims, spec.format, spec.layout, start, size, spec.divisors
+            )
         elif isinstance(spec, ResourceSpec):
             obj = ResourceObject(name, spec.encoding, offset, spec.bytes)
         else:
@@ -196,7 +207,7 @@ def _parse_object(value: object) -> ArtifactObject:
     common = {"id", "kind", "offset", "bytes"}
     kind = value.get("kind")
     if kind == "tensor":
-        members(value, common | {"shape", "format", "layout"}, set(), "tensor")
+        members(value, common | {"shape", "format", "layout"}, {"divisors"}, "tensor")
     elif kind == "resource":
         members(value, common | {"encoding"}, set(), "resource")
     else:
@@ -214,6 +225,7 @@ def _parse_object(value: object) -> ArtifactObject:
         identifier(value["layout"], name),
         offset,
         size,
+        integer(value.get("divisors", 1), f"{name} divisors", positive=True),
     )
 
 

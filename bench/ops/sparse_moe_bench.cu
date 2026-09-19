@@ -46,6 +46,7 @@ enum class CodecProfile : std::uint8_t {
     Q4Q5,
     Q4Q6,
     Q8Q8,
+    Nvfp4,
 };
 
 enum class ExpertDistribution : std::uint8_t {
@@ -123,12 +124,23 @@ const char* codec_name(CodecProfile profile) {
         return "q4-q6";
     case CodecProfile::Q8Q8:
         return "q8-q8";
+    case CodecProfile::Nvfp4:
+        return "nvfp4";
     }
     return "unknown";
 }
 
 QType gate_codec(CodecProfile profile) {
-    return profile == CodecProfile::Q8Q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16;
+    switch (profile) {
+    case CodecProfile::Q4Q5:
+    case CodecProfile::Q4Q6:
+        return QType::Q4_G64_FP16;
+    case CodecProfile::Q8Q8:
+        return QType::Q8_G32_FP16;
+    case CodecProfile::Nvfp4:
+        return QType::NVFP4;
+    }
+    throw std::logic_error("unknown SparseMoe codec profile");
 }
 
 QType down_codec(CodecProfile profile) {
@@ -139,8 +151,16 @@ QType down_codec(CodecProfile profile) {
         return QType::Q6_G64_FP16;
     case CodecProfile::Q8Q8:
         return QType::Q8_G32_FP16;
+    case CodecProfile::Nvfp4:
+        return QType::NVFP4;
     }
     throw std::logic_error("unknown SparseMoe codec profile");
+}
+
+// The shared expert follows the routed codec only where a profile stores all four matrices one
+// way. The row-split profiles keep it at Q8 whatever they route with.
+QType shared_codec(CodecProfile profile) {
+    return profile == CodecProfile::Nvfp4 ? QType::NVFP4 : QType::Q8_G32_FP16;
 }
 
 const char* distribution_name(ExpertDistribution distribution) {
@@ -170,6 +190,11 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t columns) {
+    if (qtype == QType::NVFP4) {
+        // Four bits of code plus one e4m3 byte per sixteen values.
+        const std::uint64_t elements = static_cast<std::uint64_t>(rows) * columns;
+        return elements / 2 + elements / 16;
+    }
     const std::int32_t group   = qtype == QType::Q8_G32_FP16 ? 32 : 64;
     const std::uint64_t groups = static_cast<std::uint64_t>(rows) * columns / group;
     const std::uint64_t low    = qtype == QType::Q8_G32_FP16
@@ -182,9 +207,10 @@ std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t c
 }
 
 double unique_weight_bytes(const Result& result) {
+    const QType shared        = shared_codec(result.codec);
     const std::uint64_t fixed = static_cast<std::uint64_t>(kRouterRows) * kHidden * 2 +
-                                packed_weight_bytes(QType::Q8_G32_FP16, 1024, kHidden) +
-                                packed_weight_bytes(QType::Q8_G32_FP16, kHidden, kIntermediate);
+                                packed_weight_bytes(shared, 1024, kHidden) +
+                                packed_weight_bytes(shared, kHidden, kIntermediate);
     const std::uint64_t per_expert =
         packed_weight_bytes(gate_codec(result.codec), 1024, kHidden) +
         packed_weight_bytes(down_codec(result.codec), kHidden, kIntermediate);
@@ -286,7 +312,8 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --codec q4-q5|q4-q6|q8-q8|all  Routed weight profile (default q4-q5).\n"
+                 "  --codec q4-q5|q4-q6|q8-q8|nvfp4|all  Expert weight profile (default "
+                 "q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
                  "  --sweep START:END[:STEP]         Public token-extent sweep.\n"
                  "  --distribution trace-like|independent|same\n"
@@ -356,8 +383,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
     }
     if (options.codec != "q4-q5" && options.codec != "q4-q6" && options.codec != "q8-q8" &&
-        options.codec != "all") {
-        throw std::invalid_argument("--codec must be q4-q5, q4-q6, q8-q8, or all");
+        options.codec != "nvfp4" && options.codec != "all") {
+        throw std::invalid_argument("--codec must be q4-q5, q4-q6, q8-q8, nvfp4, or all");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -367,10 +394,13 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::vector<CodecProfile> selected_profiles(const std::string& codec) {
-    if (codec == "all") { return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::Q8Q8}; }
+    if (codec == "all") {
+        return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::Q8Q8, CodecProfile::Nvfp4};
+    }
     if (codec == "q4-q5") return {CodecProfile::Q4Q5};
     if (codec == "q4-q6") return {CodecProfile::Q4Q6};
-    return {CodecProfile::Q8Q8};
+    if (codec == "q8-q8") return {CodecProfile::Q8Q8};
+    return {CodecProfile::Nvfp4};
 }
 
 std::vector<std::int32_t> selected_tokens(const TokenSweep& sweep) {
@@ -501,20 +531,30 @@ Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
     return result;
 }
 
+// `divisor_rows` is the artifact's own stride for that bank: gate and up are quantised apart, so
+// the routed gate/up plane carries one divisor per 512 rows, and routed down one per 2048. A shared
+// bank is one matrix and keeps a single divisor. Only NVFP4 stores divisors at all.
+bench::PackedQuantizedWeight make_expert_plane(QType qtype, std::int32_t n, std::int32_t k,
+                                               bench::QuantizedWeightFill fill,
+                                               std::int32_t divisor_rows = 0) {
+    return qtype == QType::NVFP4 ? bench::make_nvfp4_weight(n, k, divisor_rows)
+                                 : bench::make_row_split_weight(qtype, n, k, k, fill);
+}
+
 class BenchmarkWeights {
 public:
     BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
         : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
-          routed_gate_(bench::make_row_split_weight(
-              gate_codec(profile), kExperts * 1024, kHidden, kHidden,
-              {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})),
-          routed_down_(bench::make_row_split_weight(
-              down_codec(profile), kExperts * kHidden, kIntermediate, kIntermediate,
-              {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})),
-          shared_gate_(bench::make_row_split_weight(QType::Q8_G32_FP16, 1024, kHidden, kHidden,
-                                                    {0x27, 0x00, 0x1405})),
-          shared_down_(bench::make_row_split_weight(QType::Q8_G32_FP16, kHidden, kIntermediate,
-                                                    kIntermediate, {0x73, 0x00, 0x1407})),
+          routed_gate_(make_expert_plane(gate_codec(profile), kExperts * 1024, kHidden,
+                                         {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401},
+                                         512)),
+          routed_down_(make_expert_plane(
+              down_codec(profile), kExperts * kHidden, kIntermediate,
+              {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403}, kIntermediate * 4)),
+          shared_gate_(
+              make_expert_plane(shared_codec(profile), 1024, kHidden, {0x27, 0x00, 0x1405})),
+          shared_down_(make_expert_plane(shared_codec(profile), kHidden, kIntermediate,
+                                         {0x73, 0x00, 0x1407})),
           flush_(flush_bytes) {
         std::vector<std::uint16_t> router(static_cast<std::size_t>(kRouterRows) * kHidden,
                                           bench::f32_to_bf16(0.0F));

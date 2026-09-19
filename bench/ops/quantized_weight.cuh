@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::bench {
 
@@ -163,10 +164,16 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
     return result;
 }
 
-inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k) {
-    if (n <= 0 || k <= 0 || (n % 128) != 0 || (k % 64) != 0) {
+// `divisor_rows` is how many consecutive rows one stored divisor covers: the whole plane for a
+// matrix quantised on its own, and one source matrix's share for a plane stacked from several.
+inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                               std::int32_t divisor_rows = 0) {
+    if (divisor_rows == 0) { divisor_rows = n; }
+    if (n <= 0 || k <= 0 || (n % 128) != 0 || (k % 64) != 0 || divisor_rows <= 0 ||
+        (n % divisor_rows) != 0 || (divisor_rows % 128) != 0) {
         throw std::invalid_argument("invalid benchmark NVFP4 weight shape");
     }
+    const std::int32_t divisors = n / divisor_rows;
     const std::uint64_t elements =
         detail::checked_mul(static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k),
                             "benchmark NVFP4 element count overflow");
@@ -176,7 +183,8 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k) {
     const std::uint64_t divisor_offset =
         detail::checked_add(scale_offset, scale_bytes, "benchmark NVFP4 divisor offset overflow");
     const std::uint64_t payload_bytes =
-        detail::checked_add(divisor_offset, sizeof(float), "benchmark NVFP4 payload size overflow");
+        detail::checked_add(divisor_offset, static_cast<std::uint64_t>(divisors) * sizeof(float),
+                            "benchmark NVFP4 payload size overflow");
     if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::overflow_error("benchmark NVFP4 payload does not fit size_t");
     }
@@ -194,9 +202,17 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k) {
     CUDA_CHECK(cudaMemset(result.storage.p, 0x22, code_bytes));
     CUDA_CHECK(
         cudaMemset(static_cast<std::uint8_t*>(result.storage.p) + scale_offset, 0x38, scale_bytes));
+    // A published checkpoint quantises every source matrix on its own, so the divisors differ.
+    // Equal ones would let a per-row lookup pass while reading only the first word.
     constexpr float kWeightDivisor = 0.125F;
+    std::vector<float> divisor_words(static_cast<std::size_t>(divisors));
+    for (std::int32_t index = 0; index < divisors; ++index) {
+        divisor_words[static_cast<std::size_t>(index)] =
+            kWeightDivisor * (1.0F + 0.75F * static_cast<float>(index % 5));
+    }
     CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + divisor_offset,
-                          &kWeightDivisor, sizeof(kWeightDivisor), cudaMemcpyHostToDevice));
+                          divisor_words.data(), divisor_words.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
 
     Weight& weight              = result.weight;
     weight.payload              = result.storage.p;
@@ -216,8 +232,10 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k) {
     weight.scales               = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
     weight.n                    = n;
     weight.k                    = k;
-    weight.weight_scale_divisor = kWeightDivisor;
+    weight.weight_scale_divisor = divisor_words[0];
     weight.input_scale_divisor  = 3.5F;
+    weight.weight_divisors      = static_cast<std::uint8_t*>(result.storage.p) + divisor_offset;
+    weight.weight_divisor_rows  = divisor_rows;
     return result;
 }
 

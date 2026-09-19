@@ -5,17 +5,21 @@ from dataclasses import replace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from tools.artifact.reader import Artifact
 from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
+from tools.artifact.layouts import block_scale_geometry, encoded_size
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.methods import grouped_absmax, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
+from tools.convert.official_recipes import _moe_encoded_source
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import EncodedRows, LogicalSource, array_source
+from tools.convert.sources.safetensors import SafetensorsSource
 
 
 def _model(names=("query", "key", "gate", "value")):
@@ -154,12 +158,15 @@ def test_shared_weight_keeps_use_independent_and_can_be_overridden():
     assert independent.bindings["key"] != independent.bindings["context_key"]
 
 
-def _encoded_source(name, divisor, shift=0):
+def _encoded_source(name, divisor, shift=0, rows=128, activation=None):
     codes = (
-        (torch.arange(128 * 32) + shift).remainder(256).to(torch.uint8).reshape(128, 32)
+        (torch.arange(rows * 32) + shift)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(rows, 32)
     )
     scales = (
-        (torch.arange(128 * 4) + shift).remainder(127).to(torch.uint8).reshape(128, 4)
+        (torch.arange(rows * 4) + shift).remainder(127).to(torch.uint8).reshape(rows, 4)
     )
     word = struct.pack("<f", divisor)
 
@@ -168,13 +175,14 @@ def _encoded_source(name, divisor, shift=0):
 
     return (
         LogicalSource(
-            (128, 64),
+            (rows, 64),
             name,
             no_values,
             lambda begin, end: EncodedRows(
                 "nvfp4", codes[begin:end], scales[begin:end], word
             ),
             lambda: word,
+            None if activation is None else (lambda: struct.pack("<f", activation)),
         ),
         codes,
         scales,
@@ -213,18 +221,83 @@ def test_nvfp4_encoded_only_import_streams_complete_parent_tiles(tmp_path):
         )
 
 
-def test_incompatible_nvfp4_divisors_keep_default_parents_separate():
+def test_differing_nvfp4_divisors_stay_apart_by_default_and_stack_when_grouped(tmp_path):
+    """Sources quantised apart are not merged unasked, and keep both divisors when they are.
+
+    Default packing leaves them as separate parents because nothing said they belong together.
+    An explicit group does say so, and the parent then stores one divisor per source instead of
+    rewriting either source's block scales onto the other's divisor.
+    """
+
     model = Model({"text": {"config": {}}})
+    words = []
     for name, divisor in (("gate", 2.0), ("up", 4.0)):
         source, _, _ = _encoded_source(name, divisor)
         model.add(Parameter(name, source.shape, source))
+        words.append(struct.pack("<f", divisor))
     model.packing_groups = [("gate", "up")]
     recipe = Recipe(model)
     recipe.assign("*", format="nvfp4", method=import_encoded)
     assert len(recipe.prepare(device="cpu").weights) == 2
+
     recipe.group(("gate", "up"))
-    with pytest.raises(ValueError, match="weight divisors differ"):
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert len(prepared.weights) == 1
+    spec = prepared.weights[0].spec
+    assert spec.divisors == 2
+    path = tmp_path / "stacked.ninfer"
+    _write(path, model, prepared)
+    with Artifact(path) as artifact:
+        payload = artifact.read_object(spec.id)
+    geometry = block_scale_geometry("nvfp4", spec.shape, spec.divisors)
+    assert payload[geometry.weight_divisor_offset :] == words[0] + words[1]
+
+
+def test_sources_sharing_one_nvfp4_divisor_stay_at_one_divisor():
+    """Stacking is not what makes a parent hold several divisors -- disagreement is."""
+
+    model = Model({"text": {"config": {}}})
+    for name in ("gate", "up"):
+        source, _, _ = _encoded_source(name, 2.0)
+        model.add(Parameter(name, source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.group(("gate", "up"))
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert prepared.weights[0].spec.divisors == 1
+
+
+def test_unequal_nvfp4_sources_with_different_divisors_are_refused_at_plan_time():
+    """A divisor per source addresses an equal share of the rows, so the sources must be equal.
+
+    The refusal belongs where the parent's shape is chosen: every method has already run by the
+    time the writer would notice.
+    """
+
+    model = Model({"text": {"config": {}}})
+    for name, divisor, rows in (("gate", 2.0, 256), ("up", 4.0, 128)):
+        source, _, _ = _encoded_source(name, divisor, rows=rows)
+        model.add(Parameter(name, source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.group(("gate", "up"))
+    with pytest.raises(ValueError, match="equal row counts"):
         recipe.prepare(device="cpu")
+
+
+def test_a_divisor_may_not_cover_part_of_a_scale_tile():
+    """The scale plane is addressed in whole 128-row tiles, so a source shorter than one is not
+    representable however its rows divide the parent."""
+
+    with pytest.raises(ValueError, match="128-row scale tiles"):
+        block_scale_geometry("nvfp4", (256, 64), 4)
+
+
+def test_only_the_block_scale_layout_stores_several_divisors():
+    """Other layouts have nowhere to put them, and the engine refuses such an object outright."""
+
+    with pytest.raises(ValueError, match="stores one divisor"):
+        encoded_size("contiguous_le_v1", "bf16", (4, 128), 3)
 
 
 def test_alias_does_not_inherit_another_uses_calibration():
@@ -268,3 +341,142 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
     prepared = shared.prepare(device="cpu")
     assert len(prepared.weights) == 1
     assert prepared.bindings["draft"] == prepared.bindings["target"]
+
+
+def test_allow_a4_without_an_override_takes_the_source_activation_divisor():
+    """An AllowA4 input with no override has to carry the source's own calibrated word.
+
+    `prepare_sparse_moe_weights` refuses an AllowA4 input that has no activation divisor, so a
+    conversion that emits none produces an artifact that fails at bind rather than at build.
+    """
+
+    model = Model({"text": {"config": {}}})
+    source, _, _ = _encoded_source("gate", 2.0, activation=3.0)
+    model.add(Parameter("gate", source.shape, source, inputs=("input",)))
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.use("gate", "input", activation_policy="AllowA4")
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert len(prepared.auxiliaries) == 1
+    assert prepared.auxiliaries[0][1] == struct.pack("<f", 3.0)
+
+
+def test_a_stacked_parent_takes_the_smallest_source_activation_divisor():
+    """One plane, one quantised activation, so exactly one of the sources' words can survive.
+
+    It cancels in the GEMM's alpha, so the choice only decides where a block scale lands on the
+    e4m3 grid; the smallest is the one direction that cannot saturate another source's blocks
+    upward.
+    """
+
+    model = Model({"text": {"config": {}}})
+    # The smallest is neither the first nor the last source, so a lookup that takes either is
+    # caught rather than agreeing with the answer by accident.
+    for name, divisor, activation in (("gate", 4.0, 7.0), ("up", 2.0, 5.0), ("extra", 3.0, 9.0)):
+        source, _, _ = _encoded_source(name, divisor, activation=activation)
+        model.add(Parameter(name, source.shape, source, inputs=("input",)))
+    model.packing_groups = [("gate", "up", "extra")]
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.group(("gate", "up", "extra"))
+    recipe.use("gate", "input", activation_policy="AllowA4")
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert prepared.weights[0].spec.divisors == 3
+    assert len(prepared.auxiliaries) == 1
+    assert prepared.auxiliaries[0][1] == struct.pack("<f", 5.0)
+
+
+def test_one_weight_divisor_still_shares_one_activation_divisor():
+    """Agreeing on the weight divisor does not mean agreeing on the activation one.
+
+    The two are calibrated apart, so a parent can collapse to a single weight divisor and still
+    hold sources with different activation words. Both words reaching the artifact has the bank
+    refused at bind, so the plane has to settle on one here.
+    """
+
+    model = Model({"text": {"config": {}}})
+    for name, activation in (("gate", 7.0), ("up", 5.0)):
+        source, _, _ = _encoded_source(name, 2.0, activation=activation)
+        model.add(Parameter(name, source.shape, source, inputs=("input",)))
+    model.packing_groups = [("gate", "up")]
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.group(("gate", "up"))
+    recipe.use("gate", "input", activation_policy="AllowA4")
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    assert prepared.weights[0].spec.divisors == 1
+    assert len(prepared.auxiliaries) == 1
+    assert prepared.auxiliaries[0][1] == struct.pack("<f", 5.0)
+
+
+def _moe_parameter(name, shape):
+    """A routed expert matrix as the MoE description declares it: a projection of that shape."""
+    return Parameter(
+        name, shape, array_source(torch.zeros(shape), name), inputs=("ffn_input",)
+    )
+
+
+def _nvfp4_expert_checkpoint(tmp_path, rows, columns, prefixes):
+    """One compressed-tensors shard holding several per-expert NVFP4 matrices."""
+    tensors = {}
+    for index, prefix in enumerate(prefixes):
+        tensors[f"{prefix}.weight_packed"] = torch.full(
+            (rows, columns // 2), 0x32 + index, dtype=torch.uint8
+        )
+        tensors[f"{prefix}.weight_scale"] = torch.full(
+            (rows, columns // 16), 0x38, dtype=torch.uint8
+        ).view(torch.float8_e4m3fn)
+        tensors[f"{prefix}.weight_global_scale"] = torch.tensor(
+            [2.0], dtype=torch.float32
+        )
+        tensors[f"{prefix}.input_global_scale"] = torch.tensor(
+            [1.5], dtype=torch.float32
+        )
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    return SafetensorsSource(tmp_path)
+
+
+def test_moe_encoded_source_maps_routed_and_shared_experts(tmp_path):
+    rows, columns = 128, 64
+    layer, expert = "7", "13"
+    routed = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
+    shared = f"model.language_model.layers.{layer}.mlp.shared_expert"
+    prefixes = [
+        f"{routed}.gate_proj",
+        f"{routed}.up_proj",
+        f"{routed}.down_proj",
+        f"{shared}.gate_proj",
+        f"{shared}.down_proj",
+    ]
+    with _nvfp4_expert_checkpoint(tmp_path, rows, columns, prefixes) as store:
+        for name, expected in (
+            (f"text/layers/{layer}/moe/experts/{expert}/gate", prefixes[0]),
+            (f"text/layers/{layer}/moe/experts/{expert}/up", prefixes[1]),
+            (f"text/layers/{layer}/moe/experts/{expert}/down", prefixes[2]),
+            (f"text/layers/{layer}/moe/shared/gate", prefixes[3]),
+            (f"text/layers/{layer}/moe/shared/down", prefixes[4]),
+        ):
+            source = _moe_encoded_source(
+                store, _moe_parameter(name, (rows, columns)), name
+            )
+            assert expected in source.label
+            words = source.read_encoded(0, rows)
+            assert words.format == "nvfp4"
+            assert tuple(words.codes.shape) == (rows, columns // 2)
+            assert words.weight_divisor == struct.pack("<f", 2.0)
+            assert source.input_divisor() == struct.pack("<f", 1.5)
+
+
+def test_moe_encoded_source_reports_a_missing_or_mismatched_expert(tmp_path):
+    rows, columns = 128, 64
+    present = "model.language_model.layers.0.mlp.experts.0.gate_proj"
+    with _nvfp4_expert_checkpoint(tmp_path, rows, columns, [present]) as store:
+        missing = "text/layers/0/moe/experts/1/gate"
+        with pytest.raises(ValueError, match="no NVFP4 source"):
+            _moe_encoded_source(store, _moe_parameter(missing, (rows, columns)), missing)
+        name = "text/layers/0/moe/experts/0/gate"
+        source = _moe_encoded_source(
+            store, _moe_parameter(name, (rows, columns + 16)), name
+        )
+        with pytest.raises(ValueError, match="expected"):
+            source.read_encoded(0, rows)

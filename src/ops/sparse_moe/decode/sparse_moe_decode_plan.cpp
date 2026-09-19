@@ -25,7 +25,11 @@ SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up, QType r
         (routed_down == QType::Q5_G64_FP16 || routed_down == QType::Q6_G64_FP16);
     const bool mtp_profile =
         routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
-    if (!main_profile && !mtp_profile) {
+    // The decode kernels are CUDA-core dot products, so NVFP4 is read here against represented
+    // BF16 activations: four-bit activations buy no arithmetic on this path and would cost a
+    // quantiser kernel of their own.
+    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    if (!main_profile && !mtp_profile && !nvfp4_profile) {
         throw std::invalid_argument("sparse_moe: unsupported routed codec profile");
     }
 

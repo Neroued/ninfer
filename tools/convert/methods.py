@@ -249,7 +249,26 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
         raise ValueError("import_encoded requires a known encoded matrix target")
     _preflight(request, values=False)
     auxiliaries = {}
-    weight_divisor = None
+    # The sources of one parent read one activation tensor, which is quantised once, and the
+    # consumer holds one `input_scale_divisor` for the whole plane - so exactly one of their
+    # calibrated divisors can survive. It cancels in the GEMM's alpha, so the choice only decides
+    # where a block scale lands on the e4m3 grid; the smallest is taken, the one direction that
+    # cannot saturate another source's blocks upward.
+    #
+    # This is decided by the number of sources, not by `divisors`: the two are calibrated apart, so
+    # sources that agree on their weight divisor - which collapses `divisors` to one - can still
+    # disagree here, and keeping both words has the bank refused at bind.
+    activation_divisor = None
+    if request.target.format == "nvfp4" and len(request.inputs) > 1:
+        words = [
+            item.source.input_divisor()
+            for item in request.inputs
+            if item.source.input_divisor is not None
+        ]
+        if words:
+            activation_divisor = min(
+                words, key=lambda word: struct.unpack("<f", word)[0]
+            )
     for item in request.inputs:
         source = item.source
         if source.read_encoded is None:
@@ -260,12 +279,6 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                 f"{item.parameter}: source {first.format} differs from target {request.target.format}"
             )
         if first.format == "nvfp4":
-            if weight_divisor is None:
-                weight_divisor = first.weight_divisor
-            elif first.weight_divisor != weight_divisor:
-                raise ValueError(
-                    "NVFP4 weight divisors differ; choose separate parents or a conversion method"
-                )
             for parameter, input_name in item.uses:
                 key = (parameter, input_name, "activation_input_divisor")
                 if key in request.auxiliary_overrides:
@@ -276,7 +289,9 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                             f"{parameter}: supply an activation divisor for AllowA4"
                         )
                     auxiliaries[key] = AuxiliaryValue.activation_divisor(
-                        source.input_divisor()
+                        activation_divisor
+                        if activation_divisor is not None
+                        else source.input_divisor()
                     )
     n = request.target.shape[0]
     chunk = (
@@ -286,9 +301,22 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     )
 
     def produce(output):
-        for begin in range(0, n, chunk):
-            words = request.encoded_rows(begin, min(n, begin + chunk))
-            output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+        # A stacked plane starts a new run of chunks at every source boundary, because a chunk that
+        # straddled two sources would carry two divisors and a row block carries one. A plane of one
+        # source keeps the single run it always had, so its chunking is untouched.
+        bounds = [n]
+        if request.target.divisors > 1:
+            bounds = []
+            edge = 0
+            for item in request.inputs:
+                edge += item.source.shape[0]
+                bounds.append(edge)
+        cursor = 0
+        for edge in bounds:
+            for begin in range(cursor, edge, chunk):
+                words = request.encoded_rows(begin, min(edge, begin + chunk))
+                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+            cursor = edge
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
 

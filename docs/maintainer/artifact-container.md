@@ -237,6 +237,7 @@ Target 引用须能找到对应组件，其数学关联由架构 binder 检查�
 | layout | ID | 第 6 节的布局 |
 | offset | U64 | 对象起点在逻辑 payload 中的字节偏移 |
 | bytes | PositiveU64 | 该对象完整编码的字节数 |
+| divisors | PositiveU64 | 可选，缺省为 1。堆叠进本平面且各自独立量化的源矩阵数量；每个源矩阵各持一个 NVFP4 权重除数，按平面行数均分。仅 `nvfp4` 与 `block_scale_k16_m128x4_v1` 允许大于 1 |
 
 ```json
 {
@@ -322,7 +323,7 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 
 量化名字末尾的 FP16/BF16 表示 scale 类型。激活计算许可在 uses 中表达。
 Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-formats.md)解释。
-尤其是 NVFP4 的重建采用 `code_value * block_scale / weight_divisor`，逐行 FP8 采用其既定的
+尤其是 NVFP4 的重建采用 `code_value * block_scale / weight_divisor[floor(row / (N / divisors))]`，逐行 FP8 采用其既定的
 `code_value * row_scale` 重建规则。
 
 同一数值含义更换 encoder 或校准过程时，format 名保持相同，生成方法记录在 recipe/provenance。

@@ -47,10 +47,12 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    std::uint64_t divisor_count       = 1;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                                             std::span<const std::uint64_t> shape);
+                                             std::span<const std::uint64_t> shape,
+                                             std::uint64_t divisors = 1);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
 struct WeightParent {

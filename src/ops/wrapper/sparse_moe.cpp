@@ -2,6 +2,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
@@ -137,8 +138,48 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
 }
 
+// The NVFP4 profile is all four expert matrices together: the gate/up epilogue emits the
+// encoded intermediate `down` consumes, so the two cannot be mixed with a groupwise codec.
+bool nvfp4_profile(const SparseMoeWeights& weights) {
+    return weights.routed_gate_up.qtype == QType::NVFP4 &&
+           weights.routed_down.qtype == QType::NVFP4 &&
+           weights.shared_gate_up.qtype == QType::NVFP4 &&
+           weights.shared_down.qtype == QType::NVFP4;
+}
+
+void require_nvfp4(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,
+                   std::vector<AddressRange>& ranges) {
+    require_matrix_metadata(weight, n, k, name);
+    // Every expert matrix was quantised on its own, so each of these planes is a stack.
+    const detail::Nvfp4WeightGeometry geometry =
+        detail::validate_nvfp4_weight(weight, (std::string("sparse_moe ") + name).c_str(), true);
+    ranges.push_back(
+        address_range(weight.qdata, geometry.code_plane_bytes, std::string(name) + " code"));
+    ranges.push_back(
+        address_range(weight.scales, geometry.scale_plane_bytes, std::string(name) + " scales"));
+}
+
 void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, ranges);
+    if (nvfp4_profile(weights)) {
+        require_nvfp4(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
+        require_nvfp4(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
+        require_nvfp4(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up", ranges);
+        require_nvfp4(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
+        // The prefill route encodes the hidden state once and both gate/up GEMMs read that one
+        // plane, each dividing by its own bank's activation divisor. Two different divisors would
+        // scale the shared expert's whole contribution by their ratio, silently.
+        if (weights.routed_gate_up.input_scale_divisor !=
+            weights.shared_gate_up.input_scale_divisor) {
+            throw std::invalid_argument(
+                "sparse_moe: routed and shared experts must share one activation divisor");
+        }
+        return;
+    }
+    if (weights.routed_gate_up.qtype == QType::NVFP4 || weights.routed_down.qtype == QType::NVFP4 ||
+        weights.shared_gate_up.qtype == QType::NVFP4 || weights.shared_down.qtype == QType::NVFP4) {
+        throw std::invalid_argument("sparse_moe: NVFP4 requires all four expert matrices");
+    }
     if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
         weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
         throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or Q8");
@@ -169,10 +210,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
 
     const bool q8_profile =
         routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
-    const std::int32_t prefill_first =
-        q8_profile ? detail::kSparseMoePrefillQ8Q8Min
-                   : (routed_down == QType::Q5_G64_FP16 ? detail::kSparseMoePrefillQ4Q5Min
-                                                        : detail::kSparseMoePrefillQ4Q6Min);
+    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    const std::int32_t prefill_first = q8_profile      ? detail::kSparseMoePrefillQ8Q8Min
+                                       : nvfp4_profile ? detail::kSparseMoePrefillNvfp4Min
+                                       : routed_down == QType::Q5_G64_FP16
+                                           ? detail::kSparseMoePrefillQ4Q5Min
+                                           : detail::kSparseMoePrefillQ4Q6Min;
 
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
@@ -186,7 +229,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
 
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
-        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
+        // The prefill workspace query has a floor of its own, and the plan allocates to it, so an
+        // interval whose top is below that floor still has to promise what execution will take.
+        required =
+            std::max(required, detail::sparse_moe_prefill_workspace_bytes(
+                                   std::max(max_tokens, detail::kSparseMoePrefillWorkspaceMin),
+                                   nvfp4_profile));
     }
     return required;
 }
@@ -246,7 +294,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         const detail::SparseMoePrefillWorkspace views =
-            detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens);
+            detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens, plan.nvfp4);
         detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream);
         return;
     }

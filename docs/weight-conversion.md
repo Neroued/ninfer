@@ -54,6 +54,7 @@ The built-in recipes are ordinary Python functions in
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
+| `qwen3_8_27b_q6` | Q4/Q5 projections, Q6 MLP gate/up, Q8 vocabulary weights | None |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
@@ -61,6 +62,32 @@ The built-in recipes are ordinary Python functions in
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
+
+`qwen3_8_27b_q6` differs from `qwen3_8_27b` in one place: the MLP gate and up projections carry Q6
+instead of Q4. Those two parameters are 43% of the text weights, and at 4.25 bits per weight Q4
+leaves precision unused there (11.5% relative weight error against 2.6% for Q6 at 6.25 bits per
+weight). The vocabulary endpoints deliberately stay Q8, which at 8.5 bits per weight already
+outranks Q6.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe qwen3_8_27b_q6 \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name qwen3.8-27b-q6 \
+  --out models/qwen3_8_27b_q6.ninfer
+```
+
+Measured with `ninfer-perplexity` over a 47,917-token corpus at `--context 4096 --stride 2048`
+with `--kv-dtype int8`, this artifact scores 1.520765 against 1.524538 for `qwen3_8_27b` and
+1.530857 for `qwen3_8_27b_nvfp4`.
+
+The FFN evaluates a Q6 gate/up pair through its existing materialized decomposition (the generic
+`linear` op followed by `silu_mul`) rather than the fused `linear_swiglu` op, which has no Q6
+variant. That decomposition costs nothing measurable: forcing the fused Q4 route through the same
+decomposition moves the corpus perplexity from 1.524538 to 1.524618.
 
 For a Qwen3.8-27B NVFP4/FP8 artifact with DFlash2:
 

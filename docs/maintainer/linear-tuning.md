@@ -83,6 +83,9 @@ requirements for the large-extent region, not a mandatory position in the develo
 A retained Linear performance report describes the final implementation's absolute performance.
 Use the [Q4 6144×5120 report](examples/q4-linear.md) as a worked example, with this structure:
 
+Reports for shapes registered later live beside it; the
+[Q6 34816×5120 report](examples/q6-linear.md) records the fused gate/up projection at Q6.
+
 1. State the format/layout, N/K, input/output types, activation policy, GPU/toolchain, timing
    boundary, cache conditions, warmup/repetitions, and latency statistic.
 2. Plot the final latency at every valid T through 128 on linear axes, marking priority points

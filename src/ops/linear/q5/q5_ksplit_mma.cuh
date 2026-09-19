@@ -369,6 +369,13 @@ __launch_bounds__(Q5KSplitMmaSchedule::kThreads, q5_ksplit_min_blocks_per_sm<Til
 // (Capacity - 8, Capacity]. MaxColumns > Capacity launches ceil(T / Capacity) column tiles
 // along blockIdx.y, streaming the weights once per tile; that stays far ahead of the wide GEMM
 // tiles, which compute padded columns, until T approaches a few tiles.
+//
+// Capacity is compile time and sizes the accumulator fragments and the staged item count, so a
+// single wide instance makes small T pay for columns it never fills: one Capacity=32 instance
+// serving all of T<=96 costs the same at T=2 as at T=17. Callers should ladder Capacity to T
+// (4/8/16, then 32 with column tiling) the way the shape dispatchers and the linear_add route do;
+// measured on an RTX 5090, the ladder is 20-40% faster than a lone Capacity=32 instance across
+// T=2..16 on every Q5 shape.
 template <int OutputRows, int InputRows, int Capacity, int MaxColumns = Capacity,
           bool AddResidual = false>
 void launch_q5_ksplit_mma(const Tensor& x, const Weight& weight, Tensor& out,

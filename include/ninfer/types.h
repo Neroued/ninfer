@@ -993,6 +993,22 @@ struct ContextCostSummary {
     std::filesystem::path preset_path;
 };
 
+// Static facts about the loaded model, independent of the current request context and memory
+// layout. The Engine derives the model identity (model_id) and the dimension facts
+// (vocab_size, embedding_size, native_context) from the loaded model, and measures the
+// parameters, weight bytes, and weights profile from the artifact's tensor inventory. Serving
+// renders these into the OpenAI-compatible /v1/models model object and its llama.cpp-compatible
+// `meta` field.
+struct ModelMetadata {
+    std::string model_id;    // Artifact model name (directory metadata "name").
+    std::string weights_id;  // Encoded formats of the artifact tensors (meta ftype).
+    std::uint64_t vocab_size     = 0; // Tokenizer token domain (meta n_vocab).
+    std::uint64_t embedding_size = 0; // Model embedding width (meta n_embd).
+    std::uint64_t native_context = 0; // Model native/training context (meta n_ctx_train).
+    std::uint64_t parameters     = 0; // Total logical weight elements (meta n_params).
+    std::uint64_t weight_bytes   = 0; // Encoded weight payload bytes (meta size).
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;

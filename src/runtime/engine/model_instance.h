@@ -31,6 +31,7 @@ struct ModelInstance {
 struct ConstructedModel {
     std::unique_ptr<ModelInstance> instance;
     LoadSummary load;
+    ModelMetadata model_metadata;
     ContextMachineCostModel context_cost;
 };
 

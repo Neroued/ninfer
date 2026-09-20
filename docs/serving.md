@@ -55,8 +55,8 @@ selected for this process.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Engine readiness |
-| `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
-| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
+| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object |
+| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -81,6 +81,26 @@ a dead or unacknowledging peer is normally cancelled within about 20 seconds, in
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
 connection when the downstream client disappears.
+
+## Models
+
+`GET /v1/models` and `GET /v1/models/{id}` return the configured public OpenAI model alias
+(defaults to the artifact `metadata.name`, overridable with `--model-id`) together with the
+effective `max_model_len` (the `--max-context` ceiling) and a `meta` object in the shape exposed by
+`llama.cpp`. The `meta` facts describe the registered artifact behind the alias:
+
+| Field | Meaning |
+|---|---|
+| `n_vocab` | tokenizer token domain |
+| `n_ctx` | configured per-request context ceiling (equal to `max_model_len`) |
+| `n_ctx_train` | model native/training context |
+| `n_embd` | model embedding width |
+| `n_params` | total logical weight elements across the registered artifact tensors |
+| `size` | encoded weight payload bytes of the registered artifact |
+| `ftype` | encoded tensor formats of the artifact, joined with `+` when mixed |
+
+`GET /v1/models/{id}` returns the same object for the single configured alias and a `404` for any
+other id.
 
 ## OpenAI Chat Completions
 

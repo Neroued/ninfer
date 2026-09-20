@@ -211,7 +211,36 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
-    return {std::move(instance), std::move(summary), std::move(context_cost.model)};
+
+    // Static /v1/models metadata: the model identity and dimension facts come from the loaded
+    // model; the parameters, weight bytes, and weights profile are pure functions of the
+    // artifact's tensor inventory.
+    const auto& text_config = instance->model->config().text;
+    ModelMetadata metadata;
+    metadata.model_id       = summary.model_name;
+    metadata.vocab_size     = text_config.vocab_size;
+    metadata.embedding_size = text_config.hidden_size;
+    metadata.native_context = text_config.max_position_embeddings;
+    std::uint64_t parameters   = 0;
+    std::uint64_t weight_bytes = 0;
+    std::set<std::string> tensor_formats;
+    for (const auto& object : reader.directory().objects) {
+        const auto* tensor = std::get_if<artifact::TensorObject>(&object);
+        if (tensor == nullptr) { continue; } // Non-weight resources (tokenizer, templates).
+        std::uint64_t elements = 1;
+        for (const auto dimension : tensor->shape) { elements *= dimension; }
+        parameters     += elements;
+        weight_bytes   += tensor->bytes;
+        tensor_formats.emplace(tensor->format);
+    }
+    metadata.parameters   = parameters;
+    metadata.weight_bytes = weight_bytes;
+    for (const auto& format : tensor_formats) {
+        if (!metadata.weights_id.empty()) { metadata.weights_id += "+"; }
+        metadata.weights_id += format;
+    }
+    return {std::move(instance), std::move(summary), std::move(metadata),
+            std::move(context_cost.model)};
 }
 
 } // namespace ninfer::runtime

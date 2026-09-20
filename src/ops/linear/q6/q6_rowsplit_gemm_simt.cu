@@ -10,10 +10,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using SimtR8C4Schedule = Q6RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using SimtR8C5Schedule = Q6RowSplitSimtGemmSchedule<8, 5, 16, 2, Cache::ca, 1>;
-using SimtR8C6Schedule = Q6RowSplitSimtGemmSchedule<8, 6, 16, 2, Cache::ca, 1>;
-using SimtR8C7Schedule = Q6RowSplitSimtGemmSchedule<8, 7, 16, 2, Cache::ca, 1>;
+using SimtR8C4Schedule = Q6RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::cg, 1>;
+using SimtR8C5Schedule = Q6RowSplitSimtGemmSchedule<8, 5, 16, 2, Cache::cg, 1>;
+using SimtR8C6Schedule = Q6RowSplitSimtGemmSchedule<8, 6, 16, 2, Cache::cg, 1>;
+using SimtR8C7Schedule = Q6RowSplitSimtGemmSchedule<8, 7, 16, 2, Cache::cg, 1>;
 
 template <class Schedule>
 void launch_schedule(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

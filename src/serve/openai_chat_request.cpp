@@ -584,6 +584,9 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     for (std::size_t index = 0; index < messages.size(); ++index) {
         output.messages.push_back(parse_message(messages.at(index), index));
     }
+    if (!output.messages.empty() && output.messages.back().role == ChatRole::Assistant) {
+        output.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    }
 }
 
 void parse_tools(const Json& body, GenerationRequest& output) {

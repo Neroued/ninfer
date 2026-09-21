@@ -186,11 +186,6 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             break;
         }
     }
-    if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
-        result.enable_thinking == true) {
-        invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
-                              "messages", "assistant_prefill_not_supported");
-    }
     return result;
 }
 

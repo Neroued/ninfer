@@ -99,23 +99,43 @@ std::string_view extract_name_from_tag_header(std::string_view header) {
     if (header.starts_with('=')) {
         return unquote(header.substr(1));
     }
-    std::size_t name_pos = header.find("name");
-    if (name_pos != std::string_view::npos) {
-        std::size_t eq_pos = header.find('=', name_pos + 4);
-        if (eq_pos != std::string_view::npos) {
-            std::string_view val = trim_format_whitespace(header.substr(eq_pos + 1));
-            if (!val.empty() && (val.front() == '"' || val.front() == '\'')) {
-                char q = val.front();
-                std::size_t q_end = val.find(q, 1);
+    for (std::size_t i = 0; i < header.size();) {
+        if (is_format_whitespace(header[i])) {
+            ++i;
+            continue;
+        }
+        const std::size_t attr_begin = i;
+        while (i < header.size() && header[i] != '=' && !is_format_whitespace(header[i]) && header[i] != '>') {
+            ++i;
+        }
+        const std::string_view attr_name = header.substr(attr_begin, i - attr_begin);
+        skip_format_whitespace(header, i);
+        if (i < header.size() && header[i] == '=') {
+            ++i;
+            skip_format_whitespace(header, i);
+            if (i >= header.size()) break;
+            std::string_view val;
+            if (header[i] == '"' || header[i] == '\'') {
+                const char q = header[i];
+                const std::size_t q_start = i + 1;
+                const std::size_t q_end = header.find(q, q_start);
                 if (q_end != std::string_view::npos) {
-                    return val.substr(1, q_end - 1);
+                    val = header.substr(q_start, q_end - q_start);
+                    i = q_end + 1;
+                } else {
+                    val = header.substr(q_start);
+                    i = header.size();
                 }
+            } else {
+                const std::size_t val_begin = i;
+                while (i < header.size() && !is_format_whitespace(header[i]) && header[i] != '/' && header[i] != '>') {
+                    ++i;
+                }
+                val = header.substr(val_begin, i - val_begin);
             }
-            std::size_t end = 0;
-            while (end < val.size() && !is_format_whitespace(val[end]) && val[end] != '/' && val[end] != '>') {
-                ++end;
+            if (attr_name == "name") {
+                return val;
             }
-            return val.substr(0, end);
         }
     }
     return unquote(header);
@@ -605,7 +625,7 @@ private:
 
         for (;;) {
             skip_format_whitespace(text_, pos);
-            if (consume(pos, fn_close) || consume(pos, "</function>") || consume(pos, "</invoke>")) {
+            if (consume(pos, fn_close)) {
                 return FallbackReason::None;
             }
             const FallbackReason failure = parse_parameter(pos, call);
@@ -615,10 +635,13 @@ private:
 
     FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) const {
         std::size_t header_begin = 0;
+        std::string_view param_close = "</parameter>";
         if (starts_with_at(text_, pos, "<parameter")) {
             header_begin = pos + 10;
+            param_close  = "</parameter>";
         } else if (starts_with_at(text_, pos, "<param")) {
             header_begin = pos + 6;
+            param_close  = "</param>";
         } else {
             return FallbackReason::MalformedStructure;
         }
@@ -636,7 +659,7 @@ private:
         const std::size_t value_begin = tag_end + 1;
         std::size_t value_end         = 0;
         std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len)) {
+        if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
             return FallbackReason::MalformedStructure;
         }
         const std::string_view value = text_.substr(value_begin, value_end - value_begin);
@@ -659,19 +682,18 @@ private:
     }
 
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
-                              std::size_t& close_len) const {
+                              std::size_t& close_len, std::string_view required_close) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         while (scan < text_.size()) {
-            std::size_t tag_size = 0;
-            if (is_param_close_at(text_, scan, tag_size)) {
+            if (starts_with_at(text_, scan, required_close)) {
                 --depth;
                 if (depth == 0) {
                     value_end = scan;
-                    close_len = tag_size;
+                    close_len = required_close.size();
                     return true;
                 }
-                scan += tag_size;
+                scan += required_close.size();
                 continue;
             }
             std::size_t open_tag_end = 0;

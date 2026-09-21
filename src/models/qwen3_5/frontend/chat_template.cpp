@@ -160,11 +160,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     Json context = template_parameters(options, special_tokens_);
     if (continuation) {
         const auto& final = messages.back();
-        if (final.role != ChatRole::Assistant || final.has_media() ||
-            !final.reasoning_content.empty() || !final.tool_calls.empty() ||
-            context.value("enable_thinking", false)) {
-            throw std::invalid_argument("assistant continuation requires a final text-only "
-                                        "assistant message and disabled thinking");
+        if (final.role != ChatRole::Assistant || final.has_media()) {
+            throw std::invalid_argument("assistant continuation requires a final assistant message without media");
         }
     }
     context["continue_final_message"] = continuation;

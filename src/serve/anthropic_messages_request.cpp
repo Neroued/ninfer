@@ -630,14 +630,6 @@ void parse_messages(const Json& body, GenerationRequest& request) {
     lower_messages(std::move(parsed), request);
 
     if (!request.messages.empty() && request.messages.back().role == ChatRole::Assistant) {
-        const ChatTurn& final = request.messages.back();
-        if (final.content.empty() || !final.reasoning_content.empty() ||
-            !final.tool_calls.empty() ||
-            std::any_of(final.content.begin(), final.content.end(),
-                        [](const ContentPart& part) { return part.kind != ContentKind::Text; })) {
-            bad_request("a final assistant prefill must contain only text", "messages",
-                        "assistant_prefill_not_supported");
-        }
         request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
     }
 }

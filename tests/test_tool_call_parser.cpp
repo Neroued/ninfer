@@ -805,6 +805,117 @@ int test_duplicate_identical_parameters_coalesced() {
     return failures;
 }
 
+int test_attribute_token_boundary() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string text =
+        "<tool_call>\n<function filename=\"x\" name=\"TaskCreate\">\n"
+        "<parameter filename=\"ignored\" name=\"description\">\nCreate task\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 128, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "TaskCreate",
+                      "attribute token boundary failed to extract correct name");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Create task",
+                          "parameter attribute token boundary failed");
+    }
+    return failures;
+}
+
+int test_mismatched_closing_tags_rejected() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string fn_invoke_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</invoke>\n</tool_call>";
+    failures += check_rejected(fn_invoke_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "function opening with invoke closing tag was accepted");
+
+    const std::string invoke_fn_mismatch =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(invoke_fn_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "invoke opening with function closing tag was accepted");
+
+    const std::string param_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</param>\n</function>\n</tool_call>";
+    failures += check_rejected(param_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "parameter opening with param closing tag was accepted");
+
+    const std::string param_open_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(param_open_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "param opening with parameter closing tag was accepted");
+
+    return failures;
+}
+
+int test_claude_code_plan_and_task_create_exact_repro() {
+    const std::string task_create_def = tool_definition(
+        "TaskCreate",
+        Json{{"description", Json{{"type", "string"}}},
+             {"task_type", Json{{"type", "string"}}},
+             {"priority", Json{{"type", "integer"}}}});
+    const std::string task_update_def = tool_definition(
+        "TaskUpdate",
+        Json{{"taskId", Json{{"type", "string"}}},
+             {"status", Json{{"type", "string"}}}});
+    const auto contract =
+        contract_from_definitions({task_create_def, task_update_def});
+
+    const std::string full_response =
+        "I have analyzed the repository requirements. Here is the implementation plan:\n\n"
+        "### Plan\n"
+        "1. Inspect existing CUDA kernels in `src/ops/softmax_attention/`\n"
+        "2. Add test coverage for long context attention splits\n"
+        "3. Update frontend tool call decoder\n\n"
+        "Let me create the first task in the tracking system now:\n\n"
+        "<tool_call>\n"
+        "<function name=\"TaskCreate\">\n"
+        "<parameter name=\"description\">\n"
+        "Implement split-KV page-safety and bounded loops\n"
+        "</parameter>\n"
+        "<parameter name=\"task_type\">\n"
+        "feature\n"
+        "</parameter>\n"
+        "<parameter name=\"priority\">\n"
+        "1\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    const auto parsed = fi::parse_qwen_tool_call_output(full_response, 128, *contract);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "Claude Code Plan + TaskCreate failed to parse as tool call");
+    failures += check(parsed.tool_calls.size() == 1, "tool call count != 1");
+    failures += check(parsed.content.starts_with("I have analyzed"), "plan content prefix lost");
+    failures += check(parsed.content.ends_with("tracking system now:"), "plan content tail lost");
+
+    if (parsed.tool_calls.size() == 1) {
+        const auto& call = parsed.tool_calls.front();
+        failures += check(call.name == "TaskCreate", "tool name != TaskCreate");
+        const Json args = Json::parse(call.arguments_json);
+        failures += check(args.at("description") == "Implement split-KV page-safety and bounded loops",
+                          "TaskCreate description argument changed");
+        failures += check(args.at("task_type") == "feature", "TaskCreate task_type argument changed");
+        failures += check(args.at("priority") == 1, "TaskCreate priority argument changed");
+    }
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -830,6 +941,9 @@ int main() {
     failures += test_incremental_embedded_parameter_markup();
     failures += test_claude_code_xml_markup_variants();
     failures += test_duplicate_identical_parameters_coalesced();
+    failures += test_attribute_token_boundary();
+    failures += test_mismatched_closing_tags_rejected();
+    failures += test_claude_code_plan_and_task_create_exact_repro();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

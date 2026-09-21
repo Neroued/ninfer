@@ -491,9 +491,8 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
                       "disabled-Thinking assistant prefill was rejected");
     body.erase("thinking");
-    failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
-                          "assistant_prefill_not_supported",
-                      "Thinking-on assistant prefill was not rejected at capability resolution");
+    failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
+                      "Thinking-on assistant prefill was rejected at capability resolution");
     return failures;
 }
 

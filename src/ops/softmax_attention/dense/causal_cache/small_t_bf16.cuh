@@ -143,8 +143,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     assert(page_count <= PageIds);
-    const int bounded_pages = min(page_count, PageIds);
-    for (int page = tid; page < bounded_pages; page += Threads) {
+    for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
 

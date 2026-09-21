@@ -87,6 +87,7 @@ private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
     std::string trailing_whitespace_;
     std::string tool_region_;
+    std::string pending_tag_;
     std::size_t marker_prefix_bytes_  = 0;
     std::size_t max_tool_name_length_ = 0;
     bool saw_tool_marker_             = false;

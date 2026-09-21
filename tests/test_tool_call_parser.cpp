@@ -733,6 +733,78 @@ int test_incremental_embedded_parameter_markup() {
     return failures;
 }
 
+int test_claude_code_xml_markup_variants() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string standard_xml =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Initial setup\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_standard = fi::parse_qwen_tool_call_output(standard_xml, 128, contract);
+    failures += check(parsed_standard.is_tool_call_response && parsed_standard.tool_calls.size() == 1 &&
+                          parsed_standard.tool_calls.front().name == "TaskCreate",
+                      "function name attribute syntax was not parsed");
+    if (parsed_standard.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_standard.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Initial setup",
+                          "function name attribute argument changed");
+    }
+
+    const std::string invoke_xml =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Create tasks\n</parameter>\n</invoke>\n</tool_call>";
+    const auto parsed_invoke = fi::parse_qwen_tool_call_output(invoke_xml, 128, contract);
+    failures += check(parsed_invoke.is_tool_call_response && parsed_invoke.tool_calls.size() == 1 &&
+                          parsed_invoke.tool_calls.front().name == "TaskCreate",
+                      "invoke tag syntax was not parsed");
+
+    const std::string function_calls_xml =
+        "<function_calls>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Function calls container\n</parameter>\n</invoke>\n</function_calls>";
+    const auto parsed_function_calls = fi::parse_qwen_tool_call_output(function_calls_xml, 128, contract);
+    failures += check(parsed_function_calls.is_tool_call_response && parsed_function_calls.tool_calls.size() == 1 &&
+                          parsed_function_calls.tool_calls.front().name == "TaskCreate",
+                      "function_calls container syntax was not parsed");
+
+    const std::string standalone_invoke =
+        "Plan is ready:\n<invoke name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Standalone invoke\n</param>\n</invoke>";
+    const auto parsed_standalone = fi::parse_qwen_tool_call_output(standalone_invoke, 128, contract);
+    failures += check(parsed_standalone.is_tool_call_response && parsed_standalone.content == "Plan is ready:" &&
+                          parsed_standalone.tool_calls.size() == 1 &&
+                          parsed_standalone.tool_calls.front().name == "TaskCreate",
+                      "standalone invoke after plan was not parsed");
+
+    return failures;
+}
+
+int test_duplicate_identical_parameters_coalesced() {
+    const auto contract =
+        contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string identical_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nfirst\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_identical = fi::parse_qwen_tool_call_output(identical_dup, 64, contract);
+    failures += check(parsed_identical.is_tool_call_response && parsed_identical.tool_calls.size() == 1,
+                      "duplicate identical parameter was not coalesced");
+    if (parsed_identical.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_identical.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "first", "coalesced parameter value changed");
+    }
+
+    const std::string conflicting_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nsecond\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(conflicting_dup, contract,
+                               ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+                               "conflicting duplicate parameter was not rejected");
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -756,6 +828,8 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_claude_code_xml_markup_variants();
+    failures += test_duplicate_identical_parameters_coalesced();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

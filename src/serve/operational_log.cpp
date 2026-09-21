@@ -298,10 +298,23 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
     }
+    // The reason alone names the verdict, not the markup that earned it.
+    constexpr std::size_t kMarkupSnippetBytes = 240;
+    std::string snippet;
+    if (const std::size_t marker = outcome.text.find("<tool_call>");
+        marker != std::string::npos) {
+        snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
+        if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
+        for (char& byte : snippet) {
+            if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+        }
+    }
+
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   (snippet.empty() ? std::string{} : " | " + snippet),
     };
 }
 

@@ -776,6 +776,42 @@ int test_common_objects() {
     return failures;
 }
 
+int test_assistant_continuation_mode() {
+    int failures = 0;
+
+    // Normal conversation ending with user -> NewAssistantTurn
+    Json normal = Json{
+        {"model", "qwen"},
+        {"messages", Json::array({
+            Json{{"role", "system"}, {"content", "system prompt"}},
+            Json{{"role", "user"}, {"content", "first question"}},
+            Json{{"role", "assistant"}, {"content", "first answer"}},
+            Json{{"role", "user"}, {"content", "second question"}}
+        })}
+    };
+    const auto normal_req = parse(normal);
+    failures += check(normal_req.generation.continuation == ninfer::PromptContinuationMode::NewAssistantTurn,
+                      "conversation ending with user was not NewAssistantTurn");
+
+    // Conversation ending with assistant -> ContinueFinalAssistant
+    Json trailing_assistant = Json{
+        {"model", "qwen"},
+        {"messages", Json::array({
+            Json{{"role", "system"}, {"content", "system prompt"}},
+            Json{{"role", "user"}, {"content", "question"}},
+            Json{{"role", "assistant"}, {"content", "partial answer..."}}
+        })}
+    };
+    const auto cont_req = parse(trailing_assistant);
+    failures += check(cont_req.generation.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                      "conversation ending with assistant was not ContinueFinalAssistant");
+    const auto cont_prompt = prompt(cont_req.generation);
+    failures += check(cont_prompt.options.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                      "continuation mode did not reach PromptInput options");
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -791,6 +827,7 @@ int main() {
     failures += test_stream_response();
     failures += test_stream_observations();
     failures += test_common_objects();
+    failures += test_assistant_continuation_mode();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

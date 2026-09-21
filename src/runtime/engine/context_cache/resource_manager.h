@@ -1937,6 +1937,7 @@ private:
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    .publication_order        = entry.publication_order,
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -2067,9 +2068,11 @@ private:
                         private_has_active_edge(slot)) {
                         return std::nullopt;
                     }
-                    if (publication_slot == kInvalidCatalogSlot &&
-                        outcome.disposition == VictimDisposition::Evicted) {
-                        publication_slot = slot;
+                    if (outcome.disposition == VictimDisposition::Evicted) {
+                        if (publication_slot == kInvalidCatalogSlot ||
+                            entry.publication_order < catalog_[publication_slot].publication_order) {
+                            publication_slot = slot;
+                        }
                     }
                 } else {
                     const std::uint32_t slot = record->capability.slot;

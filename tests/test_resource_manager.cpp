@@ -818,6 +818,8 @@ public:
             FakeActiveCaptureResult result;
             result.status =
                 cancellation.requested() ? ContextTransactionStatus::Aborted : capture_status;
+            result.capacity_preparation_committed =
+                pending_capture_replacement_ && result.status == ContextTransactionStatus::Published;
             if (pending_plan_) {
                 for (std::size_t index = 0; index < pending_plan_->private_actions.size();
                      ++index) {
@@ -981,6 +983,7 @@ public:
         transaction_kind_ = TransactionKind::None;
         pending_plan_.reset();
         pending_capture_publish_shared_ = false;
+        pending_capture_replacement_    = false;
     }
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
@@ -1051,20 +1054,23 @@ public:
 
     [[nodiscard]] ContextTransactionReserveStatus
     reserve_active_capture(FakeCaptureOffer&&, const FakeSharedPrefixHandle*,
-                           const FakeSharedPrefixHandle*, std::optional<CheckpointRef>, bool,
+                           const FakeSharedPrefixHandle* shared_replacement,
+                           std::optional<CheckpointRef>, bool publish_shared,
                            CancellationFlagView cancellation) {
         if (cancellation.requested() || abort_capture_start) {
             return ContextTransactionReserveStatus::Aborted;
         }
         pending_plan_.reset();
-        pending_capture_publish_shared_ = false;
+        pending_capture_publish_shared_ = publish_shared;
+        pending_capture_replacement_    = shared_replacement != nullptr;
         transaction_kind_               = TransactionKind::Capture;
         advance_revision();
         return ContextTransactionReserveStatus::Reserved;
     }
 
     [[nodiscard]] ContextTransactionReserveStatus reserve_active_capture_with_pressure(
-        FakeCaptureOffer&&, const FakeSharedPrefixHandle*, const FakeSharedPrefixHandle*,
+        FakeCaptureOffer&&, const FakeSharedPrefixHandle*,
+        const FakeSharedPrefixHandle* shared_replacement,
         std::optional<CheckpointRef>, bool publish_shared, FakeResourcePlan&& pressure,
         CancellationFlagView cancellation) {
         if (cancellation.requested() || abort_capture_start || pressure.revision != revision_) {
@@ -1079,6 +1085,7 @@ public:
         }
         pending_plan_.emplace(std::move(pressure));
         pending_capture_publish_shared_ = publish_shared;
+        pending_capture_replacement_    = shared_replacement != nullptr;
         transaction_kind_               = TransactionKind::Capture;
         advance_revision();
         return ContextTransactionReserveStatus::Reserved;
@@ -1194,6 +1201,7 @@ private:
     std::optional<FakeResourcePlan> pending_plan_;
     std::unique_ptr<FakeAdmissionCandidate> capture_pressure_candidate_;
     bool pending_capture_publish_shared_ = false;
+    bool pending_capture_replacement_    = false;
 };
 
 FakePressurePlanningSession::FakePressurePlanningSession(
@@ -3452,6 +3460,66 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 }
 
 
+void test_private_continuation_saturation_evicts_oldest_publication_order() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const auto req1 = start_active(manager, program, 100, make_base(100, FakeCacheSessionKey{1}), 10);
+    (void)finish_active(manager, program, req1);
+    const auto req2 = start_active(manager, program, 200, make_base(200, FakeCacheSessionKey{2}), 20);
+    (void)finish_active(manager, program, req2);
+
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
+                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+            "private catalog was not saturated with 2 sessions");
+
+    auto result = manager.inspect(program, FakePreparedPrompt{300}, make_base(300, FakeCacheSessionKey{3}), 30);
+    require(result.choice.has_value(), "private saturation did not produce a feasible materialization choice");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*result.choice), FakePreparedPrompt{300}, {});
+    require(program.started_action_ids.size() == 1 && program.started_action_ids.front() == 2000U + req1.sequence.id,
+            "private continuation saturation did not evict oldest session 1 (publication order 10)");
+}
+
+void test_shared_catalog_continuous_cycles_regression_251() {
+    FakeManager manager = make_manager(1, 2, 7);
+    FakeProgram program;
+    program.finish_frontier = 64;
+
+    for (std::uint32_t i = 1; i <= 50; ++i) {
+        if (i > 1) {
+            FakeRequestBasePlan prev_base = make_base(1000 + i - 1);
+            auto reuse_inspection = manager.inspect(program, FakePreparedPrompt{1000 + i - 1}, prev_base, i * 10 - 5);
+            require(reuse_inspection.choice.has_value(), "prefix reuse failed on continuous cycle");
+        }
+
+        FakeRequestBasePlan shared_base = make_base(1000 + i);
+        shared_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+
+        const ActiveRequest active = start_active(manager, program, 1000 + i, shared_base, i * 10);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 1000 + i, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+
+        const auto reserved = manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = i}, 0, {});
+        require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "shared capture failed to reserve at continuous iteration");
+        auto progress = manager.progress_context_transaction(program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published,
+                "shared capture failed to publish at continuous iteration");
+        (void)finish_active(manager, program, active, 64);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -3525,6 +3593,10 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("private saturation oldest eviction",
+             test_private_continuation_saturation_evicts_oldest_publication_order);
+    run_test("shared catalog continuous cycles regression 251",
+             test_shared_catalog_continuous_cycles_regression_251);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

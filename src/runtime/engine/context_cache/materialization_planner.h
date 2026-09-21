@@ -37,6 +37,7 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    std::uint64_t publication_order        = 0;
 };
 
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
@@ -329,9 +330,10 @@ public:
                 .target                    = target,
                 .candidate_index           = candidate_index,
                 .lower_bound_ns            = cost.lower_bound_ns,
-                .affected_selected_hits    = cost.affected_selected_hits,
-                .newest_affected_hit_epoch = cost.newest_affected_hit_epoch,
-                .owner_evictions           = cost.owner_evictions,
+                .affected_selected_hits          = cost.affected_selected_hits,
+                .newest_affected_hit_epoch       = cost.newest_affected_hit_epoch,
+                .newest_affected_publication_order = cost.newest_affected_publication_order,
+                .owner_evictions                 = cost.owner_evictions,
                 .checkpoint_drops          = cost.checkpoint_drops,
                 .copy_operations           = cost.copy_operations,
                 .transferred_bytes         = cost.transferred_bytes,
@@ -768,28 +770,30 @@ private:
     static constexpr std::uint32_t kTargetBudget = 4096;
 
     struct FoldedCost {
-        std::uint64_t now_ns                    = 0;
-        std::uint64_t future_loss_ns            = 0;
-        std::uint64_t total_ns                  = 0;
-        std::uint64_t lower_bound_ns            = 0;
-        std::uint64_t affected_selected_hits    = 0;
-        std::uint64_t newest_affected_hit_epoch = 0;
-        std::uint32_t owner_evictions           = 0;
-        std::uint32_t checkpoint_drops          = 0;
-        std::uint32_t copy_operations           = 0;
-        std::uint64_t transferred_bytes         = 0;
-        std::uint64_t remaining_text_prefill    = 0;
-        std::uint64_t remaining_vision_prefill  = 0;
-        std::uint32_t reused_prompt_tokens      = 0;
-        bool current_session_binding            = false;
-        std::uint32_t candidate_ordinal         = 0;
-        std::uint32_t target_ordinal            = 0;
+        std::uint64_t now_ns                          = 0;
+        std::uint64_t future_loss_ns                  = 0;
+        std::uint64_t total_ns                        = 0;
+        std::uint64_t lower_bound_ns                  = 0;
+        std::uint64_t affected_selected_hits          = 0;
+        std::uint64_t newest_affected_hit_epoch       = 0;
+        std::uint64_t newest_affected_publication_order = 0;
+        std::uint32_t owner_evictions                 = 0;
+        std::uint32_t checkpoint_drops                = 0;
+        std::uint32_t copy_operations                 = 0;
+        std::uint64_t transferred_bytes               = 0;
+        std::uint64_t remaining_text_prefill          = 0;
+        std::uint64_t remaining_vision_prefill        = 0;
+        std::uint32_t reused_prompt_tokens            = 0;
+        bool current_session_binding                  = false;
+        std::uint32_t candidate_ordinal               = 0;
+        std::uint32_t target_ordinal                  = 0;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
                 total_ns,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
+                newest_affected_publication_order,
                 owner_evictions,
                 checkpoint_drops,
                 copy_operations,
@@ -829,46 +833,48 @@ private:
 
     struct QueueEntry {
         PressureTargetHandle target{};
-        std::uint32_t candidate_index           = 0;
-        std::uint64_t lower_bound_ns            = 0;
-        std::uint64_t affected_selected_hits    = 0;
-        std::uint64_t newest_affected_hit_epoch = 0;
-        std::uint32_t owner_evictions           = 0;
-        std::uint32_t checkpoint_drops          = 0;
-        std::uint32_t copy_operations           = 0;
-        std::uint64_t transferred_bytes         = 0;
-        std::uint64_t remaining_prefill         = 0;
-        std::uint64_t remaining_vision_prefill  = 0;
-        std::uint32_t reused_prompt_tokens      = 0;
-        bool current_session_binding            = false;
-        std::uint32_t candidate_ordinal         = 0;
-        std::uint32_t stable_target_ordinal     = 0;
+        std::uint32_t candidate_index                 = 0;
+        std::uint64_t lower_bound_ns                  = 0;
+        std::uint64_t affected_selected_hits          = 0;
+        std::uint64_t newest_affected_hit_epoch       = 0;
+        std::uint64_t newest_affected_publication_order = 0;
+        std::uint32_t owner_evictions                 = 0;
+        std::uint32_t checkpoint_drops                = 0;
+        std::uint32_t copy_operations                 = 0;
+        std::uint64_t transferred_bytes               = 0;
+        std::uint64_t remaining_prefill               = 0;
+        std::uint64_t remaining_vision_prefill        = 0;
+        std::uint32_t reused_prompt_tokens            = 0;
+        bool current_session_binding                  = false;
+        std::uint32_t candidate_ordinal               = 0;
+        std::uint32_t stable_target_ordinal           = 0;
     };
 
     struct GuidanceCost {
-        std::uint64_t estimated_total_ns        = 0;
-        bool recovery_complete                  = false;
-        bool requires_exact_feedback            = false;
-        bool logical_ready                      = false;
-        std::uint32_t estimated_remaining_steps = 0;
-        std::uint32_t unsatisfied_constraints   = 0;
-        std::uint64_t normalized_residual_q20   = 0;
-        std::uint64_t affected_selected_hits    = 0;
-        std::uint64_t newest_affected_hit_epoch = 0;
-        std::uint64_t retention_weight          = 0;
-        std::uint32_t explicit_shared_losses    = 0;
-        std::uint32_t owner_evictions           = 0;
-        std::uint32_t checkpoint_drops          = 0;
-        std::uint32_t degradation_units         = 0;
-        std::uint64_t estimated_immediate_ns    = 0;
-        std::uint32_t copy_operations           = 0;
-        std::uint64_t transferred_bytes         = 0;
-        std::uint64_t remaining_prefill         = 0;
-        std::uint64_t remaining_vision_prefill  = 0;
-        std::uint32_t reused_prompt_tokens      = 0;
-        bool current_session_binding            = false;
-        std::uint32_t candidate_ordinal         = 0;
-        std::uint32_t stable_target_ordinal     = 0;
+        std::uint64_t estimated_total_ns              = 0;
+        bool recovery_complete                        = false;
+        bool requires_exact_feedback                  = false;
+        bool logical_ready                            = false;
+        std::uint32_t estimated_remaining_steps       = 0;
+        std::uint32_t unsatisfied_constraints         = 0;
+        std::uint64_t normalized_residual_q20         = 0;
+        std::uint64_t affected_selected_hits          = 0;
+        std::uint64_t newest_affected_hit_epoch       = 0;
+        std::uint64_t newest_affected_publication_order = 0;
+        std::uint64_t retention_weight                = 0;
+        std::uint32_t explicit_shared_losses          = 0;
+        std::uint32_t owner_evictions                 = 0;
+        std::uint32_t checkpoint_drops                = 0;
+        std::uint32_t degradation_units               = 0;
+        std::uint64_t estimated_immediate_ns          = 0;
+        std::uint32_t copy_operations                 = 0;
+        std::uint64_t transferred_bytes               = 0;
+        std::uint64_t remaining_prefill               = 0;
+        std::uint64_t remaining_vision_prefill        = 0;
+        std::uint32_t reused_prompt_tokens            = 0;
+        bool current_session_binding                  = false;
+        std::uint32_t candidate_ordinal               = 0;
+        std::uint32_t stable_target_ordinal           = 0;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
@@ -878,6 +884,7 @@ private:
                 owner_evictions,
                 checkpoint_drops,
                 newest_affected_hit_epoch,
+                newest_affected_publication_order,
                 estimated_remaining_steps,
                 unsatisfied_constraints,
                 normalized_residual_q20,
@@ -1036,6 +1043,8 @@ private:
             planning_saturating_add(cost.affected_selected_hits, policy->selected_hit_count);
             cost.newest_affected_hit_epoch =
                 std::max(cost.newest_affected_hit_epoch, policy->last_hit_epoch);
+            cost.newest_affected_publication_order =
+                std::max(cost.newest_affected_publication_order, policy->publication_order);
             planning_saturating_add(cost.retention_weight, policy->private_retention_weight);
             if (policy->explicit_shared_credit) { ++cost.explicit_shared_losses; }
         }
@@ -1120,7 +1129,11 @@ private:
             if (policy == nullptr) {
                 throw std::logic_error("pressure target references an unknown logical owner");
             }
-            if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
+            if (outcome.disposition == VictimDisposition::Evicted) {
+                ++cost.owner_evictions;
+                cost.newest_affected_publication_order =
+                    std::max(cost.newest_affected_publication_order, policy->publication_order);
+            }
         }
 
         impact_scratch_.clear();

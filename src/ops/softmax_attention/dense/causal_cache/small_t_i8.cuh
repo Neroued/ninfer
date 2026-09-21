@@ -187,9 +187,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
-    const int page_count =
-        min(((split_end - 1) >> kPagedKVPageShift) - first_page + 1, PageIds);
-    for (int page = tid; page < page_count; page += Threads) {
+    const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    assert(page_count <= PageIds);
+    const int bounded_pages = min(page_count, PageIds);
+    for (int page = tid; page < bounded_pages; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
 

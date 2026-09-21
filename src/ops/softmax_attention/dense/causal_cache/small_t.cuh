@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include <cassert>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -124,10 +125,8 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
 template <typename Geometry>
 __device__ __forceinline__ int
 causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
-    int splits = causal_small_t_default_splits<Geometry>(window);
-    if constexpr (Geometry::SmallTSplitScale == 1) {
-        if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
-    }
+    (void)tokens;
+    const int splits = causal_small_t_default_splits<Geometry>(window);
     return splits < launch_capacity ? splits : launch_capacity;
 }
 

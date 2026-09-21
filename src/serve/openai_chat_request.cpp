@@ -136,10 +136,11 @@ void validate_standard_output_controls(const Json& body) {
         if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
             bad_request("response_format must contain a string type", "response_format");
         }
-        if (format.at("type").get<std::string>() != "text") {
+        const std::string type = format.at("type").get<std::string>();
+        if (type != "text" && type != "json_object" && type != "json_schema") {
             bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
+                "this response_format requires an unsupported output format; "
+                "only 'text', 'json_object', and 'json_schema' are accepted",
                 "response_format", "response_format_not_supported");
         }
     }

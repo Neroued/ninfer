@@ -109,7 +109,7 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `n:1`, text-only `modalities`, and `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema"}`);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -123,7 +123,7 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.

@@ -40,6 +40,9 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
     if (window > 8198) { include_tier(16390, 256 / Geometry::SmallTSplitScale); }
     if (window > 16390) { include_tier(window, 480 / Geometry::SmallTSplitScale); }
 
+    const std::int32_t page_limit = div_up(window, 3840 / Geometry::SmallTSplitScale);
+    splits = std::max(splits, page_limit);
+
     return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
 }
 
@@ -225,6 +228,7 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
     if (q_heads == CausalD256H24Kv4::QHeads) {
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
+        const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
         if (batch_size > 1) {
             // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
             // leaves room for the indivisible 4*B group, including B=3/5/6/7.
@@ -240,13 +244,17 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
             // key-tile rounding and page alignment at the 262144-key resource limit.
-            const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }
-        return capacity;
+        return std::min(static_cast<int>(CausalD256H24Kv4::SmallTMaximumSplits),
+                        std::max(capacity, page_limit));
     }
     if (q_heads == CausalD256H16Kv2::QHeads) {
-        return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
+        const int capacity =
+            causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
+        const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
+        return std::min(static_cast<int>(CausalD256H16Kv2::SmallTMaximumSplits),
+                        std::max(capacity, page_limit));
     }
     throw std::invalid_argument(
         "causal_softmax_attention split capacity: unsupported head geometry");

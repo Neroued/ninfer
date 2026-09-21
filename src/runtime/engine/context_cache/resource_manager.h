@@ -598,7 +598,7 @@ public:
                 });
                 break;
             }
-            if (pressure_evidence) {
+            if (pressure_evidence || !candidate.physically_feasible || scenarios.empty()) {
                 for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                     SharedCatalogEntry& entry = shared_catalog_[slot];
                     if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
@@ -635,6 +635,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_,
                         program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                    .unreachable          = false,
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -704,6 +705,7 @@ public:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = false,
                 });
             }
 
@@ -730,7 +732,7 @@ public:
                     }
                     return found->id;
                 };
-                if (pressure_evidence) {
+                if (pressure_evidence || !scenario.assessment.physically_feasible) {
                     private_owners.reserve(catalog_count_);
                     private_owner_ids.reserve(catalog_count_);
                     shared_owners.reserve(shared_catalog_count_);
@@ -981,6 +983,7 @@ public:
         publication.session   = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
+        publication.publication_order = active.publication_order;
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
@@ -1160,7 +1163,8 @@ private:
         std::optional<ContinuationHandle> handle;
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
-        RetentionClass retention = RetentionClass::RecentPrivate;
+        RetentionClass retention        = RetentionClass::RecentPrivate;
+        std::uint64_t publication_order = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1716,12 +1720,16 @@ private:
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
+            const std::optional<PrefixShortlistKey> incoming =
+                base.prefix_shortlist_key(checkpoint.shortlist_key.frontier);
+            const bool unreachable = !incoming || *incoming != checkpoint.shortlist_key;
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
                 .owner       = owner,
                 .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
                 .rebuild_ns  = rebuild,
                 .baseline_recovery_ns = recovery,
                 .target_recovery_ns   = recovery,
+                .unreachable          = unreachable,
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -1900,6 +1908,9 @@ private:
                         throw std::logic_error("catalogued checkpoint has no policy observation");
                     }
                     selected_hits = std::max(selected_hits, observation->selected_hit_count);
+                    const std::optional<PrefixShortlistKey> incoming =
+                        base.prefix_shortlist_key(checkpoint.shortlist_key.frontier);
+                    const bool unreachable = !incoming || *incoming != checkpoint.shortlist_key;
                     checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                         .owner              = owner,
                         .checkpoint         = checkpoint.ref,
@@ -1912,6 +1923,7 @@ private:
                         .baseline_recovery_ns = price_checkpoint_recovery_work(
                             cost_model_,
                             program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                        .unreachable          = unreachable,
                     });
                 };
                 if (entry.summary.endpoint) { append_checkpoint(*entry.summary.endpoint); }
@@ -1958,6 +1970,10 @@ private:
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
+                const std::optional<PrefixShortlistKey> incoming =
+                    base.prefix_shortlist_key(entry.summary.checkpoint.shortlist_key.frontier);
+                const bool unreachable =
+                    !incoming || *incoming != entry.summary.checkpoint.shortlist_key;
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner              = owner,
                     .checkpoint         = entry.summary.checkpoint.ref,
@@ -1970,6 +1986,7 @@ private:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .unreachable = unreachable,
                 });
             }
 

@@ -89,6 +89,8 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     }
     constexpr int kMinSplits = 4 * Geometry::SmallTSplitScale;
     int splits               = div_up(window, target_keys_per_split);
+    const int page_limit     = div_up(window, 3840 / Geometry::SmallTSplitScale);
+    splits                   = splits > page_limit ? splits : page_limit;
     splits                   = splits > kMinSplits ? splits : kMinSplits;
     return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
 }

@@ -706,8 +706,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
     if (!engine.options().context_cache.max_shared_prefixes ||
         *engine.options().context_cache.max_shared_prefixes !=
-            ninfer::kMaximumExplicitPromptCacheMarkers) {
-        std::cerr << "single-concurrency Engine did not expose four default shared prefixes\n";
+            ninfer::kMaximumPreparedPromptCacheCandidatesPerRequest) {
+        std::cerr << "single-concurrency Engine did not expose seven default shared prefixes\n";
         return 1;
     }
 

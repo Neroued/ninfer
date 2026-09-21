@@ -58,6 +58,12 @@ struct StopPresentation {
 };
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
+    if (outcome.finish_reason == ninfer::FinishReason::OutputLimit) {
+        return StopPresentation{.reason = "max_tokens"};
+    }
+    if (outcome.finish_reason == ninfer::FinishReason::ContextCapacity) {
+        return StopPresentation{.reason = "model_context_window_exceeded"};
+    }
     if (!outcome.tool_calls.empty()) { return StopPresentation{.reason = "tool_use"}; }
     switch (outcome.finish_reason) {
     case ninfer::FinishReason::OutputLimit:
@@ -69,7 +75,7 @@ StopPresentation stop_presentation(const GenerationOutcome& outcome) {
             throw std::logic_error("stop-string terminal result has no matched declaration");
         }
         return StopPresentation{.reason   = "stop_sequence",
-                                .sequence = *outcome.matched_stop_string};
+                                 .sequence = *outcome.matched_stop_string};
     case ninfer::FinishReason::StopToken:
     case ninfer::FinishReason::None:
         return StopPresentation{.reason = "end_turn"};

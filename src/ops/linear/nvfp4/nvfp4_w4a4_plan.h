@@ -39,8 +39,8 @@ Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t toke
     if (input_rows <= 0 || (input_rows % 64) != 0) {
         throw std::invalid_argument("nvfp4 W4A4 workspace: invalid K");
     }
-    const std::size_t code_bytes =
-        nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 2);
+    const std::size_t code_bytes = nvfp4_w4a4_checked_bytes(
+        nvfp4_w4a4_padded_tokens(tokens), static_cast<std::size_t>(input_rows) / 2);
     // The tiled layout addresses whole tiles, so the scale plane is allocated for the padded token
     // count: at most 255 tokens of scales, under 0.3 MiB on the widest registered K, and paid
     // whichever layout the quantizer then writes.

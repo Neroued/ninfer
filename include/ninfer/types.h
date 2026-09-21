@@ -19,7 +19,8 @@ using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
-inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers              = 4;
+inline constexpr std::size_t kMaximumPreparedPromptCacheCandidatesPerRequest = 7;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -127,7 +128,7 @@ struct StartupObserver {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=2;
     // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.

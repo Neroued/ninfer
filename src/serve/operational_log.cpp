@@ -293,16 +293,32 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
-    const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    if (!outcome.tool_call_parse.marker_seen ||
-        reason == ninfer::ToolCallParseFallbackReason::None) {
+    const ninfer::ToolCallParseDiagnostics& diagnostics = outcome.tool_call_parse;
+    if (!diagnostics.marker_seen) {
         return std::nullopt;
     }
-    return OperationalRecord{
-        .severity = OperationalSeverity::Warning,
-        .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
-    };
+
+    std::ostringstream out;
+    out << "req#" << context.id;
+    if (diagnostics.recovery_reason != ninfer::ToolCallParseFallbackReason::None &&
+        diagnostics.recovered_call_count != 0) {
+        out << " recovered complete tool calls "
+            << product::format_pretty_count(diagnostics.recovered_call_count) << " | "
+            << pretty_code(
+                   ninfer::tool_call_parse_fallback_reason_name(diagnostics.recovery_reason));
+        if (diagnostics.suppressed_marker_bytes != 0) {
+            out << " | suppressed unsafe tool markup "
+                << product::format_pretty_count(diagnostics.suppressed_marker_bytes) << " bytes";
+        }
+    } else if (diagnostics.fallback_reason != ninfer::ToolCallParseFallbackReason::None) {
+        out << " suppressed unsafe tool markup "
+            << product::format_pretty_count(diagnostics.suppressed_marker_bytes) << " bytes | "
+            << pretty_code(
+                   ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason));
+    } else {
+        return std::nullopt;
+    }
+    return OperationalRecord{.severity = OperationalSeverity::Warning, .message = out.str()};
 }
 
 OperationalRecord render_request_failure(const RequestLogContext& context,

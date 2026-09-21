@@ -644,7 +644,7 @@ int test_tool_call_presentation() {
         make_anthropic_response_identity("req_tool", "claude-local");
     GenerationOutcome outcome;
     outcome.text                = "I need one more check.";
-    outcome.finish_reason       = ninfer::FinishReason::StopToken;
+    outcome.finish_reason       = ninfer::FinishReason::OutputLimit;
     const std::string arguments = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name           = "Edit",

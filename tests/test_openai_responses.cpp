@@ -879,16 +879,20 @@ int test_response_object() {
     GenerationOutcome tools = sample_outcome();
     tools.text.clear();
     tools.reasoning.clear();
+    tools.finish_reason = ninfer::FinishReason::OutputLimit;
     tools.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
     const BuiltOpenAIResponse tool_response =
         make_openai_response_object("resp_tool", 123, request, runtime, tools);
     const Json& item = tool_response.body.at("output").at(0);
-    failures += check(item.at("type") == "function_call" &&
+    failures += check(tool_response.body.at("status") == "completed" &&
+                          tool_response.body.at("completed_at").is_number_integer() &&
+                          tool_response.body.at("incomplete_details").is_null() &&
+                          item.at("type") == "function_call" &&
                           item.at("call_id").get<std::string>().starts_with("call_") &&
                           tool_response.output_history[0].tool_calls[0].id ==
                               item.at("call_id").get<std::string>(),
-                      "wire and continuation history share one stable function call_id");
+                      "output-limit tool result is completed with one stable function call_id");
     return failures;
 }
 
@@ -923,6 +927,23 @@ int test_sse_sequence_and_failures() {
                           parse_event(wire.back()).at("type") == "response.completed" &&
                           text_deltas == "answer",
                       "SSE starts, reconstructs output, and terminates canonically");
+
+    OpenAIResponsesCreateRequest tool_request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream tool_stream("resp_tool_stream", 123, tool_request, {});
+    (void)tool_stream.start();
+    GenerationOutcome tool_outcome;
+    tool_outcome.finish_reason = ninfer::FinishReason::OutputLimit;
+    tool_outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+    const OpenAIResponsesStreamFinish tool_finish = tool_stream.finish(tool_outcome);
+    const Json tool_terminal = parse_event(tool_stream.terminal(tool_finish.response));
+    failures += check(tool_terminal.at("type") == "response.completed" &&
+                          tool_terminal.at("response").at("status") == "completed" &&
+                          tool_terminal.at("response").at("incomplete_details").is_null() &&
+                          tool_terminal.at("response").at("output").at(0).at("type") ==
+                              "function_call",
+                      "output-limit tool stream did not terminate as a completed response");
 
     OpenAIResponsesEventStream failed("resp_failed", 123, std::move(request), {});
     (void)failed.start();

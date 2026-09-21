@@ -108,6 +108,9 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
+- the boolean `ignore_eos` extension: `true` suppresses the checkpoint's own stop tokens so
+  generation runs to the requested token budget, while caller-supplied stop strings and stop token
+  ids still apply; omitted or `false` keeps them;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;

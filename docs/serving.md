@@ -431,7 +431,10 @@ wire response contains typed `output` Items.
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. When a rejection is caused by a
+specific value, the error names that value (ASCII-escaped and truncated), its size where relevant,
+and its location in the request, both in the error `param` (for example `tools[0].function.name`
+or `messages[2].tool_calls[0].function.name`) and in the message text.
 
 ### Input Item contract
 

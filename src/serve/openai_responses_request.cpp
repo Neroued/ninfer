@@ -23,11 +23,17 @@ void require_object(const Json& value, std::string_view name = "request body") {
 
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("function name must be a string", param);
+        bad_request("function name must be a string, got " +
+                        std::string(object.contains("name")
+                                        ? request_json_type_name(object.at("name"))
+                                        : "no name field"),
+                    param);
     }
     const std::string name = object.at("name").get<std::string>();
     if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+        bad_request("function name '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                    param);
     }
     return name;
 }
@@ -35,23 +41,32 @@ std::string require_function_name(const Json& object, const char* param) {
 std::optional<std::string> optional_namespace_name(const Json& object, const char* param) {
     if (!object.contains("namespace") || object.at("namespace").is_null()) { return std::nullopt; }
     if (!object.at("namespace").is_string()) {
-        bad_request("function namespace must be a string or null", param);
+        bad_request("function namespace must be a string or null, got " +
+                        std::string(request_json_type_name(object.at("namespace"))),
+                    param);
     }
     const std::string name = object.at("namespace").get<std::string>();
     if (!valid_tool_name(name, 64)) {
-        bad_request("function namespace must match [A-Za-z0-9_-]{1,64}", param,
-                    "invalid_tool_name");
+        bad_request("function namespace '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                    param, "invalid_tool_name");
     }
     return name;
 }
 
 std::string require_namespace_tool_name(const Json& object) {
     if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("namespace name must be a string", "tools");
+        bad_request("namespace name must be a string, got " +
+                        std::string(object.contains("name")
+                                        ? request_json_type_name(object.at("name"))
+                                        : "no name field"),
+                    "tools");
     }
     const std::string name = object.at("name").get<std::string>();
     if (!valid_tool_name(name, 64)) {
-        bad_request("namespace name must match [A-Za-z0-9_-]{1,64}", "tools", "invalid_tool_name");
+        bad_request("namespace name '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                    "tools", "invalid_tool_name");
     }
     return name;
 }

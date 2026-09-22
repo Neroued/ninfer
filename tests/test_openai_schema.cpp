@@ -226,6 +226,64 @@ Json function_tool(std::string name = "weather", bool strict = false) {
                                   {"strict", strict}}}};
 }
 
+int test_tool_name_diagnostics() {
+    int failures = 0;
+
+    Json body                                    = base_request();
+    body["tools"]                               = Json::array({function_tool("weather")});
+    body["tools"][0]["function"]["name"]        = "mcp.weather";
+    const ApiError invalid_name                  = api_error([&] { (void)parse(body); });
+    failures += check(invalid_name.status == 400 &&
+                          invalid_name.param == "tools[0].function.name" &&
+                          invalid_name.message.find("'mcp.weather'") != std::string::npos &&
+                          invalid_name.message.find("11 bytes") != std::string::npos &&
+                          invalid_name.message.find("[A-Za-z0-9_-]{1,64}") != std::string::npos,
+                      "invalid tool name rejection names the value, its length, and its location");
+
+    body["tools"][0]["function"]["name"] = Json::array({"not", "a", "string"});
+    const ApiError non_string             = api_error([&] { (void)parse(body); });
+    failures += check(non_string.param == "tools[0].function.name" &&
+                          non_string.message.find("must be a string") != std::string::npos &&
+                          non_string.message.find("array") != std::string::npos,
+                      "non-string tool name rejection reports the actual JSON type");
+
+    body                                 = base_request();
+    body["tools"]                        = Json::array({function_tool("weather")});
+    body["tools"][0]["function"]["name"] = "bad\nname";
+    const ApiError escaped               = api_error([&] { (void)parse(body); });
+    failures += check(escaped.message.find("bad\\x0aname") != std::string::npos &&
+                          escaped.message.find('\n') == std::string::npos,
+                      "control characters in a rejected name are escaped, not embedded raw");
+
+    Json history = base_request();
+    history["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_1"},
+                                 {"type", "function"},
+                                 {"function",
+                                  Json{{"name", "mcp.weather"}, {"arguments", "{}"}}}}})}}});
+    const ApiError history_error = api_error([&] { (void)parse(history); });
+    failures += check(history_error.param == "messages[1].tool_calls[0].function.name" &&
+                          history_error.message.find("'mcp.weather'") != std::string::npos,
+                      "invalid historical tool_call name reports its message location");
+
+    Json allowed        = base_request();
+    allowed["tools"]    = Json::array({function_tool("weather")});
+    allowed["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"allowed_tools",
+              Json{{"mode", "auto"},
+                   {"tools", Json::array({Json{{"type", "function"}, {"name", "bad.name"}}})}}}};
+    const ApiError allowed_error = api_error([&] { (void)parse(allowed); });
+    failures += check(allowed_error.param == "tool_choice.allowed_tools.tools[0].name",
+                      "invalid allowed_tools name reports its location");
+
+    return failures;
+}
+
 int test_tools() {
     int failures                      = 0;
     Json body                         = base_request();
@@ -785,6 +843,7 @@ int main() {
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
+    failures += test_tool_name_diagnostics();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();

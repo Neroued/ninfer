@@ -56,13 +56,19 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-std::string require_function_name(const Json& object, const char* param) {
+std::string require_function_name(const Json& object, std::string param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("function name must be a string", param);
+        bad_request("function name must be a string, got " +
+                        std::string(object.contains("name")
+                                        ? request_json_type_name(object.at("name"))
+                                        : "no name field"),
+                    std::move(param));
     }
     std::string name = object.at("name").get<std::string>();
     if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+        bad_request("function name '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                    std::move(param));
     }
     return name;
 }
@@ -369,25 +375,30 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
                     "messages");
     }
     calls.reserve(values.size());
-    for (const Json& value : values) {
+    for (std::size_t call_index = 0; call_index < values.size(); ++call_index) {
+        const std::string prefix = "messages[" + std::to_string(index) + "].tool_calls[" +
+                                   std::to_string(call_index) + "]";
+        const Json& value = values.at(call_index);
         if (!value.is_object() || !value.contains("id") || !value.at("id").is_string()) {
-            bad_request("tool_calls entries must contain a string id", "messages");
+            bad_request("tool_calls entries must contain a string id", prefix + ".id");
         }
         if (!value.contains("type") || !value.at("type").is_string() ||
             value.at("type").get<std::string>() != "function") {
-            bad_request("only function tool_calls are supported", "messages",
+            bad_request("only function tool_calls are supported", prefix + ".type",
                         "tool_type_not_supported");
         }
         if (!value.contains("function") || !value.at("function").is_object()) {
-            bad_request("tool_calls entries must contain a function object", "messages");
+            bad_request("tool_calls entries must contain a function object", prefix + ".function");
         }
         const Json& function = value.at("function");
         if (!function.contains("arguments") || !function.at("arguments").is_string()) {
-            bad_request("function tool_calls must contain string arguments", "messages");
+            bad_request("function tool_calls must contain string arguments",
+                        prefix + ".function.arguments");
         }
-        calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
-                                 .name           = require_function_name(function, "messages"),
-                                 .arguments_json = function.at("arguments").get<std::string>()});
+        calls.push_back(ToolCall{
+            .id             = value.at("id").get<std::string>(),
+            .name           = require_function_name(function, prefix + ".function.name"),
+            .arguments_json = function.at("arguments").get<std::string>()});
     }
     return calls;
 }
@@ -406,8 +417,9 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
-    return ToolCall{.id             = {},
-                    .name           = require_function_name(call, "messages"),
+    return ToolCall{.id   = {},
+                    .name = require_function_name(
+                        call, "messages[" + std::to_string(index) + "].function_call.name"),
                     .arguments_json = call.at("arguments").get<std::string>()};
 }
 
@@ -565,7 +577,9 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
     validate_message_name(item, role);
-    if (legacy_function) { (void)require_function_name(item, "messages"); }
+    if (legacy_function) {
+        (void)require_function_name(item, "messages[" + std::to_string(index) + "].name");
+    }
     validate_non_assistant_fields(item, role);
 
     if (role == ChatRole::Tool) { return parse_tool_message(item, index, legacy_function); }
@@ -591,26 +605,29 @@ void parse_tools(const Json& body, GenerationRequest& output) {
     const Json& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
     output.tools.reserve(tools.size());
-    for (const Json& item : tools) {
+    for (std::size_t index = 0; index < tools.size(); ++index) {
+        const std::string prefix = "tools[" + std::to_string(index) + "]";
+        const Json& item         = tools.at(index);
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
-            bad_request("tools entries must contain a string type", "tools");
+            bad_request("tools entries must contain a string type", prefix + ".type");
         }
         const std::string type = item.at("type").get<std::string>();
         if (type != "function") {
             bad_request(
                 "tool type '" + type +
                     "' requires a non-function output contract that NInfer does not provide",
-                "tools", "tool_type_not_supported");
+                prefix + ".type", "tool_type_not_supported");
         }
         if (!item.contains("function") || !item.at("function").is_object()) {
-            bad_request("function tools must contain a function object", "tools");
+            bad_request("function tools must contain a function object", prefix + ".function");
         }
         const Json& function = item.at("function");
         ToolDefinition tool;
-        tool.name = require_function_name(function, "tools");
+        tool.name = require_function_name(function, prefix + ".function.name");
         if (function.contains("description") && !function.at("description").is_null()) {
             if (!function.at("description").is_string()) {
-                bad_request("function description must be a string", "tools");
+                bad_request("function description must be a string",
+                            prefix + ".function.description");
             }
             tool.description = function.at("description").get<std::string>();
         }
@@ -618,19 +635,20 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             tool.input_schema_json =
                 Json{{"type", "object"}, {"properties", Json::object()}}.dump();
         } else if (!function.at("parameters").is_object()) {
-            bad_request("function parameters must be a JSON object", "tools");
+            bad_request("function parameters must be a JSON object",
+                        prefix + ".function.parameters");
         } else {
             tool.input_schema_json = function.at("parameters").dump();
         }
         if (function.contains("strict") && !function.at("strict").is_null()) {
             if (!function.at("strict").is_boolean()) {
-                bad_request("function strict must be a boolean", "tools");
+                bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
             if (function.at("strict").get<bool>()) {
                 bad_request(
                     "strict=true requires generated function arguments to satisfy the declared "
                     "JSON Schema, which NInfer cannot guarantee",
-                    "tools", "strict_tools_not_supported");
+                    prefix + ".function.strict", "strict_tools_not_supported");
             }
         }
         output.tools.push_back(std::move(tool));
@@ -654,17 +672,19 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
 
     std::vector<std::string> allowed_names;
     allowed_names.reserve(config.at("tools").size());
-    for (const Json& item : config.at("tools")) {
+    for (std::size_t index = 0; index < config.at("tools").size(); ++index) {
+        const std::string prefix = "tool_choice.allowed_tools.tools[" + std::to_string(index) + "]";
+        const Json& item         = config.at("tools").at(index);
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
-            bad_request("allowed tool entries must contain a string type", "tool_choice");
+            bad_request("allowed tool entries must contain a string type", prefix + ".type");
         }
         if (item.at("type").get<std::string>() != "function") {
             bad_request(
                 "allowed_tools can select only function tools because NInfer does not provide "
                 "custom tool output",
-                "tool_choice", "tool_type_not_supported");
+                prefix + ".type", "tool_type_not_supported");
         }
-        const std::string name = require_function_name(item, "tool_choice");
+        const std::string name = require_function_name(item, prefix + ".name");
         const bool declared =
             std::any_of(output.tools.begin(), output.tools.end(),
                         [&](const ToolDefinition& tool) { return tool.name == name; });
@@ -720,7 +740,8 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             if (!choice.contains("function") || !choice.at("function").is_object()) {
                 bad_request("function tool_choice must contain a function object", "tool_choice");
             }
-            const std::string name = require_function_name(choice.at("function"), "tool_choice");
+            const std::string name =
+                require_function_name(choice.at("function"), "tool_choice.function.name");
             bad_request(
                 "tool_choice for function '" + name +
                     "' requires that exact function to be called, which NInfer cannot guarantee",

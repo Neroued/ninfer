@@ -19,7 +19,10 @@ namespace {
 
 using Json = RequestJson;
 
-constexpr std::size_t kMaxToolNameLength = 128;
+// Shares the protocol-wide limit (serve/request.h). Anthropic's own boundary is
+// narrower, but agent hosts send longer names — VS Code Copilot wraps MCP tools
+// as "activate_fallback_mcp_<server>_<tool>", past 64 bytes.
+constexpr std::size_t kMaxToolNameLength = kMaximumToolNameLength;
 
 enum class ParsePurpose {
     Messages,

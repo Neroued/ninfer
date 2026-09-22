@@ -30,9 +30,10 @@ std::string require_function_name(const Json& object, const char* param) {
                     param);
     }
     const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
         bad_request("function name '" + ascii_preview(name) + "' (" +
-                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     param);
     }
     return name;
@@ -46,9 +47,10 @@ std::optional<std::string> optional_namespace_name(const Json& object, const cha
                     param);
     }
     const std::string name = object.at("namespace").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
         bad_request("function namespace '" + ascii_preview(name) + "' (" +
-                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     param, "invalid_tool_name");
     }
     return name;
@@ -63,9 +65,10 @@ std::string require_namespace_tool_name(const Json& object) {
                     "tools");
     }
     const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
         bad_request("namespace name '" + ascii_preview(name) + "' (" +
-                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     "tools", "invalid_tool_name");
     }
     return name;
@@ -83,9 +86,10 @@ std::string lower_function_identity(
     const char* param) {
     const std::string engine_name =
         identity.wire_namespace ? *identity.wire_namespace + "__" + identity.name : identity.name;
-    if (!valid_tool_name(engine_name, 64)) {
+    if (!valid_tool_name(engine_name, kMaximumToolNameLength)) {
         bad_request("flattened function identity '" + engine_name +
-                        "' exceeds the Engine tool-name contract [A-Za-z0-9_-]{1,64}",
+                        "' exceeds the Engine tool-name contract [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     param, "invalid_tool_name");
     }
     const auto [position, inserted] = identities.emplace(engine_name, identity);

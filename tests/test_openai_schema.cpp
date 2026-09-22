@@ -232,12 +232,14 @@ int test_tool_name_diagnostics() {
     Json body                                    = base_request();
     body["tools"]                               = Json::array({function_tool("weather")});
     body["tools"][0]["function"]["name"]        = "mcp.weather";
+    const std::string limit_spec =
+        "[A-Za-z0-9_-]{1," + std::to_string(kMaximumToolNameLength) + "}";
     const ApiError invalid_name                  = api_error([&] { (void)parse(body); });
     failures += check(invalid_name.status == 400 &&
                           invalid_name.param == "tools[0].function.name" &&
                           invalid_name.message.find("'mcp.weather'") != std::string::npos &&
                           invalid_name.message.find("11 bytes") != std::string::npos &&
-                          invalid_name.message.find("[A-Za-z0-9_-]{1,64}") != std::string::npos,
+                          invalid_name.message.find(limit_spec) != std::string::npos,
                       "invalid tool name rejection names the value, its length, and its location");
 
     body["tools"][0]["function"]["name"] = Json::array({"not", "a", "string"});
@@ -254,6 +256,17 @@ int test_tool_name_diagnostics() {
     failures += check(escaped.message.find("bad\\x0aname") != std::string::npos &&
                           escaped.message.find('\n') == std::string::npos,
                       "control characters in a rejected name are escaped, not embedded raw");
+
+    // Regression for VS Code Copilot agent traffic: MCP activation wrappers are
+    // synthesized as "activate_fallback_mcp_<server>_<tool>" and exceed the
+    // OpenAI 64-byte limit; the Engine must accept them up to the shared cap.
+    const std::string mcp_name =
+        "activate_fallback_mcp_pgsql-tools_pgsql_get_dashboard_metric_data";
+    body["tools"][0]["function"]["name"] = mcp_name;
+    const OpenAIChatRequest mcp_ok        = parse(body);
+    failures += check(mcp_name.size() == 65 && mcp_ok.generation.tools.size() == 1 &&
+                          mcp_ok.generation.tools[0].name == mcp_name,
+                      "MCP wrapper names longer than 64 bytes are accepted");
 
     Json history = base_request();
     history["messages"] = Json::array(

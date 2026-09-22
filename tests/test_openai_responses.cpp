@@ -702,7 +702,7 @@ int test_namespace_tools() {
     oversized["tool_choice"] = "auto";
     oversized["tools"] =
         Json::array({Json{{"type", "namespace"},
-                          {"name", std::string(60, 'n')},
+                          {"name", std::string(kMaximumToolNameLength, 'n')},
                           {"tools", Json::array({Json{{"type", "function"}, {"name", "tool"}}})}}});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(oversized, limits());

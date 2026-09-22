@@ -65,9 +65,10 @@ std::string require_function_name(const Json& object, std::string param) {
                     std::move(param));
     }
     std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
         bad_request("function name '" + ascii_preview(name) + "' (" +
-                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1,64}",
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     std::move(param));
     }
     return name;

@@ -111,22 +111,29 @@ The endpoint supports:
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
-- `stream_options.include_usage`;
+- `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
+  parsers;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
-- non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
-  parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
-  function-call history;
-- the top-level `reasoning_effort` field;
+- function tools and free-form `custom` tools, the latter served to the model as a
+  single-string-input function under the caller's own tool name so callers that dispatch by name
+  keep working;
+- `tool_choice` `auto`/`none`, and `required`, named-function, `custom`, or function-only
+  `allowed_tools` selections, which are accepted and treated as advisory narrowing because the
+  Engine cannot force a call;
+- `strict:true` and `parallel_tool_calls:false` as advisory flags: the Engine does not enforce JSON
+  Schema through constrained decoding and cannot limit the model to one call;
+- assistant tool-call history, tool-result messages, and legacy function-call history;
+- the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
+  server-configured level;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+audio/file input or audio output, explicit low/high image detail, web search, moderation, low/high
+verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
@@ -802,6 +809,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
+| `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |

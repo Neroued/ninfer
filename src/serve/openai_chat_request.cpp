@@ -600,6 +600,30 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     }
 }
 
+// Custom tools carry no declared JSON Schema: their input is free-form text. NInfer serves them as
+// a single-string-input function under the same name, so callers that dispatch by tool name (for
+// example the GitHub Copilot CLI and MCP clients) keep working. A declared `format` is carried as
+// descriptive prompt metadata only, because the engine has no constrained decoding for it.
+std::string custom_tool_input_schema(const Json& custom) {
+    std::string description = "The complete custom tool input.";
+    if (custom.contains("format") && custom.at("format").is_object()) {
+        const Json& format = custom.at("format");
+        if (format.contains("type") && format.at("type").is_string()) {
+            description += " Declared format: " + format.at("type").get<std::string>() + ".";
+            if (format.contains("grammar") && format.at("grammar").is_string()) {
+                description += " Grammar: " + format.at("grammar").get<std::string>();
+            }
+        }
+    }
+    return Json{{"type", "object"},
+                {"properties",
+                 Json{{"input",
+                       Json{{"type", "string"}, {"description", std::move(description)}}}}},
+                {"required", Json::array({"input"})},
+                {"additionalProperties", false}}
+        .dump();
+}
+
 void parse_tools(const Json& body, GenerationRequest& output) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     const Json& tools = body.at("tools");
@@ -612,6 +636,24 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             bad_request("tools entries must contain a string type", prefix + ".type");
         }
         const std::string type = item.at("type").get<std::string>();
+        if (type == "custom") {
+            if (!item.contains("custom") || !item.at("custom").is_object()) {
+                bad_request("custom tools must contain a custom object", prefix + ".custom");
+            }
+            const Json& custom = item.at("custom");
+            ToolDefinition tool;
+            tool.name = require_function_name(custom, prefix + ".custom.name");
+            if (custom.contains("description") && !custom.at("description").is_null()) {
+                if (!custom.at("description").is_string()) {
+                    bad_request("custom tool description must be a string",
+                                prefix + ".custom.description");
+                }
+                tool.description = custom.at("description").get<std::string>();
+            }
+            tool.input_schema_json = custom_tool_input_schema(custom);
+            output.tools.push_back(std::move(tool));
+            continue;
+        }
         if (type != "function") {
             bad_request(
                 "tool type '" + type +
@@ -644,12 +686,8 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
-            if (function.at("strict").get<bool>()) {
-                bad_request(
-                    "strict=true requires generated function arguments to satisfy the declared "
-                    "JSON Schema, which NInfer cannot guarantee",
-                    prefix + ".function.strict", "strict_tools_not_supported");
-            }
+            // strict:true is accepted as advisory. NInfer cannot constrain decoding to the declared
+            // schema, so the flag does not change generation (docs/serving.md).
         }
         output.tools.push_back(std::move(tool));
     }
@@ -678,10 +716,11 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
             bad_request("allowed tool entries must contain a string type", prefix + ".type");
         }
-        if (item.at("type").get<std::string>() != "function") {
+        if (item.at("type").get<std::string>() != "function" &&
+            item.at("type").get<std::string>() != "custom") {
             bad_request(
-                "allowed_tools can select only function tools because NInfer does not provide "
-                "custom tool output",
+                "allowed_tools entries must select a function or custom tool, because NInfer "
+                "provides no other output contract",
                 prefix + ".type", "tool_type_not_supported");
         }
         const std::string name = require_function_name(item, prefix + ".name");
@@ -689,7 +728,8 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
             std::any_of(output.tools.begin(), output.tools.end(),
                         [&](const ToolDefinition& tool) { return tool.name == name; });
         if (!declared) {
-            bad_request("allowed tool '" + name + "' is not present in tools", "tool_choice");
+            bad_request("allowed tool '" + name + "' is not present in tools",
+                        prefix + ".name");
         }
         if (std::find(allowed_names.begin(), allowed_names.end(), name) == allowed_names.end()) {
             allowed_names.push_back(name);
@@ -697,10 +737,8 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
     }
 
     if (mode == "required") {
-        bad_request(
-            "tool_choice.allowed_tools mode='required' requires at least one tool call, which "
-            "NInfer cannot guarantee",
-            "tool_choice", "tool_choice_not_supported");
+        // mode='required' is accepted as advisory: the engine cannot force a call, so the request
+        // proceeds with the narrowed tool set and automatic selection (docs/serving.md).
     }
 
     std::erase_if(output.tools, [&](const ToolDefinition& tool) {
@@ -720,10 +758,9 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
         } else if (value == "none") {
             output.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            bad_request(
-                "tool_choice='required' requires at least one tool call, which NInfer cannot "
-                "guarantee",
-                "tool_choice", "tool_choice_not_supported");
+            // Advisory: accepted without forcing a call, because the engine cannot guarantee that
+            // the model emits one (docs/serving.md). Automatic selection remains in force.
+            output.tool_choice.mode = ToolChoiceMode::Auto;
         } else {
             bad_request("tool_choice must be 'auto', 'none', 'required', or a function choice",
                         "tool_choice");
@@ -740,16 +777,18 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             if (!choice.contains("function") || !choice.at("function").is_object()) {
                 bad_request("function tool_choice must contain a function object", "tool_choice");
             }
-            const std::string name =
-                require_function_name(choice.at("function"), "tool_choice.function.name");
-            bad_request(
-                "tool_choice for function '" + name +
-                    "' requires that exact function to be called, which NInfer cannot guarantee",
-                "tool_choice", "tool_choice_not_supported");
+            // A named choice is advisory: the engine cannot force that exact function, so the
+            // declared name is validated and automatic selection proceeds (docs/serving.md).
+            (void)require_function_name(choice.at("function"), "tool_choice.function.name");
+            output.tool_choice.mode = ToolChoiceMode::Auto;
         } else if (type == "custom") {
-            bad_request(
-                "custom tool_choice requires custom tool output, which NInfer does not provide",
-                "tool_choice", "tool_type_not_supported");
+            if (!choice.contains("custom") || !choice.at("custom").is_object()) {
+                bad_request("custom tool_choice must contain a custom object", "tool_choice");
+            }
+            // Custom tools are served as functions with one string input, so a custom choice is
+            // validated and then handled like any other advisory named choice.
+            (void)require_function_name(choice.at("custom"), "tool_choice.custom.name");
+            output.tool_choice.mode = ToolChoiceMode::Auto;
         } else {
             bad_request("unsupported tool_choice type: " + type, "tool_choice");
         }
@@ -759,18 +798,15 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
 }
 
 void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output) {
+    (void)output;
     if (!body.contains("parallel_tool_calls") || body.at("parallel_tool_calls").is_null()) {
         return;
     }
     if (!body.at("parallel_tool_calls").is_boolean()) {
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
-    if (!body.at("parallel_tool_calls").get<bool>() && output.uses_tools()) {
-        bad_request(
-            "parallel_tool_calls=false requires the model to emit at most one tool call, which "
-            "NInfer cannot guarantee while tools are enabled",
-            "parallel_tool_calls", "parallel_tool_calls_not_supported");
-    }
+    // parallel_tool_calls=false is accepted as advisory. The engine cannot limit the model to one
+    // call while tools are enabled, so a request may still yield multiple calls (docs/serving.md).
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
@@ -856,10 +892,12 @@ void parse_reasoning_effort(const Json& body, GenerationRequest& output) {
         bad_request("reasoning_effort must be a string or null", "reasoning_effort");
     }
     const std::string value = body.at("reasoning_effort").get<std::string>();
+    // Client aliases for "use the server-configured level" are accepted as an omitted request.
+    if (value == "default" || value == "auto") { return; }
     const std::optional<RequestedReasoningEffort> parsed = parse_requested_reasoning_effort(value);
     if (!parsed) {
         bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
-                    "max",
+                    "max, or the aliases default/auto",
                     "reasoning_effort");
     }
     output.reasoning_effort = *parsed;

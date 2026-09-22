@@ -2,6 +2,49 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+> **Windows port fork.** This is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer),
+> ported to build and run **natively on Windows** (MSVC + CUDA, no WSL) for a **single NVIDIA GeForce
+> RTX 5090** (`sm_120a`). The upstream sections below describe the Linux build; Windows users should
+> follow **[Windows build & run](#windows-build--run)** first. The port adds a native `ReadFile`
+> artifact path, a TMA tensormap-proxy fix for the NVFP4 kernels, and a PowerShell serve harness under
+> [`scripts/windows/`](scripts/windows/).
+
+## Windows build & run
+
+The engine builds with the MSVC x64 developer environment plus CUDA Toolkit 13.3, CMake 3.28+, and
+Ninja. The agent/CI shell is **not** a Visual Studio developer prompt, so `INCLUDE`/`LIB` are unset
+and a bare `cmake --build` fails with `C1083: cannot open include file: 'chrono'`. Initialize MSVC in
+the *same* command as the build (adjust the `vcvars64.bat` path to your Visual Studio install):
+
+```powershell
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" `
+  && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  && cmake --build build --target ninfer-serve -j'
+```
+
+The server binary lands at `build/apps/ninfer-serve.exe`.
+
+### Serve harness (`scripts/windows/`)
+
+PowerShell launchers that resolve the build tree, model artifacts, and third-party DLLs portably
+(env override → repo layout → workspace-root fallback; see `scripts/windows/win_paths.ps1`):
+
+| Script | Purpose |
+|---|---|
+| `serve.ps1 <1..4>` | Launch the server. Model 1 = NVFP4 text-only, 2 = groupwise-int + vision, 3 = heretic + vision, 4 = NVFP4 + vision. |
+| `watch-serve.ps1` | Heartbeat supervisor: relaunches on crash/health-fail with bounded backoff. |
+| `swap-serve.ps1` | A/B swap between the current build and a candidate build, with auto-rollback. |
+| `win_repro_test.ps1` / `win_parity_capture.ps1` | One-shot smoke / cross-platform parity capture. |
+
+```powershell
+.\scripts\windows\serve.ps1 1          # NVFP4, text-only, 256K context + MTP3
+```
+
+Two Windows gotchas: (1) the server appends its request JSONL to `debug/ninfer-serve-<date>.jsonl`
+and **fails to start if `debug/` does not exist** — create it first; (2) vision builds import FFmpeg
+and libcurl DLLs at load — supply them and point `NINFER_FFMPEG_BIN` / `NINFER_CURL_BIN` at their
+`bin` dirs (they are not vendored; see `.gitignore`).
+
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
@@ -22,7 +65,8 @@ tokenizer, chat template, and media frontend resources required by its registere
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
+NInfer requires 64-bit Linux (or, in this fork, native Windows via MSVC + CUDA — see
+[Windows build & run](#windows-build--run)), an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
 newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
 `libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.

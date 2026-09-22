@@ -42,10 +42,16 @@ out/
 /tmp-*/
 /AGENTS.override.md
 /logs/
+/debug/
 *.log
 *.tmp
 /core
 /core.*
+
+# Windows serve harness runtime assets (large / third-party; supply locally).
+# scripts/windows/win_paths.ps1 resolves these via NINFER_FFMPEG_BIN /
+# NINFER_CURL_BIN or a sibling third_party/ dir - they are NOT vendored here.
+/third_party/
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.

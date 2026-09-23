@@ -127,6 +127,18 @@ constexpr ninfer::TokenId kByte98Token = fixture_byte_token(0x98);
 constexpr ninfer::TokenId kByteC2Token = fixture_byte_token(0xc2);
 constexpr ninfer::TokenId kByteA2Token = fixture_byte_token(0xa2);
 
+// The fixture's added token for the literal reasoning close marker.
+constexpr ninfer::TokenId kFixtureThinkCloseToken = 248069;
+
+std::vector<ninfer::TokenId> fixture_tokens(std::string_view text) {
+    std::vector<ninfer::TokenId> tokens;
+    tokens.reserve(text.size());
+    for (const char byte : text) {
+        tokens.push_back(fixture_byte_token(static_cast<std::uint8_t>(byte)));
+    }
+    return tokens;
+}
+
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
@@ -1688,6 +1700,130 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
+int test_reasoning_close_requires_boundary(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> quoted = fixture_tokens("discussing ");
+    quoted.push_back(kFixtureThinkCloseToken);
+    const auto quoted_decision =
+        session.preview_model(quoted, 64, ninfer::FinishReason::OutputLimit);
+    const auto quoted_output = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(quoted_decision.accepted_tokens == quoted.size() && !quoted_decision.finished(),
+              "a close candidate at a round boundary ended its round early");
+    failures +=
+        check(channel_text(quoted_output, ninfer::OutputChannel::Reasoning) == "discussing " &&
+                  channel_text(quoted_output, ninfer::OutputChannel::Content).empty(),
+              "a close candidate at a round boundary was not held for its following byte");
+
+    const auto quoted_tail = fixture_tokens("'; then hidden\n");
+    const auto tail_decision =
+        session.preview_model(quoted_tail, 64, ninfer::FinishReason::OutputLimit);
+    const auto tail_output = session.commit_preview();
+    failures += check(channel_text(tail_output, ninfer::OutputChannel::Reasoning) ==
+                              "</think>'; then hidden\n" &&
+                          channel_text(tail_output, ninfer::OutputChannel::Content).empty(),
+                      "a marker followed by a quote was treated as a reasoning close");
+
+    std::vector<ninfer::TokenId> close = {kFixtureThinkCloseToken};
+    const auto answer                  = fixture_tokens("\n\nreal answer");
+    close.insert(close.end(), answer.begin(), answer.end());
+    const auto close_decision = session.preview_model(close, 64, ninfer::FinishReason::OutputLimit);
+    const auto close_output   = session.commit_preview();
+    failures +=
+        check(channel_text(close_output, ninfer::OutputChannel::Reasoning).empty() &&
+                  channel_text(close_output, ninfer::OutputChannel::Content) == "real answer",
+              "the real close did not open the content channel");
+    return failures;
+}
+
+int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    std::vector<ninfer::TokenId> tokens = fixture_tokens("done thinking");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures += check(decision.accepted_tokens == tokens.size() &&
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "the implicit terminal close changed the round decision");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "done thinking" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "the implicit terminal close was published into reasoning");
+    return failures;
+}
+
+int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    auto session =
+        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 3});
+
+    const std::vector<ninfer::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
+    const auto decision = session.preview_model(tokens, 10, ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+
+    int failures = 0;
+    failures +=
+        check(!decision.finished() &&
+                  decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "a quoted close marker suppressed the thinking budget control");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "x</think>x" &&
+                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+                      "a quoted close marker was not preserved in the reasoning channel");
+    return failures;
+}
+
+int test_tool_marker_after_quoted_marker() {
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string generated = "The failure looked like " + quoted +
+                                  "\nThen the real call:\n"
+                                  "<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n"
+                                  "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    const auto output   = session.commit_preview();
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+
+    int failures = 0;
+    failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          calls.size() == 1 && calls.front().name == "bash",
+                      "a quoted malformed marker demoted the following real tool call");
+    if (calls.size() == 1) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("command") == "echo ok",
+                          "the recovered tool call lost its arguments");
+    }
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "The failure looked like " + quoted + "\nThen the real call:",
+                      "the quoted marker was not preserved as ordinary content");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -2191,8 +2327,12 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
+    failures += test_reasoning_close_requires_boundary(frontend);
+    failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

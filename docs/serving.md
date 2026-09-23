@@ -172,7 +172,9 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+unambiguously; either makes that tool-call region ordinary content. Later content is still examined:
+the first complete `<tool_call>` region that consumes the remainder of the response becomes the
+structured turn, and any quoted markup before it stays ordinary content.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.

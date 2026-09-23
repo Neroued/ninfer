@@ -598,22 +598,41 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract) {
-    const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    std::size_t candidate = text.find(kToolOpen);
+    if (candidate == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
-    out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
     out.diagnostics.marker_seen = true;
 
+    // Generated prose can quote a `<tool_call>` marker before the real turn. Try each marker in
+    // order and accept the first region that consumes the response to its end; earlier markers
+    // stay ordinary content.
+    const std::string_view source(text);
     std::vector<RawToolCall> raw_calls;
-    const std::string_view tool_region = std::string_view(text).substr(first);
-    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
+    std::size_t accepted         = std::string::npos;
+    FallbackReason first_failure = FallbackReason::MalformedStructure;
+    bool first_failure_recorded  = false;
+    while (candidate != std::string::npos) {
+        std::vector<RawToolCall> calls;
+        const QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract);
+        const FallbackReason failure = parser.parse(calls);
+        if (failure == FallbackReason::None) {
+            accepted  = candidate;
+            raw_calls = std::move(calls);
+            break;
+        }
+        if (!first_failure_recorded) {
+            first_failure          = failure;
+            first_failure_recorded = true;
+        }
+        candidate = text.find(kToolOpen, candidate + 1);
+    }
+    if (accepted == std::string::npos) {
+        out.diagnostics.fallback_reason = first_failure;
         return fallback(text, out.diagnostics);
     }
 
+    out.content = rtrim_format_whitespace(source.substr(0, accepted));
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
@@ -681,10 +700,13 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
+        // The parser reports the held bytes before the accepted structured region, which are the
+        // bytes after an earlier quoted marker that this decoder has not published yet.
+        std::string content = std::move(parsed.content);
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }

@@ -22,22 +22,6 @@ __device__ __forceinline__ float exp2_approx(float x) {
     return y;
 }
 
-// silu for a caller that rounds the result to bf16 immediately. Both halves of the accurate form
-// are expensive for a value about to lose 16 mantissa bits: expf compiles to a guarded slow path
-// and the divide to a Newton refinement.
-//
-// The exponential is folded onto the side that cannot overflow. 1 + exp(-x) exceeds 2^126 for x
-// below -87.34, and __fdividef returns zero past that, so the unfolded form loses the tail; written
-// this way the divisor stays in [1, 2], where __fdividef carries its documented 2 ulp.
-//
-// __expf rather than exp2_approx: the documented error bound belongs to the intrinsic, and folding
-// the log2(e) scale in by hand would put a rounding of its own in front of it.
-__device__ __forceinline__ float silu_approx(float x) {
-    const float e = __expf(-fabsf(x));
-    const float r = __fdividef(1.0f, 1.0f + e);
-    return (x >= 0.0f ? x : x * e) * r;
-}
-
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);

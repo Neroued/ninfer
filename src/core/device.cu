@@ -54,6 +54,15 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     bind_to_current_thread();
 
+    // cudaDeviceScheduleAuto spin-waits in every synchronize when the host has more cores
+    // than GPUs, keeping this thread at 100% of a core for as long as the GPU is busy.
+    err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError(); // don't leak this into later launch checks
+        std::fprintf(stderr, "warning: %s; keeping default CUDA sync schedule\n",
+                     cuda_error_message("cudaSetDeviceFlags failed", err).c_str());
+    }
+
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="400" viewBox="0 0 980 400" font-family="DejaVu Sans, Arial, sans-serif" font-size="11">
+<rect width="980" height="400" fill="#ffffff"/>
+<line x1="62" y1="354.0" x2="662" y2="354.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="54" y="358.0" text-anchor="end" fill="#555">0</text>
+<line x1="62" y1="274.0" x2="662" y2="274.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="54" y="278.0" text-anchor="end" fill="#555">91</text>
+<line x1="62" y1="194.0" x2="662" y2="194.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="54" y="198.0" text-anchor="end" fill="#555">182</text>
+<line x1="62" y1="114.0" x2="662" y2="114.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="54" y="118.0" text-anchor="end" fill="#555">273</text>
+<line x1="62" y1="34.0" x2="662" y2="34.0" stroke="#e6e6e6" stroke-width="1"/>
+<text x="54" y="38.0" text-anchor="end" fill="#555">364</text>
+<line x1="62.0" y1="34" x2="62.0" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="62.0" y="370" text-anchor="middle" fill="#555">1</text>
+<line x1="132.9" y1="34" x2="132.9" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="132.9" y="370" text-anchor="middle" fill="#555">16</text>
+<line x1="208.5" y1="34" x2="208.5" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="208.5" y="370" text-anchor="middle" fill="#555">32</text>
+<line x1="284.0" y1="34" x2="284.0" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="284.0" y="370" text-anchor="middle" fill="#555">48</text>
+<line x1="359.6" y1="34" x2="359.6" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="359.6" y="370" text-anchor="middle" fill="#555">64</text>
+<line x1="435.2" y1="34" x2="435.2" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="435.2" y="370" text-anchor="middle" fill="#555">80</text>
+<line x1="510.8" y1="34" x2="510.8" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="510.8" y="370" text-anchor="middle" fill="#555">96</text>
+<line x1="586.4" y1="34" x2="586.4" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="586.4" y="370" text-anchor="middle" fill="#555">112</text>
+<line x1="662.0" y1="34" x2="662.0" y2="354" stroke="#f2f2f2" stroke-width="1"/>
+<text x="662.0" y="370" text-anchor="middle" fill="#555">128</text>
+<line x1="62" y1="354" x2="662" y2="354" stroke="#999" stroke-width="1"/>
+<line x1="62" y1="34" x2="62" y2="354" stroke="#999" stroke-width="1"/>
+<text x="362" y="388" text-anchor="middle" fill="#333">T (token columns), 1&#8211;128</text>
+<text x="16" y="194" fill="#333" transform="rotate(-90 16 194)" text-anchor="middle">median latency (&#181;s)</text>
+<text x="62" y="20" fill="#333" font-weight="bold">Q6 G64_FP16, N=34816, K=5120 &#8212; T=1..128</text>
+<path d="M62.0,261.2 L66.7,259.7 L71.4,259.6 L76.2,256.1 L80.9,243.1 L85.6,230.9 L90.3,221.6 L95.1,207.4 L99.8,205.8 L104.5,205.7 L109.2,204.1 L114.0,204.1 L118.7,203.6 L123.4,202.2 L128.1,202.1 L132.9,205.5 L137.6,205.7 L142.3,205.4 L147.0,205.2 L151.8,204.8 L156.5,204.0 L161.2,203.8 L165.9,203.9 L170.7,205.7 L175.4,216.5 L180.1,215.1 L184.8,214.8 L189.6,214.7 L194.3,214.2 L199.0,214.0 L203.7,213.0 L208.5,214.6 L213.2,162.7 L217.9,162.6 L222.6,162.5 L227.4,162.5 L232.1,162.1 L236.8,162.2 L241.5,162.3 L246.3,162.3 L251.0,161.7 L255.7,162.2 L260.4,161.6 L265.1,160.8 L269.9,160.6 L274.6,160.8 L279.3,160.8 L284.0,164.3 L288.8,151.2 L293.5,151.6 L298.2,151.4 L302.9,151.3 L307.7,150.1 L312.4,150.3 L317.1,150.1 L321.8,154.4 L326.6,148.7 L331.3,148.2 L336.0,148.2 L340.7,148.1 L345.5,148.2 L350.2,148.2 L354.9,147.9 L359.6,149.4 L364.4,133.7 L369.1,133.4 L373.8,132.1 L378.5,132.1 L383.3,131.9 L388.0,131.8 L392.7,131.8 L397.4,131.2 L402.2,130.1 L406.9,130.9 L411.6,130.0 L416.3,130.0 L421.1,129.5 L425.8,129.3 L430.5,128.9 L435.2,131.7 L440.0,112.1 L444.7,112.1 L449.4,112.1 L454.1,112.0 L458.9,112.0 L463.6,110.9 L468.3,110.5 L473.0,110.5 L477.7,110.3 L482.5,110.3 L487.2,110.3 L491.9,108.6 L496.6,109.6 L501.4,108.5 L506.1,108.5 L510.8,113.8 L515.5,58.1 L520.3,58.1 L525.0,58.1 L529.7,58.2 L534.4,58.1 L539.2,58.1 L543.9,58.0 L548.6,58.2 L553.3,58.1 L558.1,58.1 L562.8,58.1 L567.5,58.1 L572.2,58.1 L577.0,58.1 L581.7,58.0 L586.4,58.0 L591.1,56.4 L595.9,56.4 L600.6,56.3 L605.3,56.3 L610.0,56.3 L614.8,56.3 L619.5,56.3 L624.2,56.3 L628.9,56.2 L633.7,56.3 L638.4,56.2 L643.1,56.2 L647.8,56.3 L652.6,56.0 L657.3,55.9 L662.0,65.4" fill="none" stroke="#2f6fb5" stroke-width="1.6"/>
+<circle cx="62.0" cy="261.2" r="4.2" fill="#e8862a" stroke="#ffffff" stroke-width="1"/>
+<circle cx="66.7" cy="259.7" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="71.4" cy="259.6" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="76.2" cy="256.1" r="4.2" fill="#e8862a" stroke="#ffffff" stroke-width="1"/>
+<circle cx="80.9" cy="243.1" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="85.6" cy="230.9" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="90.3" cy="221.6" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="95.1" cy="207.4" r="4.2" fill="#e8862a" stroke="#ffffff" stroke-width="1"/>
+<circle cx="114.0" cy="204.1" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="132.9" cy="205.5" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="151.8" cy="204.8" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="170.7" cy="205.7" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="189.6" cy="214.7" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="208.5" cy="214.6" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="246.3" cy="162.3" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="284.0" cy="164.3" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="321.8" cy="154.4" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="359.6" cy="149.4" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="435.2" cy="131.7" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="510.8" cy="113.8" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="586.4" cy="58.0" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<circle cx="662.0" cy="65.4" r="2.8" fill="#2f6fb5" stroke="#ffffff" stroke-width="0.8"/>
+<text x="62.0" y="270.2" text-anchor="middle" fill="#b8641a" font-size="10">T=1</text>
+<text x="76.2" y="265.1" text-anchor="middle" fill="#b8641a" font-size="10">T=4</text>
+<text x="95.1" y="216.4" text-anchor="middle" fill="#b8641a" font-size="10">T=8</text>
+<text x="686" y="20" fill="#333" font-weight="bold">Bulk anchors</text>
+<rect x="726" y="205.4" width="62" height="148.6" fill="#7fa9d6" stroke="#2f6fb5"/>
+<text x="757.0" y="199.4" text-anchor="middle" fill="#333">998.0 &#181;s</text>
+<text x="757.0" y="283.7" text-anchor="middle" fill="#123">183 TFLOP/s</text>
+<text x="757.0" y="370" text-anchor="middle" fill="#555">T=512</text>
+<rect x="856" y="75.7" width="62" height="278.3" fill="#7fa9d6" stroke="#2f6fb5"/>
+<text x="887.0" y="69.7" text-anchor="middle" fill="#333">1868.5 &#181;s</text>
+<text x="887.0" y="218.9" text-anchor="middle" fill="#123">195 TFLOP/s</text>
+<text x="887.0" y="370" text-anchor="middle" fill="#555">T=1024</text>
+<line x1="686" y1="354" x2="986" y2="354" stroke="#999" stroke-width="1"/>
+<text x="836" y="388" text-anchor="middle" fill="#333">512 and 1024, measured separately</text>
+</svg>

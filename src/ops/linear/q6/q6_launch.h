@@ -19,6 +19,12 @@ void launch_q6_mma_r64_c32_k128(const Tensor& x, const Weight& w, Tensor& out, c
 void launch_q6_mma_r64_c40_k128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_mma_r64_c48_k128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_mma_r64_c56_k128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q6_mma_r32_c16_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
+void launch_q6_mma_r32_c24_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
+void launch_q6_mma_r32_c32_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
 void launch_q6_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_mma_r64_c64_k128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_mma_r64_c72_k128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);

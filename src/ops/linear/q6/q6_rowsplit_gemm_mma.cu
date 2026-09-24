@@ -28,6 +28,15 @@ using MmaR64C48K128Schedule =
 using MmaR64C56K128Schedule =
     Q6RowSplitMmaGemmSchedule<64, 56, 128, 32, 8, 2, 2, Q6FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q6ScaleLoad::Pair32, 1>;
+using MmaR32C16K256Schedule =
+    Q6RowSplitMmaGemmSchedule<32, 16, 256, 16, 8, 2, 3, Q6FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q6ScaleLoad::Pair32, 1>;
+using MmaR32C24K256Schedule =
+    Q6RowSplitMmaGemmSchedule<32, 24, 256, 16, 8, 2, 2, Q6FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q6ScaleLoad::Pair32, 1>;
+using MmaR32C32K256Schedule =
+    Q6RowSplitMmaGemmSchedule<32, 32, 256, 16, 8, 2, 2, Q6FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q6ScaleLoad::Pair32, 1>;
 using MmaR64C64Schedule =
     Q6RowSplitMmaGemmSchedule<64, 64, 64, 32, 32, 2, 3, Q6FragmentPipeline::PingPong, Cache::ca,
                               Cache::ca, Q6ScaleLoad::Scalar16>;
@@ -119,6 +128,21 @@ void launch_q6_mma_r64_c48_k128(const Tensor& x, const Weight& w, Tensor& out,
 void launch_q6_mma_r64_c56_k128(const Tensor& x, const Weight& w, Tensor& out,
                                 cudaStream_t stream) {
     launch_route<MmaR64C56K128Schedule>(x, w, out, stream);
+}
+
+void launch_q6_mma_r32_c16_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    launch_route<MmaR32C16K256Schedule>(x, w, out, stream);
+}
+
+void launch_q6_mma_r32_c24_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    launch_route<MmaR32C24K256Schedule>(x, w, out, stream);
+}
+
+void launch_q6_mma_r32_c32_k256(const Tensor& x, const Weight& w, Tensor& out,
+                                cudaStream_t stream) {
+    launch_route<MmaR32C32K256Schedule>(x, w, out, stream);
 }
 
 void launch_q6_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

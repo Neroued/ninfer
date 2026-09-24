@@ -85,14 +85,7 @@ stage_nvfp4_scales(const std::uint8_t* __restrict__ scales,
 
 template <class Geometry>
 __device__ __forceinline__ std::int64_t nvfp4_scale_offset(int parent_row, int group) {
-    const int m_tile       = parent_row / 128;
-    const int row_inner    = parent_row - m_tile * 128;
-    const int scale_tile   = group / 4;
-    const int scale_lane   = group & 3;
-    const int row_mod32    = row_inner & 31;
-    const int row_quartile = row_inner >> 5;
-    return static_cast<std::int64_t>(m_tile * Geometry::kScaleTilesPerRow + scale_tile) * 512 +
-           row_mod32 * 16 + row_quartile * 4 + scale_lane;
+    return nvfp4_scale_byte<Geometry::kScaleTilesPerRow>(parent_row, group);
 }
 
 template <class Geometry, class Schedule>

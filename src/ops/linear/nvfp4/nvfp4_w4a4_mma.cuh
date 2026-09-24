@@ -22,7 +22,9 @@ struct Nvfp4W4a4MmaSchedule {
     static_assert(WarpsM > 0 && WarpsN > 0);
     static_assert((BlockM % WarpsM) == 0 && ((BlockM / WarpsM) % 16) == 0);
     static_assert((BlockN % WarpsN) == 0 && ((BlockN / WarpsN) % 8) == 0);
-    static_assert(Stages >= 1 && Stages <= 4);
+    // Six is what the narrow shared-expert schedules take: a tile of sixteen tokens has little
+    // else to hide its weight stream behind, and the shared-memory budget admits the depth.
+    static_assert(Stages >= 1 && Stages <= 6);
     static_assert(MinBlocksPerSm > 0);
 
     static constexpr int kBlockM         = BlockM;
@@ -56,6 +58,32 @@ struct Nvfp4W4a4IdentityRows {
     }
 };
 
+// The activation plane is addressed by token. A dense operator consumes it in order; a routed
+// one consumes the same plane through its own column order, so the row a tile stages is a
+// policy rather than the tile index.
+struct Nvfp4W4a4IdentityTokens {
+    __device__ __forceinline__ int source_token(int token) const { return token; }
+
+    // A dense operator knows its extent at launch. A routed one learns it per group, so the
+    // extent is read through the same policy instead of being a second launch argument.
+    __device__ __forceinline__ int active_tokens(int launched) const { return launched; }
+};
+
+// Which tile of the grid a CTA takes. A dense operator reads it straight off the block index;
+// a routed one folds its own work list into it, so the tile a CTA serves is a policy rather than
+// the block index itself.
+struct Nvfp4W4a4MmaRasterRowFast {
+    __device__ __forceinline__ void blocks(int& block_row, int& block_token) const {
+        block_row   = static_cast<int>(blockIdx.x);
+        block_token = static_cast<int>(blockIdx.y);
+    }
+
+    // A routed launch sizes its grid from a host-side bound on the work list and learns the real
+    // count only on the device, so the tiles past the end have to leave before they read a weight
+    // plane. A dense launch has no such tiles.
+    __device__ __forceinline__ bool live() const { return true; }
+};
+
 template <class Schedule>
 struct Nvfp4W4a4SharedStorage {
     alignas(
@@ -77,18 +105,18 @@ __device__ __forceinline__ int nvfp4_w4a4_swizzled_byte(int row, int logical_byt
     return physical_segment * 16 + byte_in_segment;
 }
 
-template <class Geometry, class Schedule>
+template <class Geometry, class Schedule, class TokenPolicy>
 __device__ __forceinline__ void
 stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
                             Nvfp4W4a4SharedStorage<Schedule>& shared, int stage, int k_tile,
-                            int token_begin, int active_tokens) {
+                            int token_begin, int active_tokens, TokenPolicy token_policy) {
     constexpr int kCodeTasks = Schedule::kBlockM * Schedule::kSegmentsPerRow;
     for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
         const int row             = task / Schedule::kSegmentsPerRow;
         const int logical_segment = task - row * Schedule::kSegmentsPerRow;
         const int token           = token_begin + row;
         const bool valid          = token < active_tokens;
-        const int source_token    = valid ? token : 0;
+        const int source_token    = valid ? token_policy.source_token(token) : 0;
         const int physical_byte   = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
         auto* destination = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
         const auto* input = source.codes +
@@ -103,7 +131,7 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
              row += Schedule::kThreads) {
             const int token        = token_begin + row;
             const bool valid       = token < active_tokens;
-            const int source_token = valid ? token : 0;
+            const int source_token = valid ? token_policy.source_token(token) : 0;
             auto* destination      = &shared.a_scale4[stage][row * Schedule::kK64PerStage];
             const auto* input      = source.scales + (static_cast<std::int64_t>(source_token) *
                                                      Geometry::kScaleTilesPerRow +
@@ -121,7 +149,7 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
             const int segment      = task - row * kSegmentsPerRow;
             const int token        = token_begin + row;
             const bool valid       = token < active_tokens;
-            const int source_token = valid ? token : 0;
+            const int source_token = valid ? token_policy.source_token(token) : 0;
             const int local_k64    = segment * 4;
             auto* destination = &shared.a_scale4[stage][row * Schedule::kK64PerStage + local_k64];
             const auto* input = source.scales + (static_cast<std::int64_t>(source_token) *
@@ -203,21 +231,31 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
 }
 
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
-          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false>
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
+          class TokenPolicy  = Nvfp4W4a4IdentityTokens,
+          class RasterPolicy = Nvfp4W4a4MmaRasterRowFast>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_mma_kernel(
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
-    Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {}) {
+    Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {},
+    TokenPolicy token_policy = {}, RasterPolicy raster_policy = {}) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
     __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
-    const int token_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
+    int block_row   = 0;
+    int block_token = 0;
+    // Liveness first: a dead tile of a routed launch has no work-list entry to read, and reading
+    // one would touch arena bytes nothing has written.
+    if (!raster_policy.live()) { return; }
+    raster_policy.blocks(block_row, block_token);
+    const int token_begin       = block_token * Schedule::kBlockM;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
-    const int row_begin         = static_cast<int>(blockIdx.x) * kRowsPerBlock;
+    const int row_begin         = block_row * kRowsPerBlock;
+    const int active            = token_policy.active_tokens(tokens);
     constexpr int kKTiles       = Geometry::kInputRows / Schedule::kBlockK;
     constexpr int kWaitGroups   = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
 
@@ -225,7 +263,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
             stage_nvfp4_w4a4_activation<Geometry, Schedule>(activation, shared, stage, stage,
-                                                            token_begin, tokens);
+                                                            token_begin, active, token_policy);
             stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
                                                         stage, row_begin, row_policy);
             cp_commit();
@@ -320,7 +358,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
             stage_nvfp4_w4a4_activation<Geometry, Schedule>(activation, shared, stage, next_k_tile,
-                                                            token_begin, tokens);
+                                                            token_begin, active, token_policy);
             stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
                                                         next_k_tile, row_begin, row_policy);
         }
@@ -350,11 +388,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             float value01         = accumulators[mma_m][mma_n][1] * alpha;
             float value10         = accumulators[mma_m][mma_n][2] * alpha;
             float value11         = accumulators[mma_m][mma_n][3] * alpha;
-            if (token0 < tokens) {
+            if (token0 < active) {
                 value00 = epilogue.apply(parent_row0, token0, value00);
                 value01 = epilogue.apply(parent_row1, token0, value01);
             }
-            if (token1 < tokens) {
+            if (token1 < active) {
                 value10 = epilogue.apply(parent_row0, token1, value10);
                 value11 = epilogue.apply(parent_row1, token1, value11);
             }
@@ -365,13 +403,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     __syncthreads();
     constexpr int kStoredRows    = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
     constexpr int kVectorsPerRow = kStoredRows / 8;
+    // An output policy that completes a value across the neighbouring lane - the sparse-MoE
+    // gate/up epilogue does - needs both lanes of a pair to hold the same token, and they do only
+    // while a row's vectors come in pairs. A geometry that broke it would deadlock on the shuffle
+    // rather than fail a test, so it is refused here. This is stricter than the kernel needs: the
+    // dense output policies pair no lanes and would be safe with an odd count. Every schedule in
+    // the tree satisfies it, the narrowest being BlockN=32 with PairRows, which gives two.
+    static_assert((kVectorsPerRow % 2) == 0,
+                  "a lane pair must stay inside one token: give the tile an even number of "
+                  "output vectors per row");
     constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
     for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
          task += Schedule::kThreads) {
         const int token_local = task / kVectorsPerRow;
         const int row_vector  = task - token_local * kVectorsPerRow;
         const int token       = token_begin + token_local;
-        if (token < tokens) {
+        if (token < active) {
             const uint4 values =
                 load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
             if constexpr (PairRows) {

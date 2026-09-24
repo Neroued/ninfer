@@ -4,6 +4,8 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -48,7 +50,19 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--invalid-sync") {
+        try {
+            ninfer::DeviceContext ctx(0);
+        } catch (const std::invalid_argument& error) {
+            return std::string_view(error.what()).find("NINFER_CUDA_SYNC") != std::string_view::npos
+                       ? 0
+                       : fail("invalid sync setting has no configuration diagnostic");
+        }
+        return fail("invalid sync setting did not fail before CUDA initialization");
+    }
+    const unsigned int expected_flags =
+        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleSpin;
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err)) {
@@ -67,12 +81,31 @@ int main() {
     int failures = 0;
 
     ninfer::DeviceContext ctx(0);
+    unsigned int actual_flags = 0;
+    CUDA_CHECK(cudaGetDeviceFlags(&actual_flags));
+    if ((actual_flags & cudaDeviceScheduleMask) != expected_flags) {
+        return fail("CUDA did not apply the requested synchronization schedule");
+    }
     if (ctx.device != 0) {
         ++failures;
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
     }
     failures += check_context(ctx, "ctx");
+    int* device_value = nullptr;
+    int* host_value   = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&host_value, sizeof(int)));
+    *host_value = 0;
+    CUDA_CHECK(cudaMemsetAsync(device_value, 0x5a, sizeof(int), ctx.stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(host_value, device_value, sizeof(int), cudaMemcpyDeviceToHost, ctx.stream));
     ctx.synchronize();
+    const bool transfer_complete = *host_value == 0x5a5a5a5a;
+    CUDA_CHECK(cudaFreeHost(host_value));
+    CUDA_CHECK(cudaFree(device_value));
+    if (!transfer_complete) {
+        return fail("stream synchronization returned before transfer completed");
+    }
 
     const cudaStream_t original_stream = ctx.stream;
     ninfer::DeviceContext moved(std::move(ctx));

@@ -555,13 +555,12 @@ int run_q4_q5() {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
-    // The column counts that reach a projection mechanism this change touched: W=7 is the first
-    // extent with a tail column, W=8 the first full row-block extent on the Q5 side, W=9 the first
-    // extent of the 9..12 band (K-split Q4 parent with the narrow c4 SIMT Q5 tile, which is a
-    // different Q5 mechanism from the row-block used at 7/8). These are compared against the complete
-    // FP64 formula for every output row and every state channel, so a mechanism that is wrong away
-    // from the sampled rows cannot pass.
-    for (const std::int32_t tokens : {7, 8, 9}) {
+    // The column counts that reach a projection mechanism this change touched: 7 and 8 are the first
+    // counts the Q5 parent's split4 shape takes over (they were the row-block band, and the first two
+    // counts of the narrow-SIMT band), 9 the count that used to be the top of the split4 band, and 10
+    // the top of it now. These are compared against the complete FP64 formula for every output row and
+    // every state channel, so a mechanism that is wrong away from the sampled rows cannot pass.
+    for (const std::int32_t tokens : {7, 8, 9, 10}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1, true);
     }
     // The rest of the admitted range keeps the sampled comparison: the same formula, a smaller
@@ -600,7 +599,78 @@ int run_q4_q5() {
                                               state, valid, initial, snapshot_base, q, k, v, z,
                                               workspace, nullptr);
         });
+    // The batched organisations whose aggregate column count is 10 reach the same Q5 parent mechanism
+    // as the dense B=1 W=10 case above, through the seam of a multi-request call: B=2/W=5 here, which
+    // covers the per-request history split and the aggregate route. Two forms of the same aggregate
+    // count are covered because the per-side band end moved, and the aggregate count is what selects
+    // the route.
+    constexpr std::int32_t kAggTenWidth = 5;
+    constexpr std::int32_t kAggTenBatch = 2;
+    const std::size_t agg_ten_workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(kQueryRows, kKeyRows, kValueRows,
+                                                                  kAggTenBatch, kAggTenWidth,
+                                                                  kAggTenWidth);
+    failures += run_batched_case(
+        "Q4/Q5 A16 B=2 W=5", kHidden, kValueRows, kZRows, kAggTenWidth, kAggTenBatch, {},
+        conv_weight, agg_ten_workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
 
+    // One batched case with mixed valid prefixes whose aggregate column count is 8 (4 x 2): two live
+    // prefixes (4 and 2 of 4) over the same projection route, plus the exact-zero invalid tails and the
+    // per-request history split. The projection is routed once from the aggregate count, not per
+    // request, so this is a batched organisation of the aggregate-8 configuration and not a claim
+    // about where any single-side band ends.
+    constexpr std::int32_t kNarrowWidth = 4;
+    constexpr std::int32_t kNarrowBatch = 2;
+    const std::vector<std::int32_t> narrow_valid{4, 2};
+    const std::size_t narrow_workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(kQueryRows, kKeyRows, kValueRows,
+                                                                  kNarrowBatch, kNarrowWidth,
+                                                                  kNarrowWidth);
+    failures += run_batched_case(
+        "Q4/Q5 A16 B=2 W=4 masked", kHidden, kValueRows, kZRows, kNarrowWidth, kNarrowBatch,
+        narrow_valid, conv_weight, narrow_workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
     // One batched case with mixed valid prefixes whose aggregate column count is 48 (16 x 3). The
     // projection is routed once for the whole call from that aggregate column count - so this case
     // exercises the mixed valid prefixes and the exact-zero invalid tails, not three different

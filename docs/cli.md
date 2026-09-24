@@ -251,6 +251,22 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## CUDA synchronization
+
+`NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI
+and HTTP server. When unset, it defaults to `spin`, prioritizing low synchronization latency at
+the cost of CPU usage while waiting for the GPU. Use `blocking` to let the waiting thread sleep;
+the decode performance cost depends on the host. `yield` yields the CPU while waiting, and `auto`
+uses CUDA's scheduling heuristic, not an automatic performance benchmark.
+
+```bash
+NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
+```
+
+The Engine-ready log reports the selected mode. Empty or unrecognized values, or failure to apply
+the schedule, fail startup. This controls device scheduling (including stream synchronization);
+it does not override individual CUDA event creation flags.
+
 ## Context and memory
 
 The official artifacts have a native context limit of 262,144 tokens. The practical allocation

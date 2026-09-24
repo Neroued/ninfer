@@ -158,6 +158,7 @@ public:
         auto constructed  = runtime::construct_model(options, device);
         active            = std::move(constructed.instance);
         load              = std::move(constructed.load);
+        load.cuda_sync_mode = device.sync_mode();
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {

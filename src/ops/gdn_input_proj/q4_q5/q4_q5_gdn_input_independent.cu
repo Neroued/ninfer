@@ -10,7 +10,6 @@
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
-#include "ops/linear/q5/q5_rowsplit_rowblock_small_t.cuh"
 
 #include <cuda_bf16.h>
 
@@ -147,28 +146,6 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     }
 }
 
-void launch_q5_rowblock(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
-                        cudaStream_t stream) {
-    constexpr int kColsPerTile  = 8;
-    constexpr int kRowsPerBlock = 8;
-    constexpr int kStages       = 2;
-    constexpr int kThreads      = kRowsPerBlock * 32;
-    const std::int32_t cols     = x.ne[1];
-    const std::int32_t out_ld   = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, kRowsPerBlock)),
-                    static_cast<unsigned>(div_up(cols, kColsPerTile)), 1u);
-    q5_rowsplit_rowblock_small_t_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock,
-                                        kStages, true, kValueRows>
-        <<<grid, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.qhigh),
-            static_cast<const std::uint8_t*>(weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            kValueZRows, out_ld, kHidden, cols, weight.padded_shape[1], kHidden / 1024);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
     constexpr int kRowsPerBlock = 16;
@@ -218,8 +195,20 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
     case 6:
         launch_q5_split4<6>(x, weight, value, z, stream);
         return;
+    case 7:
+        launch_q5_split4<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_q5_split4<8>(x, weight, value, z, stream);
+        return;
+    case 9:
+        launch_q5_split4<9>(x, weight, value, z, stream);
+        return;
+    case 10:
+        launch_q5_split4<10>(x, weight, value, z, stream);
+        return;
     default:
-        throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("GDN Q5 split4 requires T in [2,10]");
     }
 }
 
@@ -249,25 +238,20 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
+    if (x.ne[1] <= 10) {
+        // Split4: one CTA owns one output row, its four warps split the K dimension and reduce
+        // their partial sums through shared memory. The column count is a compile-time template
+        // argument, so the kernel covers exactly the live columns. The fused projections below
+        // (T=2..6) use the same shape, so the Q5 parent has one mechanism from 2 to 10; the band
+        // end is the measured crossover against the c4 tile at 11..12, not a shape limit.
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 8) {
-        // T=7/8: the row-block kernel stages one 1024-value activation slab per block in shared
-        // memory and lets all kRowsPerBlock warps read it, so the activation traffic drops by
-        // kRowsPerBlock. At T=8 that moved this side from 93.4 us (row-split SIMT, activation bound
-        // by repeated activation traffic) to 62.7 us.
-        launch_q5_rowblock(x, weight, value, z, stream);
-        return;
-    }
     if (x.ne[1] <= 12) {
-        // T=9..12: this side stays on the narrow-column SIMT tile while the Q4 parent moves to the
-        // K-split, which is what makes the split form faster than the grouped kernel here. Measured
-        // as a complete op at T=9..12, a 4-column tile gives 101.6-105.7 us against 163.1-165.1 us for
-        // an 8-column tile and 109.8-126.7 us for the row-block shape. The 4-column tile is the
-        // fastest of the three that were measured; the measurement does not single out one cause for
-        // the difference between them.
+        // c4 SIMT: one output row per warp, up to four columns per column tile, with the quantized
+        // weight planes staged in shared memory and activations read from the input tensor.
+        // Retained in this interval on complete-Op measurements; both shapes are legal at every
+        // count in [2,15].
         launch_q5_simt_cols<4>(x, weight, value, z, stream);
         return;
     }

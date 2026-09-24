@@ -7,6 +7,23 @@ add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 
+set_tests_properties(ninfer_device_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")
+set(sync_modes spin blocking yield auto)
+set(sync_flags 1 4 2 0)
+foreach(mode flags IN ZIP_LISTS sync_modes sync_flags)
+  add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test ${flags})
+  set_tests_properties(ninfer_device_sync_${mode}_test PROPERTIES
+    ENVIRONMENT "NINFER_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
+endforeach()
+foreach(mode IN ITEMS invalid empty)
+  add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test --invalid-sync)
+endforeach()
+set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
+  ENVIRONMENT "NINFER_CUDA_SYNC=invalid")
+set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
+  ENVIRONMENT "NINFER_CUDA_SYNC=")
+
 ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES ninfer_core)
 

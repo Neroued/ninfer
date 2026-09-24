@@ -5,6 +5,8 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 ## Start the server
 
+See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \

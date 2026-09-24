@@ -37,7 +37,7 @@ class TensorOutput:
         self.object = obj
         self.format = get_format(obj.format)
         self._padding_initialized = False
-        self._divisor: bytes | None = None
+        self._divisors: list[bytes | None] = [None] * obj.divisors
 
     def write_bytes(self, offset: int, data: bytes | memoryview) -> None:
         self.writer.write_region(self.object.id, offset, data)
@@ -110,7 +110,7 @@ class TensorOutput:
                 raise ValueError(
                     f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor"
                 )
-            g = block_scale_geometry(self.format, obj.shape)
+            g = block_scale_geometry(self.format, obj.shape, len(self._divisors))
             local = block_scale_geometry(self.format, (rows, k))
             block = memoryview(encode_nvfp4(codes, scales, weight_divisor, (rows, k)))
             self.write_bytes(row_begin * (k // 2), block[: local.code_plane_bytes])
@@ -118,10 +118,17 @@ class TensorOutput:
                 g.scale_plane_offset + row_begin * (k // 16),
                 block[local.scale_plane_offset : local.weight_divisor_offset],
             )
-            if self._divisor is None:
-                self.write_bytes(g.weight_divisor_offset, weight_divisor)
-                self._divisor = bytes(weight_divisor)
-            elif self._divisor != weight_divisor:
+            # A row block belongs to exactly one source, so it names exactly one divisor.
+            rows_per_divisor = g.n // len(self._divisors)
+            index, offset_in_source = divmod(row_begin, rows_per_divisor)
+            if offset_in_source + rows > rows_per_divisor:
+                raise ValueError(
+                    f"{obj.id}: a row block may not span two separately quantised sources"
+                )
+            if self._divisors[index] is None:
+                self.write_bytes(g.weight_divisor_offset + index * 4, weight_divisor)
+                self._divisors[index] = bytes(weight_divisor)
+            elif self._divisors[index] != weight_divisor:
                 raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")

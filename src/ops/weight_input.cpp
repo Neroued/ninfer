@@ -235,19 +235,37 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                 matrix(shared_down) == std::vector<std::uint64_t>{2048, 512},
             "SparseMoe shared expert geometry differs");
     const std::array router_inputs{router, shared_score};
-    const auto router_bank  = single(router_inputs);
-    const auto gate_up_bank = single(expert_gate_up);
-    const auto down_bank    = single(expert_down);
-    const auto shared       = prepare_linear_swiglu_weight(shared_gate, shared_up);
-    const auto down         = prepare_linear_weight(shared_down);
-    const auto gate_format  = gate_up_bank.weight.qtype;
-    const auto down_format  = down_bank.weight.qtype;
-    require(router_bank.weight.qtype == QType::BF16 && shared.weight.qtype == QType::Q8_G32_FP16 &&
-                down.weight.qtype == QType::Q8_G32_FP16 &&
-                ((gate_format == QType::Q4_G64_FP16 &&
-                  (down_format == QType::Q5_G64_FP16 || down_format == QType::Q6_G64_FP16)) ||
-                 (gate_format == QType::Q8_G32_FP16 && down_format == QType::Q8_G32_FP16)),
+    const auto router_bank        = single(router_inputs);
+    const auto gate_up_bank       = single(expert_gate_up);
+    const auto down_bank          = single(expert_down);
+    const auto shared             = prepare_linear_swiglu_weight(shared_gate, shared_up);
+    const auto down               = prepare_linear_weight(shared_down);
+    const auto gate_format        = gate_up_bank.weight.qtype;
+    const auto down_format        = down_bank.weight.qtype;
+    const auto shared_format      = shared.weight.qtype;
+    const auto shared_down_format = down.weight.qtype;
+    const bool groupwise =
+        shared_format == QType::Q8_G32_FP16 && shared_down_format == QType::Q8_G32_FP16 &&
+        ((gate_format == QType::Q4_G64_FP16 &&
+          (down_format == QType::Q5_G64_FP16 || down_format == QType::Q6_G64_FP16)) ||
+         (gate_format == QType::Q8_G32_FP16 && down_format == QType::Q8_G32_FP16));
+    // The four expert matrices are one profile rather than two independent choices: the prefill
+    // route quantises the activation as well as the weight and its gate/up epilogue emits the
+    // encoded intermediate `down` consumes, so a mixture with a groupwise codec has no route
+    // behind it at any token count.
+    const bool nvfp4 = gate_format == QType::NVFP4 && down_format == QType::NVFP4 &&
+                       shared_format == QType::NVFP4 && shared_down_format == QType::NVFP4;
+    require(router_bank.weight.qtype == QType::BF16 && (groupwise || nvfp4),
             "SparseMoe native bank formats are unsupported");
+    if (nvfp4) {
+        // The prefill route of this profile quantises the hidden state to four bits, which is what
+        // AllowA4 grants. The groupwise profiles consume it represented and need no permission.
+        const auto permits = [](const WeightInput& input) { return allows_a4(input.policy); };
+        require(std::all_of(expert_gate_up.begin(), expert_gate_up.end(), permits) &&
+                    std::all_of(expert_down.begin(), expert_down.end(), permits) &&
+                    permits(shared_gate) && permits(shared_up) && permits(shared_down),
+                "SparseMoe NVFP4 requires AllowA4 on every expert input");
+    }
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
 }
 

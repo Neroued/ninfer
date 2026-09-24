@@ -22,11 +22,24 @@
         "BUILD_TESTING": "ON",
         "NINFER_BUILD_BENCHMARKS": "ON"
       }
+    },
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows (vcpkg, Ninja)",
+      "description": "Configures with the vcpkg toolchain for manifest-mode dependency resolution. Set VCPKG_ROOT or vcpkg will be auto-detected.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "120a"
+      },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
-    { "name": "dev", "configurePreset": "dev" }
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "windows-vcpkg", "configurePreset": "windows-vcpkg" }
   ],
   "testPresets": [
     {

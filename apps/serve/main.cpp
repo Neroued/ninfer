@@ -16,6 +16,21 @@
 #include <string>
 #include <utility>
 
+#ifdef _WIN32
+// Emit UTF-8 bytes to the console regardless of the legacy ANSI code page. The
+// activeCodePage=UTF-8 manifest fixes argv input; this fixes console display.
+#include <windows.h>
+namespace {
+struct ConsoleUtf8Setup {
+    ConsoleUtf8Setup() {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+};
+const ConsoleUtf8Setup console_utf8_setup;
+} // namespace
+#endif
+
 namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};

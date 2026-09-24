@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: 'fa16c31a-cc76-42b2-a193-0e4ef2d56b3e'
+  PropagateID: 'fa16c31a-cc76-42b2-a193-0e4ef2d56b3e'
+  ReservedCode1: '699436de-0b80-4adf-a485-3bc60a6778a7'
+  ReservedCode2: '699436de-0b80-4adf-a485-3bc60a6778a7'
+---
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.
@@ -28,11 +39,12 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+NInfer requires 64-bit Linux (or Windows), an NVIDIA GeForce RTX 5090, a CUDA toolkit
+supporting `sm_120a`, CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`,
+FFmpeg development libraries (`libavformat`, `libavcodec`, `libavutil`, and
+`libswscale`), and `libcurl >= 7.85`. CUDA 13.1 is the validated development toolkit;
+CMake does not impose a CUDA version floor. The build rejects CUDA architectures other
+than `sm_120a`.
 
 Build the product binaries:
 
@@ -44,11 +56,33 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+On Windows, dependencies (FFmpeg and libcurl with Schannel TLS) are managed with
+[vcpkg](https://vcpkg.io) in manifest mode — no GStreamer runtime or prebuilt curl
+packages are needed:
+
+```powershell
+git clone https://github.com/Neroued/ninfer.git
+cd ninfer
+
+# One-time setup (or use an existing vcpkg installation)
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg && .\bootstrap-vcpkg.bat && cd ..
+$env:VCPKG_ROOT = "$PWD\vcpkg"
+
+# Configure through the vcpkg toolchain; dependencies install automatically
+cmake -S . -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_BUILD_TYPE=Release
+cmake --build build-win -j
+```
+
+On first configuration vcpkg compiles FFmpeg and curl from source (about 15 minutes);
+subsequent configurations restore them from the local binary cache in seconds.
+
 Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
 the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
 Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
+The `windows-vcpkg` preset wraps the vcpkg toolchain for the Windows build.
 
 There is no install target or packaged binary distribution; run NInfer from its source build tree.
 Python tools run independently of CMake; the standalone HBM probe has its own

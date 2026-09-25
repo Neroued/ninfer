@@ -170,9 +170,16 @@ supported explicit type retain untyped inference. NInfer does not apply defaults
 properties, perform recursive JSON Schema validation, or use constrained decoding.
 
 String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape.
+A standalone `</parameter>` that is not followed, after whitespace, by `<parameter=` or `</function>`
+is value text. A string value therefore cannot contain `</parameter>` followed by whitespace and
+then `<parameter=` or `</function>`, nor an unmatched nested parameter opener; either causes the
+complete tool-call region to fall back to ordinary content.
+
+When text quotes the tool-call opener before the real call, the region starting at that quote does
+not parse. If that first opener does not begin a complete call, the parser tries the last four later openers, earliest first. The first one that
+parses completely supplies the tool calls, and the text before it is returned as ordinary content.
+If none parses, the whole output falls back to content with the first opener's fallback reason.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.

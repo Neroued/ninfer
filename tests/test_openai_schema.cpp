@@ -578,6 +578,25 @@ int test_stops_and_ranges() {
     failures +=
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
+    body = base_request();
+    failures += check(options(parse(body).generation).stop.include_model_defaults,
+                      "an omitted ignore_eos keeps the checkpoint's own stop tokens");
+    body["ignore_eos"] = false;
+    failures += check(options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos false keeps the checkpoint's own stop tokens");
+    body["ignore_eos"] = true;
+    failures += check(parse(body).generation.ignore_eos &&
+                          !options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos suppresses the checkpoint's own stop tokens");
+    body["stop"] = Json::array({"A"});
+    failures += check(options(parse(body).generation).stop.strings.size() == 2 &&
+                          !options(parse(body).generation).stop.include_model_defaults,
+                      "ignore_eos leaves caller stop strings in place");
+    body.erase("stop");
+    body["ignore_eos"] = "true";
+    failures += check(api_error([&] { (void)parse(body); }).param == "ignore_eos",
+                      "a non-boolean ignore_eos is rejected");
+
     body                                  = base_request();
     body["top_k"]                         = 21;
     const GenerationRequest invalid_top_k = parse(body).generation;

@@ -753,6 +753,7 @@ void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
+    output.ignore_eos = get_bool(body, "ignore_eos", false);
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     output.stop_strings_apply_to_reasoning = true;
     const Json& stop                       = body.at("stop");

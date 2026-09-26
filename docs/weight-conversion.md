@@ -278,6 +278,125 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 `EncodedRows`, and the format's required divisor accessors. Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
+## Convert from a GGUF quant instead of the full checkpoint
+
+The base `--model` checkpoint only needs to supply `config.json` and the frontend
+resources (tokenizer, chat template, generation config); it does not need every
+weight tensor present. If you already have a GGUF export of the model -- F16, or a
+ggml quant level such as `Q8_0` or `Q4_K_M` -- an override recipe can read the actual
+tensor values from that file instead of downloading the multi-gigabyte Safetensors
+checkpoint again. Keep only the checkpoint's small config/tokenizer files locally, and
+pass the GGUF file as a named `--source`:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/checkpoint-config-only \
+  --recipe qwen3_6_27b \
+  --source quantized=/path/to/model-Q4_K_M.gguf \
+  --override use_gguf_source.py \
+  --out models/my_qwen.ninfer
+```
+
+`tools/convert/sources/gguf.py` reads the GGUF file (via the `gguf` package --
+`pip install gguf`; it performs the actual block dequantization, since GGUF's quant
+byte layouts are intricate enough that reusing the maintained ggml-org reader beats
+reimplementing them) and exposes its tensors as FP32 values. Because GGUF tensor
+names never match the HF Safetensors names a recipe's `source_name`s are written
+against (`model.layers.0.self_attn.q_proj.weight` vs. `blk.0.attn_q.weight`), and
+some architectures reorder tensors on export, `HFAliasSource` wraps a `GGUFSource`
+with an explicit `{hf_name: gguf_name}` map (plus optional per-tensor transforms)
+so it satisfies the same interface a recipe already expects from `sources["..."]`.
+
+`use_gguf_source.py`:
+
+```python
+from tools.convert.sources.gguf import HFAliasSource, standard_dense_name_map
+
+
+def configure(model, recipe, sources):
+    gguf_source = sources["quantized"]  # opened as a GGUFSource because the path ends in .gguf
+    name_map, transforms, shapes = standard_dense_name_map(
+        model.config["num_hidden_layers"],
+        tie_word_embeddings=model.config["tie_word_embeddings"],
+        text_prefix="model.language_model.",  # "model." for a text-only (non-vision) checkpoint
+    )
+    quantized = HFAliasSource(gguf_source, name_map, transforms=transforms, shapes=shapes)
+    for name, parameter in model.parameters.items():
+        if parameter.source_factory is None:
+            continue
+        recipe.assign(name, source=model.source(name, quantized))
+```
+
+Parameters whose HF source name isn't in `name_map` (mixture-of-experts routing,
+MTP, vision, ...) fail with a clear "no GGUF tensor mapped for ..." error rather
+than silently reading the wrong bytes; extend `name_map`/`transforms` for those
+before assigning them too, or leave them assigned to the base recipe's original
+source by only looping over the names you've actually mapped.
+
+### MTP, vision, and DFlash2 from GGUF
+
+`--components text,vision,mtp,dflash2` works with GGUF sources too, matching a
+normal multi-component conversion, though each component needs its own wiring:
+
+- **MTP** is usually exported as a *separate* GGUF file (llama.cpp names these
+  `mtp-*.gguf`), not fused into the main model's file. It appears as one more
+  transformer layer appended after the base model's real layers (layer 64 for a
+  64-layer model), reusing the same attention/MLP/norm tensor roles
+  `standard_dense_name_map` already covers, plus four MTP-specific tensors.
+  `qwen35_mtp_name_map(gguf_layer_index, hf_prefix=...)` builds that map --
+  `hf_prefix="mtp."` when the MTP tensors are fused into the main checkpoint's
+  state dict, or `hf_prefix=""` for a standalone MTP-only checkpoint whose
+  tensors have no prefix. Pass it its own `--source mtp_quantized=mtp-*.gguf`
+  and wrap that in its own `HFAliasSource`.
+
+- **Vision** is exported as a separate `mmproj-*.gguf` file (GGUF architecture
+  `clip`, not the text model's `qwen35`/`qwen35moe`) covering the ViT tower and
+  the projector MLP. `qwen35_vision_name_map(depth, hidden_size=..., patch_size=...,
+  temporal_patch_size=..., ...)` builds its name map from the checkpoint's own
+  `vision_config`. It also needs a `--source vision_quantized=mmproj-*.gguf`.
+  One tensor needs more than a name/value transform: the patch-embed Conv3d
+  kernel's temporal dimension is split across two separate GGUF tensors
+  (`v.patch_embd.weight` / `.weight.1`), which `HFAliasSource`'s `composites`
+  argument reassembles by reading both from the underlying `GGUFSource` and
+  stacking them -- see its docstring if you need the same pattern elsewhere.
+
+- **DFlash2** needs no GGUF-specific code at all in the cases seen so far: it's
+  a small enough draft head that a plain Safetensors checkpoint for it is the
+  normal way to get one, and `tools.convert` already reads that natively via
+  `--source dflash2=PATH` plus `--components ...,dflash2` -- the same mechanism
+  `qwen3_8_27b_nvfp4`'s example in this doc already uses. An override recipe
+  only needs to touch `dflash2/*` parameters if you actually have a GGUF export
+  of the draft head to source them from instead.
+
+All three name maps above were checked against a real checkpoint/GGUF pair on
+this machine the same way `qwen35_linear_attention_name_map` was (see its
+docstring): every tensor's dequantized GGUF value was compared back to the
+original Safetensors value. MTP's own norm tensors turned out to need **no**
++1 shift (unlike the base model's layers -- verified, not assumed), vision
+needs no shift at all (it's LayerNorm, not RMSNorm), and the patch-embed
+temporal split reassembles to the exact original kernel. None of the three
+cover mixture-of-experts tensors, and the vision map doesn't cover deepstack
+layers (no checkpoint with those to verify against was available).
+
+This keeps every format/method choice the base recipe already made (`qwen3_6_27b`
+here); only the byte source for each parameter's values changes. Formats needing
+higher source fidelity than the GGUF file provides will simply re-quantize its
+already-lossy values -- e.g. re-deriving `q4_g64_fp16` from a `Q4_K_M` source
+compounds two rounds of quantization error. Prefer the highest-fidelity GGUF you
+have (F16 or `Q8_0`/`Q6_K`) as the source when the target format is more precise
+than the GGUF's own quant level.
+
+`standard_dense_name_map` only covers ordinary attention/MLP/norm tensors. Run
+`python3 -m tools.convert.sources.gguf /path/to/model.gguf` to list every tensor
+name, shape and ggml type in your file, and extend the map for anything it doesn't
+cover -- mixture-of-experts routing/shared-expert tensors, MTP/nextn tensors, or
+(for Qwen3.5's hybrid linear-attention layers) the GDN tensors handled by
+`qwen35_linear_attention_name_map` and `reorder_linear_attention_v_heads` in the
+same module. Verify a full conversion's outputs (`tools.artifact.inspect`, then the
+normal CLI/serving smoke test) before relying on it -- name-mapping mistakes for a
+component this map doesn't cover fail as a missing-tensor error, but a wrong
+element ordering for a component it does claim to cover would not.
+
 ## Write a conversion method
 
 A method receives a `PrepareRequest` and returns `request.job(produce=...)`. Preparation validates

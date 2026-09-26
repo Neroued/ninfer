@@ -1,10 +1,9 @@
 #pragma once
 
 #include "ops/common/math.cuh"
-#include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ops/linear_attention/kimi_delta_attention/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear_attention/kimi_delta_attention/launch.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -13,11 +12,10 @@
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 
-inline constexpr int kDvPerWarp     = 4;
-inline constexpr int kNumWarps      = 4;
-inline constexpr int kBlockDv       = kNumWarps * kDvPerWarp;
-inline constexpr int kQkPerLane     = kStateDim / kWarpSize;
-inline constexpr float kQkL2NormEps = 1.0e-6F;
+inline constexpr int kDvPerWarp = 4;
+inline constexpr int kNumWarps  = 4;
+inline constexpr int kBlockDv   = kNumWarps * kDvPerWarp;
+inline constexpr int kQkPerLane = kStateDim / kWarpSize;
 
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
@@ -29,19 +27,6 @@ struct alignas(16) GateStage {
     float beta[2];
     float a_log_exp;
 };
-
-__device__ __forceinline__ void load_bf16x4(float (&values)[kQkPerLane],
-                                            const __nv_bfloat16* source) {
-    // A built-in 64-bit vector keeps this as one coalesced LDG. Loading the equivalent struct lets
-    // ptxas scalarize it into two stride-8 32-bit requests.
-    const uint2 packed = load_vec<uint2>(source);
-    const float2 low   = bf16x2_bits_to_float2(packed.x);
-    const float2 high  = bf16x2_bits_to_float2(packed.y);
-    values[0]          = low.x;
-    values[1]          = low.y;
-    values[2]          = high.x;
-    values[3]          = high.y;
-}
 
 __device__ __forceinline__ void normalize_qk(float (&values)[kQkPerLane], int lane) {
     float sum = 0.0F;
@@ -131,7 +116,7 @@ run_recurrent_token(float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16*
     const float gate_raw = __bfloat162float(gate_source[thread]);
     const float log_alpha =
         lower_bound * sigmoid_approx(a_scale * (gate_raw + dt_bias_source[thread]));
-    gate_stage.alpha[stage][thread] = exp_approx(log_alpha);
+    gate_stage.alpha[stage][thread] = exp_approx_ftz(log_alpha);
     if (thread == 0) { gate_stage.beta[stage] = sigmoid_approx(__bfloat162float(*beta_source)); }
 
     // Alpha and beta are produced once per CTA. Direct alternates buffers so the writes for a

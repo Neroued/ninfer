@@ -10,6 +10,8 @@
 
 namespace ninfer::ops {
 
+inline constexpr float kLog2E = 1.4426950408889634F;
+
 template <class T>
 NINFER_KERNEL_HD constexpr T div_up(T x, T d) {
     static_assert(std::is_integral_v<T>, "div_up requires an integral type");

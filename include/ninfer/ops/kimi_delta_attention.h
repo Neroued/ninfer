@@ -46,8 +46,10 @@ namespace ninfer::ops {
  * FP32 SIMT and chunked BF16/TF32 MMA are private arithmetic profiles qualified directly against
  * that oracle. Running and published state stay FP32; the output epilogue rounds once to BF16.
  * Q/K normalization, activated gates, triangular solves, residuals and accumulators stay FP32;
- * chunked decay-weighted Q/K operands have private BF16 storage. Transcendental approximations
- * and reduction association are implementation details.
+ * chunked decay-weighted Q/K operands have private BF16 storage. Chunked state prediction and
+ * small matrix products use TF32 MMA; Q readout and state updates use BF16 MMA with FP32
+ * accumulators. State snapshots and Delta stay FP32, converting only their BF16 MMA operands.
+ * Transcendental approximations and reduction association are implementation details.
  *
  * workspace supplies the capacity query above and is scoped to the call; the Op allocates no
  * device storage. execution supplies the stream and physical SM count for launch decomposition.

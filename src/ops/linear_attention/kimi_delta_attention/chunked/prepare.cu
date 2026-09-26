@@ -1,6 +1,7 @@
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ops/linear_attention/kimi_delta_attention/math.cuh"
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/warp.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
@@ -46,13 +47,10 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
         qs = fmaf(q[i], q[i], qs);
         ks = fmaf(k[i], k[i], ks);
     }
-#pragma unroll
-    for (int d = 8; d; d >>= 1) {
-        qs += __shfl_xor_sync(0xffffffffU, qs, d, 16);
-        ks += __shfl_xor_sync(0xffffffffU, ks, d, 16);
-    }
-    const float qi = rsqrtf(qs + 1.0e-6F);
-    const float ki = rsqrtf(ks + 1.0e-6F);
+    qs             = warp_sum<16>(qs);
+    ks             = warp_sum<16>(ks);
+    const float qi = rsqrtf(qs + kQkL2NormEps);
+    const float ki = rsqrtf(ks + kQkL2NormEps);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         q[i] *= qi;
@@ -81,20 +79,20 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
             sm.prefix[t * kStateDim + tid] = sum;
         }
         sm.last[tid]         = sum;
-        sm.packet.gamma[tid] = exp2_approx(sum);
+        sm.packet.gamma[tid] = exp2_approx_ftz(sum);
     }
     __syncthreads();
 
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const float g       = sm.prefix[row * kStateDim + col + i];
-        const float decay   = exp2_approx(g);
+        const float decay   = exp2_approx_ftz(g);
         const int index     = vector_index(row, col + i);
         sm.packet.kd[index] = __float2bfloat16_rn(k[i] * decay);
         sm.packet.qd[index] = __float2bfloat16_rn(q[i] * decay);
-        sm.ki[index]        = __float2bfloat16_rn(k[i] * exp2_approx(-g));
+        sm.ki[index]        = __float2bfloat16_rn(k[i] * exp2_approx_ftz(-g));
         sm.packet.kr[restored_index(row, col + i)] =
-            __float2bfloat16_rn(k[i] * exp2_approx(sm.last[col + i] - g));
+            __float2bfloat16_rn(k[i] * exp2_approx_ftz(sm.last[col + i] - g));
     }
     __syncthreads();
 

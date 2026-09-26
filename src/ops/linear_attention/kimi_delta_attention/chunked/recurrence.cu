@@ -1,4 +1,5 @@
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
@@ -14,25 +15,36 @@ __device__ __forceinline__ int value_index(int row, int col) {
     return row * Width + (col ^ ((row & 3) * 8));
 }
 
-__device__ __forceinline__ void load_vector_a(const __nv_bfloat16* p, int k, int lane,
-                                              unsigned (&a)[4]) {
+__device__ __forceinline__ void load_vector_tf32_a(const __nv_bfloat16* p, int k, int lane,
+                                                   unsigned (&a)[4]) {
     unsigned low, high;
     ldmatrix_x2(low, high, smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8, k)));
-    a[0] = low << 16;
-    a[2] = low & 0xffff0000U;
-    a[1] = high << 16;
-    a[3] = high & 0xffff0000U;
+    unpack_bf16x2_to_fp32_bits(low, a[0], a[2]);
+    unpack_bf16x2_to_fp32_bits(high, a[1], a[3]);
 }
 
-__device__ __forceinline__ void load_restored_a(const __nv_bfloat16* p, int key, int k, int lane,
-                                                unsigned (&a)[4]) {
-    unsigned low, high;
-    ldmatrix_x2_t(low, high,
-                  smem_addr(p + vector_index(k + (lane & 7), key + ((lane >> 3) & 1) * 8)));
-    a[0] = low << 16;
-    a[2] = low & 0xffff0000U;
-    a[1] = high << 16;
-    a[3] = high & 0xffff0000U;
+// The producer interleaves each eight inner coordinates as {0,4,1,5,2,6,3,7}.
+// BF16 A consumes those bits directly; B packing applies the matching permutation.
+__device__ __forceinline__ void load_vector_bf16_a(const __nv_bfloat16* p, int k, int lane,
+                                                   unsigned (&a)[4]) {
+    ldmatrix_x4(
+        a[0], a[1], a[2], a[3],
+        smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8, k + (lane >> 4) * 8)));
+}
+
+__device__ __forceinline__ void load_restored_bf16_a(const __nv_bfloat16* p, int key, int lane,
+                                                     unsigned (&a)[4]) {
+    ldmatrix_x4_t(
+        a[0], a[1], a[2], a[3],
+        smem_addr(p + vector_index((lane & 7) + (lane >> 4) * 8, key + ((lane >> 3) & 1) * 8)));
+}
+
+template <int DV>
+__device__ __forceinline__ void load_bf16_b(const float* p, int k, int n, int lane, unsigned& b0,
+                                            unsigned& b1) {
+    const int t = lane & 3, col = n * 8 + lane / 4;
+    b0 = pack_bf16x2(p[value_index<DV>(k + t, col)], p[value_index<DV>(k + t + 4, col)]);
+    b1 = pack_bf16x2(p[value_index<DV>(k + t + 8, col)], p[value_index<DV>(k + t + 12, col)]);
 }
 
 template <int DV>
@@ -177,21 +189,26 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         if constexpr (NT >= kWarps) {
             float prediction[NPW][4]{};
 #pragma unroll
-            for (int k = 0; k < kStateDim; k += 8) {
-                unsigned ka[4], qa[4];
-                load_vector_a(p.kd, k, lane, ka);
-                load_vector_a(p.qd, k, lane, qa);
+            for (int k = 0; k < kStateDim; k += 16) {
+                unsigned ka0[4], ka1[4], qa[4];
+                load_vector_tf32_a(p.kd, k, lane, ka0);
+                load_vector_tf32_a(p.kd, k + 8, lane, ka1);
+                load_vector_bf16_a(p.qd, k, lane, qa);
 #pragma unroll
                 for (int ni = 0; ni < NPW; ++ni) {
-                    const int n = warp + ni * kWarps;
-                    const unsigned b0 =
-                        __float_as_uint(sm.snapshot[value_index<DV>(k + t, n * 8 + g)]);
-                    const unsigned b1 =
-                        __float_as_uint(sm.snapshot[value_index<DV>(k + t + 4, n * 8 + g)]);
+                    const int n    = warp + ni * kWarps;
+                    const float b0 = sm.snapshot[value_index<DV>(k + t, n * 8 + g)];
+                    const float b1 = sm.snapshot[value_index<DV>(k + t + 4, n * 8 + g)];
+                    const float b2 = sm.snapshot[value_index<DV>(k + t + 8, n * 8 + g)];
+                    const float b3 = sm.snapshot[value_index<DV>(k + t + 12, n * 8 + g)];
                     mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                  prediction[ni][3], ka[0], ka[1], ka[2], ka[3], b0, b1);
-                    mma_tf32_bits(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
-                                  qa[0], qa[1], qa[2], qa[3], b0, b1);
+                                  prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
+                                  __float_as_uint(b0), __float_as_uint(b1));
+                    mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                  prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
+                                  __float_as_uint(b2), __float_as_uint(b3));
+                    mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3], qa[0],
+                             qa[1], qa[2], qa[3], pack_bf16x2(b0, b1), pack_bf16x2(b2, b3));
                 }
             }
 #pragma unroll
@@ -200,20 +217,30 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             }
         } else {
             if (warp < 2 * NT) {
-                const bool query   = warp >= NT;
-                const int n        = warp % NT;
-                const auto* matrix = query ? p.qd : p.kd;
+                const bool query = warp >= NT;
+                const int n      = warp % NT;
+                if (query) {
 #pragma unroll
-                for (int k = 0; k < kStateDim; k += 8) {
-                    unsigned af[4];
-                    load_vector_a(matrix, k, lane, af);
-                    mma_tf32_bits(
-                        history[0][0], history[0][1], history[0][2], history[0][3], af[0], af[1],
-                        af[2], af[3],
-                        __float_as_uint(sm.snapshot[value_index<DV>(k + t, n * 8 + g)]),
-                        __float_as_uint(sm.snapshot[value_index<DV>(k + t + 4, n * 8 + g)]));
+                    for (int k = 0; k < kStateDim; k += 16) {
+                        unsigned af[4], b0, b1;
+                        load_vector_bf16_a(p.qd, k, lane, af);
+                        load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                        mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3], af[0],
+                                 af[1], af[2], af[3], b0, b1);
+                    }
+                } else {
+#pragma unroll
+                    for (int k = 0; k < kStateDim; k += 8) {
+                        unsigned af[4];
+                        load_vector_tf32_a(p.kd, k, lane, af);
+                        mma_tf32_bits(
+                            history[0][0], history[0][1], history[0][2], history[0][3], af[0],
+                            af[1], af[2], af[3],
+                            __float_as_uint(sm.snapshot[value_index<DV>(k + t, n * 8 + g)]),
+                            __float_as_uint(sm.snapshot[value_index<DV>(k + t + 4, n * 8 + g)]));
+                    }
+                    store_residual<DV>(sm.delta, stage.value, history[0], n, lane);
                 }
-                if (!query) store_residual<DV>(sm.delta, stage.value, history[0], n, lane);
             }
         }
         __syncthreads();
@@ -244,6 +271,14 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         }
 
         // S^T = diag(gamma) S^T + Kr^T Delta. State remains an FP32 accumulator.
+        // Convert Delta only for this MMA and reuse its fragment across all key tiles.
+        // The output branch above consumes the original FP32 Delta through TF32 MMA.
+        unsigned delta_b[NPW][2];
+#pragma unroll
+        for (int ni = 0; ni < NPW; ++ni) {
+            load_bf16_b<DV>(sm.delta, 0, n_start + ni * kWarps, lane, delta_b[ni][0],
+                            delta_b[ni][1]);
+        }
 #pragma unroll
         for (int mi = 0; mi < MPW; ++mi) {
             const int key  = (m_start + mi * MW) * 16 + g;
@@ -255,18 +290,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 state[ni][mi][2] *= g1;
                 state[ni][mi][3] *= g1;
             }
+            unsigned af[4];
+            load_restored_bf16_a(p.kr, key - g, lane, af);
 #pragma unroll
-            for (int k = 0; k < kChunkSize; k += 8) {
-                unsigned af[4];
-                load_restored_a(p.kr, key - g, k, lane, af);
-#pragma unroll
-                for (int ni = 0; ni < NPW; ++ni) {
-                    const int n = n_start + ni * kWarps;
-                    mma_tf32_bits(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2],
-                                  state[ni][mi][3], af[0], af[1], af[2], af[3],
-                                  __float_as_uint(sm.delta[value_index<DV>(k + t, n * 8 + g)]),
-                                  __float_as_uint(sm.delta[value_index<DV>(k + t + 4, n * 8 + g)]));
-                }
+            for (int ni = 0; ni < NPW; ++ni) {
+                mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2], state[ni][mi][3],
+                         af[0], af[1], af[2], af[3], delta_b[ni][0], delta_b[ni][1]);
             }
         }
         __syncthreads();
@@ -303,16 +332,21 @@ void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) 
 } // namespace
 
 int chunk_value_tile(int value_heads, int multiprocessor_count) {
-    // Small grids need the narrowest stripe. Otherwise minimize the stripe work in
-    // a wave of SMs; equal work favors fewer replicated packet reads. This models
-    // the measured 5090 crossover without specializing any head count or Q/K ratio.
+    // Small grids need the narrowest stripe. Otherwise minimize SM waves weighted
+    // by the measured per-wave cost of this mixed BF16/TF32 kernel on SM120a.
+    // Wider stripes reduce replicated packet reads but retain more state per CTA.
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
     int best               = 64;
     std::int64_t best_work = INT64_MAX;
-    for (int tile : {64, 32, 16}) {
+
+    struct Choice {
+        int tile, cost;
+    };
+
+    for (const auto [tile, cost] : {Choice{64, 34}, Choice{32, 20}, Choice{16, 13}}) {
         const auto blocks = static_cast<std::int64_t>(value_heads) * (kStateDim / tile);
         const auto waves  = (blocks + multiprocessor_count - 1) / multiprocessor_count;
-        const auto work   = waves * tile;
+        const auto work   = waves * cost;
         if (work < best_work) {
             best      = tile;
             best_work = work;

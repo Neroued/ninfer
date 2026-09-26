@@ -25,7 +25,7 @@ constexpr float kLowerBound = -5.0F;
 constexpr float kScale      = 1.0F / 11.313708498984761F;
 
 constexpr ReductionCriterion output_criterion(bool chunked = false) {
-    // BF16 decay operands and native TF32 products are a distinct arithmetic profile.
+    // Mixed BF16/TF32 MMA with FP32 master state is a distinct arithmetic profile.
     if (chunked) return {6.0e-3, 1.0e-5, 1.5e-2};
     return {/*relative_l2=*/2.2e-3, /*gross_absolute=*/1.0e-5,
             /*gross_relative_to_max_reference=*/4.0e-3};
@@ -41,15 +41,22 @@ struct Case {
     const char* name;
     int heads;
     int tokens;
-    bool near_zero_qk   = false;
-    bool saturated_gate = false;
-    bool zero_state     = false;
-    int qk_heads        = 0;
-    float lower_bound   = kLowerBound;
-    bool weak_decay     = false;
+    bool near_zero_qk     = false;
+    bool saturated_gate   = false;
+    bool zero_state       = false;
+    int qk_heads          = 0;
+    float lower_bound     = kLowerBound;
+    bool weak_decay       = false;
+    bool small_beta       = false;
+    bool collinear_cancel = false;
 
     int qheads() const { return qk_heads == 0 ? heads : qk_heads; }
 };
+
+std::string case_label(const Case& c) {
+    return std::string(c.name) + " Hq=" + std::to_string(c.qheads()) +
+           " Hv=" + std::to_string(c.heads) + " T=" + std::to_string(c.tokens);
+}
 
 void fill_uniform(std::vector<float>& values, std::mt19937& generator, float low, float high) {
     std::uniform_real_distribution<float> distribution(low, high);
@@ -102,6 +109,37 @@ kda_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
         std::fill(in.g.begin(), in.g.end(), -8.0F);
         std::fill(in.a_log.begin(), in.a_log.end(), 0.0F);
         std::fill(in.dt_bias.begin(), in.dt_bias.end(), 0.0F);
+    }
+    if (test_case.small_beta) { std::fill(in.beta.begin(), in.beta.end(), -6.0F); }
+    if (test_case.collinear_cancel) {
+        for (float& value : in.state) { value *= 50.0F; }
+        const std::vector<float> base(in.k.begin(), in.k.begin() + kStateDim * in.qk_heads);
+        for (int token = 0; token < in.tokens; ++token) {
+            for (std::size_t i = 0; i < base.size(); ++i) {
+                const auto offset = token * base.size() + i;
+                in.k[offset]      = base[i] + 0.002F * in.k[offset];
+            }
+        }
+        // Construct V near S*K from represented K, stressing cancellation in the residual.
+        round_to_bf16(in.k);
+        for (int token = 0; token < in.tokens; ++token) {
+            for (int head = 0; head < in.value_heads; ++head) {
+                const auto kb =
+                    (token * in.qk_heads + head / (in.value_heads / in.qk_heads)) * kStateDim;
+                double norm = 1.0e-6;
+                for (int d = 0; d < kStateDim; ++d) { norm += double(in.k[kb + d]) * in.k[kb + d]; }
+                const double inv_norm = 1.0 / std::sqrt(norm);
+                for (int value = 0; value < kStateDim; ++value) {
+                    double prediction = 0.0;
+                    for (int d = 0; d < kStateDim; ++d) {
+                        prediction += double(in.state[(head * kStateDim + value) * kStateDim + d]) *
+                                      in.k[kb + d] * inv_norm;
+                    }
+                    in.v[(token * in.value_heads + head) * kStateDim + value] = float(prediction);
+                }
+            }
+        }
+        std::fill(in.beta.begin(), in.beta.end(), 4.0F);
     }
     round_to_bf16(in.q);
     round_to_bf16(in.k);
@@ -231,14 +269,68 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
                               views.state_out, views.out, execution());
     cuda_synchronize();
 
-    const std::string label = std::string(test_case.name) + " inplace";
+    const std::string label = case_label(test_case) + " inplace";
     int failures = verify_result(label, in, reference, state, out, test_case.tokens >= 12);
     failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_inputs_unchanged(label, in, device);
     return failures;
 }
 
-int distinct_case(const Case& test_case, std::uint32_t seed) {
+int continue_decode(const Case& prefix, const kda_ref::Inputs& prefix_input,
+                    const kda_ref::Result& prefix_reference, GuardedDeviceBuffer& state) {
+    Case c{"chunked to decode", prefix.heads, 128};
+    c.qk_heads   = prefix.qheads();
+    c.weak_decay = true;
+    auto in      = make_inputs(c, 70123U);
+    in.a_log     = prefix_input.a_log;
+    in.dt_bias   = prefix_input.dt_bias;
+    for (std::size_t i = 0; i < in.state.size(); ++i) {
+        in.state[i] = static_cast<float>(prefix_reference.final_state[i]);
+    }
+    DeviceInputs device(in);
+    GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+    out.fill(0xff);
+    Case single   = c;
+    single.tokens = 1;
+    Views views(single, device, state.data(), state.data(), out.data());
+    auto step   = in;
+    step.tokens = 1;
+    kda_ref::Result expected;
+    expected.out.reserve(in.v.size());
+    const auto ex = execution();
+    for (int token = 0; token < c.tokens; ++token) {
+        const auto slice = [token](const std::vector<float>& source, int width,
+                                   std::vector<float>& destination, const DeviceBuffer& buffer,
+                                   Tensor& tensor) {
+            const auto offset = static_cast<std::size_t>(token) * width;
+            destination.assign(source.begin() + offset, source.begin() + offset + width);
+            tensor.data = static_cast<std::uint16_t*>(buffer.p) + offset;
+        };
+        slice(in.q, kStateDim * c.qheads(), step.q, device.q, views.q);
+        slice(in.k, kStateDim * c.qheads(), step.k, device.k, views.k);
+        slice(in.v, kStateDim * c.heads, step.v, device.v, views.v);
+        slice(in.g, kStateDim * c.heads, step.g, device.g, views.g);
+        slice(in.beta, c.heads, step.beta, device.beta, views.beta);
+        views.out.data = static_cast<std::uint16_t*>(out.data()) + token * kStateDim * c.heads;
+        const auto reference = kda_ref::evaluate(step, prefix.lower_bound, kScale);
+        expected.out.insert(expected.out.end(), reference.out.begin(), reference.out.end());
+        // Every public one-token call publishes an FP32 state for the next call.
+        for (std::size_t i = 0; i < step.state.size(); ++i) {
+            step.state[i] = static_cast<float>(reference.final_state[i]);
+        }
+        expected.final_state = doubles(step.state);
+        ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
+                                  views.dt_bias, prefix.lower_bound, kScale, views.workspace,
+                                  views.state_out, views.out, ex);
+    }
+    cuda_synchronize();
+    const auto label = case_label(prefix) + " then 128 one-token calls";
+    int failures     = verify_result(label, in, expected, state, out, true);
+    failures += views.scratch.verify_guards(label + " workspace");
+    return failures;
+}
+
+int distinct_case(const Case& test_case, std::uint32_t seed, bool decode = false) {
     const kda_ref::Inputs in        = make_inputs(test_case, seed);
     const kda_ref::Result reference = kda_ref::evaluate(
         in, static_cast<double>(test_case.lower_bound), static_cast<double>(kScale));
@@ -257,13 +349,14 @@ int distinct_case(const Case& test_case, std::uint32_t seed) {
                               views.out, execution());
     cuda_synchronize();
 
-    const std::string label = std::string(test_case.name) + " distinct";
+    const std::string label = case_label(test_case) + " distinct";
     int failures = verify_result(label, in, reference, state_out, out, test_case.tokens >= 12);
     failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_exact((label + " state-in unchanged").c_str(),
                              from_device<float>(state_in.data(), in.state.size()), in.state);
     failures += state_in.verify_guards(label + " state-in");
     failures += verify_inputs_unchanged(label, in, device);
+    if (decode) { failures += continue_decode(test_case, in, reference, state_out); }
     return failures;
 }
 
@@ -284,7 +377,7 @@ int distinct_exact_alias_case(const Case& test_case, std::uint32_t seed) {
                               views.out, execution());
     cuda_synchronize();
 
-    const std::string label = std::string(test_case.name) + " distinct exact-alias";
+    const std::string label = case_label(test_case) + " distinct exact-alias";
     int failures = verify_result(label, in, reference, state, out, test_case.tokens >= 12);
     failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_inputs_unchanged(label, in, device);
@@ -597,19 +690,31 @@ int main() {
         c.name   = "chunked grouped";
         failures += distinct_case(c, 16180U + vheads);
         failures += inplace_case(c, 14142U + vheads);
+        if (qheads > 1 && vheads >= 32) {
+            c.tokens = 1025;
+            failures += distinct_case(c, 53212U + vheads);
+        }
     }
     for (int t : {11, 12, 13, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1025}) {
         Case c{"chunk boundary", 3, t};
         c.qk_heads = 1;
         failures += distinct_case(c, 90000U + t);
     }
-    Case weak{"weak decay long", 3, 4097};
+    Case weak{"weak decay long", 3, 16385};
     weak.qk_heads   = 1;
     weak.weak_decay = true;
-    failures += distinct_case(weak, 99887U);
+    failures += distinct_case(weak, 99887U, true);
     weak.lower_bound = 0.0F;
     weak.name        = "zero decay long";
-    failures += distinct_case(weak, 88776U);
+    failures += distinct_case(weak, 88776U, true);
+    weak.name       = "small beta zero decay long";
+    weak.small_beta = true;
+    failures += distinct_case(weak, 332213U, true);
+    Case cancellation{"near collinear residual cancellation", 3, 4097};
+    cancellation.qk_heads         = 1;
+    cancellation.lower_bound      = 0.0F;
+    cancellation.collinear_cancel = true;
+    failures += distinct_case(cancellation, 99891U);
     failures += distinct_case({"chunk saturated", 5, 257, false, true}, 77665U);
     failures += distinct_case({"chunk near zero QK", 5, 65, true}, 66554U);
     failures += distinct_exact_alias_case({"chunk state alias", 32, 65}, 55443U);

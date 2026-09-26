@@ -159,12 +159,6 @@ __device__ __forceinline__ void issue_load_k_bf16(Bf16KView view,
     }
 }
 
-__device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsigned& low,
-                                                           unsigned& high) {
-    low  = packed << 16;
-    high = packed & 0xffff0000U;
-}
-
 // The narrow geometry targets two 128-register CTAs per SM. The wide geometry
 // uses one 512-thread CTA; both expose 16 resident warps without local spills.
 template <int NStrip>

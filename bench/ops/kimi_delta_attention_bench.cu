@@ -183,19 +183,22 @@ Traffic traffic(Profile p, int t, int b, std::size_t ws, int slices, std::string
     const double state = 8.0 * D * D * hv;
     const double logical =
         (4.0 * D * hq * nt + (6.0 * D + 2) * hv * nt + state) * b + 4.0 * (D + 1) * hv;
-    const double prepare    = (6.0 * D + 2) * nt * hv + 4.0 * (D + 1) * hv * nc + ws;
-    const double recurrence = slices * static_cast<double>(ws) + 4.0 * D * nt * hv + state;
-    if (stage == "prepare") return {0, double(ws), 0, prepare, 4.0 * 16 * 16 * D * hv * nc, 0};
+    const double prepare         = (6.0 * D + 2) * nt * hv + 4.0 * (D + 1) * hv * nc + ws;
+    const double recurrence      = slices * static_cast<double>(ws) + 4.0 * D * nt * hv + state;
+    constexpr double c           = kda::kChunkSize;
+    const double prepare_bf16    = 4.0 * c * c * D * hv * nc;
+    const double recurrence_bf16 = 4.0 * c * D * D * hv * nc; // Qd*S and Kr^T*Delta
+    const double recurrence_tf32 = (2.0 * c * D * D + 4.0 * c * c * D) * hv * nc;
+    if (stage == "prepare") return {0, double(ws), 0, prepare, prepare_bf16, 0};
     if (stage == "recurrence")
-        return {0,          0, slices * double(ws),
-                recurrence, 0, (6.0 * 16 * D * D + 4.0 * 16 * 16 * D) * hv * nc};
+        return {0, 0, slices * double(ws), recurrence, recurrence_bf16, recurrence_tf32};
     if (ws == 0) return {logical, 0, 0, logical, 0, 0};
     return {logical,
             double(ws),
             slices * double(ws),
             prepare + recurrence,
-            4.0 * 16 * 16 * D * hv * nc,
-            (6.0 * 16 * D * D + 4.0 * 16 * 16 * D) * hv * nc};
+            prepare_bf16 + recurrence_bf16,
+            recurrence_tf32};
 }
 
 void print(Profile p, int t, int b, const char* stage, int tile, std::size_t ws, std::size_t nodes,

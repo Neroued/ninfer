@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ops/common/math.h"
 
 #include <cuda_bf16.h>
 #include <cstddef>
@@ -12,6 +13,7 @@ namespace ninfer::ops::detail::kimi_delta_attention {
 inline constexpr int kStateDim         = 128;
 inline constexpr int kChunkSize        = 16;
 inline constexpr int kChunkedMinTokens = 12;
+inline constexpr float kQkL2NormEps    = 1.0e-6F;
 
 struct Arguments {
     const __nv_bfloat16 *q, *k, *v, *g, *beta;
@@ -24,9 +26,7 @@ struct Arguments {
 
 inline bool valid_heads(int qk, int value) { return qk > 0 && value >= qk && value % qk == 0; }
 
-__host__ __device__ inline int chunk_count(int tokens) {
-    return tokens / kChunkSize + (tokens % kChunkSize != 0);
-}
+__host__ __device__ inline int chunk_count(int tokens) { return div_up(tokens, kChunkSize); }
 
 // One producer/consumer packet. The vector and square tiles use the swizzles below in both
 // global and shared memory, so recurrence can asynchronously copy whole packets without repacking.
@@ -45,7 +45,7 @@ __host__ __device__ constexpr int vector_index(int row, int col) {
     return row * kStateDim + (col ^ (row * 8));
 }
 
-// Kr time rows are interleaved {0,4,1,5,2,6,3,7}, so LDSM.TRANS supplies TF32 A.
+// Kr time rows are interleaved {0,4,1,5,2,6,3,7} for transposed BF16 MMA loads.
 __host__ __device__ constexpr int restored_index(int row, int col) {
     const int physical = (row & ~7) + (row & 3) * 2 + ((row >> 2) & 1);
     return vector_index(physical, col);

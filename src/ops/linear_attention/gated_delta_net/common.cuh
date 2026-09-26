@@ -93,8 +93,6 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
     }
 }
 
-inline constexpr float kLog2E = 1.4426950408889634f;
-
 #endif // __CUDACC__
 
 struct head_map {

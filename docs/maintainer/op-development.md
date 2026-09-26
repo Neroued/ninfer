@@ -454,11 +454,12 @@ A long-lived Op benchmark calls the public contract and, when applicable, its pu
 capacity query. It does not include private implementation headers, call private launchers, expose
 candidate or kernel forcing, or duplicate candidate legality and production dispatch tables.
 
-The sole standing exception is `ninfer_gated_delta_net_bench --chunked-only --breakdown`: the
-complete chunked pipeline is still measured through the public Op, while the benchmark may call
-exactly its three intrinsic `prepare_wy_wu`, `state_passing`, and `output` stage launchers for
-algorithm-stage attribution. It may not call the private complete-pipeline launcher or any other
-private launcher.
+The Gated DeltaNet benchmark is an explicit exception: `--running` measures the public Op and
+uses its workspace capacity query, while `--breakdown` may call the selected production
+`prepare` and `recurrence` stage launchers with their private workspace layout. `--force-chunked`
+and `--recurrent-only` may force those production routes at matching prefill extents to measure
+their crossover; `--chunked-only` measures the same chunked route with pre-normalized BF16 Q/K.
+These controls qualify the production prefill decomposition and do not change decode or ReplaySSM.
 
 Candidate comparison is task-local development work. A temporary sweep may call private launchers
 and encode the exact overlapping candidate domains needed for a decision. Measure candidates under

@@ -1,5 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
+
 #include "core/device.h"
+#include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "ops/op_tester.h"
 
@@ -54,8 +56,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots;
 
     std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
-    std::vector<std::uint16_t> k_bits       = make_bf16(qk_elements, seed + 1);
-    std::vector<std::uint16_t> v_bits       = make_bf16(value_elements, seed + 2);
+    std::vector<std::uint16_t> k_bits = make_bf16(qk_elements, seed + 1);
+    std::vector<std::uint16_t> v_bits = make_bf16(value_elements, seed + 2);
     std::vector<float> g(gate_elements);
     std::vector<float> beta(gate_elements);
     fill_uniform(g, seed + 3, -1.2F, -0.02F);
@@ -81,9 +83,10 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer device_g        = to_device(g);
     DeviceBuffer device_beta     = to_device(beta);
     DeviceBuffer reference_state = to_device(state);
-    DeviceBuffer reference_final(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * batch * sizeof(float));
-    DeviceBuffer record_state    = to_device(state);
-    DeviceBuffer device_initial  = to_device(initial_slots);
+    DeviceBuffer reference_final(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
+                                 batch * sizeof(float));
+    DeviceBuffer record_state   = to_device(state);
+    DeviceBuffer device_initial = to_device(initial_slots);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
@@ -106,7 +109,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor reference_states(reference_state.p, DType::FP32,
                             {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
-    Tensor reference_final_states(reference_final.p, DType::FP32, {kStateDim, kStateDim, value_heads, batch});
+    Tensor reference_final_states(reference_final.p, DType::FP32,
+                                  {kStateDim, kStateDim, value_heads, batch});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
@@ -117,40 +121,46 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
-    WorkspaceArena reference_workspace(256);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     cuda_synchronize();
+    // Replay is bitwise equivalent to recurrence, independently of the prefill dispatcher.
     const auto launch_reference = [&] {
         CUDA_CHECK(cudaMemsetAsync(reference_out.p, 0, reference_out.bytes, stream));
-    for (std::int32_t row = 0; row < batch; ++row) {
-        const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
-        Tensor q_row =
-            q.slice(3, row, 1).slice(2, 0, valid_extent).view({kStateDim, kQkHeads, valid_extent});
-        Tensor k_row =
-            k.slice(3, row, 1).slice(2, 0, valid_extent).view({kStateDim, kQkHeads, valid_extent});
-        Tensor v_row = v.slice(3, row, 1)
-                           .slice(2, 0, valid_extent)
-                           .view({kStateDim, value_heads, valid_extent});
-        Tensor g_row =
-            g_tensor.slice(2, row, 1).slice(1, 0, valid_extent).view({value_heads, valid_extent});
-        Tensor beta_row = beta_tensor.slice(2, row, 1)
-                              .slice(1, 0, valid_extent)
-                              .view({value_heads, valid_extent});
-        Tensor state_row =
-            reference_states.slice(3, initial_slots[static_cast<std::size_t>(row)], 1)
-                .view({kStateDim, kStateDim, value_heads});
-        Tensor out_row = reference_output.slice(3, row, 1)
-                             .slice(2, 0, valid_extent)
-                             .view({kStateDim, value_heads, valid_extent});
-        Tensor final_row = reference_final_states.slice(3, row, 1).view({kStateDim, kStateDim, value_heads});
-        ops::gated_delta_net(q_row, k_row, v_row, g_row, beta_row, kScale, true,
-                             reference_workspace, state_row, final_row, out_row, stream);
-    }
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
+            Tensor q_row                    = q.slice(3, row, 1)
+                               .slice(2, 0, valid_extent)
+                               .view({kStateDim, kQkHeads, valid_extent});
+            Tensor k_row = k.slice(3, row, 1)
+                               .slice(2, 0, valid_extent)
+                               .view({kStateDim, kQkHeads, valid_extent});
+            Tensor v_row = v.slice(3, row, 1)
+                               .slice(2, 0, valid_extent)
+                               .view({kStateDim, value_heads, valid_extent});
+            Tensor g_row = g_tensor.slice(2, row, 1)
+                               .slice(1, 0, valid_extent)
+                               .view({value_heads, valid_extent});
+            Tensor beta_row = beta_tensor.slice(2, row, 1)
+                                  .slice(1, 0, valid_extent)
+                                  .view({value_heads, valid_extent});
+            Tensor state_row =
+                reference_states.slice(3, initial_slots[static_cast<std::size_t>(row)], 1)
+                    .view({kStateDim, kStateDim, value_heads});
+            Tensor out_row = reference_output.slice(3, row, 1)
+                                 .slice(2, 0, valid_extent)
+                                 .view({kStateDim, value_heads, valid_extent});
+            Tensor final_row =
+                reference_final_states.slice(3, row, 1).view({kStateDim, kStateDim, value_heads});
+            ops::detail::gated_delta_net::launch_recurrent_inout(q_row, k_row, v_row, g_row,
+                                                                 beta_row, kScale, true, state_row,
+                                                                 final_row, out_row, stream);
+        }
     };
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
-            valid, initial, key_record_tensor, value_record_tensor, gate_record_tensor, record_output, stream);
+                                           valid, initial, key_record_tensor, value_record_tensor,
+                                           gate_record_tensor, record_output, stream);
     };
     launch_reference();
     launch_record();
@@ -165,11 +175,12 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (auto& bits : q_bits) bits ^= 0x8000U;
-        CUDA_CHECK(cudaMemcpyAsync(device_q.p, q_bits.data(), device_q.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_q.p, q_bits.data(), device_q.bytes,
+                                   cudaMemcpyHostToDevice, stream));
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;
             CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid_columns.data(), device_valid.bytes,
-                                        cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice, stream));
         }
         CUDA_CHECK(cudaMemsetAsync(key_record.p, 0xff, key_record.bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(value_record.p, 0xff, value_record.bytes, stream));

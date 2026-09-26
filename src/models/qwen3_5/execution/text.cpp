@@ -1048,7 +1048,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             q_recurrent, k_recurrent, vv, g, beta,
             static_cast<float>(1.0 /
                                std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-            /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
+            /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o,
+            ctx_.execution_view());
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)

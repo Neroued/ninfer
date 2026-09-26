@@ -348,7 +348,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     if (path == GdnWorkspacePath::Prefill) {
                         scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
                                             dimension(config.gdn->linear_num_key_heads),
-                                            dimension(config.gdn->linear_num_value_heads), true,
+                                            dimension(config.gdn->linear_num_value_heads),
                                             first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);

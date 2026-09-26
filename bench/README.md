@@ -421,35 +421,40 @@ cmake --build build -j --target ninfer_dynamic_grouped_conv_prepare_bench
 
 `ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
 128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
-Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and optional mixed valid
-prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
-interval.
+Running/chunked modes use batch 1; batch-update mode accepts exact `B=1..8` at `T=1`. Every
+measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed interval.
 
-`--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
-production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
-`--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
-`--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
-three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete
-pipeline and every other mode remain public-contract calls.
+`--running` measures the public running-state entry and uses its workspace capacity query. The
+current prefill dispatcher uses recurrence below 16 tokens and a two-kernel chunked route at
+larger extents. The chunked route prepares 16-token packets and combines recurrence with output;
+its final packet is padded inside the kernels. `--batch-update` measures the public selected-slot
+update at `T=1`, with `B=1..8`; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+
+`--force-chunked` and `--recurrent-only` call the selected production launchers with fused Q/K
+normalization at matching prefill extents to measure their crossover. `--chunked-only` forces
+the chunked route with pre-normalized BF16 Q/K. These prefill comparisons are independent of
+decode and ReplaySSM. Adding `--breakdown` to a chunked measurement reports isolated
+`chunked.prepare` and `chunked.recurrence` timings using the same production launchers and
+workspace layout.
+
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
 cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
 pipeline latency.
 
 `logical_bytes` and `logical_gbps` count each contract-visible tensor and state transfer once.
-`traffic_bytes` and `traffic_gbps` instead sum one full tensor extent for every kernel input and
-output in the selected implementation. This includes repeated consumption by different kernels,
-the composed or public chunked Q/K-normalization intermediates, and every producer/consumer access
-to chunked `g_cumsum`, W, U, `v_new`, and `h_chunk`. `intermediate_traffic_bytes` isolates those
-normalization and chunked-workspace accesses. These deterministic byte counts describe
-implementation-level tensor traffic; physical DRAM/L2 sectors and cache reuse still require NCU.
+`tensor_io_request_bytes` and `tensor_io_request_gbps` count CTA tensor I/O requests, including
+repeated Q/K reads in prepare and repeated packet reads across recurrence value tiles. The
+workspace holds BF16 Q/K shared by each Q/K head group and FP32 control packets per value head;
+`workspace_request_bytes` isolates their producer/consumer traffic and any composed normalization
+intermediates. These deterministic byte counts describe requests, not physical DRAM traffic;
+physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
-cmake --build build --parallel --target ninfer_gated_delta_net_bench
+cmake --build build -j --target ninfer_gated_delta_net_bench
 ./build/bench/ninfer_gated_delta_net_bench \
   --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
-  --snapshot --value-heads 32 --qk-norm fused --warmup 20 --repeat 100 --csv
+  --batch-update --value-heads 32 --batch 8 --qk-norm fused --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
   --chunked-only --value-heads 32 --tokens 1024 --breakdown \
   --warmup 20 --repeat 100

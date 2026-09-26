@@ -1,48 +1,57 @@
 #pragma once
-
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/q4/q4_launch.h"
-#include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q4/q4_a16_simt.cuh"
+#include "ops/linear/q4/q4_operands.h"
 
 namespace ninfer::ops::detail {
-
-template <class Schedule, bool Full, bool FullK>
-void launch_q4_simt_tile(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const std::int32_t rows     = out.ne[0];
-    const std::int32_t k        = x.ne[0];
-    const std::int32_t cols     = x.ne[1];
-    const std::int32_t out_ld   = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    const std::int32_t padded_k = w.padded_shape[1];
-
-    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)),
-                    static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
-
-    q4_rowsplit_gemm_simt_kernel<Schedule, Full, false, 0, Q4SimtStoreEpilogue, false, false,
-                                 Full || FullK><<<grid, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), nullptr,
-        out_ld, 0, rows, k, cols, padded_k);
-    CUDA_CHECK(cudaGetLastError());
+template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, bool Dependent,
+          class Output, class Epilogue>
+void launch_q4_a16_simt_slice(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
+                              int token_begin, int tokens, cudaStream_t stream) {
+    const dim3 grid(div_up(operands.rows, Schedule::kBlockRows),
+                    div_up(tokens, Schedule::kBlockTokens));
+    const dim3 block(Schedule::kThreads);
+    const auto* x = operands.x + static_cast<std::int64_t>(token_begin) * operands.k;
+    if constexpr (Dependent) {
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, block, 0, stream},
+            q4_a16_simt_kernel<Schedule, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>, x,
+            operands.codes, operands.scales, output, epilogue, operands.rows, operands.k, tokens,
+            operands.padded_k, token_begin));
+    } else {
+        q4_a16_simt_kernel<Schedule, Full, FullK, Output, Epilogue, TriggerPdl, JoinPdl>
+            <<<grid, block, 0, stream>>>(x, operands.codes, operands.scales, output, epilogue,
+                                         operands.rows, operands.k, tokens, operands.padded_k,
+                                         token_begin);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
-template <class Schedule, bool FullK = false>
-void launch_q4_simt(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const bool full = (out.ne[0] % Schedule::kRowsPerCta) == 0 &&
-                      ((x.ne[0] / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
-                      (x.ne[1] % Schedule::kColsPerTile) == 0;
-    for_each_token_slice(
-        x.ne[1], Schedule::kColsPerTile, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice = x.slice(1, offset, count);
-            Tensor out_slice     = out.slice(1, offset, count);
-            if (full) {
-                launch_q4_simt_tile<Schedule, true, FullK>(x_slice, w, out_slice, stream);
-            } else {
-                launch_q4_simt_tile<Schedule, false, FullK>(x_slice, w, out_slice, stream);
-            }
-        });
+template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
+          class Output, class Epilogue>
+void launch_q4_a16_simt(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
+                        cudaStream_t stream) {
+    validate_q4_operands(operands);
+    constexpr int W   = Schedule::kWarpsPerRow;
+    const bool full_k = !Schedule::kPredicated && (operands.k / 128) % W == 0 &&
+                        (operands.k / 64 / W) % Schedule::kGroupsPerWarpStage == 0;
+    for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const bool full = !Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
+                          count % Schedule::kBlockTokens == 0;
+        if (full && full_k)
+            launch_q4_a16_simt_slice<Schedule, true, true, TriggerPdl, JoinPdl, Dependent>(
+                operands, output, epilogue, offset, count, stream);
+        else if (full)
+            launch_q4_a16_simt_slice<Schedule, true, false, TriggerPdl, JoinPdl, Dependent>(
+                operands, output, epilogue, offset, count, stream);
+        else if (full_k)
+            launch_q4_a16_simt_slice<Schedule, false, true, TriggerPdl, JoinPdl, Dependent>(
+                operands, output, epilogue, offset, count, stream);
+        else
+            launch_q4_a16_simt_slice<Schedule, false, false, TriggerPdl, JoinPdl, Dependent>(
+                operands, output, epilogue, offset, count, stream);
+    });
 }
-
-
 } // namespace ninfer::ops::detail

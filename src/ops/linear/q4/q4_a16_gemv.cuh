@@ -1,124 +1,24 @@
 #pragma once
-
 #include "core/pdl.cuh"
-#include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/q4/q4_rowsplit_storage.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
-#include <cstdint>
+#include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/q4/q4_schedule.cuh"
 
 namespace ninfer::ops::detail {
-
-enum class Q4GemvActivationAccess {
-    Direct,
-    CtaSharedFullK,
-};
-
-enum class Q4GemvLaneMapping {
-    PackedByte2,
-    PackedWord8,
-};
-
-enum class Q4GemvDecodeMode {
-    ScalarInteger,
-    Fp16Mantissa,
-};
-
-enum class Q4GemvCodeTransfer {
-    SyncVector16,
-    AsyncVector16,
-};
-
-enum class Q4GemvScaleAccess {
-    Scalar16Shuffle,
-    SharedPair32,
-};
-
-template <int RowsPerCta, int WarpsPerRow, int GroupsPerWarpTile, int PipelineStages,
-          Q4GemvActivationAccess ActivationAccess, Q4GemvLaneMapping LaneMapping,
-          Q4GemvDecodeMode DecodeMode, Q4GemvCodeTransfer CodeTransfer,
-          Q4GemvScaleAccess ScaleAccess, Cache CodeCache, int StaticGroupsPerRow,
-          int LaunchBoundsMinBlocks>
-struct Q4RowSplitGemvSchedule {
-    static_assert(RowsPerCta > 0, "Q4 GEMV requires at least one row per CTA");
-    static_assert(WarpsPerRow > 0, "Q4 GEMV requires at least one warp per row");
-    static_assert(GroupsPerWarpTile > 0 && (GroupsPerWarpTile % 2) == 0,
-                  "Q4 GEMV group tiles must contain whole scale pairs");
-    static_assert(GroupsPerWarpTile <= 32,
-                  "Q4 GEMV scalar-shuffle scale access is limited to one warp");
-    static_assert(PipelineStages >= 1 && PipelineStages <= 8,
-                  "Q4 GEMV pipeline depth must fit cp.async wait-group immediates");
-    static_assert(StaticGroupsPerRow == 0 ||
-                      (StaticGroupsPerRow > 0 && (StaticGroupsPerRow % 2) == 0),
-                  "Q4 GEMV static row ownership must contain whole scale pairs");
-    static_assert(LaunchBoundsMinBlocks >= 1, "Q4 GEMV launch-bounds occupancy must be positive");
-
-    static constexpr int kRowsPerCta            = RowsPerCta;
-    static constexpr int kWarpsPerRow           = WarpsPerRow;
-    static constexpr int kGroupsPerWarpTile     = GroupsPerWarpTile;
-    static constexpr int kPipelineStages        = PipelineStages;
-    static constexpr auto kActivationAccess     = ActivationAccess;
-    static constexpr auto kLaneMapping          = LaneMapping;
-    static constexpr auto kDecodeMode           = DecodeMode;
-    static constexpr auto kCodeTransfer         = CodeTransfer;
-    static constexpr auto kScaleAccess          = ScaleAccess;
-    static constexpr auto kCodeCache            = CodeCache;
-    static constexpr int kStaticGroupsPerRow    = StaticGroupsPerRow;
-    static constexpr int kLaunchBoundsMinBlocks = LaunchBoundsMinBlocks;
-
-    static constexpr int kCtaWarps = kRowsPerCta * kWarpsPerRow;
-    static constexpr int kThreads  = kCtaWarps * 32;
-    static constexpr int kCodeVectorsPerTile =
-        kGroupsPerWarpTile * Q4RowSplitStorage::kCodeBytesPerGroup / sizeof(uint4);
-    static constexpr int kScalePairsPerTile = kGroupsPerWarpTile / 2;
-
-    static_assert(kCtaWarps <= 32, "Q4 GEMV cannot exceed the CUDA CTA warp limit");
-    static_assert(kThreads <= 1024, "Q4 GEMV cannot exceed the CUDA CTA thread limit");
-    static_assert((kGroupsPerWarpTile * Q4RowSplitStorage::kCodeBytesPerGroup) % sizeof(uint4) == 0,
-                  "Q4 GEMV code tile must be representable as 16-byte vectors");
-
-    static_assert((kLaneMapping == Q4GemvLaneMapping::PackedByte2 &&
-                   kDecodeMode == Q4GemvDecodeMode::ScalarInteger) ||
-                      (kLaneMapping == Q4GemvLaneMapping::PackedWord8 &&
-                       kDecodeMode == Q4GemvDecodeMode::Fp16Mantissa),
-                  "Q4 GEMV lane mapping and decode mode must describe the same packed ownership");
-    static_assert((kCodeTransfer == Q4GemvCodeTransfer::SyncVector16 &&
-                   kScaleAccess == Q4GemvScaleAccess::Scalar16Shuffle && kPipelineStages == 1 &&
-                   kCodeCache == Cache::ca) ||
-                      (kCodeTransfer == Q4GemvCodeTransfer::AsyncVector16 &&
-                       kScaleAccess == Q4GemvScaleAccess::SharedPair32),
-                  "Q4 GEMV transfer and scale schedules must select an implemented path");
-};
-
-using Q4GemvR4W1DirectSchedule =
-    Q4RowSplitGemvSchedule<4, 1, 16, 1, Q4GemvActivationAccess::Direct,
-                           Q4GemvLaneMapping::PackedWord8, Q4GemvDecodeMode::Fp16Mantissa,
-                           Q4GemvCodeTransfer::AsyncVector16, Q4GemvScaleAccess::SharedPair32,
-                           Cache::ca, 0, 1>;
-using Q4GemvR1Q8DirectSchedule =
-    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
-                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
-                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
-                           Cache::ca, 80, 1>;
 
 template <class Schedule, Q4GemvScaleAccess ScaleAccess = Schedule::kScaleAccess>
 struct Q4GemvTileStorage;
 
 template <class Schedule>
 struct Q4GemvTileStorage<Schedule, Q4GemvScaleAccess::Scalar16Shuffle> {
-    __align__(16)
-        uint4 codes[Schedule::kCtaWarps][Schedule::kPipelineStages][Schedule::kCodeVectorsPerTile];
+    __align__(16) uint4 codes[Schedule::kWarps][Schedule::kStages][Schedule::kCodeVectorsPerTile];
 };
 
 template <class Schedule>
 struct Q4GemvTileStorage<Schedule, Q4GemvScaleAccess::SharedPair32> {
-    __align__(16)
-        uint4 codes[Schedule::kCtaWarps][Schedule::kPipelineStages][Schedule::kCodeVectorsPerTile];
+    __align__(16) uint4 codes[Schedule::kWarps][Schedule::kStages][Schedule::kCodeVectorsPerTile];
     __align__(16) std::uint32_t
-        scale_pairs[Schedule::kCtaWarps][Schedule::kPipelineStages][Schedule::kScalePairsPerTile];
+        scale_pairs[Schedule::kWarps][Schedule::kStages][Schedule::kScalePairsPerTile];
 };
 
 template <class Schedule>
@@ -207,8 +107,8 @@ __device__ __forceinline__ float q4_gemv_dot_word_async(
     const __nv_bfloat16* __restrict__ activation, const std::uint8_t* __restrict__ code_row,
     const std::uint8_t* __restrict__ scale_row, int group_begin, int group_end, int lane) {
     constexpr int kGroupsPerTile    = Schedule::kGroupsPerWarpTile;
-    constexpr int kPipelineStages   = Schedule::kPipelineStages;
-    constexpr int kPipelinePrefetch = kPipelineStages - 1;
+    constexpr int kStages           = Schedule::kStages;
+    constexpr int kPipelinePrefetch = kStages - 1;
 
     const int tile_count = div_up(group_end - group_begin, kGroupsPerTile);
     float accumulator    = 0.0f;
@@ -232,7 +132,7 @@ __device__ __forceinline__ float q4_gemv_dot_word_async(
         if (fetch < tile_count) {
             const int fetch_group_begin   = group_begin + fetch * kGroupsPerTile;
             const int fetch_active_groups = min(kGroupsPerTile, group_end - fetch_group_begin);
-            const int fetch_stage         = fetch % kPipelineStages;
+            const int fetch_stage         = fetch % kStages;
             q4_gemv_issue_async_tile<Schedule>(shared_tiles.codes[cta_warp][fetch_stage],
                                                shared_tiles.scale_pairs[cta_warp][fetch_stage],
                                                code_row, scale_row, fetch_group_begin,
@@ -246,7 +146,7 @@ __device__ __forceinline__ float q4_gemv_dot_word_async(
 
         const int tile_group_begin = group_begin + tile * kGroupsPerTile;
         const int active_groups    = min(kGroupsPerTile, group_end - tile_group_begin);
-        const int consume_stage    = tile % kPipelineStages;
+        const int consume_stage    = tile % kStages;
         accumulator                = q4_gemv_consume_word_tile<Schedule>(
             shared_tiles.codes[cta_warp][consume_stage],
             shared_tiles.scale_pairs[cta_warp][consume_stage], activation, tile_group_begin,
@@ -266,7 +166,7 @@ q4_gemv_dot_byte_static(Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
     static_assert(Schedule::kDecodeMode == Q4GemvDecodeMode::ScalarInteger);
     static_assert(Schedule::kCodeTransfer == Q4GemvCodeTransfer::SyncVector16);
     static_assert(Schedule::kScaleAccess == Q4GemvScaleAccess::Scalar16Shuffle);
-    static_assert(Schedule::kPipelineStages == 1);
+    static_assert(Schedule::kStages == 1);
     static_assert(GroupsPerWarp > 0 && GroupsPerWarp <= Schedule::kGroupsPerWarpTile);
     static_assert((GroupsPerWarp % 2) == 0, "Q4 GEMV static ownership preserves scale pairs");
 
@@ -317,7 +217,7 @@ __device__ __forceinline__ float q4_gemv_dot_byte_sync(Q4GemvTileStorage<Schedul
     static_assert(Schedule::kDecodeMode == Q4GemvDecodeMode::ScalarInteger);
     static_assert(Schedule::kCodeTransfer == Q4GemvCodeTransfer::SyncVector16);
     static_assert(Schedule::kScaleAccess == Q4GemvScaleAccess::Scalar16Shuffle);
-    static_assert(Schedule::kPipelineStages == 1);
+    static_assert(Schedule::kStages == 1);
 
     auto* shared_codes = shared_tiles.codes[cta_warp][0];
     float accumulator0 = 0.0f;
@@ -379,53 +279,22 @@ __device__ __forceinline__ float q4_gemv_dot_byte_sync(Q4GemvTileStorage<Schedul
     return accumulator0 + accumulator1;
 }
 
-template <bool SplitOutput, int SplitRow>
-__device__ __forceinline__ void q4_gemv_store(__nv_bfloat16* out, __nv_bfloat16* out_tail,
-                                              int output_row, float value) {
-    if constexpr (SplitOutput) {
-        if (output_row < SplitRow) {
-            out[output_row] = __float2bfloat16(value);
-        } else {
-            out_tail[output_row - SplitRow] = __float2bfloat16(value);
-        }
-    } else {
-        out[output_row] = __float2bfloat16(value);
-    }
-}
-
-// clang-format off
-struct Q4GemvStoreEpilogue {
-    template <bool SplitOutput, int SplitRow>
-    __device__ __forceinline__ void operator()(__nv_bfloat16* out, __nv_bfloat16* out_tail,
-                                               int row, float value) const {
-        q4_gemv_store<SplitOutput, SplitRow>(out, out_tail, row, value);
-    }
-};
-
-template <class Schedule, bool SplitOutput = false, int SplitRow = 0,
-          class Epilogue = Q4GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kLaunchBoundsMinBlocks)
-void q4_rowsplit_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out,
-    __nv_bfloat16* __restrict__ out_tail,
-    std::int32_t rows,
-    std::int32_t k,
-    Epilogue epilogue = {}) {
+template <class Schedule, class Output, class Epilogue, bool TriggerPdl = false,
+          bool JoinPdl = false>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, std::int32_t rows,
+    std::int32_t k, std::int32_t padded_k) {
     // clang-format on
-    constexpr int kRowsPerCta  = Schedule::kRowsPerCta;
+    constexpr int kBlockRows   = Schedule::kBlockRows;
     constexpr int kWarpsPerRow = Schedule::kWarpsPerRow;
-    static_assert(!SplitOutput || SplitRow > 0,
-                  "split-output Q4 GEMV requires a positive compile-time seam");
 
     if constexpr (TriggerPdl) {
         if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     }
 
     __shared__ Q4GemvTileStorage<Schedule> shared_tiles;
-    __shared__ float row_partials[kRowsPerCta][kWarpsPerRow];
+    __shared__ float row_partials[kBlockRows][kWarpsPerRow];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];
 
     auto* shared_x = reinterpret_cast<__nv_bfloat16*>(dynamic_shared);
@@ -446,7 +315,7 @@ void q4_rowsplit_gemv_kernel(
     const int cta_warp    = static_cast<int>(threadIdx.x) >> 5;
     const int row_in_cta  = cta_warp / kWarpsPerRow;
     const int warp_in_row = cta_warp % kWarpsPerRow;
-    const int row         = static_cast<int>(blockIdx.x) * kRowsPerCta + row_in_cta;
+    const int row         = static_cast<int>(blockIdx.x) * kBlockRows + row_in_cta;
 
     const int groups_per_row = Schedule::kStaticGroupsPerRow > 0 ? Schedule::kStaticGroupsPerRow
                                                                  : k / Q4RowSplitStorage::kGroupK;
@@ -467,9 +336,11 @@ void q4_rowsplit_gemv_kernel(
         group_end               = pair_end * 2;
     }
 
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * groups_per_row *
+    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row < rows ? row : 0) *
+                                               (padded_k / 64) *
                                                Q4RowSplitStorage::kCodeBytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * groups_per_row *
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row < rows ? row : 0) *
+                                                 (padded_k / 64) *
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
     const __nv_bfloat16* activation =
         Schedule::kActivationAccess == Q4GemvActivationAccess::CtaSharedFullK ? shared_x : x;
@@ -496,21 +367,22 @@ void q4_rowsplit_gemv_kernel(
 
     accumulator = warp_reduce_sum(accumulator);
     if constexpr (kWarpsPerRow == 1) {
-        if (lane == 0) {
-            epilogue.template operator()<SplitOutput, SplitRow>(out, out_tail, row, accumulator);
+        if (lane == 0 && row < rows) {
+            const float values[1]{accumulator};
+            linear_finish_row(output, epilogue, row, 0, values, 1);
         }
     } else {
         if (lane == 0) { row_partials[row_in_cta][warp_in_row] = accumulator; }
         __syncthreads();
 
-        if (warp_in_row == 0 && lane == 0) {
+        if (warp_in_row == 0 && lane == 0 && row < rows) {
             float row_accumulator = 0.0f;
 #pragma unroll
             for (int warp = 0; warp < kWarpsPerRow; ++warp) {
                 row_accumulator += row_partials[row_in_cta][warp];
             }
-            epilogue.template operator()<SplitOutput, SplitRow>(out, out_tail, row,
-                                                                row_accumulator);
+            const float values[1]{row_accumulator};
+            linear_finish_row(output, epilogue, row, 0, values, 1);
         }
     }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }

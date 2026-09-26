@@ -39,4 +39,18 @@ struct LinearBf16InputView {
     }
 };
 
+template <int SplitRow>
+struct LinearBf16SplitOutput2 {
+    static_assert(SplitRow > 0);
+    LinearBf16StridedOutput first;
+    LinearBf16StridedOutput second;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        if (row < SplitRow)
+            first.store(row, token, value);
+        else
+            second.store(row - SplitRow, token, value);
+    }
+};
+
 } // namespace ninfer::ops::detail

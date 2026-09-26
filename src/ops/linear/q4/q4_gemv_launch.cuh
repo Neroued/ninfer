@@ -1,30 +1,40 @@
 #pragma once
-
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q4/q4_launch.h"
-#include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q4/q4_a16_gemv.cuh"
+#include "ops/linear/q4/q4_operands.h"
 
 namespace ninfer::ops::detail {
-
-template <class Schedule, class Epilogue = Q4GemvStoreEpilogue>
-void launch_q4_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const std::int32_t rows = out.ne[0];
-    const std::int32_t k    = x.ne[0];
-    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kRowsPerCta)), 1u, 1u);
-    constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
-    const std::size_t dynamic_shared_bytes =
+template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
+          class Output, class Epilogue>
+void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
+                        cudaStream_t stream) {
+    validate_q4_operands(operands);
+    if (operands.tokens != 1) throw std::invalid_argument("Q4 GEMV requires T=1");
+    if constexpr (Schedule::kStaticGroupsPerRow > 0) {
+        if (operands.k != Schedule::kStaticGroupsPerRow * 64)
+            throw std::invalid_argument("Q4 GEMV static K differs from operands");
+    }
+    const dim3 grid(div_up(operands.rows, Schedule::kBlockRows));
+    const dim3 block(Schedule::kThreads);
+    const std::size_t shared_bytes =
         Schedule::kActivationAccess == Q4GemvActivationAccess::CtaSharedFullK
-            ? static_cast<std::size_t>(k) * sizeof(__nv_bfloat16)
-            : 0u;
-
-    q4_rowsplit_gemv_kernel<Schedule, false, 0, Epilogue>
-        <<<grid, block, dynamic_shared_bytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            nullptr, rows, k);
-    CUDA_CHECK(cudaGetLastError());
+            ? static_cast<std::size_t>(operands.k) * sizeof(__nv_bfloat16)
+            : 0;
+    if (Schedule::kSharedBytes + shared_bytes > 48 * 1024)
+        throw std::invalid_argument("Q4 GEMV shared memory exceeds 48 KiB");
+    if constexpr (Dependent) {
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, block, shared_bytes, stream},
+            q4_a16_gemv_kernel<Schedule, Output, Epilogue, TriggerPdl, JoinPdl>, operands.x,
+            operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
+            operands.padded_k));
+    } else {
+        q4_a16_gemv_kernel<Schedule, Output, Epilogue, TriggerPdl, JoinPdl>
+            <<<grid, block, shared_bytes, stream>>>(operands.x, operands.codes, operands.scales,
+                                                    output, epilogue, operands.rows, operands.k,
+                                                    operands.padded_k);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
-
-
 } // namespace ninfer::ops::detail

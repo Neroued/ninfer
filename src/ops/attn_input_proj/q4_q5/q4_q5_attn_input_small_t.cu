@@ -1,12 +1,12 @@
+#include "ops/linear/q4/q4_instances.cuh"
 #include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q4/q4_ksplit_mma.cuh"
-#include "ops/linear/q4/q4_ksplit_strided_store.cuh"
-#include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
-#include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/q4/q4_simt_launch.cuh"
+#include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
 
@@ -22,92 +22,71 @@ constexpr std::int32_t kParentRows = 7168;
 constexpr std::int32_t kSplitRow   = 6144;
 constexpr std::int32_t kHidden     = 5120;
 
-using Q4AttnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4AttnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
+using Q4AttnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                     cudaStream_t stream) {
-    using Schedule = Q4GemvR1Q8DirectSchedule;
-    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, Schedule::kRowsPerCta)), 1u, 1u);
-    constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
-    q4_rowsplit_gemv_kernel<Schedule, true, kSplitRow><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(key.data), kParentRows, kHidden);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <class Schedule, bool Full>
-void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                    cudaStream_t stream) {
-    const std::int32_t cols = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, Schedule::kRowsPerCta)),
-                    static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
-    q4_rowsplit_gemm_simt_kernel<Schedule, Full, true, kSplitRow>
-        <<<grid, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
-            static_cast<__nv_bfloat16*>(key.data), q.ne[0], key.ne[0], kParentRows, kHidden, cols,
-            weight.padded_shape[1]);
-    CUDA_CHECK(cudaGetLastError());
+    launch_q4_a16_gemv<q4_instances::GemvR1W8K5120>(
+        q4_linear_operands(x, weight),
+        LinearBf16SplitOutput2<kSplitRow>{
+            {static_cast<__nv_bfloat16*>(q.data),
+             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+            {static_cast<__nv_bfloat16*>(key.data),
+             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
+        LinearIdentityEpilogue{}, stream);
 }
 
 template <class Schedule>
-void launch_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-                          cudaStream_t stream) {
-    const bool full = (kParentRows % Schedule::kRowsPerCta) == 0 &&
-                      ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
-                      (x.ne[1] % Schedule::kColsPerTile) == 0;
-    if (full) {
-        launch_q4_simt<Schedule, true>(x, weight, q, key, stream);
-    } else {
-        launch_q4_simt<Schedule, false>(x, weight, q, key, stream);
-    }
+void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                    cudaStream_t stream) {
+    launch_q4_a16_simt<Schedule>(
+        q4_linear_operands(x, weight),
+        LinearBf16SplitOutput2<kSplitRow>{
+            {static_cast<__nv_bfloat16*>(q.data),
+             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+            {static_cast<__nv_bfloat16*>(key.data),
+             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
+        LinearIdentityEpilogue{}, stream);
 }
 
 template <std::int32_t Capacity>
-void launch_q4_ksplit_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                             cudaStream_t stream) {
-    using Geometry = Q4LinearGeometry<kParentRows, kHidden>;
-    constexpr std::int32_t kTileCols = (Capacity + 7) / 8 * 8;
-    using Store = Q4KSplitStridedStore<true, kSplitRow>;
-    // The store's live-column count is the problem's actual column count: Capacity only sizes the
-    // tile, and the K-split kernel stages exactly the columns it is told are live.
-    const Store store{static_cast<__nv_bfloat16*>(q.data), q.ne[0],
-                      static_cast<__nv_bfloat16*>(key.data), key.ne[0], x.ne[1]};
-    q4_ksplit_mma_kernel<Geometry, kTileCols, Capacity, Store, Q4KSplitIdentityRows, true>
-        <<<kParentRows / Q4KSplitMmaSchedule::kRowsPerCta, Q4KSplitMmaSchedule::kThreads, 0,
-           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                     static_cast<const std::uint8_t*>(weight.qdata),
-                     static_cast<const std::uint8_t*>(weight.scales),
-                     static_cast<__nv_bfloat16*>(q.data), store, {}, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    using Schedule = Q4A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
+                                             6, kHidden, Capacity>;
+    launch_q4_a16_sliced_k_mma<Schedule>(
+        q4_linear_operands(x, weight),
+        LinearBf16SplitOutput2<kSplitRow>{
+            {static_cast<__nv_bfloat16*>(q.data),
+             static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+            {static_cast<__nv_bfloat16*>(key.data),
+             static_cast<std::int64_t>(key.nb[1] / sizeof(__nv_bfloat16)), 0}},
+        LinearIdentityEpilogue{}, stream);
 }
 
-void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                            cudaStream_t stream) {
     if (weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
     }
     switch (x.ne[1]) {
     case 7:
-        launch_q4_ksplit_exact<7>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<7>(x, weight, q, key, stream);
         return;
     case 8:
-        launch_q4_ksplit_exact<8>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<8>(x, weight, q, key, stream);
         return;
     case 9:
-        launch_q4_ksplit_exact<9>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<9>(x, weight, q, key, stream);
         return;
     case 10:
-        launch_q4_ksplit_exact<10>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<10>(x, weight, q, key, stream);
         return;
     case 11:
-        launch_q4_ksplit_exact<11>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<11>(x, weight, q, key, stream);
         return;
     case 12:
-        launch_q4_ksplit_exact<12>(x, weight, q, key, stream);
+        launch_q4_sliced_exact<12>(x, weight, q, key, stream);
         return;
     default:
         throw std::invalid_argument("attention Q4 K-split band covers T in [7,12]");
@@ -130,16 +109,16 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         // 73.0-77.6 us at T=9..12 against 100.1-105.7 us for the row-split SIMT that R0 used there,
         // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
         // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
-        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile, where
-        // a 16-wide K-split tile would waste more MMA work than it saves.
-        launch_q4_ksplit_band(x, weight, q, key, stream);
+        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile,
+        // where a 16-wide K-split tile would waste more MMA work than it saves.
+        launch_q4_sliced_band(x, weight, q, key, stream);
         return;
     case 2:
     case 3:
     case 4:
     case 5:
     case 6:
-        launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
+        launch_q4_simt<Q4AttnSimtR8T4Schedule>(x, weight, q, key, stream);
         return;
     default:
         throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");

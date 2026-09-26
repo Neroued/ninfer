@@ -1,3 +1,4 @@
+#include "ops/linear/q4/q4_instances.cuh"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
@@ -6,8 +7,8 @@
 #include "ops/common/math.h"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
-#include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
-#include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q4/q4_simt_launch.cuh"
+#include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
 
@@ -29,8 +30,8 @@ constexpr int kQkRows      = kQueryRows + kKeyRows;
 constexpr int kChannels    = kQkRows + kValueRows;
 constexpr int kValueOffset = kQkRows;
 
-using Q4ScheduleC4 = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4ScheduleC8 = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
+using Q4ScheduleT4 = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1, true>;
+using Q4ScheduleT8 = Q4A16SimtSchedule<8, 8, 1, 16, 2, Cache::ca, 1, true>;
 
 enum class PdlOrder {
     Q4ThenQ5,
@@ -66,11 +67,11 @@ template <class Publish>
 struct Q4GdnDecodeEpilogue {
     GdnConvEpilogue<Publish> conv;
 
-    template <bool, int>
-    __device__ __forceinline__ void operator()(__nv_bfloat16*, __nv_bfloat16*, int row,
-                                               float value) const {
-        const float projected[1]{value};
-        conv.store(row, projected);
+    template <class Output, int Tokens>
+    __device__ __forceinline__ void apply_row(const Output&, int row, int,
+                                              const float (&values)[Tokens], int) const {
+        static_assert(Tokens == 1);
+        conv.store(row, values);
     }
 };
 
@@ -78,14 +79,14 @@ template <int Tokens, class Publish>
 struct Q4GdnSmallTEpilogue {
     GdnConvEpilogue<Publish> conv;
 
-    template <bool, int, int TileCols>
-    __device__ __forceinline__ void
-    operator()(__nv_bfloat16*, __nv_bfloat16*, std::int32_t, std::int32_t, std::int32_t row,
-               std::int32_t, std::int32_t active_cols, const float (&values)[TileCols]) const {
+    template <class Output, int TileTokens>
+    __device__ __forceinline__ void apply_row(const Output&, int row, int token_begin,
+                                              const float (&values)[TileTokens], int active) const {
+        static_assert(Tokens <= TileTokens);
         float projected[Tokens];
 #pragma unroll
-        for (int token = 0; token < Tokens; ++token) { projected[token] = values[token]; }
-        if (active_cols == Tokens) { conv.store(row, projected); }
+        for (int token = 0; token < Tokens; ++token) projected[token] = values[token];
+        if (token_begin == 0 && active == Tokens) conv.store(row, projected);
     }
 };
 
@@ -131,27 +132,10 @@ struct Q5GdnSmallTEpilogue {
 template <class Publish, bool TriggerPdl, bool JoinPdl, bool Dependent>
 void launch_q4_t1(const Tensor& x, const Weight& qk_weight,
                   const GdnConvEpilogue<Publish>& qk_epilogue, Tensor& query, cudaStream_t stream) {
-    constexpr int q4_threads = Q4GemvR1Q8DirectSchedule::kThreads;
-    constexpr int q4_blocks  = kQkRows / Q4GemvR1Q8DirectSchedule::kRowsPerCta;
-    if constexpr (Dependent) {
-        CUDA_CHECK(pdl::launch_dependent(
-            {dim3(q4_blocks), dim3(q4_threads), 0, stream},
-            q4_rowsplit_gemv_kernel<Q4GemvR1Q8DirectSchedule, false, 0,
-                                    Q4GdnDecodeEpilogue<Publish>, TriggerPdl, JoinPdl>,
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(qk_weight.qdata),
-            static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
-            Q4GdnDecodeEpilogue<Publish>{qk_epilogue}));
-    } else {
-        q4_rowsplit_gemv_kernel<Q4GemvR1Q8DirectSchedule, false, 0, Q4GdnDecodeEpilogue<Publish>,
-                                TriggerPdl, JoinPdl><<<q4_blocks, q4_threads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(qk_weight.qdata),
-            static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
-            Q4GdnDecodeEpilogue<Publish>{qk_epilogue});
-    }
+    launch_q4_a16_gemv<q4_instances::GemvR1W8K5120, TriggerPdl, JoinPdl, Dependent>(
+        q4_linear_operands(x, qk_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(query.data), query.ne[0]},
+        Q4GdnDecodeEpilogue<Publish>{qk_epilogue}, stream);
 }
 
 template <class Publish, bool TriggerPdl, bool JoinPdl, bool Dependent>
@@ -187,30 +171,13 @@ void launch_q5_t1(const Tensor& x, const Weight& value_z_weight,
 
 template <int Tokens, class Q4Schedule, class Publish, bool TriggerPdl, bool JoinPdl,
           bool Dependent>
-void launch_q4_ksplit(const Tensor& x, const Weight& qk_weight,
-                      const GdnConvEpilogue<Publish>& qk_epilogue, Tensor& query,
-                      cudaStream_t stream) {
-    const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
-    if constexpr (Dependent) {
-        CUDA_CHECK(pdl::launch_dependent(
-            {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
-            q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                         Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>,
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(qk_weight.qdata),
-            static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQueryRows, 0, kQkRows, kHidden,
-            Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue}));
-    } else {
-        q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                     Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>
-            <<<q4_grid, Q4Schedule::kThreads, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(qk_weight.qdata),
-                static_cast<const std::uint8_t*>(qk_weight.scales),
-                static_cast<__nv_bfloat16*>(query.data), nullptr, kQueryRows, 0, kQkRows, kHidden,
-                Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue});
-    }
+void launch_q4_simt(const Tensor& x, const Weight& qk_weight,
+                    const GdnConvEpilogue<Publish>& qk_epilogue, Tensor& query,
+                    cudaStream_t stream) {
+    launch_q4_a16_simt<Q4Schedule, TriggerPdl, JoinPdl, Dependent>(
+        q4_linear_operands(x, qk_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(query.data), query.ne[0]},
+        Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue}, stream);
 }
 
 template <int Tokens, class Publish, bool TriggerPdl, bool JoinPdl, bool Dependent>
@@ -279,11 +246,11 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
         launch_q5_small_t<Tokens, Publish, true, false, false>(x, value_z_weight, value_epilogue,
                                                                value, z, stream);
-        launch_q4_ksplit<Tokens, Q4Schedule, Publish, false, true, true>(x, qk_weight, qk_epilogue,
-                                                                         query, stream);
+        launch_q4_simt<Tokens, Q4Schedule, Publish, false, true, true>(x, qk_weight, qk_epilogue,
+                                                                       query, stream);
     } else {
-        launch_q4_ksplit<Tokens, Q4Schedule, Publish, true, false, false>(x, qk_weight, qk_epilogue,
-                                                                          query, stream);
+        launch_q4_simt<Tokens, Q4Schedule, Publish, true, false, false>(x, qk_weight, qk_epilogue,
+                                                                        query, stream);
         launch_q5_small_t<Tokens, Publish, false, true, true>(x, value_z_weight, value_epilogue,
                                                               value, z, stream);
     }
@@ -295,10 +262,10 @@ void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
                     Tensor& z, cudaStream_t stream) {
     if constexpr (Tokens <= 4) {
-        launch_small_t_schedule<Tokens, Q4ScheduleC4, Order, Publish>(
+        launch_small_t_schedule<Tokens, Q4ScheduleT4, Order, Publish>(
             x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z, stream);
     } else {
-        launch_small_t_schedule<Tokens, Q4ScheduleC8, Order, Publish>(
+        launch_small_t_schedule<Tokens, Q4ScheduleT8, Order, Publish>(
             x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z, stream);
     }
 }

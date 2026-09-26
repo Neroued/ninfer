@@ -2,15 +2,15 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-
 Q4Launch select_q4_n4304_k1152(std::int32_t tokens) {
-    if (tokens > 131072 || tokens % 4 != 0) {
+    if (tokens > 131072 || tokens % 4 != 0)
         throw std::invalid_argument("q4 linear: T must be a multiple of 4 in [4,131072]");
-    }
-    if (tokens <= 12) return tokens % 8 == 0 ? launch_q4_simt_r8_c8 : launch_q4_simt_r8_c4;
-    if (tokens <= 24) return launch_q4_simt_r8_c8;
-    if (tokens <= 320) return launch_q4_mma_r64_c64;
-    return launch_q4_mma_r64_c128;
+    // Selected with complete-Op cold CUDA Graph measurements on RTX 5090.
+    if (tokens <= 16) return launch_q4_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 32) return launch_q4_a16_sliced_r16_t32_w4_s2;
+    if (tokens <= 64) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    if (tokens <= 96) return launch_q4_a16_mma_r32_t32_k128_s2_a2;
+    if (tokens <= 384) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    return launch_q4_a16_mma_r64_t128;
 }
-
 } // namespace ninfer::ops::detail

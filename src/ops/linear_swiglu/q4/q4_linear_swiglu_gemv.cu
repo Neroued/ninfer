@@ -5,7 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
-#include "ops/linear/q4/q4_ksplit_mma.cuh"
+#include "ops/linear/q4/q4_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -37,13 +37,10 @@ static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
 
-struct Q4SwiGluSmallTGeometry {
-    static constexpr int kInputRows    = kK;
-    static constexpr int kGroupsPerRow = kK / kGroupK;
-};
-
 struct Q4SwiGluSmallTRows {
     static constexpr int kOutputRowsPerCta = 8;
+
+    __host__ __device__ int output_rows(int rows) const { return rows / 2; }
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
         return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
@@ -51,19 +48,13 @@ struct Q4SwiGluSmallTRows {
 };
 
 struct Q4SwiGluSmallTEpilogue {
-    __nv_bfloat16* out;
-    int columns;
-
-    template <int ActiveCols>
-    __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
-        if (col0 < columns) {
-            out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
-                __float2bfloat16_rn(silu(projected.x) * projected.z);
-        }
-        if (col0 + 1 < columns) {
-            out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
-                __float2bfloat16_rn(silu(projected.y) * projected.w);
-        }
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
+                                                   float4 projected, int rows,
+                                                   int token_end) const {
+        if (row >= rows / 2) return;
+        if (token < token_end) output.store(row, token, silu(projected.x) * projected.z);
+        if (token + 1 < token_end) output.store(row, token + 1, silu(projected.y) * projected.w);
     }
 };
 
@@ -71,17 +62,19 @@ using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStrea
 
 template <int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    constexpr int TileCols =
-        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
-    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
-    q4_ksplit_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true>
-        <<<kBlocks, Q4KSplitMmaSchedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    // Wider tiles are shared-memory limited before six CTAs can be resident.
+    // Match launch bounds to that limit instead of forcing register spills.
+    constexpr int kMinBlocks = ActiveCols <= 8    ? 6
+                               : ActiveCols <= 16 ? 4
+                               : ActiveCols <= 24 ? 3
+                                                  : 2;
+    using Schedule =
+        Q4A16SlicedKMmaSchedule<16, (ActiveCols + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
+                                kMinBlocks, kK, ActiveCols, Q4SlicedKReduction::Pairwise>;
+    launch_q4_a16_sliced_k_mma<Schedule>(
+        q4_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows{});
 }
 
 template <std::size_t... Offsets>

@@ -41,6 +41,7 @@ struct Options {
 
     // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
     SamplingOverrides sampling;
+    StructuredOutputOptions structured_output;
     bool greedy                 = false;
     product::LogLevel log_level = product::LogLevel::Info;
 };

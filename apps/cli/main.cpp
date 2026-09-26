@@ -257,9 +257,11 @@ int main(int argc, char** argv) {
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
         input.options.reasoning_effort = cli.reasoning_effort;
+        ninfer::product::apply_structured_output_instruction(input, cli.structured_output);
 
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
+        request.execution.structured_output       = cli.structured_output;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;

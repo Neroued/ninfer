@@ -12,4 +12,9 @@ namespace ninfer::product {
                                                std::optional<bool> enable_thinking,
                                                bool vision_enabled);
 
+// Make the requested final-response contract visible to the model before preparation.
+// Grammar enforcement remains an execution responsibility.
+void apply_structured_output_instruction(PromptInput& input,
+                                         const StructuredOutputOptions& options);
+
 } // namespace ninfer::product

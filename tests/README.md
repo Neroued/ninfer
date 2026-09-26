@@ -226,3 +226,32 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
 integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
 the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
+
+## Structured output
+
+The CPU grammar and protocol tests and the GPU sampling/speculative tests qualify this path:
+
+```bash
+ctest --test-dir build --output-on-failure -R 'ninfer_(structured_output|sampling|speculative_round|openai_schema|openai_responses|anthropic_schema|cli_options|prompt_input|tool_call_parser|qwen3_5_frontend|qwen3_5_structured_round)_test$'
+```
+
+`tests/test_structured_output_live.py` runs a temporary loopback server and validates completed
+outputs with the independent Python `jsonschema` validator. Use Python 3.11 with `requests` and
+`jsonschema` installed in a test environment. Supply an explicit v3 artifact containing the
+selected speculative backends; the test never downloads or converts weights.
+
+```bash
+python tests/test_structured_output_live.py \
+  --server build/apps/ninfer-serve --artifact /absolute/path/model.ninfer \
+  --output-dir work/structured-live --modes none mtp dflash2 dflash2-eager
+```
+
+It checks conflicting prompts, greedy and stochastic generation, schema versus JSON object mode,
+concurrent and mixed traffic, prefix reuse, SSE, token limits, disconnect cleanup, compile errors,
+Responses, and Anthropic Messages. It also runs a tool-result-to-bounded-JSON exchange while
+reasoning and multiple tools remain enabled, including a Markdown-formatted example in the prompt.
+CPU tests cover numeric endpoints, schema enforcement with tool alternatives, split and mixed-token
+reasoning transitions, speculative mask previews, injected thinking-budget closure, and prompt cache
+boundary preservation. `--concurrency 8 --draft-tokens 15 --modes dflash2` exercises
+the largest draft and batch dimensions. A separate DFlash-capable artifact can use `--modes dflash`.
+The server is terminated on success or failure. An occupied test port causes the test to stop.

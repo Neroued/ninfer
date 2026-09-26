@@ -43,7 +43,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.token_mask == b.token_mask &&
+           a.token_mask_stride == b.token_mask_stride;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -612,6 +613,48 @@ int increment_counts_contract() {
     return failures;
 }
 
+int masked_sampling_contract() {
+    int failures = 0;
+    for (int domain : {64, 257, 248077}) {
+        const int words = (domain + 31) / 32;
+        std::vector<std::uint32_t> mask(words, 0);
+        std::vector<float> column(domain, 1000.0f), reference(domain, -INFINITY);
+        const std::vector<int> allowed{3, 7, domain - 1};
+        for (std::size_t i = 0; i < allowed.size(); ++i) {
+            int id = allowed[i];
+            mask[id / 32] |= 1U << (id % 32);
+            column[id] = reference[id] = 1.0f - static_cast<float>(i);
+        }
+        auto device_mask = to_device(mask);
+        ops::SamplingConfig cfg;
+        cfg.token_mask        = static_cast<const std::uint32_t*>(device_mask.p);
+        cfg.token_mask_stride = words;
+        auto greedy = run_homogeneous_batch(repeat_column(column, 8), domain, domain, 8, cfg, 0,
+                                            ops::kSamplePurposeDecode);
+        failures += greedy.integrity_failures;
+        failures +=
+            verify_exact("masked argmax before raw winner", greedy.tokens, std::vector<int>(8, 3));
+        cfg.temperature = 0.8f;
+        cfg.top_k       = 20;
+        cfg.top_p       = 0.95f;
+        cfg.min_p       = 0.05f;
+        cfg.seed        = 9517;
+        auto samples = run_repeated(column, domain, 4096, 8, cfg, 123, ops::kSamplePurposeDecode);
+        failures += samples.integrity_failures;
+        failures += verify_distribution("masked distribution before filters", samples.tokens,
+                                        distribution_oracle(reference, domain, cfg));
+        std::fill(mask.begin(), mask.end(), 0);
+        mask[(domain - 1) / 32] = 1U << ((domain - 1) % 32);
+        auto singleton          = to_device(mask);
+        cfg.token_mask          = static_cast<const std::uint32_t*>(singleton.p);
+        auto one = run_homogeneous_batch(repeat_column(column, 8), domain, domain, 8, cfg, 42,
+                                         ops::kSamplePurposePrefill);
+        failures += verify_exact("singleton mask with top-k=20", one.tokens,
+                                 std::vector<int>(8, domain - 1));
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -633,6 +676,7 @@ int main() {
         std::cerr << "sampling workspace accepted an invalid lane interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    failures += masked_sampling_contract();
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();

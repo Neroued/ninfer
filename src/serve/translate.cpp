@@ -1,5 +1,6 @@
 #include "serve/translate.h"
 #include "serve/request_json.h"
+#include "product/prompt_input/prompt_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -150,6 +151,17 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         effort = nested;
     }
     kwargs.erase("reasoning_effort");
+    if (request.structured_output.kind != StructuredOutputKind::None) {
+        if (!request.stop_strings.empty() ||
+            request.continuation != PromptContinuationMode::NewAssistantTurn) {
+            invalid_prompt_option(
+                "structured output requires default stops and a new assistant turn",
+                "response_format", "incompatible_structured_output");
+        }
+        // Preserve explicit reasoning requests; retain the economical final-only default when
+        // the caller has not selected a reasoning mode or budget.
+        if (!thinking && !effort && !request.thinking_budget) { thinking = false; }
+    }
     ResolvedPromptSemantics result{
         .enable_thinking           = thinking ? thinking : server.enable_thinking,
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
@@ -305,6 +317,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     }
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
+    product::apply_structured_output_instruction(input, request.structured_output);
     return input;
 }
 
@@ -315,13 +328,16 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
+    options.execution.structured_output       = request.structured_output;
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.output.preserve_special_tokens =
+        request.structured_output.kind == StructuredOutputKind::None &&
+        (request.uses_tools() || request.has_tool_history());
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));

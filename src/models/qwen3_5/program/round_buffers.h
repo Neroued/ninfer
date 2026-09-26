@@ -292,7 +292,10 @@ struct DFlashDecodeState {
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
+class StructuredRound;
+
 struct RoundState {
+    StructuredRound* structured = nullptr;
     std::optional<OrdinaryDecodeState> ordinary;
     Tensor token;
     Tensor pos;

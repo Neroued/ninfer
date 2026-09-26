@@ -723,10 +723,19 @@ int test_explicit_rejections() {
                       "strict function schema is rejected explicitly");
 
     value         = base;
+    value["text"]         = Json{{"format", Json{{"type", "json_schema"},
+                                                 {"name", "answer"},
+                                                 {"strict", true},
+                                                 {"schema", Json{{"type", "object"}}}}}};
+    const auto structured = parse_openai_responses_create_request(value, limits());
+    failures += check(structured.prompt.generation.structured_output.kind ==
+                              ninfer::StructuredOutputKind::JsonSchema &&
+                          structured.prompt.text_format.at("type") == "json_schema",
+                      "Responses schema retained");
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
+                      }) == "invalid_response_format",
                       "structured output is rejected explicitly");
 
     value               = base;

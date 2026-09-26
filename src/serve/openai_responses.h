@@ -31,6 +31,7 @@ struct OpenAIResponsesFunctionIdentity {
 struct OpenAIResponsesPromptRequest {
     std::string model;
     GenerationRequest generation;
+    nlohmann::json text_format = {{"type", "text"}};
     std::vector<ChatTurn> input_turns;
     std::vector<nlohmann::json> input_items;
     std::optional<std::string> instructions;

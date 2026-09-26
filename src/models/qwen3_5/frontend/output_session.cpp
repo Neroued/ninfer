@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/output_session.h"
+#include "text/structured_output.h"
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
@@ -367,6 +368,8 @@ public:
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready = false;
+    std::shared_ptr<text::GrammarState> grammar;
+    std::unique_ptr<text::GrammarState> preview_grammar;
 };
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -401,10 +404,17 @@ OutputSession::OutputSession(
     std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy, OutputOptions output,
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output)
+    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+    std::shared_ptr<text::GrammarState> grammar)
     : impl_(std::make_unique<Impl>(
           std::move(tokenizer), std::move(policy), output, starts_in_reasoning, thinking,
-          std::move(thinking_control_tokens), std::move(tool_call_output))) {}
+          std::move(thinking_control_tokens), std::move(tool_call_output))) {
+    impl_->grammar = std::move(grammar);
+}
+
+std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
+    return impl_ ? impl_->grammar : nullptr;
+}
 
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
                                                      std::uint32_t total_budget_remaining,
@@ -438,6 +448,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
+        }
+        if (impl_->grammar) {
+            impl_->preview_grammar = impl_->grammar->fork();
+            impl_->preview_grammar->accept(tokens.first(count));
         }
         impl_->preview_ready = true;
         return runtime::OutputDecision{
@@ -577,7 +591,11 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
-    impl_->preview_ready                    = true;
+    if (impl_->grammar) {
+        impl_->preview_grammar = impl_->grammar->fork();
+        impl_->preview_grammar->accept(tokens);
+    }
+    impl_->preview_ready = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
         .prefix_execution_split_after = impl_->preview_execution_split_after,
@@ -622,6 +640,10 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
 
 PublishedOutput OutputSession::commit_preview() {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
+    if (impl_->preview_grammar) {
+        *impl_->grammar = std::move(*impl_->preview_grammar);
+        impl_->preview_grammar.reset();
+    }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);

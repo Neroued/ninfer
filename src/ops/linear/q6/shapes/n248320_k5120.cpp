@@ -3,15 +3,18 @@
 namespace ninfer::ops::detail {
 
 Q6Launch select_q6_n248320_k5120(std::int32_t tokens) {
-    if (tokens <= 4) return launch_q6_simt_r8_c4;
-    if (tokens <= 5) return launch_q6_simt_r8_c5;
-    if (tokens <= 6) return launch_q6_simt_r8_c6;
-    if (tokens <= 7) return launch_q6_simt_r8_c7;
-    if (tokens <= 16) return launch_q6_mma_r64_c16_k128;
-    if (tokens <= 24) return launch_q6_mma_r64_c24_k128;
-    if (tokens <= 32) return launch_q6_mma_r64_c32_k128;
-    if (tokens <= 48) return launch_q6_mma_r64_c48_k128;
-    return launch_q6_mma_r64_c128;
+    // Capacity routes come from complete-Op cold Graph comparisons on RTX 5090.
+    if (tokens <= 2) return launch_q6_a16_simt_r8_t4;
+    if (tokens <= 8) return launch_q6_a16_sliced_r16_t8_w4_s2;
+    if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
+    if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s1;
+    if (tokens <= 48) return launch_q6_a16_mma_r64_t48_k128;
+    if (tokens <= 56) return launch_q6_a16_mma_r64_t56_k128;
+    if (tokens <= 64) return launch_q6_a16_mma_r64_t64_k128;
+    if (tokens <= 80) return launch_q6_a16_mma_r64_t80;
+    if (tokens <= 96) return launch_q6_a16_mma_r64_t96;
+    if (tokens <= 112) return launch_q6_a16_mma_r64_t112;
+    return launch_q6_a16_mma_r64_t128;
 }
 
 } // namespace ninfer::ops::detail

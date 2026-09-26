@@ -1,92 +1,11 @@
 #pragma once
 
-// Q6G64 RowSplit x BF16 Tensor Core GEMM.
-//
-// out[Rows, Cols] = W[Rows, K] * x[K, Cols]
-//
-// Each CTA owns a BlockRows x BlockCols output tile and advances K in one or more
-// complete 64-value quant groups. Raw Q6 code/high planes and FP16 scales are
-// staged independently from the BF16 activation tile. Q6 values are decoded
-// to BF16 in shared memory, then consumed by m16n8k16 BF16 MMA with FP32
-// accumulation.
-//
-// The template describes only physical kernel structure. Rows, Cols, and K
-// remain runtime dimensions; registered shapes select a closed schedule and a
-// statically compiled boundary variant outside the kernel.
-
+// Row/tokens tiled Q6 x BF16 MMA. Scaled weights are materialized as BF16;
+// accumulation is FP32. N/K/T stay runtime values and the launcher owns bounds.
 #include "ops/common/mma.cuh"
-#include "ops/linear/q6/q6_rowsplit_storage.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-
-#include <cstdint>
+#include "ops/linear/q6/q6_schedule.cuh"
 
 namespace ninfer::ops::detail {
-
-enum class Q6FragmentPipeline {
-    Serial,
-    PingPong,
-};
-
-enum class Q6ScaleLoad {
-    Scalar16,
-    Pair32,
-};
-
-template <int BlockRows_, int BlockCols_, int BlockK_, int WarpRows_, int WarpCols_,
-          int PipelineStages_, int LaunchBoundsMinBlocks_, Q6FragmentPipeline FragmentPipeline_,
-          Cache QuantCache_, Cache ActivationCache_, Q6ScaleLoad ScaleLoadMode_,
-          int ActivationStages_ = PipelineStages_>
-struct Q6RowSplitMmaGemmSchedule {
-    static constexpr int kBlockRows = BlockRows_;
-    static constexpr int kBlockCols = BlockCols_;
-    static constexpr int kBlockK    = BlockK_;
-    static constexpr int kWarpRows  = WarpRows_;
-    static constexpr int kWarpCols  = WarpCols_;
-
-    static constexpr int kPipelineStages                  = PipelineStages_;
-    static constexpr int kLaunchBoundsMinBlocks           = LaunchBoundsMinBlocks_;
-    static constexpr Q6FragmentPipeline kFragmentPipeline = FragmentPipeline_;
-    static constexpr Cache kQuantCache                    = QuantCache_;
-    static constexpr Cache kActivationCache               = ActivationCache_;
-    static constexpr Q6ScaleLoad kScaleLoadMode           = ScaleLoadMode_;
-    static constexpr int kActivationStages                = ActivationStages_;
-
-    static constexpr int kWarpGridRows = kBlockRows / kWarpRows;
-    static constexpr int kWarpGridCols = kBlockCols / kWarpCols;
-    static constexpr int kWarps        = kWarpGridRows * kWarpGridCols;
-    static constexpr int kThreads      = kWarps * 32;
-    static constexpr int kMmaRows      = kWarpRows / 16;
-    static constexpr int kMmaCols      = kWarpCols / 8;
-    static constexpr int kMmaKSteps    = kBlockK / 16;
-    static constexpr int kGroupsPerK   = kBlockK / Q6RowSplitStorage::kGroupK;
-    static constexpr int kScaleBytes =
-        kScaleLoadMode == Q6ScaleLoad::Pair32 ? 4 : Q6RowSplitStorage::kScaleBytesPerGroup;
-
-    static constexpr int kSharedBytes =
-        kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kActivationStages * kBlockCols * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kPipelineStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kCodeBytesPerGroup +
-        kPipelineStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kHighBytesPerGroup +
-        kPipelineStages * kBlockRows * kGroupsPerK * kScaleBytes;
-
-    static_assert(kBlockRows > 0 && kBlockCols > 0);
-    static_assert(kBlockK % Q6RowSplitStorage::kGroupK == 0,
-                  "Q6 MMA K tile must contain complete quant groups");
-    static_assert(kBlockRows % kWarpRows == 0 && kBlockCols % kWarpCols == 0,
-                  "Q6 MMA block tile must divide into warp tiles");
-    static_assert(kWarpRows % 16 == 0 && kWarpCols % 8 == 0,
-                  "Q6 MMA warp tile must be composed of m16n8 MMA tiles");
-    static_assert(kPipelineStages >= 1 && kPipelineStages <= 8,
-                  "Q6 MMA cp.async pipeline depth must fit cp_wait");
-    static_assert(kActivationStages == 1 || kActivationStages == kPipelineStages,
-                  "Q6 MMA activation staging is single-buffered or follows the quant pipeline");
-    static_assert(kLaunchBoundsMinBlocks >= 1);
-    static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 48 * 1024,
-                  "Q6 MMA staged shared memory exceeds the static 48 KiB budget");
-};
 
 // XOR swizzle for a [rows][64] BF16 tile. The eight 16-byte column groups are
 // permuted by the low row bits so ldmatrix reads do not repeatedly hit the same
@@ -96,30 +15,29 @@ __device__ __forceinline__ int q6_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, bool Full>
-__global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
-void q6_rowsplit_gemm_mma_kernel(
+template <class Schedule, bool Full, class Output, class Epilogue>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
+void q6_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
     const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high,
     const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out,
+    Output output, Epilogue epilogue,
     std::int32_t rows,
     std::int32_t k,
     std::int32_t cols,
-    std::int32_t padded_k) {
+    std::int32_t padded_k, std::int32_t token_begin) {
     // clang-format on
-    using Schedule       = Schedule_;
     constexpr bool kFull = Full;
     constexpr int BM     = Schedule::kBlockRows;
-    constexpr int BN     = Schedule::kBlockCols;
+    constexpr int BN     = Schedule::kBlockTokens;
     constexpr int BK     = Schedule::kBlockK;
     constexpr int WM     = Schedule::kWarpRows;
-    constexpr int WN     = Schedule::kWarpCols;
+    constexpr int WN     = Schedule::kWarpTokens;
     constexpr int MT     = Schedule::kMmaRows;
-    constexpr int NT     = Schedule::kMmaCols;
+    constexpr int NT     = Schedule::kMmaTokens;
     constexpr int KSUB   = Schedule::kMmaKSteps;
-    constexpr int S      = Schedule::kPipelineStages;
+    constexpr int S      = Schedule::kStages;
     constexpr int BS     = Schedule::kActivationStages;
     constexpr int GPB    = Schedule::kGroupsPerK;
     constexpr int SB     = Schedule::kScaleBytes;
@@ -134,8 +52,8 @@ void q6_rowsplit_gemm_mma_kernel(
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
     const int lane           = tid & 31;
-    const int warp_row       = warp / Schedule::kWarpGridCols;
-    const int warp_col       = warp % Schedule::kWarpGridCols;
+    const int warp_row       = warp / Schedule::kWarpGridTokens;
+    const int warp_col       = warp % Schedule::kWarpGridTokens;
     const int mma_row        = lane >> 2;
     const int mma_col        = lane & 3;
 
@@ -199,13 +117,13 @@ void q6_rowsplit_gemm_mma_kernel(
             if constexpr (kFull) {
                 const std::int64_t group_index =
                     static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                cp_async<16, Schedule::kQuantCache>(
+                cp_async<16, Schedule::kWeightCache>(
                     dst, &codes[group_index * Q6RowSplitStorage::kCodeBytesPerGroup + half * 16]);
             } else {
                 if (row < rows) {
                     const std::int64_t group_index =
                         static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                    cp_async<16, Schedule::kQuantCache>(
+                    cp_async<16, Schedule::kWeightCache>(
                         dst,
                         &codes[group_index * Q6RowSplitStorage::kCodeBytesPerGroup + half * 16]);
                 } else {
@@ -223,13 +141,13 @@ void q6_rowsplit_gemm_mma_kernel(
             if constexpr (kFull) {
                 const std::int64_t group_index =
                     static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                cp_async<16, Schedule::kQuantCache>(
+                cp_async<16, Schedule::kWeightCache>(
                     dst, &high[group_index * Q6RowSplitStorage::kHighBytesPerGroup]);
             } else {
                 if (row < rows) {
                     const std::int64_t group_index =
                         static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                    cp_async<16, Schedule::kQuantCache>(
+                    cp_async<16, Schedule::kWeightCache>(
                         dst, &high[group_index * Q6RowSplitStorage::kHighBytesPerGroup]);
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
@@ -378,7 +296,7 @@ void q6_rowsplit_gemm_mma_kernel(
             }
         };
 
-        if constexpr (Schedule::kFragmentPipeline == Q6FragmentPipeline::PingPong) {
+        if constexpr (Schedule::kFragmentPipeline == Q6MmaFragmentPipeline::PingPong) {
             unsigned a_frag[2][MT][4];
             unsigned b_frag[2][NT][2];
             load_fragments(0, a_frag[0], b_frag[0]);
@@ -430,44 +348,20 @@ void q6_rowsplit_gemm_mma_kernel(
 
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
-        const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
-        const int output_row1 = output_row0 + 8;
+        const int row0 = static_cast<int>(blockIdx.x) * BM + warp_row * WM + mi * 16 + mma_row;
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {
-            const int output_col0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
-            const int output_col1 = output_col0 + 1;
-            const float* values   = accum[mi][ni];
-            if constexpr (kFull) {
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                    __float2bfloat16_rn(values[0]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                    __float2bfloat16_rn(values[1]);
-                out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                    __float2bfloat16_rn(values[2]);
-                out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                    __float2bfloat16_rn(values[3]);
-            } else {
-                if (output_row0 < rows) {
-                    if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row0] =
-                            __float2bfloat16_rn(values[0]);
-                    }
-                    if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row0] =
-                            __float2bfloat16_rn(values[1]);
-                    }
+            const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
+            const auto store = [&](int row, int token, float value) {
+                if (kFull || (row < rows && token < cols)) {
+                    const int global_token = token_begin + token;
+                    output.store(row, global_token, epilogue.apply(row, global_token, value));
                 }
-                if (output_row1 < rows) {
-                    if (output_col0 < cols) {
-                        out[static_cast<std::int64_t>(output_col0) * rows + output_row1] =
-                            __float2bfloat16_rn(values[2]);
-                    }
-                    if (output_col1 < cols) {
-                        out[static_cast<std::int64_t>(output_col1) * rows + output_row1] =
-                            __float2bfloat16_rn(values[3]);
-                    }
-                }
-            }
+            };
+            store(row0, token0, accum[mi][ni][0]);
+            store(row0, token0 + 1, accum[mi][ni][1]);
+            store(row0 + 8, token0, accum[mi][ni][2]);
+            store(row0 + 8, token0 + 1, accum[mi][ni][3]);
         }
     }
 }

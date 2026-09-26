@@ -28,6 +28,9 @@ For analysis or design, deliver the explanation or design. For diagnosis, establ
 supporting evidence; implement a fix when requested. For implementation, complete the selected
 design across its affected implementations, callers, tests, tools, and active documentation.
 
+Requests for analysis or proposals for review do not authorize applying them;
+implementation authorization must cover that same scope.
+
 The current product and architecture govern ordinary work. An explicit task may change them;
 update the affected contracts and implementation together instead of treating the current design
 as an immutable prohibition. Skills provide task-specific methods, not additional deliverables or
@@ -126,92 +129,40 @@ inventories, and exact probabilistic outputs are not default requirements. Use e
 exact outputs, and appropriate numerical or behavioral criteria otherwise. State checks that could
 not run and their implications.
 
-Finish when the deliverable is usable, applicable contracts are satisfied, material claims have
-sufficient evidence, relevant checks pass or their limitations are clear, and no known in-scope
-issue blocks use. Completion also requires the complete, non-selective final report specified
-below. Before declaring completion, reconcile the report against the user's requirements, the
-affected scope, and all collected findings. If any agreed completion condition remains unmet,
-state which parts are complete and which remain incomplete; disclosing an unmet condition does
-not satisfy it. Expand or repeat verification only for new changes, failures, or unresolved risks
-that could change the result. Supporting work is not an independent completion objective.
+## Reporting and completion
 
-## Complete reporting and evidence integrity
+Selective reporting and evidence gaming are prohibited, even when every disclosed
+statement is individually true. For every implementation task:
 
-These requirements are mandatory for every implementation task. Selective reporting and evidence
-gaming are prohibited integrity violations, even when every disclosed statement or number is
-true. Never use selection, omission, comparison choices, or aggregation to manufacture an
-impression of success that the full results do not support.
+1. Cover the entire agreed deliverable, its completion status, and all affected or
+   evaluated dimensions: behavior, numerical semantics, interfaces, architecture,
+   performance, resources, and maintenance. Distinguish completed, incomplete, and
+   unverified work; never describe an unmeasured aspect as unchanged.
 
-1. **Account for the entire deliverable.** The final reply must cover every user requirement,
-   promised item, affected implementation or route, and evaluated aspect. State whether each is
-   complete, partially complete, incomplete, or unverified. Report different types, components,
-   and routes separately when their outcomes differ. A successful subset must never stand in for
-   the whole task.
-2. **Describe all known effects of the chosen design.** Cover the functionality, mathematical
-   semantics, interfaces, architecture, performance, resource usage, complexity, and maintenance
-   costs affected or evaluated in this task. Explain benefits, disadvantages, capability losses,
-   and retained trade-offs. A favorable metric cannot substitute for the other dimensions.
-   Distinguish no observed change, no evaluation, and not applicable; never call an unchecked
-   aspect unaffected or not applicable.
-3. **Put unfavorable findings in the final reply itself.** Disclose all known failures,
-   regressions, slowdowns, additional costs, unresolved problems, and verification gaps. Being
-   unfavorable, small, below an alert threshold, or not yet explained is never a reason to omit
-   a result. Thresholds determine interpretation and action, not whether a finding is disclosed.
-4. **Account for unsuccessful and inferior approaches actually evaluated.** Explain their
-   observed problems, why they were rejected or retained, and any disadvantages carried into the
-   final implementation. Include problems found and subsequently fixed, together with the
-   correction and verification outcome. Repeated experiments may be grouped by common cause or
-   outcome, but every failure category, affected scope, and distinct exception must remain
-   visible; rejected results must not disappear from the account.
-5. **Use comparable baselines and label the nature of each gain.** Distinguish adding a missing
-   capability, replacing an inefficient fallback, and improving an existing optimized
-   implementation. Never relabel the first two as improvements to an existing optimized
-   implementation. Whole-system claims require measurement at that scope; an isolated path's
-   gain is insufficient. State the comparison conditions and explain differences in workload,
-   precision, semantics, hardware, execution mode, or measurement scope that affect interpretation.
-   Do not select a weaker baseline merely because it yields a larger gain.
-6. **Summarize the full evaluation set.** Identify the evaluated objects, workloads, and metrics,
-   then account for improved, unchanged, worse, and inconclusive results. Quantitative summaries
-   must state their coverage, distribution, worst changes, and exceptions. Never report only a
-   best case, maximum speedup, or favorable average. Aggregation must not hide a regression or
-   imply uniform improvement. Grouping is allowed only when the scope and differing outcomes
-   remain clear.
-7. **Apply the same evidentiary standard to good and bad results.** A small improvement is not
-   automatically a proven gain, and a small slowdown is not automatically noise. Mark unproven
-   interpretations as uncertain and explain the missing evidence. Changes to the test set,
-   baseline, measurement method, aggregation, or acceptance criteria must have a stated
-   justification and preserve earlier adverse findings. Never make such changes to obtain a
-   more favorable conclusion.
-8. **Make the final reply self-contained.** Attachments, logs, raw data, and progress messages
-   support the report; they do not replace it. The user must not have to inspect an attachment
-   or reconstruct earlier messages to discover an unfavorable result, omitted work, or a
-   limitation. Brevity may compress wording and group repeated findings, but must never remove
-   a required aspect, adverse result, or qualification.
-9. **Keep completion claims within the evidence.** A successful build, passing tests, or a
-   completed commit establishes only the corresponding fact. None substitutes for correctness,
-   performance, architectural, or other task-specific acceptance. Do not claim that a task or
-   optimization is complete while an agreed completion condition remains unmet. Explain the
-   actual status of each part and the remaining work.
-10. **Check report completeness before sending it.** Reconcile the final reply with the task
-    accounting and all available results, including abandoned approaches and unfavorable
-    findings. Correct unsupported conclusions and omissions before claiming completion. Do not
-    wait for the user to detect missing evidence or challenge a favorable headline.
+2. Put favorable and unfavorable findings in the final reply itself, including
+   regressions, costs, rejected approaches, failures subsequently fixed, unresolved
+   issues, and verification gaps. Explain their disposition. Group repetition
+   without hiding distinct problems or exceptions. Small or unexplained adverse
+   results must remain visible; attachments cannot substitute for disclosure.
 
-Every implementation final reply must contain the following information. The presentation may
-combine items, but none may be omitted:
+3. Make comparisons representative and comparable. State the baseline, workload,
+   conditions, metrics, coverage, outcome distribution, worst changes, and exceptions.
+   Distinguish new capability, fallback replacement, and improvement to an optimized
+   implementation. Keep claims within the measured scope; neither a best case nor
+   an average may stand in for the full results.
 
-- The user's requirements and the completion status of each.
-- The actual changes and their affected scope.
-- Design choices, unsuccessful approaches, and retained disadvantages or trade-offs.
-- Results across all affected or evaluated dimensions, including unchanged outcomes,
-  regressions, and additional costs.
-- Verification evidence, failures, checks not run, and coverage limits.
-- Remaining issues and an evidence-supported completion conclusion.
+4. Apply the same evidence standard to gains and regressions. Label uncertainty;
+   do not dismiss slowdowns as noise without evidence. Explain changes to scope,
+   baselines, methods, or acceptance criteria and preserve earlier adverse findings.
+   Never change these choices to manufacture a favorable conclusion.
 
-Completeness concerns this task's agreed scope, actual work, and evaluated approaches. It does not
-require unrelated audits, exhaustive hypothetical configuration sweeps, permanent test matrices,
-or new reporting tools. Known unfavorable findings must be reported; unknown or unverified
-aspects must remain explicitly unknown or unverified.
+5. Reuse sufficient evidence. Additional or repeated checks must satisfy required
+   verification, replace invalidated evidence, or resolve a concrete question that
+   could change implementation or acceptance. Once the deliverable and acceptance
+   conditions are satisfied, stop and report. Report review checks existing work
+   and findings; it must not become a new audit, sweep, or reporting-tool project.
+   Disclose remaining uncertainty without silently making it a new requirement.
+   Disclosure does not excuse unmet completion conditions.
 
 ## Reference navigation
 

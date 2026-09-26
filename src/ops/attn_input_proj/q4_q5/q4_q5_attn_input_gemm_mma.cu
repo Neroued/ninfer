@@ -126,6 +126,13 @@ void q4_q5_attn_input_mixed_r32_c32_s2_launch(const Tensor& x, const Weight& w0,
                                                                        stream);
 }
 
+void q4_q5_attn_input_mixed_r32_c32_k128_s2_launch(const Tensor& x, const Weight& w0,
+                                                   const Weight& w1, Tensor& q, Tensor& g,
+                                                   Tensor& k, Tensor& v, cudaStream_t stream) {
+    launch_mixed<GemmCfg<32, 32, 128, 16, 16, 2, 1, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                        stream);
+}
+
 void q4_q5_attn_input_mixed_r32_c64_s3_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                               cudaStream_t stream) {

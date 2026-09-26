@@ -102,7 +102,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/convert \
-  tests/test_serve_corpus.py
+  tests/test_serve_corpus.py tests/test_speed_of_light.py
 ```
 
 The Python suites exercise conversion and encoded output, without running model inference.

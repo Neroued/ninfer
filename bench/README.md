@@ -93,6 +93,80 @@ The benchmark disables context retention because every repetition is an independ
 Schema v15 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 
+### Inference speed-of-light estimate
+
+`tools.bench.speed_of_light` adds a theoretical reference to a completed, non-speculative
+`ninfer_bench` JSON run. It was inspired by [llm.q's speed-of-light accounting](https://github.com/IST-DASLab/llmq/blob/main/src/utilities/sol.cpp),
+which describes the idealized limit as the “fastest possible speed if the GPU was only running
+strictly necessary matmuls at peak flop/s” in its [README](https://github.com/IST-DASLab/llmq#how-to-train-your-quantized-llm).
+NInfer uses separate compute and weight-stream fractions because prompt and decode phases have
+different likely limits. The analyzer reads only the v3 artifact directory and the public Engine
+benchmark report; it does not load weights or run a second inference path.
+
+```bash
+./build/bench/ninfer_bench --weights out/qwen3_8_27b_nvfp4.ninfer \
+  -pg '2048,128' --max-ctx 8192 --kv-dtype fp8 --warmup 1 -r 5 -o json \
+  --output-file profiles/bench/sol_input.json
+python3 -m tools.bench.speed_of_light \
+  --report profiles/bench/sol_input.json \
+  --artifact out/qwen3_8_27b_nvfp4.ninfer \
+  --peak-tflops 1676 --hbm-gbps 1792
+```
+
+The peak values above are the nominal RTX 5090 FP4 compute ceiling and DRAM bandwidth.
+The repository also records a measured 1674.5 GB/s pure-read ceiling for this card
+(`tools/hbm_bandwidth_probe.cu`); claiming it instead of the nominal 1792 GB/s scales the
+decode weight and KV fractions by 1792/1674.5 (about 7%) — the tighter floor for
+read-dominated decode. Record which ceiling a result was claimed against.
+`--json` emits all inputs, counts, times, and fractions for further analysis.
+To see what a change bought against the roofs, keep the `--json` output of the
+pre-change run and pass it to the post-change run with `--baseline`:
+
+```bash
+python3 -m tools.bench.speed_of_light --report before.json \
+  --artifact out/qwen3_8_27b_nvfp4.ninfer \
+  --peak-tflops 1676 --hbm-gbps 1792 --json > profiles/bench/sol_before.json
+python3 -m tools.bench.speed_of_light --report after.json \
+  --artifact out/qwen3_8_27b_nvfp4.ninfer \
+  --peak-tflops 1676 --hbm-gbps 1792 --baseline profiles/bench/sol_before.json
+```
+
+The two runs must use the same model, ceilings, and per-test token counts. For each
+matching test, phase, and roof it reports the measured time change and the fraction of
+the pre-change gap to the roof that the change closed; a negative value moved the run
+away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
+gap closure. Tests or phases present in only one run are listed as unmatched.
+The tool requires schema v15 and `--spec none`. It rejects speculative runs because proposals,
+verification, and acceptance make output tokens an invalid proxy for executed model work.
+
+Projection compute work is counted as `2 * matrix elements` for each executed text projection.
+Prefill counts the output head once at the prompt frontier; decode counts it once per output token.
+For MoE it counts the configured number of selected experts. The compute roof fraction is this
+projection-only ideal time divided by the measured Engine phase time. It omits attention/GDN
+arithmetic, quantization, launch, and data movement, so it is an optimistic partial floor, not a
+GPU-utilization percentage. The optional decode weight fraction estimates encoded projection bytes
+from artifact bindings — the token embedding table and non-text (vision) components are not
+counted — and counts the smallest selectable MoE experts. The separate KV fraction
+uses the reported KV payload per capacity token and the sum of decode attention positions. Each
+divides estimated bytes by the supplied bandwidth and measured decode time. They assume one read
+from GPU memory per needed weight or KV element; cache residency, repeated reads, and reuse can
+change actual HBM traffic. Compare like workloads and inspect component timings before interpreting
+a fraction as a bottleneck.
+
+Reading a result. Measured on this card in September 2026: qwen3.8-27b (dense, NVFP4),
+`pp2048+tg128`, 8k context, fp8 KV, nominal ceilings. Prefill measured 0.241 s against a
+0.0595 s projection-FLOP floor — 24.7% of the compute roof; decode measured 1.765 s against
+a 1.364 s weight-stream floor — 77.3% of the weight roof, or 82.7% against the measured
+1674.5 GB/s read ceiling. Decode at concurrency 1 streams the full 17.80 GiB of selected
+weights per token, so a weight fraction near its ceiling says the phase is bandwidth-bound;
+the gap to the ceiling is non-projection work the roof does not count (attention, GDN,
+dispatch, elementwise) plus projection kernels running below the claimed ceiling — component
+timings separate the two. The low prefill fraction says prefill is not compute-bound at this
+shape. These fractions are the concurrency-1, non-speculative baseline (the benchmark runs
+one request per repetition), so do not transfer them to a served configuration — higher
+concurrency, speculative decoding, or a different context length — without a matching
+benchmark run.
+
 ## Context-cost calibration
 
 `ninfer_context_cost_bench` measures the static coefficients used to compare context-cache

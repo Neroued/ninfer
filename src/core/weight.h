@@ -47,6 +47,16 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+
+    // An NVFP4 plane assembled from several source matrices carries one divisor per source, in the
+    // payload after the scales. `weight_divisors` addresses them and `weight_divisor_rows` says how
+    // many consecutive rows each covers, so the divisor of row r is element r /
+    // weight_divisor_rows. A plane with one source sets the rows to its own row count, which makes
+    // that index zero for every row, and `weight_scale_divisor` is then the whole story. On a stack
+    // `weight_scale_divisor` holds only the first source's word, so a route that reads it for any
+    // other row is silently wrong by a scale factor.
+    const void* weight_divisors      = nullptr;
+    std::int32_t weight_divisor_rows = 0;
 };
 
 } // namespace ninfer

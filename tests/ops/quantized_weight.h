@@ -247,10 +247,15 @@ struct PackedWeight {
                            ? nullptr
                            : static_cast<std::uint8_t*>(device_payload) + high_plane_offset;
             w.scales = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
+            if (w.qtype == QType::NVFP4) {
+                w.weight_divisors =
+                    static_cast<std::uint8_t*>(device_payload) + weight_divisor_offset;
+            }
         } else {
-            w.qdata  = nullptr;
-            w.qhigh  = nullptr;
-            w.scales = nullptr;
+            w.qdata           = nullptr;
+            w.qhigh           = nullptr;
+            w.scales          = nullptr;
+            w.weight_divisors = nullptr;
         }
         return w;
     }
@@ -293,6 +298,8 @@ struct PackedWeight {
         w.n               = row_count;
         w.shape[0]        = row_count;
         w.padded_shape[0] = row_count;
+        // A view is one source's worth of rows, so its divisor covers all of them.
+        w.weight_divisor_rows = row_count;
         return w;
     }
 };
@@ -483,6 +490,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         packed.weight.k                    = k;
         packed.weight.weight_scale_divisor = options.weight_scale_divisor;
         packed.weight.input_scale_divisor  = options.input_scale_divisor;
+        packed.weight.weight_divisors      = packed.payload.data() + packed.weight_divisor_offset;
+        packed.weight.weight_divisor_rows  = n;
         return packed;
     }
     if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {

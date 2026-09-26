@@ -31,7 +31,7 @@ The block-scaled floating-point weight format is:
 
 | Canonical name | Code | K group | Block scale | Global field |
 |---|---|---:|---|---|
-| `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor |
+| `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor per stacked source matrix |
 
 The row-scaled floating-point weight format is:
 
@@ -89,7 +89,7 @@ may preserve an already encoded source or quantize floating-point values.
 The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
 E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
-scales, and, for NVFP4, the matrix weight divisor. NInfer currently provides no built-in
+scales, and, for NVFP4, the weight divisor of the row's own source matrix. NInfer currently provides no built-in
 floating-point-to-NVFP4 quantizer.
 
 A recipe can supply a Python callable as its method. Different methods can produce different
@@ -226,8 +226,11 @@ abbreviations; artifacts store the complete canonical names.
 
 `nvfp4` is a block-scaled floating-point weight representation, not a signed-integer
 `QuantFormat`. For a logical matrix `[N,K]`, every K-axis group contains 16 E2M1 code words and one
-E4M3FN scale word. The representation also contains one FP32 serialized weight divisor `d_w` for
-the complete matrix.
+E4M3FN scale word. The representation also contains one FP32 serialized weight divisor `d_w` per
+source matrix stacked into the plane: a plane quantized as one matrix holds one, and a plane
+assembled from several matrices that were quantized apart holds one for each, covering
+`N / divisors` consecutive rows in the order the sources are stacked. `divisors` is the tensor
+object's member of that name.
 
 An E2M1 word has sign bit 3, exponent bits 2:1, and mantissa bit 0. Positive code words `0..7`
 decode to:
@@ -250,13 +253,13 @@ e == 15, m == 7: NaN
 ```
 
 Stored NVFP4 weight scales admit only sign-zero finite words, including positive zero. Negative
-values, negative zero, and both NaN words are invalid. The serialized binary32 word `d_w` must be
+values, negative zero, and both NaN words are invalid. Every serialized binary32 word of `d_w` must be
 finite and strictly positive.
 
 For code `c[n,k]`, scale word `s[n,g]`, and `g=floor(k/16)`, the exact represented weight is:
 
 ```text
-W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) / d_w
+W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) / d_w[floor(n / (N / divisors))]
 ```
 
 `import_encoded` copies all three fields without requantizing or canonicalizing them. Activation
@@ -552,8 +555,8 @@ A conforming producer must:
 - for a quantized format, preserve the logical shape and last-axis group rule;
 - for a grouped signed-integer format, emit one valid binary16 scale per logical group and only
   legal signed codes, including never emitting Q8 `-128`;
-- for `nvfp4`, emit only valid E2M1 code words, nonnegative finite E4M3FN scale words, and one finite
-  positive FP32 weight divisor under Section 3.3;
+- for `nvfp4`, emit only valid E2M1 code words, nonnegative finite E4M3FN scale words, and one
+  finite positive FP32 weight divisor per stacked source matrix under Section 3.3;
 - for `fp8_e4m3fn_row_bf16`, emit only finite E4M3FN code words and valid BF16 row multipliers,
   with signed-zero codes as the only legal codes in a positive-zero-scale row under Section 3.4;
 - record enough conversion provenance for the artifact producer to identify how the values
@@ -580,8 +583,8 @@ The `.ninfer` container and each registered storage layout must:
 - for grouped signed-integer formats, make the number and ownership of logical groups unambiguous
   and reconstruct every signed code and binary16 scale without inference from a kernel
   implementation;
-- for `nvfp4`, reconstruct every E2M1 code word, natural E4M3FN scale word, and the matrix FP32
-  divisor under Section 3.3;
+- for `nvfp4`, reconstruct every E2M1 code word, natural E4M3FN scale word, and the FP32 divisor
+  of the row's own source matrix under Section 3.3;
 - for `fp8_e4m3fn_row_bf16`, reconstruct every E4M3FN code word and its owning BF16 row multiplier
   under Section 3.4;
 - define its canonical physical-padding contents and producer responsibilities, if it materializes
@@ -632,7 +635,7 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
 - Q4, Q5, Q6, and Q8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
   padding, consecutive row views, and arbitrary row gathers;
 - all 16 E2M1 words, all 256 E4M3FN words, NVFP4 scale/divisor validity, the exact divisor-based
-  reconstruction equation, and known block-scale swizzle offsets;
+  reconstruction equation for a plane of one source, and known block-scale swizzle offsets;
 - finite E4M3FN weight-code validity, BF16 row-scale validity, signed-zero rows, exact code/scale
   plane round trips, and the row-multiplier reconstruction equation for
   `fp8_e4m3fn_row_bf16`;

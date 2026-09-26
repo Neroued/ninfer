@@ -403,6 +403,9 @@ The oracle determines correctness but does not prescribe production arithmetic. 
 instruction operands, reduction association, staging, workspace representation, and kernel
 decomposition remain implementation choices unless the contract makes an intermediate value
 observable.
+Unless the contract requires an intermediate representation boundary, a fused implementation must
+not retain extra low-precision intermediate rounding to reproduce an unfused route or achieve
+bitwise parity.
 
 ### 6.2 Conformance domain
 
@@ -514,7 +517,11 @@ plausible candidates. Instantiate only the small overlapping candidate set neede
 decision; do not create a Cartesian product of speculative knobs. Add another family or parameter
 only when evidence shows that the existing candidates cannot cover a relevant part of the
 workload. Once dispatch is selected, retain the winning instances and parameters and remove losing
-candidates and unused knobs.
+candidate instances and temporary tuning entry points. Reusable kernel families and schedule
+parameters with a clear purpose and development validation may remain as tuning assets even when
+current production dispatch does not select them. Qualify new configuration/epilogue combinations
+during development; permanent tests protect public behavior and production routes, not an unused
+configuration-by-epilogue matrix.
 
 Derive latency-sensitive extents and bulk anchors from the active workload and the Op's actual
 input semantics. Review pointwise behavior and material route seams; select a small set of useful

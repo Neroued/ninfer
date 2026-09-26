@@ -742,8 +742,9 @@ cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
 ## NVFP4 LinearSwiGLU Op benchmark
 
 `ninfer_nvfp4_linear_swiglu_bench` measures the public NVFP4
-`[34816,5120] -> [17408,T]` profile. The A4 sweep includes both fused route seams and the
-larger materialized/TMA paths.
+`[34816,5120] -> [17408,T]` profile. Each sample measures the complete production-dispatched call,
+including activation quantization and caller-owned workspace when required. The fused epilogue
+consumes FP32 gate/up accumulators and writes only the final BF16 output.
 
 ```bash
 cmake --build build --parallel --target ninfer_nvfp4_linear_swiglu_bench
@@ -785,17 +786,17 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
 ## BF16 LinearAdd Op benchmark
 
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
-in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
-aggregate MMA through `T=48`, and the large-T MMA afterward.
-Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
+in-place BF16 residual epilogue. Each production sample measures one complete public call after
+restoring the residual outside the timed region and flushing L2.
+Effective bandwidth counts the weight once, the activation once, and
 the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
 references.
 
 ```bash
 cmake --build build --parallel --target ninfer_bf16_linear_add_bench
 ./build/bench/ninfer_bf16_linear_add_bench \
-  --sweep 1:48:1 --route production --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/bf16_linear_add_t1_48.csv
+  --sweep 1:128:1 --route production --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/bf16_linear_add_t1_128.csv
 ./build/bench/ninfer_bf16_linear_add_bench \
   --t-sweep 1024,1536,2048 --route production --warmup 10 --repeat 50
 ./build/bench/ninfer_bf16_linear_add_bench \

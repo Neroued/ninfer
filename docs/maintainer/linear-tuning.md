@@ -47,6 +47,17 @@ the speculative workload priorities solely because they share a Linear geometry.
 
 ## 3. Dispatch and interval quality
 
+Reusable templates live in the format directories under [src/ops/linear/](../../src/ops/linear/).
+Schedules describe computation organization, operands provide explicit inputs, launchers validate
+constraints and launch kernels, and Output/Epilogue define output mapping and fused computation.
+Each semantic Op selects its own production instances. A template's availability neither registers
+a public shape nor implies that production dispatch uses it.
+
+CTA-local sliced-K reduces partial sums within a block. Cross-CTA split-K requires caller-owned
+workspace and a final reduction; apply the epilogue once, after the complete reduction.
+New configuration/epilogue combinations receive development qualification; permanent tests cover
+public behavior and selected production routes.
+
 Measure every valid integer in the hot interval, respecting the Op's alignment contract. A
 temporary private-launcher sweep can establish candidate crossovers and the pointwise performance
 envelope. Dense measurement does not require dense dispatch or matching the fastest candidate at
@@ -79,6 +90,10 @@ and measure the implementation that production dispatch actually selects. These 
 requirements for the large-extent region, not a mandatory position in the development order.
 
 ## 4. Report format
+
+This section applies when a retained absolute-performance report is requested; routine changes do
+not require a new report or plot. Task summaries still follow [AGENTS.md](../../AGENTS.md#reporting-and-completion),
+including comparative results, regressions, and limitations.
 
 A retained Linear performance report describes the final implementation's absolute performance.
 Use the [Q4 6144×5120 report](examples/q4-linear.md) as a worked example, with this structure:

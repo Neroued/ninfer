@@ -24,6 +24,9 @@ constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParamOpen     = "<parameter=";
 constexpr std::string_view kParamClose    = "</parameter>";
 
+// Bounds the terminal-only re-parse cost when the first marker does not start a valid region.
+constexpr std::size_t kMaxQuotedMarkerRetries = 4;
+
 struct RawParameter {
     std::string_view name;
     std::string_view value;
@@ -512,6 +515,11 @@ private:
         return false;
     }
 
+    bool closes_parameter(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        return starts_with_at(text_, pos, kParamOpen) || starts_with_at(text_, pos, kFunctionClose);
+    }
+
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
@@ -526,7 +534,8 @@ private:
                 continue;
             }
 
-            --depth;
+            // A closer that cannot be followed by the grammar's next token is quoted value text.
+            if (depth != 1 || closes_parameter(close + kParamClose.size())) { --depth; }
             if (depth == 0) {
                 value_end = close;
                 return true;
@@ -602,17 +611,45 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     if (first == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
-    out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
     out.diagnostics.marker_seen = true;
 
     std::vector<RawToolCall> raw_calls;
-    const std::string_view tool_region = std::string_view(text).substr(first);
-    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
+    const auto parse_from = [&](std::size_t start) {
+        raw_calls.clear();
+        return QwenToolRegionParser(std::string_view(text).substr(start), max_tool_name_length,
+                                    contract)
+            .parse(raw_calls);
+    };
+
+    std::size_t start            = first;
+    const FallbackReason failure = parse_from(first);
+    // A complete first call followed by text was not a quote; recovering a later call would execute
+    // only part of the output.
+    if (failure == FallbackReason::TrailingContent) {
         out.diagnostics.fallback_reason = failure;
         return fallback(text, out.diagnostics);
     }
+    if (failure != FallbackReason::None) {
+        // A marker quoted in prose precedes the real call. Retry from the last few later markers,
+        // earliest first so that every call of a multi-call suffix is kept.
+        std::vector<std::size_t> later;
+        for (std::size_t pos = text.find(kToolOpen, first + kToolOpen.size());
+             pos != std::string::npos; pos = text.find(kToolOpen, pos + kToolOpen.size())) {
+            later.push_back(pos);
+        }
+        const std::size_t skip =
+            later.size() > kMaxQuotedMarkerRetries ? later.size() - kMaxQuotedMarkerRetries : 0;
+        const auto recovered = std::find_if(later.begin() + static_cast<std::ptrdiff_t>(skip),
+                                            later.end(), [&](std::size_t candidate) {
+                                                return parse_from(candidate) == FallbackReason::None;
+                                            });
+        if (recovered == later.end()) {
+            out.diagnostics.fallback_reason = failure;
+            return fallback(text, out.diagnostics);
+        }
+        start = *recovered;
+    }
+    out.content = rtrim_format_whitespace(std::string_view(text).substr(0, start));
 
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
@@ -684,7 +721,8 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        // Non-empty only when a later marker was recovered; the withheld prose before it is text.
+        return Terminal{.content     = std::move(parsed.content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }

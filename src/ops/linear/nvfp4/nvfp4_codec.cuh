@@ -23,6 +23,28 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
     return static_cast<float2>(value).x;
 }
 
+__device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
+    const float2 values    = decode_nvfp4_e2m1x2(code);
+    const float multiplier = decode_nvfp4_e4m3(scale);
+
+    union {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    } result;
+
+    result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+    return result.bits;
+}
+
+__device__ __forceinline__ int nvfp4_a16_shared_col_64(int row, int col) {
+    return col ^ ((row & 7) << 3);
+}
+
+__device__ __forceinline__ std::int64_t nvfp4_scale_byte_offset(int row, int group, int k) {
+    return static_cast<std::int64_t>((row / 128) * (k / 64) + group / 4) * 512 + (row & 31) * 16 +
+           ((row & 127) >> 5) * 4 + (group & 3);
+}
+
 struct alignas(8) Nvfp4QuantizedK16 {
     std::uint32_t codes_lo;
     std::uint32_t codes_hi;

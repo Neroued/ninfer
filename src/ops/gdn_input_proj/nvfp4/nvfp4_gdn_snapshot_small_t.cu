@@ -2,9 +2,9 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/gdn_conv_output.cuh"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_simt.cuh"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_epilogue.cuh"
+#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
 #include <array>
 #include <cstddef>
@@ -26,25 +26,21 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
                   const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                   Publish publish, cudaStream_t stream) {
     using Geometry = Nvfp4N16384K5120;
-    using Schedule = Nvfp4SimtSchedule<4, 1, 2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16,
-                                       ActiveTokens, 1,
-                                       ActiveTokens == 2 ? Nvfp4SimtActivationAccess::SharedPhase
-                                                         : Nvfp4SimtActivationAccess::TokenPacked,
-                                       Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                       Nvfp4SimtBlockOrder::RowsContiguous, 1>;
-    static_assert(Schedule::kTokenTile == ActiveTokens);
+    using Schedule =
+        Nvfp4A16SimtSchedule<4, 1, 2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16,
+                             ActiveTokens, 1,
+                             ActiveTokens == 2 ? Nvfp4SimtActivationAccess::SharedPhase
+                                               : Nvfp4SimtActivationAccess::TokenPacked,
+                             Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                             Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+    static_assert(Schedule::kBlockTokens == ActiveTokens);
 
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
-                      GdnConvOutput<ActiveTokens, Publish>, Nvfp4SimtFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,
-                                               initial_slot, query, key, value, z, publish));
-    CUDA_CHECK(cudaGetLastError());
+    launch_nvfp4_a16_simt<
+        Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
+        nvfp4_a16_operands(x, weight),
+        make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
+                                           query, key, value, z, publish),
+        Nvfp4GdnConvEpilogue<ActiveTokens>{}, stream);
 }
 
 template <int ActiveTokens>

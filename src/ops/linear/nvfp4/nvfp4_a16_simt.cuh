@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/linear/nvfp4/nvfp4_gemv.cuh"
+#include "ops/linear/nvfp4/nvfp4_a16_gemv.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -9,36 +9,31 @@
 
 namespace ninfer::ops::detail {
 
-enum class Nvfp4SimtFinalization {
-    Elementwise,
-    RowVector,
-};
-
 template <class Geometry, int ActiveTokens, class Schedule>
-struct Nvfp4SimtSharedStorage {
+struct Nvfp4A16SimtSharedStorage {
     static constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * 32 * Schedule::kValuesPerLane;
     static constexpr int kActivationElements =
         Schedule::kActivationAccess == Nvfp4SimtActivationAccess::SharedPhase
-            ? Schedule::kTokenTile * kValuesPerPhase
+            ? Schedule::kBlockTokens * kValuesPerPhase
             : 8;
-    static constexpr int kPartialTokens = Schedule::kWarpsPerRow > 1 ? Schedule::kTokenTile : 1;
+    static constexpr int kPartialTokens = Schedule::kWarpsPerRow > 1 ? Schedule::kBlockTokens : 1;
 
-    Nvfp4GemvSharedStorage<Geometry, Schedule> gemv;
+    Nvfp4A16GemvSharedStorage<Geometry, Schedule> gemv;
     alignas(16) __nv_bfloat16 activation[kActivationElements];
     float partials[Schedule::kRowGroupsPerCta][Schedule::kRowsPerWarp][kPartialTokens]
                   [Schedule::kWarpsPerRow];
 };
 
 template <int Values>
-struct Nvfp4ActivationPack {
+struct Nvfp4A16ActivationPack {
     static_assert(Values == 8 || Values == 16 || Values == 32);
     std::uint32_t words[Values / 2];
 };
 
 template <int Values>
-__device__ __forceinline__ Nvfp4ActivationPack<Values>
+__device__ __forceinline__ Nvfp4A16ActivationPack<Values>
 load_nvfp4_activation_pack(const __nv_bfloat16* pointer) {
-    Nvfp4ActivationPack<Values> result;
+    Nvfp4A16ActivationPack<Values> result;
 #pragma unroll
     for (int chunk = 0; chunk < Values / 8; ++chunk) {
         const uint4 packed          = load_vec<uint4>(pointer + chunk * 8);
@@ -51,15 +46,16 @@ load_nvfp4_activation_pack(const __nv_bfloat16* pointer) {
 }
 
 template <class Geometry, int ActiveTokens, class Schedule>
-__device__ __forceinline__ void compute_nvfp4_simt_rows(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales,
-    Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule>& shared, float inverse_weight_divisor,
-    const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0, int token0, int warp_in_row,
-    int lane,
-    float (
-        &accumulators)[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains],
-    int live_tokens = ActiveTokens) {
+__device__ __forceinline__ void
+compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+                        const std::uint8_t* __restrict__ scales,
+                        Nvfp4A16SimtSharedStorage<Geometry, ActiveTokens, Schedule>& shared,
+                        float inverse_weight_divisor,
+                        const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0, int token0,
+                        int warp_in_row, int lane,
+                        float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kBlockTokens]
+                                             [Schedule::kAccumulatorChains],
+                        int live_tokens = ActiveTokens) {
     constexpr int kValuesPerWarpPhase = 32 * Schedule::kValuesPerLane;
     constexpr int kValuesPerPhase     = Schedule::kWarpsPerRow * kValuesPerWarpPhase;
     constexpr int kPhases             = Geometry::kInputRows / kValuesPerPhase;
@@ -72,7 +68,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
         if constexpr (Schedule::kActivationAccess == Nvfp4SimtActivationAccess::SharedPhase) {
             static_assert((kValuesPerPhase % 8) == 0);
             constexpr int kPacksPerToken = kValuesPerPhase / 8;
-            constexpr int kStagePacks    = Schedule::kTokenTile * kPacksPerToken;
+            constexpr int kStagePacks    = Schedule::kBlockTokens * kPacksPerToken;
             auto* destination            = reinterpret_cast<uint4*>(shared.activation);
             for (int task = static_cast<int>(threadIdx.x); task < kStagePacks;
                  task += Schedule::kThreads) {
@@ -108,9 +104,9 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
         }
 
         if constexpr (Schedule::kActivationAccess == Nvfp4SimtActivationAccess::TokenPacked) {
-            Nvfp4ActivationPack<Schedule::kValuesPerLane> activation[Schedule::kTokenTile];
+            Nvfp4A16ActivationPack<Schedule::kValuesPerLane> activation[Schedule::kBlockTokens];
 #pragma unroll
-            for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
+            for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                 const int token = token0 + local_token;
                 if (token < ActiveTokens) {
                     const int value_begin = phase * kValuesPerPhase +
@@ -137,7 +133,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
 #pragma unroll
-                for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
+                for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                     const int token = token0 + local_token;
                     if (token < ActiveTokens) {
                         const float2 activation_value =
@@ -173,7 +169,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                                        warp_in_row * (kValuesPerWarpPhase / 2) +
                                        lane * Schedule::kPairsPerLane + pair;
 #pragma unroll
-                for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
+                for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                     const int token = token0 + local_token;
                     if (token < ActiveTokens) {
                         float2 activation_value;
@@ -212,172 +208,87 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
     }
 }
 
-template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy,
-          Nvfp4SimtFinalization Finalization = Nvfp4SimtFinalization::Elementwise,
-          bool RuntimeColumns                = false>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_simt_kernel(
+template <class Schedule, class Output, class Epilogue, class Rows>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_simt_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
-    OutputPolicy output, int columns = ActiveTokens) {
-    const int live_tokens = RuntimeColumns ? columns : ActiveTokens;
-    static_assert(!RuntimeColumns || Finalization == Nvfp4SimtFinalization::Elementwise);
-    static_assert(ActiveTokens >= 2);
-    static_assert(Schedule::kTokenTile <= ActiveTokens);
-    static_assert((Geometry::kOutputRows % 128) == 0);
-    static_assert((Schedule::kRowsPerCta % 4) == 0);
-    static_assert((128 % Schedule::kRowsPerCta) == 0);
-
-    constexpr int kRowBlocks  = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
-    const int linear_block    = static_cast<int>(blockIdx.x);
-    int row_block;
-    int token_tile;
-    if constexpr (Schedule::kBlockOrder == Nvfp4SimtBlockOrder::RowsContiguous) {
-        token_tile = linear_block / kRowBlocks;
-        row_block  = linear_block - token_tile * kRowBlocks;
+    const std::uint8_t* __restrict__ scales, float alpha, Output output, Epilogue epilogue,
+    Rows policy, int rows, int tokens) {
+    using Geometry             = Nvfp4Geometry<128, Schedule::kStaticK>;
+    constexpr int ActiveTokens = Schedule::kTokenCapacity;
+    static_assert(ActiveTokens >= 1 && Schedule::kBlockTokens <= ActiveTokens);
+    static_assert(Schedule::kBlockRows % 4 == 0 && 128 % Schedule::kBlockRows == 0);
+    static_assert(!Rows::kPaired || Schedule::kRowsPerWarp % 2 == 0);
+    const int live       = Schedule::kExactTokens ? ActiveTokens : tokens;
+    const int row_blocks = rows / Schedule::kBlockRows;
+    constexpr int token_tiles =
+        (ActiveTokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
+    const int block = blockIdx.x;
+    int rb, tt;
+    if constexpr (token_tiles == 1) {
+        rb = block;
+        tt = 0;
+    } else if constexpr (Schedule::kBlockOrder == Nvfp4SimtBlockOrder::RowsContiguous) {
+        tt = block / row_blocks;
+        rb = block % row_blocks;
     } else {
-        row_block  = linear_block / kTokenTiles;
-        token_tile = linear_block - row_block * kTokenTiles;
+        rb = block / token_tiles;
+        tt = block % token_tiles;
     }
-    const int token0 = kTokenTiles == 1 ? 0 : token_tile * Schedule::kTokenTile;
-
-    __shared__ Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
-    constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
-    const int m_tile           = row_block / kCtasPerM128;
-    const int cta_in_tile      = row_block - m_tile * kCtasPerM128;
-    const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
-    stage_nvfp4_scales<Geometry, Schedule>(scales, shared.gemv, m_tile, rmod_base);
-
-    const int lane        = static_cast<int>(threadIdx.x) & 31;
-    const int warp        = static_cast<int>(threadIdx.x) >> 5;
-    const int row_group   = warp / Schedule::kWarpsPerRow;
-    const int warp_in_row = warp - row_group * Schedule::kWarpsPerRow;
-    const int flat_row0   = row_group * Schedule::kRowsPerWarp;
-    int parent_rows[Schedule::kRowsPerWarp];
+    const int token0 = tt * Schedule::kBlockTokens;
+    __shared__ Nvfp4A16SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
+    nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared.gemv, rb, rows, policy);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int rg = warp / Schedule::kWarpsPerRow, wr = warp % Schedule::kWarpsPerRow;
+    const int local0 = rg * Schedule::kRowsPerWarp;
+    int parent[Schedule::kRowsPerWarp];
 #pragma unroll
-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-        const int flat_row     = flat_row0 + local_row;
-        const int rmod         = rmod_base + flat_row / 4;
-        const int quartile     = flat_row & 3;
-        parent_rows[local_row] = m_tile * 128 + rmod + quartile * 32;
-    }
-
-    float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
-        {};
+    for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+        parent[r] = nvfp4_a16_parent_row<Schedule>(rb, local0 + r, rows, policy);
+    float acc[Schedule::kRowsPerWarp][Schedule::kBlockTokens][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
-        x, codes, scales, shared, inverse_weight_divisor, parent_rows, flat_row0, token0,
-        warp_in_row, lane, accumulators, live_tokens);
-
-    if constexpr (Finalization == Nvfp4SimtFinalization::RowVector) {
-        static_assert(Schedule::kTokenTile == ActiveTokens,
-                      "row-vector finalization requires one CTA to own the full token row");
-        if constexpr (Schedule::kWarpsPerRow == 1) {
+        x, codes, scales, shared, alpha, parent, local0, token0, wr, lane, acc, live);
+    float totals[Schedule::kRowsPerWarp][Schedule::kBlockTokens];
 #pragma unroll
-            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                float projected[ActiveTokens];
+    for (int r = 0; r < Schedule::kRowsPerWarp; ++r) {
 #pragma unroll
-                for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
-                    float total = 0.0F;
+        for (int t = 0; t < Schedule::kBlockTokens; ++t) {
+            float sum = 0;
 #pragma unroll
-                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
-                        total += accumulators[local_row][local_token][chain];
-                    }
-                    total = warp_reduce_sum(total);
-                    if (lane == 0) {
-                        const int parent_row   = parent_rows[local_row];
-                        projected[local_token] = epilogue.apply(parent_row, local_token, total);
-                    }
-                }
-                if (lane == 0) { output.store_row(parent_rows[local_row], projected); }
-            }
-        } else {
-#pragma unroll
-            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-#pragma unroll
-                for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
-                    float total = 0.0F;
-#pragma unroll
-                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
-                        total += accumulators[local_row][local_token][chain];
-                    }
-                    total = warp_reduce_sum(total);
-                    if (lane == 0) {
-                        shared.partials[row_group][local_row][local_token][warp_in_row] = total;
-                    }
-                }
-            }
-            __syncthreads();
-            if (warp_in_row == 0) {
-#pragma unroll
-                for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                    float projected[ActiveTokens];
-#pragma unroll
-                    for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
-                        const float partial =
-                            lane < Schedule::kWarpsPerRow
-                                ? shared.partials[row_group][local_row][local_token][lane]
-                                : 0.0F;
-                        const float total = warp_reduce_sum(partial);
-                        if (lane == 0) {
-                            const int parent_row   = parent_rows[local_row];
-                            projected[local_token] = epilogue.apply(parent_row, local_token, total);
-                        }
-                    }
-                    if (lane == 0) { output.store_row(parent_rows[local_row], projected); }
-                }
-            }
+            for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += acc[r][t][c];
+            sum = warp_reduce_sum(sum);
+            if constexpr (Schedule::kWarpsPerRow == 1)
+                totals[r][t] = sum;
+            else if (lane == 0)
+                shared.partials[rg][r][t][wr] = sum;
         }
-    } else {
+    }
+    if constexpr (Schedule::kWarpsPerRow > 1) {
+        __syncthreads();
+        if (wr == 0) {
 #pragma unroll
-        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
 #pragma unroll
-            for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
-                const int token = token0 + local_token;
-                if (token < live_tokens) {
-                    float total = 0.0F;
-#pragma unroll
-                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
-                        total += accumulators[local_row][local_token][chain];
-                    }
-                    total = warp_reduce_sum(total);
-                    if constexpr (Schedule::kWarpsPerRow == 1) {
-                        if (lane == 0) {
-                            const int parent_row = parent_rows[local_row];
-                            output.store(parent_row, token,
-                                         epilogue.apply(parent_row, token, total));
-                        }
-                    } else if (lane == 0) {
-                        shared.partials[row_group][local_row][local_token][warp_in_row] = total;
-                    }
+                for (int t = 0; t < Schedule::kBlockTokens; ++t) {
+                    const float sum =
+                        lane < Schedule::kWarpsPerRow ? shared.partials[rg][r][t][lane] : 0.0f;
+                    totals[r][t] = warp_reduce_sum(sum);
                 }
-            }
         }
-
-        if constexpr (Schedule::kWarpsPerRow > 1) {
-            __syncthreads();
-            if (warp_in_row == 0) {
+    }
+    if (wr == 0 && lane == 0) {
 #pragma unroll
-                for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+        for (int r = 0; r < Schedule::kRowsPerWarp; r += Rows::kPaired ? 2 : 1) {
+            if constexpr (Rows::kPaired) {
 #pragma unroll
-                    for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
-                        const int token = token0 + local_token;
-                        if (token < live_tokens) {
-                            const float partial =
-                                lane < Schedule::kWarpsPerRow
-                                    ? shared.partials[row_group][local_row][local_token][lane]
-                                    : 0.0F;
-                            const float total = warp_reduce_sum(partial);
-                            if (lane == 0) {
-                                const int parent_row = parent_rows[local_row];
-                                output.store(parent_row, token,
-                                             epilogue.apply(parent_row, token, total));
-                            }
-                        }
-                    }
-                }
-            }
+                for (int t = 0; t < Schedule::kBlockTokens; ++t)
+                    if (token0 + t < live)
+                        epilogue.apply_pair(output, parent[r], token0 + t, totals[r][t],
+                                            totals[r + 1][t]);
+            } else
+                linear_finish_row(output, epilogue, parent[r], token0, totals[r],
+                                  min(Schedule::kBlockTokens, live - token0));
         }
     }
 }
-
 } // namespace ninfer::ops::detail

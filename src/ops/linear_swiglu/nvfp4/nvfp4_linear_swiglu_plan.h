@@ -20,8 +20,8 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Te
                                        cudaStream_t stream);
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
-void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                     WorkspaceArena& workspace, cudaStream_t stream);
+void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                   WorkspaceArena& workspace, cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,

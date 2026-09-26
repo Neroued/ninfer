@@ -1,8 +1,10 @@
 #pragma once
 
-#include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
-#include "ops/linear/nvfp4/nvfp4_output.cuh"
+#include "ops/linear/nvfp4/nvfp4_operands.h"
+#include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/common/vector_output.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -49,9 +51,9 @@ __device__ __forceinline__ Nvfp4CodePack<Values> load_nvfp4_codes(const std::uin
 }
 
 template <class Geometry, class Schedule>
-struct Nvfp4GemvSharedStorage {
+struct Nvfp4A16GemvSharedStorage {
     static constexpr int kRawScaleBytes = Schedule::kScaleAccess == Nvfp4ScaleAccess::StagedRaw
-                                              ? Schedule::kRowsPerCta * Geometry::kGroupsPerRow
+                                              ? Schedule::kBlockRows * Geometry::kGroupsPerRow
                                               : 16;
     alignas(16) std::uint8_t raw_scales[kRawScaleBytes];
 };
@@ -59,9 +61,10 @@ struct Nvfp4GemvSharedStorage {
 template <class Geometry, class Schedule>
 __device__ __forceinline__ void
 stage_nvfp4_scales(const std::uint8_t* __restrict__ scales,
-                   Nvfp4GemvSharedStorage<Geometry, Schedule>& shared, int m_tile, int rmod_base) {
+                   Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared, int m_tile,
+                   int rmod_base) {
     if constexpr (Schedule::kScaleAccess == Nvfp4ScaleAccess::StagedRaw) {
-        constexpr int kQuartetsPerCta = Schedule::kRowsPerCta / 4;
+        constexpr int kQuartetsPerCta = Schedule::kBlockRows / 4;
         constexpr int kTasks          = Geometry::kScaleTilesPerRow * kQuartetsPerCta;
         for (int task = static_cast<int>(threadIdx.x); task < kTasks; task += Schedule::kThreads) {
             const int scale_tile = task / kQuartetsPerCta;
@@ -97,7 +100,7 @@ __device__ __forceinline__ std::int64_t nvfp4_scale_offset(int parent_row, int g
 
 template <class Geometry, class Schedule>
 __device__ __forceinline__ std::uint32_t
-load_staged_scale_word(const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared, int local_row,
+load_staged_scale_word(const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared, int local_row,
                        int phase, int lane) {
     constexpr int kSubgroupWidth  = 64 / Schedule::kValuesPerLane;
     constexpr int kGroupsPerPhase = (32 * Schedule::kValuesPerLane) / 16;
@@ -114,7 +117,7 @@ load_staged_scale_word(const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared,
 template <class Geometry, class Schedule>
 __device__ __forceinline__ void load_nvfp4_coefficients(
     const std::uint8_t* __restrict__ scales,
-    const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared, int parent_row, int local_row,
+    const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared, int parent_row, int local_row,
     int phase, int lane, float inverse_weight_divisor,
     float (&coefficients)[Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16]) {
     constexpr int kGroupsPerLane =
@@ -149,7 +152,7 @@ template <class Geometry, class Schedule>
 __device__ __forceinline__ void
 compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                    const std::uint8_t* __restrict__ scales,
-                   const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared,
+                   const Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared,
                    float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp],
                    int flat_row0, int lane,
                    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
@@ -200,51 +203,87 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
     }
 }
 
-template <class Geometry, class Schedule, class Epilogue, class Output>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
-    Output output) {
-    static_assert((Geometry::kOutputRows % 128) == 0);
-    static_assert((Schedule::kRowsPerCta % 4) == 0);
-    static_assert((128 % Schedule::kRowsPerCta) == 0);
+// SIMT rows follow the stored M128 scale permutation. A paired policy maps
+// adjacent local rows to the two semantic branches owned by the same warp.
+template <class Schedule, class Rows>
+__device__ __forceinline__ int nvfp4_a16_parent_row(int block, int local, int rows, Rows policy) {
+    constexpr int branches = Rows::kPaired ? 2 : 1;
+    const int flat         = block * (Schedule::kBlockRows / branches) + local / branches;
+    const int physical     = (flat / 128) * 128 + ((flat & 127) >> 2) + (flat & 3) * 32;
+    if constexpr (Rows::kPaired)
+        return policy.weight_row(physical, local & 1, rows);
+    else
+        return policy.weight_row(0, physical, rows);
+}
 
-    __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
-    constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
-    const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
-    const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
-    const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
-    stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
-
-    const int lane      = static_cast<int>(threadIdx.x) & 31;
-    const int warp      = static_cast<int>(threadIdx.x) >> 5;
-    const int flat_row0 = warp * Schedule::kRowsPerWarp;
-    int parent_rows[Schedule::kRowsPerWarp];
-#pragma unroll
-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-        const int flat_row     = flat_row0 + local_row;
-        const int rmod         = rmod_base + flat_row / 4;
-        const int quartile     = flat_row & 3;
-        parent_rows[local_row] = m_tile * 128 + rmod + quartile * 32;
-    }
-
-    float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
-                                           parent_rows, flat_row0, lane, accumulators);
-
-#pragma unroll
-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-        float total = 0.0F;
-#pragma unroll
-        for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
-            total += accumulators[local_row][chain];
+template <class Geometry, class Schedule, class Rows>
+__device__ __forceinline__ void
+nvfp4_stage_a16_scales(const std::uint8_t* scales,
+                       Nvfp4A16GemvSharedStorage<Geometry, Schedule>& shared, int block, int rows,
+                       Rows policy) {
+    if constexpr ([] {
+                      if constexpr (requires { Rows::kContiguous; })
+                          return Rows::kContiguous;
+                      else
+                          return false;
+                  }()) {
+        constexpr int ctas = 128 / Schedule::kBlockRows;
+        const int tile = block / ctas, within = block % ctas;
+        stage_nvfp4_scales<Geometry, Schedule>(scales, shared, tile,
+                                               within * (Schedule::kBlockRows / 4));
+    } else if constexpr (Schedule::kScaleAccess == Nvfp4ScaleAccess::StagedRaw) {
+        for (int item = threadIdx.x; item < Schedule::kBlockRows * Geometry::kScaleTilesPerRow;
+             item += Schedule::kThreads) {
+            const int local  = item / Geometry::kScaleTilesPerRow,
+                      group  = (item % Geometry::kScaleTilesPerRow) * 4;
+            const int parent = nvfp4_a16_parent_row<Schedule>(block, local, rows, policy);
+            cp_async<4>(shared.raw_scales + local * Geometry::kGroupsPerRow + group,
+                        scales + nvfp4_scale_offset<Geometry>(parent, group));
         }
-        total = warp_reduce_sum(total);
-        if (lane == 0) {
-            const int parent_row = parent_rows[local_row];
-            output.store(parent_row, 0, epilogue.apply(parent_row, 0, total));
-        }
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
     }
 }
 
+template <class Schedule, class Output, class Epilogue, class Rows>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, float alpha, Output output, Epilogue epilogue,
+    Rows policy, int rows) {
+    using Geometry = Nvfp4Geometry<128, Schedule::kStaticK>;
+    static_assert(Schedule::kBlockRows % 4 == 0 && 128 % Schedule::kBlockRows == 0);
+    static_assert(!Rows::kPaired || Schedule::kRowsPerWarp % 2 == 0);
+    __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
+    const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
+    const int local0 = warp * Schedule::kRowsPerWarp;
+    int parent[Schedule::kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+        parent[r] = nvfp4_a16_parent_row<Schedule>(block, local0 + r, rows, policy);
+    float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
+                                           accumulators);
+    float totals[Schedule::kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < Schedule::kRowsPerWarp; ++r) {
+        float sum = 0;
+#pragma unroll
+        for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += accumulators[r][c];
+        totals[r] = warp_reduce_sum(sum);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < Schedule::kRowsPerWarp; r += Rows::kPaired ? 2 : 1) {
+            if constexpr (Rows::kPaired)
+                epilogue.apply_pair(output, parent[r], 0, totals[r], totals[r + 1]);
+            else {
+                const float value[1]{totals[r]};
+                linear_finish_row(output, epilogue, parent[r], 0, value, 1);
+            }
+        }
+    }
+}
 } // namespace ninfer::ops::detail

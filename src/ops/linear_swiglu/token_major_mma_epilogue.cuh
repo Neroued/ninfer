@@ -10,6 +10,7 @@ template <class Schedule>
 struct SwiGluTokenMajorMmaRows {
     static_assert(Schedule::kWarpRows % 16 == 0);
     static constexpr bool kPaired          = true;
+    static constexpr bool kWarpPaired      = true;
     static constexpr bool kContiguous      = false;
     static constexpr bool kContiguousPairs = true;
 
@@ -33,10 +34,23 @@ struct SwiGluTokenMajorMmaEpilogue {
         constexpr int rows           = S::kBlockRows / 2;
         constexpr int stride         = rows + 8;
         constexpr int gate_fragments = S::kMmaRows / 2;
-        const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+        constexpr int producers      = [] {
+            if constexpr (requires { S::kProducerThreads; })
+                return S::kProducerThreads;
+            else
+                return 0;
+        }();
+        constexpr int threads = S::kThreads - producers;
+        const int tid = static_cast<int>(threadIdx.x) - producers, warp = tid >> 5, lane = tid & 31;
+        const auto synchronize = [] {
+            if constexpr (producers)
+                asm volatile("bar.sync 1, %0;" ::"r"(threads) : "memory");
+            else
+                __syncthreads();
+        };
         const int wt = warp / S::kWarpsRows, wr = warp % S::kWarpsRows;
         auto* final_tile = reinterpret_cast<__nv_bfloat16*>(scratch);
-        __syncthreads();
+        synchronize();
 #pragma unroll
         for (int mt = 0; mt < S::kMmaTokens; ++mt) {
             const int token = wt * S::kWarpTokens + mt * 16 + (lane >> 2);
@@ -51,8 +65,8 @@ struct SwiGluTokenMajorMmaEpilogue {
                     __floats2bfloat162_rn(silu(gate[2]) * up[2], silu(gate[3]) * up[3]);
             }
         }
-        __syncthreads();
-        for (int item = tid; item < S::kBlockTokens * (rows / 8); item += S::kThreads) {
+        synchronize();
+        for (int item = tid; item < S::kBlockTokens * (rows / 8); item += threads) {
             const int token = item / (rows / 8), row = (item % (rows / 8)) * 8;
             if (Full || token_begin + token < token_end)
                 linear_store_bf16_vector(output, row_begin + row, token_begin + token,

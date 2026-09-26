@@ -114,17 +114,18 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& co
             const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query, Tensor& key,
             Tensor& value, Publish publish, cudaStream_t stream) {
     constexpr int kWarpsPerCta = 32;
-    constexpr int kTokenTile   = 8;
+    constexpr int kBlockTokens = 8;
     constexpr int kBlocks      = kGdnChannels / 32;
-    nvfp4_gdn_conv_post_kernel<kWarpsPerCta, kTokenTile><<<kBlocks, kWarpsPerCta * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projected.data),
-        static_cast<const __nv_bfloat16*>(conv_weight.data),
-        static_cast<const __nv_bfloat16*>(conv_states.data),
-        static_cast<const std::int32_t*>(initial_slot.data),
-        valid_columns.data == nullptr ? nullptr
-                                      : static_cast<const std::int32_t*>(valid_columns.data),
-        static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-        static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish);
+    nvfp4_gdn_conv_post_kernel<kWarpsPerCta, kBlockTokens>
+        <<<kBlocks, kWarpsPerCta * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projected.data),
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(conv_states.data),
+            static_cast<const std::int32_t*>(initial_slot.data),
+            valid_columns.data == nullptr ? nullptr
+                                          : static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish);
     CUDA_CHECK(cudaGetLastError());
 }
 

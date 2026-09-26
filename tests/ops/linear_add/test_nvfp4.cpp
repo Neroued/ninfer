@@ -89,10 +89,25 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    const std::int32_t first_a4 = k == 6144 ? 17 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},
+        Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{17, ops::LinearPolicy::A16Only},
+        Invocation{24, ops::LinearPolicy::A16Only},
+        Invocation{25, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{48, ops::LinearPolicy::A16Only},
+        Invocation{49, ops::LinearPolicy::A16Only},
+        Invocation{64, ops::LinearPolicy::A16Only},
+        Invocation{65, ops::LinearPolicy::A16Only},
+        Invocation{128, ops::LinearPolicy::A16Only},
+        Invocation{129, ops::LinearPolicy::A16Only},
+        Invocation{1024, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},

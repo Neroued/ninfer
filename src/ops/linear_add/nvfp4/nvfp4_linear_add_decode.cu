@@ -2,9 +2,9 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_gemv.cuh"
-#include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
+#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/common/epilogue.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -12,16 +12,11 @@ namespace {
 template <class Geometry>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     using Schedule =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    const float inverse   = 1.0F / weight.weight_scale_divisor;
-    auto* output          = static_cast<__nv_bfloat16*>(residual.data);
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse,
-        Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
-        Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
-    CUDA_CHECK(cudaGetLastError());
+        Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+        nvfp4_a16_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n},
+        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream);
 }
 
 } // namespace

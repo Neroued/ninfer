@@ -25,7 +25,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     const auto& shape = resolve_shape(n, k, policy);
     return allows_a4(policy) && shape.uses_a4(min_tokens, max_tokens)
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, k)
+               ? nvfp4_a4_workspace_capacity_bytes(max_tokens, k)
                : 0;
 }
 
@@ -39,7 +39,7 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     if (workspace == nullptr)
         throw std::invalid_argument("nvfp4 A4 linear requires caller workspace");
     auto scope         = workspace->scope();
-    const auto scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
+    const auto scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     shape.a4(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

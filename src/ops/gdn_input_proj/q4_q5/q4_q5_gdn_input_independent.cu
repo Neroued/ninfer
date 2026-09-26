@@ -1,3 +1,4 @@
+#include "ops/linear/q5/q5_instances.cuh"
 #include "ops/linear/q4/q4_instances.cuh"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -8,8 +9,8 @@
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 #include "ops/linear/q4/q4_simt_launch.cuh"
 #include "ops/linear/q4/q4_gemv_launch.cuh"
-#include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
-#include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#include "ops/linear/q5/q5_simt_launch.cuh"
+#include "ops/linear/q5/q5_gemv_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -19,10 +20,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kValueRows  = 6144;
-constexpr std::int32_t kZRows      = 6144;
-constexpr std::int32_t kValueZRows = kValueRows + kZRows;
-constexpr std::int32_t kHidden     = 5120;
+constexpr std::int32_t kValueRows = 6144;
+constexpr std::int32_t kHidden    = 5120;
 
 using Q4GdnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 using Q4GdnSimtR8T8Schedule = Q4A16SimtSchedule<8, 8, 1, 16, 2, Cache::ca, 1>;
@@ -117,36 +116,28 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     }
 }
 
+auto q5_projection_output(Tensor& first, Tensor& second) {
+    return LinearBf16SplitOutput2<kValueRows>{
+        {static_cast<__nv_bfloat16*>(first.data), std::int64_t(first.nb[1] / sizeof(__nv_bfloat16)),
+         0},
+        {static_cast<__nv_bfloat16*>(second.data),
+         std::int64_t(second.nb[1] / sizeof(__nv_bfloat16)), 0}};
+}
+
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
-    constexpr int kRowsPerBlock = 16;
-    constexpr int kThreads      = kRowsPerBlock * 32;
-    q5_rowsplit_gemv_kernel<kValueZRows, kHidden, kRowsPerBlock, 2, true, true, kValueRows>
-        <<<kValueZRows / kRowsPerBlock, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.qhigh),
-            static_cast<const std::uint8_t*>(weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data));
-    CUDA_CHECK(cudaGetLastError());
+    launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
+                                                           q5_projection_output(value, z),
+                                                           LinearIdentityEpilogue{}, stream);
 }
 
 template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                       cudaStream_t stream) {
-    constexpr int kThreads = 4 * 32;
-    const std::int32_t out_ld =
-        static_cast<std::int32_t>(static_cast<std::int64_t>(value.nb[1] / sizeof(__nv_bfloat16)));
-    const dim3 grid(static_cast<unsigned>(kValueZRows), 1u, 1u);
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden, true, kValueRows>
-        <<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                        static_cast<const std::uint8_t*>(weight.qdata),
-                                        static_cast<const std::uint8_t*>(weight.qhigh),
-                                        static_cast<const std::uint8_t*>(weight.scales),
-                                        static_cast<__nv_bfloat16*>(value.data),
-                                        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld,
-                                        kHidden, Cols, weight.padded_shape[1], 5);
-    CUDA_CHECK(cudaGetLastError());
+    using Schedule = Q5A16DirectSimtSchedule<1, Cols, 4, 4, 10, kHidden, true>;
+    launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight),
+                                        q5_projection_output(value, z), LinearIdentityEpilogue{},
+                                        stream);
 }
 
 void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
@@ -187,22 +178,9 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
 template <int kColsPerTile>
 void launch_q5_simt_cols(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                          cudaStream_t stream) {
-    constexpr int kRowsPerBlock = 8;
-    constexpr int kStages       = 2;
-    constexpr int kThreads      = kRowsPerBlock * 32;
-    const std::int32_t cols     = x.ne[1];
-    const std::int32_t out_ld =
-        static_cast<std::int32_t>(static_cast<std::int64_t>(value.nb[1] / sizeof(__nv_bfloat16)));
-    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, kRowsPerBlock)),
-                    static_cast<unsigned>(div_up(cols, kColsPerTile)), 1u);
-    q5_rowsplit_gemm_simt_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock, kStages, true,
-                                 kValueRows><<<grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.qhigh),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
-        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld, kHidden, cols,
-        weight.padded_shape[1], 5);
-    CUDA_CHECK(cudaGetLastError());
+    using Schedule = Q5A16SimtSchedule<8, kColsPerTile, 1, 16, 2, Cache::ca, 1>;
+    launch_q5_a16_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(value, z),
+                                 LinearIdentityEpilogue{}, stream);
 }
 
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
@@ -237,24 +215,12 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
 
 void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                    Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
-    using Q4Schedule         = Q4GdnSimtR8T4Schedule;
-    constexpr int kQ5Threads = 4 * 32;
-    const dim3 q5_grid(kValueZRows, 1u, 1u);
-    const std::int32_t q5_out_ld =
-        static_cast<std::int32_t>(static_cast<std::int64_t>(value.nb[1] / sizeof(__nv_bfloat16)));
-
-    // Q5 and Q4 publish disjoint row ranges. Q4 can execute while Q5 drains and joins Q5 only at
-    // exit, before the following convolution/snapshot kernel becomes runnable.
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, 5, kHidden, true, kValueRows,
-                                        Q5Split4StoreEpilogue, true, false>
-        <<<q5_grid, kQ5Threads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(value_z_weight.qdata),
-            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
-            static_cast<const std::uint8_t*>(value_z_weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            kValueZRows, q5_out_ld, kHidden, 4, value_z_weight.padded_shape[1], 5);
-    CUDA_CHECK(cudaGetLastError());
+    using Q4Schedule = Q4GdnSimtR8T4Schedule;
+    using Q5Schedule = Q5A16DirectSimtSchedule<1, 4, 4, 4, 10, kHidden, true>;
+    // Q5 and Q4 publish disjoint rows; Q4 joins the Q5 producer at kernel exit.
+    launch_q5_a16_direct_simt<Q5Schedule, true>(q5_linear_operands(x, value_z_weight),
+                                                q5_projection_output(value, z),
+                                                LinearIdentityEpilogue{}, stream);
     launch_q4_a16_simt<Q4Schedule, false, true, true>(
         q4_linear_operands(x, qk_weight),
         LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(qk.data),

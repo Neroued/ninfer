@@ -1,10 +1,12 @@
+#include "ops/linear/q5/q5_instances.cuh"
 #include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/q5/q5_rowsplit_gemm_mma.cuh"
+#include "ops/linear/q5/q5_mma_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -13,83 +15,105 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using MmaR64C16Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 16, 64, 16, 8, 2, 3, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
-using MmaR64C24Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 24, 64, 16, 8, 2, 2, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
-using MmaR64C32S3Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 32, 64, 16, 16, 3, 2, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
-using MmaR64C32S4Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 32, 64, 16, 16, 4, 2, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
-using MmaR64C128Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
 
-template <class Schedule, bool Full>
-void launch_kernel(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    const auto* xp              = static_cast<const __nv_bfloat16*>(x.data);
-    const auto* codes           = static_cast<const std::uint8_t*>(w.qdata);
-    const auto* high            = static_cast<const std::uint8_t*>(w.qhigh);
-    const auto* scales          = static_cast<const std::uint8_t*>(w.scales);
-    auto* out                   = static_cast<__nv_bfloat16*>(residual_out.data);
-    const std::int32_t rows     = residual_out.ne[0];
-    const std::int32_t k        = x.ne[0];
-    const std::int32_t cols     = x.ne[1];
-    const std::int32_t padded_k = w.padded_shape[1];
-    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kBlockRows)),
-                    static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)), 1u);
+// This Op keeps its vectorized collective finish and its BF16 projection
+// materialization. The contraction only lends scratch and fully reduced fragments.
+struct Q5LinearAddTileEpilogue {
+    template <class Schedule, bool Full>
+    __device__ __forceinline__ void
+    finish_tile(LinearBf16StridedOutput output, __nv_bfloat16* scratch,
+                const float (&acc)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
+                int token_begin, int rows, int token_end) const {
+        constexpr int R = Schedule::kBlockRows;
+        constexpr int T = Schedule::kBlockTokens;
+        static_assert(R <= Schedule::kBlockK && R % 8 == 0);
+        const int tid        = int(threadIdx.x);
+        const int warp       = tid >> 5;
+        const int lane       = tid & 31;
+        const int warp_row   = warp / Schedule::kWarpGridTokens;
+        const int warp_token = warp % Schedule::kWarpGridTokens;
+#pragma unroll
+        for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+            const int row = warp_row * Schedule::kWarpRows + mi * 16 + (lane >> 2);
+#pragma unroll
+            for (int ni = 0; ni < Schedule::kMmaTokens; ++ni) {
+                const int token = warp_token * Schedule::kWarpTokens + ni * 8 + 2 * (lane & 3);
+                scratch[token * R + row]           = __float2bfloat16_rn(acc[mi][ni][0]);
+                scratch[(token + 1) * R + row]     = __float2bfloat16_rn(acc[mi][ni][1]);
+                scratch[token * R + row + 8]       = __float2bfloat16_rn(acc[mi][ni][2]);
+                scratch[(token + 1) * R + row + 8] = __float2bfloat16_rn(acc[mi][ni][3]);
+            }
+        }
+        __syncthreads();
 
-    q5_rowsplit_gemm_mma_kernel<Schedule, Full, Q5MmaEpilogue::CtaCollectiveResidual>
-        <<<grid, Schedule::kThreads, 0, stream>>>(xp, codes, high, scales, out, out, rows, k, cols,
-                                                  padded_k);
-    CUDA_CHECK(cudaGetLastError());
-}
+        union alignas(16) Pack {
+            int4 raw;
+            Bf16x8Pack values;
+        };
+
+        for (int item = tid; item < T * (R / 8); item += Schedule::kThreads) {
+            const int local_token = item / (R / 8);
+            const int local_row   = (item % (R / 8)) * 8;
+            const int row         = row_begin + local_row;
+            const int token       = token_begin + local_token;
+            if (Full || (row < rows && token < token_end)) {
+                auto* dst =
+                    output.data + std::int64_t(token) * output.leading_dim + output.row_begin + row;
+                const auto* projected = scratch + local_token * R + local_row;
+                if (Full || row + 8 <= rows) {
+                    Pack value, residual;
+                    value.raw    = load_vec<int4>(projected);
+                    residual.raw = load_vec<int4>(dst);
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair)
+                        residual.values.pair[pair] =
+                            __floats2bfloat162_rn(__low2float(residual.values.pair[pair]) +
+                                                      __low2float(value.values.pair[pair]),
+                                                  __high2float(residual.values.pair[pair]) +
+                                                      __high2float(value.values.pair[pair]));
+                    store_vec(dst, residual.raw);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        if (row + i < rows)
+                            dst[i] = __float2bfloat16_rn(__bfloat162float(dst[i]) +
+                                                         __bfloat162float(projected[i]));
+                }
+            }
+        }
+    }
+};
 
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    const bool full = (w.n % 64) == 0 && (x.ne[1] % Schedule::kBlockCols) == 0 &&
-                      w.k == w.padded_shape[1] && (w.k % 64) == 0;
-    for_each_token_slice(x.ne[1], Schedule::kBlockCols,
-                         [&](std::int32_t offset, std::int32_t count) {
-                             const Tensor x_slice  = x.slice(1, offset, count);
-                             Tensor residual_slice = residual_out.slice(1, offset, count);
-                             if (full) {
-                                 launch_kernel<Schedule, true>(x_slice, w, residual_slice, stream);
-                             } else {
-                                 launch_kernel<Schedule, false>(x_slice, w, residual_slice, stream);
-                             }
-                         });
+    launch_q5_a16_mma<Schedule>(
+        q5_linear_operands(x, w),
+        LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(residual_out.data),
+                                std::int64_t(residual_out.nb[1] / sizeof(__nv_bfloat16)), 0},
+        Q5LinearAddTileEpilogue{}, stream);
 }
 
+template <class Schedule>
+void launch_pointwise(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+    auto* data        = static_cast<__nv_bfloat16*>(residual.data);
+    const auto stride = std::int64_t(residual.nb[1] / sizeof(__nv_bfloat16));
+    launch_q5_a16_mma<Schedule>(q5_linear_operands(x, w), LinearBf16StridedOutput{data, stride, 0},
+                                LinearResidualAddEpilogue{{data, stride, 0}}, stream);
+}
 } // namespace
 
-void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    launch_route<MmaR64C16Schedule>(x, w, residual_out, stream);
+void q5_linear_add_mma_r32_t32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                           cudaStream_t stream) {
+    launch_pointwise<q5_instances::MmaR32T32K128S2A2>(x, w, residual, stream);
 }
 
-void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    launch_route<MmaR64C24Schedule>(x, w, residual_out, stream);
-}
-
-void q5_linear_add_mma_r64_c32_s3_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                         cudaStream_t stream) {
-    launch_route<MmaR64C32S3Schedule>(x, w, residual_out, stream);
-}
-
-void q5_linear_add_mma_r64_c32_s4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                         cudaStream_t stream) {
-    launch_route<MmaR64C32S4Schedule>(x, w, residual_out, stream);
-}
-
-void q5_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+void q5_linear_add_mma_r32_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                        cudaStream_t stream) {
-    launch_route<MmaR64C128Schedule>(x, w, residual_out, stream);
+    launch_pointwise<q5_instances::MmaR32T128>(x, w, residual, stream);
 }
 
+void q5_linear_add_mma_r64_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                       cudaStream_t stream) {
+    launch_route<q5_instances::MmaR64T128>(x, w, residual, stream);
+}
 } // namespace ninfer::ops::detail

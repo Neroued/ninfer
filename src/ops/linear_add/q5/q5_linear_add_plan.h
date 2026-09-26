@@ -12,12 +12,18 @@ namespace ninfer::ops::detail {
 
 enum class Q5LinearAddScheduleId {
     Split2ExactResidual,
-    MmaResidualR64C16,
-    MmaResidualR64C24,
-    MmaResidualR64C32S3,
-    MmaResidualR64C32S4,
-    MmaResidualR64C128,
-    MmaResidualR64C128Tail,
+    SlicedR16T8W4S2,
+    SlicedR16T16W4S2,
+    SlicedR16T24W4S2,
+    SlicedR32T32W4S2,
+    SlicedR32T24W4S2Pairwise,
+    SlicedR32T32W4S1,
+    SlicedR32T32W2S2,
+    SlicedR32T64W2S1,
+    MmaResidualR32T32K128,
+    MmaResidualR32T128,
+    MmaResidualR64T128,
+    MmaResidualR64T128Tail,
 };
 
 struct Q5LinearAddProblem {

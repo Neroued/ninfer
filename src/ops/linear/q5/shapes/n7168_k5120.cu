@@ -1,18 +1,20 @@
 #include "ops/linear/q5/q5_shapes.h"
-#include "ops/linear/q5/q5_ksplit_launch.cuh"
 
 namespace ninfer::ops::detail {
-
 Q5Launch select_q5_n7168_k5120(std::int32_t tokens) {
-    if (tokens == 1) return launch_q5_split4_c1_k5120;
-    if (tokens <= 2) return launch_q5_ksplit<5120, 2, 4>;
-    if (tokens <= 3) return launch_q5_ksplit<5120, 3, 4>;
-    if (tokens <= 4) return launch_q5_ksplit<5120, 4, 4>;
-    if (tokens <= 5) return launch_q5_ksplit<5120, 5, 4>;
-    if (tokens <= 6) return launch_q5_ksplit<5120, 6, 4>;
-    if (tokens <= 11) return launch_q5_simt_r8_c4;
-    if (tokens <= 112) return launch_q5_mma_r64_c32_s3;
-    return launch_q5_mma_r64_c128;
+    // Selected with complete-Op cold CUDA Graph measurements on RTX 5090.
+    if (tokens <= 1) return launch_q5_a16_direct_r1_t1_w4_k5120;
+    if (tokens <= 2) return launch_q5_a16_direct_r1_t2_w4_k5120;
+    if (tokens <= 4) return launch_q5_a16_sliced_r16_t8_capacity4;
+    if (tokens <= 8) return launch_q5_a16_sliced_r16_t8_w4_s2;
+    if (tokens <= 16) return launch_q5_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 24) return launch_q5_a16_sliced_r16_t24_w4_s2;
+    if (tokens <= 32) return launch_q5_a16_sliced_r32_t16_w4_s2;
+    if (tokens <= 96) return launch_q5_a16_sliced_r32_t32_w4_s1;
+    if (tokens <= 128) return launch_q5_a16_mma_r32_t128;
+    if (tokens <= 192) return launch_q5_a16_sliced_r32_t64_w2_s1;
+    if (tokens <= 384) return launch_q5_a16_mma_r64_t128;
+    if (tokens <= 576) return launch_q5_a16_mma_r64_t96_k128_s1_a1;
+    return launch_q5_a16_mma_r64_t128;
 }
-
 } // namespace ninfer::ops::detail

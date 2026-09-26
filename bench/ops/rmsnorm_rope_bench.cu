@@ -1,5 +1,10 @@
-// Public-Op benchmark for variable-width DFlash2 pair and context-K RMSNorm+RoPE profiles.
+// Public-Op benchmark for the variable-width DFlash2 pair, context-K and text RMSNorm+RoPE
+// profiles. The text profile carries both routes: the three calls the model issues today, and the
+// fused Op that replaces them.
 #include "ninfer/ops/rmsnorm_rope.h"
+
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rope.h"
 
 #include "ninfer_bench_common.h"
 
@@ -22,7 +27,14 @@ constexpr int kHeadDim    = 128;
 constexpr int kQueryHeads = 32;
 constexpr int kKeyHeads   = 8;
 
-enum class Form : std::uint8_t { Pair, Single };
+// The text profile, as the Op's contract states it.
+constexpr int kTextHeadDim    = 256;
+constexpr int kTextRotaryDim  = 64;
+constexpr float kTextRopeBase = 1.0e7F;
+constexpr float kTextEps      = 1.0e-6F;
+
+enum class Form : std::uint8_t { Pair, Single, Text };
+enum class Route : std::uint8_t { Split, Fused };
 enum class Execution : std::uint8_t { Eager, Graph };
 
 struct Options {
@@ -34,12 +46,14 @@ struct Options {
     int warmup   = 20;
     int repeat   = 200;
     bool profile = false;
+    Route route  = Route::Fused;
 };
 
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_rmsnorm_rope_bench --form pair|single "
+                 "usage: ninfer_rmsnorm_rope_bench --form pair|single|text "
+                 "[--route split|fused] "
                  "[--widths W,...] [--batches B,...] [--tokens T,...] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile]\n",
                  message);
@@ -85,8 +99,18 @@ Options parse_options(int argc, char** argv) {
                 options.form = Form::Pair;
             else if (value == "single")
                 options.form = Form::Single;
+            else if (value == "text")
+                options.form = Form::Text;
             else
-                usage("--form expects pair or single");
+                usage("--form expects pair, single or text");
+        } else if (argument == "--route") {
+            const std::string_view value(next("--route requires a value"));
+            if (value == "split")
+                options.route = Route::Split;
+            else if (value == "fused")
+                options.route = Route::Fused;
+            else
+                usage("--route expects split or fused");
         } else if (argument == "--widths") {
             options.widths = parse_list(next("--widths requires a value"), 2, 16, "--widths");
         } else if (argument == "--batches") {
@@ -213,6 +237,58 @@ void run_single(const Options& options, int tokens, cudaStream_t stream) {
                 options.execution == Execution::Graph ? 32 : 1);
 }
 
+// The text profile of the two registered geometries. `split` is what every full-attention layer
+// issues today: normalize q, normalize k, rotate both. `fused` is the Op that replaces the three.
+void run_text(const Options& options, int query_heads, int key_heads, int tokens,
+              cudaStream_t stream) {
+    const auto positions_host = host_positions(tokens);
+    DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
+    positions.copy_from_host(positions_host.data(), positions.bytes);
+    const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
+    const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
+    DeviceBuffer q               = bench::make_bf16(q_elements);
+    DeviceBuffer k               = bench::make_bf16(k_elements);
+    DeviceBuffer qn              = bench::make_bf16(q_elements);
+    DeviceBuffer kn              = bench::make_bf16(k_elements);
+    DeviceBuffer q_weight        = bench::make_bf16(kTextHeadDim);
+    DeviceBuffer k_weight        = bench::make_bf16(kTextHeadDim);
+    Tensor t_positions(positions.p, DType::I32, {tokens});
+    Tensor t_q(q.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor t_k(k.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor t_qn(qn.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor t_kn(kn.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor t_q_weight(q_weight.p, DType::BF16, {kTextHeadDim});
+    Tensor t_k_weight(k_weight.p, DType::BF16, {kTextHeadDim});
+    const auto launch = [&](cudaStream_t launch_stream) {
+        if (options.route == Route::Fused) {
+            ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, t_qn, t_kn,
+                              launch_stream);
+            return;
+        }
+        ops::rmsnorm(t_q, t_q_weight, kTextEps, true, t_qn, launch_stream);
+        ops::rmsnorm(t_k, t_k_weight, kTextEps, true, t_kn, launch_stream);
+        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn, launch_stream);
+    };
+    if (options.profile) {
+        for (int index = 0; index < options.warmup; ++index) launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStart());
+        launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStop());
+        return;
+    }
+    // Read in, write out, for both operands.
+    const double bytes         = 2.0 * 2.0 * static_cast<double>(q_elements + k_elements);
+    const bench::Result timing = measure(options, launch, bytes, stream);
+    std::printf("form=text route=%s Q=%d K=%d T=%d execution=%s median=%.3f us min=%.3f us "
+                "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
+                options.route == Route::Fused ? "fused" : "split", query_heads, key_heads, tokens,
+                options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
+                timing.min_us, timing.p95_us, timing.gbs,
+                options.execution == Execution::Graph ? 32 : 1);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -228,8 +304,13 @@ int main(int argc, char** argv) {
         if (options.form == Form::Pair) {
             for (int width : options.widths)
                 for (int batch : options.batches) run_pair(options, width, batch, stream);
-        } else {
+        } else if (options.form == Form::Single) {
             for (int tokens : options.tokens) run_single(options, tokens, stream);
+        } else {
+            for (int tokens : options.tokens) {
+                run_text(options, 16, 2, tokens, stream);
+                run_text(options, 24, 4, tokens, stream);
+            }
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

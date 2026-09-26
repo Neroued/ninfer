@@ -2,8 +2,7 @@
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/bf16/bf16_config.h"
-#include "ops/linear/bf16/bf16_simt.cuh"
+#include "ops/linear/bf16/bf16_template_launch.cuh"
 
 #include <array>
 #include <cstddef>
@@ -15,45 +14,17 @@ namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-struct Bf16LinearAddSmallTOutput {
-    __nv_bfloat16* residual;
-    std::int32_t rows;
-
-    __device__ __forceinline__ void store(std::int32_t row, std::int32_t token,
-                                          float accumulator) const {
-        __nv_bfloat16* destination = residual + static_cast<std::int64_t>(token) * rows + row;
-        const float residual_value = __bfloat162float(*destination);
-        *destination               = __float2bfloat16_rn(accumulator + residual_value);
-    }
-};
-
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Geometry = Bf16Geometry<5120, 6144>;
+    static_assert(ActiveTokens >= 2 && ActiveTokens <= 4);
     using Schedule =
-        Bf16SimtSchedule<4, 1,
-                         (ActiveTokens == 4 || ActiveTokens == 6) ? 2 : (ActiveTokens <= 8 ? 4 : 2),
-                         (ActiveTokens == 3 || ActiveTokens == 8) ? 16 : 8, 1, 4,
-                         ActiveTokens <= 8 ? Bf16SimtActivationAccess::WarpPacked
-                                           : Bf16SimtActivationAccess::DirectStream,
-                         Bf16WeightCache::Default,
-                         (ActiveTokens <= 9 || ActiveTokens >= 17) ? Bf16PhaseOrder::Sequential
-                                                                   : Bf16PhaseOrder::RowSwizzled,
-                         1,
-                         ((ActiveTokens >= 2 && ActiveTokens <= 8) ||
-                          (ActiveTokens >= 10 && ActiveTokens <= 19) || ActiveTokens >= 27)
-                             ? 2
-                             : 1,
-                         1, 2>;
-    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
-
-    const Bf16LinearAddSmallTOutput output{static_cast<__nv_bfloat16*>(residual.data),
-                                           Geometry::kOutputRows};
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    bf16_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-        output);
-    CUDA_CHECK(cudaGetLastError());
+        Bf16A16SimtSchedule<4, 1, ActiveTokens == 4 ? 2 : 4, ActiveTokens == 3 ? 16 : 8, 1, 4,
+                            Bf16SimtActivationAccess::WarpPacked, Bf16WeightCache::Default,
+                            Bf16PhaseOrder::Sequential, 1, 2, 1, 2>;
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    launch_bf16_a16_simt<Bf16ScheduleInstance<Schedule, 6144, ActiveTokens, true>>(
+        bf16_a16_operands(x, weight), LinearBf16Output{data, weight.n},
+        LinearResidualAddEpilogue{{data, weight.n}}, stream);
 }
 
 template <std::size_t... Offsets>

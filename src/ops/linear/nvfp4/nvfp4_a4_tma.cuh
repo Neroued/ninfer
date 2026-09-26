@@ -116,7 +116,7 @@ struct Nvfp4A4TmaSharedStorage {
 // stock grid -- x over weight-row tiles, y over token tiles -- puts a different weight tile
 // in every CTA that runs at the same time, and the whole weight matrix is re-read from
 // memory once per token tile. Walking the token index fastest instead makes the CTAs that
-// share a weight tile run together, and the matrix is read once. bf16_gemm_mma_kernel
+// share a weight tile run together, and the matrix is read once. bf16_a16_mma_kernel
 // already makes this choice; Bf16MmaRaster::TokenFast is the default for every bf16
 // schedule in the tree.
 __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y) {

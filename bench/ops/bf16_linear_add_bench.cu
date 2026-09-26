@@ -338,10 +338,15 @@ int main(int argc, char** argv) {
                 const auto launch = [&](cudaStream_t launch_stream) {
                     launch_route(route, x, weight.weight, out, workspace, launch_stream);
                 };
+                const auto prepare = [&](cudaStream_t launch_stream) {
+                    CUDA_CHECK(cudaMemsetAsync(out.data, 0,
+                                               2ULL * static_cast<std::uint64_t>(kRows) * tokens,
+                                               launch_stream));
+                };
                 Result result =
                     make_result(route_name(route, tokens), tokens,
-                                bench::measure_cold_launch(launch, flush, stream, options.warmup,
-                                                           options.repeat),
+                                bench::measure_cold_launch_prepared(prepare, launch, flush, stream,
+                                                                    options.warmup, options.repeat),
                                 weight.model_weight_bytes());
                 print_result(result);
                 results.push_back(std::move(result));

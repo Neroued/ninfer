@@ -176,7 +176,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
 }
 
 int run_selector_linear() {
-    constexpr int n = 256, k = 5120, max_t = 1024;
+    constexpr int n = 256, k = 5120, max_t = 2048;
     DeviceWeight weight(make_patterned(n, k, 419U));
     const auto bits       = make_activation_bits(k, max_t);
     const auto activation = materialize(bits);
@@ -247,8 +247,11 @@ int run_selector_linear() {
         if (replay) input.copy_from_host(bits.data(), input.bytes);
     };
     for (int tokens = 1; tokens <= 120; ++tokens) run(tokens, false);
-    for (int tokens : {121, 127, 128, 129, 256, 1024}) run(tokens, false);
-    for (int tokens : {1, 7, 8, 15, 16, 63, 64, 65, 76, 77, 80, 81, 119, 120, 129, 1024})
+    for (int tokens : {121, 127, 128,  129,  159,  160,  161,  162,  256,  639,  640,
+                       641, 642, 1023, 1024, 1025, 1026, 1279, 1280, 1281, 1282, 2048})
+        run(tokens, false);
+    for (int tokens : {1,   7,   8,   15,  16,  63,  64,  65,   76,   77,   80,   81,
+                       119, 120, 129, 160, 161, 640, 641, 1024, 1025, 1280, 1281, 2048})
         run(tokens, true);
     failures += weight.verify_preserved("BF16 selector weight");
     return failures;
@@ -262,10 +265,11 @@ int run_bf16_linear() {
         for (int tokens = 1; tokens <= 33; ++tokens) {
             failures += run_bf16_linear_case(*weight, tokens);
         }
-        for (int tokens : {127, 128, 129, 1024, 1536}) {
+        for (int tokens :
+             {63, 64, 65, 66, 95, 96, 97, 98, 127, 128, 129, 130, 191, 192, 193, 194, 1024, 1536}) {
             failures += run_bf16_linear_case(*weight, tokens);
         }
-        for (int tokens : {3, 7, 13, 19, 23, 25, 29}) {
+        for (int tokens : {3, 7, 13, 19, 23, 25, 29, 33, 64, 65, 97, 129, 193}) {
             failures += run_bf16_linear_case(*weight, tokens, true);
         }
     }

@@ -248,14 +248,14 @@ int verify_direct_output_sampled(std::string_view label, const GuardedBf16Tensor
     return failures;
 }
 
-int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 5120;
-    constexpr std::int32_t kQRows       = 6144;
-    constexpr std::int32_t kKvRows      = 1024;
-    constexpr std::int32_t kParentRows  = 14336;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 317U + tokens);
-    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
-    DeviceBuffer device_activation                   = to_device(activation_bits);
+int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens, bool replay = false) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQRows      = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kParentRows = 14336;
+    std::vector<float> activation      = make_bf16_activation(kHidden, tokens, 317U + tokens);
+    std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation             = to_device(activation_bits);
 
     GuardedBf16Tensor query(kQRows, tokens);
     GuardedBf16Tensor gate(kQRows, tokens);
@@ -266,14 +266,36 @@ int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    DeviceContext context;
+    // The fixture poisons outputs on the default stream; order it before the nonblocking stream.
     cuda_synchronize();
+    const auto launch = [&] { ops::attn_input_proj(x, parent.view(), q, g, k, v, context.stream); };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    if (replay) {
+        definition.capture(context.stream, launch);
+        graph.instantiate(definition);
+        graph.launch(context.stream);
+        cuda_synchronize(context.stream);
+        for (auto& value : activation) value = -value;
+        activation_bits = bf16_bits(activation);
+        device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+        query.repaint(context.stream);
+        gate.repaint(context.stream);
+        key.repaint(context.stream);
+        value.repaint(context.stream);
+        graph.launch(context.stream);
+    } else {
+        launch();
+    }
+    cuda_synchronize(context.stream);
 
     constexpr std::int32_t kKeyBegin   = kQRows;
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
-    const std::string suffix           = " BF16 A16 T=" + std::to_string(tokens);
-    int failures                       = 0;
+    const std::string suffix =
+        " BF16 A16 T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
+    int failures = 0;
     if (tokens == 1) {
         const std::vector<double> expected = bf16_attention_oracle(parent.host, activation);
         failures += verify_direct_output(
@@ -315,9 +337,13 @@ int run_bf16_target() {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
-    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 22, 23, 32, 33, 128, 129, 1024}) {
+    for (const std::int32_t tokens :
+         {1,  2,  3,  4,  5,  6,  7,  8,  9,  10,  11,  12,  13,  15,  16,  17,  31,  32,  33,
+          34, 63, 64, 65, 66, 95, 96, 97, 98, 127, 128, 129, 130, 191, 192, 193, 194, 1024}) {
         failures += run_bf16_target_case(parent, tokens);
     }
+    for (const std::int32_t tokens : {4, 5, 16, 17, 32, 33, 64, 65, 96, 97, 128, 129, 192, 193})
+        failures += run_bf16_target_case(parent, tokens, true);
     return failures;
 }
 

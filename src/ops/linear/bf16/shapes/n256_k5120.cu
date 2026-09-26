@@ -1,39 +1,19 @@
+#include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
-#include "core/device.h"
-#include "ops/common/token_slices.h"
-#include "ops/linear/bf16/bf16_n256_k5120.cuh"
+#include "ops/linear/bf16/bf16_launch.cuh"
 
 namespace ninfer::ops::detail {
-namespace {
-template <class Schedule>
-void launch_chunk(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* out,
-                  std::int32_t tokens, cudaStream_t stream) {
-    constexpr int kRowTiles = 256 / Schedule::kOutputRowsPerCta;
-    const dim3 grid(kRowTiles, (tokens + Schedule::kTileTokens - 1) / Schedule::kTileTokens);
-    static const cudaError_t attr =
-        cudaFuncSetAttribute(bf16_n256_k5120_mma_kernel<Schedule>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-    CUDA_CHECK(attr);
-    bf16_n256_k5120_mma_kernel<Schedule>
-        <<<grid, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(x, weight, out, tokens);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <class Schedule>
-void launch_grid(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    for_each_token_slice(x.ne[1], Schedule::kTileTokens, [&](int offset, int count) {
-        launch_chunk<Schedule>(
-            static_cast<const __nv_bfloat16*>(x.data) + static_cast<std::int64_t>(offset) * 5120,
-            static_cast<const __nv_bfloat16*>(weight.qdata),
-            static_cast<__nv_bfloat16*>(out.data) + static_cast<std::int64_t>(offset) * 256, count,
-            stream);
-    });
-}
-} // namespace
-
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
-    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<16, 8>>;
-    return launch_grid<Bf16N256K5120MmaSchedule<8, 16>>;
+    if (tokens <= 76)
+        return launch_bf16_sliced_k_mma<
+            Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 16>, 5120>>;
+    if (tokens <= 160)
+        return launch_bf16_sliced_k_mma<
+            Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 8>, 5120>>;
+    if (tokens <= 640) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K256S3, 5120>>;
+    if (tokens <= 1024) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K128S3, 5120>>;
+    if (tokens <= 1280)
+        return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T32K64S3, 5120>>;
+    return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K128S2, 5120>>;
 }
-
 } // namespace ninfer::ops::detail

@@ -9,11 +9,10 @@
 
 namespace ninfer::ops::detail {
 
-// The Attention epilogue has its own measured crossover. The wider candidate domain remains
-// benchmark-callable so the production boundary is not conflated with template availability.
+// The Attention epilogue owns its measured crossover independently of pure Linear.
 inline constexpr std::int32_t kBf16AttnInputSmallTMinTokens   = 2;
-inline constexpr std::int32_t kBf16AttnInputSmallTMaxTokens   = 32;
-inline constexpr std::int32_t kBf16AttnInputSmallTDispatchEnd = 22;
+inline constexpr std::int32_t kBf16AttnInputSmallTMaxTokens   = 4;
+inline constexpr std::int32_t kBf16AttnInputSmallTDispatchEnd = 4;
 
 void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream);

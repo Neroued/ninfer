@@ -7,7 +7,7 @@
 // owns the semantic row/token mapping, allowing pure Linear and fused projection Ops to share the
 // same computation body without a packed intermediate.
 
-#include "ops/linear/bf16/bf16_gemv.cuh"
+#include "ops/linear/bf16/bf16_a16_gemv.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -56,13 +56,14 @@ struct Bf16SimtSharedStorage {
                   [kReductionWarps];
 };
 
-template <class Geometry, int ActiveTokens, class Schedule>
+template <int ActiveTokens, class Schedule>
 __device__ __forceinline__ void bf16_simt_accumulate_direct_phase(
     const __nv_bfloat16* __restrict__ x, int phase, int warp_in_row, int lane,
     const Bf16GemvPack<Schedule::kValuesPerLane> (&packed_weights)[Schedule::kRowsPerWarp],
     float (&accumulators)[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains],
-    int live_tokens = ActiveTokens) {
-    using Pack = Bf16GemvPack<Schedule::kValuesPerLane>;
+    int live_tokens, int input_rows) {
+    const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    using Pack  = Bf16GemvPack<Schedule::kValuesPerLane>;
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
         const auto weight_values = bf16_simt_decode_pack(packed_weights[local_row]);
@@ -73,10 +74,9 @@ __device__ __forceinline__ void bf16_simt_accumulate_direct_phase(
             for (int local_token = 0; local_token < Schedule::kTokenBatch; ++local_token) {
                 const int token = token0 + local_token;
                 if (token < ActiveTokens) {
-                    activation[local_token] = load_bf16_activation_phase<Geometry, Schedule>(
-                        x + static_cast<std::int64_t>(min(token, live_tokens - 1)) *
-                                Geometry::kInputRows,
-                        phase, warp_in_row, lane);
+                    activation[local_token] = load_bf16_activation_phase<Schedule>(
+                        x + static_cast<std::int64_t>(min(token, live_tokens - 1)) * K, phase,
+                        warp_in_row, lane);
                 }
             }
 #pragma unroll
@@ -91,19 +91,19 @@ __device__ __forceinline__ void bf16_simt_accumulate_direct_phase(
     }
 }
 
-template <class Geometry, int ActiveTokens, class Schedule>
+template <int ActiveTokens, class Schedule>
 __device__ __forceinline__ void bf16_simt_compute_rows(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, int row0,
     int warp_in_row, int lane,
     float (&accumulators)[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains],
-    int live_tokens = ActiveTokens) {
+    int live_tokens, int input_rows) {
+    const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
-    static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
-    constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
-    using Pack            = Bf16GemvPack<Schedule::kValuesPerLane>;
-    const int phase0      = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
-                                ? 0
-                                : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
+    const int kPhases             = K / kValuesPerPhase;
+    using Pack                    = Bf16GemvPack<Schedule::kValuesPerLane>;
+    const int phase0              = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
+                                        ? 0
+                                        : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
 
     if constexpr (Schedule::kActivationAccess == Bf16SimtActivationAccess::WarpPacked) {
 #pragma unroll Schedule::kPhaseUnroll
@@ -113,16 +113,15 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
             Pack activation[ActiveTokens];
 #pragma unroll
             for (int token = 0; token < ActiveTokens; ++token) {
-                activation[token] = load_bf16_activation_phase<Geometry, Schedule>(
-                    x + static_cast<std::int64_t>(min(token, live_tokens - 1)) *
-                            Geometry::kInputRows,
-                    phase, warp_in_row, lane);
+                activation[token] = load_bf16_activation_phase<Schedule>(
+                    x + static_cast<std::int64_t>(min(token, live_tokens - 1)) * K, phase,
+                    warp_in_row, lane);
             }
 
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                const Pack packed_weight = load_bf16_weight_phase<Geometry, Schedule>(
-                    weight, row0 + local_row, phase, warp_in_row, lane);
+                const Pack packed_weight = load_bf16_weight_phase<Schedule>(
+                    weight, row0 + local_row, phase, warp_in_row, lane, K);
                 const auto weight_values = bf16_simt_decode_pack(packed_weight);
 #pragma unroll
                 for (int token = 0; token < ActiveTokens; ++token) {
@@ -139,19 +138,19 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
             Pack packed_weights[Schedule::kRowsPerWarp];
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                packed_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
-                    weight, row0 + local_row, phase, warp_in_row, lane);
+                packed_weights[local_row] = load_bf16_weight_phase<Schedule>(
+                    weight, row0 + local_row, phase, warp_in_row, lane, K);
             }
-            bf16_simt_accumulate_direct_phase<Geometry, ActiveTokens, Schedule>(
-                x, phase, warp_in_row, lane, packed_weights, accumulators, live_tokens);
+            bf16_simt_accumulate_direct_phase<ActiveTokens, Schedule>(
+                x, phase, warp_in_row, lane, packed_weights, accumulators, live_tokens, K);
         }
     } else {
         int phase = phase0;
         Pack current_weights[Schedule::kRowsPerWarp];
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            current_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
-                weight, row0 + local_row, phase, warp_in_row, lane);
+            current_weights[local_row] = load_bf16_weight_phase<Schedule>(
+                weight, row0 + local_row, phase, warp_in_row, lane, K);
         }
 
 #pragma unroll Schedule::kPhaseUnroll
@@ -162,12 +161,12 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
             if (iteration + 1 < kPhases) {
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-                    next_weights[local_row] = load_bf16_weight_phase<Geometry, Schedule>(
-                        weight, row0 + local_row, next_phase, warp_in_row, lane);
+                    next_weights[local_row] = load_bf16_weight_phase<Schedule>(
+                        weight, row0 + local_row, next_phase, warp_in_row, lane, K);
                 }
             }
-            bf16_simt_accumulate_direct_phase<Geometry, ActiveTokens, Schedule>(
-                x, phase, warp_in_row, lane, current_weights, accumulators, live_tokens);
+            bf16_simt_accumulate_direct_phase<ActiveTokens, Schedule>(
+                x, phase, warp_in_row, lane, current_weights, accumulators, live_tokens, K);
             if (iteration + 1 < kPhases) {
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -179,75 +178,99 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
     }
 }
 
-template <class Geometry, int ActiveTokens, class Schedule, class OutputPolicy,
-          bool RuntimeColumns = false>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_simt_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-    OutputPolicy output, int columns = ActiveTokens) {
-    const int live_tokens = RuntimeColumns ? columns : ActiveTokens;
-    static_assert(ActiveTokens >= 2 && ActiveTokens <= 32);
-    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
-
+template <class Schedule, class Output, class Epilogue>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue, int input_rows, int tokens, int token_offset) {
+    constexpr int ActiveTokens = Schedule::kBlockTokens;
+    const int K                = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    // A whole-call specialization must not carry an unused token-grid offset through its
+    // unrolled load loop: that extends register lifetimes at the small-T occupancy boundary.
+    constexpr bool whole_call = Schedule::kTokenCapacity > 0;
+    const int token_begin =
+        whole_call ? 0 : token_offset + static_cast<int>(blockIdx.y) * ActiveTokens;
+    const int live_tokens = Schedule::kExactTokens
+                                ? ActiveTokens
+                                : (whole_call ? tokens : min(ActiveTokens, tokens - token_begin));
     __shared__ Bf16SimtSharedStorage<Schedule, ActiveTokens> shared;
-
-    const int lane        = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp        = static_cast<int>(threadIdx.x) / kWarpSize;
-    const int row_group   = warp / Schedule::kWarpsPerRow;
-    const int warp_in_row = warp % Schedule::kWarpsPerRow;
-    const int cta_row0    = static_cast<int>(blockIdx.x) * Schedule::kRowsPerCta;
-    const int row0        = cta_row0 + row_group * Schedule::kRowsPerWarp;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const int row_group    = warp / Schedule::kWarpsPerRow;
+    const int warp_in_row  = warp % Schedule::kWarpsPerRow;
+    const int cta_row0     = blockIdx.x * Schedule::kBlockRows;
+    const int row0         = cta_row0 + row_group * Schedule::kRowsPerWarp;
+    const auto destination = linear_output_tile<Schedule::kBlockRows>(output, cta_row0);
     float accumulators[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains] = {};
-
-    bf16_simt_compute_rows<Geometry, ActiveTokens, Schedule>(x, weight, row0, warp_in_row, lane,
-                                                             accumulators, live_tokens);
-
+    bf16_simt_compute_rows<ActiveTokens, Schedule>(x + static_cast<std::int64_t>(token_begin) * K,
+                                                   weight, row0, warp_in_row, lane, accumulators,
+                                                   live_tokens, K);
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+        float values[ActiveTokens];
 #pragma unroll
         for (int token = 0; token < ActiveTokens; ++token) {
             float total = 0.0F;
 #pragma unroll
-            for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+            for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain)
                 total += accumulators[local_row][token][chain];
-            }
             total = warp_reduce_sum(total);
             if constexpr (Schedule::kWarpsPerRow == 1) {
-                if (lane == 0 && token < live_tokens) {
-                    output.store(row0 + local_row, token, total);
+                if constexpr (requires {
+                                  epilogue.apply_row(destination, row0, token_begin, values,
+                                                     live_tokens);
+                              }) {
+                    values[token] = total;
+                } else if (lane == 0 && token < live_tokens) {
+                    const int row = row0 + local_row, column = token_begin + token;
+                    destination.store(row, column, epilogue.apply(row, column, total));
                 }
             } else if (lane == 0) {
                 shared.partials[row_group][local_row][token][warp_in_row] = total;
             }
         }
+        if constexpr (Schedule::kWarpsPerRow == 1) {
+            if constexpr (requires {
+                              epilogue.apply_row(destination, row0, token_begin, values,
+                                                 live_tokens);
+                          }) {
+                if (lane == 0)
+                    linear_finish_row(destination, epilogue, row0 + local_row, token_begin, values,
+                                      live_tokens);
+            }
+        }
     }
-
     if constexpr (Schedule::kWarpsPerRow > 1) {
         __syncthreads();
         if (warp_in_row == 0) {
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                float values[ActiveTokens];
 #pragma unroll
                 for (int token = 0; token < ActiveTokens; ++token) {
                     const float partial = lane < Schedule::kWarpsPerRow
                                               ? shared.partials[row_group][local_row][token][lane]
                                               : 0.0F;
                     const float total   = warp_reduce_sum(partial);
-                    if (lane == 0 && token < live_tokens) {
-                        output.store(row0 + local_row, token, total);
+                    if constexpr (requires {
+                                      epilogue.apply_row(destination, row0, token_begin, values,
+                                                         live_tokens);
+                                  }) {
+                        values[token] = total;
+                    } else if (lane == 0 && token < live_tokens) {
+                        const int row = row0 + local_row, column = token_begin + token;
+                        destination.store(row, column, epilogue.apply(row, column, total));
                     }
+                }
+                if constexpr (requires {
+                                  epilogue.apply_row(destination, row0, token_begin, values,
+                                                     live_tokens);
+                              }) {
+                    if (lane == 0)
+                        linear_finish_row(destination, epilogue, row0 + local_row, token_begin,
+                                          values, live_tokens);
                 }
             }
         }
     }
 }
-
-struct Bf16SimtContiguousOutput {
-    __nv_bfloat16* data;
-    std::int32_t rows;
-
-    __device__ __forceinline__ void store(std::int32_t row, std::int32_t token, float value) const {
-        data[static_cast<std::int64_t>(token) * rows + row] = __float2bfloat16_rn(value);
-    }
-};
-
 } // namespace ninfer::ops::detail

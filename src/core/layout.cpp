@@ -86,39 +86,23 @@ std::size_t LayoutBuilder::finish(std::size_t alignment, std::string_view label)
     return align_up(peak_, alignment, label);
 }
 
-WorkspaceLayoutBuilder::Scope::Scope(WorkspaceLayoutBuilder& builder) noexcept
-    : builder_(&builder), saved_cursor_(builder.cursor_) {}
-
-WorkspaceLayoutBuilder::Scope::~Scope() noexcept {
-    if (builder_ != nullptr) { builder_->cursor_ = saved_cursor_; }
-}
-
-WorkspaceLayoutBuilder::Scope::Scope(Scope&& other) noexcept
-    : builder_(other.builder_), saved_cursor_(other.saved_cursor_) {
-    other.builder_ = nullptr;
-}
-
 Tensor WorkspaceLayoutBuilder::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                      std::size_t alignment) {
     Tensor tensor(nullptr, dtype, shape);
-    cursor_ = align_up(cursor_, alignment, "workspace layout");
-    cursor_ = checked_add(cursor_, tensor.bytes(), "workspace layout");
-    if (cursor_ > peak_) { peak_ = cursor_; }
+    (void)layout_.add(tensor.bytes(), alignment, "workspace layout");
     return tensor;
 }
 
 DeviceSpan WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) { return {}; }
-    cursor_ = align_up(cursor_, alignment, "workspace layout");
-    cursor_ = checked_add(cursor_, bytes, "workspace layout");
-    if (cursor_ > peak_) { peak_ = cursor_; }
+    (void)layout_.add(bytes, alignment, "workspace layout");
     return DeviceSpan{nullptr, bytes};
 }
 
-WorkspaceLayoutBuilder::Scope WorkspaceLayoutBuilder::scope() noexcept { return Scope(*this); }
+WorkspaceLayoutBuilder::Scope WorkspaceLayoutBuilder::scope() noexcept { return layout_.scope(); }
 
 std::size_t WorkspaceLayoutBuilder::peak_bytes(std::size_t alignment) const {
-    return align_up(peak_, alignment, "workspace layout");
+    return layout_.finish(alignment, "workspace layout");
 }
 
 } // namespace ninfer

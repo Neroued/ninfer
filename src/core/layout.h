@@ -62,23 +62,10 @@ private:
 
 // Dry-run counterpart of WorkspaceArena. Target allocation helpers can run against this builder
 // and the real arena, including identical nested scope lifetimes, without maintaining byte
-// formulas.
+// formulas. Cursor, alignment checks, and peak accounting delegate to the LayoutBuilder member.
 class WorkspaceLayoutBuilder {
 public:
-    class Scope {
-    public:
-        ~Scope() noexcept;
-        Scope(const Scope&)            = delete;
-        Scope& operator=(const Scope&) = delete;
-        Scope(Scope&& other) noexcept;
-        Scope& operator=(Scope&&) = delete;
-
-    private:
-        friend class WorkspaceLayoutBuilder;
-        explicit Scope(WorkspaceLayoutBuilder& builder) noexcept;
-        WorkspaceLayoutBuilder* builder_ = nullptr;
-        std::size_t saved_cursor_        = 0;
-    };
+    using Scope = LayoutBuilder::Scope;
 
     [[nodiscard]] Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                std::size_t alignment = 256);
@@ -87,8 +74,7 @@ public:
     [[nodiscard]] std::size_t peak_bytes(std::size_t alignment = 256) const;
 
 private:
-    std::size_t cursor_ = 0;
-    std::size_t peak_   = 0;
+    LayoutBuilder layout_;
 };
 
 } // namespace ninfer

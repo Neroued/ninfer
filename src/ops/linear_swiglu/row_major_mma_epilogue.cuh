@@ -1,10 +1,11 @@
 #pragma once
 #include "ops/common/math.cuh"
-#include "ops/linear/q8/q8_a16_mma.cuh"
+#include "ops/linear/common/output.cuh"
 
 namespace ninfer::ops::detail {
 template <class Schedule>
-struct Q8SwiGluMmaRows {
+struct SwiGluRowMajorMmaRows {
+    static constexpr bool kPaired          = true;
     static constexpr int kOutputRowsPerCta = Schedule::kBlockRows / 2;
 
     __device__ __forceinline__ int weight_row(int row0, int local_row, int rows) const {
@@ -13,7 +14,7 @@ struct Q8SwiGluMmaRows {
     }
 };
 
-struct Q8SwiGluMmaEpilogue {
+struct SwiGluRowMajorMmaEpilogue {
     template <class Schedule>
     static constexpr int kSharedBytes = Schedule::kBlockRows * Schedule::kBlockTokens * 2;
 
@@ -21,13 +22,14 @@ struct Q8SwiGluMmaEpilogue {
     __device__ __forceinline__ void finish_tile(Output output_tile, unsigned char* scratch,
                                                 float (&acc)[Cfg::kMmaRows][Cfg::kMmaTokens][4],
                                                 int m0, int n0, int m, int n) const {
-        constexpr int BM = Cfg::kBlockRows, BN = Cfg::kBlockTokens;
+        constexpr int BN = Cfg::kBlockTokens;
         constexpr int WN = Cfg::kWarpTokens;
         constexpr int MT = Cfg::kMmaRows, NT = Cfg::kMmaTokens;
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-        const int wm = warp / Cfg::kWarpGridTokens, wn = warp % Cfg::kWarpGridTokens;
+        const int wm  = warp / (Cfg::kBlockTokens / Cfg::kWarpTokens),
+                  wn  = warp % (Cfg::kBlockTokens / Cfg::kWarpTokens);
         const int gid = lane >> 2, lid = lane & 3;
-        if constexpr (Cfg::kWarpGridRows == 1) {
+        if constexpr ((Cfg::kBlockRows / Cfg::kWarpRows) == 1) {
             static_assert((MT % 2) == 0);
             constexpr int kGateMt = MT / 2;
 #pragma unroll
@@ -62,7 +64,7 @@ struct Q8SwiGluMmaEpilogue {
                 }
             }
         } else {
-            static_assert(Cfg::kWarpGridRows == 2);
+            static_assert((Cfg::kBlockRows / Cfg::kWarpRows) == 2);
             auto* up_shared = reinterpret_cast<float*>(scratch);
             __syncthreads();
             if (wm == 1) {

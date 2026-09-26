@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/memory.cuh"
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -18,6 +19,10 @@ struct LinearBf16Output {
 
     __device__ __forceinline__ void store(int row, int token, float value) const {
         *at(row, token) = __float2bfloat16_rn(value);
+    }
+
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
+        store_vec(at(row, token), values);
     }
 };
 
@@ -67,6 +72,10 @@ struct LinearBf16SegmentOutput {
         data[static_cast<std::int64_t>(token) * rows + row - parent_row_begin] =
             __float2bfloat16_rn(value);
     }
+
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
+        store_vec(data + static_cast<std::int64_t>(token) * rows + row - parent_row_begin, values);
+    }
 };
 
 template <int... SegmentRows>
@@ -90,6 +99,19 @@ struct LinearBf16SegmentedOutput {
 
     __device__ __forceinline__ void store(int row, int token, float value) const {
         segment(row).store(row, token, value);
+    }
+
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
+        if constexpr (((SegmentRows % 8 == 0) && ...)) {
+            segment(row).store_vector(row, token, values);
+        } else {
+            const unsigned words[]{values.x, values.y, values.z, values.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                store(row + i, token,
+                      __bfloat162float(__ushort_as_bfloat16(
+                          static_cast<unsigned short>(words[i / 2] >> ((i & 1) * 16)))));
+        }
     }
 
     template <int TileRows>

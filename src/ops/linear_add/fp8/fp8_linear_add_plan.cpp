@@ -2,7 +2,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
-#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_geometry.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -30,21 +30,9 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1];
-         token_begin += kFp8LinearAddChunkTokens) {
-        const std::int32_t active = std::min(kFp8LinearAddChunkTokens, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* output = static_cast<std::uint8_t*>(residual.data) +
-                       static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor residual_chunk(output, DType::BF16, {weight.n, active});
-        if (active == 1) {
-            fp8_linear_add_decode_launch(input_chunk, weight, residual_chunk, stream);
-        } else {
-            fp8_linear_add_small_t_launch(input_chunk, weight, residual_chunk, stream);
-        }
-    }
+    if (x.ne[1] == 1) return fp8_linear_add_decode_launch(x, weight, residual, stream);
+    if (x.ne[1] <= 4) return fp8_linear_add_small_t_launch(x, weight, residual, stream);
+    fp8_linear_add_matrix_launch(x, weight, residual, stream);
 }
 
 } // namespace

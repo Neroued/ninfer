@@ -1,4 +1,4 @@
-#include "ops/linear_swiglu/q8/q8_swiglu_mma_epilogue.cuh"
+#include "ops/linear_swiglu/row_major_mma_epilogue.cuh"
 #include "core/weight.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
@@ -11,10 +11,10 @@ namespace {
 
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_q8_a16_mma<Schedule, Q8SwiGluMmaRows<Schedule>>(
+    launch_q8_a16_mma<Schedule, SwiGluRowMajorMmaRows<Schedule>>(
         q8_linear_operands(x, w),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]}, Q8SwiGluMmaEpilogue{},
-        stream);
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        SwiGluRowMajorMmaEpilogue{}, stream);
 }
 
 } // namespace

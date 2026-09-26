@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/memory.cuh"
+#include "ops/linear/common/output.cuh"
 
 #include <cuda_bf16.h>
 
@@ -20,38 +20,6 @@ static_assert((kFp8AttnInputQueryRows % 8) == 0);
 static_assert((kFp8AttnInputKeyRows % 8) == 0);
 static_assert((kFp8AttnInputGateRows % 8) == 0);
 
-struct Fp8AttentionInputOutput {
-    __nv_bfloat16* query;
-    __nv_bfloat16* key;
-    __nv_bfloat16* gate;
-    __nv_bfloat16* value;
-
-    __device__ __forceinline__ __nv_bfloat16* destination(std::int32_t parent_row,
-                                                          std::int32_t token) const {
-        if (parent_row < kFp8AttnInputKeyBegin) {
-            return query + static_cast<std::int64_t>(token) * kFp8AttnInputQueryRows + parent_row;
-        }
-        if (parent_row < kFp8AttnInputGateBegin) {
-            return key + static_cast<std::int64_t>(token) * kFp8AttnInputKeyRows + parent_row -
-                   kFp8AttnInputKeyBegin;
-        }
-        if (parent_row < kFp8AttnInputValueBegin) {
-            return gate + static_cast<std::int64_t>(token) * kFp8AttnInputGateRows + parent_row -
-                   kFp8AttnInputGateBegin;
-        }
-        return value + static_cast<std::int64_t>(token) * kFp8AttnInputKeyRows + parent_row -
-               kFp8AttnInputValueBegin;
-    }
-
-    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
-                                          float result) const {
-        *destination(parent_row, token) = __float2bfloat16_rn(result);
-    }
-
-    __device__ __forceinline__ void store_vector(std::int32_t parent_row, std::int32_t token,
-                                                 uint4 values) const {
-        store_vec(destination(parent_row, token), values);
-    }
-};
+using Fp8AttentionInputOutput = LinearBf16SegmentedOutput<6144, 1024, 6144, 1024>;
 
 } // namespace ninfer::ops::detail

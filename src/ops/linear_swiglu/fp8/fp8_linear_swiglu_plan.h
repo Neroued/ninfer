@@ -20,6 +20,7 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
                                      cudaStream_t stream);
 void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                       cudaStream_t stream);
+void fp8_linear_swiglu_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream);
 

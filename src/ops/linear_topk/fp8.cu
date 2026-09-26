@@ -5,7 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
-#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 
 #include <array>
@@ -25,19 +25,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
     constexpr int kHidden    = Fp8N248320K5120::kInputRows;
     constexpr int kTileK     = Schedule::kTileKPerWarp;
     constexpr int kWarps     = Schedule::kKWarps;
-    constexpr int kRows      = Schedule::kRowsPerCta;
-    constexpr int kGroupK    = Schedule::kGroupK;
-    constexpr int kGroups    = kHidden / kGroupK;
-    constexpr int kTileCols  = Schedule::kTileTokens;
+    constexpr int kRows      = Schedule::kBlockRows;
+    constexpr int kBlockK    = Schedule::kBlockK;
+    constexpr int kGroups    = kHidden / kBlockK;
+    constexpr int kTileCols  = Schedule::kBlockTokens;
     constexpr int kTokenMmas = kTileCols / 8;
     constexpr int kRowTiles  = kLinearTopKGroupedRows / kRows;
     static_assert(kRows == 16 && kLinearTopKGroupedRows == 128);
-    static_assert((kHidden % kGroupK) == 0);
+    static_assert((kHidden % kBlockK) == 0);
     static_assert(Capacity <= kTileCols);
 
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRows][kGroupK];
+            std::uint8_t codes[kRows][kBlockK];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
         } staging;
 
@@ -83,7 +83,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
             for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
                 const int local_row = warp * Schedule::kRowsPerLoaderWarp + row_item;
                 const int row       = row_begin + local_row;
-                for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
+                for (int chunk = lane; chunk < kBlockK / 16; chunk += 32) {
                     const int swizzled_chunk = chunk ^ (local_row & 7);
                     cp_async<16, Cache::cg>(&code_shared[local_row][swizzled_chunk * 16],
                                             weight_codes +
@@ -133,7 +133,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
 
             if (group_index + 1 < kGroups) {
                 __syncthreads();
-                const int next_k0 = (group_index + 1) * kGroupK;
+                const int next_k0 = (group_index + 1) * kBlockK;
                 stage_codes(next_k0);
                 stage_activation(next_k0);
                 cp_commit();
@@ -223,7 +223,7 @@ using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const Linear
 template <int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Schedule = Fp8A16KSplitSchedule<8, Capacity, 2>;
+    using Schedule = Fp8A16SlicedKMmaSchedule<8, Capacity, 2>;
     fp8_grouped_ksplit_topk_kernel<Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),

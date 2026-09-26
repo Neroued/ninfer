@@ -1,11 +1,11 @@
+#include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/fp8/fp8_config.h"
-#include "ops/linear/fp8/fp8_gemv.cuh"
-#include "ops/linear/fp8/fp8_output.cuh"
-#include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
+#include "ops/linear/fp8/fp8_schedule.cuh"
+#include "ops/linear/fp8/fp8_a16_gemv.cuh"
+#include "ops/linear/common/epilogue.cuh"
 
 #include <cuda_bf16.h>
 
@@ -16,17 +16,12 @@ namespace {
 
 template <class Geometry>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    auto* output          = static_cast<__nv_bfloat16*>(residual.data);
-    const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
-    const Fp8GemvIdentityRows rows{};
-    const Fp8AddResidualEpilogue epilogue{output, Geometry::kOutputRows};
-    fp8_gemv_kernel<Geometry, Schedule, Fp8ContiguousOutput, Fp8GemvIdentityRows, false,
-                    Fp8AddResidualEpilogue><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const __nv_bfloat16*>(weight.scales), destination, rows, epilogue);
-    CUDA_CHECK(cudaGetLastError());
+    using Schedule = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+    auto* output   = static_cast<__nv_bfloat16*>(residual.data);
+    const LinearBf16Output destination{output, Geometry::kOutputRows};
+    const LinearResidualAddEpilogue epilogue{{output, Geometry::kOutputRows}};
+    launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+        fp8_a16_operands(x, weight), destination, epilogue, stream);
 }
 
 } // namespace

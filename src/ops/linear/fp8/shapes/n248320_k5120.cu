@@ -1,26 +1,23 @@
+#include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/fp8/fp8_a16_ksplit_mma.cuh"
-#include "ops/linear/fp8/fp8_a16_gemm_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_mma.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
 template <int ActiveTokens>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Fp8N248320K5120;
-    using Schedule = Fp8A16KSplitSchedule<(ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4)),
-                                          ActiveTokens, ActiveTokens <= 8 ? 1 : 2>;
-    static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    fp8_a16_ksplit_mma_kernel<Geometry, ActiveTokens, Schedule, Fp8ContiguousOutput, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales), output, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    using Schedule =
+        Fp8A16SlicedKMmaSchedule<(ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4)),
+                                 ActiveTokens, ActiveTokens <= 8 ? 1 : 2>;
+    static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
+        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -37,39 +34,16 @@ void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
 // Measured schedules for [248320,5120]. The 128-token
 // schedule is the large-T computation core. The 64- and 96-token schedules avoid executing a
 // mostly empty final token tile; dispatch emits at most one such tail launch.
-using Main128 = Fp8A16GemmSchedule<64, 128, 64, 64, 16, 2, 2>;
-using Tail64  = Fp8A16GemmSchedule<128, 64, 64, 64, 16, 2, 2>;
-using Tail96  = Fp8A16GemmSchedule<64, 96, 64, 64, 16, 2, 2>;
-
-template <class Schedule, bool FullTokens>
-void launch_slice(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = Fp8N248320K5120;
-    static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
-    static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
-    constexpr int row_tiles = Geometry::kOutputRows / Schedule::kBlockRows;
-    const int token_tiles   = div_up(x.ne[1], Schedule::kBlockTokens);
-    const dim3 grid(static_cast<unsigned>(row_tiles), static_cast<unsigned>(token_tiles), 1U);
-    const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    fp8_a16_gemm_mma_kernel<Geometry, Schedule, FullTokens>
-        <<<grid, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales), output, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
-}
+using Main128 = Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
+using Tail64  = Fp8A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>;
+using Tail96  = Fp8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>;
 
 template <class Schedule>
 void launch_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    for_each_token_slice(x.ne[1], Schedule::kBlockTokens,
-                         [&](std::int32_t offset, std::int32_t count) {
-                             const Tensor input = x.slice(1, offset, count);
-                             Tensor output      = out.slice(1, offset, count);
-                             if ((count % Schedule::kBlockTokens) == 0) {
-                                 launch_slice<Schedule, true>(input, weight, output, stream);
-                             } else {
-                                 launch_slice<Schedule, false>(input, weight, output, stream);
-                             }
-                         });
+    launch_fp8_a16_mma<Fp8ScheduleInstance<Schedule, 5120>>(
+        fp8_a16_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, LinearIdentityEpilogue{},
+        stream);
 }
 
 void launch_tail(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

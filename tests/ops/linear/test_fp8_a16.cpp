@@ -16,9 +16,12 @@ using namespace ninfer::test::linear;
 std::vector<Invocation> a16_capacity_calls() {
     std::vector<Invocation> calls;
     for (int t = 1; t <= 33; ++t) calls.push_back({t});
+    for (int t : {63, 64, 65, 95, 96, 97, 127, 128, 129, 512, 1024}) calls.push_back({t});
     for (int t : {3, 7, 11, 15, 19, 23, 25, 33})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     calls.push_back({1, CallForm::A16Convenience});
+    for (int t : {64, 97, 129})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     return calls;
 }
 

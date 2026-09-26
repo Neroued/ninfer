@@ -8,7 +8,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_decode.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_small_t.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_add.cu"

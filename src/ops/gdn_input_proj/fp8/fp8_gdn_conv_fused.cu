@@ -1,11 +1,12 @@
+#include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
-#include "ops/linear/fp8/fp8_config.h"
-#include "ops/linear/fp8/fp8_gemv.cuh"
-#include "ops/linear/fp8/fp8_simt.cuh"
+#include "ops/linear/fp8/fp8_schedule.cuh"
+#include "ops/linear/fp8/fp8_a16_gemv.cuh"
+#include "ops/linear/fp8/fp8_a16_simt.cuh"
 
 #include <array>
 #include <cstddef>
@@ -14,6 +15,17 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+template <int Tokens, class Publish>
+struct Fp8GdnConvEpilogue {
+    [[maybe_unused]] static constexpr int kRowTokens = Tokens;
+
+    template <class Output>
+    __device__ __forceinline__ void apply_row(const Output& output, int row, int,
+                                              const float (&values)[Tokens], int) const {
+        output.store_row(row, values);
+    }
+};
 
 using Geometry = Fp8N16384K5120;
 
@@ -30,22 +42,17 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
                     const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
                     Tensor& z, Publish publish, cudaStream_t stream) {
     using Schedule =
-        Fp8SimtSchedule<8, 2, (ActiveTokens >= 5 && ActiveTokens <= 6) ? 8 : 16, ActiveTokens, 1,
-                        ActiveTokens <= 4 ? Fp8SimtActivationAccess::SharedPhase
-                                          : Fp8SimtActivationAccess::TokenPacked,
-                        Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
-    static_assert(Schedule::kTokenTile == ActiveTokens);
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    using Output          = GdnConvOutput<ActiveTokens, Publish>;
-    fp8_simt_kernel<Geometry, ActiveTokens, Schedule, Output, Fp8IdentityEpilogue,
-                    Fp8GemvIdentityRows, false, Fp8SimtFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales),
-            make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,
-                                               initial_slot, query, key, value, z, publish));
-    CUDA_CHECK(cudaGetLastError());
+        Fp8A16SimtSchedule<8, 2, (ActiveTokens >= 5 && ActiveTokens <= 6) ? 8 : 16, ActiveTokens, 1,
+                           ActiveTokens <= 4 ? Fp8SimtActivationAccess::SharedPhase
+                                             : Fp8SimtActivationAccess::TokenPacked,
+                           Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
+    static_assert(Schedule::kBlockTokens == ActiveTokens);
+    using Output = GdnConvOutput<ActiveTokens, Publish>;
+    launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
+        fp8_a16_operands(x, weight),
+        make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
+                                           query, key, value, z, publish),
+        Fp8GdnConvEpilogue<ActiveTokens, Publish>{}, stream);
 }
 
 template <int ActiveTokens>
@@ -79,17 +86,15 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
                             const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                             cudaStream_t stream) {
-    using Schedule        = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    fp8_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const __nv_bfloat16*>(weight.scales),
+    using Schedule = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+    launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+        fp8_a16_operands(x, weight),
         make_gdn_conv_output<1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                    static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kGdnChannels}));
-    CUDA_CHECK(cudaGetLastError());
+                                   kGdnChannels}),
+        Fp8GdnConvEpilogue<1, SnapshotHistoryPublish>{}, stream);
 }
 
 template <std::size_t... Offsets>

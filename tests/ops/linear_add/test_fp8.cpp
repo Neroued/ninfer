@@ -111,6 +111,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     for (int columns = 2; columns <= 24; ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
+    for (int columns : {31, 32, 33, 63, 64, 65, 127, 128, 129, 1024})
+        invocations.push_back({columns, ops::LinearPolicy::A16Only});
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);

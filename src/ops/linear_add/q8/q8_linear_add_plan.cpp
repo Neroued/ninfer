@@ -116,11 +116,6 @@ std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
 
 std::int32_t schedule_cols(Q8LinearAddScheduleId schedule);
 
-bool use_full(Q8LinearAddScheduleId schedule, const Q8LinearAddProblem& problem) {
-    return problem.rows % schedule_rows(schedule) == 0 &&
-           problem.cols % schedule_cols(schedule) == 0;
-}
-
 std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
     switch (schedule) {
     case Q8LinearAddScheduleId::DecodeR16:
@@ -254,7 +249,6 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
         q8_linear_add_medium_splitk_launch(x, w, residual_out, stream);
         return;
     }
-    const bool full = use_full(plan.schedule, problem);
     for_each_token_slice(
         x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
             const Tensor x_slice  = x.slice(1, offset, count);
@@ -264,46 +258,46 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             case Q8LinearAddScheduleId::MediumSplitK:
                 break;
             case Q8LinearAddScheduleId::SimtR8C4:
-                q8_linear_add_simt_r8_c4_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_simt_r8_c4_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR32C64:
-                q8_linear_add_mma_r32_c64_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r32_c64_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR32C80:
-                q8_linear_add_mma_r32_c80_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r32_c80_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR32C96:
-                q8_linear_add_mma_r32_c96_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r32_c96_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR32C128:
-                q8_linear_add_mma_r32_c128_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r32_c128_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR48C64:
-                q8_linear_add_mma_r48_c64_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r48_c64_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR48C96:
-                q8_linear_add_mma_r48_c96_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r48_c96_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR48C112:
-                q8_linear_add_mma_r48_c112_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r48_c112_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR48C128:
-                q8_linear_add_mma_r48_c128_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r48_c128_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR64C96:
-                q8_linear_add_mma_r64_c96_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r64_c96_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR64C112:
-                q8_linear_add_mma_r64_c112_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r64_c112_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR64C128:
-                q8_linear_add_mma_r64_c128_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r64_c128_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR128C64:
-                q8_linear_add_mma_r128_c64_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r128_c64_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::MmaR128C80:
-                q8_linear_add_mma_r128_c80_launch(full, x_slice, w, residual_slice, stream);
+                q8_linear_add_mma_r128_c80_launch(x_slice, w, residual_slice, stream);
                 return;
             case Q8LinearAddScheduleId::GroupedSplitK:
             case Q8LinearAddScheduleId::SplitKMmaCapacity:

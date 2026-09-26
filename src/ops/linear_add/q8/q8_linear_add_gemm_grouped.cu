@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
+#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -12,12 +12,11 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t str
     constexpr int kColumns     = 128;
     constexpr int kSplits      = 2;
     constexpr int kTokenGroups = 4;
-    const dim3 grid(5120 / 16, div_up(x.ne[1], kColumns));
-    const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual.data), 5120};
-    q8_ksplit_grouped_mma_kernel<K, kColumns, kSplits, kTokenGroups, 1, Q8ContiguousOutput, true,
-                                 true><<<grid, kSplits * kTokenGroups * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(residual.data), 5120};
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        kColumns, kSplits, kTokenGroups, 1, 1, K, Cache::cg, Cache::cg, true>>(
+        q8_linear_operands(x, w), output, LinearResidualAddEpilogue{{output.data, output.rows, 0}},
+        stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

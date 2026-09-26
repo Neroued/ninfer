@@ -3,26 +3,24 @@
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
-#include "ops/linear/q8/q8_k2048_decode.cuh"
+#include "ops/linear/q8/q8_gemv_launch.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
 
-using Output = Q8SplitOutput2<8192, 4096>;
+using Output = LinearBf16SegmentedOutput<8192, 4096>;
 
 struct Q8GdnDecodeConvEpilogue {
     GdnConvEpilogue<SnapshotHistoryPublish> conv;
     __nv_bfloat16* z;
 
-    template <class IgnoredOutput>
-    __device__ __forceinline__ void operator()(const IgnoredOutput&, std::int32_t, std::int32_t row,
-                                               float accumulator) const {
-        if (row < 8192) {
-            const float projected[1]{accumulator};
+    template <class Output>
+    __device__ __forceinline__ void apply_row(const Output&, int row, int,
+                                              const float (&projected)[1], int) const {
+        if (row < 8192)
             conv.store(row, projected);
-        } else {
-            z[row - 8192] = __float2bfloat16_rn(accumulator);
-        }
+        else
+            z[row - 8192] = __float2bfloat16_rn(projected[0]);
     }
 };
 
@@ -55,15 +53,12 @@ make_conv_epilogue(const Tensor& conv_weight, Tensor& conv_states, const Tensor&
 
 void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
-    constexpr int kRows       = 12288;
+
     constexpr int kRowsPerCta = 8;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    q8_k2048_decode_kernel<kRows, kRowsPerCta>
-        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -71,7 +66,7 @@ void q8_gdn_input_decode_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
-    constexpr int kRows       = 12288;
+
     constexpr int kRowsPerCta = 8;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
@@ -80,11 +75,8 @@ void q8_gdn_input_decode_conv_snapshot_launch(
                            snapshot_base_slot, query, key, value),
         static_cast<__nv_bfloat16*>(z.data),
     };
-    q8_k2048_decode_kernel<kRows, kRowsPerCta, Output, Q8GdnDecodeConvEpilogue>
-        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
+    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
+        q8_linear_operands(x, weight), ignored_output, epilogue, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,13 +1,14 @@
+#include "ops/linear/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/q8/q8_ksplit_config.h"
-#include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
-#include "ops/linear/q8/q8_rowsplit_output.cuh"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_schedule.cuh"
+#include "ops/linear/q8/q8_mma_launch.cuh"
+#include "ops/linear/common/output.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 
 #include <array>
 #include <cstddef>
@@ -22,7 +23,7 @@ using Geometry                          = Q8LinearGeometry<6144, 5120>;
 constexpr std::int32_t kQueryRows       = 4096;
 constexpr std::int32_t kKvRows          = 1024;
 constexpr std::int32_t kLastSmallTokens = 48;
-using Output                            = Q8SplitOutput3<kQueryRows, kKvRows, kKvRows>;
+using Output                            = LinearBf16SegmentedOutput<kQueryRows, kKvRows, kKvRows>;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 // Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
@@ -32,24 +33,19 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
                   cudaStream_t stream) {
     constexpr int Capacity = (Columns + 7) / 8 * 8;
     constexpr int Warps    = Columns <= 4 ? 16 : Columns <= 16 ? 8 : 4;
-    constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16)
-                                 ? Q8KSplitScaleAccess::Direct
-                                 : Q8KSplitScaleAccess::Shared;
-    using Schedule         = Q8KSplitSchedule<Warps, Capacity, 2, Scales>;
-    static_assert((kQueryRows % Schedule::kRowsPerCta) == 0);
-    static_assert((kKvRows % Schedule::kRowsPerCta) == 0);
-    static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
+    constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16) ? Q8ScaleAccess::Direct
+                                                                            : Q8ScaleAccess::Shared;
+    using Schedule         = Q8A16SlicedKMmaSchedule<Capacity, Warps, 1, 2, Scales>;
+    static_assert((kQueryRows % Schedule::kBlockRows) == 0);
+    static_assert((kKvRows % Schedule::kBlockRows) == 0);
+    static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
 
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                         static_cast<__nv_bfloat16*>(v.data)};
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    q8_ksplit_mma_kernel<Geometry, Columns, Schedule, Output, Q8KSplitStoreEpilogue,
-                         Q8KSplitIdentityRows, false, !Exact>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
-            Q8KSplitIdentityRows{}, x.ne[1]);
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, Columns, Exact>,
+        Q8SlicedKIdentityRows>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
+                               stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -63,41 +59,13 @@ constexpr auto make_small_launchers(std::index_sequence<I...>) {
 constexpr auto kExactLaunchers = make_small_launchers<true>(std::make_index_sequence<16>{});
 constexpr auto kTileLaunchers  = make_small_launchers<false>(std::make_index_sequence<4>{});
 
-template <class Schedule, bool Full>
-void launch_mma_slice(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
-                      cudaStream_t stream) {
-    static_assert((kQueryRows % Schedule::BM) == 0);
-    static_assert((kKvRows % Schedule::BM) == 0);
-    const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
-                        static_cast<__nv_bfloat16*>(v.data)};
-    const dim3 grid(Geometry::kOutputRows / Schedule::BM,
-                    static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, Output>
-        <<<grid, Schedule::THREADS, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Geometry::kOutputRows,
-            Geometry::kInputRows, x.ne[1], Geometry::kInputRows);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <class Schedule, bool AllowFull = true>
+template <class Schedule>
 void launch_mma(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                 cudaStream_t stream) {
-    for_each_token_slice(x.ne[1], Schedule::BN, [&](std::int32_t offset, std::int32_t count) {
-        const Tensor x_slice = x.slice(1, offset, count);
-        Tensor q_slice       = q.slice(1, offset, count);
-        Tensor k_slice       = k.slice(1, offset, count);
-        Tensor v_slice       = v.slice(1, offset, count);
-        if constexpr (AllowFull) {
-            if ((count % Schedule::BN) == 0) {
-                launch_mma_slice<Schedule, true>(x_slice, weight, q_slice, k_slice, v_slice,
-                                                 stream);
-                return;
-            }
-        }
-        launch_mma_slice<Schedule, false>(x_slice, weight, q_slice, k_slice, v_slice, stream);
-    });
+    const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                        static_cast<__nv_bfloat16*>(v.data)};
+    launch_q8_a16_mma<Schedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
+                                stream);
 }
 
 } // namespace
@@ -115,33 +83,33 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
 
 void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                               Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
+    using Schedule = Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                                Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Schedule = Q8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+    using Schedule = Q8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Schedule = Q8RowSplitMmaGemmSchedule<16, 64, 16, 16, 1, 2, 128, 1>;
+    using Schedule = Q8A16MmaSchedule<16, 64, 128, 16, 16, 1, 1>;
     // This route owns only the partial 49..63-column tile.
-    launch_mma<Schedule, false>(x, w, q, k, v, stream);
+    launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Schedule = Q8RowSplitMmaGemmSchedule<32, 32, 16, 16, 1, 2, 128, 1>;
+    using Schedule = Q8A16MmaSchedule<32, 32, 128, 16, 16, 1, 1>;
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
     // Three-block launch bounds reduce register usage and keep all 384 decode CTAs in one wave.
-    using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 16, 16, 3, 2, 128, 1>;
+    using Schedule = Q8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>;
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 

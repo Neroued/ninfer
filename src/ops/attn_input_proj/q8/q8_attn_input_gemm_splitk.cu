@@ -1,9 +1,11 @@
+#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/q8/q8_instances.cuh"
 #include "core/weight.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
 #include "core/device.h"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
-#include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 #include <array>
 #include <cstdint>
@@ -20,8 +22,8 @@ constexpr int kRowsPerCta             = 16;
 constexpr int kFirstExactCols         = 2;
 constexpr int kLastTargetExactCols    = 48;
 constexpr int kLastCompanionExactCols = 32;
-using TargetOutput                    = Q8SplitOutput4<4096, 512, 4096, 512>;
-using CompanionOutput                 = Q8SplitOutput3<4096, 1024, 1024>;
+using TargetOutput                    = LinearBf16SegmentedOutput<4096, 512, 4096, 512>;
+using CompanionOutput                 = LinearBf16SegmentedOutput<4096, 1024, 1024>;
 using TargetLauncher    = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
                                 cudaStream_t);
 using CompanionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
@@ -36,12 +38,10 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
                              : ActiveCols <= 40 ? 40
                                                 : 48;
     using Geometry         = Q8LinearGeometry<Rows, kHidden>;
-    using Schedule         = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    using Schedule         = Q8SlicedKDefault<TileCols, ActiveCols>;
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 template <int ActiveCols>
@@ -88,11 +88,9 @@ void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q,
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kTargetRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, kHidden, Cache::cg, Cache::cg, false>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
@@ -102,11 +100,9 @@ void launch_companion_medium_cols(const Tensor& x, const Weight& weight, Tensor&
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kCompanionRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, kHidden, Cache::cg, Cache::cg, false>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 } // namespace

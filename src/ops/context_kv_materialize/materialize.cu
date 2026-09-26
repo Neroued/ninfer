@@ -2,7 +2,7 @@
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/common/dflash_rope.cuh"
 #include <cuda_bf16.h>
@@ -339,7 +339,9 @@ struct MaterializeProjectionEpilogue {
         }
     }
 
-    __device__ void store_pair(int row, int col, float4 sum, int columns) const {
+    template <class Output>
+    __device__ void store_fragment(const Output&, int row, int col, float4 sum, int,
+                                   int columns) const {
         if (col < columns) {
             store(row, col, sum.x);
             store(row + 8, col, sum.z);
@@ -360,7 +362,9 @@ struct ContextPrefixColumns {
 };
 
 template <int Columns, int KWarps = 8>
-using GroupedSchedule = Q8KSplitSchedule<KWarps, Columns, 1, Q8KSplitScaleAccess::Shared>;
+using GroupedSchedule =
+    Q8A16SlicedKMmaSchedule<Columns, KWarps, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::ActiveOnly, 5120>;
 
 template <int Columns, int KWarps = 8>
 __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
@@ -373,10 +377,10 @@ __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
     const auto* scales = value ? layer.value_scales : layer.key_scales;
     const MaterializeProjectionEpilogue epilogue{layer, positions, counts,    slots,     scratch, l,
                                                  width, batch,     min_count, max_count, value};
-    q8_ksplit_mma<Q8LinearGeometry<1024, 5120>, Columns, GroupedSchedule<Columns, KWarps>,
-                  Q8ContiguousOutput, MaterializeProjectionEpilogue, Q8KSplitIdentityRows, true,
-                  true>(x, codes, scales, {nullptr, 0}, epilogue, {}, max_count * batch,
-                        ContextPrefixColumns{width, max_count});
+    q8_a16_sliced_k_mma<GroupedSchedule<Columns, KWarps>, true>(
+        Q8LinearOperands{x, codes, scales, 1024, 5120, max_count * batch, 5120},
+        LinearBf16Output{nullptr, 0}, epilogue, Q8SlicedKIdentityRows{}, 0,
+        ContextPrefixColumns{width, max_count});
 }
 
 template <int Columns, int KWarps = 8>
@@ -384,12 +388,14 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
                     const Tensor& slots, DeviceLayers layers,
                     ContextKVMaterializeExecutionEnvelope envelope, const Tensor& scratch,
                     cudaStream_t stream) {
-    context_kv_grouped_kernel<Columns, KWarps>
-        <<<dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), KWarps * 32, 0,
-           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                     static_cast<const int*>(positions.data), static_cast<const int*>(counts.data),
-                     static_cast<const int*>(slots.data), layers, static_cast<float*>(scratch.data),
-                     x.ne[1], x.ne[2], envelope.min_count, envelope.max_count);
+    constexpr auto kernel = context_kv_grouped_kernel<Columns, KWarps>;
+    const int shared = q8_prepare_shared<GroupedSchedule<Columns, KWarps>::kSharedBytes, kernel>();
+    kernel<<<dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), KWarps * 32,
+             shared, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
+        static_cast<const int*>(counts.data), static_cast<const int*>(slots.data), layers,
+        static_cast<float*>(scratch.data), x.ne[1], x.ne[2], envelope.min_count,
+        envelope.max_count);
     CUDA_CHECK(cudaGetLastError());
 }
 

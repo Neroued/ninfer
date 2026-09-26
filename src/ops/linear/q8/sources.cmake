@@ -1,6 +1,7 @@
 target_sources(ninfer_ops PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/q8_rowsplit_gemm_mma.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/q8_rowsplit_gemm_simt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_sliced_k_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_gemv.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k2048.cpp"

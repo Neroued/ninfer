@@ -4,7 +4,7 @@
 // weight tile while N-groups cover disjoint column ranges. Output owns the
 // physical direct-write policy.
 
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_a16_sliced_k_mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -13,34 +13,53 @@
 
 namespace ninfer::ops::detail {
 
-template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
-          bool AddResidual = false, bool TiledColumns = false>
-__global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_grouped_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
-    constexpr int kTileK       = 64;
-    constexpr int kMmaRows     = 16;
-    constexpr int kRowsPerCta  = 16;
-    constexpr int kKernelWarps = KSplits * NGroups;
-    constexpr int kGroupK      = KSplits * kTileK;
-    constexpr int kGroups      = Hidden / kGroupK;
-    constexpr int kWarpCols    = TileCols / NGroups;
-    constexpr int kNt          = kWarpCols / 8;
-    constexpr unsigned kMask   = 0xffffffffu;
+template <class Schedule, bool FullWeights, class Output, class Epilogue>
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    Schedule::kMinBlocksPerSm) void q8_a16_grouped_sliced_k_mma_kernel(Q8LinearOperands operands,
+                                                                       Output output,
+                                                                       Epilogue epilogue,
+                                                                       int token_begin,
+                                                                       int token_count) {
+    constexpr int TileCols = Schedule::kBlockTokens, KSplits = Schedule::kKWarps;
+    constexpr int NGroups = Schedule::kTokenGroups, Stages = Schedule::kStages;
+    constexpr bool TiledColumns = Schedule::kTiledTokens;
+    const int Hidden            = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.k;
+    const int padded_k          = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.padded_k;
+    const auto* __restrict__ x  = operands.x;
+    const auto* __restrict__ codes  = operands.codes;
+    const auto* __restrict__ scales = operands.scales;
+    const int active_cols           = token_count;
+    constexpr int kTileK            = 64;
+    constexpr int kMmaRows          = 16;
+    constexpr int kRowsPerCta       = 16;
+    constexpr int kKernelWarps      = KSplits * NGroups;
+    constexpr int kGroupK           = KSplits * kTileK;
+    const int kGroups               = (Hidden + kGroupK - 1) / kGroupK;
+    constexpr int kWarpCols         = TileCols / NGroups;
+    constexpr int kNt               = kWarpCols / 8;
+    constexpr unsigned kMask        = 0xffffffffu;
     static_assert(KSplits == 2 || KSplits == 4 || KSplits == 8);
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
-    static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
+    static_assert(kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    struct Shared {
+        struct {
+            alignas(16) std::uint8_t codes[kMmaRows][kGroupK];
+            alignas(16) __nv_bfloat16 activations[kKernelWarps][kWarpCols * kTileK];
+        } stage[Stages];
+    };
 
-    const int tid        = static_cast<int>(threadIdx.x);
-    const int warp       = tid >> 5;
-    const int lane       = tid & 31;
-    const int n_group    = warp / KSplits;
-    const int k_split    = warp - n_group * KSplits;
-    const int gid        = lane >> 2;
-    const int lid        = lane & 3;
+    static_assert(sizeof(Shared) == Schedule::kSharedBytes);
+    auto& shared = *reinterpret_cast<Shared*>(q8_shared_storage<sizeof(Shared)>());
+
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int warp        = tid >> 5;
+    const int lane        = tid & 31;
+    const int n_group     = warp / KSplits;
+    const int k_split     = warp - n_group * KSplits;
+    const int gid         = lane >> 2;
+    const int lid         = lane & 3;
     const int n_base      = n_group * kWarpCols;
     const int token_tiles = TiledColumns ? static_cast<int>(gridDim.y) : 1;
     const int linear_block =
@@ -54,27 +73,37 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
     const int cta_row0 =
         (TiledColumns ? linear_block / token_tiles : static_cast<int>(blockIdx.x)) * kRowsPerCta;
 
-    const auto stage_x = [&](int k0) {
+    const auto stage_x = [&](int slot, int k0) {
+        auto& b_shared = shared.stage[slot].activations;
         for (int item = lane; item < local_cols * (kTileK / 8); item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + q8_ksplit_swizzle_64(col, k8 * 8)];
-            cp_async<16, Cache::cg>(
-                dst,
-                &x[static_cast<std::int64_t>(column_offset + n_base + col) * Hidden + k0 + k8 * 8]);
+            auto* dst     = &b_shared[warp][col * kTileK + q8_sliced_k_swizzle_64(col, k8 * 8)];
+            if (FullWeights || k0 + k8 * 8 < Hidden)
+                cp_async<16, Schedule::kActivationCache>(
+                    dst, &x[static_cast<std::int64_t>(token_begin + column_offset + n_base + col) *
+                                Hidden +
+                            k0 + k8 * 8]);
+            else
+                store_vec(dst, make_uint4(0, 0, 0, 0));
         }
         cp_commit();
     };
 
-    const auto stage_codes = [&](int group_k0) {
+    const auto stage_codes = [&](int slot, int group_k0) {
+        auto& code_shared     = shared.stage[slot].codes;
         constexpr int kChunks = kGroupK / 16;
         for (int item = tid; item < kMmaRows * kChunks; item += kKernelWarps * 32) {
             const int row            = item / kChunks;
             const int chunk          = item - row * kChunks;
             const int swizzled_chunk = chunk ^ (row & 7);
-            cp_async<16, Cache::cg>(&code_shared[row][swizzled_chunk * 16],
-                                    codes + static_cast<std::int64_t>(cta_row0 + row) * Hidden +
-                                        group_k0 + chunk * 16);
+            auto* dst                = &code_shared[row][swizzled_chunk * 16];
+            if (FullWeights || (cta_row0 + row < operands.rows && group_k0 + chunk * 16 < padded_k))
+                cp_async<16, Schedule::kWeightCache>(
+                    dst, codes + static_cast<std::int64_t>(cta_row0 + row) * padded_k + group_k0 +
+                             chunk * 16);
+            else
+                store_vec(dst, make_uint4(0, 0, 0, 0));
         }
         cp_commit();
     };
@@ -91,23 +120,39 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0);
-    stage_x(warp_koff);
+    stage_codes(0, 0);
+    stage_x(0, warp_koff);
     cp_wait<0>();
     __syncthreads();
 
     // Bulk tiles keep the K loop compact; the small fixed callers retain their unrolling.
-    constexpr int kGroupUnroll = TiledColumns ? 1 : kGroups;
+    constexpr int kGroupUnroll =
+        TiledColumns || Schedule::kStaticK == 0 ? 1 : Schedule::kStaticK / kGroupK;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
         const int k0       = group_k0 + warp_koff;
+        const int slot     = group_index % Stages;
+        auto& code_shared  = shared.stage[slot].codes;
+        auto& b_shared     = shared.stage[slot].activations;
+        if constexpr (Stages == 2) {
+            if (group_index + 1 < kGroups) {
+                stage_codes(slot ^ 1, group_k0 + kGroupK);
+                stage_x(slot ^ 1, k0 + kGroupK);
+            }
+        }
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
             const int scale_row = cta_row0 + gid + lid * 8;
-            lane_scale_pair     = *reinterpret_cast<const unsigned*>(
-                scales + (static_cast<std::int64_t>(scale_row) * (Hidden / 32) + k0 / 32) * 2);
+            if (FullWeights || (scale_row < operands.rows && k0 < padded_k)) {
+                const auto* address =
+                    scales + (static_cast<std::int64_t>(scale_row) * (padded_k / 32) + k0 / 32) * 2;
+                if constexpr (Schedule::kReadOnlyScales)
+                    lane_scale_pair = load_ldg<unsigned>(address);
+                else
+                    lane_scale_pair = load_vec<unsigned>(address);
+            }
         }
         const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
         const unsigned bot_scale_pair = __shfl_sync(kMask, lane_scale_pair, (lane & ~3) + 1);
@@ -132,11 +177,10 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col));
-                const unsigned af1 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
-                const unsigned af2 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
-                const unsigned af3 =
-                    q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                const unsigned af0 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af1 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                const unsigned af2 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                const unsigned af3 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -144,15 +188,19 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
                     ldmatrix_x2(
                         bf0, bf1,
                         smem_addr(&b_shared[warp][br * kTileK +
-                                                  q8_ksplit_swizzle_64(br, ks * 16 + b_koff)]));
+                                                  q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
                     mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
             const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
-            const float top_scale   = __half2float(__ushort_as_half(top_bits));
-            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
+            const float top_scale   = (FullWeights || k0 + group * 32 < Hidden)
+                                          ? __half2float(__ushort_as_half(top_bits))
+                                          : 0.0f;
+            const float bot_scale   = (FullWeights || k0 + group * 32 < Hidden)
+                                          ? __half2float(__ushort_as_half(bot_bits))
+                                          : 0.0f;
 #pragma unroll
             for (int ni = 0; ni < kNt; ++ni) {
                 acc[ni][0] = fmaf(group_acc[ni][0], top_scale, acc[ni][0]);
@@ -164,15 +212,17 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
-            stage_codes(group_k0 + kGroupK);
-            stage_x(k0 + kGroupK);
+            if constexpr (Stages == 1) {
+                stage_codes(0, group_k0 + kGroupK);
+                stage_x(0, k0 + kGroupK);
+            }
             cp_wait<0>();
             __syncthreads();
         }
     }
 
     __syncthreads();
-    auto* partial = reinterpret_cast<float*>(b_shared);
+    auto* partial = reinterpret_cast<float*>(shared.stage[0].activations);
     if ((k_split & 1) != 0) {
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
@@ -218,11 +268,11 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
     }
 
     if (k_split == 0) {
-        const Q8OutputTile output_tile = output.tile(cta_row0);
-        const auto store               = [&](int row, int col, float value) {
-            __nv_bfloat16* destination = output_tile.at(row, column_offset + col);
-            if constexpr (AddResidual) { value += __bfloat162float(*destination); }
-            *destination = __float2bfloat16_rn(value);
+        const auto output_tile = linear_output_tile<16>(output, cta_row0);
+        const auto store       = [&](int row, int col, float value) {
+            const int token = token_begin + column_offset + col;
+            if (FullWeights || row < operands.rows)
+                output_tile.store(row, token, epilogue.apply(row, token, value));
         };
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {

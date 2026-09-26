@@ -1,11 +1,12 @@
+#include "ops/linear/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/linear/q8/q8_ksplit_config.h"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_schedule.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 
 #include <array>
@@ -24,12 +25,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, int columns) {
     using Geometry           = Q8LinearGeometry<248320, 5120>;
     constexpr int kHidden    = Geometry::kInputRows;
-    constexpr int kTileK     = Schedule::kTileKPerWarp;
+    constexpr int kTileK     = Schedule::kWarpK;
     constexpr int kWarps     = Schedule::kKWarps;
-    constexpr int kRows      = Schedule::kRowsPerCta;
-    constexpr int kGroupK    = Schedule::kGroupK;
+    constexpr int kRows      = Schedule::kBlockRows;
+    constexpr int kGroupK    = Schedule::kBlockK;
     constexpr int kGroups    = kHidden / kGroupK;
-    constexpr int kTileCols  = Schedule::kTileTokens;
+    constexpr int kTileCols  = Schedule::kBlockTokens;
     constexpr int kTokenMmas = kTileCols / 8;
     constexpr int kRowTiles  = kLinearTopKGroupedRows / kRows;
     constexpr unsigned kMask = 0xffffffffu;
@@ -41,7 +42,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
         struct {
             std::uint8_t codes[kRows][kGroupK];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint8_t scales[kRows][Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared
+            std::uint8_t scales[kRows][Schedule::kScaleAccess == Q8ScaleAccess::Shared
                                            ? Schedule::kScaleBytesPerRow
                                            : 1];
         } staging;
@@ -78,7 +79,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
                 const int k8     = item - column * (kTileK / 8);
                 const int source = column < columns ? column : 0;
                 cp_async_zfill<16, Schedule::kActivationCache>(
-                    &x_shared[warp][column * kTileK + q8_ksplit_swizzle_64(column, k8 * 8)],
+                    &x_shared[warp][column * kTileK + q8_sliced_k_swizzle_64(column, k8 * 8)],
                     hidden + static_cast<std::int64_t>(source) * kHidden + group_k0 +
                         warp * kTileK + k8 * 8,
                     column < columns ? 16 : 0);
@@ -97,7 +98,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
                         codes + static_cast<std::int64_t>(row) * kHidden + group_k0 + chunk * 16);
                 }
             }
-            if constexpr (Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared) {
+            if constexpr (Schedule::kScaleAccess == Q8ScaleAccess::Shared) {
                 constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
                 for (int item = tid; item < kRows * kScaleChunksPerRow;
                      item += Schedule::kThreads) {
@@ -125,7 +126,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
             const int group_k0       = group_index * kGroupK;
             unsigned lane_scale_pair = 0;
             if (lid < 2) {
-                if constexpr (Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared) {
+                if constexpr (Schedule::kScaleAccess == Q8ScaleAccess::Shared) {
                     lane_scale_pair = *reinterpret_cast<const unsigned*>(
                         &scale_shared[gid + lid * 8][warp_k0 / 16]);
                 } else {
@@ -152,11 +153,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
                         return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
                             &code_shared[local_row][offset]));
                     };
-                    const unsigned a0 = q8_ksplit_bf16_pair_from_s8(load_pair(gid, code_col));
-                    const unsigned a1 = q8_ksplit_bf16_pair_from_s8(load_pair(gid + 8, code_col));
-                    const unsigned a2 = q8_ksplit_bf16_pair_from_s8(load_pair(gid, code_col + 8));
-                    const unsigned a3 =
-                        q8_ksplit_bf16_pair_from_s8(load_pair(gid + 8, code_col + 8));
+                    const unsigned a0 = q8_bf16_pair_from_s8(load_pair(gid, code_col));
+                    const unsigned a1 = q8_bf16_pair_from_s8(load_pair(gid + 8, code_col));
+                    const unsigned a2 = q8_bf16_pair_from_s8(load_pair(gid, code_col + 8));
+                    const unsigned a3 = q8_bf16_pair_from_s8(load_pair(gid + 8, code_col + 8));
 #pragma unroll
                     for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                         unsigned b0;
@@ -165,7 +165,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
                         ldmatrix_x2(
                             b0, b1,
                             smem_addr(
-                                &x_shared[k_split][row * kTileK + q8_ksplit_swizzle_64(
+                                &x_shared[k_split][row * kTileK + q8_sliced_k_swizzle_64(
                                                                       row, k_step * 16 + b_koff)]));
                         mma_bf16(group_acc[token_mma][0], group_acc[token_mma][1],
                                  group_acc[token_mma][2], group_acc[token_mma][3], a0, a1, a2, a3,
@@ -270,7 +270,7 @@ using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const Linear
 template <int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Schedule = Q8KSplitSchedule<8, Capacity, 2, Q8KSplitScaleAccess::Shared>;
+    using Schedule = Q8A16SlicedKMmaSchedule<Capacity, 8, 1, 2, Q8ScaleAccess::Shared>;
     q8_grouped_ksplit_topk_kernel<Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),

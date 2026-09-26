@@ -32,6 +32,25 @@ int q8_a16_conformance() {
                       64, 65, 79, 80, 81, 95, 96, 97, 127, 128, 129, 256, 1024}) {
             calls.push_back({t});
         }
+        if (shape.n == 2048 && shape.k == 4096) {
+            for (int t : {895, 896, 897}) calls.push_back({t});
+        }
+        if (shape.n == 6144 && shape.k == 5120) {
+            for (int t : {191, 192, 193}) calls.push_back({t});
+        }
+        if (shape.k == 4608) {
+            for (int t : {6, 11, 12, 13, 14, 19, 20, 21, 27, 28, 29}) calls.push_back({t});
+            if (shape.n == 2048) {
+                for (int t : {870, 871, 872}) calls.push_back({t});
+            }
+            if (shape.n == 4608) {
+                for (int t : {255, 257}) calls.push_back({t});
+            }
+        }
+        if (shape.n == 9216 && shape.k == 2048) {
+            for (int t : {12, 13, 14}) calls.push_back({t});
+        }
+        if (shape.n == 248320) calls.push_back({34});
         if (shape.n == 2048 && shape.k == 16384) {
             for (int t : {383,  384,  385,  479,  480,  481,  639,  640,  641,  703,
                           704,  705,  959,  960,  961,  1343, 1344, 1345, 1679, 1680,

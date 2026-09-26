@@ -18,21 +18,14 @@ struct Q8SwiGluPairedRows {
     }
 };
 
+// The admitted SwiGLU geometries contain complete eight-row output tiles.
 struct Q8SwiGluDirectEpilogue {
-    __nv_bfloat16* out;
-    std::int32_t rows;
-
-    __device__ __forceinline__ void store_pair(int row, int col0, float4 projected,
-                                               int columns) const {
-        if (col0 < columns) {
-            out[static_cast<std::int64_t>(col0) * rows + row] =
-                __float2bfloat16_rn(silu(projected.x) * projected.z);
-        }
-        if (col0 + 1 < columns) {
-            out[static_cast<std::int64_t>(col0 + 1) * rows + row] =
-                __float2bfloat16_rn(silu(projected.y) * projected.w);
-        }
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output& output, int row, int col,
+                                                   float4 projected, int /*rows*/,
+                                                   int columns) const {
+        if (col < columns) output.store(row, col, silu(projected.x) * projected.z);
+        if (col + 1 < columns) output.store(row, col + 1, silu(projected.y) * projected.w);
     }
 };
-
 } // namespace ninfer::ops::detail

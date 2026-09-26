@@ -5,7 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>

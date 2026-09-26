@@ -8,19 +8,23 @@ namespace ninfer::ops::detail {
 
 using Q8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-void launch_q8_gemv_n2048_k16384(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_simt_r8_c4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_simt_r8_c8(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r32_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r32_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r32_c128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r48_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r64_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r64_c128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r96_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r128_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r128_c80(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r64x16_c48_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-void launch_q8_mma_r64x32_c64_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_gemv_r4_w1_k16384(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_simt_r8_t4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_simt_r8_t8(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r32_t64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r32_t96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r32_t128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r48_t64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r64_t96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r64_t128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r96_t96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r128_t64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r128_t80(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r64x16_t48_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r64x32_t64_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+void launch_q8_a16_simt_r4_t4_w2_g16_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_sliced_r16_t16_w8_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_sliced_r16_t16_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_sliced_r16_t32_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 } // namespace ninfer::ops::detail

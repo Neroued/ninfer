@@ -1,9 +1,10 @@
+#include "ops/linear/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
 #include "core/device.h"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
-#include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 #include <array>
 #include <cstdint>
@@ -31,22 +32,20 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     constexpr int KWarps =
         Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);
     constexpr int MinBlocks = Hidden == 4096 ? (KWarps == 16 ? 1 : 2) : (ActiveCols <= 32 ? 2 : 3);
-    constexpr auto ScaleAccess =
-        ActiveCols > 4 ? Q8KSplitScaleAccess::Shared : Q8KSplitScaleAccess::Direct;
+    constexpr auto ScaleAccess = ActiveCols > 4 ? Q8ScaleAccess::Shared : Q8ScaleAccess::Direct;
     constexpr auto ActivationCache =
         Hidden == 4096 && (ActiveCols == 4 || (ActiveCols >= 27 && ActiveCols <= 40)) ? Cache::cg
                                                                                       : Cache::ca;
     using Geometry = Q8LinearGeometry<kRows, Hidden>;
-    using Schedule = Q8KSplitSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
+    using Schedule =
+        Q8A16SlicedKMmaSchedule<TileCols, KWarps, 1, MinBlocks, ScaleAccess, ActivationCache>;
     static_assert((kRows % kRowsPerCta) == 0);
     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
-    const Q8ContiguousOutput output{residual, kRows};
-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
-                         Q8KSplitResidualEpilogue>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitResidualEpilogue{});
+    const LinearBf16Output output{residual, kRows};
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
+        q8_linear_operands(x, weight), output,
+        LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream);
 }
 
 template <int Hidden, std::size_t... Offsets>
@@ -63,11 +62,11 @@ constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
                    cudaStream_t stream) {
-    const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), kRows};
-    q8_ksplit_grouped_mma_kernel<Hidden, TileCols, KSplits, NGroups, MinBlocks, Q8ContiguousOutput,
-                                 true><<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(residual_out.data), kRows};
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, Hidden, Cache::cg, Cache::cg, false>>(
+        q8_linear_operands(x, weight), output,
+        LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>

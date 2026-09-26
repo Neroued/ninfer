@@ -450,7 +450,7 @@ void launch_tiled(Q8PairScheduleId schedule, bool full, const Tensor& x, const W
         Tensor second_slice  = second_out.slice(1, offset, count);
         switch (schedule) {
         case Q8PairScheduleId::TwoSimtR8C4:
-            q8_pair_simt_r8_c4_launch(full, x_slice, first_weight, second_weight, first_slice,
+            q8_pair_simt_r8_c4_launch(x_slice, first_weight, second_weight, first_slice,
                                       second_slice, stream);
             return;
         case Q8PairScheduleId::DualMmaR32C64:
@@ -463,7 +463,7 @@ void launch_tiled(Q8PairScheduleId schedule, bool full, const Tensor& x, const W
             return;
         default:
             if (is_concat_schedule(schedule)) {
-                q8_pair_concat_mma_launch(schedule, full, x_slice, first_weight, second_weight,
+                q8_pair_concat_mma_launch(schedule, x_slice, first_weight, second_weight,
                                           first_slice, second_slice, stream);
                 return;
             }

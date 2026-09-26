@@ -3,7 +3,7 @@
 // Paired MTP K/V Q8G32 GEMM. One CTA keeps a single BF16 activation tile in
 // shared memory and contracts it against independent K and V weight tiles.
 
-#include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
+#include "ops/linear/q8/q8_mma_launch.cuh"
 
 namespace ninfer::ops::detail {
 

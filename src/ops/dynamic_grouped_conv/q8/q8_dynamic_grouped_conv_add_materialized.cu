@@ -1,10 +1,11 @@
+#include "ops/linear/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
 #include "core/device.h"
-#include "ops/linear/q8/q8_ksplit_config.h"
+#include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_launch.h"
-#include "ops/linear/q8/q8_rowsplit_output.cuh"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/common/output.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include <cuda_bf16.h>
 #include <array>
 #include <algorithm>
@@ -38,27 +39,16 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         InputRows == 4096 && ((TileColumns > 24 && TileColumns <= 40) || TileColumns > 48)
             ? Cache::cg
             : Cache::ca;
-    using Geometry            = Q8LinearGeometry<kRows, InputRows>;
-    using Schedule            = Q8KSplitSchedule<Warps, TileColumns, Warps == 8 ? 2 : 3,
-                                                 Q8KSplitScaleAccess::Shared, Activation>;
-    constexpr int SharedBytes = TileColumns > 64 ? sizeof(Q8KSplitSharedStorage<Schedule>) : 0;
-    if constexpr (SharedBytes > 0) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
-                                 Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
-        CUDA_CHECK(attribute);
-    }
+    using Geometry    = Q8LinearGeometry<kRows, InputRows>;
+    using Schedule    = Q8A16SlicedKMmaSchedule<TileColumns, Warps, 1, Warps == 8 ? 2 : 3,
+                                                Q8ScaleAccess::Shared, Activation>;
     const int columns = x.ne[1];
-    Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
+    LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kRows};
     const dim3 grid(kRows / 16, (columns + TileColumns - 1) / TileColumns);
-    q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput, Q8KSplitStoreEpilogue,
-                         Q8KSplitIdentityRows, false, true>
-        <<<grid, Schedule::kThreads, SharedBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
-            Q8KSplitIdentityRows{}, columns);
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, TileColumns, false>,
+        Q8SlicedKIdentityRows>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
+                               stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -94,7 +84,7 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         break;
     }
     case Q8DynamicConvAddSchedule::MmaK128:
-        launch_q8_mma_r64x32_c64_k128_a1(flat, weight, result, stream);
+        launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
     }
     const dim3 grid((kRows + 255) / 256, tokens);

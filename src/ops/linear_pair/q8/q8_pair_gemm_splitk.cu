@@ -1,10 +1,12 @@
+#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/q8/q8_instances.cuh"
 #include "core/weight.h"
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
-#include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,7 +24,7 @@ constexpr int kHidden      = 2048;
 constexpr int kRowsPerCta  = 8;
 constexpr int kFirstExactT = 2;
 constexpr int kLastExactT  = 32;
-using PairOutput           = Q8SplitOutput2<kRows, kRows>;
+using PairOutput           = LinearBf16SegmentedOutput<kRows, kRows>;
 using PairLauncher         = void (*)(const Tensor&, const Weight&, const Weight&, Tensor&, Tensor&,
                               cudaStream_t);
 
@@ -39,20 +41,16 @@ struct Q8PairExactTEpilogue {
     __nv_bfloat16* first;
     __nv_bfloat16* second;
 
-    template <int ActiveCols>
-    __device__ __forceinline__ void store(int row, float (&projected)[ActiveCols]) const {
-        constexpr unsigned kPairMask = 0x0000ffffu;
-        const int lane               = static_cast<int>(threadIdx.x) & 31;
-        const int output_row         = row - lane + (lane & (kRowsPerCta - 1));
-#pragma unroll
-        for (int token = 0; token < ActiveCols; ++token) {
-            const float second_value =
-                __shfl_sync(kPairMask, projected[token], (lane & (kRowsPerCta - 1)) + kRowsPerCta);
-            if (lane < kRowsPerCta) {
-                const std::int64_t offset = static_cast<std::int64_t>(token) * kRows + output_row;
-                first[offset]             = __float2bfloat16_rn(projected[token]);
-                second[offset]            = __float2bfloat16_rn(second_value);
-            }
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output&, int row, int col, float4 v, int,
+                                                   int columns) const {
+        if (col < columns) {
+            first[static_cast<std::int64_t>(col) * kRows + row]  = __float2bfloat16_rn(v.x);
+            second[static_cast<std::int64_t>(col) * kRows + row] = __float2bfloat16_rn(v.z);
+        }
+        if (col + 1 < columns) {
+            first[static_cast<std::int64_t>(col + 1) * kRows + row]  = __float2bfloat16_rn(v.y);
+            second[static_cast<std::int64_t>(col + 1) * kRows + row] = __float2bfloat16_rn(v.w);
         }
     }
 };
@@ -63,7 +61,7 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
     using Geometry           = Q8LinearGeometry<2 * kRows, kHidden>;
-    using Schedule           = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
+    using Schedule           = Q8SlicedKDefault<TileCols, ActiveCols>;
     const auto* first_codes  = static_cast<const std::uint8_t*>(first_weight.qdata);
     const auto* first_scales = static_cast<const std::uint8_t*>(first_weight.scales);
     if (static_cast<const std::uint8_t*>(second_weight.qdata) != first_codes + kRows * kHidden ||
@@ -72,13 +70,15 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
         throw std::invalid_argument("Q8 exact pair requires adjacent K/V row views");
     }
 
-    const Q8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
+    const LinearBf16Output ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
     const Q8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput, Q8PairExactTEpilogue,
-                         Q8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
-        Q8PairExactTRows{});
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>,
+        Q8PairExactTRows>(Q8LinearOperands{static_cast<const __nv_bfloat16*>(x.data), first_codes,
+                                           first_scales, Geometry::kOutputRows,
+                                           Geometry::kInputRows, ActiveCols, Geometry::kInputRows},
+                          ignored, epilogue, stream);
 }
 
 template <std::size_t... Offsets>
@@ -102,9 +102,11 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
     }
     const PairOutput output{static_cast<__nv_bfloat16*>(first_out.data),
                             static_cast<__nv_bfloat16*>(second_out.data)};
-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, kHidden, Cache::cg, Cache::cg, false>>(
+        Q8LinearOperands{static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales,
+                         ((2 * kRows) / 16) * 16, kHidden, x.ne[1], kHidden},
+        output, LinearIdentityEpilogue{}, stream);
 }
 
 } // namespace

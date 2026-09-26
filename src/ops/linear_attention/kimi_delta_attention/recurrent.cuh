@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/linear_attention/kimi_delta_attention/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 
@@ -11,13 +13,11 @@
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 
-inline constexpr std::int32_t kStateDim = 128;
-inline constexpr int kDvPerWarp         = 4;
-inline constexpr int kNumWarps          = 4;
-inline constexpr int kBlockDv           = kNumWarps * kDvPerWarp;
-inline constexpr int kQkPerLane         = kStateDim / kWarpSize;
-inline constexpr float kQkL2NormEps     = 1.0e-6F;
-inline constexpr float kLog2E           = 1.4426950408889634F;
+inline constexpr int kDvPerWarp     = 4;
+inline constexpr int kNumWarps      = 4;
+inline constexpr int kBlockDv       = kNumWarps * kDvPerWarp;
+inline constexpr int kQkPerLane     = kStateDim / kWarpSize;
+inline constexpr float kQkL2NormEps = 1.0e-6F;
 
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
@@ -29,22 +29,6 @@ struct alignas(16) GateStage {
     float beta[2];
     float a_log_exp;
 };
-
-__device__ __forceinline__ float tanh_approx(float value) {
-    float result;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(result) : "f"(value));
-    return result;
-}
-
-__device__ __forceinline__ float sigmoid_approx(float value) {
-    return 0.5F * tanh_approx(0.5F * value) + 0.5F;
-}
-
-__device__ __forceinline__ float exp_approx(float value) {
-    float result;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value * kLog2E));
-    return result;
-}
 
 __device__ __forceinline__ void load_bf16x4(float (&values)[kQkPerLane],
                                             const __nv_bfloat16* source) {
@@ -163,15 +147,13 @@ run_recurrent_token(float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16*
     store_readout(state, query, output, dv_base, lane, scale);
 }
 
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_direct_kernel(const __nv_bfloat16* __restrict__ q,
-                            const __nv_bfloat16* __restrict__ k,
-                            const __nv_bfloat16* __restrict__ v,
-                            const __nv_bfloat16* __restrict__ g,
-                            const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
-                            const float* __restrict__ dt_bias, const float* state_read,
-                            float* state_write, __nv_bfloat16* __restrict__ out, std::int32_t heads,
-                            std::int32_t width, float lower_bound, float scale) {
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_direct_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ g,
+    const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, const float* state_read, float* state_write,
+    __nv_bfloat16* __restrict__ out, std::int32_t qk_heads, std::int32_t heads, std::int32_t width,
+    float lower_bound, float scale) {
     __shared__ GateStage gate_stage;
 
     const int lane          = threadIdx.x;
@@ -193,8 +175,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     for (std::int32_t token = 0; token < width; ++token) {
         const std::int64_t vector_offset =
             (static_cast<std::int64_t>(token) * heads + head) * kStateDim;
+        const std::int64_t query_offset =
+            (static_cast<std::int64_t>(token) * qk_heads + head / (heads / qk_heads)) * kStateDim;
         run_recurrent_token(
-            state, q + vector_offset, k + vector_offset, v + vector_offset, g + vector_offset,
+            state, q + query_offset, k + query_offset, v + vector_offset, g + vector_offset,
             beta + static_cast<std::int64_t>(token) * heads + head,
             dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset, gate_stage,
             token & 1, lane, thread, dv_base, dqk_base, a_scale, lower_bound, scale);
@@ -209,7 +193,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_updat
     const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
     const float* __restrict__ dt_bias, float* __restrict__ states,
     const std::int32_t* __restrict__ state_slots, __nv_bfloat16* __restrict__ out,
-    std::int32_t heads, std::int64_t state_slot_stride, float lower_bound, float scale) {
+    std::int32_t qk_heads, std::int32_t heads, std::int64_t state_slot_stride, float lower_bound,
+    float scale) {
     __shared__ GateStage gate_stage;
 
     const int lane       = threadIdx.x;
@@ -232,7 +217,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_updat
     if (thread == 0) { gate_stage.a_log_exp = expf(a_log[head]); }
     __syncthreads();
 
-    run_recurrent_token(state, q + vector_offset, k + vector_offset, v + vector_offset,
+    const std::int64_t query_offset =
+        (static_cast<std::int64_t>(batch) * qk_heads + head / (heads / qk_heads)) * kStateDim;
+    run_recurrent_token(state, q + query_offset, k + query_offset, v + vector_offset,
                         g + vector_offset, beta + static_cast<std::int64_t>(batch) * heads + head,
                         dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset,
                         gate_stage, 0, lane, thread, dv_base, dqk_base, gate_stage.a_log_exp,

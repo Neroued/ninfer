@@ -8,8 +8,9 @@
 namespace ninfer::test::kda_ref {
 
 struct Inputs {
-    std::int64_t heads  = 0;
-    std::int64_t tokens = 0;
+    std::int64_t qk_heads    = 0;
+    std::int64_t value_heads = 0;
+    std::int64_t tokens      = 0;
 
     // q/k/v/g/beta contain the exact FP32 values represented by their public BF16 tensors.
     // A_log/dt_bias/state contain the exact public FP32 values.
@@ -36,15 +37,17 @@ inline double sigmoid(double value) {
 
 inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
     constexpr std::int64_t D = 128;
-    const std::int64_t H     = in.heads;
+    const std::int64_t H     = in.value_heads;
+    const std::int64_t Hq    = in.qk_heads;
     const std::int64_t T     = in.tokens;
-    if (H <= 0 || T <= 0 || lower_bound < -5.0 || lower_bound > 0.0) {
+    if (Hq <= 0 || H < Hq || H % Hq != 0 || T <= 0 || lower_bound < -5.0 || lower_bound > 0.0) {
         throw std::invalid_argument("kda_ref: invalid geometry or lower bound");
     }
 
     const std::size_t vector_size = static_cast<std::size_t>(D * H * T);
+    const std::size_t qk_size     = static_cast<std::size_t>(D * Hq * T);
     const std::size_t state_size  = static_cast<std::size_t>(D * D * H);
-    if (in.q.size() != vector_size || in.k.size() != vector_size || in.v.size() != vector_size ||
+    if (in.q.size() != qk_size || in.k.size() != qk_size || in.v.size() != vector_size ||
         in.g.size() != vector_size || in.beta.size() != static_cast<std::size_t>(H * T) ||
         in.a_log.size() != static_cast<std::size_t>(H) ||
         in.dt_bias.size() != static_cast<std::size_t>(D * H) || in.state.size() != state_size) {
@@ -53,11 +56,11 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
 
     // Normalize the complete represented Q/K inputs in FP64. These are logical values, not a
     // model of a production reduction tree or staging format.
-    std::vector<double> q_normalized(vector_size);
-    std::vector<double> k_normalized(vector_size);
+    std::vector<double> q_normalized(qk_size);
+    std::vector<double> k_normalized(qk_size);
     for (std::int64_t token = 0; token < T; ++token) {
-        for (std::int64_t head = 0; head < H; ++head) {
-            const std::size_t base = static_cast<std::size_t>((token * H + head) * D);
+        for (std::int64_t head = 0; head < Hq; ++head) {
+            const std::size_t base = static_cast<std::size_t>((token * Hq + head) * D);
             double q_sumsq         = 0.0;
             double k_sumsq         = 0.0;
             for (std::int64_t column = 0; column < D; ++column) {
@@ -96,6 +99,8 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
         const std::size_t dt_base = static_cast<std::size_t>(head * D);
         for (std::int64_t token = 0; token < T; ++token) {
             const std::size_t vector_base = static_cast<std::size_t>((token * H + head) * D);
+            const std::size_t qk_base =
+                static_cast<std::size_t>((token * Hq + head / (H / Hq)) * D);
             for (std::int64_t column = 0; column < D; ++column) {
                 const double gate = static_cast<double>(in.g[vector_base + column]) +
                                     static_cast<double>(in.dt_bias[dt_base + column]);
@@ -111,7 +116,7 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
                 for (std::int64_t column = 0; column < D; ++column) {
                     prediction += state[row_base + static_cast<std::size_t>(column)] *
                                   alpha[static_cast<std::size_t>(column)] *
-                                  k_normalized[vector_base + static_cast<std::size_t>(column)];
+                                  k_normalized[qk_base + static_cast<std::size_t>(column)];
                 }
                 delta[static_cast<std::size_t>(row)] =
                     beta * (static_cast<double>(in.v[vector_base + static_cast<std::size_t>(row)]) -
@@ -125,7 +130,7 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
                     const std::size_t index = row_base + static_cast<std::size_t>(column);
                     state[index] =
                         alpha[static_cast<std::size_t>(column)] * state[index] +
-                        row_delta * k_normalized[vector_base + static_cast<std::size_t>(column)];
+                        row_delta * k_normalized[qk_base + static_cast<std::size_t>(column)];
                 }
             }
 
@@ -134,7 +139,7 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
                 double readout             = 0.0;
                 for (std::int64_t column = 0; column < D; ++column) {
                     readout += state[row_base + static_cast<std::size_t>(column)] *
-                               q_normalized[vector_base + static_cast<std::size_t>(column)];
+                               q_normalized[qk_base + static_cast<std::size_t>(column)];
                 }
                 result.out[vector_base + static_cast<std::size_t>(row)] = scale * readout;
             }

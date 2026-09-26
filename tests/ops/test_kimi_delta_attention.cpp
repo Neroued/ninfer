@@ -24,12 +24,15 @@ constexpr int kStateDim     = 128;
 constexpr float kLowerBound = -5.0F;
 constexpr float kScale      = 1.0F / 11.313708498984761F;
 
-constexpr ReductionCriterion output_criterion() {
+constexpr ReductionCriterion output_criterion(bool chunked = false) {
+    // BF16 decay operands and native TF32 products are a distinct arithmetic profile.
+    if (chunked) return {6.0e-3, 1.0e-5, 1.5e-2};
     return {/*relative_l2=*/2.2e-3, /*gross_absolute=*/1.0e-5,
             /*gross_relative_to_max_reference=*/4.0e-3};
 }
 
-constexpr ReductionCriterion state_criterion() {
+constexpr ReductionCriterion state_criterion(bool chunked = false) {
+    if (chunked) return {4.0e-3, 1.0e-5, 1.2e-2};
     return {/*relative_l2=*/1.5e-5, /*gross_absolute=*/5.0e-6,
             /*gross_relative_to_max_reference=*/3.0e-5};
 }
@@ -41,6 +44,11 @@ struct Case {
     bool near_zero_qk   = false;
     bool saturated_gate = false;
     bool zero_state     = false;
+    int qk_heads        = 0;
+    float lower_bound   = kLowerBound;
+    bool weak_decay     = false;
+
+    int qheads() const { return qk_heads == 0 ? heads : qk_heads; }
 };
 
 void fill_uniform(std::vector<float>& values, std::mt19937& generator, float low, float high) {
@@ -50,15 +58,16 @@ void fill_uniform(std::vector<float>& values, std::mt19937& generator, float low
 
 kda_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     kda_ref::Inputs in;
-    in.heads  = test_case.heads;
-    in.tokens = test_case.tokens;
+    in.value_heads = test_case.heads;
+    in.qk_heads    = test_case.qheads();
+    in.tokens      = test_case.tokens;
 
     const std::size_t vector_size =
         static_cast<std::size_t>(kStateDim) * test_case.heads * test_case.tokens;
     const std::size_t state_size =
         static_cast<std::size_t>(kStateDim) * kStateDim * test_case.heads;
-    in.q.resize(vector_size);
-    in.k.resize(vector_size);
+    in.q.resize(static_cast<std::size_t>(kStateDim) * test_case.qheads() * test_case.tokens);
+    in.k.resize(in.q.size());
     in.v.resize(vector_size);
     in.g.resize(vector_size);
     in.beta.resize(static_cast<std::size_t>(test_case.heads * test_case.tokens));
@@ -89,6 +98,11 @@ kda_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     }
     if (test_case.zero_state) { std::fill(in.state.begin(), in.state.end(), 0.0F); }
 
+    if (test_case.weak_decay) {
+        std::fill(in.g.begin(), in.g.end(), -8.0F);
+        std::fill(in.a_log.begin(), in.a_log.end(), 0.0F);
+        std::fill(in.dt_bias.begin(), in.dt_bias.end(), 0.0F);
+    }
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
@@ -127,8 +141,8 @@ struct DeviceInputs {
 struct Views {
     Views(const Case& test_case, DeviceInputs& device, void* state_in_data, void* state_out_data,
           void* out_data)
-        : q(device.q.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
-          k(device.k.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
+        : q(device.q.p, DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
+          k(device.k.p, DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
           v(device.v.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
           g(device.g.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
           beta(device.beta.p, DType::BF16, {test_case.heads, test_case.tokens}),
@@ -136,7 +150,13 @@ struct Views {
           dt_bias(device.dt_bias.p, DType::FP32, {kStateDim, test_case.heads}),
           state_in(state_in_data, DType::FP32, {kStateDim, kStateDim, test_case.heads}),
           state_out(state_out_data, DType::FP32, {kStateDim, kStateDim, test_case.heads}),
-          out(out_data, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}) {}
+          out(out_data, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
+          scratch(std::max<std::size_t>(
+              256, ops::kimi_delta_attention_workspace_capacity_bytes(
+                       test_case.qheads(), test_case.heads, test_case.tokens, test_case.tokens))),
+          workspace(DeviceSpan{scratch.data(), scratch.bytes()}) {
+        scratch.fill(0xff);
+    }
 
     Tensor q;
     Tensor k;
@@ -148,7 +168,17 @@ struct Views {
     Tensor state_in;
     Tensor state_out;
     Tensor out;
+    GuardedDeviceBuffer scratch;
+    WorkspaceArena workspace;
 };
+
+DeviceExecutionView execution(cudaStream_t stream = nullptr) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    return {stream, properties.multiProcessorCount};
+}
 
 int verify_inputs_unchanged(const std::string& label, const kda_ref::Inputs& in,
                             const DeviceInputs& device) {
@@ -173,22 +203,22 @@ int verify_inputs_unchanged(const std::string& label, const kda_ref::Inputs& in,
 
 int verify_result(const std::string& label, const kda_ref::Inputs& in,
                   const kda_ref::Result& reference, const GuardedDeviceBuffer& state,
-                  const GuardedDeviceBuffer& out) {
+                  const GuardedDeviceBuffer& out, bool chunked = false) {
     int failures = 0;
     failures += verify_reduction(label + " out", from_device_bf16(out.data(), in.v.size()),
-                                 reference.out, output_criterion());
+                                 reference.out, output_criterion(chunked));
     failures += verify_reduction(label + " state",
                                  doubles(from_device<float>(state.data(), in.state.size())),
-                                 reference.final_state, state_criterion());
+                                 reference.final_state, state_criterion(chunked));
     failures += state.verify_guards(label + " state");
     failures += out.verify_guards(label + " out");
     return failures;
 }
 
 int inplace_case(const Case& test_case, std::uint32_t seed) {
-    const kda_ref::Inputs in = make_inputs(test_case, seed);
-    const kda_ref::Result reference =
-        kda_ref::evaluate(in, static_cast<double>(kLowerBound), static_cast<double>(kScale));
+    const kda_ref::Inputs in        = make_inputs(test_case, seed);
+    const kda_ref::Result reference = kda_ref::evaluate(
+        in, static_cast<double>(test_case.lower_bound), static_cast<double>(kScale));
     DeviceInputs device(in);
     GuardedDeviceBuffer state(in.state.size() * sizeof(float));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
@@ -197,20 +227,21 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     Views views(test_case, device, state.data(), state.data(), out.data());
 
     ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
-                              views.dt_bias, kLowerBound, kScale, views.state_out, views.out,
-                              nullptr);
+                              views.dt_bias, test_case.lower_bound, kScale, views.workspace,
+                              views.state_out, views.out, execution());
     cuda_synchronize();
 
     const std::string label = std::string(test_case.name) + " inplace";
-    int failures            = verify_result(label, in, reference, state, out);
+    int failures = verify_result(label, in, reference, state, out, test_case.tokens >= 12);
+    failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_inputs_unchanged(label, in, device);
     return failures;
 }
 
 int distinct_case(const Case& test_case, std::uint32_t seed) {
-    const kda_ref::Inputs in = make_inputs(test_case, seed);
-    const kda_ref::Result reference =
-        kda_ref::evaluate(in, static_cast<double>(kLowerBound), static_cast<double>(kScale));
+    const kda_ref::Inputs in        = make_inputs(test_case, seed);
+    const kda_ref::Result reference = kda_ref::evaluate(
+        in, static_cast<double>(test_case.lower_bound), static_cast<double>(kScale));
     DeviceInputs device(in);
     GuardedDeviceBuffer state_in(in.state.size() * sizeof(float));
     GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
@@ -220,13 +251,15 @@ int distinct_case(const Case& test_case, std::uint32_t seed) {
     out.fill(0xff);
     Views views(test_case, device, state_in.data(), state_out.data(), out.data());
 
-    ops::kimi_delta_attention(
-        views.q, views.k, views.v, views.g, views.beta, views.a_log, views.dt_bias, kLowerBound,
-        kScale, static_cast<const Tensor&>(views.state_in), views.state_out, views.out, nullptr);
+    ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
+                              views.dt_bias, test_case.lower_bound, kScale, views.workspace,
+                              static_cast<const Tensor&>(views.state_in), views.state_out,
+                              views.out, execution());
     cuda_synchronize();
 
     const std::string label = std::string(test_case.name) + " distinct";
-    int failures            = verify_result(label, in, reference, state_out, out);
+    int failures = verify_result(label, in, reference, state_out, out, test_case.tokens >= 12);
+    failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_exact((label + " state-in unchanged").c_str(),
                              from_device<float>(state_in.data(), in.state.size()), in.state);
     failures += state_in.verify_guards(label + " state-in");
@@ -235,9 +268,9 @@ int distinct_case(const Case& test_case, std::uint32_t seed) {
 }
 
 int distinct_exact_alias_case(const Case& test_case, std::uint32_t seed) {
-    const kda_ref::Inputs in = make_inputs(test_case, seed);
-    const kda_ref::Result reference =
-        kda_ref::evaluate(in, static_cast<double>(kLowerBound), static_cast<double>(kScale));
+    const kda_ref::Inputs in        = make_inputs(test_case, seed);
+    const kda_ref::Result reference = kda_ref::evaluate(
+        in, static_cast<double>(test_case.lower_bound), static_cast<double>(kScale));
     DeviceInputs device(in);
     GuardedDeviceBuffer state(in.state.size() * sizeof(float));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
@@ -245,13 +278,15 @@ int distinct_exact_alias_case(const Case& test_case, std::uint32_t seed) {
     out.fill(0xff);
     Views views(test_case, device, state.data(), state.data(), out.data());
 
-    ops::kimi_delta_attention(
-        views.q, views.k, views.v, views.g, views.beta, views.a_log, views.dt_bias, kLowerBound,
-        kScale, static_cast<const Tensor&>(views.state_in), views.state_out, views.out, nullptr);
+    ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
+                              views.dt_bias, test_case.lower_bound, kScale, views.workspace,
+                              static_cast<const Tensor&>(views.state_in), views.state_out,
+                              views.out, execution());
     cuda_synchronize();
 
     const std::string label = std::string(test_case.name) + " distinct exact-alias";
-    int failures            = verify_result(label, in, reference, state, out);
+    int failures = verify_result(label, in, reference, state, out, test_case.tokens >= 12);
+    failures += views.scratch.verify_guards(label + " workspace");
     failures += verify_inputs_unchanged(label, in, device);
     return failures;
 }
@@ -266,10 +301,11 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
 
     const kda_ref::Inputs shared = make_inputs(test_case, seed ^ 0x51a7U);
     kda_ref::Inputs aggregate;
-    aggregate.heads   = test_case.heads;
-    aggregate.tokens  = batch;
-    aggregate.a_log   = shared.a_log;
-    aggregate.dt_bias = shared.dt_bias;
+    aggregate.value_heads = test_case.heads;
+    aggregate.qk_heads    = test_case.qheads();
+    aggregate.tokens      = batch;
+    aggregate.a_log       = shared.a_log;
+    aggregate.dt_bias     = shared.dt_bias;
     aggregate.q.reserve(vector_row_size * static_cast<std::size_t>(batch));
     aggregate.k.reserve(vector_row_size * static_cast<std::size_t>(batch));
     aggregate.v.reserve(vector_row_size * static_cast<std::size_t>(batch));
@@ -302,8 +338,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
         std::copy(input.state.begin(), input.state.end(),
                   initial_states.begin() + static_cast<std::size_t>(slot) * state_size);
 
-        kda_ref::Result reference =
-            kda_ref::evaluate(input, static_cast<double>(kLowerBound), static_cast<double>(kScale));
+        kda_ref::Result reference = kda_ref::evaluate(
+            input, static_cast<double>(test_case.lower_bound), static_cast<double>(kScale));
         std::copy(reference.out.begin(), reference.out.end(),
                   expected_output.begin() + static_cast<std::size_t>(row) * vector_row_size);
         references.push_back(std::move(reference));
@@ -317,8 +353,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     states.copy_from_host(initial_states.data(), states.bytes());
     out.fill(0xff);
 
-    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
-    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
     Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
     Tensor g(device.g.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
     Tensor beta(device.beta.p, DType::BF16, {test_case.heads, 1, batch});
@@ -364,6 +400,71 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     failures += states.verify_guards(label + " states");
     failures += out.verify_guards(label + " out");
     failures += verify_inputs_unchanged(label, aggregate, device);
+    return failures;
+}
+
+int graph_replay_case() {
+    Case c{"chunked graph input updates", 48, 65};
+    c.qk_heads            = 16;
+    kda_ref::Inputs input = make_inputs(c, 45678U);
+    DeviceInputs device(input);
+    GuardedDeviceBuffer state_in(input.state.size() * sizeof(float));
+    GuardedDeviceBuffer state_out(input.state.size() * sizeof(float));
+    GuardedDeviceBuffer out(input.v.size() * sizeof(std::uint16_t));
+    state_in.copy_from_host(input.state.data(), state_in.bytes());
+    Views views(c, device, state_in.data(), state_out.data(), out.data());
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(
+        cudaStreamSynchronize(nullptr)); // Drain fixture initialization on the default stream.
+    const auto ex = execution(stream);
+    auto launch   = [&] {
+        ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
+                                    views.dt_bias, c.lower_bound, kScale, views.workspace,
+                                    views.state_in, views.state_out, views.out, ex);
+    };
+    launch();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    launch();
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, 0));
+    int failures = 0;
+    for (unsigned replay = 0; replay < 2; ++replay) {
+        input                  = make_inputs(c, 56789U + replay);
+        const auto upload_bf16 = [](DeviceBuffer& dst, const std::vector<float>& values) {
+            const auto bits = bf16_bits(values);
+            dst.copy_from_host(bits.data(), dst.bytes);
+        };
+        upload_bf16(device.q, input.q);
+        upload_bf16(device.k, input.k);
+        upload_bf16(device.v, input.v);
+        upload_bf16(device.g, input.g);
+        upload_bf16(device.beta, input.beta);
+        device.a_log.copy_from_host(input.a_log.data(), device.a_log.bytes);
+        device.dt_bias.copy_from_host(input.dt_bias.data(), device.dt_bias.bytes);
+        state_in.copy_from_host(input.state.data(), state_in.bytes());
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        CUDA_CHECK(cudaMemsetAsync(out.data(), 0xff, out.bytes(), stream));
+        CUDA_CHECK(cudaMemsetAsync(state_out.data(), 0xff, state_out.bytes(), stream));
+        CUDA_CHECK(cudaMemsetAsync(views.scratch.data(), 0xff, views.scratch.bytes(), stream));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto ref = kda_ref::evaluate(input, c.lower_bound, kScale);
+        failures += verify_result(std::string(c.name) + " " + std::to_string(replay), input, ref,
+                                  state_out, out, true);
+        failures += verify_inputs_unchanged(c.name, input, device);
+        failures +=
+            verify_exact("graph state input unchanged",
+                         from_device<float>(state_in.data(), input.state.size()), input.state);
+        failures += state_in.verify_guards(c.name);
+        failures += views.scratch.verify_guards("graph workspace");
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaStreamDestroy(stream));
     return failures;
 }
 
@@ -434,10 +535,11 @@ int contract_rejection_cases() {
     Tensor state(state_buffer.p, DType::FP32, {kStateDim, kStateDim, heads});
     Tensor out(vectors.p, DType::BF16, {kStateDim, heads, 1});
 
+    WorkspaceArena workspace(256);
     const auto rejects = [&](const Tensor& test_g, float lower_bound, float scale) {
         try {
             ops::kimi_delta_attention(q, k, v, test_g, beta, a_log, dt_bias, lower_bound, scale,
-                                      state, out, nullptr);
+                                      workspace, state, out, execution());
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;
@@ -469,6 +571,7 @@ int main() {
     }
 
     int failures = contract_rejection_cases();
+    failures += graph_replay_case();
     failures += batch_contract_rejection_cases();
     failures += inplace_case({"Kimi Linear ordinary", 32, 7}, 32007U);
     failures += distinct_case({"Kimi Linear ordinary", 32, 7}, 32107U);
@@ -482,6 +585,34 @@ int main() {
     failures +=
         batch_update_case({"Kimi K3 ordinary", 96, 1}, {10, 3, 7, 0, 9, 5, 1, 8}, 11, 96801U);
     failures += batch_update_case({"runtime head count", 5, 1}, {3, 0, 4}, 5, 50301U);
+
+    for (const auto [qheads, vheads] :
+         {std::pair{16, 48}, {16, 32}, {96, 96}, {64, 64}, {1, 32}, {5, 15}}) {
+        Case c{"grouped recurrent", vheads, 7};
+        c.qk_heads = qheads;
+        failures += distinct_case(c, 31415U + vheads);
+        c.tokens = 1;
+        failures += batch_update_case(c, {5, 1, 3}, 7, 27182U + vheads);
+        c.tokens = 129;
+        c.name   = "chunked grouped";
+        failures += distinct_case(c, 16180U + vheads);
+        failures += inplace_case(c, 14142U + vheads);
+    }
+    for (int t : {11, 12, 13, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1025}) {
+        Case c{"chunk boundary", 3, t};
+        c.qk_heads = 1;
+        failures += distinct_case(c, 90000U + t);
+    }
+    Case weak{"weak decay long", 3, 4097};
+    weak.qk_heads   = 1;
+    weak.weak_decay = true;
+    failures += distinct_case(weak, 99887U);
+    weak.lower_bound = 0.0F;
+    weak.name        = "zero decay long";
+    failures += distinct_case(weak, 88776U);
+    failures += distinct_case({"chunk saturated", 5, 257, false, true}, 77665U);
+    failures += distinct_case({"chunk near zero QK", 5, 65, true}, 66554U);
+    failures += distinct_exact_alias_case({"chunk state alias", 32, 65}, 55443U);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " kimi_delta_attention correctness\n";
     return failures == 0 ? 0 : 1;

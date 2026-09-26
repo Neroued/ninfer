@@ -113,22 +113,29 @@ The endpoint supports:
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
-- `stream_options.include_usage`;
+- `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
+  parsers;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
-- non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
-  parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
-  function-call history;
-- the top-level `reasoning_effort` field;
+- function tools and free-form `custom` tools, the latter served to the model as a
+  single-string-input function under the caller's own tool name so callers that dispatch by name
+  keep working;
+- `tool_choice` `auto`/`none`, and `required`, named-function, `custom`, or function-only
+  `allowed_tools` selections, which are accepted and treated as advisory narrowing because the
+  Engine cannot force a call;
+- `strict:true` and `parallel_tool_calls:false` as advisory flags: the Engine does not enforce JSON
+  Schema through constrained decoding and cannot limit the model to one call;
+- assistant tool-call history, tool-result messages, and legacy function-call history;
+- the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
+  server-configured level;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+audio/file input or audio output, explicit low/high image detail, web search, moderation, low/high
+verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
@@ -174,7 +181,12 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+unambiguously. Parsing stops at the first unsafe call: fully closed declared calls before that
+boundary are retained, ordinary prose outside the marker region is preserved, and rejected marker
+bytes are suppressed rather than returned as assistant text. NInfer never closes a truncated call,
+repairs JSON, guesses a tool name, skips ahead to a later call, or executes an undeclared tool.
+The same strict decoder remains active for requests with no effective tools, where every generated
+tool name is undeclared and the marker region is suppressed.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.
@@ -428,7 +440,10 @@ wire response contains typed `output` Items.
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. When a rejection is caused by a
+specific value, the error names that value (ASCII-escaped and truncated), its size where relevant,
+and its location in the request, both in the error `param` (for example `tools[0].function.name`
+or `messages[2].tool_calls[0].function.name`) and in the message text.
 
 ### Input Item contract
 
@@ -510,9 +525,9 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
-without changing declaration order, while `tool_choice:"none"` disables structured tool output even
-when the history contains earlier calls.
+undeclared model tool markup is suppressed and never becomes executable or assistant text.
+`allowed_tools` with mode `auto` filters that set without changing declaration order, while
+`tool_choice:"none"` disables structured tool output even when the history contains earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
@@ -529,10 +544,13 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 - one or more `function_call` Items.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
-produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
-an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses. `completed_at` is populated only for completed Responses. A
-reasoning-only incomplete result contains no invented empty assistant message.
+produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`, unless the terminal
+output contains at least one fully parsed function call. A complete call is actionable and makes
+the public Response `completed`; the Engine finish reason remains unchanged in the structured
+request log. Errors accepted after an SSE response has started produce `response.failed`;
+validation and preparation errors remain normal HTTP error responses. `completed_at` is populated
+only for completed Responses. A reasoning-only incomplete result contains no invented empty
+assistant message.
 
 Usage is checkpoint-native:
 
@@ -575,7 +593,8 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+Malformed/undeclared marker regions are suppressed; complete declared calls before the first unsafe
+call are emitted normally, and parsing never skips ahead to execute a later call.
 
 ### Local response state and resources
 
@@ -792,6 +811,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
+| `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
@@ -832,8 +852,9 @@ but Serve throughput is always a persistent record. Redirected stderr contains n
 sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
 complete fields and full precision. Operational records never contain prompts, generated text,
 request bodies, credentials, or arbitrary client error messages.
-If a tool marker is returned to text because its structure or tool identity cannot be represented,
-Serve emits one warning with only the failure classification, never the generated markup.
+When an unsafe tool-marker region is encountered, Serve emits one warning with only the failure
+classification and suppressed-byte count, never the generated markup. If complete declared calls
+were recovered before the defect, the warning also records the recovered-call count.
 
 ## Structured request log
 
@@ -842,7 +863,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -861,9 +882,11 @@ they do not infer request behavior from process-global counter deltas.
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
-call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
+call count, recovered-call count, suppressed marker-byte count, empty non-string arguments omitted
+during normalization, schema-mismatched arguments preserved for consumer validation, and stable
+fallback/recovery reasons. `fallback_reason` describes a rejected first call with zero executable
+calls; `recovery_reason` describes the unsafe suffix after retained complete calls. Reasons are
+`none`, `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
 `trailing_content`. These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
@@ -997,7 +1020,9 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
 responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+decoding. Parsing commits only fully closed calls whose names are declared by the current request,
+stops at the first unsafe call, and suppresses rejected marker bytes. Earlier complete calls remain
+structured; a malformed first call executes nothing.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

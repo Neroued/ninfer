@@ -68,13 +68,50 @@ tool_call(std::string_view tool_name,
     return text;
 }
 
-int check_rejected(const std::string& text, const fi::ToolCallOutputContract& contract,
-                   ninfer::ToolCallParseFallbackReason reason, std::string_view message) {
+int check_suppressed(const std::string& text, const fi::ToolCallOutputContract& contract,
+                     ninfer::ToolCallParseFallbackReason reason,
+                     std::string_view expected_content, std::string_view message) {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
-    return check(!parsed.is_tool_call_response && parsed.content == text &&
+    return check(!parsed.is_tool_call_response && parsed.content == expected_content &&
                      parsed.tool_calls.empty() && parsed.diagnostics.marker_seen &&
                      parsed.diagnostics.fallback_reason == reason,
                  std::string(message));
+}
+
+bool same_tool_calls(const std::vector<ninfer::GeneratedToolCall>& left,
+                     const std::vector<ninfer::GeneratedToolCall>& right) {
+    if (left.size() != right.size()) { return false; }
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (left[index].name != right[index].name ||
+            left[index].arguments_json != right[index].arguments_json) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool every_incremental_split_matches(
+    const std::string& text, std::shared_ptr<const fi::ToolCallOutputContract> contract,
+    const fi::ParsedToolCallOutput& expected) {
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        std::string visible = decoder.feed(std::string_view(text).substr(0, split));
+        visible += decoder.feed(std::string_view(text).substr(split));
+        auto terminal = decoder.finish();
+        visible += terminal.content;
+        if (visible != expected.content || !same_tool_calls(terminal.tool_calls, expected.tool_calls) ||
+            terminal.diagnostics != expected.diagnostics) {
+            return false;
+        }
+    }
+
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible;
+    for (const char byte : text) { visible += decoder.feed(std::string_view(&byte, 1)); }
+    auto terminal = decoder.finish();
+    visible += terminal.content;
+    return visible == expected.content && same_tool_calls(terminal.tool_calls, expected.tool_calls) &&
+           terminal.diagnostics == expected.diagnostics;
 }
 
 int check_parameter_schema_mismatch(const fi::ToolCallOutputContract& contract,
@@ -221,12 +258,12 @@ int test_unrepresentable_parameter_delimiters_fall_back() {
     const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
 
     int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+    failures += check_suppressed(unmatched_open, contract,
+                                 ninfer::ToolCallParseFallbackReason::MalformedStructure, {},
+                                 "unbalanced nested parameter open was silently repaired");
+    failures += check_suppressed(standalone_close, contract,
+                                 ninfer::ToolCallParseFallbackReason::MalformedStructure, {},
+                                 "standalone parameter close was guessed to be string content");
     return failures;
 }
 
@@ -547,36 +584,38 @@ int test_strict_structure_and_active_tool_set() {
     int failures        = 0;
 
     const std::string malformed = "<tool_call>\n<function=configure>\n";
-    failures +=
-        check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                       "missing structural tags were accepted");
+    failures += check_suppressed(malformed, contract,
+                                 ninfer::ToolCallParseFallbackReason::MalformedStructure, {},
+                                 "missing structural tags were accepted");
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
+    const auto suffix_parsed = fi::parse_qwen_tool_call_output(suffix, 64, contract);
+    failures += check(suffix_parsed.is_tool_call_response &&
+                          suffix_parsed.content == "\nextra answer" &&
+                          suffix_parsed.tool_calls.size() == 1,
+                      "complete call was not retained alongside trailing prose");
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
         "</function>\n</tool_call>";
-    failures += check_rejected(missing_parameter_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "missing parameter close was repaired");
+    failures += check_suppressed(missing_parameter_close, contract,
+                                 ninfer::ToolCallParseFallbackReason::MalformedStructure, {},
+                                 "missing parameter close was repaired");
 
     const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
-    failures +=
-        check_rejected(duplicate, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
-                       "duplicate parameter was silently overwritten");
+    failures += check_suppressed(duplicate, contract,
+                                 ninfer::ToolCallParseFallbackReason::DuplicateParameter, {},
+                                 "duplicate parameter was silently overwritten");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
-    failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
-                       "undeclared tool name was accepted");
+    failures += check_suppressed(unknown_tool, contract,
+                                 ninfer::ToolCallParseFallbackReason::UndeclaredTool, {},
+                                 "undeclared tool name was accepted");
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
-    failures += check_rejected(invalid_name, kLegacyContract,
-                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
-                               "invalid function-name character was accepted");
+    failures += check_suppressed(invalid_name, kLegacyContract,
+                                 ninfer::ToolCallParseFallbackReason::InvalidToolName, {},
+                                 "invalid function-name character was accepted");
     return failures;
 }
 
@@ -634,12 +673,98 @@ int test_conflicting_duplicate_tool_contracts_use_legacy_normalization() {
     return failures;
 }
 
-int test_all_or_nothing_structural_commit() {
-    const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
-    const std::string text = tool_call("configure", {{"flag", "true"}}) +
-                             "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                          "partially valid tool-call region was partially committed");
+int test_safe_structural_recovery() {
+    const auto shared_contract =
+        output_contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    const auto& contract       = *shared_contract;
+    const std::string valid    = tool_call("configure", {{"flag", "true"}});
+    const std::string malformed_second =
+        valid + "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
+    const std::string undeclared_second = valid + "\n" + tool_call("stale_tool");
+    const std::string duplicate_second =
+        valid + "\n" + tool_call("configure", {{"flag", "false"}, {"flag", "true"}});
+    const std::string prose_then_malformed =
+        valid + "\nordinary suffix\n<tool_call>\n<function=configure>";
+    const std::string prefixed_malformed =
+        "ordinary prefix  \n<tool_call>\n<function=configure>";
+    const std::string malformed_then_valid =
+        "<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n" + valid;
+    const std::string two_valid_then_malformed =
+        valid + "\n" + valid + "\n<tool_call>\n<function=configure>";
+
+    int failures = 0;
+    const auto malformed =
+        fi::parse_qwen_tool_call_output(malformed_second, 64, contract);
+    failures += check(malformed.is_tool_call_response && malformed.content.empty() &&
+                          malformed.tool_calls.size() == 1 &&
+                          Json::parse(malformed.tool_calls.front().arguments_json).at("flag") == true,
+                      "complete call was discarded because a later call was truncated");
+
+    const auto undeclared =
+        fi::parse_qwen_tool_call_output(undeclared_second, 64, contract);
+    failures += check(undeclared.is_tool_call_response && undeclared.content.empty() &&
+                          undeclared.tool_calls.size() == 1,
+                      "complete call was discarded because a later tool was undeclared");
+
+    const auto duplicate =
+        fi::parse_qwen_tool_call_output(duplicate_second, 64, contract);
+    failures += check(duplicate.is_tool_call_response && duplicate.content.empty() &&
+                          duplicate.tool_calls.size() == 1,
+                      "complete call was discarded because a later parameter was duplicated");
+
+    const auto prose =
+        fi::parse_qwen_tool_call_output(prose_then_malformed, 64, contract);
+    failures += check(prose.is_tool_call_response && prose.content == "\nordinary suffix\n" &&
+                          prose.tool_calls.size() == 1,
+                      "ordinary suffix before rejected markup was not preserved");
+
+    const auto prefixed =
+        fi::parse_qwen_tool_call_output(prefixed_malformed, 64, contract);
+    failures += check(!prefixed.is_tool_call_response && prefixed.content == "ordinary prefix" &&
+                          prefixed.tool_calls.empty(),
+                      "ordinary prefix was not retained when the first call was malformed");
+
+    const auto no_skip =
+        fi::parse_qwen_tool_call_output(malformed_then_valid, 64, contract);
+    failures += check(!no_skip.is_tool_call_response && no_skip.content.empty() &&
+                          no_skip.tool_calls.empty(),
+                      "parser skipped an unsafe call and executed a later call");
+
+    const auto two_valid =
+        fi::parse_qwen_tool_call_output(two_valid_then_malformed, 64, contract);
+    failures += check(two_valid.is_tool_call_response && two_valid.content.empty() &&
+                          two_valid.tool_calls.size() == 2,
+                      "multiple complete calls were discarded by a malformed tail");
+
+    for (const auto& [name, text, expected] :
+         std::initializer_list<std::tuple<std::string_view, const std::string*,
+                                          const fi::ParsedToolCallOutput*>>{
+             {"malformed tail", &malformed_second, &malformed},
+             {"undeclared tail", &undeclared_second, &undeclared},
+             {"duplicate tail", &duplicate_second, &duplicate},
+             {"prose and malformed tail", &prose_then_malformed, &prose},
+             {"malformed first call", &prefixed_malformed, &prefixed},
+             {"no skip ahead", &malformed_then_valid, &no_skip},
+             {"multiple complete calls", &two_valid_then_malformed, &two_valid},
+         }) {
+        failures += check(every_incremental_split_matches(*text, shared_contract, *expected),
+                          std::string(name) + " depends on transport chunk boundaries");
+    }
+
+    const auto empty_contract = contract_from_definitions({});
+    const std::string stale_without_tools = tool_call("run_in_terminal");
+    const auto stale = fi::parse_qwen_tool_call_output(stale_without_tools, 64, *empty_contract);
+    failures += check(!stale.is_tool_call_response && stale.content.empty() &&
+                          stale.tool_calls.empty() && stale.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                      "zero-tool contract exposed or executed stale tool markup");
+
+    const std::string partial_marker = "ordinary text ending in <tool_";
+    const auto partial = fi::parse_qwen_tool_call_output(partial_marker, 64, contract);
+    failures += check(!partial.is_tool_call_response && partial.content == partial_marker &&
+                          partial.tool_calls.empty() && !partial.diagnostics.marker_seen,
+                      "partial marker lookalike was treated as executable markup");
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -674,14 +799,14 @@ int test_incremental_valid_and_boolean() {
     return failures;
 }
 
-int test_incremental_fallback_preserves_bytes() {
+int test_incremental_failure_suppresses_markup() {
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
     fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
-    std::string restored;
-    restored += malformed.feed(original.substr(0, 10));
-    restored += malformed.feed(original.substr(10));
+    std::string visible;
+    visible += malformed.feed(original.substr(0, 10));
+    visible += malformed.feed(original.substr(10));
     auto malformed_terminal = malformed.finish();
-    restored += malformed_terminal.content;
+    visible += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
@@ -696,10 +821,10 @@ int test_incremental_fallback_preserves_bytes() {
     partial_restored += partial.finish().content;
 
     int failures = 0;
-    failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
+    failures += check(visible == "prefix" && malformed_terminal.diagnostics.marker_seen &&
                           malformed_terminal.diagnostics.fallback_reason ==
                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                      "malformed incremental call lost raw bytes or fallback diagnostics");
+                      "malformed incremental call leaked markup or lost diagnostics");
     failures += check(ordinary_text == "ordinary text  ",
                       "ordinary incremental output lost trailing whitespace");
     failures +=
@@ -752,9 +877,9 @@ int main() {
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
-    failures += test_all_or_nothing_structural_commit();
+    failures += test_safe_structural_recovery();
     failures += test_incremental_valid_and_boolean();
-    failures += test_incremental_fallback_preserves_bytes();
+    failures += test_incremental_failure_suppresses_markup();
     failures += test_incremental_embedded_parameter_markup();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

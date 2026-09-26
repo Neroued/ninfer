@@ -226,6 +226,77 @@ Json function_tool(std::string name = "weather", bool strict = false) {
                                   {"strict", strict}}}};
 }
 
+int test_tool_name_diagnostics() {
+    int failures = 0;
+
+    Json body                                    = base_request();
+    body["tools"]                               = Json::array({function_tool("weather")});
+    body["tools"][0]["function"]["name"]        = "mcp.weather";
+    const std::string limit_spec =
+        "[A-Za-z0-9_-]{1," + std::to_string(kMaximumToolNameLength) + "}";
+    const ApiError invalid_name                  = api_error([&] { (void)parse(body); });
+    failures += check(invalid_name.status == 400 &&
+                          invalid_name.param == "tools[0].function.name" &&
+                          invalid_name.message.find("'mcp.weather'") != std::string::npos &&
+                          invalid_name.message.find("11 bytes") != std::string::npos &&
+                          invalid_name.message.find(limit_spec) != std::string::npos,
+                      "invalid tool name rejection names the value, its length, and its location");
+
+    body["tools"][0]["function"]["name"] = Json::array({"not", "a", "string"});
+    const ApiError non_string             = api_error([&] { (void)parse(body); });
+    failures += check(non_string.param == "tools[0].function.name" &&
+                          non_string.message.find("must be a string") != std::string::npos &&
+                          non_string.message.find("array") != std::string::npos,
+                      "non-string tool name rejection reports the actual JSON type");
+
+    body                                 = base_request();
+    body["tools"]                        = Json::array({function_tool("weather")});
+    body["tools"][0]["function"]["name"] = "bad\nname";
+    const ApiError escaped               = api_error([&] { (void)parse(body); });
+    failures += check(escaped.message.find("bad\\x0aname") != std::string::npos &&
+                          escaped.message.find('\n') == std::string::npos,
+                      "control characters in a rejected name are escaped, not embedded raw");
+
+    // Regression for VS Code Copilot agent traffic: MCP activation wrappers are
+    // synthesized as "activate_fallback_mcp_<server>_<tool>" and exceed the
+    // OpenAI 64-byte limit; the Engine must accept them up to the shared cap.
+    const std::string mcp_name =
+        "activate_fallback_mcp_pgsql-tools_pgsql_get_dashboard_metric_data";
+    body["tools"][0]["function"]["name"] = mcp_name;
+    const OpenAIChatRequest mcp_ok        = parse(body);
+    failures += check(mcp_name.size() == 65 && mcp_ok.generation.tools.size() == 1 &&
+                          mcp_ok.generation.tools[0].name == mcp_name,
+                      "MCP wrapper names longer than 64 bytes are accepted");
+
+    Json history = base_request();
+    history["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_1"},
+                                 {"type", "function"},
+                                 {"function",
+                                  Json{{"name", "mcp.weather"}, {"arguments", "{}"}}}}})}}});
+    const ApiError history_error = api_error([&] { (void)parse(history); });
+    failures += check(history_error.param == "messages[1].tool_calls[0].function.name" &&
+                          history_error.message.find("'mcp.weather'") != std::string::npos,
+                      "invalid historical tool_call name reports its message location");
+
+    Json allowed        = base_request();
+    allowed["tools"]    = Json::array({function_tool("weather")});
+    allowed["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"allowed_tools",
+              Json{{"mode", "auto"},
+                   {"tools", Json::array({Json{{"type", "function"}, {"name", "bad.name"}}})}}}};
+    const ApiError allowed_error = api_error([&] { (void)parse(allowed); });
+    failures += check(allowed_error.param == "tool_choice.allowed_tools.tools[0].name",
+                      "invalid allowed_tools name reports its location");
+
+    return failures;
+}
+
 int test_tools() {
     int failures                      = 0;
     Json body                         = base_request();
@@ -250,11 +321,13 @@ int test_tools() {
               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
 
     body["tool_choice"] = "required";
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "required tool choice rejected");
+    const GenerationRequest required_choice = parse(body).generation;
+    failures += check(required_choice.uses_tools() &&
+                          prompt(required_choice).options.tool_jsons.size() == 1,
+                      "required tool choice is accepted as advisory auto selection");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "named tool choice rejected");
+    failures += check(parse(body).generation.uses_tools(),
+                      "named tool choice is accepted as advisory auto selection");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -275,31 +348,43 @@ int test_tools() {
     const GenerationRequest direct_allowed = parse(body).generation;
     failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
                       "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"]     = "required";
-    const ApiError required_allowed = api_error([&] { (void)parse(body); });
-    failures +=
-        check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.find("at least one tool call") != std::string::npos,
-              "required allowed_tools reports the unenforceable guarantee");
+    body["tool_choice"]["mode"] = "required";
+    const GenerationRequest required_allowed = parse(body).generation;
+    failures += check(required_allowed.tools.size() == 1 &&
+                          required_allowed.tools[0].name == "weather",
+                      "required allowed_tools is accepted as advisory auto selection");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
-    failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
-                      "allowed_tools rejects names absent from the declared tool set");
+    failures += check(
+        api_error([&] { (void)parse(body); }).param == "tool_choice.allowed_tools.tools[0].name",
+        "allowed_tools rejects names absent from the declared tool set");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
-    body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
-                      "custom tools rejected");
+    const OpenAIChatRequest strict_tools = parse(body);
+    failures += check(strict_tools.generation.tools.size() == 1 &&
+                          prompt(strict_tools.generation).options.tool_jsons[0].find(
+                              "\"strict\":false") != std::string::npos,
+                      "strict tools are accepted as advisory without reaching the prompt");
+    body["tools"] = Json::array({Json{{"type", "custom"},
+                                      {"custom",
+                                       Json{{"name", "shell"},
+                                            {"description", "Run a shell command"},
+                                            {"format", Json{{"type", "grammar"},
+                                                             {"grammar", "start: /.+/"}}}}}}});
+    const GenerationRequest custom_tools = parse(body).generation;
+    failures += check(custom_tools.tools.size() == 1 && custom_tools.tools[0].name == "shell" &&
+                          custom_tools.tools[0].input_schema_json.find("\"input\"") !=
+                              std::string::npos &&
+                          custom_tools.tools[0].input_schema_json.find("start: /.+/") !=
+                              std::string::npos,
+                      "custom tools are served as a single-string-input function");
 
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    failures += check(parse(body).generation.uses_tools(),
+                      "parallel_tool_calls=false is accepted as advisory with tools enabled");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");
@@ -505,6 +590,16 @@ int test_messages_and_media() {
 int test_reasoning_and_extensions() {
     int failures = 0;
     Json body    = base_request();
+    body["reasoning_effort"] = "default";
+    failures += check(!parse(body).generation.reasoning_effort.has_value(),
+                      "reasoning_effort default alias resolves to the server-configured level");
+    body["reasoning_effort"] = "auto";
+    failures += check(!parse(body).generation.reasoning_effort.has_value(),
+                      "reasoning_effort auto alias resolves to the server-configured level");
+    body["reasoning_effort"] = "xhigh";
+    failures += check(parse(body).generation.reasoning_effort == RequestedReasoningEffort::XHigh,
+                      "explicit reasoning_effort still reaches the Engine");
+    body = base_request();
     body["messages"].push_back(Json{{"role", "assistant"},
                                     {"content", "answer"},
                                     {"reasoning_content", "thought"},
@@ -635,6 +730,7 @@ int test_aggregate_response() {
         "aggregate timings use exact cache and N-1 generation intervals");
 
     outcome.text.clear();
+    outcome.finish_reason = ninfer::FinishReason::OutputLimit;
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name = "Edit",
         .arguments_json =
@@ -680,6 +776,19 @@ int test_stream_response() {
                       "dedicated stream usage carries token accounting and terminal timings");
     failures += check(events.back() == "data: [DONE]\n\n", "stream ends with DONE sentinel");
 
+    OpenAIChatStream choiced_stream(identity(), true, false, false, true);
+    (void)choiced_stream.start();
+    (void)choiced_stream.reasoning_delta("thought");
+    (void)choiced_stream.content_delta("ans");
+    const std::vector<std::string> choiced_events = choiced_stream.finish(outcome);
+    const Json choiced_usage                      = parse_sse(choiced_events[2]);
+    failures += check(choiced_usage["choices"].size() == 1 &&
+                          choiced_usage["choices"][0]["delta"].empty() &&
+                          choiced_usage["choices"][0]["finish_reason"].is_null() &&
+                          choiced_usage["usage"]["completion_tokens"] ==
+                              usage["usage"]["completion_tokens"],
+                      "usage-chunk-choice keeps usage accounting with a zero-delta choice");
+
     OpenAIChatStream mismatch(identity(), false);
     (void)mismatch.start();
     (void)mismatch.content_delta("different");
@@ -691,7 +800,7 @@ int test_stream_response() {
     GenerationOutcome tool_outcome;
     tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
-    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
+    tool_outcome.finish_reason                 = ninfer::FinishReason::OutputLimit;
     const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
     const Json tool_delta                      = parse_sse(tool_events[0]);
     failures += check(
@@ -784,6 +893,7 @@ int main() {
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
+    failures += test_tool_name_diagnostics();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();

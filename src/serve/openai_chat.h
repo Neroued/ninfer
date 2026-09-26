@@ -45,7 +45,8 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
 class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                     bool timings_per_token = false, bool return_progress = false);
+                     bool timings_per_token = false, bool return_progress = false,
+                     bool usage_chunk_choice = false);
 
     std::string start();
     void note_start(const ninfer::GenerationStart& start);
@@ -70,6 +71,7 @@ private:
     bool include_usage_                     = false;
     bool timings_per_token_                 = false;
     bool return_progress_                   = false;
+    bool usage_chunk_choice_                = false;
     bool started_                           = false;
     bool admitted_                          = false;
     bool progress_started_                  = false;

@@ -37,7 +37,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 21,
+        "schema_version": 22,
         "event": "request_done",
         "request": {
             "model": spec.model_id,

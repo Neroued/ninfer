@@ -445,9 +445,12 @@ int main() {
     failures +=
         check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
+                  done.at("result").at("tool_call_parse").at("recovered_call_count") == 0 &&
+                  done.at("result").at("tool_call_parse").at("suppressed_marker_bytes") == 0 &&
                   done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
-                  done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
+                  done.at("result").at("tool_call_parse").at("fallback_reason") == "none" &&
+                  done.at("result").at("tool_call_parse").at("recovery_reason") == "none",
               "default tool-call parse diagnostics missing");
     outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::PrivateResponseReplay;
     const Json response_restore =
@@ -512,31 +515,79 @@ int main() {
             normalized_tool_done.at("result")
                     .at("tool_call_parse")
                     .at("schema_mismatch_arguments") == 2 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("recovered_call_count") ==
+                0 &&
+            normalized_tool_done.at("result")
+                    .at("tool_call_parse")
+                    .at("suppressed_marker_bytes") == 0 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                "none" &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("recovery_reason") ==
                 "none" &&
             !render_tool_call_fallback(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
+
+    GenerationOutcome recovered_outcome = normalized_tool_outcome;
+    recovered_outcome.tool_call_parse    = {
+           .marker_seen               = true,
+           .structured_call_count     = 1,
+           .recovered_call_count      = 1,
+           .suppressed_marker_bytes   = 42,
+           .empty_arguments_omitted   = 0,
+           .schema_mismatch_arguments = 0,
+           .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+           .recovery_reason = ninfer::ToolCallParseFallbackReason::MalformedStructure,
+    };
+    const Json recovered_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, recovered_outcome));
+    failures += check(
+        recovered_done.at("result").at("tool_call_count") == 1 &&
+            recovered_done.at("result").at("tool_call_parse").at("recovered_call_count") == 1 &&
+            recovered_done.at("result")
+                    .at("tool_call_parse")
+                    .at("suppressed_marker_bytes") == 42 &&
+            recovered_done.at("result").at("tool_call_parse").at("fallback_reason") == "none" &&
+            recovered_done.at("result").at("tool_call_parse").at("recovery_reason") ==
+                "malformed_structure",
+        "recovered tool-call diagnostics are incomplete");
+    const std::optional<OperationalRecord> recovery_warning =
+        render_tool_call_fallback(context, recovered_outcome);
+    failures += check(
+        recovery_warning && recovery_warning->severity == OperationalSeverity::Warning &&
+            recovery_warning->message ==
+                "req#7 recovered complete tool calls 1 | malformed structure | suppressed unsafe "
+                "tool markup 42 bytes",
+        "recovered tool-call warning is absent or ambiguous");
 
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
           .marker_seen               = true,
           .structured_call_count     = 0,
+          .recovered_call_count      = 0,
+          .suppressed_marker_bytes   = 42,
           .empty_arguments_omitted   = 0,
           .schema_mismatch_arguments = 0,
           .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .recovery_reason           = ninfer::ToolCallParseFallbackReason::None,
     };
     const Json fallback_done =
-        Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
+        Json::parse(format_request_done_json("serve-test", 3004, context, fallback_outcome));
     failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
+                          fallback_done.at("result")
+                                  .at("tool_call_parse")
+                                  .at("suppressed_marker_bytes") == 42 &&
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                              "duplicate_parameter",
-                      "tool-call text fallback diagnostics missing from JSONL");
+                              "duplicate_parameter" &&
+                          fallback_done.at("result").at("tool_call_parse").at("recovery_reason") ==
+                              "none",
+                      "tool-call suppression diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
-        "tool-call text fallback warning is absent or exposes raw content");
+            fallback_warning->message ==
+                "req#7 suppressed unsafe tool markup 42 bytes | duplicate parameter",
+        "tool-call suppression warning is absent or exposes raw content");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

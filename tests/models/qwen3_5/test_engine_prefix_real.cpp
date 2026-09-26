@@ -40,7 +40,9 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
-    options.context_cache.device_state_slots     = 1;
+    // This fixture asserts a complete Host restore. Extra Device checkpoint slots can leave the
+    // selected endpoint resident and turn the pressure request into a different valid scenario.
+    options.context_cache.device_state_slots     = 0;
     options.context_cache.host_state_slots       = 2;
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
@@ -229,13 +231,39 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
+struct RegisteredFrontendGoldens {
+    std::uint32_t thinking_tokens;
+    std::uint32_t no_thinking_tokens;
+    ninfer::PrefixReusePath host_restore_path;
+};
+
+std::optional<RegisteredFrontendGoldens> registered_frontend_goldens(
+    std::string_view model_name) {
+    if (model_name == "qwen3.6-27b") {
+        return RegisteredFrontendGoldens{16, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
+    }
+    if (model_name == "qwen3.8-27b") {
+        return RegisteredFrontendGoldens{58, 18, ninfer::PrefixReusePath::PrivateEndpoint};
+    }
+    return std::nullopt;
+}
+
 int exercise_registered_frontend(const ninfer::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
-        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
+    const auto thinking_tokens    = engine.count_tokens(chinese_chat(true));
+    const auto no_thinking_tokens = engine.count_tokens(chinese_chat(false));
+    const auto model_name         = engine.load_summary().model_name;
+    const auto goldens            = registered_frontend_goldens(model_name);
+    if (!goldens) {
+        std::cerr << "registered tokenizer/chat template has no prompt golden: model="
+                  << model_name << '\n';
         return 1;
     }
-    if (engine.count_tokens(chinese_chat(false)) != 18) {
-        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden\n";
+    if (thinking_tokens != goldens->thinking_tokens ||
+        no_thinking_tokens != goldens->no_thinking_tokens) {
+        std::cerr << "registered tokenizer/chat template changed a prompt golden: model="
+                  << model_name << " thinking=" << thinking_tokens << "/"
+                  << goldens->thinking_tokens << " no_thinking=" << no_thinking_tokens << "/"
+                  << goldens->no_thinking_tokens << '\n';
         return 1;
     }
     return 0;
@@ -460,6 +488,12 @@ int exercise_prefix(ninfer::Engine& engine) {
 
 int exercise_host_restore(const char* artifact) {
     ninfer::Engine engine(host_restore_engine_options(artifact));
+    const auto model_name = engine.load_summary().model_name;
+    const auto goldens    = registered_frontend_goldens(model_name);
+    if (!goldens) {
+        std::cerr << "Host-restore fixture has no reuse-path golden: model=" << model_name << '\n';
+        return 1;
+    }
     auto options = [](std::uint32_t outputs, bool reuse) {
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = outputs;
@@ -525,18 +559,32 @@ int exercise_host_restore(const char* artifact) {
         engine.generate(engine.prepare(std::move(continuation)), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.runtime_stats();
     if (restored.generated_token_ids.size() != 2 ||
-        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
+        restored.prefix_reuse_path != goldens->host_restore_path ||
         restored.reused_prompt_tokens == 0 ||
         after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
         after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
         after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
         std::cerr << "Complete MTP checkpoint was not materialized from Host: path="
-                  << static_cast<int>(restored.prefix_reuse_path)
+                  << static_cast<int>(restored.prefix_reuse_path) << '/'
+                  << static_cast<int>(goldens->host_restore_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.state_h2d_count
-                  << " main=" << after_restore.main_kv_h2d_pages
-                  << " backend=" << after_restore.backend_kv_h2d_pages
+                  << " state_d2h=" << before_pressure.state_d2h_count << '/'
+                  << after_pressure.state_d2h_count << '/' << after_restore.state_d2h_count
+                  << " state_h2d=" << before_pressure.state_h2d_count << '/'
+                  << after_pressure.state_h2d_count << '/' << after_restore.state_h2d_count
+                  << " state_d2d=" << before_pressure.state_d2d_count << '/'
+                  << after_pressure.state_d2d_count << '/' << after_restore.state_d2d_count
+                  << " slots=" << after_pressure.device_state_occupied_slots << ':'
+                  << after_pressure.host_state_occupied_slots << '/'
+                  << after_restore.device_state_occupied_slots << ':'
+                  << after_restore.host_state_occupied_slots
+                  << " main=" << after_pressure.main_kv_h2d_pages << '/'
+                  << after_restore.main_kv_h2d_pages
+                  << " backend=" << after_pressure.backend_kv_h2d_pages << '/'
+                  << after_restore.backend_kv_h2d_pages
+                  << " host_kv=" << after_pressure.host_kv_occupied_bytes << '/'
+                  << after_restore.host_kv_occupied_bytes
                   << " degraded=" << after_restore.pressure_private_owners_degraded
                   << " evicted=" << after_restore.pressure_private_owners_evicted << '\n';
         return 1;

@@ -17,6 +17,14 @@ from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
 
 
+def _open_named_source(path: Path):
+    if path.suffix == ".gguf":
+        from .sources.gguf import GGUFSource
+
+        return GGUFSource(path)
+    return SafetensorsSource(path)
+
+
 class SourceInputs(Mapping):
     """Named optional sources are opened only when a recipe or component requests one."""
 
@@ -32,7 +40,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
+                _open_named_source(self._paths[name])
             )
         return self._sources[name]
 

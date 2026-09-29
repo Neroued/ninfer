@@ -2,7 +2,7 @@
 
 // Implements: include/ninfer/ops/target_logprobs.h
 // Match: contiguous BF16 [physical_rows,C], I32 [C], and FP32 [C].
-// Algorithm assumptions: one 256-thread CTA performs a stable two-pass logsumexp per column.
+// Algorithm assumptions: one 256-thread CTA performs a single-pass online logsumexp per column.
 
 #include "ops/common/warp.cuh"
 
@@ -47,17 +47,22 @@ __launch_bounds__(BlockSize) __global__
     const std::int64_t base   = static_cast<std::int64_t>(column) * physical_rows;
 
     float local_max = -CUDART_INF_F;
+    float local_sum = 0.0f;
+    // Requires finite logits (see target_logprobs.h): -inf before any finite value in a
+    // thread's subsequence NaN-poisons local_sum through expf(-inf - -inf).
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        local_max = fmaxf(local_max, __bfloat162float(logits[base + row]));
+        const float value   = __bfloat162float(logits[base + row]);
+        const float new_max = fmaxf(local_max, value);
+        if (new_max > local_max) {
+            local_sum *= expf(local_max - new_max);
+        }
+        local_max = new_max;
+        local_sum += expf(value - local_max);
     }
     const float maximum = target_logprobs_block_max<BlockSize>(local_max);
 
-    float local_sum = 0.0f;
-    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
-         row += BlockSize) {
-        local_sum += expf(__bfloat162float(logits[base + row]) - maximum);
-    }
+    local_sum *= expf(local_max - maximum);
     __shared__ float warp_sums[BlockSize / kWarpSize];
     const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
     if (threadIdx.x == 0) {

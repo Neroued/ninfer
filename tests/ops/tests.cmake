@@ -98,6 +98,11 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
+# PILOT: bit-identical check for the TMA activation-staging FP8 variant.
+ninfer_add_op_test(ninfer_fp8_attn_input_tma_pilot_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_attn_input_tma_pilot.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)

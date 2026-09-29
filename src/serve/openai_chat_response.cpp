@@ -199,9 +199,9 @@ std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json f
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
-                        Json timings) {
+                        Json timings, bool with_choice) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
-    payload["choices"] = Json::array();
+    payload["choices"] = with_choice ? Json::array({stream_choice(Json::object())}) : Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     return event(std::move(payload));
@@ -249,9 +249,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
 }
 
 OpenAIChatStream::OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                                   bool timings_per_token, bool return_progress)
+                                   bool timings_per_token, bool return_progress,
+                                   bool usage_chunk_choice)
     : identity_(std::move(identity)), include_usage_(include_usage),
-      timings_per_token_(timings_per_token), return_progress_(return_progress) {}
+      timings_per_token_(timings_per_token), return_progress_(return_progress),
+      usage_chunk_choice_(usage_chunk_choice) {}
 
 std::string OpenAIChatStream::start() {
     if (started_ || finished_) { throw std::logic_error("OpenAI Chat stream already started"); }
@@ -379,7 +381,8 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings));
     }
     if (include_usage_) {
-        events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings));
+        events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings,
+                                     usage_chunk_choice_));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

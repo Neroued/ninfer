@@ -54,6 +54,10 @@ struct ServeOptions {
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    // --usage-chunk-choice: emit the streaming usage chunk with a zero-delta choice instead of the
+    // OpenAI-conformant empty choices array. Strict client parsers (GitHub Copilot) reject the
+    // empty array as "Response contained no choices"; the extra choice is inert for other clients.
+    bool usage_chunk_choice = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

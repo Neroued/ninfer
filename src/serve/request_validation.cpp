@@ -59,4 +59,42 @@ bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept
     return true;
 }
 
+const char* request_json_type_name(const RequestJson& value) noexcept {
+    switch (value.type()) {
+    case RequestJson::value_t::null: return "null";
+    case RequestJson::value_t::object: return "object";
+    case RequestJson::value_t::array: return "array";
+    case RequestJson::value_t::string: return "string";
+    case RequestJson::value_t::boolean: return "boolean";
+    case RequestJson::value_t::number_integer:
+    case RequestJson::value_t::number_unsigned:
+    case RequestJson::value_t::number_float: return "number";
+    case RequestJson::value_t::binary: return "binary";
+    case RequestJson::value_t::discarded: return "discarded";
+    }
+    return "value";
+}
+
+std::string ascii_preview(std::string_view value, std::size_t limit) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() < limit ? value.size() : limit);
+    std::size_t shown = 0;
+    for (const unsigned char character : value) {
+        if (shown == limit) {
+            out += "...";
+            break;
+        }
+        if (character >= 0x20 && character <= 0x7e) {
+            out.push_back(static_cast<char>(character));
+        } else {
+            out += "\\x";
+            out.push_back(kHexDigits[character >> 4]);
+            out.push_back(kHexDigits[character & 0x0f]);
+        }
+        ++shown;
+    }
+    return out;
+}
+
 } // namespace ninfer::serve

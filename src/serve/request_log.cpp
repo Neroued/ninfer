@@ -87,10 +87,14 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
 Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
+                {"recovered_call_count", diagnostics.recovered_call_count},
+                {"suppressed_marker_bytes", diagnostics.suppressed_marker_bytes},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                {"recovery_reason",
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.recovery_reason)}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {

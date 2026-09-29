@@ -109,7 +109,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const bool timings_per_token = request.timings_per_token;
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
-                                                          timings_per_token, return_progress);
+                                                          timings_per_token, return_progress,
+                                                          options_.usage_chunk_choice);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(

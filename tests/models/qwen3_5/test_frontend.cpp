@@ -1633,6 +1633,68 @@ int test_structured_tool_output() {
                               !arguments.contains("enabled") && arguments.at("count") == "many",
                           "frontend did not preserve normalized tool arguments");
     }
+
+    ninfer::ChatMessage recovery_message;
+    recovery_message.role = ninfer::ChatRole::User;
+    recovery_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput recovery_input;
+    recovery_input.messages.push_back(std::move(recovery_message));
+    recovery_input.options.enable_thinking = false;
+    recovery_input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+    auto recovery_prompt  = frontend.prepare(std::move(recovery_input));
+    auto recovery_session = frontend.make_output_session(
+        recovery_prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    const std::string recovery_generated =
+        "<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n</parameter>\n"
+        "</function>\n</tool_call>\n<tool_call>\n<function=TaskUpdate>";
+    const std::vector<ninfer::TokenId> recovery_tokens =
+        fixture_tokenizer().encode(recovery_generated);
+    (void)recovery_session.preview_model(
+        recovery_tokens, static_cast<std::uint32_t>(recovery_tokens.size()),
+        ninfer::FinishReason::OutputLimit);
+    const auto recovery_output = recovery_session.commit_preview();
+    const auto recovered_calls = recovery_session.take_tool_calls();
+    const auto recovery_diagnostics = recovery_session.tool_call_parse_diagnostics();
+    failures += check(channel_text(recovery_output, ninfer::OutputChannel::Content).empty() &&
+                          recovered_calls.size() == 1 &&
+                          recovery_diagnostics.structured_call_count == 1 &&
+                          recovery_diagnostics.recovered_call_count == 1 &&
+                          recovery_diagnostics.suppressed_marker_bytes != 0 &&
+                          recovery_diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None &&
+                          recovery_diagnostics.recovery_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "frontend did not recover a complete call before a malformed tail");
+
+    ninfer::ChatMessage no_tools_message;
+    no_tools_message.role = ninfer::ChatRole::User;
+    no_tools_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput no_tools_input;
+    no_tools_input.messages.push_back(std::move(no_tools_message));
+    no_tools_input.options.enable_thinking = false;
+    auto no_tools_prompt  = frontend.prepare(std::move(no_tools_input));
+    auto no_tools_session = frontend.make_output_session(
+        no_tools_prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    const std::string stale_generated =
+        "ordinary prefix  \n<tool_call>\n<function=run_in_terminal>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> stale_tokens = fixture_tokenizer().encode(stale_generated);
+    (void)no_tools_session.preview_model(stale_tokens,
+                                         static_cast<std::uint32_t>(stale_tokens.size()),
+                                         ninfer::FinishReason::OutputLimit);
+    const auto no_tools_output = no_tools_session.commit_preview();
+    const auto no_tools_diagnostics = no_tools_session.tool_call_parse_diagnostics();
+    failures += check(
+        channel_text(no_tools_output, ninfer::OutputChannel::Content) == "ordinary prefix" &&
+            no_tools_session.take_tool_calls().empty() && no_tools_diagnostics.marker_seen &&
+            no_tools_diagnostics.structured_call_count == 0 &&
+            no_tools_diagnostics.suppressed_marker_bytes != 0 &&
+            no_tools_diagnostics.fallback_reason ==
+                ninfer::ToolCallParseFallbackReason::UndeclaredTool &&
+            no_tools_diagnostics.recovery_reason == ninfer::ToolCallParseFallbackReason::None,
+        "zero-tool frontend exposed or executed stale tool markup");
     return failures;
 }
 

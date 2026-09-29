@@ -297,8 +297,8 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// normalization but do not validate the call. Structure/identity failures never promote rejected
+// marker bytes to ordinary content; complete declared calls before the failure may be recovered.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -330,9 +330,12 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 struct ToolCallParseDiagnostics {
     bool marker_seen                            = false;
     std::uint32_t structured_call_count         = 0;
+    std::uint32_t recovered_call_count          = 0;
+    std::uint32_t suppressed_marker_bytes       = 0;
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    ToolCallParseFallbackReason recovery_reason = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;

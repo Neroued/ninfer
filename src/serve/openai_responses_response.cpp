@@ -31,6 +31,14 @@ std::string response_status(ninfer::FinishReason reason) {
     return "failed";
 }
 
+std::string response_status(const GenerationOutcome& outcome) {
+    // A complete function_call is an actionable terminal Responses result. The engine reason is
+    // still retained in GenerationOutcome and request logs, but must not make the public response
+    // incomplete after the parser safely recovered a fully closed call at the output boundary.
+    if (!outcome.tool_calls.empty()) { return "completed"; }
+    return response_status(outcome.finish_reason);
+}
+
 struct ItemIds {
     std::string reasoning;
     std::string message;
@@ -97,7 +105,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                                    const OpenAIResponsesRuntimeValues& runtime,
                                    const GenerationOutcome& outcome, ItemIds ids) {
     BuiltOpenAIResponse built;
-    const std::string status      = response_status(outcome.finish_reason);
+    const std::string status      = response_status(outcome);
     const std::string item_status = status == "completed" ? "completed" : "incomplete";
 
     if (!outcome.reasoning.empty()) {
@@ -399,7 +407,7 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
     }
     impl_->finish_built = true;
     OpenAIResponsesStreamFinish finished;
-    const std::string status = response_status(outcome.finish_reason);
+    const std::string status = response_status(outcome);
     const char* item_status  = status == "completed" ? "completed" : "incomplete";
 
     auto append = [&](std::vector<std::string> events) {

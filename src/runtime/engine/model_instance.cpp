@@ -112,8 +112,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
-        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
+    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(std::max(
+        concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest)));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
 
     if (*cache.max_private_continuations < concurrency) {

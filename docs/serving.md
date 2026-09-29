@@ -52,6 +52,103 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+## Structured output
+
+NInfer uses the vendored XGrammar v0.2.7 C++ compiler and token matcher to constrain final
+response content. This requires no model conversion or additional weights. Ordinary decoding,
+MTP, DFlash, and DFlash2 share the same target sampling contract, including CUDA Graphs,
+streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests.
+
+Chat Completions accepts:
+
+```json
+{
+  "model": "your-model-id",
+  "messages": [{"role": "user", "content": "Give the city and temperature as JSON."}],
+  "max_tokens": 128,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "weather",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "temperature": {"type": "number"}
+        },
+        "required": ["city", "temperature"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Use `response_format: {"type":"json_object"}` for any JSON object. JSON Schema mode can also
+constrain other root types. Responses uses the flat form
+`text.format: {"type":"json_schema","name":"weather","strict":true,"schema":{...}}` and
+reports that format in its Response object. Anthropic Messages accepts
+`output_config.format: {"type":"json_schema","schema":{...}}`.
+
+Supported schema constraints are `type`, `properties`, `required`, `additionalProperties`,
+`items`, `prefixItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `enum`, `const`,
+`anyOf`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `$defs`, `definitions`,
+and local fragment `$ref` (including recursive schemas).
+Annotations `$schema`, `title`, `description`, `default`, `examples`, and `$comment`
+do not impose generation constraints. Other keywords are rejected with HTTP 400: this includes
+`multipleOf`, `pattern`, `format`, `oneOf`, `allOf`, `uniqueItems`, and conditionals.
+Numeric bounds require an explicit `integer` or `number` type and finite values within
+`+/- (2^53-1)`. Integer bounds must be whole numbers. Bounded numbers use ordinary decimal
+notation with at most six fractional digits; a range with no representable value is rejected.
+`$id` and external references are rejected. An explicit `$schema` must be JSON Schema 2020-12
+or draft-07. Local references use `#` or literal object paths such as `#/$defs/node`;
+escaped or empty path segments are rejected. Bounded strings use unescaped Unicode characters; escaped quotes, backslashes,
+and control characters are excluded from that generated subset. Nonnegative length/item bounds
+must fit a signed 32-bit integer. `$ref` and `anyOf` cannot have sibling constraints; `const`
+and `enum` allow a matching single `type` declaration but no other sibling constraints. Move
+constraints into the referenced schema or each union branch. Missing `additionalProperties`
+and `items` retain JSON Schema defaults. Properties are emitted in schema declaration order;
+this is a valid subset of the requested schema. Whitespace between JSON elements is bounded to
+eight characters per run to prevent whitespace-only generation loops. Additional-property key spellings are restricted
+where necessary to prevent escaped aliases from overwriting declared typed properties.
+`strict:false` does not disable enforcement.
+
+Structured responses default to thinking disabled when no reasoning mode or budget is requested.
+Explicit thinking and thinking budgets are supported: reasoning is returned in its normal channel,
+and the first reasoning-close delimiter transitions to constrained final content. Active tools are
+also supported. After reasoning, a response can emit native Qwen tool calls or the final JSON value.
+The schema applies to final content, not reasoning or tool arguments. Tool responses have their normal
+tool-call finish reason and need not contain a JSON content value. Tool definitions and thinking
+settings may remain enabled on later requests after tool results are supplied.
+
+Serving also exposes the requested format and schema to the model as a leading instruction,
+asking for raw JSON without Markdown fences and retaining tools for information gathering.
+This helps the model choose the intended final-answer branch when tools remain enabled; the
+token grammar enforces validity independently. Tool selection and termination remain model
+decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
+Requests without an explicit response format receive no format instruction or grammar.
+
+The native tool envelope restricts calls to declared names and emits each declared parameter at most
+once, in the declaration order shown in the prompt. Parameter values remain non-strict; delimiter spellings that would make
+Qwen XML ambiguous are excluded. Strict tool argument generation and arbitrary grammar/regex aliases
+remain unsupported. Custom stops and assistant-prefill continuation are rejected with structured
+output. Public C++ callers select `ExecutionOptions::structured_output` and use default stops and
+decoded text output.
+
+Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
+schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
+partial document; inspect the finish reason or Responses status before parsing it as complete.
+SSE content deltas are ordinary partial JSON bytes; concatenate them before parsing. Constraints
+guarantee format, not factual accuracy or semantic task success.
+
+Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
+including correction and bonus tokens. Unconstrained draft distributions remain unchanged;
+accept/reject and residual sampling use the constrained target distribution. Per-request grammar
+state advances only with Engine output commit, and is never restored from a prompt/KV cache.
+DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
+this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -111,7 +208,7 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `n:1`, text-only `modalities`, and `response_format` with `text`, `json_object`, or `json_schema`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -125,8 +222,8 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
+behavior. This includes nonzero `logit_bias`, requested log probabilities,
+audio/file input or audio output, tool `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
@@ -414,7 +511,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` requests disabled thinking; other standard effort values pass to the selected template |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
@@ -514,7 +611,7 @@ undeclared model output remains ordinary text. `allowed_tools` with mode `auto` 
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
+NInfer does not execute functions or constrain tool arguments with JSON Schema, so
 `strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
 tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
 invocation are also rejected because their semantics cannot be honored.
@@ -635,7 +732,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
+moderation, non-empty `include`, background execution, compaction,
 files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
 accepted placeholders.
 
@@ -711,7 +808,7 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+Documents, Search Results, Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
@@ -996,8 +1093,8 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools or constrain their arguments. Final JSON responses can
+use [structured output](#structured-output).
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

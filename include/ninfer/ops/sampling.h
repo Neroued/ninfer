@@ -31,6 +31,11 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Optional device bitset [ceil(token_domain/32), speculative_width]. Column i is
+    // conditioned on drafts[0..i). Mask BEFORE penalties/temperature/top-k/top-p/min-p.
+    // Every reachable column must allow at least one token with a finite logit.
+    const std::uint32_t* token_mask = nullptr;
+    std::int32_t token_mask_stride  = 0; // words per column; ordinary sample uses column zero
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

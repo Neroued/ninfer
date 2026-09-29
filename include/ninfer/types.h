@@ -245,7 +245,15 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
+
+struct StructuredOutputOptions {
+    StructuredOutputKind kind = StructuredOutputKind::None;
+    std::string schema; // JSON Schema for JsonSchema, otherwise empty
+};
+
 struct ExecutionOptions {
+    StructuredOutputOptions structured_output;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;

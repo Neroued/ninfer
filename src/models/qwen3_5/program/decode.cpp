@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -136,6 +137,11 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    if (request.grammar) {
+        request.sampling_host.token_mask        = structured_round->device_mask(sequence.lane);
+        request.sampling_host.token_mask_stride = structured_round->stride();
+        structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+    }
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -328,6 +334,9 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            if (request.grammar) {
+                structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+            }
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
@@ -487,6 +496,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            if (request.grammar) {
+                structured_round->fill(
+                    sequence.lane, *request.grammar,
+                    {mtp_host_ingress->current_drafts.data() + row * draft_window, extent},
+                    device.stream);
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
@@ -685,6 +700,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        structured_round->begin_dflash();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            structured_round->set_dflash_row(row, lanes[row],
+                                             dflash_host_ingress->proposal_extents[row],
+                                             requests[lanes[row]].grammar);
+        }
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -706,6 +727,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        structured_round->check();
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();

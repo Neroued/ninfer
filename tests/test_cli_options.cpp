@@ -104,5 +104,20 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    const auto structured = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json"});
+    failures +=
+        check(structured.structured_output.kind == ninfer::StructuredOutputKind::JsonObject &&
+                  structured.enable_thinking == false,
+              "CLI JSON mode");
+    const auto structured_reasoning = parse(
+        {"ninfer", "model.ninfer", "--prompt", "hello", "--json", "--reasoning-effort", "medium"});
+    failures += check(structured_reasoning.enable_thinking != false &&
+                          structured_reasoning.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "CLI structured output preserves explicit reasoning");
+    failures += check(
+        rejects([] {
+            (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});
+        }),
+        "raw JSON output should be rejected");
     return failures == 0 ? 0 : 1;
 }

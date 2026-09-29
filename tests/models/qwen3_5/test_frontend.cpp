@@ -8,6 +8,7 @@
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "text/unicode.h"
+#include "text/structured_output.h"
 
 #include <nlohmann/json.hpp>
 
@@ -1688,6 +1689,38 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
+int test_structured_thinking_control(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    auto session =
+        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 2},
+                                     {ninfer::StructuredOutputKind::JsonObject, {}});
+    const auto grammar = session.grammar_state();
+    const auto words   = (fixture_tokenizer().vocab_size() + 31) / 32;
+    std::vector<std::uint32_t> before(words), after(words);
+    grammar->fill_masks(before, {});
+    const auto decision = session.preview_model(std::array<ninfer::TokenId, 2>{0, 0}, 1024,
+                                                ninfer::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    int failures =
+        check(decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "structured reasoning did not reach budget control");
+    const auto control = session.pending_control_tokens();
+    (void)session.preview_control(control, 1022);
+    grammar->fill_masks(after, {});
+    const auto x = fixture_byte_token('x');
+    failures += check(after[x / 32] & (1U << (x % 32)), "control preview advanced grammar");
+    (void)session.commit_preview();
+    grammar->fill_masks(after, {});
+    failures +=
+        check(!(after[x / 32] & (1U << (x % 32))), "forced closure left reasoning unconstrained");
+    const auto json_tokens = fixture_tokenizer().encode("{\"ok\":true}");
+    (void)session.preview_model(json_tokens, 900, ninfer::FinishReason::OutputLimit);
+    const auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "{\"ok\":true}",
+                      "structured final content lost after forced reasoning close");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -2193,6 +2226,7 @@ int main() {
     failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_structured_thinking_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

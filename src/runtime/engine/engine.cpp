@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "text/structured_output.h"
 
 #include "core/device.h"
 #include "core/nvtx.h"
@@ -32,12 +33,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
         throw std::invalid_argument("thinking budget must be positive");
     }
+    text::validate_structured_output(options.execution.structured_output);
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
+    resolved.execution.structured_output       = std::move(options.execution.structured_output);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;

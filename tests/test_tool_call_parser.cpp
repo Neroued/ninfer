@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "text/structured_output.h"
 
 #include <nlohmann/json.hpp>
 
@@ -735,8 +736,62 @@ int test_incremental_embedded_parameter_markup() {
 
 } // namespace
 
+int test_constrained_tool_envelope() {
+    const std::vector<std::string> tools{
+        tool_definition("weather", Json{{"city", Json{{"type", "string"}}},
+                                        {"units", Json{{"type", "string"}}}}),
+        tool_definition("clock", Json::object()),
+        R"({"type":"function","function":{"name":"run_code","parameters":{"type":"object","properties":{"language":{"type":"string"},"code":{"type":"string"}}}}})"};
+    auto contract = fi::build_tool_call_output_contract(tools, true);
+    std::vector<std::string> vocab(257);
+    for (int i = 0; i < 256; ++i) { vocab[i] = std::string(1, static_cast<char>(i)); }
+    ninfer::text::StructuredCompiler compiler(vocab, {256});
+    const auto format = fi::structured_tool_call_format(*contract);
+    auto grammar      = compiler.compile(
+        {ninfer::StructuredOutputKind::JsonSchema,
+         R"({"type":"object","properties":{"location":{"type":"string"},"temperature":{"type":"number","minimum":-100,"maximum":100}},"required":["location","temperature"],"additionalProperties":false})"},
+        {.reasoning_close = "</think>", .alternative_format = format});
+    const auto accepts = [&](const std::string& value) {
+        auto trial = grammar->fork();
+        std::vector<ninfer::TokenId> tokens;
+        for (unsigned char ch : value) { tokens.push_back(ch); }
+        tokens.push_back(256);
+        try {
+            trial->accept(tokens);
+            return true;
+        } catch (const std::logic_error&) { return false; }
+    };
+    int failures = check(accepts("plan</think>{\"location\":\"Tokyo\",\"temperature\":28}"),
+                         "reasoning + final schema rejected with multiple tools enabled");
+    failures += check(!accepts("plan</think>{\"location\":\"Tokyo\",\"temperature\":101}"),
+                      "tool alternative weakened final schema");
+    failures += check(accepts("</think><tool_call><function=run_code>"
+                              "<parameter=language>python</parameter>"
+                              "<parameter=code>print(1)</parameter></function></tool_call>"),
+                      "tool grammar reordered prompt-declared parameters");
+    const std::string call = "<tool_call>\n<function=weather>\n<parameter=city>Tokyo</parameter>\n"
+                             "<parameter=units>celsius</parameter>\n</function>\n</tool_call>";
+    const std::string parallel = call + "\n<tool_call><function=clock></function></tool_call>";
+    failures += check(accepts("plan</think>\n" + parallel), "parallel native tools rejected");
+    const auto parsed = fi::parse_qwen_tool_call_output(parallel, 128, *contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                          parsed.content.empty(),
+                      "constrained native calls did not round-trip");
+    failures += check(!accepts("</think>" + call + " prose"), "tool suffix allowed prose");
+    failures += check(!accepts("</think><tool_call><function=unknown></function></tool_call>"),
+                      "undeclared tool accepted");
+    failures += check(!accepts("</think><tool_call><function=weather><parameter=city>x</parameter>"
+                               "<parameter=city>y</parameter></function></tool_call>"),
+                      "duplicate parameter accepted");
+    failures +=
+        check(!accepts("</think><tool_call><function=weather>"), "incomplete tool can stop");
+    failures += check(!accepts("</think>not JSON"), "reasoning alternative escaped constraints");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_constrained_tool_envelope();
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();

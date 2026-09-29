@@ -1,3 +1,4 @@
+#include "serve/structured_output.h"
 #include "serve/anthropic_messages.h"
 #include "serve/request_validation.h"
 
@@ -899,9 +900,8 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        request.structured_output =
+            parse_structured_output(config.at("format"), false, "output_config.format");
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {

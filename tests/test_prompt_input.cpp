@@ -60,6 +60,33 @@ int main() {
         std::cerr << "local messages JSON changed prompt-bearing object member order\n";
         return 1;
     }
+    auto constrained = prompt;
+    constrained.context_cache.markers.push_back(
+        {.after_message_count      = 1,
+         .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+         .after_message_part_count = 1});
+    ninfer::product::apply_structured_output_instruction(
+        constrained, {ninfer::StructuredOutputKind::JsonObject, {}});
+    if (constrained.messages.size() != 3 ||
+        constrained.messages.front().role != ninfer::ChatRole::System ||
+        constrained.messages[1].parts[0].text != prompt.messages[0].parts[0].text ||
+        constrained.context_cache.markers[0].after_message_count != 2 ||
+        constrained.context_cache.markers[0].after_message_part_count != 1) {
+        std::cerr << "structured instruction changed caller content or cache boundary\n";
+        return 1;
+    }
+    auto leading                  = ninfer::product::prompt_from_text("answer", false);
+    leading.messages.front().role = ninfer::ChatRole::System;
+    leading.context_cache.markers.push_back(
+        {.location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+         .leading_instruction_bytes = 3});
+    ninfer::product::apply_structured_output_instruction(
+        leading, {ninfer::StructuredOutputKind::JsonObject, {}});
+    if (leading.messages.size() != 1 || leading.messages[0].parts[0].text != "answer" ||
+        leading.context_cache.markers[0].leading_instruction_bytes != 3) {
+        std::cerr << "structured instruction moved caller instruction boundary\n";
+        return 1;
+    }
     std::cout << "ok\n";
     return 0;
 }

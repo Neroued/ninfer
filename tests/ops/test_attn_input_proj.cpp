@@ -64,7 +64,8 @@ WeightView rows(const WeightParent& parent, std::uint64_t begin, std::uint64_t c
 }
 
 int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* gate_value,
-                               int tokens, ops::LinearPolicy policy, bool replay = false) {
+                               int tokens, ops::LinearPolicy policy, bool replay = false,
+                               bool full_reference = false) {
     constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
     const bool dual      = gate_value != nullptr;
     auto activation      = make_bf16_activation(hidden, tokens, 101U + tokens);
@@ -123,23 +124,26 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         cuda_synchronize(device.stream);
         const bool a8 =
             policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4;
-        const auto criterion     = dual ? kAttnInputProjA16Tolerance
-                                   : a8 ? kAttnInputProjA8Tolerance
-                                        : kFp8AttnInputProjA16Tolerance;
-        const int sample_count   = (a8 || replay) ? 31 : 7;
-        const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
-                                   (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
-                                   " phase=" + std::to_string(phase);
+        const auto criterion         = dual ? kAttnInputProjA16Tolerance
+                                       : a8 ? kAttnInputProjA8Tolerance
+                                            : kFp8AttnInputProjA16Tolerance;
+        const int sample_count       = (a8 || replay) ? 31 : 7;
+        const int query_sample_count = full_reference ? qrows : sample_count;
+        const int kv_sample_count    = full_reference ? kvrows : sample_count;
+        const std::string suffix =
+            std::string(dual ? " Q4/Q5" : " FP8") + (a8 ? " allow-a8" : " a16") +
+            (full_reference ? " complete-output-reference" : "") + " T=" + std::to_string(tokens) +
+            " phase=" + std::to_string(phase);
         failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
-                                  hidden, tokens, criterion, sample_count);
+                                  hidden, tokens, criterion, query_sample_count);
         failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, activation,
-                                  hidden, tokens, criterion, sample_count);
+                                  hidden, tokens, criterion, kv_sample_count);
         failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
                                   dual ? 0 : 7168, qrows, activation, hidden, tokens, criterion,
-                                  sample_count);
+                                  query_sample_count);
         failures += verify_output("attn value" + suffix, value,
                                   dual ? gate_value->host : parent.host, dual ? 6144 : 13312,
-                                  kvrows, activation, hidden, tokens, criterion, sample_count);
+                                  kvrows, activation, hidden, tokens, criterion, kv_sample_count);
         failures += verify_preserved("attn input" + suffix, input, activation_bits);
         failures += scratch.verify_guards(suffix);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) {
@@ -173,6 +177,12 @@ int run_q4_q5() {
     for (int t : {1, 7, 8, 9, 12, 13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only, true);
+    // Compare every output row for both graph replays on the new T=32 grouped mechanism.
+    failures += run_target_projection_case(query_key, &gate_value, 32, ops::LinearPolicy::A16Only,
+                                           true, true);
+    constexpr std::int32_t kFullT32ReferenceValues = 2 * 32 * (2 * 6144 + 2 * 1024);
+    std::cout << "Attention Q4/Q5 A16 T=32 graph complete FP64 reference: "
+              << kFullT32ReferenceValues << " output values across two replay phases\n";
     return failures;
 }
 

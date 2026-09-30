@@ -4,6 +4,9 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -89,12 +92,16 @@ public:
     }
 
     [[nodiscard]] std::optional<HostKVExtentReservation>
-    prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+    prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership,
+            bool pin_active_writers = false) {
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            const bool pinnable =
+                pages.can_pin_source(page) ||
+                (pin_active_writers && pages.can_pin_active_source(page));
+            if (!pinnable || pages.host_resident(page)) { return std::nullopt; }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
@@ -707,5 +714,244 @@ private:
 inline HostKVExtentReservation::~HostKVExtentReservation() {
     if (owner_ != nullptr) { owner_->abort(*this); }
 }
+
+
+inline void KVAddressSpaceStore::truncate_for_replay(
+    KVAddressSpaceHandle handle, std::uint32_t frontier, HostKVExtentStore& host) {
+    Address& address = require_active(handle);
+    if (frontier > address.committed_frontier) {
+        throw std::invalid_argument("replay rewind extends KV coverage");
+    }
+    const auto target = pages_for_tokens(frontier);
+    std::vector<LogicalKVPageHandle> removed_host;
+    for (auto p = target; p < address.page_count; ++p) {
+        const auto logical = membership(address, p);
+        if (pages_->address_references(logical) != 1 ||
+            !pages_->can_release_reference_after_active_reference(logical)) {
+            throw std::logic_error("replay suffix is shared or pinned");
+        }
+        if (pages_->host_resident(logical)) removed_host.push_back(logical);
+    }
+    const auto columns = target == 0 ? 0U : frontier - (target - 1U) * kPagedKVPageSize;
+    const auto tail = target == 0 ? LogicalKVPageHandle{} : membership(address, target - 1U);
+    const bool trim_tail = target != 0 && columns != pages_->committed_columns(tail);
+    if (trim_tail && (!pages_->can_destructive_truncate(tail, columns, true) ||
+                     (pages_->host_resident(tail) && !host.can_release_page_replica(*pages_, tail)))) {
+        throw std::logic_error("replay partial tail is not a private resident page");
+    }
+    if (trim_tail && pages_->host_resident(tail)) {
+        if (!host.release_page_replicas(*pages_, std::span<const LogicalKVPageHandle>(&tail, 1))) {
+            throw std::logic_error("replay could not invalidate the partial tail's Host copy");
+        }
+    }
+    while (address.page_count > target) {
+        const auto p = --address.page_count;
+        const auto logical = membership(address, p);
+        membership(address, p) = {};
+        pages_->release_active_reference(logical);
+        if (!pages_->release_reference(logical, true)) {
+            throw std::logic_error("replay could not release private suffix ownership");
+        }
+    }
+    if (!host.release_page_replicas(*pages_, removed_host)) {
+        throw std::logic_error("replay could not release discarded Host pages");
+    }
+    if (address.device_working_set) {
+        auto& set = *address.device_working_set;
+        set.erase(std::lower_bound(set.begin(), set.end(), target), set.end());
+    }
+    if (trim_tail) pages_->destructive_truncate(tail, columns);
+    address.committed_frontier = frontier;
+}
+
+inline KVAddressSpaceStore::KVPlacementCounts KVAddressSpaceStore::apply_device_placement(KVAddressSpaceHandle handle,
+HostKVExtentStore& host_kv_extents,
+std::span<const std::uint32_t> selected_pages,
+cudaStream_t transfer_stream, const char* trace_phase)
+{
+        const bool trace = std::getenv("NINFER_KVMEM_TRANSFER_TRACE") != nullptr;
+        using TraceClock = std::chrono::steady_clock;
+        const auto trace_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+        std::uint64_t d2h_bytes = 0, h2d_bytes = 0;
+        std::size_t d2h_pages = 0;
+        double d2h_ms = 0, h2d_ms = 0;
+        Address& address = require_active(handle);
+        for (std::size_t index = 0; index < selected_pages.size(); ++index) {
+            if (selected_pages[index] >= address.page_count ||
+                (index != 0 && selected_pages[index] <= selected_pages[index - 1U])) {
+                throw std::invalid_argument("KV device placement selects an invalid page set");
+            }
+        }
+        const auto selected = [&](std::uint32_t page) {
+            return std::binary_search(selected_pages.begin(), selected_pages.end(), page);
+        };
+
+        const std::uint32_t reserved_before     = address.reservation.pages();
+        std::uint32_t resident_before           = 0;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (pages_->device_resident(membership(address, page))) { ++resident_before; }
+        }
+
+        KVPlacementCounts counts;
+        std::vector<std::uint32_t> outgoing;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (pages_->device_resident(membership(address, page)) && !selected(page)) {
+                outgoing.push_back(page);
+            }
+        }
+        if (!outgoing.empty()) {
+            std::vector<LogicalKVPageHandle> stale;
+            for (const std::uint32_t page : outgoing) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (!pages_->host_replica_current(logical)) { stale.push_back(logical); }
+            }
+            if (!stale.empty()) {
+                auto backup = host_kv_extents.prepare(*pages_, stale, true);
+                if (!backup) { throw std::bad_alloc(); }
+                placement_scratch_.clear();
+                for (const LogicalKVPageHandle logical : stale) {
+                    placement_scratch_.push_back(pages_->physical(logical));
+                }
+                const auto destination = host_kv_extents.writable_view(*backup);
+                if (trace) {
+                    d2h_pages = stale.size();
+                    d2h_bytes = plan_host_kv_transfer_work(
+                        destination.layout(), static_cast<std::uint32_t>(stale.size()), 1).payload_bytes;
+                }
+                const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+                pages_->physical_pool().copy_to_host(
+                    placement_scratch_, destination,
+                    transfer_stream);
+                if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
+                    throw std::runtime_error("KV device placement stage-out transfer failed");
+                }
+                if (trace) d2h_ms = std::chrono::duration<double, std::milli>(
+                    TraceClock::now() - copy_begin).count();
+                (void)host_kv_extents.publish(std::move(*backup));
+            }
+            for (const std::uint32_t page : outgoing) {
+                // A pinned page belongs to a pending active snapshot or transfer: demoting
+                // it would break that publication. Keep it resident; the next placement
+                // reconsiders once the pin clears.
+                if (pages_->source_pins(membership(address, page)) != 0) { continue; }
+                if (!pages_->drop_device_replica_within_active(membership(address, page))) {
+                    throw std::logic_error("KV device placement cannot demote an outgoing page");
+                }
+                ++counts.demoted;
+            }
+        }
+
+        std::vector<std::uint32_t> incoming;
+        for (const std::uint32_t page : selected_pages) {
+            if (!pages_->device_resident(membership(address, page))) { incoming.push_back(page); }
+        }
+        if (!incoming.empty()) {
+            // Reserve exactly the pending materializations: the pages the demote above
+            // released are re-earmarked only by the final-reservation formula below, so
+            // folding the old margin in here would transiently exceed the pool even when
+            // the final state fits.
+            pages_->physical_pool().resize_reservation(
+                address.reservation, static_cast<std::uint32_t>(incoming.size()));
+            std::vector<HostKVPageReplica> sources;
+            placement_scratch_.clear();
+            for (const std::uint32_t page : incoming) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (!pages_->host_resident(logical) || !pages_->host_replica_current(logical)) {
+                    throw std::logic_error("KV device placement cannot promote a Host-absent page");
+                }
+                sources.push_back(pages_->host_replica(logical));
+                placement_scratch_.push_back(
+                    pages_->reserve_device_replica(logical, address.reservation));
+            }
+            const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+            std::size_t begin = 0;
+            while (begin < sources.size()) {
+                std::size_t end = begin + 1;
+                while (end < sources.size() && sources[end].extent == sources[begin].extent &&
+                       sources[end].page_offset == sources[end - 1U].page_offset + 1U) {
+                    ++end;
+                }
+                const HostKVAllocationConstView source =
+                    host_kv_extents.view(sources[begin].extent)
+                        .subview(sources[begin].page_offset,
+                                 static_cast<std::uint32_t>(end - begin));
+                if (trace) h2d_bytes += plan_host_kv_transfer_work(
+                    source.layout(), static_cast<std::uint32_t>(end - begin), 1).payload_bytes;
+                pages_->physical_pool().copy_from_host(
+                    source,
+                    std::span<const DeviceKVPageHandle>(placement_scratch_.data() + begin,
+                                                        end - begin),
+                    transfer_stream);
+                begin = end;
+            }
+            if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
+                throw std::runtime_error("KV device placement stage-in transfer failed");
+            }
+            if (trace) h2d_ms = std::chrono::duration<double, std::milli>(
+                TraceClock::now() - copy_begin).count();
+            for (const std::uint32_t page : incoming) {
+                pages_->publish_device_replica(membership(address, page));
+                ++counts.promoted;
+            }
+        }
+
+        std::uint32_t page = 0;
+        while (page < address.page_count) {
+            if (selected(page)) {
+                std::uint32_t end = page + 1U;
+                publish_scratch_.clear();
+                publish_scratch_.push_back(pages_->physical(membership(address, page)));
+                while (end < address.page_count && selected(end)) {
+                    publish_scratch_.push_back(pages_->physical(membership(address, end)));
+                    ++end;
+                }
+                tables_->publish(address.row->handle(), page, publish_scratch_, transfer_stream);
+                page = end;
+            } else {
+                std::uint32_t end = page + 1U;
+                while (end < address.page_count && !selected(end)) { ++end; }
+                tables_->publish_holes(address.row->handle(), page, end - page, transfer_stream);
+                page = end;
+            }
+        }
+
+        const std::uint32_t working_set =
+            resident_before - counts.demoted + counts.promoted;
+        std::uint32_t final_reservation =
+            reserved_before + resident_before > working_set
+                ? reserved_before + resident_before - working_set
+                : 0U;
+        if (sparse_activation_budget_pages_ != 0) {
+            // The margin demoted pages release is re-earmarked for growth here, but
+            // exclusive resident pages and the reservation share the budget (the
+            // audit's arithmetic); clamp the absorbed share accordingly.
+            final_reservation =
+                std::min(final_reservation, sparse_reservation_cap(address));
+        }
+        pages_->physical_pool().resize_reservation(address.reservation, final_reservation);
+        // Record the set for the next activation: it defines the restore/verify scope.
+        // Freshly mapped growth pages materialize device-resident on ensure_mapped and are
+        // outside this list until the next placement or activation republishes residency.
+        address.device_working_set =
+            std::vector<std::uint32_t>(selected_pages.begin(), selected_pages.end());
+        // The next consumer is on the compute stream, not transfer_stream. Its
+        // block-table reads must observe this placement's final publication.
+        if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
+            throw std::runtime_error("KV device placement table publication failed");
+        }
+        if (trace) {
+            // Payload excludes Host arena padding. Copy times include submission and
+            // the existing stream wait; total also includes planning/table publication.
+            std::fprintf(stderr, "KVPLACEMENT phase=%s row=%d planes=%zu mapped=%u selected=%zu "
+                "demoted=%u promoted=%u d2h_pages=%zu d2h_bytes=%llu h2d_bytes=%llu "
+                "d2h_submit_wait_ms=%.6f h2d_submit_wait_ms=%.6f total_ms=%.6f\n",
+                trace_phase, bound_row(handle), pages_->physical_pool().geometry().planes.size(),
+                address.page_count, selected_pages.size(), counts.demoted, counts.promoted,
+                d2h_pages, static_cast<unsigned long long>(d2h_bytes),
+                static_cast<unsigned long long>(h2d_bytes), d2h_ms, h2d_ms,
+                std::chrono::duration<double, std::milli>(TraceClock::now() - trace_begin).count());
+        }
+        return counts;
+    }
 
 } // namespace ninfer::models::qwen3_5::detail

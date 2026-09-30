@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
@@ -42,7 +43,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      prefill_chunk(plan.prefill_chunk), kvmem_window_pages(plan.kvmem_window_pages),
+      draft_window(plan.draft_window),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
@@ -87,6 +89,25 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
+    kvmem_lanes_.reserve(max_concurrency);
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const auto& config = parameters.model.config().text;
+        kvmem_lanes_.push_back(KvmemLaneState{
+            .query_sum = plan.persistent.kvmem_query_sum
+                ? plan.persistent.kvmem_query_sum->bind(backing).slice(1, lane, 1) : Tensor{},
+            .key_sums = plan.persistent.kvmem_key_sums
+                ? plan.persistent.kvmem_key_sums->bind(backing).slice(1, lane, 1) : Tensor{},
+            .index = RetrievalIndex(execution::kKvmemCaptureBlockTokens, config.full_attention_layers,
+                                    config.attention->num_key_value_heads, config.attention->head_dim),
+        });
+    }
+    if (plan.kvmem_window_pages != 0) {
+        kvmem_capture_slots_ = (prefill_chunk + 127U) / 128U + 1U;
+        kvmem_query_checkpoint_.emplace(backing, *plan.persistent.kvmem_query_checkpoint);
+        if (plan.persistent.kvmem_draft_checkpoint) {
+            kvmem_draft_checkpoint_.emplace(backing, *plan.persistent.kvmem_draft_checkpoint);
+        }
+    }
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
@@ -178,6 +199,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
+    }
+    if (plan.kvmem_window_pages != 0) {
+        // Window + chunk + sink/slack margins: the most a sparse activation may claim
+        // from the device pool, even though its membership (entitlement) spans the
+        // whole logical context.
+        const auto budget = kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
+        text_kv_addresses->set_sparse_activation_budget(budget);
+        if (backend_kv_addresses) {
+            backend_kv_addresses->set_sparse_activation_budget(
+                budget + (speculative_backend == SpeculativeBackend::Mtp
+                              ? (draft_window - 1U + kPagedKVPageSize - 1U) / kPagedKVPageSize
+                              : 0U));
+        }
     }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());

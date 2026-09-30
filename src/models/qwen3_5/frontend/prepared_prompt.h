@@ -141,6 +141,9 @@ struct PrepareStats {
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
+    // Exact last User message content, excluding subsequent assistant/tool history.
+    // Absent for token-only input or when the template cannot prove this token span.
+    std::optional<TokenSpan> retrieval_query;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;

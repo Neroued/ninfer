@@ -112,6 +112,7 @@ struct RewriteCheckpointByteSpec {
 
 struct RenderedChat {
     std::string text;
+    std::optional<text::ByteSpan> retrieval_query;
     std::vector<text::ByteSpan> literal_spans;
     bool starts_in_reasoning = false;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;

@@ -512,6 +512,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
 
     if (!active_item_ || *active_item_ != active->prepared_item_index) {
         const auto& payload = prompt_.media_payloads[active->prepared_item_index];
+        if (!payload) { throw std::logic_error("Vision replay payload was released before its last use"); }
         timers_.emplace_back(device_);
         timers_.back().start();
         context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
@@ -528,9 +529,32 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
 void VisionPrefillSession::release_encoded_media_payloads() noexcept {
     for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
         if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
+        if (replay_begin_) {
+            const auto use = std::find_if(plan_.uses.begin(), plan_.uses.end(),
+                [item_index](const VisionUseSpan& span) { return span.prepared_item_index == item_index; });
+            if (use != plan_.uses.end() && use->end > *replay_begin_) { continue; }
+        }
         prompt_.media_payloads[item_index].reset();
     }
     encoded_payloads_pending_release_.clear();
+}
+
+void VisionPrefillSession::retain_for_replay(std::uint32_t begin) {
+    if (next_use_ != 0 || active_item_ || replay_begin_ || begin >= prompt_.token_ids.size()) {
+        throw std::logic_error("Vision replay retention must be planned before encoding");
+    }
+    replay_begin_ = begin;
+}
+
+void VisionPrefillSession::begin_replay(std::uint32_t begin) {
+    if (!replay_begin_ || begin != *replay_begin_) {
+        throw std::logic_error("Vision replay does not match its retained suffix");
+    }
+    // Shared handoff scratch cannot preserve the probe's last embedding. Re-encode
+    // from identical immutable BF16 patches; only replay suffix payloads survive.
+    retire_handoff();
+    next_use_ = 0;
+    replay_begin_.reset();
 }
 
 void VisionPrefillSession::retire_handoff() noexcept {

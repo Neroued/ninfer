@@ -117,6 +117,44 @@ Redirected stderr receives persistent readable progress without terminal control
 diagnostics. Use `--messages FILE` and `--vision` for structured image/video input; see the
 [CLI guide](docs/cli.md) and [committed examples](examples/cli/).
 
+## KVMem sparse KV with two lanes
+
+Optional KVMem retrieval supports one or two active lanes, using
+ordinary decoding, MTP, or an all-local DFlash2 companion. For a configuration exercised by the dual-lane regression:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 16384 --max-concurrency 2 \
+  --kv-dtype int8 --kv-capacity auto --kvmem-window-pages 64 \
+  --prefill-chunk 1024 --host-kv-mib 2048 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+The 64-page window is 4,096 tokens **per lane**. Each lane owns its retrieval
+features, selected history and query-replay state; model weights and the Host KV
+budget are shared. Auto capacity reserves both working sets plus chunk-growth
+space. Larger windows require more VRAM; this option does not automatically halve
+the window to fit two lanes. Requests may queue when their combined Host reservations
+do not fit. Omit the three speculation options for ordinary decoding.
+
+Add `--vision` for artifacts containing vision weights. Media KV pages are selected
+as complete groups; the latest visible group is retained with the sink. Requests
+whose media group cannot fit with the sink and tail pages are rejected before
+execution. Query replay uses the original MRoPE axes and re-encodes retained BF16
+patches; payloads are released after their final use. The GPU handoff remains bounded
+to one media item. Smaller windows may therefore reject otherwise valid images/videos.
+
+For an artifact containing matching DFlash2 and Vision weights, use
+`--spec dflash2 --draft-tokens 7 --vision`. KVMem snapshots the draft's local cyclic
+KV before query probing and rebuilds it from retrieved target features during replay.
+A text/Vision/MTP-only artifact cannot enable DFlash2.
+
+KVMem currently rejects first-generation DFlash, draft companions with full-attention
+layers, scoring, and more than two lanes. It selects
+history for sparse attention, so this is not a claim of equivalence to dense output.
+See the [support and audit notes](docs/maintainer/kvmem-audit.md) and
+[concurrency test pipeline](tests/e2e/README.md) for validation and limitations.
+
 ## Resource-aware long-context reuse
 
 A reusable prefix checkpoint contains KV and the complete continuation state for its exact prompt

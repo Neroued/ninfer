@@ -68,6 +68,8 @@ public:
                          std::size_t& handoff_peak_bytes);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
+    void retain_for_replay(std::uint32_t begin);
+    void begin_replay(std::uint32_t begin);
     void release_encoded_media_payloads() noexcept;
     void retire_handoff() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
@@ -88,6 +90,7 @@ private:
     std::optional<std::uint32_t> active_item_;
     std::size_t active_handoff_bytes_ = 0;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
+    std::optional<std::uint32_t> replay_begin_;
     std::vector<CudaEventTimer> timers_;
 };
 

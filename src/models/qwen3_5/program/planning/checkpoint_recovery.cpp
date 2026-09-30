@@ -126,23 +126,10 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
         if (required > addresses.mapped_pages(address)) {
             throw std::logic_error("checkpoint KV requirement exceeds its address space");
         }
-        std::uint32_t missing = 0;
-        std::uint32_t runs    = 0;
-        std::optional<HostKVPageReplica> previous;
-        for (std::uint32_t page = 0; page < required; ++page) {
-            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-            if (pages.device_resident(logical)) { continue; }
-            if (!pages.host_resident(logical)) {
-                throw std::logic_error("checkpoint KV page has no restorable replica");
-            }
-            const HostKVPageReplica replica = pages.host_replica(logical);
-            if (!previous || previous->extent != replica.extent ||
-                previous->page_offset + 1U != replica.page_offset) {
-                ++runs;
-            }
-            previous = replica;
-            ++missing;
-        }
+        const KVAddressSpaceStore::KVRestoreEstimate estimate =
+            addresses.restore_estimate(address, required);
+        const std::uint32_t missing = estimate.missing_pages;
+        const std::uint32_t runs    = estimate.host_runs;
         if (missing == 0) { return; }
         const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
         requirements.push_back(kv_transfer_requirement(

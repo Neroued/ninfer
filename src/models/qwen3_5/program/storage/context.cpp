@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
@@ -1436,6 +1437,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    if (kvmem_window_pages != 0) { roll_sparse_decode_window(sequence); }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
@@ -1566,4 +1568,51 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
 }
 
 
+
+// Keeps decode growth inside the sparse window: once mapped pages exceed the window
+// plus slack, pages outside the sink prefix and newest window demote to Host replicas
+// and the entitlement re-clamps, so unbounded generation rings the window instead of
+// exhausting it. Idempotent; runs at a decode GPU boundary before KV growth mapping.
+void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
+    const auto& sparse = kvmem_lanes_.at(sequence.lane);
+    constexpr std::uint32_t slack_pages = 2U;
+    const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
+    if (mapped_pages > kvmem_window_pages) {
+        requests[sequence.lane].publish_continuation = false;
+        const auto window =
+            media_window_page_set(mapped_pages, kvmem_window_pages, sparse.retrieved_pages,
+                                  sparse.media_groups);
+        text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
+            device.transfer_stream,
+            requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
+        // Membership keeps growing with the conversation, so the clamp targets
+        // mapped+slack (never a fixed page count): the reservation lands on the slack
+        // margin regardless of how far the mapped prefix extends past the window.
+        const std::uint32_t clamped = std::min(
+            (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, mapped_pages + slack_pages);
+        if (text_kv_addresses->entitlement(sequence.kv->text) != clamped) {
+            text_kv_addresses->resize_entitlement(sequence.kv->text, clamped);
+        }
+    }
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+        const std::uint32_t lead_pages =
+            (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        const std::uint32_t backend_mapped =
+            backend_kv_addresses->mapped_pages(*sequence.kv->backend);
+        if (backend_mapped > kvmem_window_pages + lead_pages) {
+            const auto backend_window = media_window_page_set(
+                backend_mapped, kvmem_window_pages + lead_pages, sparse.retrieved_pages,
+                sparse.media_groups);
+            backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
+                                                         *host_kv_extents, backend_window,
+                device.transfer_stream,
+                requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
+            const std::uint32_t backend_clamped = std::min(
+                (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, backend_mapped + slack_pages);
+            if (backend_kv_addresses->entitlement(*sequence.kv->backend) != backend_clamped) {
+                backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_clamped);
+            }
+        }
+    }
+}
 } // namespace ninfer::models::qwen3_5::detail

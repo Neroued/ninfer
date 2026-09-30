@@ -101,6 +101,7 @@ struct ProcessorOptions {
 struct ProcessedInput {
     bool starts_in_reasoning = false;
     std::vector<int> input_ids;
+    std::optional<qwen3_5::TokenSpan> retrieval_query;
     std::vector<std::uint8_t> token_types;
     // Axis-major [3, input_ids.size()] in temporal, height, width order.
     std::vector<std::int32_t> positions;
@@ -119,6 +120,7 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
+    std::optional<qwen3_5::TokenSpan> retrieval_query;
 
     struct MediaTokenRun {
         TokenSpan tokens;

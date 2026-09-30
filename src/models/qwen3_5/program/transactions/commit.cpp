@@ -116,8 +116,28 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
-        if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+        // Sparse working sets may legitimately hold fewer resident KV pages than the
+        // planned entitlement (a retrieval placement can demote below the window), so
+        // the KV page fields only forbid exceeding the plan; structural fields stay exact.
+        const bool structurally_equal =
+            actual.device.active_lanes == expected.device.active_lanes &&
+            actual.device.state_slots == expected.device.state_slots;
+        const bool kv_within_plan =
+            actual.device.main_kv_pages <= expected.device.main_kv_pages &&
+            actual.device.backend_kv_pages <= expected.device.backend_kv_pages;
+        const bool valid_claim = kvmem_window_pages == 0 ? actual == expected
+                                                        : structurally_equal && kv_within_plan;
+        if (!valid_claim) {
+            throw std::logic_error(
+                "materialized sequence does not match its active entitlement [lanes=" +
+                std::to_string(actual.device.active_lanes) + "/" +
+                std::to_string(expected.device.active_lanes) + " state=" +
+                std::to_string(actual.device.state_slots) + "/" +
+                std::to_string(expected.device.state_slots) + " main=" +
+                std::to_string(actual.device.main_kv_pages) + "/" +
+                std::to_string(expected.device.main_kv_pages) + " backend=" +
+                std::to_string(actual.device.backend_kv_pages) + "/" +
+                std::to_string(expected.device.backend_kv_pages) + "]");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -785,12 +805,41 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
-        shared_prefix_states[index].active_references = 0;
-        auto handle =
-            ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
-        (void)release_shared_prefix(std::move(handle));
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) { continue; }
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Catalogued) {
+            shared_prefix_states[index].active_references = 0;
+            auto handle = ContractAccess::make_shared_prefix(
+                this, index, shared_prefix_slots[index].generation);
+            (void)release_shared_prefix(std::move(handle));
+            continue;
+        }
+        // A failed capture can leave staging in a transient role; its KV address space and
+        // StateImage references would pin engine resources forever (every later admission
+        // reports "isolated-feasible request is blocked in an idle Engine"). Drop them
+        // best-effort and recycle the slot.
+        SharedPrefixState& shared = shared_prefix_states[index];
+        shared.active_references  = 0;
+        if (shared.kv) {
+            if (shared.kv->backend && backend_kv_addresses) {
+                (void)backend_kv_addresses->release(*shared.kv->backend);
+            }
+            (void)text_kv_addresses->release(shared.kv->text);
+            shared.kv.reset();
+        }
+        if (state_store && state_store->valid(shared.state)) {
+            const std::uint32_t references = state_store->checkpoint_references(shared.state);
+            for (std::uint32_t drop = 0; drop < references; ++drop) {
+                state_store->release_checkpoint_reference(shared.state);
+            }
+            (void)state_store->release(shared.state);
+        }
+        shared                          = SharedPrefixState{};
+        shared_prefix_slots[index].role = SharedPrefixSlotRole::Free;
+        if (++shared_prefix_slots[index].generation == 0) {
+            ++shared_prefix_slots[index].generation;
+        }
     }
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
 
 

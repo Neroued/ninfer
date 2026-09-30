@@ -31,6 +31,14 @@ ninfer_add_test(ninfer_qwen3_5_state_image_layout_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image_layout.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_retrieval_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_retrieval.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+ninfer_add_test(ninfer_kvmem_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_options.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_context_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_store.cpp"
   LIBRARIES ninfer_engine ninfer_core)

@@ -42,6 +42,10 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> kvmem_query_sum;
+    std::optional<TensorLayout> kvmem_key_sums;
+    std::optional<LinearAttentionStatePoolLayout> kvmem_query_checkpoint;
+    std::optional<CyclicKVCacheLayout> kvmem_draft_checkpoint;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -74,6 +78,7 @@ struct SequencePlanningInputs {
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t kvmem_window_pages        = 0;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
@@ -96,6 +101,7 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t kvmem_window_pages        = 0;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;

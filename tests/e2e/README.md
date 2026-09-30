@@ -81,11 +81,11 @@ Recall requires the correct final answer line, not a substring appearing anywher
 `exact_answer_format` separately records whether the model omitted all extra prose;
 format compliance is reported rather than used as a storage-stability gate.
 
-The manual GitHub Actions workflow requires a self-hosted Linux x64 runner with
-the `ninfer-sm120a` label and a repository variable `NINFER_E2E_MODEL` pointing to
-the model on that runner. Optionally set `NINFER_E2E_PYTHON`. It uploads reports
-even after failure. Workflow installation and remote execution are separate from
-a passing local run.
+For self-hosted GPU CI, supply an idle Linux x64 worker, an explicit model path
+and the Python 3.11 interpreter, and invoke the same local runner shown above.
+Serialize jobs using the GPU and preserve reports after both success and failure.
+This test tooling does not install or start a remote workflow; configuring remote
+execution is separate from a passing local run.
 
 ## Diagnostic quality comparisons
 

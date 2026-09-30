@@ -101,6 +101,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
 
     auto issue_kv_tile = [&](int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        if (paged_kv_page_is_hole(physical_page)) {
+            ninfer::ops::cp_commit();
+            return;
+        }
         for (int key_l = tid; key_l < Bc; key_l += Schedule::kThreads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
@@ -177,6 +181,12 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const float scale_l2 = scale * Log2E;
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
+        if (paged_kv_page_is_hole(block_table[k0 >> kPagedKVPageShift])) {
+            if (kb + 1 < key_blocks) issue_kv_tile(k0 + Bc);
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
+            continue;
+        }
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];

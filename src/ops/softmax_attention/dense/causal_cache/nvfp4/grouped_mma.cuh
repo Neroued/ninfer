@@ -222,6 +222,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        if (paged_kv_page_is_hole(physical_page)) {
+            ninfer::ops::cp_commit();
+            return;
+        }
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             auto* k_dst   = k_scale_s + key_l * kKVCacheNvfp4Groups;
@@ -265,6 +269,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // All threads own the same page; absent tiles contribute no softmax mass.
+        if (paged_kv_page_is_hole(physical_page)) {
+            if (kb + 1 < key_blocks) {
+                physical_page = block_table[(k0 + Bc) >> kPagedKVPageShift];
+                issue_kv_tile(k0 + Bc, physical_page);
+            }
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
+            continue;
+        }
 
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {

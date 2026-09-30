@@ -1,0 +1,41 @@
+name: KVMem GPU regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Test depth
+        type: choice
+        options: [smoke, regression, long, concurrency, vision, dflash2-vision]
+        default: smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kvmem-single-gpu
+  cancel-in-progress: false
+
+jobs:
+  inference:
+    runs-on: [self-hosted, linux, x64, ninfer-sm120a]
+    timeout-minutes: 90
+    env:
+      NINFER_MODEL: ${{ vars.NINFER_E2E_MODEL }}
+      PYTHON: ${{ vars.NINFER_E2E_PYTHON || 'python3.11' }}
+      NINFER_TEST_OUTPUT: ${{ github.workspace }}/out/kvmem-ci
+      PROFILE: ${{ inputs.profile }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build, qualify operators, and run real inference
+        run: bash tests/e2e/run_kvmem_pipeline.sh "$PROFILE"
+      - name: Preserve reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvmem-${{ inputs.profile }}-${{ github.run_id }}
+          path: out/kvmem-ci
+          if-no-files-found: error
+          retention-days: 14

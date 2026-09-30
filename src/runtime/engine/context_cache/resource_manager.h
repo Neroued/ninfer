@@ -3278,7 +3278,9 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        // State units count images, whereas KV units count bytes. Telemetry must
+        // use the physical payload for both resources, independent of cost units.
+        const std::uint64_t bytes = observation.work.payload_bytes;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {

@@ -143,6 +143,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
+        if (paged_kv_page_is_hole(physical_page)) {
+            if (kb + 1 < n_block_max) {
+                physical_page = next_physical_page;
+                bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, (kb + 1) * Bc,
+                                                        max_query_abs, physical_page, tid);
+                ninfer::ops::cp_commit();
+            }
+            return;
+        }
+
         // Preserve the global FP16 V load/QK overlap.
         bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
                                                physical_page, tid);

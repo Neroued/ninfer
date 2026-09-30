@@ -244,6 +244,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        if (paged_kv_page_is_hole(physical_page)) {
+            ninfer::ops::cp_commit();
+            return;
+        }
         if constexpr (TokenTile == 1 && Bc == 32) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
@@ -297,6 +301,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // All threads own the same page; absent tiles contribute no softmax mass.
+        if (paged_kv_page_is_hole(physical_page)) {
+            if (kb + 1 < key_blocks) {
+                physical_page = block_table[(k0 + Bc) >> kPagedKVPageShift];
+                issue_kv_tile(k0 + Bc, physical_page);
+            }
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
+            continue;
+        }
         if (warp < RowTiles) {
             // A final query tile can contain fewer complete MMA row fragments.
             if (!ParallelQueries || warp < live_row_tiles) {

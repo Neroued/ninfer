@@ -165,6 +165,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                 storage->pages[i] = table[page_window + i];
             __syncthreads();
         }
+        if (paged_kv_page_is_hole(storage->pages[logical_page - page_window])) continue;
         bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
                                         storage->pages[logical_page - page_window], head, k0, end,
                                         first, tid);

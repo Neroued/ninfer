@@ -179,6 +179,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
 
     auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
+        if (paged_kv_page_is_hole(block_table[tile_k0 >> kPagedKVPageShift])) {
+            ninfer::ops::cp_commit();
+            return;
+        }
         issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
         issue_kv_codes(tile_k0, cooperative_tid, cooperative_threads);
     };
@@ -200,6 +204,12 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0 = (first_owned_tile + kb) * Bc;
+        if (paged_kv_page_is_hole(block_table[k0 >> kPagedKVPageShift])) {
+            if (kb + 1 < key_blocks) issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
+            return;
+        }
         // Conversion runs while all query warps retain their row state in registers.
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Schedule::kThreads) {

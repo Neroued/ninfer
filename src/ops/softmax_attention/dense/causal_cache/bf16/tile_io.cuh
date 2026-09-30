@@ -23,6 +23,7 @@ template <typename Geometry, class Schedule, typename Element>
 __device__ __forceinline__ void bf16_kv_stage_tile(Element* dst, const Element* cache, int kv_head,
                                                    int k0, int max_query_abs, int physical_page,
                                                    int tid) {
+    if (paged_kv_page_is_hole(physical_page)) return;
     constexpr int D         = Geometry::kHeadDim;
     constexpr int Bc        = Schedule::kKeyRows;
     constexpr int Threads   = Schedule::kThreads;

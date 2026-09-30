@@ -33,7 +33,7 @@ nvfp4_kv_decode_tile(__half* destination, const std::uint8_t* cache,
         const int key     = tile_k0 + key_l;
         __half* target_lo = destination + key_l * D + causal_swizzle(key_l, d);
         __half* target_hi = destination + key_l * D + causal_swizzle(key_l, d + 8);
-        if (key <= max_query_abs) {
+        if (!paged_kv_page_is_hole(physical_page) && key <= max_query_abs) {
             const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                 physical_page, kv_head, d, page_offset0 + key_l);
             const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
@@ -235,7 +235,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
         const int qrow1            = q0 + row1;
         const int qabs0            = qrow0 < tokens ? base_pos + qrow0 : -1;
         const int qabs1            = qrow1 < tokens ? base_pos + qrow1 : -1;
-        const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+        const bool tile_live = !paged_kv_page_is_hole(block_table[k0 >> kPagedKVPageShift]);
+        const bool full_score_tile = tile_live && q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
         float bm0                  = -CUDART_INF_F;
         float bm1                  = -CUDART_INF_F;
         if (full_score_tile) {
@@ -249,10 +250,10 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = qrow0 < tokens && key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = qrow0 < tokens && key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = qrow1 < tokens && key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = qrow1 < tokens && key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0]   = tile_live && qrow0 < tokens && key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1]   = tile_live && qrow0 < tokens && key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2]   = tile_live && qrow1 < tokens && key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
+                score[nt][3]   = tile_live && qrow1 < tokens && key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }

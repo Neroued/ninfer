@@ -10,6 +10,14 @@ inline constexpr int kPagedKVPageShift = 6;
 inline constexpr int kPagedKVPageMask  = kPagedKVPageSize - 1;
 
 static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
+static_assert(kPagedKVPageSize == 64 && kPagedKVPageHole == -1);
+
+// kPagedKVPageHole semantics (a hole entry marks the logical page as not materialized; keys of
+// that page are invisible to attention and never dereferenced) are defined with the block-table
+// types in core/paged_kv_cache.h; see the constant there.
+__device__ __forceinline__ bool paged_kv_page_is_hole(std::int32_t physical_page) {
+    return physical_page < 0;
+}
 
 struct PagedKVDirectMetadata {
     const std::int32_t* table;

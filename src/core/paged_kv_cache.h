@@ -17,6 +17,14 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// A block-table entry equal to kPagedKVPageHole marks the logical page as not materialized in
+// the device pool. Attention consumers treat every key of a hole page as invisible (no score
+// contribution, never dereferenced) instead of decoding it as a physical page ID. Cache-append
+// writers never target a hole page: a growing sequence materializes each page it will write
+// before the launch that writes it, so holes only ever cover historical pages outside the
+// active working-set window.
+inline constexpr std::int32_t kPagedKVPageHole = -1;
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -348,6 +356,11 @@ public:
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream = nullptr);
+    // Publishes kPagedKVPageHole for [logical_begin, logical_begin + count): the pages of this
+    // range are not materialized in the device pool, and attention consumers must treat every
+    // key of those pages as invisible.
+    void publish_holes(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                       std::uint32_t count, cudaStream_t stream = nullptr);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 

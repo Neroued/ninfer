@@ -808,6 +808,22 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
                     std::span<const std::int32_t>(shadow, page_leases.size()), stream);
 }
 
+void KVExecutionTablePool::publish_holes(KVExecutionRowHandle row_handle,
+                                         std::uint32_t logical_begin, std::uint32_t count,
+                                         cudaStream_t stream) {
+    if (!valid_handle(row_handle) || logical_begin > logical_page_capacity() ||
+        count > logical_page_capacity() - logical_begin) {
+        throw std::invalid_argument("Holed Paged KV mapping is outside its execution row");
+    }
+    if (count == 0) { return; }
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
+                   static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() +
+                   logical_begin;
+    std::fill_n(shadow, count, kPagedKVPageHole);
+    publish_indices(row_handle, logical_begin, std::span<const std::int32_t>(shadow, count),
+                    stream);
+}
+
 void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
                                             DeviceKVPageHandle page, std::uint32_t count,
                                             cudaStream_t stream) {

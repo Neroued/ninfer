@@ -2,7 +2,9 @@
 
 #include "core/device.h"
 
+#include <algorithm>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -378,41 +380,60 @@ void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layo
     }
 }
 
+template <class Visit>
+void StateImageDevicePool::for_each_host_component(std::int32_t slot, Visit&& visit) const {
+    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
+        for_each_host_component(
+            slot, StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, visit);
+    }
+    for_each_host_component(slot, StateImagePart{.kind = StateImagePart::Kind::Rest}, visit);
+}
+
+template <class Visit>
+void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImagePart part,
+                                                   Visit&& visit) const {
+    if (part.kind == StateImagePart::Kind::LinearLayer) {
+        if (part.layer >= linear_.layer_count()) {
+            throw std::out_of_range("StateImage linear layer is out of range");
+        }
+        const Tensor conv = linear_.conv_slot(part.layer, slot);
+        visit(conv.data,
+              host_layout_.linear_conv.offset + part.layer * host_layout_.linear_conv_layer_bytes,
+              conv.bytes());
+        const Tensor recurrent = linear_.recurrent_slot(part.layer, slot);
+        visit(recurrent.data,
+              host_layout_.linear_recurrent.offset +
+                  part.layer * host_layout_.linear_recurrent_layer_bytes,
+              recurrent.bytes());
+        return;
+    }
+    const Tensor hidden = continuation_hidden_slot(slot);
+    visit(hidden.data, host_layout_.continuation_hidden.offset, hidden.bytes());
+    if (dflash_local_) {
+        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
+            const Tensor k                    = view.k.slice(3, slot, 1);
+            const Tensor v                    = view.v.slice(3, slot, 1);
+            visit(k.data,
+                  host_layout_.dflash_local_k->offset +
+                      layer * host_layout_.dflash_local_layer_bytes,
+                  k.bytes());
+            visit(v.data,
+                  host_layout_.dflash_local_v->offset +
+                      layer * host_layout_.dflash_local_layer_bytes,
+                  v.bytes());
+        }
+    }
+}
+
 void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView destination,
                                         cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
-    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
-        const Tensor conv = linear_.conv_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
-            byte_offset(destination.data, host_layout_.linear_conv.offset +
-                                              layer * host_layout_.linear_conv_layer_bytes),
-            conv.data, conv.bytes(), cudaMemcpyDeviceToHost, stream));
-        const Tensor recurrent = linear_.recurrent_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
-            byte_offset(destination.data, host_layout_.linear_recurrent.offset +
-                                              layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.data, recurrent.bytes(), cudaMemcpyDeviceToHost, stream));
-    }
-    const Tensor hidden = continuation_hidden_slot(source);
-    CUDA_CHECK(
-        cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
-                        hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
-            const Tensor k                    = view.k.slice(3, source, 1);
-            const Tensor v                    = view.v.slice(3, source, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_k->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_v->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
-        }
-    }
+    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data, offset), device, bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+    });
 }
 
 void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::int32_t destination,
@@ -420,41 +441,86 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
+    for_each_host_component(destination, [&](void* device, std::size_t offset, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(device, byte_offset(source.data, offset), bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    });
+}
+
+namespace {
+
+// Visits the pieces of the host byte range [offset, offset + bytes) that fall in each fixed-size
+// segment of a segmented host image.
+template <class Visit>
+void split_segments(std::size_t offset, std::size_t bytes, std::size_t segment_bytes,
+                    Visit&& visit) {
+    std::size_t done = 0;
+    while (done < bytes) {
+        const std::size_t position = offset + done;
+        const std::size_t segment  = position / segment_bytes;
+        const std::size_t within   = position % segment_bytes;
+        const std::size_t count    = std::min(bytes - done, segment_bytes - within);
+        visit(segment, within, done, count);
+        done += count;
+    }
+}
+
+void validate_segments(std::size_t segment_count, std::size_t segment_bytes,
+                       std::size_t image_bytes) {
+    if (segment_bytes == 0 || segment_count == 0 ||
+        segment_count < 1U + (image_bytes - 1U) / segment_bytes) {
+        throw std::invalid_argument("segmented StateImage host copy does not cover the image");
+    }
+}
+
+} // namespace
+
+void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
+                                                 std::span<std::byte* const> segments,
+                                                 std::size_t segment_bytes,
+                                                 cudaStream_t stream) const {
+    validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
+    validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
+    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
+        split_segments(
+            offset, bytes, segment_bytes,
+            [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
+                CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within,
+                                           static_cast<const std::byte*>(device) + done, count,
+                                           cudaMemcpyDeviceToHost, stream));
+            });
+    });
+}
+
+void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                   std::size_t segment_bytes,
+                                                   std::int32_t destination, cudaStream_t stream) {
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
-        const Tensor conv = linear_.conv_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
-            conv.data,
-            byte_offset(source.data, host_layout_.linear_conv.offset +
-                                         layer * host_layout_.linear_conv_layer_bytes),
-            conv.bytes(), cudaMemcpyHostToDevice, stream));
-        const Tensor recurrent = linear_.recurrent_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
-            recurrent.data,
-            byte_offset(source.data, host_layout_.linear_recurrent.offset +
-                                         layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.bytes(), cudaMemcpyHostToDevice, stream));
+        copy_from_host_segments(
+            segments, segment_bytes, destination,
+            StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, stream);
     }
-    const Tensor hidden = continuation_hidden_slot(destination);
-    CUDA_CHECK(cudaMemcpyAsync(hidden.data,
-                               byte_offset(source.data, host_layout_.continuation_hidden.offset),
-                               hidden.bytes(), cudaMemcpyHostToDevice, stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
-            const Tensor k                    = view.k.slice(3, destination, 1);
-            const Tensor v                    = view.v.slice(3, destination, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                k.data,
-                byte_offset(source.data, host_layout_.dflash_local_k->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                k.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                v.data,
-                byte_offset(source.data, host_layout_.dflash_local_v->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                v.bytes(), cudaMemcpyHostToDevice, stream));
-        }
-    }
+    copy_from_host_segments(segments, segment_bytes, destination,
+                            StateImagePart{.kind = StateImagePart::Kind::Rest}, stream);
+}
+
+void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                   std::size_t segment_bytes,
+                                                   std::int32_t destination, StateImagePart part,
+                                                   cudaStream_t stream) {
+    validate_slot(destination, slot_count(),
+                  "StateImage segmented H2D destination is out of range");
+    validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
+    for_each_host_component(
+        destination, part, [&](void* device, std::size_t offset, std::size_t bytes) {
+            split_segments(
+                offset, bytes, segment_bytes,
+                [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(device) + done,
+                                               segments[segment] + within, count,
+                                               cudaMemcpyHostToDevice, stream));
+                });
+        });
 }
 
 } // namespace ninfer::models::qwen3_5

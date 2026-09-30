@@ -177,9 +177,7 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
-    EngineRequestState model_state        = EngineRequestState::Waiting;
-    bool capture_pending                  = false;
-    EngineRequestState post_capture_state = EngineRequestState::Prefill;
+    EngineRequestState model_state = EngineRequestState::Waiting;
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;

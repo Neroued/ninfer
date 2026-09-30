@@ -140,8 +140,8 @@ number of physical `cudaMemcpy*` calls implied by the page geometry and contiguo
 kind, KV dtype, and speculative backend do not select different coefficients; any differences they
 create are represented by those two physical quantities. For a suffix `S` after prefix `B`,
 `attention_pairs = B*S + S*(S+1)/2`. `chunks` is the sum of
-`ceil(segment_tokens/prefill_chunk)` across the actual prefill schedule's capture/rewrite segments;
-with no such boundary it is simply `ceil(S/prefill_chunk)`.
+`ceil(segment_tokens/prefill_chunk)` across the actual prefill schedule's segments, which exact
+prefix-cache snapshots split; with no such boundary it is simply `ceil(S/prefill_chunk)`.
 
 Build the tool, then measure machine transfer without a model:
 

@@ -21,11 +21,11 @@ inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
-inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
-inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
-inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
-inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
-inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
+inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
+inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+// Pinned Host tier of the prefix cache when --host-cache-mib is not given.
+inline constexpr std::size_t kDefaultHostCacheBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -92,9 +92,9 @@ enum class StartupPhase : std::uint8_t {
     TargetFinalize,
     FrontendInitialize,
     ProgramInitialize,
-    HostStatePin,
-    HostKvPin,
+    HostCachePin,
     CudaGraphPrepare,
+    PrefixCacheLoad,
     EngineFinalize,
 };
 
@@ -125,20 +125,35 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
+// Prefix reuse through the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache.md):
+// content-addressed 64-token KV blocks in one radix tree and sparse recurrent-state snapshots on
+// its nodes, kept on the Device and in one pinned Host tier. Engine construction derives the unset
+// optionals from max_concurrency, prefill_chunk and whether a Host tier exists
+// (host_cache_bytes != 0); Engine::options() reports the effective values.
 struct ContextCacheOptions {
-    // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
-    // Engine::options() returns those effective values.
+    // Disabled, every request prefills from the root and nothing is retained.
     bool enabled = true;
-    // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
-    std::optional<std::uint32_t> device_state_slots;
-    // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
-    std::uint32_t host_state_slots     = kDefaultHostStateSlots;
-    std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
-    // Bounded private/shared logical catalogs and per-continuation long-anchor count.
-    std::optional<std::uint32_t> max_private_continuations;
-    std::optional<std::uint32_t> max_shared_prefixes;
-    std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Pinned Host slab pool that KV blocks and state snapshot images share. 0 disables the Host
+    // tier: Device blocks and snapshots are then the only cache.
+    std::size_t host_cache_bytes = kDefaultHostCacheBytes;
+    // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
+    // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
+    // lane plus one staging slot with a Host tier, plus two without one (Device slots are then
+    // the only snapshot storage).
+    std::optional<std::uint32_t> device_snapshot_slots;
+    // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
+    std::optional<std::uint32_t> max_new_taps;
+    // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default
+    // max(4096, 2 * prefill_chunk): ladder taps land on prefill chunk boundaries.
+    std::optional<std::uint32_t> tap_ladder_tokens;
+    // Ladder taps closer than this to another snapshot on the same path are skipped. Default
+    // max(1024, prefill_chunk).
+    std::optional<std::uint32_t> tap_min_gap_tokens;
+    // Opt-in persistence of the Host tier: saved to this file when the Engine shuts down cleanly
+    // and restored from it at startup, but only when it was written for the same artifact, KV and
+    // state formats and `persistent_identity` (the product binary's build). Empty disables it.
+    std::filesystem::path persistent_file;
+    std::string persistent_identity;
 };
 
 struct ContextCostOptions {
@@ -473,16 +488,16 @@ struct PromptCacheMarker {
                                                    PromptCacheMarker) noexcept = default;
 };
 
+// Protocol cache hints. The prefix cache is content-addressed: markers become state-snapshot
+// positions, and the session and retention hints are validated but select nothing.
 struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
-    // Protocols with their own automatic/explicit write policy disable the Engine's structural
-    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    // Protocols with their own automatic/explicit write policy disable the Engine's own snapshot
+    // at the end of the tool definitions.
     bool allow_engine_automatic_shared_prefixes = true;
-    // Advance the named session lineage when session_key is present. This does not require an
-    // anonymous content-matched source to be retained.
-    bool update_session_index = true;
+    bool update_session_index                   = true;
 };
 
 struct PromptInput {
@@ -692,98 +707,22 @@ struct ThinkingBudgetStats {
     bool applied                  = false;
 };
 
+// The prefix-cache snapshot an admitted request resumed from: none, a previous request's endpoint
+// (its state after its last committed token), or a prefill snapshot inside an earlier prompt.
 enum class PrefixReusePath : std::uint8_t {
     Root,
-    PrivateEndpoint,
-    PrivateTurnClosure,
-    PrivateResponseReplay,
-    PrivateLongAnchor,
-    SharedStablePrefix,
+    Endpoint,
+    Snapshot,
 };
 
-// Why bounded pressure planning stopped for the materialization decision committed to one request.
-enum class MaterializationStopReason : std::uint8_t {
-    NoPressure,
-    QueueExhausted,
-    TargetBudget,
-    ExpansionCapacity,
-    TimeBudget,
-    InsufficientExpectedGain,
-    WorkBudget,
-};
-
-[[nodiscard]] inline constexpr const char*
-materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
-    switch (reason) {
-    case MaterializationStopReason::NoPressure:
-        return "no_pressure";
-    case MaterializationStopReason::QueueExhausted:
-        return "queue_exhausted";
-    case MaterializationStopReason::TargetBudget:
-        return "target_budget";
-    case MaterializationStopReason::ExpansionCapacity:
-        return "expansion_capacity";
-    case MaterializationStopReason::TimeBudget:
-        return "time_budget";
-    case MaterializationStopReason::InsufficientExpectedGain:
-        return "insufficient_expected_gain";
-    case MaterializationStopReason::WorkBudget:
-        return "work_budget";
-    }
-    return "no_pressure";
-}
-
-enum class MaterializationSearchPhase : std::uint8_t {
-    None,
-    Setup,
-    Construction,
-    Assessment,
-    Expansion,
-    Refinement,
-};
-
-[[nodiscard]] inline constexpr const char*
-materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
-    switch (phase) {
-    case MaterializationSearchPhase::None:
-        return "none";
-    case MaterializationSearchPhase::Setup:
-        return "setup";
-    case MaterializationSearchPhase::Construction:
-        return "construction";
-    case MaterializationSearchPhase::Assessment:
-        return "assessment";
-    case MaterializationSearchPhase::Expansion:
-        return "expansion";
-    case MaterializationSearchPhase::Refinement:
-        return "refinement";
-    }
-    return "none";
-}
-
+// Prefix-cache admission of one request. `cached_prefix_tokens` is the longest prompt prefix held
+// as cached KV blocks whether or not it was reusable: reuse also needs a state snapshot inside it,
+// so a gap to the reused token count is prefix lost to snapshot placement. `restored_host_bytes`
+// is what the admission copied back from the Host tier; the copies overlap the request's first
+// prefill pass, so their time is part of its prefill.
 struct MaterializationDiagnostics {
-    std::uint64_t predicted_now_ns           = 0;
-    std::uint64_t predicted_future_loss_ns   = 0;
-    std::uint64_t predicted_total_ns         = 0;
-    std::uint32_t targets_evaluated          = 0;
-    std::uint64_t projection_work            = 0;
-    std::uint64_t planning_elapsed_ns        = 0;
-    std::uint64_t search_elapsed_ns          = 0;
-    MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
-    bool budget_exhausted                    = false;
-    std::uint32_t selected_degradation_units = 0;
-    bool selected_maximal_fallback           = false;
-
-    std::uint64_t initial_predicted_total_ns = 0;
-    std::optional<std::uint64_t> first_improvement_ns;
-    std::uint32_t incumbent_improvements         = 0;
-    std::uint64_t search_work                    = 0;
-    std::uint64_t search_granted_ns              = 0;
-    std::uint32_t search_renewals                = 0;
-    bool search_discovery_used                   = false;
-    std::uint64_t search_overshoot_ns            = 0;
-    MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
-    bool search_boundary_limited                 = false;
+    std::uint32_t cached_prefix_tokens = 0;
+    std::uint64_t restored_host_bytes  = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
@@ -850,10 +789,8 @@ struct MemorySummary {
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t kv_payload_bytes                  = 0;
-    std::uint32_t host_state_capacity_slots       = 0;
-    std::uint32_t host_state_occupied_slots       = 0;
-    std::size_t host_kv_capacity_bytes            = 0;
-    std::size_t host_kv_occupied_bytes            = 0;
+    std::size_t host_cache_capacity_bytes         = 0;
+    std::size_t host_cache_occupied_bytes         = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -900,70 +837,44 @@ struct RuntimeStats {
     std::uint32_t decode_ready_requests     = 0;
     std::uint32_t waiting_requests          = 0;
     std::uint32_t materializing_requests    = 0;
-    std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
-    std::uint64_t active_captures_completed = 0;
-    std::uint64_t active_captures_aborted   = 0;
 
-    std::uint64_t root_selections                    = 0;
-    std::uint64_t private_endpoint_selections        = 0;
-    std::uint64_t private_turn_closure_selections    = 0;
-    std::uint64_t private_response_replay_selections = 0;
-    std::uint64_t private_long_anchor_selections     = 0;
-    std::uint64_t shared_stable_prefix_selections    = 0;
-    std::uint64_t reused_prompt_tokens               = 0;
-    std::uint32_t last_selected_frontier_tokens      = 0;
+    // Admissions by the snapshot they resumed from, and the prompt tokens they reused.
+    std::uint64_t root_selections               = 0;
+    std::uint64_t endpoint_selections           = 0;
+    std::uint64_t snapshot_selections           = 0;
+    std::uint64_t reused_prompt_tokens          = 0;
+    std::uint32_t last_selected_frontier_tokens = 0;
 
-    std::uint64_t state_moves     = 0;
-    std::uint64_t state_forks     = 0;
-    std::uint64_t state_restores  = 0;
-    std::uint64_t state_d2h_count = 0;
-    std::uint64_t state_h2d_count = 0;
-    std::uint64_t state_d2d_count = 0;
-    std::uint64_t state_d2h_bytes = 0;
-    std::uint64_t state_h2d_bytes = 0;
-    std::uint64_t state_d2d_bytes = 0;
-    double state_d2h_seconds      = 0.0;
-    double state_h2d_seconds      = 0.0;
-    double state_d2d_seconds      = 0.0;
+    // Physical occupancy gauges.
+    std::uint32_t device_state_occupied_slots      = 0;
+    std::uint32_t device_main_kv_occupied_pages    = 0;
+    std::uint32_t device_backend_kv_occupied_pages = 0;
 
-    std::uint64_t main_kv_d2h_pages    = 0;
-    std::uint64_t main_kv_h2d_pages    = 0;
-    std::uint64_t main_kv_d2d_pages    = 0;
-    std::uint64_t main_kv_d2h_bytes    = 0;
-    std::uint64_t main_kv_h2d_bytes    = 0;
-    std::uint64_t main_kv_d2d_bytes    = 0;
-    double main_kv_d2h_seconds         = 0.0;
-    double main_kv_h2d_seconds         = 0.0;
-    double main_kv_d2d_seconds         = 0.0;
-    std::uint64_t backend_kv_d2h_pages = 0;
-    std::uint64_t backend_kv_h2d_pages = 0;
-    std::uint64_t backend_kv_d2d_pages = 0;
-    std::uint64_t backend_kv_d2h_bytes = 0;
-    std::uint64_t backend_kv_h2d_bytes = 0;
-    std::uint64_t backend_kv_d2d_bytes = 0;
-    double backend_kv_d2h_seconds      = 0.0;
-    double backend_kv_h2d_seconds      = 0.0;
-    double backend_kv_d2d_seconds      = 0.0;
-
-    std::uint64_t pressure_spill_pages                 = 0;
-    std::uint64_t partial_tail_cow_pages               = 0;
-    std::uint32_t device_state_occupied_slots          = 0;
-    std::uint32_t host_state_occupied_slots            = 0;
-    std::uint32_t device_main_kv_occupied_pages        = 0;
-    std::uint32_t device_backend_kv_occupied_pages     = 0;
-    std::size_t host_kv_occupied_bytes                 = 0;
-    std::uint64_t pressure_private_owners_degraded     = 0;
-    std::uint64_t pressure_private_owners_evicted      = 0;
-    std::uint64_t pressure_shared_owners_degraded      = 0;
-    std::uint64_t pressure_shared_owners_evicted       = 0;
-    std::uint64_t pressure_checkpoints_dropped         = 0;
-    std::uint64_t pressure_searches                    = 0;
-    std::uint64_t pressure_search_budget_exhaustions   = 0;
-    std::uint64_t pressure_maximal_fallback_selections = 0;
-    std::uint32_t shared_active_references             = 0;
-    std::uint64_t historical_fork_hits                 = 0;
-    double actual_context_transfer_seconds             = 0.0;
+    // Prefix cache (docs/maintainer/hybrid-prefix-cache.md). Block, snapshot and Host-tier
+    // gauges are absolute; the rest are cumulative event counters.
+    std::uint32_t cached_blocks             = 0; // Device-resident tree blocks
+    std::uint32_t evictable_blocks          = 0;
+    std::uint32_t tree_blocks               = 0; // Device or Host
+    std::uint32_t snapshots                 = 0;
+    std::uint64_t host_cache_capacity_bytes = 0;
+    std::uint64_t host_cache_used_bytes     = 0;
+    std::uint64_t blocks_inserted           = 0;
+    std::uint64_t blocks_reattached         = 0;
+    std::uint64_t blocks_duplicate          = 0;
+    std::uint64_t taps_created              = 0;
+    std::uint64_t taps_skipped              = 0;
+    std::uint64_t endpoints_created         = 0;
+    std::uint64_t host_image_writes         = 0;
+    std::uint64_t host_block_writes         = 0;
+    std::uint64_t host_image_restores       = 0;
+    std::uint64_t host_block_restores       = 0;
+    std::uint64_t host_write_bytes          = 0;
+    std::uint64_t host_restore_bytes        = 0;
+    std::uint64_t evicted_blocks            = 0;
+    std::uint64_t host_snapshot_evictions   = 0;
+    std::uint64_t host_dead_reclaims        = 0;
+    std::uint64_t unbacked_node_losses      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1007,6 +918,24 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+
+    // Hybrid prefix cache restored from its persistent file at startup.
+    struct PrefixCacheRestore {
+        bool attempted = false;
+        bool restored  = false;
+        // Why nothing was restored (no file yet, incompatible file, I/O error).
+        std::string message;
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        std::uint64_t bytes     = 0;
+        double seconds          = 0.0;
+        // What the file holds and the Host tier bytes all of it takes, against this Engine's
+        // tier. When the tier is smaller, only the snapshots it values most were restored.
+        std::uint64_t saved_blocks        = 0;
+        std::uint64_t saved_snapshots     = 0;
+        std::uint64_t required_host_bytes = 0;
+        std::uint64_t host_bytes          = 0;
+    } prefix_cache;
 };
 
 } // namespace ninfer

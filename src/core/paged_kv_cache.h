@@ -106,6 +106,7 @@ class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
 class HostKVAllocationConstView;
+struct HostKVPageLayout;
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
 class DeviceKVPageHandle {
@@ -236,6 +237,28 @@ public:
     void copy_from_host(HostKVAllocationConstView source,
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
+    // Record-addressed forms for caller-owned pinned host memory: page i is packed with `layout`
+    // at records[i]. Runs of consecutive physical pages whose records advance by one constant
+    // pitch are copied as one strided transfer per plane. A strided transfer must stay inside one
+    // pinned allocation and within the device's maximum copy pitch: `record_groups` (empty, or
+    // one id per record) names the allocation each record lies in, and records of different
+    // groups, or further apart than the maximum pitch, are never joined into one run.
+    void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                              std::span<std::byte* const> records,
+                              std::span<const std::uint32_t> record_groups,
+                              const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout,
+                                cudaStream_t stream = nullptr) const;
+    // The same restricted to planes [plane_begin, plane_end), so a caller can order the planes a
+    // consumer needs first (a model's per-layer planes) ahead of the rest.
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout, std::size_t plane_begin,
+                                std::size_t plane_end, cudaStream_t stream) const;
 
 private:
     friend class DeviceKVPageLease;
@@ -244,6 +267,16 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
+                       std::int32_t first, std::size_t count, std::byte* host_base,
+                       std::size_t host_pitch, const HostKVPageLayout& host,
+                       cudaStream_t stream) const;
+    [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
+                                                         std::span<const std::byte* const> records,
+                                                         std::span<const std::uint32_t> groups,
+                                                         std::size_t begin, std::size_t page_stride,
+                                                         std::size_t max_pitch,
+                                                         std::size_t& pitch) noexcept;
     void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
                                  const char* duplicate_message) const;
     void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;

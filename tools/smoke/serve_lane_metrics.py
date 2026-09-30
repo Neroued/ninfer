@@ -45,8 +45,8 @@ def main() -> None:
     time.sleep(interval + 0.5)
     offset = args.log.stat().st_size
     tag = uuid.uuid4().hex
-    prompts = [f'Test {tag}/{i}. Count integers starting at {i + 1}, separated by commas. '
-               'Continue counting for as long as possible. No commentary or code blocks.'
+    prompts = [f'Test {tag}/{i}. Count every integer from {i + 1} to 10000, separated by commas. '
+               'Do not skip or abbreviate the list. No commentary or code blocks.'
                for i in range(2)]
 
     def generate(item: tuple[str, int]) -> dict:

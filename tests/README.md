@@ -15,6 +15,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   opt-in real Engine integration;
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
+- [`e2e/`](e2e/README.md) — reproducible KVMem JSON/SSE, cancellation, cache, retrieval,
+  page-growth and long-context tests against an explicit real model, with local and GPU CI runners;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
   logging, benchmark reports and causal-scoring evaluation;
 - `test_serve_corpus.py` — agreement between the serving request-log schema and its measurement

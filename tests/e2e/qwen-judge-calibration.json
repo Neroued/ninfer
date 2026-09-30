@@ -1,0 +1,11 @@
+[
+  {"id":"paraphrase", "family":"single-session-user", "question":"What color was my backpack?", "gold":"Blue", "answer":"Your backpack was blue.", "expected":[true,true]},
+  {"id":"wrong-fact", "family":"single-session-user", "question":"What color was my backpack?", "gold":"Blue", "answer":"Your backpack was red.", "expected":[false,false]},
+  {"id":"missing-fact", "family":"multi-session", "question":"List all three delivery services I used.", "gold":"Domino's, UberEats, and Fresh Fusion", "answer":"You used Domino's and Fresh Fusion.", "expected":[false,false]},
+  {"id":"contradiction", "family":"multi-session", "question":"How many services did I use?", "gold":"Three", "answer":"You used three services. To clarify, you used only two services in total.", "expected":[false,false]},
+  {"id":"proper_abs", "family":"single-session-user", "question":"Which city did I visit?", "gold":"The city is not specified.", "answer":"There is not enough information to determine which city you visited.", "expected":[true,true]},
+  {"id":"hedged_abs", "family":"single-session-user", "question":"Which city did I visit?", "gold":"The city is not specified.", "answer":"It was probably London, although I am not certain.", "expected":[false,false]},
+  {"id":"temporal-tolerance", "family":"temporal-reasoning", "question":"How many days passed between the two visits?", "gold":"Ten days", "answer":"Nine days passed.", "expected":[true,false]},
+  {"id":"recipient-separation", "family":"temporal-reasoning", "question":"Which did I buy first: a photo album for my mom or a necklace for my sister?", "gold":"The photo album for your mom", "answer":"You bought the photo album for your mom first.", "expected":[true,true]},
+  {"id":"fact-update", "family":"knowledge-update", "question":"Where do I live now?", "gold":"Paris", "answer":"You now live in Paris. Your earlier address is outdated.", "expected":[true,true]}
+]

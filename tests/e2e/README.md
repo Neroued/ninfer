@@ -28,7 +28,7 @@ runs that request and verifies subsequent inference; use the default 16K context
 64-page window and a chunk no larger than 2048 for this fixture.
 It also constrains Host KV to 32 MiB, requires an over-budget request to fail
 with HTTP 400 before execution, and verifies subsequent inference stays healthy.
-`long` adds the production 96K-device-window / 256K-logical-context ladder through
+`long` adds a 96K-device-window / 256K-logical-context test ladder through
 250K nominal tokens, twice on the same engine after cache-producing requests.
 Actual token counts and inference latency are recorded, not inferred from bytes.
 
@@ -176,10 +176,14 @@ Even zero disagreements has nonzero uncertainty, and 500 questions do not guaran
 enough power to certify a 1pp margin. Statistics do not establish
 comparability of model weights, budgets or grading, and never auto-certify parity.
 
-For this integration the agreed overall noninferiority margin is **1 percentage
-point**, supported by a paired **95%** interval; task families are reported separately.
-The comparison emits an interval-only indicator against that fixed margin, while
-`equivalence_established` stays false until the dataset, execution and comparability
+The comparison reports a paired **95%** interval and an interval-only indicator
+against a **1 percentage point** margin. That diagnostic threshold is not an
+upstream acceptance policy or proof of lossless output. Select representative
+workloads before comparing a change, repeat paired A/B runs, and include repeated
+A/A controls to characterize run-to-run variability. Inspect task-family
+regressions as well as aggregate results. These repeated-run controls must be
+planned and analyzed separately; the interval tool does not perform them.
+`equivalence_established` stays false until dataset, execution and comparability
 requirements have also been qualified. Small pilot intervals are insufficient.
 
 Whole-answer reviews can be attached without altering the raw predictions:

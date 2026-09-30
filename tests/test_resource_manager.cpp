@@ -897,6 +897,7 @@ public:
         require(pending_plan_.has_value(), "fake materialization plan disappeared");
         const FakeResourcePlan& plan = *pending_plan_;
         FakeMaterializationResult result;
+        result.transfer_observations = transfer_observations;
         result.status = (abort_progress || cancellation.requested())
                             ? ContextTransactionStatus::Aborted
                             : ContextTransactionStatus::Published;
@@ -1160,6 +1161,7 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+    std::vector<ContextTransferObservation> transfer_observations;
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -2409,6 +2411,34 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+void test_state_transfer_statistics_use_payload_bytes() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    using ninfer::runtime::ContextResourceClass;
+    using ninfer::runtime::ContextTransferDirection;
+    program.transfer_observations = {
+        {.resource = ContextResourceClass::State,
+         .direction = ContextTransferDirection::DeviceToHost,
+         .units = 2, .work = {.payload_bytes = 8192}, .elapsed_ns = 1000},
+        {.resource = ContextResourceClass::State,
+         .direction = ContextTransferDirection::HostToDevice,
+         .units = 1, .work = {.payload_bytes = 4096}, .elapsed_ns = 2000},
+        {.resource = ContextResourceClass::State,
+         .direction = ContextTransferDirection::DeviceToDevice,
+         .units = 1, .work = {.payload_bytes = 4096}, .elapsed_ns = 3000},
+    };
+    const auto active = start_active(manager, program, 7, make_base(7), 1);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.state_d2h_count == 1 && stats.state_h2d_count == 1 &&
+                stats.state_d2d_count == 1,
+            "state transfer counts must count operations, not images or bytes");
+    require(stats.state_d2h_bytes == 8192 && stats.state_h2d_bytes == 4096 &&
+                stats.state_d2d_bytes == 4096,
+            "state transfer byte counters reported image counts instead of payloads");
+    (void)finish_active(manager, program, active);
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -3455,6 +3485,7 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 } // namespace
 
 int main() {
+    run_test("state transfer payload statistics", test_state_transfer_statistics_use_payload_bytes);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",

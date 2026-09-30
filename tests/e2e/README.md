@@ -1,5 +1,9 @@
 # KVMem inference regression pipeline
 
+The model runners require the retrieval-window implementation proposed in
+[NInfer #345](https://github.com/Neroued/ninfer/pull/345), including its numerical
+primitives. The standalone harness unit tests can run without that engine change.
+
 Run from the NInfer checkout on the CUDA 13.1 / sm_120a machine. Python 3.11,
 CMake, Ninja, idle test ports (8095 through 8100), and an explicit v3 model are required.
 The runner owns only its child process; it fails if another server owns the port.

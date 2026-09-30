@@ -423,7 +423,18 @@ int main() {
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
 
+    outcome.metrics.engine_request_id = 17;
+    outcome.metrics.lane_id = 0;
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("execution").at("engine_request_id") == 17 &&
+                          done.at("execution").at("lane_id") == 0,
+                      "request completion lost its Engine identity or zero-based lane");
+    auto unassigned_outcome = outcome;
+    unassigned_outcome.metrics.lane_id.reset();
+    failures += check(Json::parse(format_request_done_json("serve-test", 3000, context,
+                                                          unassigned_outcome))
+                          .at("execution").at("lane_id").is_null(),
+                      "unadmitted request must not be attributed to lane zero");
     failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
                           done.at("materialization").at("search_granted_ns") == 8000 &&
@@ -564,6 +575,22 @@ int main() {
     throughput.committed_decode_tokens                  = 40;
     throughput.decode_rounds                            = 10;
     throughput.decode_row_rounds                        = 18;
+    throughput.previous.lane_count = throughput.current.lane_count = 2;
+    throughput.previous.lanes[0] = {.computed_prefill_tokens = 300,
+                                    .committed_decode_tokens = 30, .decode_rounds = 4,
+                                    .engine_request_id = 11,
+                                    .state = ninfer::RuntimeLaneState::DecodeReady};
+    throughput.current.lanes[0] = {.computed_prefill_tokens = 400,
+                                   .committed_decode_tokens = 55, .decode_rounds = 14,
+                                   .engine_request_id = 13,
+                                   .state = ninfer::RuntimeLaneState::Prefill};
+    // A finished lane retains the work completed earlier in this reporting interval.
+    throughput.previous.lanes[1] = {.computed_prefill_tokens = 200,
+                                    .committed_decode_tokens = 10, .decode_rounds = 2,
+                                    .engine_request_id = 12,
+                                    .state = ninfer::RuntimeLaneState::DecodeReady};
+    throughput.current.lanes[1] = {.computed_prefill_tokens = 200,
+                                   .committed_decode_tokens = 25, .decode_rounds = 10};
     throughput.previous.root_selections                 = 2;
     throughput.previous.state_h2d_bytes                 = 100;
     throughput.current.running_requests                 = 2;
@@ -632,6 +659,23 @@ int main() {
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
+    const auto& lanes = throughput_json.at("lanes");
+    failures += check(lanes.size() == 2 && lanes[0].at("lane_id") == 0 &&
+                          lanes[1].at("lane_id") == 1 &&
+                          lanes[0].at("state") == "prefill" &&
+                          lanes[0].at("engine_request_id") == 13 &&
+                          lanes[1].at("state") == "idle" &&
+                          lanes[1].at("engine_request_id").is_null(),
+                      "lane end-of-interval ownership gauges are incorrect");
+    failures += check(lanes[0].at("tokens").at("computed_prefill") == 100 &&
+                          lanes[0].at("tokens").at("committed_decode") == 25 &&
+                          lanes[1].at("tokens").at("committed_decode") == 15 &&
+                          lanes[0].at("decode_rounds") == 10 &&
+                          lanes[1].at("decode_rounds") == 8 &&
+                          lanes[0].at("throughput_tokens_per_second").at("prefill") == 50.0 &&
+                          lanes[0].at("throughput_tokens_per_second").at("decode") == 12.5 &&
+                          lanes[1].at("throughput_tokens_per_second").at("decode") == 7.5,
+                      "lane reuse or completion lost interval work, or rates use a wrong denominator");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
@@ -662,8 +706,12 @@ int main() {
         "throughput Host work deltas or normalization are incorrect");
 
     ThroughputReport zero_rounds;
+    zero_rounds.current.lane_count = 1;
     const Json zero_rounds_json =
         Json::parse(format_throughput_json("serve-test", 5001, zero_rounds));
+    failures += check(zero_rounds_json.at("lanes")[0]
+                          .at("throughput_tokens_per_second").at("decode") == 0.0,
+                      "zero interval lane rates must remain finite");
     failures += check(
         zero_rounds_json.at("decode_batch").at("average_size").is_null() &&
             zero_rounds_json.at("host_work").at("decode_host_microseconds_per_round").is_null() &&

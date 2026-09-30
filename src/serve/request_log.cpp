@@ -553,6 +553,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      const GenerationOutcome& outcome) {
     Json record       = event_base(server_instance_id, timestamp, "request_done");
     record["request"] = request_json(context);
+    record["execution"] = Json{
+        {"engine_request_id", outcome.metrics.engine_request_id},
+        {"lane_id", outcome.metrics.lane_id ? Json(*outcome.metrics.lane_id) : Json(nullptr)}};
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
@@ -615,6 +618,23 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    record["lanes"] = Json::array();
+    for (std::uint32_t lane = 0; lane < current.lane_count; ++lane) {
+        const auto& before = previous.lanes[lane];
+        const auto& after = current.lanes[lane];
+        const auto prefill = after.computed_prefill_tokens - before.computed_prefill_tokens;
+        const auto decode = after.committed_decode_tokens - before.committed_decode_tokens;
+        record["lanes"].push_back(Json{
+            {"lane_id", lane},
+            {"state", runtime_lane_state_name(after.state)},
+            {"engine_request_id", after.engine_request_id != 0 ? Json(after.engine_request_id)
+                                                              : Json(nullptr)},
+            {"tokens", Json{{"computed_prefill", prefill}, {"committed_decode", decode}}},
+            {"throughput_tokens_per_second",
+             Json{{"prefill", report.interval_seconds > 0.0 ? prefill / report.interval_seconds : 0.0},
+                  {"decode", report.interval_seconds > 0.0 ? decode / report.interval_seconds : 0.0}}},
+            {"decode_rounds", after.decode_rounds - before.decode_rounds}});
+    }
     record["scheduler"]    = Json{{"running", current.running_requests},
                                   {"prefilling", current.prefilling_requests},
                                   {"decode_ready", current.decode_ready_requests},

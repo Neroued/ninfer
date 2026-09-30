@@ -55,6 +55,14 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
 }
 
 bool report_has_activity(const ThroughputReport& report) {
+    // Publish the final idle transition even when cancellation produced no tokens.
+    for (std::uint32_t lane = 0; lane < report.current.lane_count; ++lane) {
+        if (report.current.lanes[lane].state != report.previous.lanes[lane].state ||
+            report.current.lanes[lane].engine_request_id !=
+                report.previous.lanes[lane].engine_request_id) {
+            return true;
+        }
+    }
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.current.running_requests != 0 ||
            report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||

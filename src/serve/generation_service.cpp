@@ -424,6 +424,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 
+    outcome.metrics.engine_request_id = result.engine_request_id;
+    outcome.metrics.lane_id = result.lane_id;
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +

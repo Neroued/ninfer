@@ -188,6 +188,18 @@ This smoke check is intentionally not a CTest: it needs the real artifact, a sup
 server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
 state, streaming, and multimodal requests.
 
+To validate per-lane JSONL accounting, use an otherwise idle server with `--max-concurrency 2`,
+`--request-log-jsonl out/requests.jsonl`, and a nonzero stats interval of at most 5000 ms:
+
+```bash
+python3 tools/smoke/serve_lane_metrics.py --url http://127.0.0.1:18080 \
+  --log out/requests.jsonl --output out/lane-metrics
+```
+
+This checks two concurrent requests followed by lane/prefix reuse, stable Engine-to-HTTP request
+identity, idle publication, and conservation of prefill/decode tokens between each lane, request
+completion, and aggregate interval records. It saves raw records and responses for diagnosis.
+
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares stripped and preserved closed-turn prompt lengths, and verifies compatible
 prefix reuse, speculative execution, frontier bounds and Responses inheritance:

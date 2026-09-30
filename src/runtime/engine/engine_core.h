@@ -82,6 +82,8 @@ public:
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        cumulative_stats_.lane_count = max_concurrency_;
+        published_stats_ = cumulative_stats_;
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -537,9 +539,28 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
+            auto& lane_stats = snapshot.lanes[lane];
+            const auto& request = slots_[lane];
+            lane_stats.engine_request_id = request->id;
+            if (request->terminal_reason) {
+                lane_stats.state = RuntimeLaneState::TerminalPending;
+            } else if (request->capture_pending) {
+                lane_stats.state = RuntimeLaneState::CapturePending;
+            } else if (request->is_prefilling()) {
+                lane_stats.state = RuntimeLaneState::Prefill;
+            } else if (request->is_decode_ready()) {
+                lane_stats.state = RuntimeLaneState::DecodeReady;
+            } else if (request->is_control_ready()) {
+                lane_stats.state = RuntimeLaneState::ControlReady;
+            }
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
+        }
+        if (materializing_) {
+            auto& lane_stats = snapshot.lanes[materializing_->destination.value];
+            lane_stats.engine_request_id = materializing_->request->id;
+            lane_stats.state = RuntimeLaneState::Materializing;
         }
         detail_range.reset();
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
@@ -845,6 +866,8 @@ private:
             request->queue_wait_recorded       = true;
         }
         GenerationResult result;
+        result.engine_request_id = request->id;
+        if (request->lane) { result.lane_id = request->lane->value; }
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
         result.content                 = std::move(request->content);
@@ -1208,8 +1231,11 @@ private:
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
             for (std::size_t row = 0; row < row_count; ++row) {
+                auto& lane_stats = cumulative_stats_.lanes[lane_indices[row]];
+                ++lane_stats.decode_rounds;
                 if (!cancelled[row]) {
                     cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
+                    lane_stats.committed_decode_tokens += decisions[row].accepted_tokens;
                 }
             }
         }
@@ -1332,6 +1358,8 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
+        cumulative_stats_.lanes[request->lane->value].computed_prefill_tokens +=
+            progress.processed_prompt_tokens;
         Scheduling::consume_service_work(*request, 1);
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
@@ -1902,6 +1930,7 @@ private:
             request->budget->commit(membership.row_stride);
             Scheduling::consume_service_work(*request, membership.row_stride);
             cumulative_stats_.committed_decode_tokens += membership.row_stride;
+            cumulative_stats_.lanes[lane].committed_decode_tokens += membership.row_stride;
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, request->output.commit_preview(), std::move(timing));
             request->model_state = EngineRequestState::DecodeReady;

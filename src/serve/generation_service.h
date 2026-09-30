@@ -22,6 +22,8 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
+    std::uint64_t engine_request_id = 0;
+    std::optional<std::uint32_t> lane_id;
     double prepare_seconds         = 0.0;
     double ttft_seconds            = 0.0;
     double vision_seconds          = 0.0;

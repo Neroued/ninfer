@@ -842,7 +842,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -870,6 +870,35 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+
+`request_done.execution` identifies the `engine_request_id` and zero-based `lane_id` used by the
+request. The lane is `null` if it finishes before physical admission, for example a queued
+cancellation. Engine IDs are separate from HTTP `request.request_id`; this record maps the two.
+Always scope both IDs to `server_instance_id`.
+
+For per-lane dashboard charts, consume `throughput.lanes[]`. There is one entry for every configured
+lane, including idle lanes, with these fields:
+
+| Field | Meaning |
+|---|---|
+| `lane_id` | Stable, zero-based physical lane number for this server instance |
+| `state` | End-of-interval `idle`, `materializing`, `prefill`, `decode_ready`, `control_ready`, `capture_pending`, or `terminal_pending` |
+| `engine_request_id` | Current occupant at the end of the interval, or `null` when idle |
+| `tokens.computed_prefill`, `tokens.committed_decode` | Work completed on this lane during the interval, with the same semantics as aggregate `tokens` |
+| `throughput_tokens_per_second.prefill`, `.decode` | The lane's interval tokens divided by the shared `interval_seconds` |
+| `decode_rounds` | Number of decode batches in which this lane participated during the interval |
+
+Per-lane token counts and rates sum to the unchanged aggregate fields. Per-lane `decode_rounds`
+sum to `decode_batch.row_rounds`, not `decode_batch.rounds`. Counters persist across lane reuse, so
+an interval may contain work from multiple requests; do not attribute its entire token delta to
+the final `engine_request_id`. An idle lane may still have nonzero work in the interval when its
+request just finished. These wall-interval rates include scheduling/idle time and differ from
+the active-execution rates derived from `request_done.timings_seconds`.
+
+The same `--request-log-jsonl FILE` enables these fields; no extra tracing option is needed.
+`--log-stats-interval-ms 1000` selects one-second charts (default 5000; zero disables periodic
+records). The final transition to idle is emitted; later fully idle intervals are omitted, so
+dashboards should expire the last interval's rate to zero instead of retaining it indefinitely.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token

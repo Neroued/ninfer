@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -791,6 +792,9 @@ struct MaterializationDiagnostics {
 };
 
 struct GenerationResult {
+    std::uint64_t engine_request_id = 0;
+    // No lane when a request finishes before physical admission (e.g. queued cancellation).
+    std::optional<std::uint32_t> lane_id;
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
     std::string content;
@@ -884,10 +888,45 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+enum class RuntimeLaneState : std::uint8_t {
+    Idle,
+    Materializing,
+    Prefill,
+    DecodeReady,
+    ControlReady,
+    CapturePending,
+    TerminalPending,
+};
+
+[[nodiscard]] inline constexpr const char* runtime_lane_state_name(RuntimeLaneState state) noexcept {
+    switch (state) {
+    case RuntimeLaneState::Idle: return "idle";
+    case RuntimeLaneState::Materializing: return "materializing";
+    case RuntimeLaneState::Prefill: return "prefill";
+    case RuntimeLaneState::DecodeReady: return "decode_ready";
+    case RuntimeLaneState::ControlReady: return "control_ready";
+    case RuntimeLaneState::CapturePending: return "capture_pending";
+    case RuntimeLaneState::TerminalPending: return "terminal_pending";
+    }
+    return "idle";
+}
+
+struct RuntimeLaneStats {
+    // Lifetime counters of this physical lane, never reset when its request changes.
+    std::uint64_t computed_prefill_tokens = 0;
+    std::uint64_t committed_decode_tokens = 0;
+    std::uint64_t decode_rounds = 0;
+    // Current boundary gauges; zero means no current request. Engine and HTTP IDs differ.
+    std::uint64_t engine_request_id = 0;
+    RuntimeLaneState state = RuntimeLaneState::Idle;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
+    std::uint32_t lane_count = 0;
+    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

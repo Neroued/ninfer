@@ -279,10 +279,8 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph     = cli.use_cuda_graph;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
-        engine_options.context_cache.enabled                = false;
-        engine_options.context_cache.host_state_slots       = 0;
-        engine_options.context_cache.host_kv_capacity_bytes = 0;
-        engine_options.startup_observer                     = startup_log.observer();
+        engine_options.context_cache.enabled = false;
+        engine_options.startup_observer      = startup_log.observer();
 
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());

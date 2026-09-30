@@ -55,6 +55,11 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                          = 0;
     std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Takes the per-model-layer events of a Host restore still landing, which the chunk's first
+    // pass over the layer stack waits on; empty once taken or landed. The events are a view into
+    // the landing batch, which the cache's next poll() frees, so each chunk function calls this
+    // immediately before its pass and nothing outside the chunk call can hold the view.
+    std::function<std::span<const cudaEvent_t>()> take_layer_ready;
 };
 
 struct OrdinaryBatchContext {

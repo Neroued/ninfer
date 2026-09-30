@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -116,6 +117,18 @@ struct StateImageDeviceSlotView {
     std::optional<CyclicKVCacheSlotView> dflash_local;
 };
 
+// A part of one StateImage a consumer can take on its own: one linear-attention layer's conv and
+// recurrent state, or everything else (the continuation hidden and any DFlash local state).
+struct StateImagePart {
+    enum class Kind : std::uint8_t {
+        LinearLayer,
+        Rest,
+    };
+
+    Kind kind           = Kind::Rest;
+    std::uint32_t layer = 0;
+};
+
 /**
  * Caller-backed fixed storage for Qwen3.6 continuation state.
  *
@@ -160,9 +173,27 @@ public:
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,
                         cudaStream_t stream = nullptr);
+    // Segmented host images: the packed host image byte o lives at
+    // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
+    void copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
+                               std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
+    void copy_from_host_segments(std::span<const std::byte* const> segments,
+                                 std::size_t segment_bytes, std::int32_t destination,
+                                 cudaStream_t stream = nullptr);
+    // One part of the image, so a restore can land the state a forward pass reads first ahead of
+    // the rest.
+    void copy_from_host_segments(std::span<const std::byte* const> segments,
+                                 std::size_t segment_bytes, std::int32_t destination,
+                                 StateImagePart part, cudaStream_t stream);
 
 private:
     void validate_host_layout(const StateImageHostLayout* layout, const std::byte* data) const;
+    // Visit Device components of one slot as (device pointer, packed host offset, bytes): all of
+    // them, or those of one part.
+    template <class Visit>
+    void for_each_host_component(std::int32_t slot, Visit&& visit) const;
+    template <class Visit>
+    void for_each_host_component(std::int32_t slot, StateImagePart part, Visit&& visit) const;
 
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;

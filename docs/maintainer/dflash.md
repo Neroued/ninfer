@@ -288,9 +288,9 @@ features survive commit until context catch-up, but are not checkpoint payload. 
 expands these transient extents; it does not increase DFlash2's 40 MiB ring image or introduce
 cross-round convolution history.
 
-Device fork, turn checkpoints, Host replicas and restore carry the backend context together with
-target state and continuation metadata. Their coverage must agree. These rules are shared with
-[context scheduling](resource-scheduling-and-context-cache.md) and
+Device fork, prefix-cache blocks and state snapshots, their Host copies and restore carry the
+backend context together with target state and continuation metadata. Their coverage must agree.
+These rules are shared with the [hybrid prefix cache](hybrid-prefix-cache.md) and
 [ReplaySSM](replayssm-gdn.md).
 
 ## Execution flow

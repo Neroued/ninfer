@@ -129,6 +129,16 @@ int main() {
                                .current       = 16ULL << 30,
                                .total         = 16ULL << 30,
                                .elapsed_ns    = 2'000'000'000});
+            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
+                               .status        = ninfer::StartupStatus::Begin,
+                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                               .total         = 24ULL << 30});
+            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
+                               .status        = ninfer::StartupStatus::Complete,
+                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                               .current       = 24ULL << 30,
+                               .total         = 24ULL << 30,
+                               .elapsed_ns    = 4'000'000'000});
             observer.callback({.phase      = ninfer::StartupPhase::EngineStartup,
                                .status     = ninfer::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
@@ -141,16 +151,92 @@ int main() {
         startup_output = capture.finish();
     }
     failures += check(
-        line_count(startup_output) == 4 &&
+        line_count(startup_output) == 6 &&
             startup_output.find("starting engine") != std::string::npos &&
             startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
+                std::string::npos &&
+            startup_output.find("loading prefix cache | 24.0 GiB") != std::string::npos &&
+            startup_output.find("prefix cache read | 24.0 GiB | 4.0s | 6.00 GiB/s") !=
                 std::string::npos &&
             startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
                 std::string::npos &&
             startup_output.find("CUDA sync blocking") != std::string::npos &&
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
+
+    // A Host tier smaller than the saved file warns with what was kept and what the file needs.
+    std::string partial_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer-serve",
+                 .color        = ninfer::product::LogColorMode::Never,
+                 .presentation = ninfer::product::LogPresentation::Service});
+            ninfer::product::StartupLogRenderer startup(logging);
+            ninfer::LoadSummary load;
+            load.model_name     = "qwen3.6-27b";
+            load.cuda_sync_mode = "blocking";
+            load.prefix_cache   = {.attempted           = true,
+                                   .restored            = true,
+                                   .blocks              = 9000,
+                                   .snapshots           = 60,
+                                   .bytes               = 30ULL << 30,
+                                   .seconds             = 7.0,
+                                   .saved_blocks        = 15807,
+                                   .saved_snapshots     = 98,
+                                   .required_host_bytes = 50ULL << 30,
+                                   .host_bytes          = 31ULL << 30};
+            startup.engine_ready(load);
+            logging.flush();
+        }
+        partial_output = capture.finish();
+    }
+    failures += check(
+        partial_output.find("  WARN  prefix cache partly restored | 60 of 98 snapshots | 9,000 of "
+                            "15,807 blocks | 30.0 GiB | 7.0s | the file needs 50.0 GiB of Host "
+                            "tier; --host-cache-mib gives 31.0 GiB") != std::string::npos &&
+            partial_output.find("prefix cache restored") == std::string::npos,
+        "a partial prefix cache restore is not reported as a warning");
+
+    // A Host tier that keeps no snapshot restores nothing resumable: the warning says so rather
+    // than claiming the most valuable snapshots were kept.
+    std::string none_kept_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer-serve",
+                 .color        = ninfer::product::LogColorMode::Never,
+                 .presentation = ninfer::product::LogPresentation::Service});
+            ninfer::product::StartupLogRenderer startup(logging);
+            ninfer::LoadSummary load;
+            load.model_name     = "qwen3.6-27b";
+            load.cuda_sync_mode = "blocking";
+            load.prefix_cache   = {.attempted           = true,
+                                   .restored            = true,
+                                   .blocks              = 0,
+                                   .snapshots           = 0,
+                                   .bytes               = 0,
+                                   .seconds             = 0.1,
+                                   .saved_blocks        = 15807,
+                                   .saved_snapshots     = 98,
+                                   .required_host_bytes = 50ULL << 30,
+                                   .host_bytes          = 1ULL << 30};
+            startup.engine_ready(load);
+            logging.flush();
+        }
+        none_kept_output = capture.finish();
+    }
+    failures +=
+        check(none_kept_output.find(
+                  "  WARN  prefix cache not restored | none of the file's 98 snapshots "
+                  "fits: it needs 50.0 GiB of Host tier and --host-cache-mib gives "
+                  "1.00 GiB | the save at shutdown replaces the file") != std::string::npos &&
+                  none_kept_output.find("partly restored") == std::string::npos &&
+                  none_kept_output.find("most valuable") == std::string::npos,
+              "a restore that kept no snapshot claims its most valuable snapshots were kept");
 
     std::string tool_output;
     {

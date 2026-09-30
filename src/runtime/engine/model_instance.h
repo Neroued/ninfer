@@ -31,7 +31,6 @@ struct ModelInstance {
 struct ConstructedModel {
     std::unique_ptr<ModelInstance> instance;
     LoadSummary load;
-    ContextMachineCostModel context_cost;
 };
 
 [[nodiscard]] ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device);

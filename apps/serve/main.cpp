@@ -10,10 +10,12 @@
 #include <chrono>
 #include <csignal>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace {
@@ -23,6 +25,21 @@ std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
 void handle_signal(int) {
     ninfer::serve::HttpServer* server = g_server.load();
     if (server != nullptr) { server->stop(); }
+}
+
+// Identity of this exact binary for the persisted prefix cache: the executable's size and
+// modification time, so any rebuild invalidates a saved cache whose bytes it may compute
+// differently.
+std::string binary_identity(const char* argv0) {
+    std::string out;
+    std::error_code error;
+    std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error) { self = std::filesystem::absolute(argv0, error); }
+    const auto size = std::filesystem::file_size(self, error);
+    if (!error) { out += "size=" + std::to_string(size); }
+    const auto time = std::filesystem::last_write_time(self, error);
+    if (!error) { out += ";mtime=" + std::to_string(time.time_since_epoch().count()); }
+    return out;
 }
 
 } // namespace
@@ -42,6 +59,9 @@ int main(int argc, char** argv) {
     if (options.help_requested) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
+    }
+    if (!options.context_cache.persistent_file.empty()) {
+        options.context_cache.persistent_identity = binary_identity(argv[0]);
     }
 
     ninfer::product::LoggingRuntime logging(

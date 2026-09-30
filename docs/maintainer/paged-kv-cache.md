@@ -8,8 +8,8 @@ Device/Host replicas、address spaces、reservations、block tables 和 GPU cons
 1. 一个已经选定的 logical context target 能否由当前 KV stores 兑现；
 2. 兑现后的 KV 如何被模型 execution unit 直接消费。
 
-请求顺序和生命周期由 [Engine 架构](engine-architecture.md)定义；candidate、retention、pressure target
-和资源成本由 [资源调度与上下文缓存](resource-scheduling-and-context-cache.md)定义。KV Store 不选择
+请求顺序和生命周期由 [Engine 架构](engine-architecture.md)定义；前缀缓存的 source、retention、
+eviction 和资源成本由 [Hybrid prefix cache](hybrid-prefix-cache.md)定义。KV Store 不选择
 request、source 或 victim。
 
 ---
@@ -40,14 +40,14 @@ KV 架构区分：
 |---|---|---|
 | allocation granularity | pool 一次取得或释放多少 token payload | 每个 growing pool 为 `P=64` |
 | valid-frontier granularity | consumer 可以读取到哪个 logical position | 1 token |
-| reusable-state granularity | 哪个 frontier 具有完整模型 continuation | target-defined checkpoint |
+| reusable-state granularity | 哪个 frontier 具有完整模型 continuation | target-defined state snapshot |
 
 Page boundary 不是 Attention mask boundary，也不是 prefix hit boundary。一个 valid frontier 可以位于 page
 内部任意 offset。
 
 KV Store 可以在任意 token frontier 表示、truncate 或保护 prefix；这不证明模型可以从该位置恢复。
 可复用 frontier 必须同时存在完整 StateImage 与 target-defined backend state，具体规则见
-[Continuation 与 checkpoint](resource-scheduling-and-context-cache.md#4-continuation-与-checkpoint)。
+[Hybrid prefix cache](hybrid-prefix-cache.md#53-snapshots)。
 
 ---
 
@@ -182,9 +182,10 @@ MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中�
 
 ### 3.5 Host capacity
 
-Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `HostKVArena`，但每个 allocation
-携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
-它不扩大 Device active entitlement 或单 sequence context ceiling。
+前缀缓存的 Host tier 是一个 startup-fixed pinned slab pool（`--host-cache-mib`）。Main 与 selected
+backend 的 cached block 以各自 typed 的 packed `HostKVPageLayout` 与 state snapshot 共用它；slab 结构与
+eviction 由 [Hybrid prefix cache](hybrid-prefix-cache.md#54-memory-pools)定义。Host capacity
+不扩大 Device active entitlement 或单 sequence context ceiling。
 
 ---
 
@@ -372,7 +373,8 @@ Host replica 使用 logical-order packed `HostKVPageLayout`：
 - Main/backend layouts可以在同一 arena 中分配不同 stride 的 extents。
 
 Host arena 是有界 variable-size allocator。Plan 必须针对完整 release/allocation recipe 验证 extent geometry；
-`free_bytes` 只是占用摘要，不是可分配性的充分证明。
+`free_bytes` 只是占用摘要，不是可分配性的充分证明。当前没有产品路径创建 logical-page Host replica：
+前缀缓存的 Host 副本存放在它自己的 slab pool 中（§3.5）。
 
 ### 5.4 Replica transfer
 
@@ -486,7 +488,7 @@ create or claim destination address spaces
   -> publish Active sequence
 ```
 
-ResourceManager 选择 logical target，Program 根据真实 references 决定 Move/Fork/COW。Active publication
+Program 的前缀缓存选择 source，Program 根据真实 references 决定 Move/Fork/COW。Active publication
 前，source 保持有效，任一失败都回到完整 inactive 终态。
 
 ### 7.2 Prefill 与 decode

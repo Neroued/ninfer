@@ -145,9 +145,18 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
 ```
 
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
-tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
-`pressure-resume` or `concurrent`; the default is `all`. These integration checks
+tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as
+`concurrent` or `stream-observations`; the default is `all`. These integration checks
 use behavior and state accounting rather than another numerical path's generated tokens as a golden.
+
+The prefix-cache integration test checks that Host and Device restores continue exactly as the
+uninterrupted request (with and without MTP and DFlash2), reuse at the generation opener and the
+system block, the Device-only tier, protocol cache hints, Vision, and persistence across a restart.
+`NINFER_HYBRID_REAL_SCENARIO` selects one scenario, and `NINFER_HYBRID_KV_DTYPE` the KV storage:
+
+```bash
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer   ctest --test-dir build -R ninfer_qwen3_5_hybrid_prefix_real_test --output-on-failure
+```
 
 The `attention` scenario checks the selected KV type, chunked prefill, concurrent Graph decode
 across a resource tier, prefix continuation, and workspace bounds:

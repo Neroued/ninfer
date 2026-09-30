@@ -57,97 +57,8 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));
-    } else if (requests[lane].prefill && requests[lane].prefill->pending_capture_offer != 0) {
-        out.capture.emplace(
-            ContractAccess::make_capture_offer(this, runtime::LaneId{lane}, lane_epochs[lane],
-                                               requests[lane].prefill->pending_capture_offer));
     }
     return out;
-}
-
-StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) {
-    std::optional<std::uint32_t> destination = transaction.destination.value;
-    std::optional<std::uint32_t> continuation_index;
-    try {
-        if (!transaction.prepared || !transaction.plan || !destination ||
-            *destination >= max_concurrency) {
-            throw std::invalid_argument("materialization transaction is not publishable");
-        }
-        const std::uint32_t lane              = *destination;
-        const AdmissionCandidateImpl& details = *transaction.plan->impl_;
-        if (details.destination_epoch != lane_epochs[lane] ||
-            details.has_source != transaction.has_source ||
-            details.has_shared_source != transaction.has_shared_source) {
-            throw std::logic_error("admission plan physical epoch is stale");
-        }
-        if (requests[lane].lifecycle != Lifecycle::Empty ||
-            active_continuations[lane] < continuation_capacity) {
-            throw std::logic_error("admission destination is not free");
-        }
-        if (transaction.has_source &&
-            transaction.source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
-            if (transaction.source_index >= continuation_capacity ||
-                continuation_slots[transaction.source_index].role !=
-                    ContinuationSlotRole::Catalogued ||
-                continuation_slots[transaction.source_index].generation !=
-                    transaction.source_generation ||
-                transaction.source_index != details.source_index ||
-                transaction.source_generation != details.source_generation) {
-                throw std::logic_error("admission source capability is stale");
-            }
-            continuation_index                           = transaction.source_index;
-            continuation_slots[*continuation_index].role = ContinuationSlotRole::Active;
-        } else {
-            continuation_index = transaction.root_continuation_index;
-            if (!continuation_index || transaction.root_waiting_for_victim ||
-                continuation_slots[*continuation_index].role !=
-                    ContinuationSlotRole::ReservedMaterialization) {
-                throw std::logic_error("materialization continuation reservation is unavailable");
-            }
-            continuation_slots[*continuation_index].role = ContinuationSlotRole::Active;
-        }
-
-        const detail::PhysicalResources active = details.demand.active_entitlement;
-        active_continuations[lane]             = *continuation_index;
-        SequenceState& sequence                = continuation_states[*continuation_index];
-        sequence.lane                          = lane;
-        transaction.root_continuation_index.reset();
-        start_sequence(lane, sequence, transaction);
-        detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
-        actual.device.active_lanes               = 1;
-        const detail::PhysicalResources expected = active;
-        if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
-        }
-        if (details.reuse != ReusePath::Root) {
-            if (transaction.state_restored) {
-                ++transaction.operations.state_restores;
-            } else if (details.source_mode == runtime::PrivateSourceMode::Retain ||
-                       transaction.has_shared_source || details.state_fork_required) {
-                ++transaction.operations.state_forks;
-                ++transaction.operations.historical_fork_hits;
-            } else {
-                ++transaction.operations.state_moves;
-            }
-        }
-        requests[lane].active_resources   = active;
-        requests[lane].optional_resources = details.active_optional_resources;
-        invalidate_lane(lane);
-        const SequenceHandle handle =
-            ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
-        return StartResult{.sequence = handle};
-    } catch (...) {
-        if (destination && *destination < max_concurrency) {
-            const std::uint32_t lane = *destination;
-            if (active_continuations[lane] < continuation_capacity) {
-                clear_lane_best_effort(active_sequence(lane), requests[lane]);
-            } else if (continuation_index) {
-                release_continuation_slot_best_effort(*continuation_index);
-            }
-            invalidate_lane(*destination);
-        }
-        throw;
-    }
 }
 
 PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
@@ -186,50 +97,12 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
     }
 }
 
-// Begin and ordinary rounds may already have provisional identity through the accepted extent;
-// speculative and forced spans arrive with identity at their base. Both are Program-owned pending
-// states, and this is their single accepted-prefix identity commit.
-void ProgramImpl::commit_generated_prefix_identity(
-    SequenceState& sequence, std::uint32_t base_ledger_frontier,
-    std::span<const TokenId> accepted_tokens,
-    std::optional<std::uint32_t> prefix_execution_split_after) {
-    if (base_ledger_frontier > sequence.ledger.size() ||
-        accepted_tokens.size() > sequence.ledger.size() - base_ledger_frontier ||
-        sequence.ledger.size() != base_ledger_frontier + accepted_tokens.size() ||
-        !std::equal(accepted_tokens.begin(), accepted_tokens.end(),
-                    sequence.ledger.begin() + static_cast<std::ptrdiff_t>(base_ledger_frontier)) ||
-        (prefix_execution_split_after &&
-         (*prefix_execution_split_after == 0 ||
-          *prefix_execution_split_after > accepted_tokens.size()))) {
-        throw std::logic_error("committed generated-prefix identity has an invalid span");
-    }
-    const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
-                                  sequence.prefix_digests.size() == sequence.ledger.size();
-    const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
-                               sequence.prefix_digests.size() == base_ledger_frontier;
-    if (!already_appended && !awaits_append) {
-        throw std::logic_error("generated-prefix identity is not at its base or committed extent");
-    }
-    if (already_appended && !prefix_execution_split_after) { return; }
-    sequence.prefix_identity.truncate(base_ledger_frontier);
-    sequence.prefix_digests.truncate(base_ledger_frontier);
-    sequence.prefix_identity.append_generated(accepted_tokens.size(), sequence.rope_delta,
-                                              prefix_execution_split_after);
-    sequence.prefix_digests.append_generated(accepted_tokens, sequence.rope_delta,
-                                             prefix_execution_split_after);
-    if (sequence.prefix_identity.size() != sequence.ledger.size() ||
-        sequence.prefix_digests.size() != sequence.ledger.size()) {
-        throw std::logic_error("committed generated-prefix identity changed the ledger shape");
-    }
-}
-
 runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
     std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
-    std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
-    runtime::ExecutionTiming* failed_timing) {
+    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
-        row_stride == 0 || prefix_execution_splits.size() != members.size() ||
+        row_stride == 0 ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
         throw std::invalid_argument("forced-token membership is invalid");
     }
@@ -249,8 +122,6 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         if (sequence.execution_frontier == std::numeric_limits<std::uint32_t>::max() ||
             sequence.ledger_frontier != sequence.execution_frontier + 1U ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
@@ -260,10 +131,6 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             throw std::logic_error("forced-token sequence frontier is invalid");
         }
         validate_licensed_tokens(row_major_tokens.subspan(row * row_stride, row_stride));
-        if (prefix_execution_splits[row] &&
-            (*prefix_execution_splits[row] == 0 || *prefix_execution_splits[row] > row_stride)) {
-            throw std::logic_error("forced-token execution split is outside its row");
-        }
         lanes[row] = lane;
     }
 
@@ -297,10 +164,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             RequestControl& request  = requests[lane];
             const std::span<const TokenId> forced =
                 row_major_tokens.subspan(row * row_stride, row_stride);
-            const std::uint32_t base_ledger_frontier = sequence.ledger_frontier;
-            const std::uint32_t base                 = sequence.execution_frontier;
-            const std::uint32_t end                  = base + row_stride;
-            const auto started                       = Clock::now();
+            const std::uint32_t base = sequence.execution_frontier;
+            const std::uint32_t end  = base + row_stride;
+            const auto started       = Clock::now();
 
             if (is_masked_draft_backend(speculative_backend) &&
                 sequence.dflash_context_frontier < base) {
@@ -384,16 +250,11 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             timing.end_wait();
             work.reset();
 
-            commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
-                                             prefix_execution_splits[row]);
-            advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;
             sequence.tail_hidden_valid  = true;
             if (sequence.ledger.size() != sequence.ledger_frontier ||
-                sequence.prefix_identity.size() != sequence.ledger_frontier ||
-                sequence.prefix_digests.size() != sequence.ledger_frontier ||
                 sequence.ledger.back() != forced.back()) {
                 throw std::logic_error("forced-token commit did not establish a valid frontier");
             }
@@ -452,7 +313,6 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
-        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
         for (std::size_t row = 0; row < row_count; ++row) {
             const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
             lanes[row]                              = lane;
@@ -466,16 +326,12 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!decision.cancelled &&
                  (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
-                  (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
-                (decision.prefix_execution_split_after &&
-                 (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
-                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced)))) {
                 throw std::logic_error("pending transaction decision is invalid");
             }
-            accepted[row]                = decision.accepted_tokens;
-            terminal[row]                = decision.terminal ? 1U : 0U;
-            cancelled[row]               = decision.cancelled ? 1U : 0U;
-            prefix_execution_splits[row] = decision.prefix_execution_split_after;
+            accepted[row]  = decision.accepted_tokens;
+            terminal[row]  = decision.terminal ? 1U : 0U;
+            cancelled[row] = decision.cancelled ? 1U : 0U;
             if (decision.cancelled) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
@@ -488,8 +344,6 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                                 std::span<const std::uint32_t>(accepted.data(), row_count),
                                 std::span<const std::uint8_t>(terminal.data(), row_count),
                                 std::span<const std::uint8_t>(cancelled.data(), row_count),
-                                std::span<const std::optional<std::uint32_t>>(
-                                    prefix_execution_splits.data(), row_count),
                                 failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
@@ -520,25 +374,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                 }
             }
 
-            if (pending_kinds[row] != PendingKind::Begin || decisions[row].cancelled) { continue; }
-            RequestControl& request = requests[lanes[row]];
-            if (decisions[row].terminal) {
-                request.prefill.reset();
-                continue;
+            if (pending_kinds[row] == PendingKind::Begin && !decisions[row].cancelled) {
+                requests[lanes[row]].prefill.reset();
             }
-            if (!request.prefill) { continue; }
-            RequestControl::Prefill& prefill = *request.prefill;
-            if (prefill.cursor != prefill.prompt_tokens ||
-                prefill.next_capture >= prefill.capture_groups.size() ||
-                prefill.capture_groups[prefill.next_capture].frontier != prefill.prompt_tokens ||
-                prefill.pending_capture_offer != 0) {
-                throw std::logic_error("prompt-frontier capture carrier is inconsistent");
-            }
-            if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
-            prefill.pending_capture_offer = next_capture_offer_id_;
-            out.captures[row].emplace(ContractAccess::make_capture_offer(
-                this, runtime::LaneId{lanes[row]}, lane_epochs[lanes[row]],
-                prefill.pending_capture_offer));
         }
         if (released_resource) { advance_resource_revision(); }
         out.timing = timing.finish();
@@ -578,79 +416,15 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
         return out;
     }
-    const std::uint32_t lane               = ContractAccess::lane(sequence).value;
-    RequestControl& request                = requests[lane];
-    SequenceState& state                   = active_sequence(lane);
-    const std::uint32_t continuation_index = active_continuations[lane];
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    SequenceState& state     = active_sequence(lane);
     if (request.lifecycle != Lifecycle::Finishable) { return out; }
-    if (!request.publish_continuation) {
-        if (!clear_lane_strict(state, request)) { return out; }
-        out.disposition = runtime::FinishDisposition::Released;
-        out.timings     = request.timings;
-        out.speculative = std::move(request.speculative_stats);
-        invalidate_lane(lane);
-        advance_resource_revision();
-        out.status = runtime::ConsumeStatus::Consumed;
-        return out;
-    }
-    // Every valid terminal execution path settles a borrowed materialization Fork first. A
-    // borrowed source cannot become this continuation's direct endpoint; fall back to terminal
-    // discard if that publication invariant was not established.
-    if (state.state.fork_pending && state.state.borrows_read()) { return out; }
-    try {
-        out.summary.long_anchors.reserve(state.long_anchors.size());
-    } catch (...) { return out; }
-    try {
-        if (state.state.fork_pending) {
-            const StateImageHandle source      = state.state.read;
-            const StateImageHandle destination = state.state.write;
-            state_store->abort_fork(source, destination);
-            if (!state_store->release(destination)) { return out; }
-            // An active-capture source is still this sequence's primary lifetime. Publishing it
-            // as the endpoint retains that direct ownership; surviving checkpoint references
-            // still prevent exclusive attribution and release.
-            state.state = ActiveStateBinding{.read = source, .write = source};
-        }
-        if (state.reserved_state) {
-            if (!state_store->release(*state.reserved_state)) { return out; }
-            state.reserved_state.reset();
-        }
-        if (state.rewrite_state && *state.rewrite_state == state.state.read) {
-            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
-            state_store->release_checkpoint_reference(*state.rewrite_state);
-            state.rewrite_state.reset();
-            state.rewrite_checkpoint = {};
-        }
-        if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
-            state_store->freeze(state.state.read);
-        } else if (state_store->role(state.state.read) != StateImageRole::CheckpointImmutable) {
-            return out;
-        }
-        state.endpoint_valid = true;
-        refresh_state_views(state);
-        text_kv_addresses->set_checkpoint_requirement(state.kv->text, state.execution_frontier);
-        if (state.kv->backend) {
-            backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
-                                                             backend_kv_valid(state));
-        }
-        populate_continuation_summary(state, out.summary);
-        out.summary.active_references = 0;
-    } catch (...) { return out; }
-    release_active_shared_references(state);
-    release_sequence_growth_entitlement(state);
-    unbind_sequence_kv(state);
-    request.active_resources                    = {};
-    request.optional_resources                  = {};
-    request.lifecycle                           = Lifecycle::Empty;
-    request.pending                             = {};
-    continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
-    active_continuations[lane]                  = continuation_capacity;
-    invalidate_lane(lane);
-    out.continuation.emplace(ContractAccess::make_continuation(
-        this, continuation_index, continuation_slots[continuation_index].generation));
+    // Retained context lives in the prefix index; the lane's own sequence is always released.
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
-    out.disposition = runtime::FinishDisposition::Catalogued;
+    if (!hybrid_finish_lane(state, request, lane, true)) { return out; }
+    invalidate_lane(lane);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
@@ -667,129 +441,42 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
-    if (!clear_lane_strict(state, request)) { return out; }
+    // The committed state is publishable as an endpoint when no model unit is in flight.
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
+    const bool consistent =
+        (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
+         (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
+          state.text_kv_valid == request.prefill->cursor)) &&
+        !state.state.fork_pending;
+    if (!hybrid_finish_lane(state, request, lane, consistent)) { return out; }
     invalidate_lane(lane);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
 }
 
-ReleaseResult ProgramImpl::release_continuation(ContinuationHandle&& continuation) noexcept {
-    ReleaseResult out;
-    const std::uint32_t index      = ContractAccess::index(continuation);
-    const std::uint64_t generation = ContractAccess::epoch(continuation);
-    const bool valid               = !has_context_transaction() && !pending_transaction_ &&
-                       valid_continuation(continuation) && !materialization_pins(index, generation);
-    if (!valid) { return out; }
-    try {
-        if (!can_release_continuation_slot_strict(index)) { return out; }
-    } catch (...) { return out; }
-    release_continuation_slot_strict(index);
-    ContractAccess::consume(continuation);
-    advance_resource_revision();
-    out.status = runtime::ConsumeStatus::Consumed;
-    return out;
-}
-
-bool ProgramImpl::can_release_shared_prefix_state(std::uint32_t index,
-                                                  SharedPrefixSlotRole expected_role) const {
-    if (index >= shared_prefix_capacity || !state_store || !text_kv_addresses ||
-        shared_prefix_slots[index].role != expected_role) {
-        return false;
-    }
-    const SharedPrefixState& shared = shared_prefix_states[index];
-    if (shared.active_references != 0 || !shared.kv || !shared.identity ||
-        !state_store->valid(shared.state) || !text_kv_addresses->can_release(shared.kv->text) ||
-        (shared.kv->backend &&
-         (!backend_kv_addresses || !backend_kv_addresses->can_release(*shared.kv->backend)))) {
-        return false;
-    }
-    const std::uint32_t state_references = state_store->checkpoint_references(shared.state);
-    return state_references != 0 &&
-           (state_references != 1 ||
-            state_store->can_release_after_checkpoint_references(shared.state, 1));
-}
-
-detail::PhysicalResources
-ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
-                                                SharedPrefixSlotRole expected_role) noexcept {
-    try {
-        if (!can_release_shared_prefix_state(index, expected_role)) { std::terminate(); }
-        SharedPrefixState& shared               = shared_prefix_states[index];
-        SharedPrefixSlot& slot                  = shared_prefix_slots[index];
-        const detail::PhysicalResources removed = owner_exclusive_resources(shared);
-        const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
-        if (shared.kv->backend && !backend_kv_addresses->release(*shared.kv->backend)) {
-            std::terminate();
-        }
-        if (!text_kv_addresses->release(shared.kv->text)) { std::terminate(); }
-        state_store->release_checkpoint_reference(shared.state);
-        if (last_state_reference && !state_store->release(shared.state)) { std::terminate(); }
-
-        shared    = SharedPrefixState{};
-        slot.role = SharedPrefixSlotRole::Free;
-        if (++slot.generation == 0) { ++slot.generation; }
-        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
-        return removed;
-    } catch (...) { std::terminate(); }
-}
-
-ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
-    ReleaseResult out;
-    const std::uint32_t index      = ContractAccess::index(handle);
-    const std::uint64_t generation = ContractAccess::epoch(handle);
-    const bool valid =
-        !has_context_transaction() && !pending_transaction_ && valid_shared_prefix(handle);
-    if (!valid || index >= shared_prefix_capacity ||
-        shared_prefix_slots[index].generation != generation) {
-        return out;
-    }
-    try {
-        if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
-            return out;
-        }
-    } catch (...) { return out; }
-    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
-    ContractAccess::consume(handle);
-    advance_resource_revision();
-    out.status = runtime::ConsumeStatus::Consumed;
-    return out;
-}
-
-void ProgramImpl::fail_all_cleanup() noexcept {
+void ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
     pending_transaction_.reset();
-    if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
-        if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
-        }
-        abort_active_capture(*transaction);
-    }
-    if (auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
-        if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
-        }
-        release_materialization_staging(*transaction);
-    }
-    context_transaction_.emplace<std::monostate>();
+    if (context_transaction_) { hybrid_abort_materialization(*context_transaction_); }
+    context_transaction_.reset();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (active_continuations[lane] < continuation_capacity) {
             clear_lane_best_effort(active_sequence(lane), requests[lane]);
         }
         invalidate_lane(lane);
     }
+    if (hybrid_) {
+        if (cleanup == ProgramCleanup::Shutdown) { save_hybrid_cache_for_shutdown(); }
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        hybrid_->clear();
+    }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
             release_continuation_slot_best_effort(index);
         }
-    }
-    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
-        shared_prefix_states[index].active_references = 0;
-        auto handle =
-            ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
-        (void)release_shared_prefix(std::move(handle));
     }
 }
 

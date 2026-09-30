@@ -124,12 +124,11 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.prefill_chunk                    = capacity;
     options.kv_capacity                      = KvCapacityPolicy::explicit_capacity(2 * capacity);
     options.max_concurrency                  = 2;
-    options.context_cache.device_state_slots = 1;
-    options.context_cache.host_state_slots   = 0;
-    options.context_cache.host_kv_capacity_bytes            = 0;
-    options.context_cache.max_private_continuations         = 2;
-    options.context_cache.max_shared_prefixes               = 0;
-    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.host_cache_bytes      = 0;
+    options.context_cache.device_snapshot_slots = 1;
+    options.context_cache.max_new_taps          = 0;
+    options.context_cache.tap_ladder_tokens     = 4096;
+    options.context_cache.tap_min_gap_tokens    = 1024;
     options.use_cuda_graph                                  = false;
     options.speculative.backend                             = backend;
     options.speculative.draft_tokens                        = 3;

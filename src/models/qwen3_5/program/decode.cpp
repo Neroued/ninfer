@@ -290,9 +290,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
             sequence.execution_frontier >= capacity ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.ledger.size() != sequence.ledger_frontier) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -365,9 +363,6 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
-            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(std::span<const TokenId>(&token, 1),
-                                                     sequence.rope_delta);
             request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
                                                  .base_E        = base_E,
                                                  .base_S        = base_S,
@@ -428,8 +423,6 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             sequence.mtp_kv_valid != sequence.execution_frontier ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier ||
             sequence.mtp_draft_count > draft_window) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
@@ -614,9 +607,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.dflash_context_frontier > sequence.execution_frontier ||
             sequence.execution_frontier - sequence.dflash_context_frontier > width ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.ledger.size() != sequence.ledger_frontier) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
@@ -787,7 +778,6 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
 
 runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     SequenceState& sequence, RequestControl& request, std::uint32_t accepted_tokens, bool terminal,
-    std::optional<std::uint32_t> prefix_execution_split_after,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
@@ -799,22 +789,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
         throw std::logic_error("non-speculative pending round must commit its single token");
     }
 
-    const std::uint32_t base_ledger_frontier = request.pending.kind == PendingKind::Begin
-                                                   ? request.pending.prompt_tokens
-                                                   : request.pending.base_S;
-    commit_generated_prefix_identity(
-        sequence, base_ledger_frontier,
-        std::span<const TokenId>(sequence.ledger).subspan(base_ledger_frontier, accepted_tokens),
-        prefix_execution_split_after);
-
     switch (request.pending.kind) {
     case PendingKind::Begin:
         sequence.execution_frontier = request.pending.prompt_tokens;
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
-        advance_rebuild_work(sequence, request.pending.base_E + request.pending.produced,
-                             prefill_chunk);
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
         break;
@@ -823,9 +803,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
         throw std::logic_error("non-speculative pending round has an invalid kind");
     }
     if (sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-        sequence.ledger.size() != sequence.ledger_frontier ||
-        sequence.prefix_identity.size() != sequence.ledger_frontier ||
-        sequence.prefix_digests.size() != sequence.ledger_frontier) {
+        sequence.ledger.size() != sequence.ledger_frontier) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
     // Begin publishes a sampled token but does not execute it through the target. An exact-hit

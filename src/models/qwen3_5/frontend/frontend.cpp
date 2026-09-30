@@ -9,6 +9,7 @@
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -393,61 +394,33 @@ std::optional<std::uint32_t> leading_instruction_boundary(std::span<const ChatRo
     return leading != 0 ? std::optional<std::uint32_t>(leading) : std::nullopt;
 }
 
-bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> items) {
-    for (const VisionItem& item : items) {
-        if (item.token_spans.empty()) { return false; }
-        const TokenSpan& first = item.token_spans.front();
-        const TokenSpan& last  = item.token_spans.back();
-        if (last.count > std::numeric_limits<std::size_t>::max() - last.begin) { return false; }
-        const std::size_t end = last.begin + last.count;
-        if (first.begin < frontier && frontier < end) { return false; }
-    }
-    return true;
-}
-
-PreparedContextCache prepare_context_cache(
-    ContextCacheHints hints, std::size_t message_count,
-    std::span<const std::optional<std::uint32_t>> message_boundaries,
-    std::span<const PromptCacheMarker> rendered_markers,
-    std::span<const std::optional<std::uint32_t>> cache_boundaries,
-    std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
-    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
+// Protocol cache hints are validated as submitted. The prefix cache is content-addressed, so a
+// session key or retention class selects nothing; client markers become explicit tap hints.
+void validate_context_cache_hints(const ContextCacheHints& hints, std::size_t message_count,
+                                  std::span<const PromptCacheMarker> rendered_markers,
+                                  std::span<const std::optional<std::uint32_t>> cache_boundaries) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
     if (cache_boundaries.size() != rendered_markers.size()) {
         throw std::logic_error("rendered cache marker count changed during preparation");
     }
-
-    PreparedContextCache out;
-    if (hints.session_key) {
-        if (hints.session_key->empty() || hints.session_key->size() > kPreparedSessionKeyCapacity) {
-            throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
-        }
-        PreparedSessionKey key;
-        key.size = static_cast<std::uint16_t>(hints.session_key->size());
-        std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
-        out.session_key = key;
+    if (hints.session_key && (hints.session_key->empty() ||
+                              hints.session_key->size() > kMaximumContextCacheSessionKeyBytes)) {
+        throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
     }
     switch (hints.retention) {
     case CacheRetentionHint::Default:
-        out.retention = out.session_key ? runtime::RetentionClass::LiveSession
-                                        : runtime::RetentionClass::RecentPrivate;
+    case CacheRetentionHint::Disposable:
         break;
     case CacheRetentionHint::LiveSession:
-        if (!out.session_key) {
+        if (!hints.session_key) {
             throw std::invalid_argument("LiveSession retention requires a session_key");
         }
-        out.retention = runtime::RetentionClass::LiveSession;
-        break;
-    case CacheRetentionHint::Disposable:
-        out.retention = runtime::RetentionClass::Disposable;
         break;
     default:
         throw std::invalid_argument("context cache retention hint is invalid");
     }
-    out.update_session_index = hints.update_session_index;
-
     for (const PromptCacheMarker marker : hints.markers) {
         switch (marker.kind) {
         case PromptCacheMarkerKind::SharedStablePrefix:
@@ -491,56 +464,53 @@ PreparedContextCache prepare_context_cache(
             throw std::invalid_argument("shared context cache marker evidence is empty");
         }
     }
+}
 
-    out.opportunities.reserve(7U);
-    const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
-                                     std::uint32_t frontier, std::uint32_t input_order) {
-        if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
-        const auto duplicate = std::find_if(
-            out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
-                return existing.kind == kind && existing.frontier == frontier;
-            });
-        if (duplicate == out.opportunities.end()) {
-            out.opportunities.push_back(PreparedCacheOpportunity{.kind        = kind,
-                                                                 .evidence    = evidence,
-                                                                 .frontier    = frontier,
-                                                                 .input_order = input_order});
-        } else if (kind == PromptCacheMarkerKind::SharedStablePrefix) {
-            duplicate->evidence |= evidence;
-        }
+// Boundary facts for hybrid prefix-cache taps. The Program floors each frontier to a page
+// boundary and applies its own priority, spacing and budget rules; this only reports where the
+// rendered prompt has reusable structure.
+PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
+                                   std::span<const std::optional<std::uint32_t>> message_boundaries,
+                                   std::span<const std::optional<std::uint32_t>> cache_boundaries,
+                                   std::optional<std::size_t> engine_tool_marker_index,
+                                   std::optional<std::uint32_t> leading_boundary,
+                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint) {
+    using runtime::prefix_cache::TapHint;
+    using runtime::prefix_cache::TapHintKind;
+    // Protocol write-policy hints (OpenAI explicit mode, Anthropic cache_control) do not suppress
+    // automatic placement: taps are cheap and content-deduplicated, so explicit markers only add
+    // taps.
+    PreparedTapHints out;
+    out.hints.reserve(message_boundaries.size() + hints.markers.size() + 3U);
+    const auto add = [&](std::optional<std::uint32_t> frontier, TapHintKind kind) {
+        if (frontier && *frontier != 0) { out.hints.push_back(TapHint{*frontier, kind}); }
     };
-
     for (std::size_t index = 0; index < hints.markers.size(); ++index) {
-        const PromptCacheMarker marker = hints.markers[index];
-        std::optional<std::uint32_t> resolved;
+        const PromptCacheMarker& marker = hints.markers[index];
+        // Only a client-named breakpoint is honored unconditionally; protocol-automatic markers
+        // (OpenAI default caching, Anthropic automatic cache_control) compete with the Engine's
+        // structural boundaries and mark the conversation's latest turn.
+        const TapHintKind kind = has_shared_candidate_evidence(
+                                     marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
+                                     ? TapHintKind::Explicit
+                                     : TapHintKind::Automatic;
         if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
             if (marker.after_message_count < message_boundaries.size()) {
-                resolved = message_boundaries[marker.after_message_count];
+                add(message_boundaries[marker.after_message_count], kind);
             }
-        } else {
-            if (index < cache_boundaries.size()) { resolved = cache_boundaries[index]; }
+        } else if (index < cache_boundaries.size()) {
+            add(cache_boundaries[index], kind);
         }
-        if (!resolved) { continue; }
-        add_opportunity(marker.kind, marker.evidence, *resolved, static_cast<std::uint32_t>(index));
     }
-
-    std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
-    if (hints.allow_engine_automatic_shared_prefixes) {
-        if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size() &&
-            cache_boundaries[*engine_tool_marker_index]) {
-            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                            SharedCandidateEvidence::EngineStructural,
-                            *cache_boundaries[*engine_tool_marker_index], engine_order++);
-        }
-        if (leading_boundary && *leading_boundary < message_boundaries.size() &&
-            message_boundaries[*leading_boundary]) {
-            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                            SharedCandidateEvidence::EngineStructural,
-                            *message_boundaries[*leading_boundary], engine_order++);
-        }
-        add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                        SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
-                        engine_order);
+    if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size()) {
+        add(cache_boundaries[*engine_tool_marker_index], TapHintKind::Structural);
+    }
+    if (leading_boundary && *leading_boundary < message_boundaries.size()) {
+        add(message_boundaries[*leading_boundary], TapHintKind::Structural);
+    }
+    if (rewrite_checkpoint) { add(rewrite_checkpoint->frontier, TapHintKind::GenerationOpener); }
+    for (const std::optional<std::uint32_t> boundary : message_boundaries) {
+        add(boundary, TapHintKind::MessageBoundary);
     }
     return out;
 }
@@ -815,10 +785,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
-    result.context_cache     = prepare_context_cache(
-        std::move(cache_hints), message_count, message_boundaries, rendered_markers,
-        cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
-        checked_token_count(result.token_ids.size()));
+    validate_context_cache_hints(cache_hints, message_count, rendered_markers, cache_boundaries);
+    result.tap_hints = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
+                                         engine_tool_marker_index, leading_boundary,
+                                         result.identity.rewrite_checkpoint);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -888,9 +859,8 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.identity.reusable                  = allow_prefix_identity;
-    result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
-    result.context_cache.update_session_index = false;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

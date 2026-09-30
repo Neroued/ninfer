@@ -36,9 +36,6 @@ struct CommitDecision {
     std::uint32_t accepted_tokens = 0;
     bool terminal                 = false;
     bool cancelled                = false;
-    // Copied unchanged from the corresponding OutputDecision; still relative to this row's
-    // accepted span.
-    std::optional<std::uint32_t> prefix_execution_split_after;
 };
 
 struct BeginSummary {

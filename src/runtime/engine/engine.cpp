@@ -10,6 +10,8 @@
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -164,17 +166,54 @@ public:
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);
         } else {
-            core = std::make_unique<GenerationCore>(*active, device, options,
-                                                    std::move(constructed.context_cost));
+            core = std::make_unique<GenerationCore>(*active, device, options);
         }
         finalize_phase.complete();
     }
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        const bool persists = persists_prefix_cache();
+        if (persists) {
+            std::fprintf(stderr, "[engine] saving the prefix cache to %s\n",
+                         options.context_cache.persistent_file.string().c_str());
+        }
+        // The generation core's orderly stop saves the Host tier before it drops it.
         core.emplace<std::monostate>();
         try {
             device.synchronize();
+        } catch (...) {}
+        if (persists) { report_prefix_cache_save(); }
+    }
+
+    [[nodiscard]] bool persists_prefix_cache() const noexcept {
+        return std::holds_alternative<std::unique_ptr<GenerationCore>>(core) &&
+               options.context_cache.enabled && !options.context_cache.persistent_file.empty();
+    }
+
+    void report_prefix_cache_save() const noexcept {
+        try {
+            const std::optional<models::qwen3_5::HybridCachePersistence> result =
+                active->program->hybrid_shutdown_save();
+            if (!result) {
+                std::fprintf(stderr,
+                             "[engine] prefix cache not saved: the Engine did not stop cleanly\n");
+                return;
+            }
+            const models::qwen3_5::HybridCachePersistence& saved = *result;
+            if (saved.ok) {
+                std::fprintf(stderr,
+                             "[engine] prefix cache saved: %llu blocks, %llu snapshots, %.1f MiB "
+                             "in %.1f s\n",
+                             static_cast<unsigned long long>(saved.blocks),
+                             static_cast<unsigned long long>(saved.snapshots),
+                             static_cast<double>(saved.bytes) / 1048576.0, saved.seconds);
+            } else {
+                std::fprintf(stderr, "[engine] prefix cache not saved: %s\n",
+                             saved.message.c_str());
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[engine] prefix cache not saved: %s\n", error.what());
         } catch (...) {}
     }
 

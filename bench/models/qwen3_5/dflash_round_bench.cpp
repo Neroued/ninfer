@@ -221,16 +221,12 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
-        auto request_plan =
-            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
-                                       nullptr, std::nullopt, false);
-        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-        auto resource_plan = program->seal_identity(*request_plan, prompt, {});
-        if (!resource_plan) {
-            throw std::runtime_error("benchmark root resources were not sealed");
+        auto quote = program->hybrid_quote(prompt, request_base, ninfer::runtime::LaneId{lane});
+        if (quote.readiness != ninfer::runtime::Readiness::Ready) {
+            throw std::runtime_error("benchmark root admission was rejected");
         }
         const auto reserved =
-            program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+            program->hybrid_reserve_materialization(std::move(quote), std::move(prompt), {});
         if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
             throw std::runtime_error("benchmark root materialization was not reserved");
         }

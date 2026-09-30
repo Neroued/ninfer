@@ -90,16 +90,10 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
-        return "private endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
-        return "turn closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
-        return "response replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
-        return "long anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
-        return "shared prefix";
+    case ninfer::PrefixReusePath::Endpoint:
+        return "endpoint";
+    case ninfer::PrefixReusePath::Snapshot:
+        return "snapshot";
     }
     return "unknown";
 }
@@ -362,9 +356,6 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;
     }
-    if (report.current.capture_pending_requests != 0) {
-        out << " | capture-pending " << report.current.capture_pending_requests;
-    }
     if (report.current.terminal_pending_requests != 0) {
         out << " | terminal-pending " << report.current.terminal_pending_requests;
     }
@@ -454,14 +445,15 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
 
     if (cache.enabled) {
         logger_->info(
-            "context cache | {} active + {} cached device states | host {} states, {} KV | "
-            "private {} | shared {} | anchors {}",
-            engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
-            product::format_pretty_bytes(cache.host_kv_capacity_bytes),
-            *cache.max_private_continuations, *cache.max_shared_prefixes,
-            *cache.max_long_anchors_per_continuation);
+            "prefix cache | {} active + {} snapshot device states | host {} | {} taps per "
+            "request, ladder {}, gap {}",
+            engine.max_concurrency, cache.device_snapshot_slots.value_or(0U),
+            cache.host_cache_bytes == 0 ? std::string("off")
+                                        : product::format_pretty_bytes(cache.host_cache_bytes),
+            cache.max_new_taps.value_or(0U), cache.tap_ladder_tokens.value_or(0U),
+            cache.tap_min_gap_tokens.value_or(0U));
     } else {
-        logger_->info("context cache | root only");
+        logger_->info("prefix cache | off (root only)");
     }
 
     if (service.options().enable_vision) {

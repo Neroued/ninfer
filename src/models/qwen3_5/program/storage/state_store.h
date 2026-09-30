@@ -174,6 +174,21 @@ public:
         object.role          = StateImageRole::ActiveMutable;
     }
 
+    // Hybrid prefix cache: a reserved Device destination whose slot the caller filled with a
+    // stream-ordered copy becomes the active image (snapshot restore) or an immutable checkpoint
+    // (prefill tap). The copy is ordered before any consumer on the same stream.
+    void activate_copied(StateImageHandle handle) {
+        Object& object       = require_copied_destination(handle);
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::ActiveMutable;
+    }
+
+    void publish_copied_checkpoint(StateImageHandle handle) {
+        Object& object       = require_copied_destination(handle);
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::CheckpointImmutable;
+    }
+
     [[nodiscard]] bool valid(StateImageHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < objects_.size() &&
                objects_[handle.index_].role != StateImageRole::Free &&
@@ -741,6 +756,16 @@ private:
     [[nodiscard]] const Object& require(StateImageHandle handle) const {
         if (!valid(handle)) { throw std::invalid_argument("StateImage handle is stale"); }
         return objects_[handle.index_];
+    }
+
+    [[nodiscard]] Object& require_copied_destination(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            object.checkpoint_references != 0 || has_pending_replica(object)) {
+            throw std::logic_error("StateImage copied destination is not publishable");
+        }
+        return object;
     }
 
     [[nodiscard]] bool valid_transfer(const StateImageTransfer& transfer) const noexcept {

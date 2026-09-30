@@ -337,6 +337,27 @@ working set. `--rows-per-chunk` defaults to 512; custom methods own how they use
 
 ## Resources, files and inspection
 
+### Attach an existing DFlash2 component
+
+When both inputs are v3 artifacts with identical text configs and tokenizer bytes, a Linux
+offline copy can add a donor's DFlash2 component to a target that does not yet contain one:
+
+```bash
+python3 -m tools.artifact.attach_dflash2 \
+  --base models/my_target.ninfer --donor models/target_with_dflash2.ninfer \
+  --out models/my_target_with_dflash2.ninfer
+```
+
+This preserves every encoded target object, existing binding, resource and proposal head. It
+copies the donor's draft objects without requantization, remaps physical references while retaining
+shared parents and logical ranges, and uses the base target's output-head activation policy and
+auxiliaries. Existing output files are not overwritten. Every output object is read back and
+checked against its source SHA-256; `<output>.attach.json` records the results. A successful copy
+establishes byte preservation and structural compatibility, not draft acceptance or inference
+quality for a different target checkpoint. Qualify the resulting artifact through the Engine.
+
+### Conversion resources
+
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`. Vision adds its image and video processor configs. Resources come from
 `--model`; `--resource ROLE=PATH` replaces a selected resource:

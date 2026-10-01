@@ -1,11 +1,57 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
+#include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 192;
+
+// Minimize waves per KV partition, retaining fewer partitions on a tie.
+// The bound limits FP32 partial traffic; live rows cap the count at
+// ceil(visible_keys / 512). Count changes work and storage, never kernel topology.
+inline CausalKvPartition nvfp4_tiled_partition(int heads, int width, int visible_capacity,
+                                               int multiprocessor_count) {
+    constexpr int QueryRows = Nvfp4KvTiledInstance::kQueryRows;
+    const std::int64_t tiles =
+        (static_cast<std::int64_t>(width) + QueryRows - 1) / QueryRows;
+    const std::int64_t ctas = heads * tiles;
+    int selected            = 1;
+    auto waves              = (ctas + multiprocessor_count - 1) / multiprocessor_count;
+    for (int splits = 2; splits <= kMxfp8TiledMaxSplits; ++splits) {
+        const auto next = (ctas * splits + multiprocessor_count - 1) / multiprocessor_count;
+        if (next * selected < waves * splits) {
+            selected = splits;
+            waves    = next;
+        }
+    }
+    CausalKvPartition partition{1, selected, 9};
+    partition.capacity = partition.active(visible_capacity);
+    return partition;
+}
+
+inline std::size_t nvfp4_tiled_workspace_bytes(int heads, int min_width, int max_width,
+                                               int visible_capacity, int multiprocessor_count) {
+    constexpr int QueryRows = Nvfp4KvTiledInstance::kQueryRows;
+    std::size_t maximum     = 0;
+    // A query-tile interval has one split target and increasing partial storage.
+    // Check each interval's last width; checking max_width alone would miss a
+    // larger allocation immediately before the split target decreases.
+    for (std::int64_t begin = min_width; begin <= max_width;) {
+        const auto last =
+            ((begin + QueryRows - 1) / QueryRows) * QueryRows;
+        const int end = static_cast<int>(std::min<std::int64_t>(max_width, last));
+        const auto partition =
+            nvfp4_tiled_partition(heads, end, visible_capacity, multiprocessor_count);
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_causal_partials(layout, heads, end, partition.capacity, 1);
+        maximum = std::max(maximum, layout.peak_bytes(1));
+        begin   = static_cast<std::int64_t>(end) + 1;
+    }
+    return maximum;
+}
 } // namespace
 
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
@@ -26,6 +72,10 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
     const int query_tile        = family == Nvfp4KvFamily::ParallelGrouped && width <= 16
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
+    if (family == Nvfp4KvFamily::Tiled)
+        return {family, heads, width, batch, query_tile, envelope,
+                nvfp4_tiled_partition(heads, width, envelope.max_visible_keys,
+                                      multiprocessor_count)};
     const int row_tiles         = (query_tile * (heads == 24 ? 6 : 8) + 15) / 16;
     const std::int64_t sms      = multiprocessor_count;
     const auto budget =
@@ -46,13 +96,14 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
             make_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
-        if (plan.family == Nvfp4KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
-    return maximum;
+    return std::max(maximum, nvfp4_tiled_workspace_bytes(
+                                 heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
+                                 max_width, envelope.max_visible_keys, multiprocessor_count));
 }
 
 } // namespace ninfer::ops::detail

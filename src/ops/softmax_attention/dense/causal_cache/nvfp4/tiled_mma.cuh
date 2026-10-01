@@ -3,6 +3,8 @@
 #include "ops/common/mbarrier.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
+#include "ops/softmax_attention/common/causal_operands.h"
+#include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 
 namespace ninfer::ops::detail {
@@ -54,8 +56,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
     const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
-    const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
+    CausalKvPartition partition, CausalPartialView partial) {
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;
@@ -81,16 +83,20 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
     const int kv_head = q_head / Geometry::GroupSize;
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) return;
-    if (q0 >= tokens) {
-        causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Schedule::kThreads);
-        return;
-    }
+    if (q0 >= tokens) return;
+    const int split         = blockIdx.z;
+    const int visible       = positions[width - 1] + 1;
+    const int active_splits = partition.active(visible);
+    if (split >= active_splits) return;
 
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
     const int tile_rows             = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + tile_rows - 1;
-    const int key_blocks            = max_query_abs / Bc + 1;
+    const int logical_tiles         = div_up(visible, Bc);
+    const int first_owned_tile      = split * logical_tiles / active_splits;
+    const int end_owned_tile        = (split + 1) * logical_tiles / active_splits;
+    const int key_blocks = max(0, min(end_owned_tile, max_query_abs / Bc + 1) - first_owned_tile);
 
     if (tid == 0) {
         cta_mbarrier_init(&barriers->k_full, 1);
@@ -128,13 +134,15 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
             const std::uint32_t empty_phase = 1U ^ static_cast<std::uint32_t>(kb & 1);
             cta_mbarrier_wait(&barriers->k_empty, empty_phase);
             nvfp4_kv_decode_tile<Geometry, Schedule>(k_f16, cache_k, cache_k_scale, block_table,
-                                                     kv_head, kb * Bc, max_query_abs, producer_tid);
+                                                     kv_head, (first_owned_tile + kb) * Bc,
+                                                     max_query_abs, producer_tid);
             asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kProducerThreads) : "memory");
             if (producer_tid == 0) { cta_mbarrier_arrive(&barriers->k_full); }
 
             cta_mbarrier_wait(&barriers->v_empty, empty_phase);
             nvfp4_kv_decode_tile<Geometry, Schedule>(v_f16, cache_v, cache_v_scale, block_table,
-                                                     kv_head, kb * Bc, max_query_abs, producer_tid);
+                                                     kv_head, (first_owned_tile + kb) * Bc,
+                                                     max_query_abs, producer_tid);
             asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kProducerThreads) : "memory");
             if (producer_tid == 0) { cta_mbarrier_arrive(&barriers->v_full); }
         }
@@ -184,7 +192,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
     const float scale_l2 = scale * Log2E;
 
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0                   = kb * Bc;
+        const int k0                   = (first_owned_tile + kb) * Bc;
         const std::uint32_t full_phase = static_cast<std::uint32_t>(kb & 1);
         cta_mbarrier_wait(&barriers->k_full, full_phase);
 
@@ -235,7 +243,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
         const int qrow1            = q0 + row1;
         const int qabs0            = qrow0 < tokens ? base_pos + qrow0 : -1;
         const int qabs1            = qrow1 < tokens ? base_pos + qrow1 : -1;
-        const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+        const bool full_score_tile =
+            q0 + Br <= tokens && (first_owned_tile + kb) < (base_pos + q0 + 1) / Bc;
         float bm0                  = -CUDART_INF_F;
         float bm1                  = -CUDART_INF_F;
         if (full_score_tile) {
@@ -338,32 +347,33 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
         if (consumer_tid == 0) { cta_mbarrier_arrive(&barriers->v_empty); }
     }
 
-    l0                 = warp_sum<4>(l0, FullMask);
-    l1                 = warp_sum<4>(l1, FullMask);
-    const float inv_l0 = l0 > 0.0F ? __frcp_rn(l0) : 0.0F;
-    const float inv_l1 = l1 > 0.0F ? __frcp_rn(l1) : 0.0F;
-    float* rotated_out = reinterpret_cast<float*>(smem_raw);
-#pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-        const int d0   = n * 8 + 2 * lid;
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
+    l0             = warp_sum<4>(l0, FullMask);
+    l1             = warp_sum<4>(l1, FullMask);
+    const int row0 = warp_row0 + gid;
+    const int row1 = row0 + 8;
+    if (lid == 0) {
         if (row0 < tile_rows) {
-            *reinterpret_cast<float2*>(&rotated_out[row0 * D + d0]) =
-                make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            const auto index       = causal_stat_index<Geometry>(q_head, q0 + row0, split, width);
+            partial.maximum[index] = m0 * scale;
+            partial.sum[index]     = l0;
         }
         if (row1 < tile_rows) {
-            *reinterpret_cast<float2*>(&rotated_out[row1 * D + d0]) =
-                make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            const auto index       = causal_stat_index<Geometry>(q_head, q0 + row1, split, width);
+            partial.maximum[index] = m1 * scale;
+            partial.sum[index]     = l1;
         }
     }
-    asm volatile("bar.sync 2, 128;" : : : "memory");
-
-    for (int row = consumer_warp; row < tile_rows; row += Schedule::kConsumerWarps) {
-        causal_store_inverse_rotated_row<Geometry>(rotated_out + row * D, out, q_head, q0 + row);
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+        const int d0 = n * 8 + 2 * lid;
+        if (row0 < tile_rows)
+            causal_store_partial_pair(
+                partial.acc + causal_partial_index<Geometry>(q_head, d0, q0 + row0, split, width),
+                acc[n][0], acc[n][1]);
+        if (row1 < tile_rows)
+            causal_store_partial_pair(
+                partial.acc + causal_partial_index<Geometry>(q_head, d0, q0 + row1, split, width),
+                acc[n][2], acc[n][3]);
     }
-    causal_zero_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), consumer_tid,
-                               Schedule::kConsumerThreads);
 }
-
 } // namespace ninfer::ops::detail

@@ -135,7 +135,7 @@ void nvfp4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         const auto view =
             make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Nvfp4KvFamily::Tiled)
-            nvfp4_kv_tiled_attention(p, view, stream);
+            nvfp4_kv_tiled_attention(p, view, plan.partition, workspace, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
     } else {
@@ -157,7 +157,8 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     if (plan.family == Nvfp4KvFamily::Tiled)
         nvfp4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-            make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), stream);
+            make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), plan.partition,
+            workspace, stream);
     else if (plan.family == Nvfp4KvFamily::ParallelGrouped)
         execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
                          make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), plan,

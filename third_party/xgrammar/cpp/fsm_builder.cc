@@ -1,3 +1,4 @@
+// NInfer modifications: scalar-safe UTF-8 ranges and logical JSON-string regex encoding. Original license retained.
 /*!
  *  Copyright (c) 2025 by Contributors
  * \file xgrammar/fsm_builder.cc
@@ -136,7 +137,7 @@ static void AddSameLengthCharacterRange(FSM& fsm, int from, int to, uint32_t min
     if ((max & 0x00FFFF) != 0xBFBF) {
       int tmp_state_max = fsm.AddState();
       fsm.AddEdge(from, tmp_state_max, byte_max[2], byte_max[2]);
-      AddSameLengthCharacterRange(fsm, tmp_state_max, to, 0x0080, (max & 0x00FFFF));
+      AddSameLengthCharacterRange(fsm, tmp_state_max, to, 0x008080, (max & 0x00FFFF));
     } else {
       byte_max[2]++;
     }
@@ -187,80 +188,24 @@ static void AddSameLengthCharacterRange(FSM& fsm, int from, int to, uint32_t min
 
 void AddPackedUTF8RangeEdges(FSM& fsm, int from, int to, uint32_t min, uint32_t max) {
   XGRAMMAR_CHECK(min <= max) << "Invalid character range: min (" << min << ") > max (" << max
-                             << ")";
-  // Ensure max and min are valid unicode value.
-  if (max > kMax4BytesUnicode) {
-    max = kMax4BytesUnicode;
-  } else if (max > kMax3BytesUnicode) {
-    if (max < kMin4BytesUnicode) {
-      max = kMax3BytesUnicode;
+                            << ")";
+  // Intersect with the UTF-8 encodings of Unicode scalar values. A packed interval
+  // crossing encoding lengths otherwise includes overlong encodings; the three-byte
+  // domain also has a surrogate gap. These fixed boundaries are Unicode protocol limits.
+  static const std::array<std::pair<uint32_t, uint32_t>, 5> kScalarEncodingRanges = {{
+      {0, kMax1ByteUnicode},
+      {CodepointToPackedUTF8(0x80), CodepointToPackedUTF8(0x7FF)},
+      {CodepointToPackedUTF8(0x800), CodepointToPackedUTF8(0xD7FF)},
+      {CodepointToPackedUTF8(0xE000), CodepointToPackedUTF8(0xFFFF)},
+      {CodepointToPackedUTF8(0x10000), CodepointToPackedUTF8(0x10FFFF)}
+  }};
+  for (const auto& [scalar_min, scalar_max] : kScalarEncodingRanges) {
+    const uint32_t start = std::max(min, scalar_min);
+    const uint32_t end = std::min(max, scalar_max);
+    if (start <= end) {
+      AddSameLengthCharacterRange(fsm, from, to, start, end);
     }
-  } else if (max > kMax2BytesUnicode) {
-    if (max < kMin3BytesUnicode) {
-      max = kMax2BytesUnicode;
-    }
-  } else if (max < kMin2BytesUnicode && (max > kMax1ByteUnicode)) {
-    max = kMax1ByteUnicode;
   }
-
-  if (min > kMax4BytesUnicode) {
-    min = kMax4BytesUnicode;
-  } else if (min > kMax3BytesUnicode) {
-    if (min < kMin4BytesUnicode) {
-      min = kMin4BytesUnicode;
-    }
-  } else if (min > kMax2BytesUnicode) {
-    if (min < kMin3BytesUnicode) {
-      min = kMin3BytesUnicode;
-    }
-  } else if (min < kMin2BytesUnicode && (min > kMax1ByteUnicode)) {
-    min = kMin2BytesUnicode;
-  }
-
-  // Step2. Divide the range into several ranges, which contain characters with different lengths.
-  if (max <= kMax1ByteUnicode) {
-    AddSameLengthCharacterRange(fsm, from, to, min, max);
-    return;
-  }
-  if (max <= kMax2BytesUnicode) {
-    if (min >= kMin2BytesUnicode) {
-      AddSameLengthCharacterRange(fsm, from, to, min, max);
-    } else {
-      AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
-      AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, max);
-    }
-    return;
-  }
-  if (max <= kMax3BytesUnicode) {
-    if (min >= kMin3BytesUnicode) {
-      AddSameLengthCharacterRange(fsm, from, to, min, max);
-    } else if (min >= kMin2BytesUnicode) {
-      AddSameLengthCharacterRange(fsm, from, to, min, kMax2BytesUnicode);
-      AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, max);
-    } else {
-      AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
-      AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, kMax2BytesUnicode);
-      AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, max);
-    }
-    return;
-  }
-  XGRAMMAR_CHECK(max <= kMax4BytesUnicode);
-  if (min >= kMin4BytesUnicode) {
-    AddSameLengthCharacterRange(fsm, from, to, min, max);
-  } else if (min >= kMin3BytesUnicode) {
-    AddSameLengthCharacterRange(fsm, from, to, min, kMax3BytesUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
-  } else if (min >= kMin2BytesUnicode) {
-    AddSameLengthCharacterRange(fsm, from, to, min, kMax2BytesUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, kMax3BytesUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
-  } else {
-    AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, kMax2BytesUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, kMax3BytesUnicode);
-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
-  }
-  return;
 }
 
 std::string RewriteRegexDots(const std::string& pattern, bool dot_matches_newline) {
@@ -368,15 +313,146 @@ void FoldAsciiCaseRanges(std::vector<CodepointRange>* ranges) {
 void AddCodepointRangesToFSM(
     FSM* fsm, int from, int to, const std::vector<CodepointRange>& ranges
 ) {
+  // Unicode scalar values exclude surrogate codepoints. Split again at UTF-8
+  // length boundaries so the packed helper never introduces overlong encodings
+  // through its generic cross-length bounds. These are Unicode protocol limits.
+  static constexpr std::array<CodepointRange, 5> kScalarEncodingRanges = {
+      CodepointRange{0, 0x7F},
+      CodepointRange{0x80, 0x7FF},
+      CodepointRange{0x800, 0xD7FF},
+      CodepointRange{0xE000, 0xFFFF},
+      CodepointRange{0x10000, kMaxCodepoint}};
   for (const auto& [low, high] : ranges) {
-    if (low <= kMax1ByteUnicode) {
-      fsm->AddEdge(from, to, low, std::min<uint32_t>(high, kMax1ByteUnicode));
+    for (const auto& [scalar_low, scalar_high] : kScalarEncodingRanges) {
+      const uint32_t start = std::max(low, scalar_low);
+      const uint32_t end = std::min(high, scalar_high);
+      if (start > end) {
+        continue;
+      }
+      if (end <= kMax1ByteUnicode) {
+        fsm->AddEdge(from, to, start, end);
+      } else {
+        AddPackedUTF8RangeEdges(
+            *fsm, from, to, CodepointToPackedUTF8(start), CodepointToPackedUTF8(end)
+        );
+      }
     }
-    if (high > kMax1ByteUnicode) {
-      uint32_t multi_byte_low = std::max<uint32_t>(low, kMax1ByteUnicode + 1);
-      AddPackedUTF8RangeEdges(
-          *fsm, from, to, CodepointToPackedUTF8(multi_byte_low), CodepointToPackedUTF8(high)
-      );
+  }
+}
+
+// JSON unicode escapes use four hexadecimal digits; character-class ranges are
+// represented by nibble intervals rather than enumerating the Unicode domain.
+void AddHexDigitRange(FSM* fsm, int from, int to, uint32_t low, uint32_t high) {
+  if (low <= 9) {
+    fsm->AddEdge(from, to, '0' + low, '0' + std::min<uint32_t>(high, 9));
+  }
+  if (high >= 10) {
+    const uint32_t start = std::max<uint32_t>(low, 10) - 10;
+    const uint32_t end = high - 10;
+    fsm->AddEdge(from, to, 'a' + start, 'a' + end);
+    fsm->AddEdge(from, to, 'A' + start, 'A' + end);
+  }
+}
+
+void AddHexRange(FSM* fsm, int from, int to, uint32_t low, uint32_t high, int digits) {
+  if (digits == 1) {
+    AddHexDigitRange(fsm, from, to, low, high);
+    return;
+  }
+  const uint32_t shift = 4 * (digits - 1);
+  const uint32_t suffix_mask = (1U << shift) - 1;
+  const uint32_t low_head = low >> shift;
+  const uint32_t high_head = high >> shift;
+  if (low_head == high_head) {
+    const int tail = fsm->AddState();
+    AddHexDigitRange(fsm, from, tail, low_head, high_head);
+    AddHexRange(fsm, tail, to, low & suffix_mask, high & suffix_mask, digits - 1);
+    return;
+  }
+  const int low_tail = fsm->AddState();
+  AddHexDigitRange(fsm, from, low_tail, low_head, low_head);
+  AddHexRange(fsm, low_tail, to, low & suffix_mask, suffix_mask, digits - 1);
+  const int high_tail = fsm->AddState();
+  AddHexDigitRange(fsm, from, high_tail, high_head, high_head);
+  AddHexRange(fsm, high_tail, to, 0, high & suffix_mask, digits - 1);
+  if (high_head > low_head + 1) {
+    const int middle = fsm->AddState();
+    AddHexDigitRange(fsm, from, middle, low_head + 1, high_head - 1);
+    AddHexRange(fsm, middle, to, 0, suffix_mask, digits - 1);
+  }
+}
+
+int AddJSONUnicodePrefix(FSM* fsm, int from) {
+  const int slash = fsm->AddState();
+  const int digits = fsm->AddState();
+  fsm->AddEdge(from, slash, '\\', '\\');
+  fsm->AddEdge(slash, digits, 'u', 'u');
+  return digits;
+}
+
+void AddJSONCodepointRangesToFSM(
+    FSM* fsm, int from, int to, const std::vector<CodepointRange>& ranges
+) {
+  // Raw JSON characters exclude control characters, quotation marks and reverse
+  // solidus. The scalar-safe UTF-8 emitter also excludes surrogates and overlong forms.
+  static constexpr std::array<CodepointRange, 3> kRawJSONRanges = {
+      CodepointRange{0x20, 0x21},
+      CodepointRange{0x23, 0x5B},
+      CodepointRange{0x5D, kMaxCodepoint}};
+  static constexpr std::array<std::pair<uint32_t, char>, 8> kShortEscapes = {{
+      {0x08, 'b'}, {0x09, 't'}, {0x0A, 'n'}, {0x0C, 'f'},
+      {0x0D, 'r'}, {'"', '"'}, {'\\', '\\'}, {'/', '/'}
+  }};
+  for (const auto& [low, high] : ranges) {
+    for (const auto& [raw_low, raw_high] : kRawJSONRanges) {
+      const uint32_t start = std::max(low, raw_low);
+      const uint32_t end = std::min(high, raw_high);
+      if (start <= end) {
+        AddCodepointRangesToFSM(fsm, from, to, {{start, end}});
+      }
+    }
+    for (const auto& [codepoint, escaped] : kShortEscapes) {
+      if (low <= codepoint && codepoint <= high) {
+        const int slash = fsm->AddState();
+        fsm->AddEdge(from, slash, '\\', '\\');
+        fsm->AddEdge(slash, to, escaped, escaped);
+      }
+    }
+    // A BMP scalar has a single \\uXXXX spelling. Surrogates only occur as a
+    // linked pair for an astral scalar, never as a standalone logical character.
+    static constexpr std::array<CodepointRange, 2> kBMPScalarRanges = {
+        CodepointRange{0, 0xD7FF}, CodepointRange{0xE000, 0xFFFF}};
+    for (const auto& [bmp_low, bmp_high] : kBMPScalarRanges) {
+      const uint32_t start = std::max(low, bmp_low);
+      const uint32_t end = std::min(high, bmp_high);
+      if (start <= end) {
+        AddHexRange(fsm, AddJSONUnicodePrefix(fsm, from), to, start, end, 4);
+      }
+    }
+    const uint32_t start = std::max<uint32_t>(low, 0x10000);
+    const uint32_t end = std::min(high, kMaxCodepoint);
+    if (start > end) {
+      continue;
+    }
+    const uint32_t first_high = 0xD800 + ((start - 0x10000) >> 10);
+    const uint32_t last_high = 0xD800 + ((end - 0x10000) >> 10);
+    const uint32_t first_low = 0xDC00 + ((start - 0x10000) & 0x3FF);
+    const uint32_t last_low = 0xDC00 + ((end - 0x10000) & 0x3FF);
+    const int high_start = AddJSONUnicodePrefix(fsm, from);
+    const auto add_pair = [&](uint32_t high_low, uint32_t high_high,
+                              uint32_t low_low, uint32_t low_high) {
+      const int high_end = fsm->AddState();
+      AddHexRange(fsm, high_start, high_end, high_low, high_high, 4);
+      AddHexRange(fsm, AddJSONUnicodePrefix(fsm, high_end), to, low_low, low_high, 4);
+    };
+    if (first_high == last_high) {
+      add_pair(first_high, last_high, first_low, last_low);
+    } else {
+      add_pair(first_high, first_high, first_low, 0xDFFF);
+      add_pair(last_high, last_high, 0xDC00, last_low);
+      if (last_high > first_high + 1) {
+        add_pair(first_high + 1, last_high - 1, 0xDC00, 0xDFFF);
+      }
     }
   }
 }
@@ -705,6 +781,9 @@ class RegexIR {
 
   // Whether matching is ASCII case-insensitive (enabled by a leading "(?i)").
   bool case_insensitive = false;
+
+  // Match JSON-encoded spellings of logical Unicode scalar characters.
+  bool json_string = false;
 
   /*!
     \brief Constructs a NFA from the regex IR.
@@ -1073,6 +1152,15 @@ Result<FSMWithStartEnd> RegexIR::visit(const RegexIR::Repeat& state) const {
 
 int RegexIR::AddSingleCodepoint(FSMWithStartEnd& result, int current, uint32_t codepoint) const {
   int next = result.AddState();
+  if (json_string) {
+    std::vector<CodepointRange> ranges{{codepoint, codepoint}};
+    if (case_insensitive) {
+      FoldAsciiCaseRanges(&ranges);
+      NormalizeRanges(&ranges);
+    }
+    AddJSONCodepointRangesToFSM(&result.GetFsm(), current, next, ranges);
+    return next;
+  }
   if (codepoint <= kMax1ByteUnicode) {
     result.GetFsm().AddEdge(current, next, codepoint, codepoint);
     if (case_insensitive) {
@@ -1086,14 +1174,9 @@ int RegexIR::AddSingleCodepoint(FSMWithStartEnd& result, int current, uint32_t c
     }
     return next;
   }
-  std::string utf8_bytes = CharToUTF8(static_cast<TCodepoint>(codepoint));
-  int state = current;
-  for (size_t i = 0; i < utf8_bytes.size(); ++i) {
-    int target = (i + 1 == utf8_bytes.size()) ? next : result.AddState();
-    uint8_t byte = static_cast<uint8_t>(utf8_bytes[i]);
-    result.GetFsm().AddEdge(state, target, byte, byte);
-    state = target;
-  }
+  // Use the same scalar-safe path for explicit Unicode literals and escapes.
+  // A surrogate has no UTF-8 encoding, so it leaves this transition unreachable.
+  AddCodepointRangesToFSM(&result.GetFsm(), current, next, {{codepoint, codepoint}});
   return next;
 }
 
@@ -1113,7 +1196,11 @@ Result<FSMWithStartEnd> RegexIR::BuildLeafFSMFromRegex(const std::string& regex)
     }
     auto ranges = std::move(ranges_result).Unwrap();
     int end_state = result.AddState();
-    AddCodepointRangesToFSM(&result.GetFsm(), 0, end_state, ranges);
+    if (json_string) {
+      AddJSONCodepointRangesToFSM(&result.GetFsm(), 0, end_state, ranges);
+    } else {
+      AddCodepointRangesToFSM(&result.GetFsm(), 0, end_state, ranges);
+    }
     result.AddEndState(end_state);
     return ResultOk(std::move(result));
   }
@@ -1124,7 +1211,11 @@ Result<FSMWithStartEnd> RegexIR::BuildLeafFSMFromRegex(const std::string& regex)
     if (regex[pos] == '.') {
       ++pos;
       int next = result.AddState();
-      AddCodepointRangesToFSM(&result.GetFsm(), current, next, {{0, kMaxCodepoint}});
+      if (json_string) {
+        AddJSONCodepointRangesToFSM(&result.GetFsm(), current, next, {{0, kMaxCodepoint}});
+      } else {
+        AddCodepointRangesToFSM(&result.GetFsm(), current, next, {{0, kMaxCodepoint}});
+      }
       current = next;
       continue;
     }
@@ -1146,13 +1237,20 @@ Result<FSMWithStartEnd> RegexIR::BuildLeafFSMFromRegex(const std::string& regex)
           ranges = ComplementRanges(ranges);
         }
         int next = result.AddState();
-        AddCodepointRangesToFSM(&result.GetFsm(), current, next, ranges);
+        if (json_string) {
+          AddJSONCodepointRangesToFSM(&result.GetFsm(), current, next, ranges);
+        } else {
+          AddCodepointRangesToFSM(&result.GetFsm(), current, next, ranges);
+        }
         current = next;
       }
       continue;
     }
     auto [codepoint, num_bytes] = ParseNextUTF8(regex.c_str() + pos);
     if (codepoint == CharHandlingError::kInvalidUTF8 || pos + num_bytes > regex.size()) {
+      if (json_string) {
+        return ResultErr("Invalid UTF-8 literal in JSON string regex");
+      }
       // Be permissive with non-UTF-8 patterns: match the raw byte.
       int next = result.AddState();
       uint8_t byte = static_cast<uint8_t>(regex[pos]);
@@ -1209,9 +1307,11 @@ size_t SkipCharacterClass(const std::string& regex, size_t pos) {
  * \param rule_hint Name hint for the created subrules.
  */
 Result<RegexIR> ParseRegexToIR(
-    const std::string& regex_with_flags, GrammarBuilder* builder, const std::string& rule_hint
+    const std::string& regex_with_flags, GrammarBuilder* builder, const std::string& rule_hint,
+    bool json_string = false
 ) {
   RegexIR ir;
+  ir.json_string = json_string;
   std::string regex = regex_with_flags;
   int flag_prefix_length = 0;
   if (regex.size() >= 4 && regex.compare(0, 4, "(?i)") == 0) {
@@ -1452,7 +1552,7 @@ Result<RegexIR> ParseRegexToIR(
           lower_bound = 0;
         }
         std::string name_hint = (rule_hint.empty() ? "regex" : rule_hint) + "_repeat";
-        int32_t inner_rule_id = builder->AddRuleWithHint(name_hint, builder->AddRegex(inner_regex));
+        int32_t inner_rule_id = builder->AddRuleWithHint(name_hint, builder->AddRegex(inner_regex, ir.json_string));
         builder->UpdateLookaheadExact(inner_rule_id, true);
         if (upper_bound == RegexIR::kRepeatNoUpperBound) {
           // {n,} == {n}{0,}: a repeat edge for the mandatory part, then a starred rule
@@ -1547,6 +1647,16 @@ Result<FSMWithStartEnd> RegexFSMBuilder::Build(
     const std::string& regex, GrammarBuilder* builder, const std::string& rule_hint
 ) {
   auto ir_result = ParseRegexToIR(regex, builder, rule_hint);
+  if (ir_result.IsErr()) {
+    return ResultErr(std::move(ir_result).UnwrapErr());
+  }
+  return std::move(ir_result).Unwrap().Build();
+}
+
+Result<FSMWithStartEnd> RegexFSMBuilder::BuildJSONString(
+    const std::string& regex, GrammarBuilder* builder, const std::string& rule_hint
+) {
+  auto ir_result = ParseRegexToIR(regex, builder, rule_hint, /*json_string=*/true);
   if (ir_result.IsErr()) {
     return ResultErr(std::move(ir_result).UnwrapErr());
   }

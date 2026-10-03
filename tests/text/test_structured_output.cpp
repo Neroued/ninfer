@@ -109,6 +109,38 @@ int main() {
                 return true;
             } catch (const std::logic_error&) { return false; }
         };
+        const auto accepts_schema_value = [&](const std::string& schema_value, const std::string& json_value) {
+            return accepts_value(compiler.compile({StructuredOutputKind::JsonSchema, schema_value}), json_value);
+        };
+        const std::string anchored = R"({"type":"string","pattern":"^code-[AB][0-9]+$"})";
+        require(accepts_schema_value(anchored, R"("code-A12")"), "anchored pattern lost valid value");
+        require(!accepts_schema_value(anchored, R"("bad-code-A12")"), "start anchor ignored");
+        require(!accepts_schema_value(anchored, R"("code-A12bad")"), "end anchor ignored");
+        const std::string searched = R"({"type":"string","pattern":"code"})";
+        require(accepts_schema_value(searched, R"("prefix-code-suffix")"), "pattern search became full match");
+        require(accepts_schema_value(searched, R"("\ncode\n")"), "JSON escaping weakened regex search");
+        require(!accepts_schema_value(searched, R"("prefix-only")"), "search pattern ignored");
+        const std::string single = R"({"type":"string","pattern":"^.$"})";
+        require(accepts_schema_value(single, R"("\"")"), "escaped quote does not match logical character");
+        require(!accepts_schema_value(single, std::string("\"") + char(1) + "\""), "pattern allowed raw JSON control byte");
+        const std::string calendar = R"({"type":"string","format":"date"})";
+        for (const auto* value : {"2000-02-29", "2024-02-29", "2026-04-30", "0001-01-01"}) {
+            require(accepts_schema_value(calendar, nlohmann::json(value).dump()), "calendar lost valid date");
+        }
+        for (const auto* value : {"1900-02-29", "2025-02-29", "2026-04-31", "2026-13-01", "0000-01-01"}) {
+            require(!accepts_schema_value(calendar, nlohmann::json(value).dump()), "invalid calendar date accepted");
+        }
+        const std::string timestamp = R"({"type":"string","format":"date-time"})";
+        require(accepts_schema_value(timestamp, R"("2024-02-29T23:59:59.125+08:00")"), "timestamp lost fractional timezone value");
+        require(accepts_schema_value(timestamp, R"("2026-10-03t12:30:00z")"), "timestamp lost lowercase separators");
+        require(!accepts_schema_value(timestamp, R"("2026-02-30T12:00:00Z")"), "timestamp ignored calendar date");
+        require(!accepts_schema_value(timestamp, R"("2026-10-03T24:00:00Z")"), "timestamp ignored time bounds");
+        require(!accepts_schema_value(timestamp, R"("2026-10-03T12:00:00")"), "timestamp lost required timezone");
+
+        auto object_union = compiler.compile({StructuredOutputKind::JsonSchema,
+            R"({"anyOf":[{}],"type":"object"})"});
+        require(accepts_value(object_union, "{}") && !accepts_value(object_union, "1"),
+                "anyOf common type was dropped");
         auto rating = compiler.compile(
             {StructuredOutputKind::JsonSchema, R"({"type":"number","minimum":0,"maximum":10})"});
         require(accepts_value(rating, "0") && accepts_value(rating, "10") &&
@@ -175,7 +207,7 @@ int main() {
              {R"({"type":"array","uniqueItems":true})",
               R"({"$ref":"#/$defs/a~1b","$defs":{"a/b":{"const":1},"a~1b":{"const":2}}})",
               R"({"oneOf":[{},{}]})", R"({"$ref":"https://example.org/schema"})",
-              R"({"const":1,"type":"string"})", R"({"anyOf":[{}],"type":"object"})",
+              R"({"const":1,"type":"string"})",
               R"({"type":"integer","minimum":3,"maximum":2})", R"({"type":"number","minimum":"0"})",
               R"({"type":"number","minimum":0.0000001,"maximum":0.0000002})", R"({"minimum":0})",
               R"({"type":"number","minimum":1e30})"}) {

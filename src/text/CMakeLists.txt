@@ -1,6 +1,8 @@
 add_library(ninfer_text STATIC
   unicode.cpp
   structured_output.cpp
+  schema_normalization.cpp
+  unique_strings.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
 )
 ninfer_internal_includes(ninfer_text)

@@ -1,3 +1,4 @@
+// RUR1NINFER modifications: public logical JSON-string regex builder entry point. Original license retained.
 /*!
  *  Copyright (c) 2025 by Contributors
  * \file xgrammar/fsm_builder.h
@@ -60,6 +61,16 @@ class RegexFSMBuilder {
    * \return The FSM with start and end states.
    */
   static Result<FSMWithStartEnd> Build(
+      const std::string& regex, GrammarBuilder* builder = nullptr, const std::string& rule_hint = ""
+  );
+
+  /*!
+   * \brief Match a regex over logical Unicode scalar characters in a JSON string body.
+   * Accepts equivalent raw UTF-8, short escapes and hexadecimal Unicode escapes,
+   * including correctly linked surrogate pairs for astral characters.
+   * \param builder See Build(); repeated subrules retain JSON-string mode.
+   */
+  static Result<FSMWithStartEnd> BuildJSONString(
       const std::string& regex, GrammarBuilder* builder = nullptr, const std::string& rule_hint = ""
   );
 

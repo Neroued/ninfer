@@ -1,3 +1,4 @@
+// NInfer modifications: pattern/format semantics, object constraints, and complete schema cache identities. Original license retained.
 /*!
  *  Copyright (c) 2024 by Contributors
  * \file xgrammar/json_schema_converter.cc
@@ -17,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -708,50 +710,8 @@ class SchemaParser {
 };
 
 std::string SchemaParser::ComputeCacheKey(const picojson::value& schema) {
-  static const std::unordered_set<std::string> kSkippedKeys = {
-      "title",
-      "default",
-      "description",
-      "examples",
-      "deprecated",
-      "readOnly",
-      "writeOnly",
-      "$comment",
-      "$schema",
-  };
-
-  if (schema.is<picojson::object>()) {
-    std::string result = "{";
-    std::vector<std::pair<std::string, picojson::value>> sorted_kv;
-    for (const auto& kv : schema.get<picojson::object>()) {
-      if (kSkippedKeys.count(kv.first) == 0) {
-        sorted_kv.push_back(kv);
-      }
-    }
-    std::sort(sorted_kv.begin(), sorted_kv.end(), [](const auto& lhs, const auto& rhs) {
-      return lhs.first < rhs.first;
-    });
-    int64_t idx = 0;
-    for (const auto& [key, value] : sorted_kv) {
-      if (idx != 0) {
-        result += ",";
-      }
-      ++idx;
-      result += "\"" + key + "\":" + ComputeCacheKey(value);
-    }
-    return result + "}";
-  } else if (schema.is<picojson::array>()) {
-    std::string result = "[";
-    int64_t idx = 0;
-    for (const auto& item : schema.get<picojson::array>()) {
-      if (idx != 0) {
-        result += ",";
-      }
-      ++idx;
-      result += ComputeCacheKey(item);
-    }
-    return result + "]";
-  }
+  // Complete serialization retains schema declaration order, business property names,
+  // and const/enum object values. Metadata-looking data keys are never interchangeable.
   return schema.serialize(false);
 }
 
@@ -882,7 +842,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
         );
       }
     }
-  } else if (schema_obj.count("properties") || schema_obj.count("additionalProperties") ||
+  } else if (schema_obj.count("required") || schema_obj.count("properties") || schema_obj.count("additionalProperties") ||
              schema_obj.count("unevaluatedProperties")) {
     auto obj_result = ParseObject(schema_obj);
     if (obj_result.IsErr()) return ResultErr(std::move(obj_result).UnwrapErr());
@@ -1377,6 +1337,34 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
     spec.allow_unevaluated_properties = false;
   }
 
+  // Materialize required additional keys as declared properties so they cannot be
+  // silently omitted. Their value contract remains the configured additional schema.
+  std::vector<std::string> missing_required;
+  for (const auto& name : spec.required) {
+    if (std::none_of(spec.properties.begin(), spec.properties.end(),
+                     [&](const auto& property) { return property.name == name; })) {
+      missing_required.push_back(name);
+    }
+  }
+  std::sort(missing_required.begin(), missing_required.end());
+  for (const auto& name : missing_required) {
+    if (!spec.pattern_properties.empty() || spec.property_names) {
+      return ResultErr<SchemaError>(SchemaErrorType::kUnsupportedSchema,
+                                   "required additional names with pattern/propertyNames need an explicit declaration");
+    }
+    if (!spec.allow_additional_properties) {
+      return ResultErr<SchemaError>(SchemaErrorType::kUnsatisfiableSchema,
+                                   "required property is forbidden by additionalProperties: " + name);
+    }
+    auto value_spec = spec.additional_properties_schema;
+    if (!value_spec) {
+      auto any_result = Parse(picojson::value(true), name);
+      if (any_result.IsErr()) return ResultErr(std::move(any_result).UnwrapErr());
+      value_spec = std::move(any_result).Unwrap();
+    }
+    spec.properties.push_back({name, value_spec});
+  }
+
   if (schema.count("minProperties")) {
     if (!schema.at("minProperties").is<int64_t>()) {
       return ResultErr<SchemaError>(
@@ -1836,7 +1824,7 @@ void JSONSchemaConverter::AddBasicRules(const std::vector<std::string>& addition
   AddCache(kNumberCacheKey, builder_.GetRuleId(kBasicNumber));
 
   constexpr const char* kStringCacheKey = "{\"type\":\"string\"}";
-  builder_.UpdateRuleBody(kBasicString, Sequence({ByteString("\""), RuleRef(kBasicStringSub)}));
+  builder_.UpdateRuleBody(kBasicString, GenerateString(StringSpec{}, kBasicString));
   AddCache(kStringCacheKey, builder_.GetRuleId(kBasicString));
 
   // basic_boolean - cache_key matches SchemaParser::ComputeCacheKey for {"type": "boolean"}
@@ -1894,16 +1882,11 @@ void JSONSchemaConverter::AddHelperRules() {
   );
   builder_.UpdateRuleBody(kBasicEscape, Choice({escaped_character, unicode_escape}));
 
-  int32_t normal_character = builder_.AddCharacterClass(
-      {{0, 0x1f}, {'"', '"'}, {'\\', '\\'}, {'\r', '\r'}, {'\n', '\n'}}, true
+  // Shared suffixes and unrestricted values enforce the same Unicode scalar contract.
+  builder_.UpdateRuleBody(
+      kBasicStringSub,
+      Sequence({RegexExpression(R"([\u0000-\u{10ffff}]*)", true), ByteString("\"")})
   );
-  int32_t string_sub_ref = RuleRef(kBasicStringSub);
-  int32_t string_sub_body = Choice(
-      {ByteString("\""),
-       Sequence({normal_character, string_sub_ref}),
-       Sequence({ByteString("\\"), RuleRef(kBasicEscape), string_sub_ref})}
-  );
-  builder_.UpdateRuleBody(kBasicStringSub, string_sub_body);
   int32_t closing_context =
       builder_.AddCharacterClass({{',', ','}, {'}', '}'}, {']', ']'}, {':', ':'}});
   builder_.UpdateLookaheadAssertion(
@@ -2259,6 +2242,12 @@ int32_t JSONSchemaConverter::RegexExpression(
     }
   }
 
+  if (json_string) {
+    // A plain EBNF fallback loses JSON string escaping semantics. An unsupported pattern
+    // must be an explicit compile error, not a weakened constraint or malformed JSON.
+    throw std::invalid_argument("JSON string pattern is unsupported by the native regex FSM");
+  }
+
   // Keep regex conversion independent. Only the uncommon fallback path converts its existing
   // EBNF result to a subgrammar; the JSON Schema rule graph itself is still built directly.
   return AddSubGrammar(Grammar::FromEBNF(RegexToEBNF(regex)));
@@ -2402,26 +2391,174 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   if (spec.format.has_value()) {
     auto regex = JSONFormatToRegexPattern(*spec.format);
     if (regex.has_value()) {
-      // The built-in format regexes use constructs that the FSM regex engine does not fully
-      // support yet (e.g. quoted email local parts), so they keep the CFG expansion.
-      return Sequence({ByteString("\""), RegexExpression(*regex, false, true), ByteString("\"")});
+      // Supported temporal formats use the same JSON-aware native FSM as patterns.
+      return Sequence({ByteString("\""), RegexExpression(*regex, true), ByteString("\"")});
     }
   }
   // Check for pattern
   if (spec.pattern.has_value()) {
-    return Sequence(
-        {ByteString("\""), RegexExpression(*spec.pattern, /*json_string=*/true), ByteString("\"")}
-    );
+    const std::string& pattern = *spec.pattern;
+    // ECMA262 WhiteSpace and LineTerminator sets. These are protocol constants.
+    const std::string space = R"(\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028-\u2029\u202f\u205f\u3000\ufeff)";
+    const std::string nonspace = R"(\u0000-\u0008\u000e-\u001f\u0021-\u009f\u00a1-\u167f\u1681-\u1fff\u200b-\u2027\u202a-\u202e\u2030-\u205e\u2060-\u2fff\u3001-\ufefe\uff00-\u{10ffff})";
+    bool in_class = false;
+    bool end_anchor = false;
+    bool top_level_alternation = false;
+    int group_depth = 0;
+    std::string normalized;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+      const unsigned char character = pattern[i];
+      if (character == '\\') {
+        if (++i == pattern.size()) throw std::invalid_argument("incomplete regex escape");
+        const char escaped = pattern[i];
+        if ((escaped >= '1' && escaped <= '9') ||
+            (std::isalpha(static_cast<unsigned char>(escaped)) &&
+             std::string("nrtfvdDsSwWuxc").find(escaped) == std::string::npos) ||
+            (escaped == '0' && i + 1 < pattern.size() && std::isdigit(static_cast<unsigned char>(pattern[i + 1])))) {
+          throw std::invalid_argument("regex backreferences, boundary assertions and unknown escapes are unsupported");
+        }
+        if (escaped == 'u') {
+          const auto read_hex = [&](size_t start, size_t count) -> uint32_t {
+            if (!count || count > 6 || start + count > pattern.size())
+              throw std::invalid_argument("invalid Unicode regex escape");
+            const auto digits = pattern.substr(start, count);
+            if (digits.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+              throw std::invalid_argument("invalid Unicode regex escape");
+            return static_cast<uint32_t>(std::stoul(digits, nullptr, 16));
+          };
+          uint32_t codepoint;
+          if (i + 1 < pattern.size() && pattern[i + 1] == '{') {
+            const size_t close = pattern.find('}', i + 2);
+            if (close == std::string::npos) throw std::invalid_argument("incomplete Unicode regex escape");
+            codepoint = read_hex(i + 2, close - i - 2);
+            i = close;
+          } else {
+            codepoint = read_hex(i + 1, 4);
+            i += 4;
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+              if (i + 6 >= pattern.size() || pattern[i + 1] != '\\' || pattern[i + 2] != 'u')
+                throw std::invalid_argument("unpaired surrogate regex escape");
+              const uint32_t low = read_hex(i + 3, 4);
+              if (low < 0xdc00 || low > 0xdfff) throw std::invalid_argument("unpaired surrogate regex escape");
+              codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + low - 0xdc00;
+              i += 6;
+            }
+          }
+          if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff))
+            throw std::invalid_argument("regex escape is not a Unicode scalar value");
+          std::ostringstream encoded;
+          encoded << "\\u{" << std::hex << codepoint << '}';
+          normalized += encoded.str();
+        } else if (escaped == 's' || escaped == 'S') {
+          if (in_class && ((i >= 2 && pattern[i - 2] == '-') ||
+                           (i + 1 < pattern.size() && pattern[i + 1] == '-'))) {
+            throw std::invalid_argument("whitespace class escapes cannot be adjacent to a range hyphen");
+          }
+          const auto& ranges = escaped == 's' ? space : nonspace;
+          normalized += in_class ? ranges : "[" + ranges + "]";
+        } else {
+          normalized += '\\';
+          normalized += escaped;
+        }
+        continue;
+      }
+      if (character < 0x20 || character >= 0x80) {
+        auto [codepoint, bytes] = ParseNextUTF8(pattern.c_str() + i);
+        if (codepoint < 0 || codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+          throw std::invalid_argument("pattern contains invalid Unicode");
+        }
+        std::ostringstream encoded;
+        encoded << "\\u{" << std::hex << codepoint << '}';
+        normalized += encoded.str();
+        i += bytes - 1;
+        continue;
+      }
+      if (character == '[' && !in_class) in_class = true;
+      else if (character == ']' && in_class) in_class = false;
+      else if (!in_class && (character == '^' || character == '$')) {
+        if (!((character == '^' && i == 0) || (character == '$' && i + 1 == pattern.size()))) {
+          throw std::invalid_argument("regex anchors must occur at the pattern boundaries");
+        }
+        if (character == '$') end_anchor = true;
+        continue;
+      } else if (!in_class && character == '(') {
+        if (i + 1 < pattern.size() && pattern[i + 1] == '?' &&
+            (i + 2 == pattern.size() || pattern[i + 2] != ':')) {
+          throw std::invalid_argument("regex lookarounds and inline assertions are unsupported");
+        }
+        ++group_depth;
+      } else if (!in_class && character == ')') --group_depth;
+      else if (!in_class && character == '|' && group_depth == 0) top_level_alternation = true;
+      if (!in_class && character == '.') normalized += R"([^\n\r\u2028\u2029])";
+      else normalized += character;
+    }
+    // Validate the supported ECMA token grammar before the more permissive FSM parser.
+    // This keeps whitespace in braces and stacked quantifiers from changing meaning.
+    bool atom = false;
+    bool token_class = false;
+    int token_groups = 0;
+    for (size_t pos = 0; pos < normalized.size(); ++pos) {
+      const char token = normalized[pos];
+      if (token == '\\') {
+        if (++pos >= normalized.size()) throw std::invalid_argument("incomplete regex escape");
+        if (normalized[pos] == 'u' && pos + 1 < normalized.size() && normalized[pos + 1] == '{') {
+          pos = normalized.find('}', pos + 2);
+          if (pos == std::string::npos) throw std::invalid_argument("invalid Unicode regex escape");
+        } else if (normalized[pos] == 'x') pos += 2;
+        else if (normalized[pos] == 'c') ++pos;
+        if (!token_class) atom = true;
+        continue;
+      }
+      if (token_class) { if (token == ']') { token_class = false; atom = true; } continue; }
+      if (token == '[') { token_class = true; continue; }
+      if (token == '(') {
+        ++token_groups;
+        atom = false;
+        if (normalized.compare(pos, 3, "(?:") == 0) pos += 2;
+      } else if (token == ')') {
+        if (--token_groups < 0) throw std::invalid_argument("unmatched regex group");
+        atom = true;
+      } else if (token == '|') atom = false;
+      else if (token == '*' || token == '+' || token == '?') {
+        if (!atom) throw std::invalid_argument("stacked, lazy or misplaced regex quantifier");
+        atom = false;
+      } else if (token == '{') {
+        if (!atom) throw std::invalid_argument("misplaced regex repetition");
+        size_t end = pos + 1;
+        while (end < normalized.size() && std::isdigit(static_cast<unsigned char>(normalized[end]))) ++end;
+        if (end == pos + 1) throw std::invalid_argument("invalid regex repetition count");
+        if (end < normalized.size() && normalized[end] == ',') {
+          ++end;
+          while (end < normalized.size() && std::isdigit(static_cast<unsigned char>(normalized[end]))) ++end;
+        }
+        if (end >= normalized.size() || normalized[end] != '}') throw std::invalid_argument("invalid regex repetition syntax");
+        pos = end;
+        atom = false;
+      } else {
+        if (token == '}' || token == ']') throw std::invalid_argument("unescaped regex delimiter");
+        atom = true;
+      }
+    }
+    if (token_class || token_groups) throw std::invalid_argument("unclosed regex group or class");
+    const bool start_anchor = !pattern.empty() && pattern.front() == '^';
+    if (top_level_alternation && (start_anchor || end_anchor)) {
+      throw std::invalid_argument("anchored top-level alternation requires an explicit group");
+    }
+    // A search predicate needs scalar-safe wildcards, including escaped line terminators.
+    const std::string wildcard = R"([\u0000-\u{10ffff}]*)";
+    const std::string search = (start_anchor ? "" : wildcard) + "(?:" + normalized + ")" +
+                               (end_anchor ? "" : wildcard);
+    return Sequence({ByteString("\""), RegexExpression(search, true), ByteString("\"")});
   }
   // Check for length constraints
   if (spec.min_length != 0 || spec.max_length != -1) {
-    int32_t character =
-        builder_.AddCharacterClass({{0, 0x1f}, {'"', '"'}, {'\\', '\\'}, {'\r', '\r'}, {'\n', '\n'}}, true);
+    // One repeated FSM atom represents one decoded Unicode scalar, irrespective of JSON spelling.
+    int32_t character = RegexExpression(R"([\u0000-\u{10ffff}])", true);
     int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, spec.max_length);
     return Sequence({ByteString("\""), body, ByteString("\"")});
   }
   // Default string
-  return Sequence({ByteString("\""), RuleRef(kBasicStringSub)});
+  return Sequence({ByteString("\""), RegexExpression(R"([\u0000-\u{10ffff}]*)", true), ByteString("\"")});
 }
 
 int32_t JSONSchemaConverter::GenerateBoolean(
@@ -3263,12 +3400,22 @@ std::optional<std::string> JSONSchemaConverter::JSONFormatToRegexPattern(const s
         ")";
     m["email"] = "^(" + dot_string + "|" + quoted_string + ")@" + domain + "$";
 
-    m["date"] = "^(\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\\d|3[01]))$";
-    m["time"] =
-        "^([01]\\d|2[0-3]):[0-5]\\d:([0-5]\\d|60)(\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$";
-    m["date-time"] =
-        "^(\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\\d|3[01]))T([01]\\d|2[0-3]):[0-5]\\d:([0-5]\\d|60)("
-        "\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$";
+    // RFC 3339 calendar dates, with Gregorian month lengths and leap-year arithmetic.
+    // Years are the positive four-digit subset supported by application date validators.
+    const std::string year = "([1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[1-9])";
+    const std::string leap_year =
+        "([0-9]{2}(0[48]|[2468][048]|[13579][26])|(0[48]|[2468][048]|[13579][26])00)";
+    const std::string day = "(0[1-9]|[12][0-9])";
+    const std::string date = "(" + year + "-((01|03|05|07|08|10|12)-(" + day +
+                             "|3[01])|(04|06|09|11)-(" + day +
+                             "|30)|02-(0[1-9]|1[0-9]|2[0-8]))|" + leap_year + "-02-29)";
+    // Leap-second spellings are excluded from the generated subset; ordinary seconds,
+    // fractional seconds, case-insensitive UTC and numeric offsets are all constrained.
+    const std::string time =
+        "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])";
+    m["date"] = "^" + date + "$";
+    m["time"] = "^" + time + "$";
+    m["date-time"] = "^" + date + "[Tt]" + time + "$";
     m["duration"] =
         "^P((\\d+D|\\d+M(\\d+D)?|\\d+Y(\\d+M(\\d+D)?)?)(T(\\d+S|\\d+M(\\d+S)?|\\d+H(\\d+M(\\d+"
         "S)?"

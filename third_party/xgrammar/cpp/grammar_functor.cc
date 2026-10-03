@@ -1,3 +1,4 @@
+// RUR1NINFER modifications: JSON regex FSM dispatch. Original license retained.
 /*!
  *  Copyright (c) 2024 by Contributors
  * \file xgrammar/grammar_functor.cc
@@ -1836,9 +1837,7 @@ void GrammarFSMBuilderImpl::BuildRegex(
   const std::string rule_hint = rule_name_ != nullptr ? *rule_name_ : "";
   auto build_result =
       json_string
-          ? RegexFSMBuilder::BuildWithForbiddenChars(
-                regex, GrammarFSMBuilder::JSONStringForbiddenChars(), grammar_builder_, rule_hint
-            )
+          ? RegexFSMBuilder::BuildJSONString(regex, grammar_builder_, rule_hint)
           : RegexFSMBuilder::Build(regex, grammar_builder_, rule_hint);
   if (build_result.IsErr()) {
     auto error = std::move(build_result).UnwrapErr();
@@ -1968,9 +1967,7 @@ std::optional<FSMWithStartEnd> GrammarFSMBuilderImpl::TagDispatch(
 }
 
 Result<FSMWithStartEnd> GrammarFSMBuilderImpl::Regex(const std::string& regex, bool json_string) {
-  auto build_result = json_string ? RegexFSMBuilder::BuildWithForbiddenChars(
-                                        regex, GrammarFSMBuilder::JSONStringForbiddenChars()
-                                    )
+  auto build_result = json_string ? RegexFSMBuilder::BuildJSONString(regex)
                                   : RegexFSMBuilder::Build(regex);
   if (build_result.IsErr()) {
     return build_result;

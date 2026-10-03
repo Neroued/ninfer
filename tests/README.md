@@ -255,3 +255,51 @@ reasoning transitions, speculative mask previews, injected thinking-budget closu
 boundary preservation. `--concurrency 8 --draft-tokens 15 --modes dflash2` exercises
 the largest draft and batch dimensions. A separate DFlash-capable artifact can use `--modes dflash`.
 The server is terminated on success or failure. An occupied test port causes the test to stop.
+
+## CPU structured-output qualification
+
+`ninfer_structured_output_test` and `ninfer_unicode_scalar_output_test` use a byte
+vocabulary and EOS without loading an artifact or executing CUDA. The stdin JSONL
+`ninfer_native_schema_probe` preserves schema declaration order and tests native
+compilation, token masks, accepted transitions and EOS. It is an executable fixture,
+not an unattended CTest target.
+
+`text/native_schema_oracle.py` generates and independently checks the corpus using
+Python `jsonschema`, calendar/time arithmetic, strict UTF-8 and Node.js ECMA262 regexes.
+Node is found on PATH, or selected through `NINFER_ORACLE_NODE`. Pass `--schemas` for
+an optional JSON list of `{name, schema}` application schemas; these are compile-only.
+No model or inference HTTP server is used by these tools.
+
+```bash
+cmake --build build --target ninfer_structured_output_test ninfer_unicode_scalar_output_test ninfer_native_schema_probe --parallel 2
+ctest --test-dir build -R '^ninfer_(structured_output|unicode_scalar_output)_test$' --output-on-failure
+python3 tests/text/native_schema_oracle.py --emit-corpus corpus.jsonl --report oracle.json
+build/tests/ninfer_native_schema_probe < corpus.jsonl > native.jsonl
+python3 tests/text/native_schema_oracle.py --native-results native.jsonl --report comparison.json
+```
+
+These host tests establish supported grammar semantics. Actual tokenizer,
+speculative decoding and concurrent serving behavior are exercised separately
+by the real-model structured-output tests described above.
+
+The `ninfer_unique_strings_test`, `ninfer_structured_unique_test` and
+`ninfer_unique_strings_masks_test` are CPU-only. They exercise decoded-string
+equality, remaining enum prefixes, nested scopes, rollback/forks, actual mask versus
+commit consistency, multi-item vocabulary tokens, EOS and reasoning/MTP boundaries.
+The JSONL `ninfer_schema_normalization_probe` reports normalized schemas for an
+independent JSON Schema validator to compare accepted instances. Neither probe
+loads model artifacts.
+
+`schema_semantics_oracle.py` generates independent Draft 2020-12 cases for
+string uniqueness, escaped equality, finite-domain exhaustion, nested scopes,
+union intersections, local references and explicit unsupported contracts.
+`compare_schema_semantics.py` compares the native byte-vocabulary probe with
+the unchanged input schema. Accepting an invalid value always fails; expected
+compile errors and declared serialization restrictions are reported separately.
+
+```bash
+python3 tests/text/schema_semantics_oracle.py --output semantic-corpus.jsonl
+build/tests/ninfer_native_schema_probe < semantic-corpus.jsonl > semantic-native.jsonl
+python3 tests/text/compare_schema_semantics.py --cases semantic-corpus.jsonl --results semantic-native.jsonl --report semantic-comparison.json
+ctest --test-dir build -R '^ninfer_(structured_output|unicode_scalar_output|unique_strings|structured_unique|unique_strings_masks)_test$' --output-on-failure
+```

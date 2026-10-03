@@ -828,6 +828,16 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         throw std::logic_error("active capture offer ownership changed");
     }
 
+    if (kvmem_window_pages != 0) {
+        // Rolling placement can demote borrowed shared pages and materialize private
+        // pages in their place. The exclusive KV claim saved at admission is therefore
+        // not a lifetime invariant. Refresh it from the live owner before the snapshot
+        // transfers unique full pages to shared ownership; keep the checked deduction.
+        const detail::PhysicalResources live = owner_exclusive_resources(sequence);
+        request.active_resources.device.main_kv_pages = live.device.main_kv_pages;
+        request.active_resources.device.backend_kv_pages = live.device.backend_kv_pages;
+    }
+
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
         if (!transaction.state_snapshot || sequence.state.fork_pending ||
             sequence.state.read != transaction.source_state ||

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/planning/pressure_planner.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -2613,9 +2614,29 @@ bool ProgramImpl::persistent_backfill_safe(
             throw std::logic_error("persistent backfill proof contains a duplicate sequence");
         }
         observed_lanes |= bit;
-        borrowers = checked_resource_sum(borrowers, requests[lane].active_resources);
+        auto resources = requests[lane].active_resources;
+        if (kvmem_window_pages != 0) {
+            // Borrowed shared residency is temporary: rolling placement can replace it
+            // with private pages. A persistent borrower must be safe at its future
+            // window peak, not merely at its last exclusive-owner inventory.
+            resources.device.main_kv_pages =
+                kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
+            resources.device.backend_kv_pages =
+                speculative_backend == SpeculativeBackend::Mtp
+                    ? resources.device.main_kv_pages + kv_pages_for_frontier(draft_window - 1U)
+                : speculative_backend == SpeculativeBackend::DFlash
+                    ? resources.device.main_kv_pages : 0U;
+        }
+        borrowers = checked_resource_sum(borrowers, resources);
     }
-    borrowers = checked_resource_sum(borrowers, candidate.impl_->demand.active_entitlement);
+    auto candidate_resources = candidate.impl_->demand.active_entitlement;
+    if (kvmem_window_pages != 0) {
+        candidate_resources.device.main_kv_pages =
+            candidate.impl_->text_kv_page_entitlement;
+        candidate_resources.device.backend_kv_pages =
+            candidate.impl_->backend_kv_page_entitlement;
+    }
+    borrowers = checked_resource_sum(borrowers, candidate_resources);
 
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,

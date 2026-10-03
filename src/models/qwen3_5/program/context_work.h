@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/program/program_impl.h"
 #include <chrono>
+#include <source_location>
 
 namespace ninfer::models::qwen3_5::execution {
 struct MtpCausalAttentionEnvelopes;
@@ -55,7 +56,9 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
                                                detail::PhysicalResources right);
 
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
-                                                      detail::PhysicalResources removed);
+                                                      detail::PhysicalResources removed,
+                                                      std::source_location where =
+                                                          std::source_location::current());
 
 detail::PhysicalResources positive_resource_difference(detail::PhysicalResources value,
                                                        detail::PhysicalResources removed) noexcept;

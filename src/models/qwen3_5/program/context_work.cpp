@@ -10,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -212,14 +213,28 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
 }
 
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
-                                                      detail::PhysicalResources removed) {
+                                                      detail::PhysicalResources removed,
+                                                      std::source_location where) {
     if (removed.device.active_lanes > value.device.active_lanes ||
         removed.device.state_slots > value.device.state_slots ||
         removed.device.main_kv_pages > value.device.main_kv_pages ||
         removed.device.backend_kv_pages > value.device.backend_kv_pages ||
         removed.host.state_slots > value.host.state_slots ||
         removed.host.kv_bytes > value.host.kv_bytes) {
-        throw std::logic_error("Qwen3.5 resource subtraction underflow");
+        std::ostringstream message;
+        message << "Qwen3.5 resource subtraction underflow at " << where.file_name() << ':'
+                << where.line() << " in " << where.function_name();
+        const auto field = [&](const char* name, auto available, auto deduction) {
+            message << "; " << name << '=' << available << "-" << deduction;
+            if (deduction > available) { message << " [UNDERFLOW]"; }
+        };
+        field("device.active_lanes", value.device.active_lanes, removed.device.active_lanes);
+        field("device.state_slots", value.device.state_slots, removed.device.state_slots);
+        field("device.main_kv_pages", value.device.main_kv_pages, removed.device.main_kv_pages);
+        field("device.backend_kv_pages", value.device.backend_kv_pages, removed.device.backend_kv_pages);
+        field("host.state_slots", value.host.state_slots, removed.host.state_slots);
+        field("host.kv_bytes", value.host.kv_bytes, removed.host.kv_bytes);
+        throw std::logic_error(message.str());
     }
     return detail::PhysicalResources{
         .device =

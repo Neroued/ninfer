@@ -1,5 +1,68 @@
 # HTTP serving
 
+## Experimental KVMem window
+
+DFlash2 requires its companion in the same artifact. For seven proposals per round,
+select `--spec dflash2 --draft-tokens 7`; `--vision` also requires Vision weights.
+Query replay restores recurrent target state and draft cyclic KV before rebuilding
+draft features. The private cyclic checkpoint is included in startup device capacity
+(40 MiB per lane for the five-layer, 2048-token Qwen3.8-27B companion).
+Draft companions with full-attention layers are rejected in KVMem mode.
+
+`--kvmem-window-pages N` enables sparse Host/Device KV placement (`0` is dense).
+One page is 64 tokens. The supported surface is one or two lanes with ordinary
+decoding, MTP, or all-local DFlash2, including `--vision` with matching artifact weights. First-generation DFlash, more
+than two active lanes, scoring, disabled context caching, and windows below 8 pages
+are rejected at startup. The window is per lane; the Host KV budget is shared.
+
+```bash
+./build/apps/ninfer-serve /absolute/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8095 --max-context 262144 \
+  --kv-dtype int8 --kv-capacity auto --kvmem-window-pages 1536 \
+  --host-kv-mib 12288 --max-concurrency 1 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+This keeps a 96K historical Device window and bounded prefill/growth margins.
+Host RAM retains evicted KV at original positions. Prefill rolls over processed
+history; completed block means and pre-RoPE Q features choose the decode window.
+During prefill, the history window ends at the committed cursor, rather than the
+end of advance mapping. Already mapped future append pages stay writable outside
+that window. A service grant smaller than the workspace chunk therefore cannot
+evict additional history merely because future pages have been reserved. The
+startup claim covers the historical window plus chunk growth and slack.
+The text query uses at most the last 512 tokens of the last typed user message, even
+when tool results follow it. If the template cannot prove that message's token
+boundaries, the query falls back to the new prompt suffix. Long prompts checkpoint
+the recurrent state before the query, select history, then replay from that
+checkpoint through the prompt end before publishing the first generated token.
+Main and MTP KV are rewound together. Retrieved history stays selected during
+generation; its recent share rolls, and MTP follows the same selection.
+For media, a query boundary inside an item backs up to that item's consumer start.
+MRoPE axes and logical KV rows remain separate through replay and cached text
+suffixes. Only media payloads needed by replay survive the first encoding pass;
+they are re-encoded into the existing single-item handoff and then released.
+Media items sharing a physical KV page form an indivisible group. The latest visible
+group and sink remain resident; other groups are selected whole or omitted. Admission
+rejects any group that cannot fit alongside the sink and two tail/boundary pages.
+This can reduce the text retrieval/recent share and is an explicit sparse-media policy,
+not mathematical equivalence to full attention. Native video uses the same mechanism;
+image and video qualification must be reported separately.
+Budget allocation, partial-block features and long-prefix feature ownership still
+differ from reference KVMem. Quality equivalence has not been established.
+
+Prompts fitting the window retain exact-prefix caching. Longer prompts are
+recomputed because cached continuations do not own retrieval features; generation
+crossing the window does not publish a sparse continuation. Host headroom is
+included in admission for requests that can spill. Active requests retain their
+complete future Host peak until completion or cancellation, even before pages
+actually spill. Current Host replicas already covered by those peaks are credited
+once per logical page; shared aliases cannot double-discount physical occupancy.
+Inactive cached replicas remain charged at actual occupancy. Configure enough Host capacity
+for the requested context and Main/MTP payloads; the INT8 27B 256K regression uses
+12 GiB. See [the test pipeline](../tests/e2e/README.md) and
+[integration audit](maintainer/kvmem-audit.md).
+
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 

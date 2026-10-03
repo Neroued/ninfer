@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -376,6 +378,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
+        if (kvmem_window_pages != 0 && lanes.size() > 1 &&
+            std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "KVMEM decode backend=none lanes=%zu\n", lanes.size());
+        }
         return runtime::BatchedGeneratedRound{
             .tokens =
                 std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(), lanes.size()),
@@ -557,6 +563,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
+        if (kvmem_window_pages != 0 && lanes.size() > 1 &&
+            std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "KVMEM decode backend=mtp lanes=%zu\n", lanes.size());
+        }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
                                                    lanes.size() * width),
@@ -729,6 +739,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (kvmem_window_pages != 0 && std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+                std::fprintf(stderr, "KVMEM draft lane=%u extent=%u accepted=%d\n",
+                             sequence.lane, extent, accepted_i);
+            }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -750,6 +764,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+        }
+        if (kvmem_window_pages != 0 && lanes.size() > 1 &&
+            std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "KVMEM decode backend=dflash2 lanes=%zu\n", lanes.size());
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),

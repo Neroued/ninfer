@@ -6,6 +6,7 @@
 
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/program/retrieval/query_span.h"
 
 #include <algorithm>
 #include <array>
@@ -413,6 +414,24 @@ void test_rebuild_work_prompt_frontier_boundary() {
            "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
+void test_query_replay_service_work() {
+    const auto query = q36::detail::kvmem_query_span(5461, 0, q36::TokenSpan{16, 5436});
+    expect(query.exact && query.begin == 4940 && query.end == 5452,
+           "last-user query capture must use the final 512 user tokens");
+    expect(q36::detail::kvmem_replay_quanta(5461, query.begin, 4096, 2048, {}) == 1,
+           "full-budget generation must reserve the extra replay service unit");
+    const std::array<std::uint32_t, 4> rewrites{1050, 4097, 6001, 8192};
+    expect(q36::detail::kvmem_replay_quanta(8192, 1024, 4096, 2048, rewrites) == 6,
+           "tool-tail replay must include each rewrite-split execution step");
+    expect(q36::detail::kvmem_replay_quanta(8192, 1024, 0, 2048, rewrites) == 0 &&
+               q36::detail::kvmem_replay_quanta(8192, 1024, 8192, 2048, rewrites) == 0 &&
+               q36::detail::kvmem_replay_quanta(8192, 0, 4096, 2048, rewrites) == 0,
+           "dense, within-window and zero-query-prefix requests must not reserve replay");
+    const auto cached = q36::detail::kvmem_query_span(5461, 5400, q36::TokenSpan{16, 5436});
+    expect(!cached.exact && cached.begin == 5400 && cached.end == 5461,
+           "uncaptured cached query must use only the available suffix");
+}
+
 } // namespace
 
 int main() {
@@ -422,6 +441,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_query_replay_service_work();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

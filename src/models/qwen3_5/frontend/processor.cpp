@@ -580,6 +580,12 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         span.begin = map_boundary(span.begin, "literal span");
         span.end   = map_boundary(span.end, "literal span");
     }
+    if (rendered.retrieval_query) {
+        rendered.retrieval_query->begin =
+            map_boundary(rendered.retrieval_query->begin, "retrieval query");
+        rendered.retrieval_query->end =
+            map_boundary(rendered.retrieval_query->end, "retrieval query");
+    }
     if (rendered.rewrite_checkpoint) {
         rendered.rewrite_checkpoint->offset =
             map_boundary(rendered.rewrite_checkpoint->offset, "rewrite checkpoint");
@@ -744,7 +750,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 1U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
                             rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
-                            rendered.media_token_runs.size() * 2U);
+                            rendered.media_token_runs.size() * 2U +
+                            (rendered.retrieval_query ? 2U : 0U));
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
     }
@@ -759,6 +766,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
+    }
+    if (rendered.retrieval_query) {
+        byte_boundaries.push_back(rendered.retrieval_query->begin);
+        byte_boundaries.push_back(rendered.retrieval_query->end);
     }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
@@ -837,6 +848,15 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .item_index  = run.item_index,
             .frame_index = run.frame_index,
         });
+    }
+    if (rendered.retrieval_query) {
+        const auto& begin = tokenized.boundaries.at(boundary_index++);
+        const auto& end = tokenized.boundaries.at(boundary_index++);
+        if (begin.exact_frontier && end.exact_frontier &&
+            *begin.exact_frontier < *end.exact_frontier) {
+            encoded.retrieval_query = qwen3_5::TokenSpan{
+                .begin = *begin.exact_frontier, .count = *end.exact_frontier - *begin.exact_frontier};
+        }
     }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
@@ -1064,6 +1084,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.input_ids                   = std::move(encoded.input_ids);
+    output.retrieval_query             = encoded.retrieval_query;
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);

@@ -33,6 +33,7 @@
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/span_accumulate.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -871,6 +872,39 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                              dimension(config_.attention->num_key_value_heads), T});
     ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
+
+    if (kvmem_q_sum_ != nullptr && T > 0) {
+        // Capture pre-RoPE features: the query tail feeds the Q sum and every key
+        // contributes to its global 128-token block's ring slot, across chunk splits.
+        const std::int32_t rows_q = dimension(config_.attention->query_width());
+        const std::int32_t rows_k = dimension(config_.attention->key_width());
+        Tensor q_capture(qn.view({rows_q, T}));
+        Tensor q_sum(kvmem_q_sum_ + static_cast<std::size_t>(fidx) * rows_q, DType::FP32,
+                     {rows_q});
+        const std::uint32_t chunk_end  = text_kv_base_ + static_cast<std::uint32_t>(T);
+        const auto q_begin = std::max(text_kv_base_, kvmem_query_begin_);
+        const auto q_end = std::min(chunk_end, kvmem_query_end_);
+        if (q_begin < q_end) {
+            ops::span_accumulate(q_capture, q_begin - text_kv_base_, q_end - q_begin, q_sum, s);
+        }
+        const auto first_block = text_kv_base_ / execution::kKvmemCaptureBlockTokens;
+        const auto last_block = (chunk_end + execution::kKvmemCaptureBlockTokens - 1U) /
+                                 execution::kKvmemCaptureBlockTokens;
+        if (last_block > first_block) {
+            Tensor k_capture(kn.view({rows_k, T}));
+            for (auto block = first_block; block < last_block; ++block) {
+                const auto begin = std::max(text_kv_base_, block * execution::kKvmemCaptureBlockTokens);
+                const auto end = std::min(chunk_end, (block + 1U) * execution::kKvmemCaptureBlockTokens);
+                const std::uint32_t slot = block % kvmem_capture_slots_;
+                Tensor k_sum(kvmem_k_sum_ +
+                                 (static_cast<std::size_t>(fidx) * kvmem_capture_slots_ +
+                                  slot) * rows_k,
+                             DType::FP32, {rows_k});
+                ops::span_accumulate(k_capture, begin - text_kv_base_,
+                                     end - begin, k_sum, s);
+            }
+        }
+    }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
@@ -1149,9 +1183,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
             throw std::invalid_argument("multimodal positions must have shape [3,T]");
         }
-        if (multimodal->vision == nullptr) {
-            throw std::invalid_argument("multimodal prefill requires a Vision session");
-        }
         rope_delta_ = multimodal->rope_delta;
     } else if (text_kv_base_ == 0) {
         rope_delta_ = 0;
@@ -1183,10 +1214,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
-        if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
+        if (multimodal != nullptr && multimodal->vision != nullptr) {
             vision_chunk =
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
@@ -1422,13 +1450,20 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
+                                              VisionPrefillSession* vision, bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (vision == nullptr && std::any_of(input.vision_items.begin(), input.vision_items.end(),
+            [begin](const auto& item) {
+                const auto& last = item.token_spans.back();
+                return last.begin + last.count > begin;
+            })) {
+        throw std::logic_error("uncached media requires a Vision session");
+    }
+    const MultimodalPrefill multimodal{tokens, input.positions, vision, begin, input.rope_delta};
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
@@ -1436,14 +1471,21 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end,
+                                              VisionPrefillSession* vision, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (vision == nullptr && std::any_of(input.vision_items.begin(), input.vision_items.end(),
+            [begin](const auto& item) {
+                const auto& last = item.token_spans.back();
+                return last.begin + last.count > begin;
+            })) {
+        throw std::logic_error("uncached media requires a Vision session");
+    }
+    const MultimodalPrefill multimodal{tokens, input.positions, vision, begin, input.rope_delta};
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
 }

@@ -10,6 +10,9 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/media_window.h"
+#include "ninfer/ops/span_accumulate.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -252,6 +255,8 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    // Full future sparse Host peak; separate from actual physical inventory.
+    std::size_t sparse_host_peak_bytes = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -371,6 +376,23 @@ struct SequenceState {
     std::uint32_t rebuild_tail_begin = 0;
 };
 
+// Request-local retrieval state. A second admission/prefill must never overwrite
+// the first lane's selected history, partial capture or query replay checkpoint.
+// Long sparse continuations are not published; reset this state at every admission.
+struct KvmemLaneState {
+    Tensor query_sum;
+    Tensor key_sums;
+    RetrievalIndex index;
+    std::uint32_t capture_begin = 0;
+    std::uint32_t query_begin = 0;
+    std::uint32_t query_end = 0;
+    bool query_checkpoint_valid = false;
+    std::vector<float> query;
+    std::vector<std::uint32_t> query_count;
+    std::vector<std::uint32_t> retrieved_pages;
+    std::vector<MediaPageGroup> media_groups;
+};
+
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
     StateImageHandle state;
@@ -406,6 +428,8 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Released on every terminal/cleanup path; catalog entries retain only real bytes.
+    std::size_t sparse_host_peak_bytes = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -416,6 +440,8 @@ struct RequestControl {
         std::uint64_t pending_capture_offer = 0;
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
+        // Replay advances independently: prompt progress must not count these tokens twice.
+        std::optional<std::uint32_t> query_replay_cursor;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
@@ -567,6 +593,8 @@ public:
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
+    // Sparse working-set window (pages) for prefill rolling; 0 keeps dense semantics.
+    const std::uint32_t kvmem_window_pages;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
@@ -584,6 +612,10 @@ public:
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
+    std::vector<KvmemLaneState> kvmem_lanes_;
+    std::optional<LinearAttentionStatePool> kvmem_query_checkpoint_;
+    std::optional<CyclicKVCache> kvmem_draft_checkpoint_;
+    std::uint32_t kvmem_capture_slots_ = 0;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
@@ -664,6 +696,8 @@ private:
     mutable std::uint32_t pressure_page_scratch_generation_ = 0;
     mutable std::vector<PressurePageScratchSlot> pressure_text_page_scratch_;
     mutable std::vector<PressurePageScratchSlot> pressure_backend_page_scratch_;
+    mutable std::vector<std::uint8_t> host_budget_text_seen_;
+    mutable std::vector<std::uint8_t> host_budget_backend_seen_;
     mutable std::vector<PressureSelectedPage> pressure_text_selected_pages_;
     mutable std::vector<PressureSelectedPage> pressure_backend_selected_pages_;
     mutable std::vector<std::uint8_t> pressure_private_owner_scratch_;
@@ -959,6 +993,9 @@ private:
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    // Admission/pressure only; stale inventory and overflow fail closed.
+    [[nodiscard]] std::optional<detail::PhysicalResources>
+    admission_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
@@ -1170,6 +1207,18 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    void roll_sparse_decode_window(SequenceState& sequence);
+    void consume_kvmem_chunk_capture(SequenceState& sequence, std::uint32_t chunk_begin,
+                                     std::uint32_t chunk_end);
+    void finalize_kvmem_query(SequenceState& sequence, std::uint32_t prompt_tokens);
+    void copy_kvmem_query_state(SequenceState& sequence, bool restore);
+    std::uint32_t advance_kvmem_query_replay(SequenceState& sequence,
+                                            RequestControl::Prefill& staged,
+                                            runtime::ExecutionTimingRecorder& timing);
+    void apply_kvmem_retrieval_placement(SequenceState& sequence);
+    void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
+                                    std::uint32_t cursor,
+                                    std::uint32_t backend_valid, bool retrieved_history = false);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

@@ -494,6 +494,14 @@ Cancellation 在 Engine worker 的稳定边界生效：
 
 Cancellation 不修改 in-flight mapping，也不从未完成的 active state 发布 checkpoint。
 
+稀疏 KV 的 query replay 也按 prefill chunk 返回 worker boundary。探测阶段完成后不发布
+候选 token；回放保留独立 cursor，恢复一次 GDN/Main/MTP 状态，每步至多推进一个 chunk，
+同步后允许 cancellation。回放不重复增加已计算的 prompt token 计数，只有末步可发布 Begin token。
+Program 的 root、candidate 和 sealed-plan service projection 必须计入全部回放 step，包括
+rewrite frontier 缩短的 chunk；它们仍各消费一个调度量子。初次探测中同一 step 内的 query
+checkpoint 切分不额外消费量子。规划与执行共用 query span 选择，不能借用尚未使用的输出
+预算抵消回放成本，否则用满输出预算的请求会耗尽 service projection 并使 Engine 失败。
+
 ### 7.3 Request-local rejection
 
 在 Program mutation 前可以只拒绝当前请求：

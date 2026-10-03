@@ -38,6 +38,15 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Sparse working-set capture buffers (ProgramImpl-owned, feature-first FP32):
+    // q_sum is [layers * query_width] accumulating every query column of the turn;
+    // k_sum is [layers * slots * kv_width] holding one completed block per slot.
+    // Null keeps the attention path capture-free.
+    float* kvmem_q_sum = nullptr;
+    float* kvmem_k_sum = nullptr;
+    std::uint32_t kvmem_capture_slots = 0;
+    std::uint32_t kvmem_query_begin = 0;
+    std::uint32_t kvmem_query_end = 0;
 };
 
 struct PrefillContext {
@@ -144,7 +153,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         VisionPrefillSession* vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> split_frontier, bool finalize_at_end);
 
 struct MtpBridgeInput {

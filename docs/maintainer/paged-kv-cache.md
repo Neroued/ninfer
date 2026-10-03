@@ -53,6 +53,15 @@ KV Store 可以在任意 token frontier 表示、truncate 或保护 prefix；这
 
 ## 3. Typed pool set 与容量
 
+本文下述容量公式默认 dense 模式。实验性的 `kvmem_window_pages > 0` 模式只支持单 lane 文本生成
+及普通/MTP backend；Main physical 最小需求为
+`min(L, window_pages + ceil(effective_prefill_chunk / 64) + 16)`，auto 使用该固定有界容量。
+逻辑地址仍覆盖 `L` 页，Device working set 以外的已提交页由 Host 副本持有，执行表发布 hole。
+Host 峰值 headroom 必须在请求 admission 中计入，shared resident pages 也必须扣除增长 reservation
+预算。Q/K capture 属于启动时规划的 persistent arena。长请求的稀疏 continuation 暂不进入前缀缓存。
+产品边界和检索近似见 [serving](../serving.md#experimental-kvmem-window)，验证见
+[KVMem 审计](kvmem-audit.md)。
+
 ### 3.1 Pool set
 
 模型配置和 selected speculative backend 在启动时确定 pool set：
@@ -522,6 +531,14 @@ NeededPages_s=
 Trailing mappings 可以解除；最后一个部分页保留。对 active address space，解除的 Device leases 回到
 同一 active reservation，而不是全局 available capacity。Page 内 frontier 之后的 stale bytes 不进入
 consumer valid domain。
+
+KVMem query replay 使用专门的 `truncate_for_replay`：调用者已在 GPU boundary 恢复查询前的
+recurrent StateImage，且 Main/backend 分别回退到相同输入 frontier。被改写或移除的页必须为
+当前 address 私有，不能有 checkpoint/shared 引用或 transfer pin。部分尾页必须先恢复 Device
+副本，并在缩短 committed coverage 前释放旧 Host 副本；整个后缀允许只有 Host 副本，解除
+address 引用后同步释放。先检查全部后缀再修改并裁剪 working set；调用者必须在下一次消费前
+通过 placement/growth 重新发布 table，防止恢复 probe 阶段的旧 KV。该接口不赋予共享
+continuation 原地改写的权限。
 
 投机终止先按最终提交数量完成 recurrent state、hidden 和 draft context 的补齐，等待 GPU 工作完成后
 发布 committed frontier，再裁掉未提交的尾页。不能为满足某个后续阶段更短的覆盖需求而提前裁剪

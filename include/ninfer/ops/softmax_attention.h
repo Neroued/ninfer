@@ -117,18 +117,24 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row
- * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula is the
- * shared oracle above over J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions
- * are sequential and address populated histories. A nonempty row repeats its last live position
- * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
- * Tail columns do not mutate cache and produce exact BF16 zero.
+ * kv_table_rows[b], restricted to materialized pages: a block-table entry equal to
+ * kPagedKVPageHole marks its 64-token page as not resident in the device pool, and every key of
+ * that page is invisible to the attention (no score mass; the page is never dereferenced). The
+ * current k/v row is appended before it is observed, so the formula is the shared oracle above
+ * over J={rows of populated pages within [0,p]}. Each masked row has a live prefix [0,Vb); its
+ * live positions are sequential and address populated histories, and every page a live position
+ * writes into must itself be populated (holes only ever cover historical pages outside the active
+ * growth window). A nonempty row repeats its last live position through the inert tail; an empty
+ * row uses zero positions. Other tail values are safe dummies. Tail columns do not mutate cache
+ * and produce exact BF16 zero.
  *
  * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
  * capacity query below; implementations that need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
- * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
+ * state. Capacity is measured against the logical block table, not the resident page count.
+ * A masked physical width may exceed max_visible_keys when its live prefix is shorter.
  * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
  * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
  * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
@@ -146,9 +152,10 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
- * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
- * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
- * unchanged; out is completely overwritten.
+ * and cache geometry, visible rows, scale, numerical oracle, envelope (including the
+ * kPagedKVPageHole semantics for non-resident pages), alias, and workspace rules are the same as
+ * causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte unchanged; out
+ * is completely overwritten.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,

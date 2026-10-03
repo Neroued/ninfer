@@ -26,6 +26,10 @@ namespace ninfer::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
 
+// Model-owned retrieval capture geometry. Split prefill chunks can contribute
+// to the same block across launches; the generic accumulation Op has no policy.
+inline constexpr std::uint32_t kKvmemCaptureBlockTokens = 128;
+
 enum class GdnStateAction : std::uint8_t {
     UpdateInPlace,
     RecordForReplay,
@@ -98,6 +102,18 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // Working-set capture wiring (null disables): q_sum accumulates [query_width] per
+    // full-attention layer over [query_begin, query_end); k_sum holds [kv_width] per 128-token
+    // block ring slot per layer, including blocks split across prefill chunks.
+    void set_kvmem_capture(float* q_sum, float* k_sum, std::uint32_t slots,
+                           std::uint32_t query_begin, std::uint32_t query_end) noexcept {
+        kvmem_q_sum_ = q_sum;
+        kvmem_k_sum_ = k_sum;
+        kvmem_capture_slots_ = slots;
+        kvmem_query_begin_ = query_begin;
+        kvmem_query_end_ = query_end;
+    }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -119,11 +135,11 @@ public:
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+                  std::uint32_t nominal_length, VisionPrefillSession* vision, bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
-                                                   VisionPrefillSession& vision,
+                                                   VisionPrefillSession* vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
@@ -161,6 +177,11 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    float* kvmem_q_sum_ = nullptr;
+    float* kvmem_k_sum_ = nullptr;
+    std::uint32_t kvmem_capture_slots_ = 0;
+    std::uint32_t kvmem_query_begin_ = 0;
+    std::uint32_t kvmem_query_end_ = 0;
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);

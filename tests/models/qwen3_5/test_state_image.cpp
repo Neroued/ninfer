@@ -169,6 +169,39 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect(host.release(*reused), "HostStatePool releases the reused slot");
 }
 
+// Query checkpoints use lane indices, while live state slots can be unrelated.
+void test_sparse_draft_checkpoint(ninfer::DeviceContext& device) {
+    auto planned = plan_pool(true, 4, true);
+    ninfer::DeviceArena arena(planned.bytes);
+    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    ninfer::LayoutBuilder builder;
+    auto layout = ninfer::plan_cyclic_kv_cache(builder, 5, 2048, 8, 128, 2);
+    ninfer::DeviceArena saved_arena(builder.finish(256));
+    ninfer::CyclicKVCache saved({saved_arena.base(), saved_arena.capacity()}, layout);
+    fill_slot(pool, 3, 0x11);
+    fill_slot(pool, 2, 0x51);
+    CUDA_CHECK(cudaDeviceSynchronize()); // fill_slot uses the default stream.
+    saved.copy_slot_from(*pool.dflash_local(), 3, 0, device.stream);
+    saved.copy_slot_from(*pool.dflash_local(), 2, 1, device.stream);
+    device.synchronize();
+    // Model a long probe overwriting the entire local ring, then restore lane 0.
+    for (std::uint32_t layer = 0; layer < 5; ++layer) {
+        auto view = pool.dflash_local()->layer_view(layer);
+        set_bytes(view.k.slice(3, 3, 1), 0xee);
+        set_bytes(view.v.slice(3, 3, 1), 0xee);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    pool.dflash_local()->copy_slot_from(saved, 0, 3, device.stream);
+    device.synchronize();
+    expect_slot(pool, 3, 0x11, "sparse checkpoint restores all cyclic bytes");
+    expect_slot(pool, 2, 0x51, "sparse checkpoint preserves the other live lane");
+    for (std::uint32_t layer = 0; layer < 5; ++layer) {
+        auto view = saved.layer_view(layer);
+        expect_bytes(view.k.slice(3, 1, 1), 0x81 + layer, "other lane snapshot K intact");
+        expect_bytes(view.v.slice(3, 1, 1), 0x91 + layer, "other lane snapshot V intact");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -210,6 +243,7 @@ int main() {
     expect_zero_slot(pool, 1, "StateImage zero complete destination");
     expect_slot(pool, 0, 0x11, "StateImage zero source isolation");
 
+    test_sparse_draft_checkpoint(device);
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);

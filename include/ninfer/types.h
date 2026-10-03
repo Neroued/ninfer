@@ -159,6 +159,9 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
+    // dense full-residency semantics.
+    std::uint32_t kvmem_window_pages   = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

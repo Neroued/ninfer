@@ -1,9 +1,11 @@
 #include "runtime/engine/model_instance.h"
+#include "core/paged_kv_cache.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +71,22 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.kvmem_window_pages != 0) {
+        const auto logical_pages = (static_cast<std::uint64_t>(options.max_context) + 63U) / 64U;
+        if (options.kvmem_window_pages < 8 || options.kvmem_window_pages > logical_pages) {
+            throw std::invalid_argument("kvmem_window_pages must be in [8,ceil(max_context/64)]");
+        }
+        if (options.max_concurrency == 0 || options.max_concurrency > 2 ||
+            options.purpose != EnginePurpose::Generation ||
+            (options.speculative.backend != SpeculativeBackend::None &&
+             options.speculative.backend != SpeculativeBackend::Mtp &&
+             options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument("KVMem requires one or two lanes with none, MTP or DFlash2 speculation");
+        }
+        if (!options.context_cache.enabled || options.context_cache.host_kv_capacity_bytes == 0) {
+            throw std::invalid_argument("KVMem requires an enabled Host KV arena");
+        }
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -175,8 +193,23 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
+    auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+    // A sparse working set sizes the Main pool by its window: automatic free-memory sizing
+    // would otherwise grow the pool toward the logical ceiling and defeat the window. This
+    // must happen here (the resolver consumes the engine options, not the planner inputs).
+    KvCapacityPolicy effective_kv_capacity = options.kv_capacity;
+    if (options.kvmem_window_pages != 0 &&
+        effective_kv_capacity.mode == KvCapacityMode::Automatic) {
+        // Each lane must also cover one prefill chunk of growth past its window plus the
+        // sink/slack margins of the rolling placements (peak residency is window + chunk
+        // + sink pages transiently before the demote runs).
+        effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
+            models::qwen3_5::detail::kvmem_pool_page_budget(
+                options.max_context, options.prefill_chunk,
+                options.kvmem_window_pages, options.max_concurrency) *
+            static_cast<std::uint32_t>(kPagedKVPageSize));
+    }
+    auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),
                                           current_free_device_bytes());
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||

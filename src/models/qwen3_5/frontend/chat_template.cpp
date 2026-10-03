@@ -332,6 +332,20 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (extent) message_blocks[i] = containing_message(layout, *extent);
         if (message_blocks[i]) ++block_users[*message_blocks[i]];
     }
+    // Select from typed input provenance, never from user-supplied ChatML or a Tool's
+    // user-shaped serialization. An empty/unmapped last User leaves no exact query.
+    for (std::size_t i = messages.size(); i > 0; --i) {
+        if (messages[i - 1].role != ChatRole::User) continue;
+        if (message_blocks[i - 1]) {
+            const auto index = *message_blocks[i - 1];
+            const auto& block = layout.messages[index];
+            if (block.role == ChatRole::User && block_users[index] == 1 &&
+                block.content_begin < block.content_end) {
+                result.retrieval_query = text::ByteSpan{block.content_begin, block.content_end};
+            }
+        }
+        break;
+    }
     for (std::size_t i = 0; i < messages.size(); ++i) {
         if (!message_blocks[i]) continue;
         const auto& block = layout.messages[*message_blocks[i]];

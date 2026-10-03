@@ -82,6 +82,9 @@ int main(int argc, char** argv) {
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+        // A client that disconnects mid-stream turns the next socket write into EPIPE;
+        // the default SIGPIPE disposition would take the whole engine down.
+        std::signal(SIGPIPE, SIG_IGN);
 
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),

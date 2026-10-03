@@ -10,6 +10,8 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "text/unicode.h"
+#include "text/structured_output.h"
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -624,6 +626,8 @@ public:
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
     }
 
+    mutable std::mutex grammar_mutex;
+    mutable std::unique_ptr<text::StructuredCompiler> grammar_compiler;
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
@@ -903,13 +907,44 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const StructuredOutputOptions& structured) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
+    std::shared_ptr<text::GrammarState> grammar;
+    text::validate_structured_output(structured);
+    if (structured.kind != StructuredOutputKind::None) {
+        if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
+            !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
+            caller_stop.publish_stop_token) {
+            throw std::invalid_argument(
+                "structured output requires default stops and decoded text output");
+        }
+        text::StructuredOutputEnvelope envelope;
+        if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
+        if (prompt.data_->tool_call_output) {
+            envelope.alternative_format =
+                fi::structured_tool_call_format(*prompt.data_->tool_call_output);
+        }
+        std::lock_guard lock(impl_->grammar_mutex);
+        if (!impl_->grammar_compiler) {
+            std::vector<std::string> vocab(impl_->tokenizer->vocab_size());
+            for (std::size_t id = 0; id < vocab.size(); ++id) {
+                if (impl_->tokenizer->is_valid_token(id) &&
+                    (!impl_->tokenizer->is_special_token(id) ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</think>")) {
+                    vocab[id] = impl_->tokenizer->decode_token_bytes(id, false);
+                }
+            }
+            impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
+                std::move(vocab), impl_->tokenizer->default_stop_token_ids());
+        }
+        grammar = impl_->grammar_compiler->compile(structured, envelope);
+    }
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(impl_->tokenizer, std::move(policy), output,
-                         prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+    return OutputSession(
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(grammar));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

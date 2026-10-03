@@ -5,11 +5,19 @@
 #include <cstdint>
 #include <optional>
 
+#include <memory>
+
+namespace ninfer::text {
+class GrammarState;
+}
+
 namespace ninfer::runtime {
 
 // Engine has already selected the model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
+    StructuredOutputOptions structured_output;
+    std::shared_ptr<text::GrammarState> grammar;
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;

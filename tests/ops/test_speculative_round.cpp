@@ -104,6 +104,7 @@ struct SparseAcceptSuite {
     const int kSparseColumns;
     const int kSparseBatch;
     std::size_t observed_workspace = 0;
+    std::vector<std::uint32_t> masks;
 
     SparseAcceptSuite(int drafts, int batch)
         : kSparseDrafts(drafts), kSparseColumns(drafts + 1), kSparseBatch(batch) {}
@@ -154,6 +155,11 @@ struct SparseAcceptSuite {
                                                   const std::vector<std::int32_t>& token_counts,
                                                   const std::vector<std::int32_t>& drafts) {
         const auto adjusted = [&](int token) {
+            const int words = (kSparseTokenDomain + 31) / 32;
+            if (!masks.empty() && (masks[(row * kSparseColumns + column) * words + token / 32] &
+                                   (1U << (token % 32))) == 0) {
+                return -std::numeric_limits<double>::infinity();
+            }
             double value = bf16_to_f32(logits[sparse_logit_index(row, column, token)]);
             int count    = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
             for (int previous = 0; previous < column; ++previous) {
@@ -388,6 +394,15 @@ struct SparseAcceptSuite {
         DeviceBuffer d_extents                          = to_device(extents);
         DeviceBuffer d_token_counts                     = to_device(token_counts);
         std::vector<ops::SamplingConfig> device_configs = host_configs;
+        DeviceBuffer d_masks = to_device(masks.empty() ? std::vector<std::uint32_t>{~0U} : masks);
+        if (!masks.empty()) {
+            for (int row = 0; row < kSparseBatch; ++row) {
+                device_configs[row].token_mask_stride = (kSparseTokenDomain + 31) / 32;
+                device_configs[row].token_mask =
+                    static_cast<const std::uint32_t*>(d_masks.p) +
+                    row * kSparseColumns * device_configs[row].token_mask_stride;
+            }
+        }
         for (int row = 0; row < kSparseBatch; ++row) {
             device_configs[static_cast<std::size_t>(row)].token_counts =
                 static_cast<std::int32_t*>(d_token_counts.p) +
@@ -610,7 +625,8 @@ struct SparseAcceptSuite {
                                           anchors, configs, history, {!general});
     }
 
-    int generated_general_case() {
+    int generated_general_case(bool masked = false) {
+        masks.clear();
         std::vector<int> targets(kSparseColumns * kSparseBatch),
             drafts(kSparseDrafts * kSparseBatch);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
@@ -670,7 +686,30 @@ struct SparseAcceptSuite {
                     logits[sparse_logit_index(row, col, v)] = f32_to_bf16(100.0f);
             }
         }
-        return execute_sparse_accept_case("sparse general K=" + std::to_string(kSparseDrafts) +
+        if (masked) {
+            const int words = (kSparseTokenDomain + 31) / 32;
+            masks.assign(kSparseColumns * kSparseBatch * words, 0);
+            for (int row = 0; row < kSparseBatch; ++row) {
+                for (int col = 0; col < kSparseColumns; ++col) {
+                    auto allow = [&](int token) {
+                        masks[(row * kSparseColumns + col) * words + token / 32] |= 1U
+                                                                                    << (token % 32);
+                    };
+                    const int base = 10000 + row * 4096 + col * 32;
+                    for (int rank = 1; rank <= 20; ++rank) {
+                        if ((rank + row + col) % 3 == 0) { allow(base + rank); }
+                    }
+                    const int target = targets[row * kSparseColumns + col];
+                    if (col != row % kSparseDrafts) { allow(target); }
+                    // A forbidden raw winner must be removed BEFORE target truncation.
+                    logits[sparse_logit_index(row, col, kSparseTokenDomain - 1)] =
+                        f32_to_bf16(1000.0f);
+                    targets[row * kSparseColumns + col] = kSparseTokenDomain - 1;
+                }
+            }
+        }
+        return execute_sparse_accept_case(std::string(masked ? "masked " : "") +
+                                              "sparse general K=" + std::to_string(kSparseDrafts) +
                                               " B=" + std::to_string(kSparseBatch),
                                           targets, logits, drafts, ids, q, extents, lengths,
                                           anchors, configs, history, {false});
@@ -939,6 +978,30 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
                                    " A=" + std::to_string(accepted_count),
                                targets, logits, token_domain, drafts, initial_length, token_domain,
                                ops::SamplingConfig{}, token_counts, expected);
+}
+
+int masked_greedy_drafts_case(int k, int domain, bool stochastic, int rejection) {
+    const int words = (domain + 31) / 32;
+    std::vector<std::uint32_t> mask(words * (k + 1), 0);
+    std::vector<int> targets(k + 1, 0), drafts(k), counts(domain, 0);
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(domain) * (k + 1),
+                                      f32_to_bf16(1000.0f));
+    for (int col = 0; col <= k; ++col) {
+        const int allowed                                        = domain - 1 - col;
+        mask[col * words + allowed / 32]                         = 1U << (allowed % 32);
+        logits[static_cast<std::size_t>(col) * domain + allowed] = f32_to_bf16(-2.0f);
+        if (col < k) { drafts[col] = col == rejection ? 0 : allowed; }
+    }
+    auto d_mask = to_device(mask);
+    ops::SamplingConfig config;
+    config.temperature       = stochastic ? 0.8f : 0.0f;
+    config.top_k             = 20;
+    config.top_p             = 1.0f;
+    config.token_mask        = static_cast<const std::uint32_t*>(d_mask.p);
+    config.token_mask_stride = words;
+    const auto expected      = accept_state_oracle(drafts, rejection, domain - 1 - rejection, 256);
+    return execute_accept_case("per-position grammar mask", targets, logits, domain, drafts, 256,
+                               domain, config, counts, expected);
 }
 
 int deterministic_sampling_case() {
@@ -1231,6 +1294,18 @@ int main(int argc, char** argv) {
     failures += greedy_accept_case(15, 7, 257);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
+    for (int domain : {64, 257, 248077}) {
+        for (bool stochastic : {false, true}) {
+            for (int rejection : {0, 2, 5}) {
+                failures += masked_greedy_drafts_case(5, domain, stochastic, rejection);
+            }
+        }
+    }
+    for (int k : {1, 5, 15}) {
+        for (int batch : {1, 8}) {
+            failures += SparseAcceptSuite(k, batch).generated_general_case(true);
+        }
+    }
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     std::size_t sparse_peak = 0;

@@ -7,6 +7,9 @@ single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
 resident model, and a startup-fixed capacity of one to eight active requests.
 
+JSON object and JSON Schema constrained generation use vendored XGrammar v0.2.7. See
+[structured output](docs/serving.md#structured-output) for API examples, schema support, and limits.
+
 Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
 
 | Model | Weights | Artifact | Download and model card |

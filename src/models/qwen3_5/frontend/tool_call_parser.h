@@ -62,6 +62,10 @@ struct ParsedToolCallOutput {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
 
+// Native Qwen tool-call envelope for a structured final-response request. Parameters remain
+// non-strict values, with each declared parameter emitted at most once in declaration order.
+[[nodiscard]] std::string structured_tool_call_format(const ToolCallOutputContract& contract);
+
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract);

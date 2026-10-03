@@ -10,7 +10,7 @@
 namespace ninfer::models::qwen3_5::frontend {
 namespace {
 
-using Json                = nlohmann::json;
+using Json                = nlohmann::ordered_json;
 using Contract            = ToolCallOutputContract;
 using FallbackReason      = ToolCallParseFallbackReason;
 using NormalizationPolicy = Contract::NormalizationPolicy;
@@ -593,6 +593,50 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
         if (!definition.is_discarded()) { append_tool_contract(*contract, definition); }
     }
     return contract;
+}
+
+std::string structured_tool_call_format(const ToolCallOutputContract& contract) {
+    const Json whitespace{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}};
+    const auto literal = [](const std::string& text) {
+        return Json{{"type", "const_string"}, {"value", text}};
+    };
+    Json alternatives = Json::array();
+    for (const auto& tool : contract.tools) {
+        if (!tool.unambiguous) {
+            throw std::invalid_argument("structured output requires unambiguous tool definitions");
+        }
+        Json elements =
+            Json::array({literal(std::string(kToolOpen)), whitespace,
+                         literal(std::string(kFunctionOpen) + tool.name + ">"), whitespace});
+        for (const auto& parameter : tool.parameters) {
+            if (parameter.name.empty() || parameter.name.find('>') != std::string::npos) {
+                throw std::invalid_argument("tool parameter cannot be represented in Qwen XML");
+            }
+            Json value{{"type", "any_text"},
+                       {"excludes", Json::array({kParamClose, kParamOpen, kFunctionClose, kToolOpen,
+                                                 kToolClose})}};
+            Json tagged{{"type", "tag"},
+                        {"begin", std::string(kParamOpen) + parameter.name + ">"},
+                        {"content", value},
+                        {"end", kParamClose}};
+            elements.push_back(
+                Json{{"type", "optional"},
+                     {"content", Json{{"type", "sequence"},
+                                      {"elements", Json::array({tagged, whitespace})}}}});
+        }
+        elements.push_back(literal(std::string(kFunctionClose)));
+        elements.push_back(whitespace);
+        elements.push_back(literal(std::string(kToolClose)));
+        elements.push_back(whitespace);
+        alternatives.push_back(Json{{"type", "sequence"}, {"elements", elements}});
+    }
+    if (alternatives.empty()) { return {}; }
+    return Json{{"type", "sequence"},
+                {"elements",
+                 Json::array({whitespace, Json{{"type", "plus"},
+                                               {"content", Json{{"type", "or"},
+                                                                {"elements", alternatives}}}}})}}
+        .dump();
 }
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,

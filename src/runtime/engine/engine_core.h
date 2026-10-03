@@ -200,7 +200,9 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking);
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.execution.structured_output);
+            options.execution.grammar = output.grammar_state();
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
             try {

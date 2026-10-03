@@ -255,6 +255,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                              {dimension(parameters.model.resources().public_token_count),
                                               static_cast<std::int32_t>(plan.max_concurrency)},
                                              "sampling token counts");
+        out.grammar_masks       = add_tensor(
+            builder, DType::I32,
+            {static_cast<std::int32_t>((parameters.model.resources().public_token_count + 31) / 32),
+             static_cast<std::int32_t>(plan.draft_window + 1),
+             static_cast<std::int32_t>(plan.max_concurrency)},
+            "structured output token masks");
         const auto config_words = static_cast<std::int32_t>(
             (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
         out.sampling_config = add_tensor(

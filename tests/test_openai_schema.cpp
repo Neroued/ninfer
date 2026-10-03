@@ -132,6 +132,58 @@ int test_request_envelope_and_sampling() {
     return failures;
 }
 
+int test_structured_output() {
+    int failures            = 0;
+    auto body               = base_request();
+    body["response_format"] = Json{{"type", "json_object"}};
+    auto generation         = parse(body).generation;
+    failures += check(options(generation).execution.structured_output.kind ==
+                          ninfer::StructuredOutputKind::JsonObject,
+                      "JSON mode reaches Engine");
+    failures += check(semantics(generation).enable_thinking == false,
+                      "JSON mode disables thinking default");
+    const auto json_prompt = prompt(generation);
+    failures += check(json_prompt.messages.front().role == ninfer::ChatRole::System &&
+                          json_prompt.messages.front().parts.back().text.find("raw JSON") !=
+                              std::string::npos,
+                      "JSON response contract is visible to the model");
+    body["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", Json{{"name", "answer"},
+                             {"strict", true},
+                             {"schema", Json{{"type", "object"},
+                                             {"properties", Json{{"x", Json{{"type", "integer"}}}}},
+                                             {"required", Json::array({"x"})},
+                                             {"additionalProperties", false}}}}}};
+    generation = parse(body).generation;
+    failures += check(prompt(generation)
+                              .messages.front()
+                              .parts.back()
+                              .text.find(generation.structured_output.schema) != std::string::npos,
+                      "API-only response schema reaches the prompt");
+    failures += check(options(generation).execution.structured_output.kind ==
+                          ninfer::StructuredOutputKind::JsonSchema,
+                      "JSON schema reaches Engine");
+    for (const auto& extra :
+         {Json{{"enable_thinking", true}}, Json{{"reasoning_effort", "high"}}}) {
+        auto enabled = body;
+        enabled.update(extra);
+        failures += check(semantics(parse(enabled).generation).enable_thinking == true,
+                          "structured output preserves explicit reasoning");
+    }
+    for (const auto& extra : {Json{{"stop", "}"}}}) {
+        auto invalid = body;
+        invalid.update(extra);
+        failures +=
+            check(api_error([&] { (void)semantics(parse(invalid).generation); }).status == 400,
+                  "incompatible structured output rejected");
+    }
+    body["response_format"]["json_schema"]["schema"]["not"] = Json::object();
+    failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                      "unsupported schema keyword rejected");
+    return failures;
+}
+
 int test_standard_field_policy() {
     int failures  = 0;
     auto rejected = [&](const char* key, Json value, const char* code) {
@@ -146,7 +198,7 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
+    rejected("response_format", Json{{"type", "json_schema"}}, "invalid_response_format");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -781,6 +833,7 @@ int test_common_objects() {
 int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
+    failures += test_structured_output();
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();

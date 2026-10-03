@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string_view>
 
@@ -100,6 +102,8 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--json constrains output to a JSON object; --json-schema FILE enforces a supported "
+           "JSON schema. Thinking defaults off; an explicit effort or budget enables it.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
@@ -151,6 +155,17 @@ Options parse_options(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--json" || arg == "--json-schema") {
+            if (options.structured_output.kind != StructuredOutputKind::None) {
+                throw std::invalid_argument("choose exactly one structured output mode");
+            }
+            options.structured_output.kind = arg == "--json" ? StructuredOutputKind::JsonObject
+                                                             : StructuredOutputKind::JsonSchema;
+            if (arg == "--json-schema") {
+                std::ifstream schema(value(arg));
+                if (!schema) { throw std::invalid_argument("cannot read JSON schema file"); }
+                options.structured_output.schema.assign(std::istreambuf_iterator<char>(schema), {});
+            }
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
@@ -224,6 +239,16 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.structured_output.kind != StructuredOutputKind::None) {
+        if (options.raw_output || !options.stop_strings.empty() ||
+            !options.stop_token_ids.empty()) {
+            throw std::invalid_argument(
+                "structured output requires decoded text and default stops");
+        }
+        if (!options.reasoning_effort && !options.thinking_budget) {
+            options.enable_thinking = false;
+        }
+    }
     if (options.enable_thinking == false && options.reasoning_effort &&
         *options.reasoning_effort != ReasoningEffort::None) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");

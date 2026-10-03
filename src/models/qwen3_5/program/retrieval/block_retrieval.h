@@ -105,7 +105,7 @@ BlockSelection select_blocks(const RetrievalIndex& index, std::span<const float>
                              const BlockSelectionConfig& config,
                              std::span<const std::uint32_t> mandatory = {});
 
-// Rolling prefill window over the mapped prefix: the sink prefix plus the newest
+// Rolling prefill window over the committed prefix: the sink prefix plus the newest
 // `window_pages` pages. A window that covers everything returns the full set, so short
 // prompts never demote. Ascending page indexes.
 inline std::vector<std::uint32_t> prefill_window_page_set(std::uint32_t mapped_pages,
@@ -124,6 +124,18 @@ inline std::vector<std::uint32_t> prefill_window_page_set(std::uint32_t mapped_p
         pages.push_back(page);
     }
     return pages;
+}
+
+// Mapping may run a whole workspace chunk ahead of the committed frontier even
+// when Engine grants a smaller service quantum. Future append pages remain writable
+// outside the history window; they must not displace committed sink/recent pages.
+// The caller supplies a sorted history selection strictly below committed_pages.
+inline void append_prefill_growth_pages(std::vector<std::uint32_t>& pages,
+                                         std::uint32_t committed_pages,
+                                         std::uint32_t mapped_pages) {
+    for (std::uint32_t page = committed_pages; page < mapped_pages; ++page) {
+        pages.push_back(page);
+    }
 }
 
 // Expands ascending retrieval blocks into their page indexes (block_tokens is a whole

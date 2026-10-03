@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
 #include "core/device.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -945,6 +946,58 @@ void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
            "sparse shared-prefix test leaves no physical claim");
 }
 
+void test_sparse_prefill_lookahead(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 16,
+        .geometry = {.page_tokens = 64, .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 16, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
+    ninfer::HostKVArena host(host_layout.page_stride * 16, std::array{host_layout});
+    store::LogicalKVPageStore pages(physical, 32);
+    store::HostKVExtentStore extents(host, 16);
+    store::KVAddressSpaceStore addresses(pages, tables, 2, 16);
+    addresses.set_sparse_activation_budget(16);
+    const auto address = addresses.create_active(16, 0);
+    expect(address.has_value(), "lookahead address allocated");
+    addresses.ensure_mapped_to_tokens(*address, 13 * 64, device.stream);
+    CUDA_CHECK(cudaMemsetAsync(physical.plane(0).data, 0, physical.plane(0).bytes(), device.stream));
+    addresses.commit_frontier(*address, 9 * 64);
+    device.synchronize();
+    auto selected = store::prefill_window_page_set(9, 2, 6);
+    store::append_prefill_growth_pages(selected, 9, 13);
+    addresses.apply_device_placement(*address, extents, selected, device.transfer_stream);
+    addresses.ensure_mapped_to_tokens(*address, 15 * 64, device.stream);
+    device.synchronize();
+    const auto row = read_block_table(tables, 0, 15);
+    for (std::uint32_t p = 0; p < 15; ++p) {
+        expect((row[p] >= 0) == (p != 2),
+               "eight committed history pages and every append page stay readable/writable");
+        if (p >= 9) {
+            expect(!pages.host_resident(addresses.logical_page(*address, p)),
+                   "uncommitted lookahead needs no Host backup or restore");
+        }
+    }
+    // Exercise actual append writes through the published physical row, then commit.
+    auto* data = static_cast<__half*>(physical.plane(0).data);
+    for (std::uint32_t p = 9; p < 15; ++p) {
+        if (row[p] >= 0) CUDA_CHECK(cudaMemsetAsync(data + row[p] * 1024ULL, 0x11,
+                                                   1024 * sizeof(__half), device.stream));
+    }
+    device.synchronize();
+    addresses.commit_frontier(*address, 15 * 64);
+    addresses.deactivate(*address);
+    expect(addresses.release(*address), "lookahead address releases");
+    (void)extents.release_unreferenced();
+    expect(physical.allocated_pages() == 0 && physical.reserved_pages() == 0 && host.occupied_bytes() == 0,
+           "lookahead teardown releases Device and Host ownership");
+}
 } // namespace
 
 int main() {
@@ -964,6 +1017,7 @@ int main() {
         test_sparse_replay_truncate(device);
         test_sparse_shared_reservation(device);
         test_sparse_host_credit_shared_aliases(device);
+        test_sparse_prefill_lookahead(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

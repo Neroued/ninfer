@@ -26,6 +26,11 @@ are rejected at startup. The window is per lane; the Host KV budget is shared.
 This keeps a 96K historical Device window and bounded prefill/growth margins.
 Host RAM retains evicted KV at original positions. Prefill rolls over processed
 history; completed block means and pre-RoPE Q features choose the decode window.
+During prefill, the history window ends at the committed cursor, rather than the
+end of advance mapping. Already mapped future append pages stay writable outside
+that window. A service grant smaller than the workspace chunk therefore cannot
+evict additional history merely because future pages have been reserved. The
+startup claim covers the historical window plus chunk growth and slack.
 The text query uses at most the last 512 tokens of the last typed user message, even
 when tool results follow it. If the template cannot prove that message's token
 boundaries, the query falls back to the new prompt suffix. Long prompts checkpoint

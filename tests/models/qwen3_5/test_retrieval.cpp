@@ -195,6 +195,37 @@ void test_media_windows() {
     expect(after.begin == 6000, "an older image does not expand a later text query");
 }
 
+void test_prefill_lookahead_preserves_history() {
+    // Independent membership oracle across committed frontiers and outstanding
+    // growth. Looking at mapped=13 instead of committed=9 would keep only four
+    // historical pages in an eight-page window (the other four are future writes).
+    for (std::uint32_t committed = 0; committed < 128; ++committed) {
+        for (std::uint32_t ahead = 0; ahead <= 64; ahead += 4) {
+            for (std::uint32_t budget = 2; budget <= 32; budget += 5) {
+                auto pages = r::prefill_window_page_set(committed, 2, budget - 2);
+                r::append_prefill_growth_pages(pages, committed, committed + ahead);
+                std::vector<std::uint32_t> expected;
+                for (std::uint32_t p = 0; p < committed + ahead; ++p) {
+                    const bool history = p < committed &&
+                        (p < 2 || committed <= budget || p >= committed - (budget - 2));
+                    if (history || p >= committed) expected.push_back(p);
+                }
+                expect(pages == expected, "future writes do not consume committed history slots");
+                expect(pages.size() <= budget + ahead,
+                       "history plus lookahead remains within the startup physical claim");
+            }
+        }
+    }
+    auto replay = r::decode_window_page_set(40, 8, std::array{8U, 9U});
+    r::append_prefill_growth_pages(replay, 40, 44);
+    expect(replay == std::vector<std::uint32_t>({0, 1, 8, 9, 36, 37, 38, 39, 40, 41, 42, 43}),
+           "retrieved history is preserved while replay append pages stay writable");
+    const std::array groups{r::MediaPageGroup{3, 7}, r::MediaPageGroup{10, 12}};
+    auto media = r::media_window_page_set(11, 8, {}, groups);
+    r::append_prefill_growth_pages(media, 11, 14);
+    expect(media == std::vector<std::uint32_t>({0, 1, 2, 7, 8, 9, 10, 11, 12, 13}),
+           "media history remains atomic while its future continuation stays mapped");
+}
 } // namespace
 
 int main() {
@@ -204,6 +235,7 @@ int main() {
         test_selection();
         test_window_helpers();
         test_media_windows();
+        test_prefill_lookahead_preserves_history();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         return 1;

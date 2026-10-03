@@ -1402,15 +1402,18 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
     // Demote first (shrinking the residency floor), then grow the entitlement, then
     // materialize the next chunk's pages inside it.
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
-    const auto window = !sparse.media_groups.empty()
-                            ? media_window_page_set(mapped_pages, kvmem_window_pages,
+    const std::uint32_t committed_pages =
+        std::min(mapped_pages, (cursor + kPagedKVPageSize - 1U) / kPagedKVPageSize);
+    auto window = !sparse.media_groups.empty()
+                            ? media_window_page_set(committed_pages, kvmem_window_pages,
                                   retrieved_history ? std::span<const std::uint32_t>(sparse.retrieved_pages)
                                                     : std::span<const std::uint32_t>{}, sparse.media_groups)
                         : retrieved_history
-                            ? decode_window_page_set(mapped_pages, kvmem_window_pages,
+                            ? decode_window_page_set(committed_pages, kvmem_window_pages,
                                                      sparse.retrieved_pages)
-                            : prefill_window_page_set(mapped_pages, sink_pages,
+                            : prefill_window_page_set(committed_pages, sink_pages,
                                                       kvmem_window_pages - sink_pages);
+    append_prefill_growth_pages(window, committed_pages, mapped_pages);
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                               device.transfer_stream,
                                               retrieved_history ? "replay" : "prefill");
@@ -1431,15 +1434,18 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
         const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
         const std::uint32_t backend_mapped =
             backend_kv_addresses->mapped_pages(*sequence.kv->backend);
-        const auto backend_window = !sparse.media_groups.empty()
-            ? media_window_page_set(backend_mapped, kvmem_window_pages + lead_pages,
+        const std::uint32_t backend_committed = std::min(
+            backend_mapped, (backend_valid + kPagedKVPageSize - 1U) / kPagedKVPageSize);
+        auto backend_window = !sparse.media_groups.empty()
+            ? media_window_page_set(backend_committed, kvmem_window_pages + lead_pages,
                   retrieved_history ? std::span<const std::uint32_t>(sparse.retrieved_pages)
                                     : std::span<const std::uint32_t>{}, sparse.media_groups)
             : retrieved_history
-            ? decode_window_page_set(backend_mapped, kvmem_window_pages + lead_pages,
+            ? decode_window_page_set(backend_committed, kvmem_window_pages + lead_pages,
                                      sparse.retrieved_pages)
-            : prefill_window_page_set(backend_mapped, sink_pages,
+            : prefill_window_page_set(backend_committed, sink_pages,
                                       kvmem_window_pages - sink_pages + lead_pages);
+        append_prefill_growth_pages(backend_window, backend_committed, backend_mapped);
         backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
                                                      backend_window, device.transfer_stream,
                                                      retrieved_history ? "replay" : "prefill");

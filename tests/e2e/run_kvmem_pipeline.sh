@@ -28,15 +28,21 @@ cmake --build "$BUILD" -j --target ninfer-serve ninfer_kvmem_options_test \
     ninfer_qwen3_5_retrieval_test ninfer_qwen3_5_context_store_test ninfer_qwen3_5_frontend_test \
     ninfer_span_accumulate_test ninfer_softmax_attention_test ninfer_serve_options_test \
     ninfer_resource_manager_test ninfer_qwen3_5_runtime_mechanisms_test \
-    ninfer_qwen3_5_state_image_test ninfer_qwen3_5_state_image_layout_test
+    ninfer_qwen3_5_state_image_test ninfer_qwen3_5_state_image_layout_test \
+    ninfer_qwen3_5_host_future_budget_test
 "$PYTHON" -m unittest discover -s tests/e2e -p 'test_kvmem*.py'
 ctest --test-dir "$BUILD" --output-on-failure --no-tests=error \
     --output-junit "$OUTPUT/unit.xml" \
-    -R '^ninfer_(kvmem_options|qwen3_5_retrieval|qwen3_5_context_store|qwen3_5_frontend|qwen3_5_runtime_mechanisms|qwen3_5_state_image|qwen3_5_state_image_layout|span_accumulate|softmax_attention|serve_options|resource_manager)_test$'
+    -R '^ninfer_(kvmem_options|qwen3_5_retrieval|qwen3_5_context_store|qwen3_5_frontend|qwen3_5_runtime_mechanisms|qwen3_5_state_image|qwen3_5_state_image_layout|qwen3_5_host_future_budget|span_accumulate|softmax_attention|serve_options|resource_manager)_test$'
 "$PYTHON" - "$OUTPUT/unit.xml" <<'PY'
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
-assert len(root.findall('testcase')) >= 11, 'missing required tests'
+required = {'ninfer_' + name + '_test' for name in (
+    'kvmem_options', 'qwen3_5_retrieval', 'qwen3_5_context_store', 'qwen3_5_frontend',
+    'qwen3_5_runtime_mechanisms', 'qwen3_5_state_image', 'qwen3_5_state_image_layout',
+    'qwen3_5_host_future_budget', 'span_accumulate', 'softmax_attention', 'serve_options',
+    'resource_manager')}
+assert {case.attrib['name'] for case in root.findall('testcase')} == required, 'missing required tests'
 assert not root.findall('.//skipped'), 'CUDA tests skipped; this is not a passing GPU pipeline'
 PY
 COMMON=(--binary "$BUILD/apps/ninfer-serve" --model "$NINFER_MODEL")
@@ -69,6 +75,9 @@ if [[ "$PROFILE" == concurrency ]]; then
             --profile concurrency --concurrency 2 --spec "$SPEC" --host-mib 2048 --port "$PORT"
         PORT=$((PORT + 1))
     done
+    "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/concurrent-host-claims" \
+        --profile concurrent-host-claims --concurrency 2 --spec none --window 64 \
+        --context 262144 --host-mib "${NINFER_HOST_CLAIM_MIB:-12288}" --port "$PORT"
     echo "KVMem concurrency pipeline passed: $OUTPUT"
     exit 0
 fi

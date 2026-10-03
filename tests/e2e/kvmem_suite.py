@@ -558,6 +558,67 @@ class Suite:
             messages.append({"role": "assistant", "content": result["text"]})
         return details
 
+    def concurrent_host_claims(self):
+        """Two future contexts fit Device windows but not the shared Host budget.
+
+        Cancel well before materializing the requested output. This exercises
+        admission claims rather than risking an allocation failure at full depth.
+        """
+        def open_stream(index):
+            body = {"model": "kvmem-test", "messages": [
+                {"role": "system", "content": "Treat this archive as irrelevant context:\n" +
+                    (" alpha beta gamma delta epsilon." * 800)},
+                {"role": "user", "content": f"Request {index}: Count every integer from 1 to 100000 "
+                    "in order, separated by commas. Do not skip or abbreviate. No commentary or code blocks."}],
+                "max_tokens": self.args.context, "temperature": 0, "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False}}
+            request = urllib.request.Request(self.url + "/v1/chat/completions",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(request, timeout=30)
+
+        def first_content(response):
+            for raw in response:
+                if not raw.startswith(b"data:"): continue
+                payload = raw[5:].strip()
+                if payload == b"[DONE]": raise AssertionError("claim probe finished without output")
+                event = json.loads(payload)
+                if "error" in event: raise AssertionError(f"SSE error: {event['error']}")
+                for choice in event.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if delta.get("content") or delta.get("reasoning_content"): return
+            raise AssertionError("claim probe stream ended without content")
+
+        first, second = open_stream(0), None
+        ready, errors, stamps = threading.Event(), [], {}
+        try:
+            first_content(first)
+            stamps["first_ready"] = time.monotonic()
+            second = open_stream(1)
+            def receive():
+                try:
+                    first_content(second)
+                    stamps["second_ready"] = time.monotonic()
+                    ready.set()
+                except Exception as error:
+                    errors.append(repr(error))
+            worker = threading.Thread(target=receive, daemon=True)
+            worker.start()
+            admitted_early = ready.wait(4)
+            stamps["first_cancelled"] = time.monotonic()
+            first.close()
+            assert not admitted_early, "second full-future Host claim admitted before first release"
+            assert ready.wait(20), f"queued Host claim did not resume after release: {errors}"
+            worker.join(timeout=2)
+            assert not errors, errors
+            return {"second_admitted_before_first_cancel": admitted_early,
+                    "resume_after_cancel_seconds": stamps["second_ready"] - stamps["first_cancelled"],
+                    "logical_context": self.args.context, "shared_host_mib": self.args.host_mib,
+                    "requested_output_tokens_each": self.args.context,
+                    "bounded_probe": "both streams cancelled before large page growth"}
+        finally:
+            first.close()
+            if second is not None: second.close()
+
     def check_log(self):
         for name in ('memory-abort.json', 'windows-memory-abort.json'):
             if (self.args.output / name).exists():
@@ -577,6 +638,10 @@ class Suite:
         if self.results[-1]["status"] == "failed":
             return
         self.case("json-generation", self.health)
+        if self.args.profile == "concurrent-host-claims":
+            self.case("two-full-future-host-claims", self.concurrent_host_claims)
+            self.case("generation-after-released-host-claims", self.health)
+            return
         if self.args.profile == "concurrency":
             for repeat in range(self.args.repeats):
                 self.case(f"parallel-sparse-pair-{repeat}", lambda r=repeat: self.parallel_pair(r))
@@ -638,11 +703,14 @@ def main():
     p.add_argument("--dtype", choices=["bf16", "int8", "fp8", "nvfp4", "k8v4"], default="int8")
     p.add_argument("--spec", choices=["none", "mtp", "dflash2"], default="mtp")
     p.add_argument("--concurrency", type=int, choices=[1, 2], default=1)
-    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency"], default="regression")
+    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency", "concurrent-host-claims"], default="regression")
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--startup-timeout", type=float, default=600)
     p.add_argument("--request-timeout", type=float, default=1800)
     args = p.parse_args()
+    if args.profile == "concurrent-host-claims" and (
+            args.concurrency != 2 or args.spec != "none" or args.window == 0 or args.context < 65536):
+        p.error("concurrent-host-claims requires two lanes, ordinary decoding, sparse KV and >=64K context")
     if args.profile == "concurrency" and (args.concurrency != 2 or args.window == 0 or
                                            args.context < args.window * 64 + 4096):
         p.error("concurrency profile requires two lanes and context >= window * 64 + 4096")

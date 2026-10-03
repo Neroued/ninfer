@@ -70,6 +70,27 @@ disconnecting one active lane must leave the other generating and permit another
 request afterwards. HTTP overlap alone cannot pass this profile. These controlled
 output comparisons are regression checks, not broad model quality equivalence.
 
+The `concurrency` pipeline also checks retained **future Host claims**, after the
+small paired requests above. For the Qwen 27B INT8 fixture, one 256K logical request
+fits 12 GiB of shared Host KV, but two do not. The second stream must stay queued
+while the first owns its future claim, then produce content after cancellation
+releases that claim. Both streams are deliberately cancelled before large page
+growth; this is an admission and release test, not two full-context allocations.
+The old occupancy-only admission bug admitted both in this controlled fixture.
+
+```bash
+python3.11 tests/e2e/kvmem_suite.py --binary "$BUILD/apps/ninfer-serve" --model "$MODEL" \
+  --output "$OUTPUT" --profile concurrent-host-claims --concurrency 2 --spec none \
+  --context 262144 --window 64 --host-mib 12288 --port 8129
+```
+
+For other model geometries, choose `--host-mib` (or `NINFER_HOST_CLAIM_MIB` for the
+pipeline) so one complete future Host footprint fits and two do not. A rejected
+first request or an immediately admitted second request fails the check. This
+profile requires the future-claim repair in #345; current upstream master alone
+does not implement that contract. The pipeline requires its independent native
+Host budget test as well and fails if a required test is missing or skipped.
+
 To serve with this implementation, use `--max-concurrency 2 --kv-capacity auto`
 alongside your KVMem options. The window remains **per lane**: auto capacity is
 `lanes * min(ceil(context/64), window_pages + ceil(min(chunk,context)/64) + 16)`

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/retrieval/host_budget.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
 
@@ -469,12 +470,76 @@ detail::PhysicalResources ProgramImpl::physical_occupancy() const noexcept {
     return out;
 }
 
+std::optional<detail::PhysicalResources> ProgramImpl::admission_occupancy() const noexcept {
+    detail::PhysicalResources out = physical_occupancy();
+    if (kvmem_window_pages == 0) { return out; }
+    try {
+        std::fill(host_budget_text_seen_.begin(), host_budget_text_seen_.end(), 0);
+        std::fill(host_budget_backend_seen_.begin(), host_budget_backend_seen_.end(), 0);
+        std::array<std::size_t, kMaximumConcurrency> peaks{};
+        std::size_t peak_count = 0, main_pages = 0, backend_pages = 0;
+        const auto credit_address = [&](const KVAddressSpaceStore& addresses,
+                                        const LogicalKVPageStore& pages,
+                                        KVAddressSpaceHandle address,
+                                        std::span<std::uint8_t> seen,
+                                        std::size_t& count) {
+            if (!addresses.valid(address) || !addresses.active(address)) { return false; }
+            for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
+                if (!pages.mark_host_replica_once(addresses.logical_page(address, page),
+                                                  seen, count)) { return false; }
+            }
+            return true;
+        };
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const RequestControl& request = requests[lane];
+            if (request.lifecycle == Lifecycle::Empty || request.sparse_host_peak_bytes == 0) {
+                continue;
+            }
+            if (peak_count == peaks.size() || active_continuations[lane] >= continuation_capacity) {
+                return std::nullopt;
+            }
+            peaks[peak_count++] = request.sparse_host_peak_bytes;
+            const SequenceState& sequence = active_sequence(lane);
+            if (!sequence.kv || !credit_address(*text_kv_addresses, *text_kv_pages,
+                    sequence.kv->text, host_budget_text_seen_, main_pages)) {
+                return std::nullopt;
+            }
+            if (sequence.kv->backend && (!backend_kv_addresses || !backend_kv_pages ||
+                !credit_address(*backend_kv_addresses, *backend_kv_pages,
+                    *sequence.kv->backend, host_budget_backend_seen_, backend_pages))) {
+                return std::nullopt;
+            }
+        }
+        const auto multiply = [](std::size_t pages, std::size_t stride)
+            -> std::optional<std::size_t> {
+            if (stride != 0 && pages > std::numeric_limits<std::size_t>::max() / stride) {
+                return std::nullopt;
+            }
+            return pages * stride;
+        };
+        const auto main = multiply(main_pages, text_host_kv_page_stride);
+        const auto backend = multiply(backend_pages, backend_host_kv_page_stride);
+        if (!main || !backend || *backend > std::numeric_limits<std::size_t>::max() - *main) {
+            return std::nullopt;
+        }
+        const auto budget = sparse_host_budget_occupancy(out.host.kv_bytes, *main + *backend,
+            std::span<const std::size_t>(peaks.data(), peak_count));
+        if (!budget) { return std::nullopt; }
+        out.host.kv_bytes = *budget;
+        return out;
+    } catch (...) { return std::nullopt; }
+}
+
 detail::PhysicalResources
 ProgramImpl::materialization_deficit(const ResourceCandidateState& admission) const {
     // Pressure is relative to this candidate's real peak. Treating every dimension as scarce
     // would forbid Device-to-Host demotion even when Host capacity is available.
     const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
+        checked_resource_sum([&] {
+            const auto occupied = admission_occupancy();
+            if (!occupied) { throw std::logic_error("invalid active sparse Host budget"); }
+            return *occupied;
+        }(), admission.demand.physical_peak_additional);
     return positive_resource_difference(required, admission_capacity());
 }
 
@@ -488,12 +553,18 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
         checked_resource_sum(admission.demand.physical_peak_additional, pressure.added),
         pressure.removed);
     const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), projected_peak);
+        checked_resource_sum([&] {
+            const auto occupied = admission_occupancy();
+            if (!occupied) { throw std::logic_error("invalid active sparse Host budget"); }
+            return *occupied;
+        }(), projected_peak);
     return positive_resource_difference(required, admission_capacity());
 }
 
 bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
-    const detail::PhysicalResources occupied = physical_occupancy();
+    const auto budget_occupied = admission_occupancy();
+    if (!budget_occupied) { return false; }
+    const detail::PhysicalResources occupied = *budget_occupied;
     const detail::PhysicalResources limits   = admission_capacity();
     const auto fits_u32 = [](std::uint32_t used, std::uint32_t added, std::uint32_t capacity) {
         return added <= capacity && used <= capacity - added;
@@ -1016,6 +1087,7 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
     request.active_resources     = {};
+    request.sparse_host_peak_bytes = 0;
     request.optional_resources   = {};
     request.publish_continuation = true;
     return true;
@@ -1040,6 +1112,7 @@ void ProgramImpl::clear_lane_best_effort(SequenceState& sequence,
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
     request.active_resources     = {};
+    request.sparse_host_peak_bytes = 0;
     request.optional_resources   = {};
     request.publish_continuation = true;
     const auto* begin            = continuation_states.data();

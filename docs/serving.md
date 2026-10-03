@@ -49,7 +49,11 @@ differ from reference KVMem. Quality equivalence has not been established.
 Prompts fitting the window retain exact-prefix caching. Longer prompts are
 recomputed because cached continuations do not own retrieval features; generation
 crossing the window does not publish a sparse continuation. Host headroom is
-included in admission for requests that can spill. Configure enough Host capacity
+included in admission for requests that can spill. Active requests retain their
+complete future Host peak until completion or cancellation, even before pages
+actually spill. Current Host replicas already covered by those peaks are credited
+once per logical page; shared aliases cannot double-discount physical occupancy.
+Inactive cached replicas remain charged at actual occupancy. Configure enough Host capacity
 for the requested context and Main/MTP payloads; the INT8 27B 256K regression uses
 12 GiB. See [the test pipeline](../tests/e2e/README.md) and
 [integration audit](maintainer/kvmem-audit.md).

@@ -151,6 +151,7 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
             }
         }
         requests[lane].active_resources   = active;
+        requests[lane].sparse_host_peak_bytes = details.sparse_host_peak_bytes;
         requests[lane].optional_resources = details.active_optional_resources;
         invalidate_lane(lane);
         const SequenceHandle handle =
@@ -660,6 +661,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
     request.active_resources                    = {};
+    request.sparse_host_peak_bytes               = 0;
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};

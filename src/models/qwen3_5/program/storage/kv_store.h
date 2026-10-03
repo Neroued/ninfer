@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/paged_kv_cache.h"
+#include "models/qwen3_5/program/retrieval/host_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -403,6 +404,17 @@ public:
 
     [[nodiscard]] bool host_resident(LogicalKVPageHandle handle) const {
         return require(handle).host_replica.has_value();
+    }
+
+    // This read-only snapshot credit is independent of address reference counts.
+    // A shared logical descriptor is credited at most once per boundary.
+    [[nodiscard]] bool mark_host_replica_once(LogicalKVPageHandle handle,
+                                              std::span<std::uint8_t> seen,
+                                              std::size_t& unique_pages) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        if (!page.host_replica) { return true; }
+        return mark_unique_host_replica(seen, handle.index_, unique_pages);
     }
 
     [[nodiscard]] const HostKVPageReplica& host_replica(LogicalKVPageHandle handle) const {

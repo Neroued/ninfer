@@ -507,6 +507,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
 
     auto plan                         = std::make_unique<AdmissionCandidateImpl>();
     plan->summary                     = base.summary;
+    plan->sparse_host_peak_bytes = base.root_demand.physical_peak_additional.host.kv_bytes;
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;

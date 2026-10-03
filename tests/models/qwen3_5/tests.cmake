@@ -39,6 +39,9 @@ ninfer_add_test(ninfer_kvmem_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_options.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+ninfer_add_test(ninfer_qwen3_5_host_future_budget_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_future_budget.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_context_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_store.cpp"
   LIBRARIES ninfer_engine ninfer_core)

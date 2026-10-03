@@ -214,9 +214,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
     }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
+    host_budget_text_seen_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
     if (backend_kv_pages) {
         pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
+        host_budget_backend_seen_.resize(backend_kv_pages->capacity());
         pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {

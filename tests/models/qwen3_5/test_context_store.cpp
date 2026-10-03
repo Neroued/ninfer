@@ -839,6 +839,73 @@ void test_sparse_replay_truncate(ninfer::DeviceContext& device) {
                pages.occupied() == 0, "replay rewind and growth leave no physical or logical leak");
 }
 
+void test_sparse_host_credit_shared_aliases(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 12,
+        .geometry = {.page_tokens = 64,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 8, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical, 20);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, tables, 4, 8);
+    addresses.set_sparse_activation_budget(6);
+    const auto source = addresses.create_active(6, 0);
+    addresses.ensure_mapped_to_tokens(*source, 256, device.stream);
+    addresses.commit_frontier(*source, 256);
+    device.synchronize();
+    addresses.apply_device_placement(*source, extents, std::array{0U, 3U}, device.transfer_stream);
+    addresses.apply_device_placement(*source, extents, std::array{0U, 1U, 2U, 3U}, device.transfer_stream);
+    addresses.deactivate(*source);
+    const auto first = addresses.create_inactive();
+    auto fork_first = addresses.prepare_prefix_fork(*source, *first, 256, 6, 0);
+    addresses.commit_prefix_fork(std::move(fork_first), device.stream);
+    const auto second = addresses.create_inactive();
+    auto fork_second = addresses.prepare_prefix_fork(*source, *second, 256, 6, 1);
+    addresses.commit_prefix_fork(std::move(fork_second), device.stream);
+    device.synchronize();
+    std::vector<std::uint8_t> seen(pages.capacity());
+    std::size_t unique = 0;
+    for (const auto address : std::array{*first, *second}) {
+        for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
+            expect(pages.mark_host_replica_once(addresses.logical_page(address, page), seen, unique),
+                   "valid claimed-active Host credit");
+        }
+    }
+    expect(unique == 2 && host_arena.occupied_bytes() == 2 * host_layout.page_stride,
+           "two active aliases and inactive source share exactly two actual Host replicas");
+    const auto peak = 6 * host_layout.page_stride;
+    const std::array two_peaks{peak, peak};
+    const auto both = store::sparse_host_budget_occupancy(host_arena.occupied_bytes(),
+        unique * host_layout.page_stride, two_peaks);
+    expect(both && *both == 2 * peak, "shared actual store replicas credited once, not per address");
+    addresses.deactivate(*first);
+    expect(addresses.release(*first), "first active alias releases");
+    const auto old = addresses.logical_page(*second, 1);
+    addresses.deactivate(*second);
+    expect(addresses.release(*second), "second active alias releases");
+    (void)extents.release_unreferenced();
+    const std::array no_peaks{std::size_t{0}};
+    const auto retained = store::sparse_host_budget_occupancy(host_arena.occupied_bytes(), 0, no_peaks);
+    expect(retained && *retained == 2 * host_layout.page_stride,
+           "inactive catalog retains actual replicas after active claims released");
+    expect(addresses.release(*source), "inactive catalog source releases");
+    (void)extents.release_unreferenced();
+    expect(!pages.mark_host_replica_once(old, seen, unique), "stale Host handle fails closed");
+    expect(host_arena.occupied_bytes() == 0 && pages.occupied() == 0 &&
+               physical.allocated_pages() == 0 && physical.reserved_pages() == 0,
+           "shared Host credit test closes all real payload and claims");
+}
+
 void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     const auto layout = ninfer::plan_device_kv_page_pool(builder, {
@@ -896,6 +963,7 @@ int main() {
         test_kv_placement(device);
         test_sparse_replay_truncate(device);
         test_sparse_shared_reservation(device);
+        test_sparse_host_credit_shared_aliases(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

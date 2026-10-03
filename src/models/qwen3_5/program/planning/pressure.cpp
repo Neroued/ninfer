@@ -2627,6 +2627,9 @@ bool ProgramImpl::persistent_backfill_safe(
                 : speculative_backend == SpeculativeBackend::DFlash
                     ? resources.device.main_kv_pages : 0U;
         }
+        if (requests[lane].sparse_host_peak_bytes != 0) {
+            resources.host.kv_bytes = requests[lane].sparse_host_peak_bytes;
+        }
         borrowers = checked_resource_sum(borrowers, resources);
     }
     auto candidate_resources = candidate.impl_->demand.active_entitlement;
@@ -2635,6 +2638,9 @@ bool ProgramImpl::persistent_backfill_safe(
             candidate.impl_->text_kv_page_entitlement;
         candidate_resources.device.backend_kv_pages =
             candidate.impl_->backend_kv_page_entitlement;
+    }
+    if (candidate.impl_->sparse_host_peak_bytes != 0) {
+        candidate_resources.host.kv_bytes = candidate.impl_->sparse_host_peak_bytes;
     }
     borrowers = checked_resource_sum(borrowers, candidate_resources);
 

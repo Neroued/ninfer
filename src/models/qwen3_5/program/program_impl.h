@@ -255,6 +255,8 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    // Full future sparse Host peak; separate from actual physical inventory.
+    std::size_t sparse_host_peak_bytes = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -426,6 +428,8 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Released on every terminal/cleanup path; catalog entries retain only real bytes.
+    std::size_t sparse_host_peak_bytes = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -692,6 +696,8 @@ private:
     mutable std::uint32_t pressure_page_scratch_generation_ = 0;
     mutable std::vector<PressurePageScratchSlot> pressure_text_page_scratch_;
     mutable std::vector<PressurePageScratchSlot> pressure_backend_page_scratch_;
+    mutable std::vector<std::uint8_t> host_budget_text_seen_;
+    mutable std::vector<std::uint8_t> host_budget_backend_seen_;
     mutable std::vector<PressureSelectedPage> pressure_text_selected_pages_;
     mutable std::vector<PressureSelectedPage> pressure_backend_selected_pages_;
     mutable std::vector<std::uint8_t> pressure_private_owner_scratch_;
@@ -987,6 +993,9 @@ private:
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    // Admission/pressure only; stale inventory and overflow fail closed.
+    [[nodiscard]] std::optional<detail::PhysicalResources>
+    admission_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,

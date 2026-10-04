@@ -62,27 +62,24 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-Start a long-running text/agent server with two active-request lanes and explicit Device/Host
-checkpoint capacity:
+Start a long-running text/agent server with two active-request lanes and an 8 GiB Host prefix
+cache:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 240000 \
-  --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
+  --host-cache-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. A shared 240,000-token Device KV pool serves
-admitted requests; two requests run concurrently when their combined reservations fit. The cache
-tiers provide two Device checkpoint slots, eight pinned Host State slots, and 8 GiB of pinned Host
-KV beyond the two active StateImages.
+Each request has a 240,000-token logical ceiling. `--kv-capacity` defaults to `auto`, so the shared
+Device KV pool takes the memory the model and runtime leave free; two requests run concurrently when
+their combined reservations fit, and pages no active request holds are the Device prefix cache.
+`--host-cache-mib 8192` pins 8 GiB of Host memory that cached KV blocks and state snapshots share.
 
 Send an OpenAI-style request:
 
@@ -117,16 +114,18 @@ Redirected stderr receives persistent readable progress without terminal control
 diagnostics. Use `--messages FILE` and `--vision` for structured image/video input; see the
 [CLI guide](docs/cli.md) and [committed examples](examples/cli/).
 
-## Resource-aware long-context reuse
+## Long-context prefix reuse
 
-A reusable prefix checkpoint contains KV and the complete continuation state for its exact prompt
-frontier. A Device-resident checkpoint resumes directly. Under pressure, the planner weighs Device
-retention, pinned Host State/KV, and eviction by immediate restore work and later reuse cost. Active
-requests retain their completion reservations.
+The prefix cache keeps every committed full 64-token KV block of every request in one
+content-addressed radix tree, shared by all requests, with sparse snapshots of the recurrent model
+state on its nodes. A request resumes from the deepest snapshot on its prompt's path. Blocks and
+snapshots live on the Device and in one pinned Host pool; Host copies are restored layer by layer
+while the resumed request's first prefill pass runs. Active requests retain their completion
+reservations.
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
-reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
+See [Hybrid prefix cache](docs/maintainer/hybrid-prefix-cache.md) for the design and
+[Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot reuse, Host resume,
+eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
 ## Performance
 
@@ -209,12 +208,9 @@ docker run --rm \
   ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
   --host 0.0.0.0 \
   --max-context 240000 \
-  --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
+  --host-cache-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
@@ -230,7 +226,8 @@ The official artifacts provide the following capabilities, with optional compone
 - MTP speculative decoding with draft windows from one to five;
 - BF16, INT8, FP8, NVFP4, and K8V4 KV storage;
 - offline causal-perplexity scoring;
-- private and shared exact-prefix reuse with Device/Host State and KV retention;
+- content-addressed prefix reuse shared across requests, with Device and Host retention of KV
+  blocks and state snapshots;
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
   tools, local response state, token counting, and usage accounting.
@@ -264,7 +261,7 @@ capacities remain fixed for the process lifetime.
 - [Performance](docs/performance.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
-- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
+- [Hybrid prefix cache](docs/maintainer/hybrid-prefix-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)

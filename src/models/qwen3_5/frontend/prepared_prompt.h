@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/contract/resources.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include "models/qwen3_5/frontend/frontend.h"
 
@@ -91,36 +92,6 @@ struct PromptIdentity {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
 };
 
-inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
-
-struct PreparedSessionKey {
-    std::uint16_t size = 0;
-    std::array<char, kPreparedSessionKeyCapacity> bytes{};
-
-    [[nodiscard]] std::string_view view() const noexcept { return {bytes.data(), size}; }
-
-    [[nodiscard]] friend bool operator==(const PreparedSessionKey&,
-                                         const PreparedSessionKey&) noexcept = default;
-};
-
-struct PreparedCacheOpportunity {
-    PromptCacheMarkerKind kind       = PromptCacheMarkerKind::SharedStablePrefix;
-    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
-    std::uint32_t frontier           = 0;
-    std::uint32_t input_order        = 0;
-
-    [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
-                                         PreparedCacheOpportunity) noexcept = default;
-};
-
-struct PreparedContextCache {
-    std::optional<PreparedSessionKey> session_key;
-    runtime::RetentionClass retention = runtime::RetentionClass::RecentPrivate;
-    std::vector<PreparedCacheOpportunity> opportunities;
-    // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
-    bool update_session_index = true;
-};
-
 struct PrepareStats {
     double seconds                       = 0.0;
     double media_preprocess_seconds      = 0.0;
@@ -139,7 +110,17 @@ struct PrepareStats {
     std::size_t reused_patch_bytes       = 0;
 };
 
+// Prompt boundary facts for hybrid prefix-cache tap placement
+// (docs/maintainer/hybrid-prefix-cache.md §7.1). Frontiers are exact token positions.
+struct PreparedTapHints {
+    std::vector<runtime::prefix_cache::TapHint> hints;
+};
+
 struct PreparedPromptData {
+    // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
+    // hash per full 64-token block and, with media, one cumulative Vision key per block.
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<std::uint64_t> block_extras;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
@@ -148,7 +129,7 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
-    PreparedContextCache context_cache;
+    PreparedTapHints tap_hints;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;

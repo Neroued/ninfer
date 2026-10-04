@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -1263,15 +1264,13 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty() &&
         !prepared_data.vision_items.front().token_spans.empty()) {
         const auto span            = prepared_data.vision_items.front().token_spans.front();
-        const auto explicit_marker = std::find_if(
-            prepared_data.context_cache.opportunities.begin(),
-            prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
-                return ninfer::has_shared_candidate_evidence(
-                    opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
-            });
-        failures += check(explicit_marker != prepared_data.context_cache.opportunities.end() &&
-                              explicit_marker->frontier >= span.begin + span.count &&
-                              explicit_marker->frontier < prepared_data.token_ids.size(),
+        const auto& hints          = prepared_data.tap_hints.hints;
+        const auto explicit_marker = std::find_if(hints.begin(), hints.end(), [](const auto& hint) {
+            return hint.kind == ninfer::runtime::prefix_cache::TapHintKind::Explicit;
+        });
+        failures += check(explicit_marker != hints.end() &&
+                              explicit_marker->position >= span.begin + span.count &&
+                              explicit_marker->position < prepared_data.token_ids.size(),
                           "media expansion did not remap the following message cache boundary");
     }
     if (image_patches.size() == 16 * 1536) {
@@ -1372,16 +1371,12 @@ int test_explicit_leading_instruction_cache_boundary() {
 
     const auto prepared        = frontend.prepare(std::move(input));
     const auto& data           = FrontendFactory::inspect(prepared);
-    const auto explicit_marker = std::find_if(
-        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
-        [](const auto& opportunity) {
-            return ninfer::has_shared_candidate_evidence(
-                opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
-        });
-    return check(explicit_marker != data.context_cache.opportunities.end() &&
-                     explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                     explicit_marker->frontier != 0 &&
-                     explicit_marker->frontier < data.token_ids.size(),
+    const auto& hints          = data.tap_hints.hints;
+    const auto explicit_marker = std::find_if(hints.begin(), hints.end(), [](const auto& hint) {
+        return hint.kind == ninfer::runtime::prefix_cache::TapHintKind::Explicit;
+    });
+    return check(explicit_marker != hints.end() && explicit_marker->position != 0 &&
+                     explicit_marker->position < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
                  "full-system marker");
 }
@@ -1514,6 +1509,79 @@ int test_video_prepare(const Frontend& frontend) {
             prepared_data.prepare.media_cache_misses == 1 &&
             prepared_data.prepare.media_cache_hits == 0 && prepared_data.identity.reusable,
         "video frontend did not duplicate the odd temporal frame correctly");
+    return failures;
+}
+
+// Preparation publishes the hybrid prefix cache's lookup keys, which the Program's quote and
+// admission read instead of hashing the prompt again: one chained hash per full 64-token block,
+// as the prefix index computes it, and with media one Vision key per block that is zero before the
+// first image and tells apart images that render to the same placeholder tokens.
+int test_prefix_block_keys(const Frontend& frontend) {
+    namespace pc = ninfer::runtime::prefix_cache;
+    std::vector<ninfer::TokenId> tokens(200);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        tokens[index] = fixture_byte_token(static_cast<std::uint8_t>('a' + index % 26));
+    }
+    const auto text       = frontend.prepare_tokens(tokens);
+    const auto& text_data = FrontendFactory::inspect(text);
+    int failures          = check(
+        text_data.block_hashes.size() == 200 / pc::kBlockTokens && text_data.block_extras.empty() &&
+            text_data.block_hashes == pc::block_lookup_hashes(text_data.token_ids, {}),
+        "prepare_tokens did not publish the text prompt's block keys");
+
+    std::string before, after;
+    for (int index = 0; index < 160; ++index) {
+        before.push_back(static_cast<char>('a' + index % 26));
+        after.push_back(static_cast<char>('A' + index % 26));
+    }
+    const auto prepare_image = [&](std::vector<std::uint8_t> bytes) {
+        ninfer::MessagePart image;
+        image.kind              = ninfer::MessagePartKind::Media;
+        image.media.kind        = ninfer::MediaKind::Image;
+        image.media.bytes       = std::move(bytes);
+        image.media.media_type  = "image/x-portable-pixmap";
+        image.media.source_name = "inline.ppm";
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = before, .media = {}});
+        message.parts.push_back(std::move(image));
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = after, .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        return frontend.prepare(std::move(input));
+    };
+    const auto gradient      = prepare_image(gradient_ppm());
+    const auto flat          = prepare_image(block_ppm(64, 64, 17));
+    const auto& first        = FrontendFactory::inspect(gradient);
+    const auto& second       = FrontendFactory::inspect(flat);
+    const std::size_t blocks = first.token_ids.size() / pc::kBlockTokens;
+    if (first.vision_items.size() != 1 || first.vision_items.front().token_spans.empty() ||
+        first.token_ids != second.token_ids) {
+        return failures + check(false, "block-key fixture: two same-sized images must render "
+                                       "to one token sequence with one Vision item");
+    }
+    const std::size_t image_begin = first.vision_items.front().token_spans.front().begin;
+    failures += check(image_begin >= pc::kBlockTokens && blocks > image_begin / pc::kBlockTokens,
+                      "block-key fixture: the image must follow a full block and precede one");
+    failures += check(
+        first.block_extras.size() == blocks && second.block_extras.size() == blocks &&
+            first.block_hashes == pc::block_lookup_hashes(first.token_ids, first.block_extras) &&
+            second.block_hashes == pc::block_lookup_hashes(second.token_ids, second.block_extras),
+        "prepare did not publish the media prompt's block keys");
+    const std::size_t checked =
+        std::min({blocks, first.block_extras.size(), second.block_extras.size()});
+    for (std::size_t block = 0; block < checked; ++block) {
+        const bool before_image = (block + 1) * pc::kBlockTokens <= image_begin;
+        failures += check(before_image
+                              ? first.block_extras[block] == 0 && second.block_extras[block] == 0 &&
+                                    first.block_hashes[block] == second.block_hashes[block]
+                              : first.block_extras[block] != 0 &&
+                                    first.block_extras[block] != second.block_extras[block],
+                          before_image ? "a block before the image carried a Vision key"
+                                       : "a block from the image on did not identify the image");
+    }
     return failures;
 }
 
@@ -1654,18 +1722,16 @@ int test_reasoning_split(const Frontend& frontend) {
         canonical_tokens, static_cast<std::uint32_t>(canonical_tokens.size() + 1U),
         ninfer::FinishReason::OutputLimit);
     int failures =
-        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished() &&
-                  canonical.prefix_execution_split_after == canonical_tokens.size(),
-              "canonical reasoning close did not publish its exact token execution frontier");
+        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished(),
+              "canonical reasoning close was not accepted");
     (void)canonical_session.commit_preview();
 
     auto session = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 &&
-                          decision.finish_reason == ninfer::FinishReason::OutputLimit &&
-                          !decision.prefix_execution_split_after,
-                      "reasoning close inside a mixed token produced an execution frontier");
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "reasoning close inside a mixed token was not accepted");
     const auto output = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
@@ -1722,8 +1788,7 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     const auto control_decision = session.preview_control(control, 18);
     failures +=
-        check(control_decision.accepted_tokens == control.size() && !control_decision.finished() &&
-                  control_decision.prefix_execution_split_after == control.size(),
+        check(control_decision.accepted_tokens == control.size() && !control_decision.finished(),
               "canonical thinking control was not accepted atomically");
     const auto control_output = session.commit_preview();
     failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
@@ -2187,6 +2252,7 @@ int main() {
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);
+    failures += test_prefix_block_keys(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);

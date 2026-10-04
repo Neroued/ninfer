@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -169,6 +171,78 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect(host.release(*reused), "HostStatePool releases the reused slot");
 }
 
+// Segmented Host images (hybrid prefix cache slabs): the packed image split into fixed-size
+// segments at scattered addresses must hold exactly the contiguous packed bytes, and restore them.
+// An odd segment size splits components mid-way.
+void test_segmented_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false) {
+    PlannedPool planned = plan_pool(dflash, 2, dflash2);
+    ninfer::DeviceArena arena(planned.bytes);
+    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    fill_slot(pool, 0, dflash ? 0x31 : 0x47);
+    pool.zero_slot(1, device.stream);
+
+    q36::HostStatePool contiguous(planned.layout.host, 1);
+    const auto handle = contiguous.allocate();
+    pool.copy_to_host(0, contiguous.writable_view(*handle), device.stream);
+
+    const std::size_t image_bytes   = planned.layout.host.image_bytes;
+    const std::size_t segment_bytes = 777;
+    const std::size_t segments      = (image_bytes + segment_bytes - 1) / segment_bytes;
+    ninfer::PinnedHostBuffer backing(segments * segment_bytes);
+    auto* base = static_cast<std::byte*>(backing.data());
+    std::vector<std::byte*> scattered;
+    for (std::size_t segment = 0; segment < segments; ++segment) {
+        scattered.push_back(base + (segments - 1U - segment) * segment_bytes);
+    }
+    pool.copy_to_host_segments(0, scattered, segment_bytes, device.stream);
+    device.synchronize();
+
+    const std::byte* packed = contiguous.view(*handle).data;
+    bool equal              = true;
+    for (std::size_t offset = 0; offset < image_bytes; ++offset) {
+        equal =
+            equal && scattered[offset / segment_bytes][offset % segment_bytes] == packed[offset];
+    }
+    expect(equal, "segmented StateImage bytes differ from the packed image");
+
+    const std::vector<const std::byte*> sources(scattered.begin(), scattered.end());
+    pool.copy_from_host_segments(sources, segment_bytes, 1, device.stream);
+    device.synchronize();
+    expect_slot(pool, 1, dflash ? 0x31 : 0x47, "segmented Host roundtrip");
+
+    // Part by part (the order a hybrid restore lands them: the rest, then each linear layer)
+    // rebuilds the same slot.
+    pool.zero_slot(1, device.stream);
+    pool.copy_from_host_segments(sources, segment_bytes, 1,
+                                 q36::StateImagePart{.kind = q36::StateImagePart::Kind::Rest},
+                                 device.stream);
+    for (std::uint32_t layer = 0; layer < pool.linear().layer_count(); ++layer) {
+        pool.copy_from_host_segments(
+            sources, segment_bytes, 1,
+            q36::StateImagePart{.kind = q36::StateImagePart::Kind::LinearLayer, .layer = layer},
+            device.stream);
+    }
+    device.synchronize();
+    expect_slot(pool, 1, dflash ? 0x31 : 0x47, "per-part segmented Host roundtrip");
+    bool layer_rejected = false;
+    try {
+        pool.copy_from_host_segments(
+            sources, segment_bytes, 1,
+            q36::StateImagePart{.kind  = q36::StateImagePart::Kind::LinearLayer,
+                                .layer = pool.linear().layer_count()},
+            device.stream);
+    } catch (const std::out_of_range&) { layer_rejected = true; }
+    expect(layer_rejected, "an out-of-range StateImage linear layer was accepted");
+
+    bool short_rejected = false;
+    try {
+        pool.copy_to_host_segments(0, std::span<std::byte* const>(scattered.data(), 1),
+                                   segment_bytes, device.stream);
+    } catch (const std::invalid_argument&) { short_rejected = true; }
+    expect(short_rejected || segments == 1, "segments that do not cover the image were accepted");
+    (void)contiguous.release(*handle);
+}
+
 } // namespace
 
 int main() {
@@ -213,6 +287,9 @@ int main() {
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);
+    test_segmented_roundtrip(false, device);
+    test_segmented_roundtrip(true, device);
+    test_segmented_roundtrip(true, device, true);
 
     return failures == 0 ? 0 : 1;
 }

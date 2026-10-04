@@ -96,6 +96,10 @@ public:
         rewrite_checkpoint_hidden_output_ = output;
     }
 
+    // One event per model layer: the next pass over the layer stack waits for each layer's event
+    // before that layer's work (the layer's cached state is still being copied in).
+    void set_layer_ready(std::span<const cudaEvent_t> events) noexcept { layer_ready_ = events; }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
@@ -239,6 +243,7 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    std::span<const cudaEvent_t> layer_ready_;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

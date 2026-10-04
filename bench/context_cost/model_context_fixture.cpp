@@ -494,8 +494,6 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     engine_options.enable_vision         = true;
     engine_options.use_cuda_graph        = true;
     engine_options.context_cache.enabled = false;
-    engine_options.context_cache.host_state_slots       = 0;
-    engine_options.context_cache.host_kv_capacity_bytes = 0;
 
     Engine engine(engine_options);
     const auto run_root = [&](std::uint32_t tokens) {

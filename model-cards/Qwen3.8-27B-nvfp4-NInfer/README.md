@@ -195,24 +195,22 @@ For images, videos, and structured chat history, see the
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
-  --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
+  --host-cache-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool admits
-two active requests when their combined completion reservations fit; either request may use the
-full pool while running alone. Two extra Device checkpoint slots, eight pinned Host State slots,
-and 8 GiB of pinned Host KV retain reusable continuations under resource pressure.
+Each request has a 240,000-token logical ceiling. The shared Device KV pool takes the memory the
+model and runtime leave free; it admits two active requests when their combined completion
+reservations fit, and either request may use the full pool while running alone. Pages no active
+request holds are the Device prefix cache, and 8 GiB of pinned Host memory holds cached KV blocks
+and state snapshots beyond it.
 
 See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
-API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
+API surface and the [prefix cache reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/hybrid-prefix-cache.md)
 for cache and admission semantics.
 
 ## Supported use

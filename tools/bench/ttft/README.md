@@ -129,29 +129,30 @@ COMMON=(--host 127.0.0.1 --port 18080 --kv-dtype fp8 \
 "$SERVE" "$NINFER_WEIGHTS" "${COMMON[@]}" <profile arguments>
 ```
 
-All capacities are tokens except values explicitly suffixed `-mib`. `device-state-slots` is extra
-checkpoint capacity beyond active lanes.
+All capacities are tokens except values explicitly suffixed `-mib`. `device-snapshot-slots` is
+Device state-snapshot capacity beyond active lanes, and `host-cache-mib` is the pinned Host
+prefix-cache pool.
 
 | Profile label | Profile arguments |
 |---|---|
 | `text-cold-8k` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
 | `text-cold-64k` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --no-prefix-reuse` |
 | `text-cold-256k` | `--max-context 262144 --kv-capacity 262144 --max-concurrency 1 --no-prefix-reuse` |
-| `cache-state-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 8 --host-state-slots 8 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 8 --max-long-anchors-per-continuation 0` |
-| `cache-private-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 2 --host-state-slots 2 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-hot` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-device` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-state-host` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 0 --host-state-slots 4 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-kv-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 8192 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-swap-64k-host` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 2 --device-state-slots 4 --host-state-slots 0 --host-kv-mib 4608 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-rotation-55k-host` | `--max-context 240000 --kv-capacity 240000 --max-concurrency 4 --max-pending-requests 32 --pending-timeout-ms 120000 --spec mtp --draft-tokens 3 --lm-head-draft --device-state-slots 2 --host-state-slots 24 --host-kv-mib 49152 --max-private-continuations 24 --max-shared-prefixes 24 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-both-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 0 --host-state-slots 4 --host-kv-mib 8192 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-evict` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 1 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-catalog` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
+| `cache-state-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-snapshot-slots 8 --host-cache-mib 1536` |
+| `cache-private-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-snapshot-slots 2 --host-cache-mib 384` |
+| `cache-hot` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --device-snapshot-slots 2 --host-cache-mib 0` |
+| `cache-pressure-device` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-snapshot-slots 2 --host-cache-mib 0` |
+| `cache-pressure-state-host` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-snapshot-slots 1 --host-cache-mib 768` |
+| `cache-pressure-kv-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-snapshot-slots 2 --host-cache-mib 8192` |
+| `cache-swap-64k-host` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 2 --device-snapshot-slots 4 --host-cache-mib 4608` |
+| `cache-rotation-55k-host` | `--max-context 240000 --kv-capacity 240000 --max-concurrency 4 --max-pending-requests 32 --pending-timeout-ms 120000 --spec mtp --draft-tokens 3 --lm-head-draft --device-snapshot-slots 2 --host-cache-mib 53760` |
+| `cache-pressure-both-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-snapshot-slots 1 --host-cache-mib 8960` |
+| `cache-pressure-evict` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-snapshot-slots 1 --host-cache-mib 0` |
+| `cache-pressure-catalog` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-snapshot-slots 2 --host-cache-mib 0` |
 | `cache-off` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `shared-prefix` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 1 --max-long-anchors-per-continuation 0` |
-| `shared-value` | `--max-context 16384 --kv-capacity 16384 --max-concurrency 1 --device-state-slots 3 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 1 --max-shared-prefixes 1 --max-long-anchors-per-continuation 0` |
-| `session-order` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 8 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
+| `shared-prefix` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-snapshot-slots 2 --host-cache-mib 0` |
+| `shared-value` | `--max-context 16384 --kv-capacity 16384 --max-concurrency 1 --device-snapshot-slots 3 --host-cache-mib 0` |
+| `session-order` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-snapshot-slots 8 --host-cache-mib 0` |
 | `scheduler-overlap` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 1024 --no-prefix-reuse` |
 | `scheduler-prefill-128` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 128 --no-prefix-reuse` |
 | `scheduler-prefill-4096` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 4096 --no-prefix-reuse` |
@@ -159,12 +160,18 @@ checkpoint capacity beyond active lanes.
 | `lane-limit-8` | `--max-context 4224 --kv-capacity 33792 --max-concurrency 8 --max-pending-requests 1 --pending-timeout-ms 120000 --no-prefix-reuse` |
 | `pending-timeout` | `--max-context 4224 --kv-capacity 4224 --max-concurrency 1 --max-pending-requests 1 --pending-timeout-ms 100 --no-prefix-reuse` |
 | `context-boundary` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `vision-cache` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512` |
-| `vision-thread-1` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512 --media-preprocess-threads 1` |
+| `vision-cache` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --vision --media-cache-mib 512 --media-live-mib 512 --device-snapshot-slots 2 --host-cache-mib 0` |
+| `vision-thread-1` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --vision --media-cache-mib 512 --media-live-mib 512 --media-preprocess-threads 1 --device-snapshot-slots 2 --host-cache-mib 0` |
 | `vision-concurrent` | `--max-context 32768 --kv-capacity 65536 --max-concurrency 2 --vision --media-cache-mib 512 --media-live-mib 1024 --no-prefix-reuse` |
 | `media-cache-tight` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --vision --media-cache-mib 16 --media-live-mib 128 --no-prefix-reuse` |
 | `vision-boundary` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --vision --no-prefix-reuse` |
 | `mixed-four` | `--max-context 8192 --kv-capacity 32768 --max-concurrency 4 --vision` |
+
+The cache profiles keep the capacities of the checkpoint-catalog profiles they replaced:
+`--device-snapshot-slots` takes the former Device State slot count (at least 1), and
+`--host-cache-mib` the former Host KV MiB plus 192 MiB per former Host State slot. Case names and
+descriptions that mention catalog owners (private, shared, catalog, Host State or Host KV) name the
+workload shape; the prefix cache itself has no such owners.
 
 ## Audited cases
 

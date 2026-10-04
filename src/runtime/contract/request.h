@@ -31,10 +31,6 @@ struct OutputDecision {
     std::uint32_t accepted_tokens   = 0;
     FinishReason finish_reason      = FinishReason::None;
     ContinuationAction continuation = ContinuationAction::Decode;
-    // Empty or one token-aligned frontier within the accepted span where model-history
-    // reconstruction gains an execution split. Frontend owns detection; Engine only transports
-    // this relative position.
-    std::optional<std::uint32_t> prefix_execution_split_after;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };

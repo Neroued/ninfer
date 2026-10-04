@@ -46,7 +46,7 @@ int main() {
             options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
             options.enable_vision                    = true;
             options.use_cuda_graph                   = false;
-            options.context_cache.device_state_slots = 1;
+            options.context_cache.device_snapshot_slots = 1;
             auto planner     = qwen::make_sequence_planner(parameters, device, options);
             const auto pages = planner.capacity_curve().minimum_main_page_groups;
             return std::move(planner).finalize(pages).workspace_capacity_bytes();

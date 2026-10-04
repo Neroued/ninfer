@@ -4,8 +4,6 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/program/vision_control.h"
 
-#include "models/qwen3_5/program/prefix_identity.h"
-#include "models/qwen3_5/program/planning/rebuild_work.h"
 
 #include <algorithm>
 #include <array>
@@ -275,144 +273,6 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     return prompt;
 }
 
-void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
-                       std::int32_t position) {
-    const std::size_t old_tokens = prompt.token_ids.size();
-    std::vector<std::int32_t> positions;
-    positions.reserve(3 * (old_tokens + 1));
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        const auto begin =
-            prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * old_tokens);
-        positions.insert(positions.end(), begin, begin + static_cast<std::ptrdiff_t>(old_tokens));
-        positions.push_back(position);
-    }
-    prompt.token_ids.push_back(token);
-    prompt.token_types.push_back(0);
-    prompt.positions = std::move(positions);
-}
-
-void test_prefix_identity() {
-    q36::PreparedPromptData original    = identity_prompt();
-    std::vector<ninfer::TokenId> ledger = original.token_ids;
-    q36::detail::ResidentPrefixIdentity resident;
-    q36::detail::PrefixShortlistDigests digests;
-    resident.reserve(16);
-    resident.assign(original);
-    digests.reserve(16);
-    digests.assign(original);
-
-    expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
-           "identical multimodal prefix identity");
-
-    q36::PreparedPromptData changed_media = identity_prompt(2);
-    expect(!q36::detail::prefix_matches(changed_media, ledger, resident,
-                                        changed_media.token_ids.size()),
-           "different media content must not reuse placeholder tokens");
-    expect(q36::detail::prefix_matches(changed_media, ledger, resident, 1),
-           "media wholly after the frontier does not affect prefix identity");
-    expect(!q36::detail::prefix_matches(original, ledger, resident, 2),
-           "frontier must not divide one Vision item");
-
-    q36::PreparedPromptData changed_position = identity_prompt();
-    changed_position.positions[0] += 1;
-    expect(!q36::detail::prefix_matches(changed_position, ledger, resident,
-                                        changed_position.token_ids.size()),
-           "different MRoPE positions must not reuse resident state");
-
-    q36::PreparedPromptData changed_decomposition              = identity_prompt();
-    changed_decomposition.identity.rewrite_execution_frontiers = {1};
-    expect(!q36::detail::prefix_matches(changed_decomposition, ledger, resident,
-                                        changed_decomposition.token_ids.size()),
-           "different GDN execution decomposition must not reuse resident state");
-    changed_decomposition.identity.rewrite_execution_frontiers = {4};
-    expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident, 3),
-           "execution decomposition wholly after the frontier changed prefix identity");
-
-    q36::PreparedPromptData resident_future              = identity_prompt();
-    resident_future.identity.rewrite_execution_frontiers = {1, 4};
-    q36::detail::ResidentPrefixIdentity resident_with_future;
-    resident_with_future.assign(resident_future);
-    q36::PreparedPromptData incoming_future              = identity_prompt();
-    incoming_future.identity.rewrite_execution_frontiers = {1, 3};
-    expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 1),
-           "resident execution decomposition after the frontier changed prefix identity");
-    expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
-           "different execution decomposition inside the frontier reused resident state");
-
-    q36::detail::PrefixShortlistDigests future_digest;
-    future_digest.assign(resident_future);
-    q36::detail::PrefixShortlistDigests incoming_digest;
-    incoming_digest.assign(incoming_future);
-    expect(future_digest.at(1) == incoming_digest.at(1),
-           "future execution boundaries changed an earlier content shortlist");
-    expect(future_digest.at(3) != incoming_digest.at(3),
-           "different in-prefix execution boundaries shared a shortlist digest");
-
-    resident.append_generated(1, original.rope_delta);
-    ledger.push_back(12);
-    const std::array<ninfer::TokenId, 1> generated{12};
-    digests.append_generated(generated, original.rope_delta);
-    append_text_token(original, 12, 4);
-    q36::detail::PrefixShortlistDigests rebuilt;
-    rebuilt.assign(original);
-    expect(digests.at(ledger.size()) == rebuilt.at(ledger.size()),
-           "incremental generated-token shortlist diverged from a full rebuild");
-    expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
-           "generated multimodal continuation identity");
-
-    q36::PreparedPromptData accepted_rebuild = identity_prompt();
-    const std::array<ninfer::TokenId, 3> proposed{20, 21, 22};
-    const std::span<const ninfer::TokenId> accepted(proposed.data(), 2);
-    std::vector<ninfer::TokenId> accepted_ledger = accepted_rebuild.token_ids;
-    accepted_ledger.insert(accepted_ledger.end(), accepted.begin(), accepted.end());
-    q36::detail::ResidentPrefixIdentity accepted_resident;
-    q36::detail::PrefixShortlistDigests accepted_digests;
-    accepted_resident.assign(accepted_rebuild);
-    accepted_digests.assign(accepted_rebuild);
-    accepted_resident.append_generated(accepted.size(), accepted_rebuild.rope_delta, 1);
-    accepted_digests.append_generated(accepted, accepted_rebuild.rope_delta, 1);
-    append_text_token(accepted_rebuild, accepted[0], 4);
-    append_text_token(accepted_rebuild, accepted[1], 5);
-    accepted_rebuild.identity.rewrite_execution_frontiers = {5};
-    q36::detail::PrefixShortlistDigests rebuilt_accepted_digests;
-    rebuilt_accepted_digests.assign(accepted_rebuild);
-    expect(q36::detail::prefix_matches(accepted_rebuild, accepted_ledger, accepted_resident,
-                                       accepted_ledger.size()) &&
-               accepted_digests.at(accepted_ledger.size()) ==
-                   rebuilt_accepted_digests.at(accepted_ledger.size()),
-           "accepted generated prefix and rebuilt history formed different cache identities");
-
-    const q36::PreparedPromptData prompt_only = identity_prompt();
-    resident.truncate(prompt_only.token_ids.size());
-    digests.truncate(prompt_only.token_ids.size());
-    ledger.resize(prompt_only.token_ids.size());
-    q36::detail::PrefixShortlistDigests prompt_digest;
-    prompt_digest.assign(prompt_only);
-    expect(digests.at(ledger.size()) == prompt_digest.at(ledger.size()),
-           "truncated shortlist did not restore the original frontier digest");
-    expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
-           "truncated multimodal continuation identity");
-}
-
-void test_rebuild_work_prompt_frontier_boundary() {
-    constexpr std::uint32_t prompt_tokens = 100;
-    constexpr std::uint32_t prefill_chunk = 2048;
-    std::uint32_t tail_begin              = 0;
-    q36::runtime_support::include_rebuild_boundary(tail_begin, prompt_tokens, prompt_tokens);
-    expect(tail_begin == prompt_tokens,
-           "prompt-frontier rebuild boundary was not retained for continuation growth");
-
-    ninfer::runtime::PrefillWork work =
-        ninfer::runtime::make_prefill_work(0, prompt_tokens, 0, 0, prefill_chunk);
-    q36::runtime_support::advance_segmented_rebuild_work(work, tail_begin, prompt_tokens,
-                                                         prompt_tokens + 1, prefill_chunk);
-    const ninfer::runtime::PrefillWork exact =
-        ninfer::runtime::make_prefill_work(0, prompt_tokens + 1, 0, 0, prefill_chunk);
-    expect(work.chunks == 2 && work.tokens == exact.tokens &&
-               work.attention_pairs == exact.attention_pairs,
-           "continuation growth did not preserve the prompt-frontier rebuild split");
-}
-
 } // namespace
 
 int main() {
@@ -420,8 +280,6 @@ int main() {
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
-    test_prefix_identity();
-    test_rebuild_work_prompt_frontier_boundary();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

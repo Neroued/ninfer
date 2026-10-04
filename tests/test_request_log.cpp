@@ -72,12 +72,11 @@ int main() {
     engine_options.speculative                                     = options.speculative;
     engine_options.enable_vision                                   = options.enable_vision;
     engine_options.use_cuda_graph                                  = options.use_cuda_graph;
-    engine_options.context_cache.device_state_slots                = 2;
-    engine_options.context_cache.host_state_slots                  = 3;
-    engine_options.context_cache.host_kv_capacity_bytes            = 64ULL << 20;
-    engine_options.context_cache.max_private_continuations         = 4;
-    engine_options.context_cache.max_shared_prefixes               = 2;
-    engine_options.context_cache.max_long_anchors_per_continuation = 2;
+    engine_options.context_cache.host_cache_bytes                  = 64ULL << 20;
+    engine_options.context_cache.device_snapshot_slots             = 2;
+    engine_options.context_cache.max_new_taps                      = 8;
+    engine_options.context_cache.tap_ladder_tokens                 = 4096;
+    engine_options.context_cache.tap_min_gap_tokens                = 1024;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
@@ -131,10 +130,8 @@ int main() {
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
     memory.kv_payload_bytes                  = 400;
-    memory.host_state_capacity_slots         = 3;
-    memory.host_state_occupied_slots         = 1;
-    memory.host_kv_capacity_bytes            = 64ULL << 20;
-    memory.host_kv_occupied_bytes            = 8ULL << 20;
+    memory.host_cache_capacity_bytes         = 64ULL << 20;
+    memory.host_cache_occupied_bytes         = 8ULL << 20;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -205,14 +202,14 @@ int main() {
             server.at("engine").at("context_cost").at("preset_path") == "local-costs.json",
         "resolved context-cost layers missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
-    failures += check(
-        server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
-            server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
-            server.at("engine").at("context_cache").at("host_state_slots") == 3 &&
-            server.at("engine").at("context_cache").at("host_kv_capacity_bytes") == (64ULL << 20) &&
-            server.at("engine").at("context_cache").at("max_private_continuations") == 4 &&
-            server.at("engine").at("context_cache").at("max_shared_prefixes") == 2,
-        "resolved context-cache configuration missing");
+    failures +=
+        check(server.at("engine").at("context_cache").at("device_snapshot_slots") == 2 &&
+                  server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
+                  server.at("engine").at("context_cache").at("host_cache_bytes") == (64ULL << 20) &&
+                  server.at("engine").at("context_cache").at("max_new_taps") == 8 &&
+                  server.at("engine").at("context_cache").at("tap_ladder_tokens") == 4096 &&
+                  server.at("engine").at("context_cache").at("tap_min_gap_tokens") == 1024,
+              "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
     failures +=
@@ -240,11 +237,9 @@ int main() {
                           server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
-    failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
-                          server.at("memory").at("host_state_occupied_slots") == 1 &&
-                          server.at("memory").at("host_kv_capacity_bytes") == (64ULL << 20) &&
-                          server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
-                      "Host context-cache memory ledger missing");
+    failures += check(server.at("memory").at("host_cache_capacity_bytes") == (64ULL << 20) &&
+                          server.at("memory").at("host_cache_occupied_bytes") == (8ULL << 20),
+                      "Host prefix-cache memory ledger missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
@@ -375,7 +370,7 @@ int main() {
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::Endpoint;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
                   .engine_boundary_exposed_seconds      = 0.001,
@@ -398,25 +393,8 @@ int main() {
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
     outcome.metrics.materialization                   = {
-                          .predicted_now_ns           = 200000,
-                          .predicted_future_loss_ns   = 50000,
-                          .predicted_total_ns         = 250000,
-                          .targets_evaluated          = 7,
-                          .projection_work            = 31,
-                          .planning_elapsed_ns        = 9000,
-                          .search_elapsed_ns          = 6000,
-                          .stop_reason                = ninfer::MaterializationStopReason::QueueExhausted,
-                          .budget_exhausted           = false,
-                          .selected_degradation_units = 2,
-                          .selected_maximal_fallback  = false,
-                          .initial_predicted_total_ns = 500000,
-                          .first_improvement_ns       = 2000,
-                          .incumbent_improvements     = 2,
-                          .search_work                = 42,
-                          .search_granted_ns          = 8000,
-                          .search_renewals            = 1,
-                          .search_discovery_used      = true,
-                          .search_overshoot_ns        = 0,
+        .cached_prefix_tokens = 128,
+        .restored_host_bytes  = 4096,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -424,19 +402,17 @@ int main() {
                                                    .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
-    failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
-                          done.at("materialization").at("first_improvement_ns") == 2000 &&
-                          done.at("materialization").at("search_granted_ns") == 8000 &&
-                          done.at("materialization").at("search_renewals") == 1 &&
-                          done.at("materialization").at("search_discovery_used") == true,
-                      "materialization search quality or cumulative budget diagnostics missing");
+    failures += check(done.at("materialization").at("cached_prefix_tokens") == 128 &&
+                          done.at("materialization").at("restored_host_bytes") == 4096 &&
+                          done.at("materialization").size() == 2,
+                      "prefix-cache admission diagnostics missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "computed prefill tokens missing");
-    failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
-                      "prefix reuse path missing");
+    failures +=
+        check(done.at("result").at("prefix_reuse_path") == "endpoint", "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
@@ -449,12 +425,11 @@ int main() {
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
-    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::PrivateResponseReplay;
-    const Json response_restore =
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::Snapshot;
+    const Json snapshot_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
-    failures +=
-        check(response_restore.at("result").at("prefix_reuse_path") == "private_response_replay",
-              "response checkpoint reuse path missing");
+    failures += check(snapshot_restore.at("result").at("prefix_reuse_path") == "snapshot",
+                      "snapshot reuse path missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -469,12 +444,6 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
-    failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
-                          done.at("materialization").at("targets_evaluated") == 7 &&
-                          done.at("materialization").at("stop_reason") == "queue_exhausted" &&
-                          !done.at("materialization").contains("model_optimal") &&
-                          !done.at("materialization").contains("absolute_bound_gap_ns"),
-                      "request-owned materialization diagnostics missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
@@ -487,7 +456,7 @@ int main() {
     failures += check(
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
-            "(25.2%, response replay) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
+            "(25.2%, snapshot) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
             "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
@@ -565,25 +534,19 @@ int main() {
     throughput.decode_rounds                            = 10;
     throughput.decode_row_rounds                        = 18;
     throughput.previous.root_selections                 = 2;
-    throughput.previous.state_h2d_bytes                 = 100;
+    throughput.previous.host_restore_bytes              = 100;
     throughput.current.running_requests                 = 2;
     throughput.current.prefilling_requests              = 1;
     throughput.current.decode_ready_requests            = 1;
     throughput.current.waiting_requests                 = 3;
     throughput.current.materializing_requests           = 1;
-    throughput.current.capture_pending_requests         = 1;
     throughput.current.terminal_pending_requests        = 1;
     throughput.current.root_selections                  = 3;
-    throughput.current.state_h2d_count                  = 1;
-    throughput.current.state_h2d_bytes                  = 132;
-    throughput.current.state_h2d_seconds                = 0.25;
+    throughput.current.endpoint_selections              = 1;
+    throughput.current.host_restore_bytes               = 132;
     throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.snapshots                        = 5;
     throughput.current.last_selected_frontier_tokens    = 64;
-    throughput.current.pressure_spill_pages             = 4;
-    throughput.current.pressure_private_owners_degraded = 1;
-    throughput.current.pressure_checkpoints_dropped     = 1;
-    throughput.current.pressure_searches                = 1;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -611,7 +574,7 @@ int main() {
         check(pretty_throughput ==
                   "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
                   "running 2 (prefill 1, decode-ready 1) | waiting 3 | materializing 1 | "
-                  "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
+                  "terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
               "pretty throughput record mismatch");
     ThroughputReport single_decode;
     single_decode.interval_seconds                     = 5.000168;
@@ -638,7 +601,6 @@ int main() {
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
     failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&
-                          throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
     failures += check(
@@ -674,11 +636,11 @@ int main() {
         "zero Host-work denominators must serialize as null");
     failures += check(
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
-            throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
+            throughput_json.at("context_cache").at("selections").at("endpoint") == 1 &&
+            throughput_json.at("context_cache").at("events").at("host_restore_bytes") == 32 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
-            throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
-            throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
-            !throughput_json.at("context_cache").contains("last_materialization"),
+            throughput_json.at("context_cache").at("occupancy").at("snapshots") == 5 &&
+            throughput_json.at("context_cache").at("last_selection").at("frontier_tokens") == 64,
         "context-cache throughput statistics missing or not interval-scoped");
 
     const std::filesystem::path log_path =

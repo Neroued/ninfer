@@ -136,16 +136,10 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
-        return "private_endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
-        return "private_turn_closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
-        return "private_response_replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
-        return "private_long_anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
-        return "shared_stable_prefix";
+    case ninfer::PrefixReusePath::Endpoint:
+        return "endpoint";
+    case ninfer::PrefixReusePath::Snapshot:
+        return "snapshot";
     }
     return "unknown";
 }
@@ -296,30 +290,8 @@ Json speculative_json(const GenerationMetrics& metrics) {
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
     return Json{
-        {"predicted_now_ns", diagnostics.predicted_now_ns},
-        {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
-        {"predicted_total_ns", diagnostics.predicted_total_ns},
-        {"targets_evaluated", diagnostics.targets_evaluated},
-        {"projection_work", diagnostics.projection_work},
-        {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
-        {"search_elapsed_ns", diagnostics.search_elapsed_ns},
-        {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
-        {"budget_exhausted", diagnostics.budget_exhausted},
-        {"selected_degradation_units", diagnostics.selected_degradation_units},
-        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
-        {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
-        {"first_improvement_ns", diagnostics.first_improvement_ns
-                                     ? Json(*diagnostics.first_improvement_ns)
-                                     : Json(nullptr)},
-        {"incumbent_improvements", diagnostics.incumbent_improvements},
-        {"search_work", diagnostics.search_work},
-        {"search_granted_ns", diagnostics.search_granted_ns},
-        {"search_renewals", diagnostics.search_renewals},
-        {"search_discovery_used", diagnostics.search_discovery_used},
-        {"search_overshoot_ns", diagnostics.search_overshoot_ns},
-        {"search_stop_phase",
-         ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
-        {"search_boundary_limited", diagnostics.search_boundary_limited},
+        {"cached_prefix_tokens", diagnostics.cached_prefix_tokens},
+        {"restored_host_bytes", diagnostics.restored_host_bytes},
     };
 }
 
@@ -452,46 +424,43 @@ std::string format_server_start_json(
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(engine_options.max_concurrency) +
-        cache.device_state_slots.value();
-    record["engine"] =
-        Json{{"device", engine_options.device},
-             {"max_context", engine_options.max_context},
-             {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
-             {"kv_capacity", memory.kv_capacity},
-             {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
-             {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
-             {"max_concurrency", engine_options.max_concurrency},
-             {"max_pending_requests", engine_options.max_pending_requests},
-             {"pending_timeout_ms", engine_options.pending_timeout_ms},
-             {"prefill_chunk", engine_options.prefill_chunk},
-             {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
-             {"vision", engine_options.enable_vision},
-             {"cuda_graph", engine_options.use_cuda_graph},
-             {"prefix_reuse", options.allow_prefix_reuse},
-             {"speculative_backend",
-              product::speculative_backend_name(engine_options.speculative.backend)},
-             {"speculative_draft_window", engine_options.speculative.draft_tokens},
-             {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
-             {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
-                                                           context_cost.transfer_source)},
-                                   {"prefill_source", ninfer::context_cost_preset_source_name(
-                                                          context_cost.prefill_source)},
-                                   {"hardware_class", context_cost.hardware_class},
-                                   {"prefill_signature", context_cost.prefill_signature},
-                                   {"preset_path", context_cost.preset_path.string()}}},
-             {"context_cache",
-              Json{{"enabled", cache.enabled},
-                   {"device_state_slots", cache.device_state_slots.value()},
-                   {"total_device_state_slots", total_device_state_slots},
-                   {"host_state_slots", cache.host_state_slots},
-                   {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
-                   {"max_private_continuations", cache.max_private_continuations.value()},
-                   {"max_shared_prefixes", cache.max_shared_prefixes.value()},
-                   {"max_long_anchors_per_continuation",
-                    cache.max_long_anchors_per_continuation.value()}}}};
+    record["engine"]                               = Json{
+        {"device", engine_options.device},
+        {"max_context", engine_options.max_context},
+        {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
+        {"kv_capacity", memory.kv_capacity},
+        {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+        {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
+        {"max_concurrency", engine_options.max_concurrency},
+        {"max_pending_requests", engine_options.max_pending_requests},
+        {"pending_timeout_ms", engine_options.pending_timeout_ms},
+        {"prefill_chunk", engine_options.prefill_chunk},
+        {"log_stats_interval_ms", options.log_stats_interval_ms},
+        {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+        {"vision", engine_options.enable_vision},
+        {"cuda_graph", engine_options.use_cuda_graph},
+        {"prefix_reuse", options.allow_prefix_reuse},
+        {"speculative_backend",
+         product::speculative_backend_name(engine_options.speculative.backend)},
+        {"speculative_draft_window", engine_options.speculative.draft_tokens},
+        {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+        {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
+                                                      context_cost.transfer_source)},
+                              {"prefill_source", ninfer::context_cost_preset_source_name(
+                                                     context_cost.prefill_source)},
+                              {"hardware_class", context_cost.hardware_class},
+                              {"prefill_signature", context_cost.prefill_signature},
+                              {"preset_path", context_cost.preset_path.string()}}},
+        {"context_cache", Json{{"enabled", cache.enabled},
+                               {"host_cache_bytes", cache.host_cache_bytes},
+                               {"device_snapshot_slots", cache.device_snapshot_slots.value_or(0U)},
+                               {"total_device_state_slots",
+                                static_cast<std::uint64_t>(engine_options.max_concurrency) +
+                                    cache.device_snapshot_slots.value_or(0U)},
+                               {"max_new_taps", cache.max_new_taps.value_or(0U)},
+                               {"tap_ladder_tokens", cache.tap_ladder_tokens.value_or(0U)},
+                               {"tap_min_gap_tokens", cache.tap_min_gap_tokens.value_or(0U)},
+                               {"persistent_file", cache.persistent_file.string()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -512,10 +481,8 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
-             {"host_state_capacity_slots", memory.host_state_capacity_slots},
-             {"host_state_occupied_slots", memory.host_state_occupied_slots},
-             {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
-             {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
+             {"host_cache_capacity_bytes", memory.host_cache_capacity_bytes},
+             {"host_cache_occupied_bytes", memory.host_cache_occupied_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -620,7 +587,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                   {"decode_ready", current.decode_ready_requests},
                                   {"waiting", current.waiting_requests},
                                   {"materializing", current.materializing_requests},
-                                  {"capture_pending", current.capture_pending_requests},
                                   {"terminal_pending", current.terminal_pending_requests}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
@@ -663,119 +629,42 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"stats_publication",
                   microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };
+    // Prefix cache: selections and cache events are interval deltas; occupancy and the last
+    // selection are end-of-interval gauges.
+    const auto delta = [&](std::uint64_t RuntimeStats::* field) {
+        return monotonic_delta(previous.*field, current.*field);
+    };
     record["context_cache"] = Json{
-        {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
-                                                        current.active_captures_completed)},
-                          {"aborted", monotonic_delta(previous.active_captures_aborted,
-                                                      current.active_captures_aborted)}}},
-        {"selections",
-         Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
-              {"private_endpoint", monotonic_delta(previous.private_endpoint_selections,
-                                                   current.private_endpoint_selections)},
-              {"private_turn_closure", monotonic_delta(previous.private_turn_closure_selections,
-                                                       current.private_turn_closure_selections)},
-              {"private_response_replay",
-               monotonic_delta(previous.private_response_replay_selections,
-                               current.private_response_replay_selections)},
-              {"private_long_anchor", monotonic_delta(previous.private_long_anchor_selections,
-                                                      current.private_long_anchor_selections)},
-              {"shared_stable_prefix", monotonic_delta(previous.shared_stable_prefix_selections,
-                                                       current.shared_stable_prefix_selections)},
-              {"reused_prompt_tokens",
-               monotonic_delta(previous.reused_prompt_tokens, current.reused_prompt_tokens)}}},
+        {"selections", Json{{"root", delta(&RuntimeStats::root_selections)},
+                            {"endpoint", delta(&RuntimeStats::endpoint_selections)},
+                            {"snapshot", delta(&RuntimeStats::snapshot_selections)},
+                            {"reused_prompt_tokens", delta(&RuntimeStats::reused_prompt_tokens)}}},
         {"last_selection", Json{{"frontier_tokens", current.last_selected_frontier_tokens}}},
-        {"state_operations",
-         Json{{"moves", monotonic_delta(previous.state_moves, current.state_moves)},
-              {"forks", monotonic_delta(previous.state_forks, current.state_forks)},
-              {"restores", monotonic_delta(previous.state_restores, current.state_restores)}}},
-        {"state_transfers",
-         Json{{"d2h",
-               Json{{"count", monotonic_delta(previous.state_d2h_count, current.state_d2h_count)},
-                    {"bytes", monotonic_delta(previous.state_d2h_bytes, current.state_d2h_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_d2h_seconds, current.state_d2h_seconds)}}},
-              {"h2d",
-               Json{{"count", monotonic_delta(previous.state_h2d_count, current.state_h2d_count)},
-                    {"bytes", monotonic_delta(previous.state_h2d_bytes, current.state_h2d_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_h2d_seconds, current.state_h2d_seconds)}}},
-              {"d2d",
-               Json{{"count", monotonic_delta(previous.state_d2d_count, current.state_d2d_count)},
-                    {"bytes", monotonic_delta(previous.state_d2d_bytes, current.state_d2d_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_d2d_seconds, current.state_d2d_seconds)}}}}},
-        {"main_kv_transfers",
-         Json{
-             {"d2h",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_d2h_pages, current.main_kv_d2h_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_d2h_bytes, current.main_kv_d2h_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_d2h_seconds, current.main_kv_d2h_seconds)}}},
-             {"h2d",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_h2d_pages, current.main_kv_h2d_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_h2d_bytes, current.main_kv_h2d_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_h2d_seconds, current.main_kv_h2d_seconds)}}},
-             {"d2d",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_d2d_pages, current.main_kv_d2d_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_d2d_bytes, current.main_kv_d2d_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_d2d_seconds, current.main_kv_d2d_seconds)}}}}},
-        {"backend_kv_transfers",
-         Json{{"d2h", Json{{"pages", monotonic_delta(previous.backend_kv_d2h_pages,
-                                                     current.backend_kv_d2h_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_d2h_bytes,
-                                                     current.backend_kv_d2h_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_d2h_seconds,
-                                                       current.backend_kv_d2h_seconds)}}},
-              {"h2d", Json{{"pages", monotonic_delta(previous.backend_kv_h2d_pages,
-                                                     current.backend_kv_h2d_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_h2d_bytes,
-                                                     current.backend_kv_h2d_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_h2d_seconds,
-                                                       current.backend_kv_h2d_seconds)}}},
-              {"d2d", Json{{"pages", monotonic_delta(previous.backend_kv_d2d_pages,
-                                                     current.backend_kv_d2d_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_d2d_bytes,
-                                                     current.backend_kv_d2d_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
-                                                       current.backend_kv_d2d_seconds)}}}}},
-        {"pressure",
-         Json{
-             {"spill_pages",
-              monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
-             {"partial_tail_cow_pages",
-              monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
-             {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
-                                                         current.pressure_private_owners_degraded)},
-             {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
-                                                        current.pressure_private_owners_evicted)},
-             {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,
-                                                        current.pressure_shared_owners_degraded)},
-             {"shared_owners_evicted", monotonic_delta(previous.pressure_shared_owners_evicted,
-                                                       current.pressure_shared_owners_evicted)},
-             {"checkpoints_dropped", monotonic_delta(previous.pressure_checkpoints_dropped,
-                                                     current.pressure_checkpoints_dropped)},
-             {"searches", monotonic_delta(previous.pressure_searches, current.pressure_searches)},
-             {"search_budget_exhaustions",
-              monotonic_delta(previous.pressure_search_budget_exhaustions,
-                              current.pressure_search_budget_exhaustions)},
-             {"maximal_fallback_selections",
-              monotonic_delta(previous.pressure_maximal_fallback_selections,
-                              current.pressure_maximal_fallback_selections)},
-             {"historical_fork_hits",
-              monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
         {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
-                           {"host_state_slots", current.host_state_occupied_slots},
                            {"device_main_kv_pages", current.device_main_kv_occupied_pages},
                            {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
-                           {"host_kv_bytes", current.host_kv_occupied_bytes},
-                           {"shared_active_references", current.shared_active_references}}},
-        {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
-                                                    current.actual_context_transfer_seconds)}};
+                           {"device_blocks", current.cached_blocks},
+                           {"evictable_blocks", current.evictable_blocks},
+                           {"tree_blocks", current.tree_blocks},
+                           {"snapshots", current.snapshots},
+                           {"host_capacity_bytes", current.host_cache_capacity_bytes},
+                           {"host_used_bytes", current.host_cache_used_bytes}}},
+        {"events", Json{{"blocks_inserted", delta(&RuntimeStats::blocks_inserted)},
+                        {"blocks_reattached", delta(&RuntimeStats::blocks_reattached)},
+                        {"blocks_duplicate", delta(&RuntimeStats::blocks_duplicate)},
+                        {"taps_created", delta(&RuntimeStats::taps_created)},
+                        {"taps_skipped", delta(&RuntimeStats::taps_skipped)},
+                        {"endpoints_created", delta(&RuntimeStats::endpoints_created)},
+                        {"host_image_writes", delta(&RuntimeStats::host_image_writes)},
+                        {"host_block_writes", delta(&RuntimeStats::host_block_writes)},
+                        {"host_image_restores", delta(&RuntimeStats::host_image_restores)},
+                        {"host_block_restores", delta(&RuntimeStats::host_block_restores)},
+                        {"host_write_bytes", delta(&RuntimeStats::host_write_bytes)},
+                        {"host_restore_bytes", delta(&RuntimeStats::host_restore_bytes)},
+                        {"evicted_blocks", delta(&RuntimeStats::evicted_blocks)},
+                        {"host_snapshot_evictions", delta(&RuntimeStats::host_snapshot_evictions)},
+                        {"host_dead_reclaims", delta(&RuntimeStats::host_dead_reclaims)},
+                        {"unbacked_node_losses", delta(&RuntimeStats::unbacked_node_losses)}}}};
     return record.dump();
 }
 

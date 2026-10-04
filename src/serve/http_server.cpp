@@ -55,73 +55,34 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
 }
 
 bool report_has_activity(const ThroughputReport& report) {
+    const ninfer::RuntimeStats& current  = report.current;
+    const ninfer::RuntimeStats& previous = report.previous;
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
-           report.decode_rounds != 0 || report.current.running_requests != 0 ||
-           report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
-           report.current.capture_pending_requests != 0 ||
-           report.current.terminal_pending_requests != 0 ||
-           report.current.active_captures_completed != report.previous.active_captures_completed ||
-           report.current.active_captures_aborted != report.previous.active_captures_aborted ||
-           report.current.root_selections != report.previous.root_selections ||
-           report.current.private_endpoint_selections !=
-               report.previous.private_endpoint_selections ||
-           report.current.private_turn_closure_selections !=
-               report.previous.private_turn_closure_selections ||
-           report.current.private_response_replay_selections !=
-               report.previous.private_response_replay_selections ||
-           report.current.private_long_anchor_selections !=
-               report.previous.private_long_anchor_selections ||
-           report.current.shared_stable_prefix_selections !=
-               report.previous.shared_stable_prefix_selections ||
-           report.current.state_moves != report.previous.state_moves ||
-           report.current.state_forks != report.previous.state_forks ||
-           report.current.state_restores != report.previous.state_restores ||
-           report.current.state_d2h_count != report.previous.state_d2h_count ||
-           report.current.state_h2d_count != report.previous.state_h2d_count ||
-           report.current.state_d2d_count != report.previous.state_d2d_count ||
-           report.current.main_kv_d2h_pages != report.previous.main_kv_d2h_pages ||
-           report.current.main_kv_h2d_pages != report.previous.main_kv_h2d_pages ||
-           report.current.main_kv_d2d_pages != report.previous.main_kv_d2d_pages ||
-           report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
-           report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
-           report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
-           report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
-           report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.pressure_private_owners_degraded !=
-               report.previous.pressure_private_owners_degraded ||
-           report.current.pressure_private_owners_evicted !=
-               report.previous.pressure_private_owners_evicted ||
-           report.current.pressure_shared_owners_degraded !=
-               report.previous.pressure_shared_owners_degraded ||
-           report.current.pressure_shared_owners_evicted !=
-               report.previous.pressure_shared_owners_evicted ||
-           report.current.pressure_checkpoints_dropped !=
-               report.previous.pressure_checkpoints_dropped ||
-           report.current.pressure_searches != report.previous.pressure_searches ||
-           report.current.pressure_search_budget_exhaustions !=
-               report.previous.pressure_search_budget_exhaustions ||
-           report.current.pressure_maximal_fallback_selections !=
-               report.previous.pressure_maximal_fallback_selections ||
-           report.current.historical_fork_hits != report.previous.historical_fork_hits ||
-           report.current.device_state_occupied_slots !=
-               report.previous.device_state_occupied_slots ||
-           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
-           report.current.device_main_kv_occupied_pages !=
-               report.previous.device_main_kv_occupied_pages ||
-           report.current.device_backend_kv_occupied_pages !=
-               report.previous.device_backend_kv_occupied_pages ||
-           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.shared_active_references != report.previous.shared_active_references ||
-           report.current.host_work.engine_boundary_ns !=
-               report.previous.host_work.engine_boundary_ns ||
-           report.current.host_work.program_submit_ns !=
-               report.previous.host_work.program_submit_ns ||
-           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
-           report.current.host_work.engine_commit_output_ns !=
-               report.previous.host_work.engine_commit_output_ns ||
-           report.current.host_work.engine_maintenance_ns !=
-               report.previous.host_work.engine_maintenance_ns ||
-           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
+           report.decode_rounds != 0 || current.running_requests != 0 ||
+           current.waiting_requests != 0 || current.materializing_requests != 0 ||
+           current.terminal_pending_requests != 0 ||
+           current.root_selections != previous.root_selections ||
+           current.endpoint_selections != previous.endpoint_selections ||
+           current.snapshot_selections != previous.snapshot_selections ||
+           current.device_state_occupied_slots != previous.device_state_occupied_slots ||
+           current.device_main_kv_occupied_pages != previous.device_main_kv_occupied_pages ||
+           current.device_backend_kv_occupied_pages != previous.device_backend_kv_occupied_pages ||
+           current.cached_blocks != previous.cached_blocks ||
+           current.snapshots != previous.snapshots ||
+           current.host_cache_used_bytes != previous.host_cache_used_bytes ||
+           current.blocks_inserted != previous.blocks_inserted ||
+           current.taps_created != previous.taps_created ||
+           current.endpoints_created != previous.endpoints_created ||
+           current.host_write_bytes != previous.host_write_bytes ||
+           current.host_restore_bytes != previous.host_restore_bytes ||
+           current.evicted_blocks != previous.evicted_blocks ||
+           current.host_work.engine_boundary_ns != previous.host_work.engine_boundary_ns ||
+           current.host_work.program_submit_ns != previous.host_work.program_submit_ns ||
+           current.host_work.program_post_ns != previous.host_work.program_post_ns ||
+           current.host_work.engine_commit_output_ns !=
+               previous.host_work.engine_commit_output_ns ||
+           current.host_work.engine_maintenance_ns != previous.host_work.engine_maintenance_ns ||
+           current.host_work.device_wait_ns != previous.host_work.device_wait_ns;
 }
 
 const char* endpoint_name(std::string_view path) noexcept {

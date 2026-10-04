@@ -148,9 +148,7 @@ public:
         RoundMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_decode_ready() || request->capture_pending) {
-                continue;
-            }
+            if (request == nullptr || !request->is_decode_ready()) { continue; }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
             }
@@ -177,9 +175,7 @@ public:
         ControlMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_control_ready() || request->capture_pending) {
-                continue;
-            }
+            if (request == nullptr || !request->is_control_ready()) { continue; }
             if (!request->budget || !request->sequence) {
                 throw std::logic_error("control-ready request has no generation state");
             }

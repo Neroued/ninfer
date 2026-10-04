@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
         options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
+        options.context_cache.device_snapshot_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                   = graph;
         options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
         options.kv_cache = ninfer::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
@@ -139,9 +139,21 @@ int main(int argc, char** argv) {
         require(sample1.generated_token_ids == sample2.generated_token_ids,
                 "same DFlash2 seed and inputs did not reproduce the conditional path");
 
+        // The prefix cache snapshots state at least one 64-token block from the root, so the
+        // reuse checks below continue a prompt longer than one block.
+        std::string block_text;
+        for (int sentence = 0; sentence < 8; ++sentence) {
+            block_text += "Numbers in English are written as words. ";
+        }
+        const auto block_prompt =
+            engine.tokenize_text(block_text + "Count from one to twenty: one, two, three,");
+        const auto block_reference =
+            engine.generate(engine.prepare_tokens(block_prompt), request(24)).generated_token_ids;
+
         // Terminal flush and fork must retain the consumed frontier for a later request.
-        const auto retained = engine.generate(engine.prepare_tokens(prompt), request(12, true));
-        auto continuation   = prompt;
+        const auto retained =
+            engine.generate(engine.prepare_tokens(block_prompt), request(12, true));
+        auto continuation = block_prompt;
         continuation.insert(continuation.end(), retained.generated_token_ids.begin(),
                             retained.generated_token_ids.end());
         continuation.push_back(198);
@@ -154,22 +166,22 @@ int main(int argc, char** argv) {
 
         if (k >= 7) {
             bool checked_partial = false;
-            for (std::size_t i = 1; i < std::min<std::size_t>(k, reference.size()); ++i) {
-                if (std::find(reference.begin(), reference.begin() + i, reference[i]) !=
-                    reference.begin() + i) {
+            for (std::size_t i = 1; i < std::min<std::size_t>(k, block_reference.size()); ++i) {
+                if (std::find(block_reference.begin(), block_reference.begin() + i,
+                              block_reference[i]) != block_reference.begin() + i) {
                     continue;
                 }
                 auto stopped_options = request(24, true);
-                stopped_options.stop.token_ids.push_back(reference[i]);
+                stopped_options.stop.token_ids.push_back(block_reference[i]);
                 const auto stopped =
-                    engine.generate(engine.prepare_tokens(prompt), stopped_options);
+                    engine.generate(engine.prepare_tokens(block_prompt), stopped_options);
                 const auto licensed = 1 + stopped.speculative.rounds +
                                       stopped.speculative.accepted_tokens +
                                       stopped.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
                 require(stopped.finish_reason == ninfer::FinishReason::StopToken,
                         "partial terminal did not stop at its token");
-                auto follow = prompt;
+                auto follow = block_prompt;
                 follow.insert(follow.end(), stopped.generated_token_ids.begin(),
                               stopped.generated_token_ids.end());
                 follow.push_back(198);
@@ -181,7 +193,7 @@ int main(int argc, char** argv) {
                 valid(fresh_stop, 8);
                 require(reused_stop.reused_prompt_tokens != 0 &&
                             reused_stop.reused_prompt_tokens <=
-                                prompt.size() + stopped.generated_token_ids.size() &&
+                                block_prompt.size() + stopped.generated_token_ids.size() &&
                             fresh_stop.reused_prompt_tokens == 0,
                         "partial terminal exposed an uncommitted prefix");
                 checked_partial = true;
@@ -204,9 +216,8 @@ int main(int argc, char** argv) {
             }
         }
         const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
-                "DFlash2 allocated or transferred a full backend KV pool");
+        require(stats.device_backend_kv_occupied_pages == 0,
+                "DFlash2 allocated a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
             auto long_prompt = std::vector<ninfer::TokenId>(2100, 198);
@@ -236,8 +247,8 @@ int main(int argc, char** argv) {
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " host_image_writes=" << stats.host_image_writes
+                  << " host_image_restores=" << stats.host_image_restores << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

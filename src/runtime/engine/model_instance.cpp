@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace ninfer::runtime {
@@ -59,6 +62,53 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
+// The hybrid index ranks admission sources and values snapshots with the Engine's calibrated
+// prefill and Host-to-Device coefficients. Uncalibrated (zero) terms keep the index's generic
+// defaults.
+prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& model) {
+    constexpr double kSecondsPerNs = 1.0e-9;
+    constexpr double kQ32          = 4294967296.0;
+    prefix_cache::CacheCostModel cost;
+    if (model.prefill.chunk_ns != 0) {
+        cost.chunk_seconds = static_cast<double>(model.prefill.chunk_ns) * kSecondsPerNs;
+    }
+    if (model.prefill.token_ns_q32 != 0) {
+        cost.token_seconds = static_cast<double>(model.prefill.token_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    if (model.prefill.attention_pair_ns_q32 != 0) {
+        cost.attention_pair_seconds =
+            static_cast<double>(model.prefill.attention_pair_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    const ContextTransferCost& h2d =
+        model.transfer[static_cast<std::size_t>(ContextTransferDirection::HostToDevice)];
+    if (h2d.ns_per_byte_q32 != 0) {
+        cost.h2d_bytes_per_second =
+            1.0 / (static_cast<double>(h2d.ns_per_byte_q32) / kQ32 * kSecondsPerNs);
+    }
+    if (h2d.batch_ns != 0) {
+        cost.transfer_batch_seconds = static_cast<double>(h2d.batch_ns) * kSecondsPerNs;
+    }
+    return cost;
+}
+
+// Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
+// file records itself): the exact artifact, its execution signature, the KV and speculative
+// formats and the product binary's build identity. Any difference makes the saved
+// state meaningless, so the file is ignored.
+std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(options.artifact_path, error);
+    const auto time = std::filesystem::last_write_time(options.artifact_path, error);
+    std::string out = "artifact=" + std::filesystem::absolute(options.artifact_path).string();
+    out += ";size=" + std::to_string(error ? 0U : size);
+    out += ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+    out += ";signature=" + signature;
+    out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
+    out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
+    out += ";build=" + options.context_cache.persistent_identity;
+    return out;
+}
+
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
@@ -91,49 +141,49 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
+    // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below the
+    // chunk: coarser ladders only waste snapshots on taps that share one boundary.
+    const std::uint32_t chunk = std::max<std::uint32_t>(options.prefill_chunk, 64U);
+    cache.tap_ladder_tokens =
+        cache.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
+    cache.tap_min_gap_tokens =
+        cache.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, chunk));
+    if (*cache.tap_ladder_tokens < 64 || *cache.tap_min_gap_tokens < 64) {
+        throw std::invalid_argument(
+            "prefix-cache tap ladder and minimum gap must be at least 64 tokens");
+    }
     if (!cache.enabled) {
-        if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
-            (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
-            (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
-            (cache.max_long_anchors_per_continuation &&
-             *cache.max_long_anchors_per_continuation != 0)) {
-            throw std::invalid_argument("disabled context cache accepts only root-only capacities");
+        // Every request prefills from the root and nothing is retained: no Host tier, no snapshot
+        // slot and no file.
+        if (cache.device_snapshot_slots.value_or(0U) != 0 || cache.max_new_taps.value_or(0U) != 0 ||
+            !cache.persistent_file.empty()) {
+            throw std::invalid_argument(
+                "a disabled prefix cache accepts no snapshot capacity or file");
         }
-        cache.device_state_slots                = 0;
-        cache.host_state_slots                  = 0;
-        cache.host_kv_capacity_bytes            = 0;
-        cache.max_private_continuations         = concurrency;
-        cache.max_shared_prefixes               = 0;
-        cache.max_long_anchors_per_continuation = 0;
+        cache.host_cache_bytes      = 0;
+        cache.device_snapshot_slots = 0;
+        cache.max_new_taps          = 0;
         return options;
     }
-
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
-    const std::uint64_t default_private = 2ULL * concurrency;
-    cache.max_private_continuations =
-        cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
-        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
-    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
-
-    if (*cache.max_private_continuations < concurrency) {
-        throw std::invalid_argument(
-            "context cache max_private_continuations must cover every active request");
+    // One pinned Host slab pool serves blocks and snapshots alike; its size is the only capacity a
+    // deployment has to choose (docs/maintainer/hybrid-prefix-cache.md §5.4).
+    const bool host_tier = cache.host_cache_bytes != 0;
+    // One resident snapshot per request lane keeps every live conversation's latest endpoint
+    // restorable without PCIe traffic; one more slot stages taps and endpoints while their Host
+    // copies are written. Without a Host tier these slots are the only snapshot storage, so one
+    // more is kept for shared prefixes.
+    cache.device_snapshot_slots =
+        cache.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+    // Taps without a Host tier would evict other conversations' resident snapshots.
+    cache.max_new_taps = cache.max_new_taps.value_or(host_tier ? 8U : 2U);
+    if (*cache.device_snapshot_slots == 0 || *cache.device_snapshot_slots > 64) {
+        throw std::invalid_argument("prefix-cache device snapshot slots must be in [1,64]");
     }
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
+    if (*cache.max_new_taps > 64) {
+        throw std::invalid_argument("prefix-cache taps per request must be at most 64");
     }
-    const std::uint64_t address_spaces =
-        static_cast<std::uint64_t>(*cache.max_private_continuations) + *cache.max_shared_prefixes;
-    if (address_spaces > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache address-space capacity exceeds uint32");
-    }
-    if (*cache.max_long_anchors_per_continuation != 0 &&
-        *cache.max_private_continuations >
-            std::numeric_limits<std::size_t>::max() / *cache.max_long_anchors_per_continuation) {
-        throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
+    if (!cache.persistent_file.empty() && !host_tier) {
+        throw std::invalid_argument("a persistent prefix-cache file needs a Host tier");
     }
     return options;
 }
@@ -188,6 +238,29 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
                                                         device, options.startup_observer);
+    LoadSummary::PrefixCacheRestore restore;
+    if (options.context_cache.enabled && options.purpose == EnginePurpose::Generation) {
+        instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
+        const std::filesystem::path& file = options.context_cache.persistent_file;
+        if (!file.empty()) {
+            const models::qwen3_5::HybridCachePersistence loaded =
+                instance->program->attach_hybrid_cache_file(
+                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+            restore = LoadSummary::PrefixCacheRestore{
+                .attempted           = true,
+                .restored            = loaded.ok,
+                .message             = loaded.message,
+                .blocks              = loaded.blocks,
+                .snapshots           = loaded.snapshots,
+                .bytes               = loaded.bytes,
+                .seconds             = loaded.seconds,
+                .saved_blocks        = loaded.saved_blocks,
+                .saved_snapshots     = loaded.saved_snapshots,
+                .required_host_bytes = loaded.required_host_bytes,
+                .host_bytes          = loaded.host_bytes,
+            };
+        }
+    }
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -211,7 +284,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
-    return {std::move(instance), std::move(summary), std::move(context_cost.model)};
+    summary.prefix_cache         = std::move(restore);
+    return {std::move(instance), std::move(summary)};
 }
 
 } // namespace ninfer::runtime

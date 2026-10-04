@@ -982,6 +982,16 @@ Admission resumes from the deepest snapshot on the prompt's path and computes on
 tokens. Marker, opener and structural snapshots split a prefill chunk at their exact position; the
 prompt tail and ladder snapshots are taken at chunk boundaries at no extra forward pass.
 
+A resume reproduces the cold prefill of the same prompt under the same cache settings bit for bit:
+a snapshot is a copy of the state the first request computed (conv history, recurrent state, last
+hidden and a DFlash2 local ring), and snapshot positions are a function of the prompt. Greedy output
+can still differ between a Host or Device cache with snapshots and `--no-prefix-reuse` (or
+`--cache-taps-per-request 0`), because a split chunk is a different floating-point decomposition of
+the same prompt, exactly as a different `--prefill-chunk` is. `--cache-taps-per-request 0` removes
+the splits, so a request that resumes nothing prefills exactly as it does with `--no-prefix-reuse`,
+at the price of mid-prompt resumes. An endpoint resume still continues from the state the previous
+request decoded, so only `--no-prefix-reuse` makes every request's output independent of the cache.
+
 Device pages no active request holds stay cached and are evicted least recently used, deepest block
 first, when an admission needs them. With a Host tier, a request's blocks and snapshots are written
 through to pinned Host memory when it releases them. Host eviction removes superseded snapshots

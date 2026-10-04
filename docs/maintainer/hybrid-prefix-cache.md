@@ -46,10 +46,10 @@ The cache configures itself: the only capacity a deployment chooses is `--host-c
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §12.2 in-flight prefix coalescing | not included: it needs a request quoted while another prefills, and the Engine admits only while no request is in staged prefill (§16.2) |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
-| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
+| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1). The implemented tap already copies the whole StateImage (conv, recurrent, hidden, DFlash local ring); §7.8 records what the split does to greedy output |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §12 optional features other than 12.1, §13.2 Op qualification | not implemented |
-| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4) |
+| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), tap resume vs cold prefill exactness (without speculation and with DFlash2), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4) |
 
 ## 0. Summary
 
@@ -644,8 +644,11 @@ breakpoint or structural boundary falls inside the new tokens.
 ### 7.2 Phase-aligned chunked GDN
 
 **Not implemented** (§7.2 and §7.3 together form the zero-split tap). The implemented tap copies
-the lane's committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a split.
-Build this only if measurement shows the remaining exact-tap split matters.
+the lane's whole committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a
+split. The split also changes the floating-point decomposition of the prompt (§7.8); phase
+alignment would remove that for the Gated DeltaNet scan only, and §7.8 shows the other ops are
+chunk-boundary sensitive too, so it would not make a resume match a prefill without taps. Build
+this only if measurement shows the remaining exact-tap split matters.
 
 The chunked GDN kernel's intra-chunk grid is relative to the call start. To make every internal
 boundary an absolute multiple of 64, the Op gains a `phase = base % 64` parameter:
@@ -663,7 +666,11 @@ change in `TextContext::prefill`.
 
 ### 7.3 Tap Op contracts
 
-**Not implemented** (the design of the zero-split tap, with §7.2).
+**Not implemented** (the design of the zero-split tap, with §7.2). What is implemented captures
+more than this list: the tap is a copy of the lane's StateImage, which holds every per-layer
+conv history and recurrent state, the continuation hidden, and for a DFlash/DFlash2 Program the
+local K/V ring (`StateImageSpec`). A resume therefore re-materializes nothing beyond the KV blocks
+the tree already holds.
 
 For each prefill unit with taps `T_u = T ∩ (unit_begin, unit_end]`, `|T_u| ≤ taps_per_unit`
 (default 4, bounded by free snapshot slots):
@@ -759,6 +766,47 @@ At terminal settlement (Finish, or Cancel after at least one committed unit):
 
 `Disabled` requests (Serve warmup, `--no-prefix-reuse`, CLI generation) never insert nodes or
 snapshots. Their pages are freed at terminal.
+
+### 7.8 Reproducibility contract
+
+Greedy generation is a function of the prompt and of the floating-point decomposition used to
+prefill it. The cache preserves the decomposition and cannot make two decompositions agree:
+
+- **A resume is bit-exact with a cold prefill under the same cache settings.** A snapshot is a copy
+  of state a request computed on its own chunk grid, and tap positions are a function of the
+  prompt, so a request that resumes from a tap and one that prefills from the root run the same
+  grid from the tap onward (§7.1). `resume-exact` in the real hybrid test checks this for no
+  speculation and DFlash2.
+- **Splitting a chunk changes the decomposition.** Exact taps split one chunk, so a prefill with
+  taps generates different greedy tokens than `--no-prefix-reuse` or `--cache-taps-per-request 0`,
+  just as another `--prefill-chunk` does. Endpoint resumes continue from decode-computed state, so
+  they differ from a prefill of the echoed tokens in the same way. Only `--no-prefix-reuse` makes
+  every output independent of the cache.
+- **Chunk boundaries move the output even at 64-token multiples.** Gated DeltaNet's scan grid is
+  relative to the call start, so chunks starting at multiples of 64 share one absolute grid, yet
+  different `--prefill-chunk` values still change greedy output. Some other prefill Op depends on
+  the chunk it is called with (not isolated here). Phase-aligned GDN (§7.2) therefore does not
+  restore bit equality with an unsplit prefill by itself.
+
+Measured on the Qwen3.8-27B official NVFP4 artifact, RTX 5090 (WSL2), `--prefill-chunk 4096`, eight
+conversations of 17–44K prompt tokens each (system block, a haystack of repository documents and a
+question; thinking on), 300 greedy tokens per answer. The first prefill is a 10–22K-token prefix of
+the second, so the second resumes from a prompt-tail or ladder tap when its snapshot survives
+(`taps_created` and `host_snapshot_evictions` show the Host tier overflowing after the third
+conversation, so only the first one to three resumed). "Identical" counts conversations whose 300
+tokens match; the number after it is the generated-token index of the first difference.
+
+| comparison | bf16 KV, no speculation | K8V4 KV, DFlash2 |
+|---|---|---|
+| the same run twice | 8/8 identical | 8/8 identical |
+| cache with taps, resumed vs cold prefill | 8/8 identical (1 resumed) | 8/8 identical (3 resumed) |
+| `--no-prefix-reuse` vs cache with taps | 1/8 identical; first differences at 38–211 | 0/8 identical; 8–93 |
+| `--no-prefix-reuse` vs taps 0 | 8/8 identical | 8/8 identical |
+| `--no-prefix-reuse`, chunk 4096 vs 3968 | 1/8 identical; 8–113 | 0/8 identical; 8–83 |
+| `--no-prefix-reuse`, chunk 4096 vs 2048 | 1/8 identical; 8–116 | not run |
+
+Tap splits move greedy output as much as a chunk-size change does, and a resume adds nothing to
+either.
 
 ---
 

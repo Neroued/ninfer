@@ -146,6 +146,68 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     return failures;
 }
 
+// Pseudo-prose of exactly `count` tokens: random words give a continuation with real
+// probability ties, so a different floating-point decomposition shows up in greedy output
+// within a few dozen tokens (random token ids continue too confidently to show it).
+std::vector<ninfer::TokenId> prose_tokens(const ninfer::Engine& engine, std::size_t count,
+                                          std::uint32_t seed) {
+    static constexpr std::array<std::string_view, 24> kWords{
+        "river",   "ledger",  "harbor",  "violet",  "copper", "winter",  "signal",  "garden",
+        "market",  "engine",  "silver",  "morning", "bridge", "pattern", "lantern", "meadow",
+        "thunder", "compass", "orchard", "canvas",  "ember",  "voyage",  "mirror",  "granite"};
+    std::string text;
+    std::uint32_t state = seed * 2654435761U + 1U;
+    std::vector<ninfer::TokenId> tokens;
+    while (tokens.size() < count) {
+        for (int word = 0; word < 400; ++word) {
+            state = state * 1664525U + 1013904223U;
+            text += kWords[(state >> 8U) % kWords.size()];
+            text += (state >> 20U) % 9U == 0 ? ". " : " ";
+        }
+        tokens = engine.tokenize_text(text);
+    }
+    tokens.resize(count);
+    return tokens;
+}
+
+// Resuming from a tap is bit-exact with prefilling the same prompt cold: the snapshot is the state
+// the first request computed on the same chunk grid, so a second Engine that never saw the first
+// prompt generates the same tokens. Raw-token prompts carry no hints, so neither request splits a
+// chunk. The comparison would not hold across chunk decompositions: another --prefill-chunk
+// changes greedy output on its own (docs/maintainer/hybrid-prefix-cache.md, section 7.8).
+int exercise_resume_exact(const char* artifact, ninfer::SpeculativeBackend backend) {
+    constexpr std::uint32_t kOutputs = 160;
+    const auto run                   = [&](bool prime) {
+        ninfer::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+        const std::vector<ninfer::TokenId> first = prose_tokens(engine, 3000, 6);
+        std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 2800);
+        const std::vector<ninfer::TokenId> suffix = prose_tokens(engine, 400, 7);
+        second.insert(second.end(), suffix.begin(), suffix.end());
+        if (prime) { (void)engine.generate(engine.prepare_tokens(first), greedy(8)); }
+        return engine.generate(engine.prepare_tokens(second), greedy(kOutputs));
+    };
+    const ninfer::GenerationResult warm = run(true);
+    const ninfer::GenerationResult cold = run(false);
+
+    // The first prompt's final chunk [2560, 3000) holds its flexible prompt-tail tap, realized at
+    // its start, inside the 2800 tokens the prompts share.
+    constexpr std::uint32_t kExpectedReuse = 5 * kPrefillChunk;
+    int failures                           = 0;
+    if (warm.reused_prompt_tokens != kExpectedReuse || cold.reused_prompt_tokens != 0) {
+        std::cerr << "resume-exact: reused warm=" << warm.reused_prompt_tokens
+                  << " cold=" << cold.reused_prompt_tokens << ", expected " << kExpectedReuse
+                  << " and 0\n";
+        ++failures;
+    }
+    if (warm.generated_token_ids.size() != kOutputs ||
+        warm.generated_token_ids != cold.generated_token_ids) {
+        std::cerr << "resume-exact: the tap resume generated different tokens than a cold "
+                  << "prefill\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // A restarted Engine resumes from the Host tier its predecessor saved: the restored snapshot is
 // the same bytes, so greedy generation matches an Engine that never restarted. A file written for
 // a different build identity is ignored, and a Host tier one slab smaller than the file restores
@@ -473,15 +535,17 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 9> kScenarios{"all",
-                                                         "restore-exact",
-                                                         "restore-exact-mtp",
-                                                         "restore-exact-dflash2",
-                                                         "turns",
-                                                         "turns-device-only",
-                                                         "vision",
-                                                         "persist",
-                                                         "turns-protocol"};
+    constexpr std::array<std::string_view, 11> kScenarios{"all",
+                                                          "restore-exact",
+                                                          "restore-exact-mtp",
+                                                          "restore-exact-dflash2",
+                                                          "resume-exact",
+                                                          "resume-exact-dflash2",
+                                                          "turns",
+                                                          "turns-device-only",
+                                                          "vision",
+                                                          "persist",
+                                                          "turns-protocol"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
         std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
@@ -497,6 +561,12 @@ int main() {
         }
         if (all || scenario == "restore-exact-dflash2") {
             failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "resume-exact") {
+            failures += exercise_resume_exact(artifact, ninfer::SpeculativeBackend::None);
+        }
+        if (all || scenario == "resume-exact-dflash2") {
+            failures += exercise_resume_exact(artifact, ninfer::SpeculativeBackend::DFlash2);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }

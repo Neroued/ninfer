@@ -645,10 +645,11 @@ breakpoint or structural boundary falls inside the new tokens.
 
 **Not implemented** (§7.2 and §7.3 together form the zero-split tap). The implemented tap copies
 the lane's whole committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a
-split. The split also changes the floating-point decomposition of the prompt (§7.8); phase
-alignment would remove that for the Gated DeltaNet scan only, and §7.8 shows the other ops are
-chunk-boundary sensitive too, so it would not make a resume match a prefill without taps. Build
-this only if measurement shows the remaining exact-tap split matters.
+split. The split also changes the floating-point decomposition of the prompt (§7.8): after a split
+at a position that is not a multiple of 64, the scan's output differs from an unsplit prefill.
+Phase alignment would remove that, but chunk width selects other routes too (§7.8), so on its own
+it would not make a prefill with taps match one without. Build this only if measurement shows the
+remaining exact-tap split matters.
 
 The chunked GDN kernel's intra-chunk grid is relative to the call start. To make every internal
 boundary an absolute multiple of 64, the Op gains a `phase = base % 64` parameter:
@@ -782,11 +783,25 @@ prefill it. The cache preserves the decomposition and cannot make two decomposit
   just as another `--prefill-chunk` does. Endpoint resumes continue from decode-computed state, so
   they differ from a prefill of the echoed tokens in the same way. Only `--no-prefix-reuse` makes
   every output independent of the cache.
-- **Chunk boundaries move the output even at 64-token multiples.** Gated DeltaNet's scan grid is
-  relative to the call start, so chunks starting at multiples of 64 share one absolute grid, yet
-  different `--prefill-chunk` values still change greedy output. Some other prefill Op depends on
-  the chunk it is called with (not isolated here). Phase-aligned GDN (§7.2) therefore does not
-  restore bit equality with an unsplit prefill by itself.
+- **Prefill Ops choose their arithmetic by call width.** Comparing per-layer activations of the
+  same prompt prefilled with different chunks isolated each source (27B NVFP4 artifact, FP8 A8
+  projections, bf16 KV); none is in prefix-cache code:
+  - FP8 A8 linears split K for the tiles of the last partial wave (`fp8_tma_split_k_plan`), so
+    which columns reduce in parts depends on the call width;
+  - the FP8 epilogue's scale and residual arithmetic contracts differently in the full-tile and
+    ragged-tile instantiations (identical with explicit `__fmul_rn`/`__fadd_rn`);
+  - the BF16 GDN gating projection picks its split count from the width (`k27Routes`);
+  - causal attention runs chunks of at most 256 queries (80 for FP8 KV) on the grouped kernel with
+    split keys, and wider chunks on the tiled kernel;
+  - below 17 columns the FP8 projections take the A16 route instead of A8, and the gating
+    projection its small-width routes, so the few tokens after a generation-opener split are
+    computed at a different activation precision;
+  - the chunked GDN scan's grid is relative to the call start (§7.2), so a split that is not a
+    multiple of 64 changes every later position.
+
+  With the first three neutralised, prefills with chunks 4096 and 3968 agree bit for bit at all
+  37,937 positions of one prompt; an exact tap then still differs through the last two. Phase
+  alignment alone therefore does not give bit equality with an unsplit prefill.
 
 Measured on the Qwen3.8-27B official NVFP4 artifact, RTX 5090 (WSL2), `--prefill-chunk 4096`, eight
 conversations of 17–44K prompt tokens each (system block, a haystack of repository documents and a
@@ -807,6 +822,12 @@ tokens match; the number after it is the generated-token index of the first diff
 
 Tap splits move greedy output as much as a chunk-size change does, and a resume adds nothing to
 either.
+
+The differences are rounding-level per Op and within each Op's qualification tolerance; they matter
+for reproducibility, not accuracy. On one 37,937-token prompt the last layer's hidden states for
+chunk 3968 against chunk 4096 have median cosine similarity 0.992 (1st percentile 0.29), and
+K8V4 against bf16 KV, a supported storage choice, gives 0.990 (0.28): long-context greedy decoding
+amplifies any perturbation of that size into a different but equally valid continuation.
 
 ---
 

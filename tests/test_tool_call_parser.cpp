@@ -218,15 +218,99 @@ int test_unrepresentable_parameter_delimiters_fall_back() {
     const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
     const std::string unmatched_open =
         tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
-    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+    // Only a closer followed by the next grammar token can end the value.
+    const std::string closer_before_structure =
+        tool_call("bash", {{"command", "echo\n</parameter>\n</function>\ntail"}});
 
     int failures = 0;
     failures += check_rejected(unmatched_open, contract,
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
+    failures += check_rejected(closer_before_structure, contract,
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+                               "structurally ambiguous parameter close was guessed");
+    return failures;
+}
+
+int test_quoted_parameter_close_stays_in_value() {
+    const auto contract =
+        contract_for("agent", Json{{"task", Json{{"type", "string"}}},
+                                   {"mode", Json{{"type", "string"}}}});
+    // Shape of an observed advisor call: prose quotes the closer sequence with escaped newlines.
+    const std::string task = "Failures:\n"
+                             "   2. `</parameter>\\n</function>\\n</tool_call>` - stopped mid value\n"
+                             "   4. `>\\n</function>` - stopped mid `</parameter>`\n"
+                             "echo '</parameter>'";
+    const std::string text = tool_call("agent", {{"task", task}, {"mode", "read"}});
+    const auto parsed      = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.content.empty(),
+                      "quoted parameter close demoted a valid call to text");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("task") == task && args.at("mode") == "read",
+                          "quoted parameter close changed parameter values");
+    }
+    const std::string truncated = "<tool_call>\n<function=agent>\n<parameter=task>\n" + task;
+    failures += check_rejected(truncated, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "truncated value with quoted closers was accepted");
+    return failures;
+}
+
+int test_quoted_marker_before_real_call() {
+    const auto contract = contract_for("todo_write", Json{{"todos", Json{{"type", "array"}}}});
+    // Shape of an observed turn: reasoning quoted the opener, then the model made the real call.
+    const std::string prose = "Avoid `<tool_call>\n<function=NAME>`; set continuation.\n"
+                              "Design ready; recording the plan.";
+    const std::string call  = tool_call("todo_write", {{"todos", "[{\"id\":\"a\"}]"}});
+    const std::string text  = prose + "\n\n" + call;
+
+    int failures = 0;
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.content == prose && parsed.diagnostics.marker_seen &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "quoted marker swallowed the real call");
+
+    // Every call after the quote is kept, not only the last one.
+    const std::string two  = prose + "\n" + call + "\n" + call;
+    const auto both        = fi::parse_qwen_tool_call_output(two, 64, contract);
+    failures += check(both.tool_calls.size() == 2 && both.content == prose,
+                      "recovery dropped an earlier call of a multi-call suffix");
+
+    // A marker quoted inside the real call's value does not hide the call itself.
+    const auto bash     = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted_value = prose + "\n" + tool_call("bash", {{"command", "grep '<tool_call>'"}});
+    const auto in_value = fi::parse_qwen_tool_call_output(quoted_value, 64, bash);
+    failures += check(in_value.tool_calls.size() == 1 && in_value.content == prose,
+                      "marker quoted in the recovered call's value was chosen as the start");
+
+    // A complete first call is not a quote, so a later call is not executed on its own.
+    failures += check_rejected(call + "\nNow also:\n" + call, contract,
+                               ninfer::ToolCallParseFallbackReason::TrailingContent,
+                               "a later call was recovered after a complete first call");
+
+    // Every candidate fails: raw bytes and the first marker's reason are kept.
+    failures += check_rejected(prose + "\nthen <tool_call> again", contract,
+                               ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                               "failed recovery lost raw bytes or the primary reason");
+
+    // Streamed in uneven chunks, including a split inside the quoted marker.
+    for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+        fi::ToolCallOutputDecoder decoder(
+            output_contract_for("todo_write", Json{{"todos", Json{{"type", "array"}}}}), 64);
+        std::string visible;
+        for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
+            visible += decoder.feed(std::string_view(text).substr(offset, chunk));
+        }
+        auto terminal = decoder.finish();
+        failures += check(visible + terminal.content == prose && terminal.tool_calls.size() == 1,
+                          "streamed quoted marker lost prose bytes or the real call");
+    }
     return failures;
 }
 
@@ -742,6 +826,8 @@ int main() {
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_quoted_parameter_close_stays_in_value();
+    failures += test_quoted_marker_before_real_call();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

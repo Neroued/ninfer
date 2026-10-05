@@ -1153,11 +1153,13 @@ void validate_common_top_level(const Json& body, bool create) {
 } // namespace
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& body,
-                                                                   const RequestLimits& limits) {
+                                                                   const RequestLimits& limits,
+                                                                   bool auto_system_shared_prefix) {
     require_object(body);
     validate_common_top_level(body, true);
     reject_unsupported_platform_fields(body);
-    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    cache_policy.auto_system_shared_prefix = auto_system_shared_prefix;
 
     ParsedPromptFields parsed  = parse_prompt_fields(body, limits);
     parsed.prompt.cache_policy = cache_policy;

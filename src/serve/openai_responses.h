@@ -75,7 +75,9 @@ struct BuiltOpenAIResponse {
 };
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const RequestJson& body,
-                                                                   const RequestLimits& limits);
+                                                                   const RequestLimits& limits,
+                                                                   bool auto_system_shared_prefix =
+                                                                       true);
 
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const RequestJson& body, const RequestLimits& limits);

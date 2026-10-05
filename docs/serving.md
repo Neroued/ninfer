@@ -791,6 +791,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--no-auto-system-shared-prefix` | disable the automatic shared-prefix candidate at the leading system/developer frontier (Responses path; see below) | on |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
@@ -820,6 +821,19 @@ Host state and Main/Backend KV share one startup-fixed byte budget; this is cont
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
+
+### Automatic system/developer shared prefix
+
+OpenAI-protocol requests publish automatic shared-prefix candidates at the last-content implicit
+frontier. For agent-style clients that never send `prompt_cache_breakpoint` (Hermes, OpenCode, Copilot,
+MCP, …), the leading system/developer head would otherwise miss every request. By default the server
+additionally publishes one `DefaultAutomatic` candidate at the **end of the contiguous leading
+turn** so sibling sessions sharing that head reuse it without a client marker (responding to #142).
+The candidate reserves one of the four frontend marker slots, so requests at the explicit-marker cap
+stay within `kMaximumExplicitPromptCacheMarkers`; explicit `prompt_cache_options.mode` never adds it.
+`--no-auto-system-shared-prefix` disables the extra candidate. The flag is currently wired to the
+Responses protocol only; Chat Completions uses the default-on policy value (matching the original
+#142/#152 proposal scope, where the Chat parse signature was deliberately left unchanged).
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

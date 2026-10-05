@@ -282,6 +282,75 @@ int test_prompt_cache_boundaries() {
     return failures;
 }
 
+int test_auto_system_shared_prefix() {
+    using Evidence = ninfer::SharedCandidateEvidence;
+    int failures   = 0;
+
+    // 1. A leading system run without any client breakpoint publishes the
+    //    system/developer frontier candidate (gated on the last-content auto).
+    Json head         = base_request();
+    head["messages"] = Json::array();
+    head["messages"].push_back(Json{{"role", "system"}, {"content", "shared agent head"}});
+    head["messages"].push_back(Json{{"role", "user"}, {"content", "hello"}});
+    const auto system_req = parse(head).generation;
+    failures += check(
+        system_req.messages.size() == 2 &&
+            system_req.messages[0].cache_boundary_after.has_value() &&
+            system_req.messages[0].cache_boundary_after->evidence == Evidence::DefaultAutomatic,
+        "leading system turn gets an automatic shared-prefix candidate");
+    failures += check(
+        !system_req.messages[1].cache_boundary_after.has_value() &&
+            system_req.messages.back().content.back().cache_boundary_after.has_value(),
+        "frontier candidate keeps the last-content candidate untouched");
+
+    // 2. The candidate sits after a contiguous system+developer run (both lead).
+    head["messages"] = Json::array();
+    head["messages"].push_back(Json{{"role", "system"}, {"content", "head"}});
+    head["messages"].push_back(Json{{"role", "developer"}, {"content", "config"}});
+    head["messages"].push_back(Json{{"role", "user"}, {"content", "hi"}});
+    const auto dev_req = parse(head).generation;
+    failures += check(
+        dev_req.messages.size() == 3 && !dev_req.messages[0].cache_boundary_after.has_value() &&
+            dev_req.messages[1].cache_boundary_after.has_value() &&
+            dev_req.messages[1].cache_boundary_after->evidence == Evidence::DefaultAutomatic,
+        "system+developer run marks the end (developer) turn, not the first turn");
+
+    // 3. Flushes to the marker-set cap: 4 explicit boundaries + the new
+    //    candidate must stay within kMaximumExplicitPromptCacheMarkers
+    //    (the P1 finding on the original #152 — overflow would 400 at frontend).
+    Json filled          = base_request();
+    Json filled_messages = Json::array();
+    filled_messages.push_back(Json{{"role", "system"}, {"content", "head"}});
+    Json four = Json::array();
+    for (int index = 0; index < 4; ++index) {
+        four.push_back(Json{{"type", "text"},
+                            {"text", "section " + std::to_string(index)},
+                            {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}});
+    }
+    filled_messages.push_back(Json{{"role", "user"}, {"content", four}});
+    filled["messages"] = filled_messages;
+    const auto capped   = prompt(parse(filled).generation);
+    failures += check(capped.context_cache.markers.size() <= 4U &&
+                          capped.context_cache.markers.size() <=
+                              ninfer::kMaximumExplicitPromptCacheMarkers,
+                      "four explicit boundaries + system candidate stay within the 4-marker cap");
+
+    // 4. explicit mode (automatic disabled) publishes no system candidate.
+    Json explicit_mode         = base_request();
+    explicit_mode["messages"] = Json::array();
+    explicit_mode["messages"].push_back(Json{{"role", "system"}, {"content", "head"}});
+    explicit_mode["messages"].push_back(Json{{"role", "developer"}, {"content", "config"}});
+    explicit_mode["messages"].push_back(Json{{"role", "user"}, {"content", "hi"}});
+    explicit_mode["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    const auto explicit_req = parse(explicit_mode).generation;
+    failures += check(
+        !explicit_req.messages[1].cache_boundary_after.has_value() &&
+            !explicit_req.messages[2].cache_boundary_after.has_value(),
+        "explicit mode disables the automatic system-frontier candidate");
+
+    return failures;
+}
+
 int test_constrained_decoding_extensions() {
     int failures                                           = 0;
     const std::vector<std::pair<const char*, Json>> active = {
@@ -879,6 +948,7 @@ int main() {
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_prompt_cache_boundaries();
+    failures += test_auto_system_shared_prefix();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();

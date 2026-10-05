@@ -879,7 +879,8 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 
 } // namespace
 
-OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
+OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits,
+                                                 bool auto_system_shared_prefix) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
     validate_constrained_decoding_extensions(body);
@@ -892,7 +893,8 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     output.model = body.at("model").get<std::string>();
 
-    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+    cache_policy.auto_system_shared_prefix = auto_system_shared_prefix;
 
     parse_tools(body, output.generation);
     parse_tool_choice(body, output.generation);

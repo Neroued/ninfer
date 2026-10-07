@@ -3,6 +3,9 @@ add_library(ninfer_media_acquire STATIC
 )
 ninfer_internal_includes(ninfer_media_acquire)
 target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+if(WIN32)
+  target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+endif()
 
 add_library(ninfer_product_prompt_input STATIC
   prompt_input/prompt_input.cpp

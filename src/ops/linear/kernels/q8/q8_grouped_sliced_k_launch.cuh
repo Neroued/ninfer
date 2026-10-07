@@ -27,8 +27,16 @@ void launch_q8_a16_grouped_sliced_k_mma(const Q8LinearOperands& operands, Output
                 constexpr auto kernel =
                     q8_a16_grouped_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue>;
                 const int shared = common::prepare_shared<Schedule::kSharedBytes, kernel>();
+#if defined(_MSC_VER)
+                // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+                // captured by this lambda (C2326), so reference the kernel template directly.
+                q8_a16_grouped_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue>
+                    <<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
+                                                                  offset, count);
+#else
                 kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
                                                                      offset, count);
+#endif
                 CUDA_CHECK(cudaGetLastError());
             };
             if (operands.rows % 16 == 0 && operands.k == operands.padded_k &&

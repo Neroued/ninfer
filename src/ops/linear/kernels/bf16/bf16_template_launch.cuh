@@ -91,8 +91,16 @@ void launch_bf16_mma_partitions(const Bf16A16Operands& p, Output output, Epilogu
             constexpr auto kernel = bf16_a16_mma_kernel<Schedule, Full, Output, Epilogue, Splits>;
             const int bytes =
                 common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
+#if defined(_MSC_VER)
+            // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+            // captured by this lambda (C2326), so reference the kernel template directly.
+            bf16_a16_mma_kernel<Schedule, Full, Output, Epilogue, Splits>
+                <<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue,
+                                                               p.rows, p.k, offset, count);
+#else
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue,
                                                                 p.rows, p.k, offset, count);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)
@@ -122,8 +130,14 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
                             ? common::div_up(p.rows, Schedule::kBlockRows)
                             : p.rows / Schedule::kBlockRows,
                         common::div_up(count, Schedule::kBlockTokens));
+#if defined(_MSC_VER)
+        bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
+                                                          p.k, p.tokens, offset);
+#else
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
                                                             p.k, p.tokens, offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
 }

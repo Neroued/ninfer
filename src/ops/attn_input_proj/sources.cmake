@@ -7,6 +7,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a16_small_t.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a16_gemm.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a8.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a8_tma_pilot.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_small_t.cu"

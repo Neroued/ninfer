@@ -4,6 +4,10 @@ add_library(ninfer_text STATIC
 )
 ninfer_internal_includes(ninfer_text)
 target_include_directories(ninfer_text PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+if(WIN32)
+  # utf8proc.h defaults to __declspec(dllimport); force static linkage.
+  target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
+endif()
 
 # Language evaluation reuses the engine's Unicode and JSON dependencies.
 target_sources(ninfer_jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/jinja.cpp)

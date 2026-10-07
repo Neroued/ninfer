@@ -22,9 +22,16 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, partition.capacity);
+#if defined(_MSC_VER)
+        mxfp8_kv_tiled_mma_kernel<G, S, Values, Metadata>
+            <<<grid, S::kThreads, S::kSharedBytes, stream>>>(
+                p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
+                p.positions, p.scale, p.width, partition, partial);
+#else
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
             p.positions, p.scale, p.width, partition, partial);
+#endif
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows)

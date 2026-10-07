@@ -113,6 +113,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{8, ops::LinearPolicy::AllowA4},
         Invocation{16, ops::LinearPolicy::AllowA4},
         Invocation{32, ops::LinearPolicy::AllowA4},
+        // 32 and 33 straddle the K=17408 narrow-tile seam: the last width M32N32 takes and the
+        // first that returns to M32N64.
+        Invocation{33, ops::LinearPolicy::AllowA4},
         Invocation{64, ops::LinearPolicy::AllowA4},
         Invocation{96, ops::LinearPolicy::AllowA4},
         Invocation{128, ops::LinearPolicy::AllowA4},

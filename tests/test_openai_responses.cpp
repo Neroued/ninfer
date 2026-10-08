@@ -1070,6 +1070,60 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_custom_tool_lowering() {
+    // A top-level custom tool is accepted, lowered to a function the Engine can call, and tracked
+    // so the response re-emits a `custom_tool_call` Item with a raw `input` string.
+    const Json body = {{"model", "m"},
+                       {"input", "list the files"},
+                       {"tools",
+                        Json::array({Json{{"type", "custom"},
+                                           {"name", "shell"},
+                                           {"input_schema", Json{{"type", "object"}}}}})}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    int failures = 0;
+    failures += check(request.prompt.generation.tools.size() == 1 &&
+                          request.prompt.generation.tools[0].name == "shell" &&
+                          request.custom_tool_engine_names.contains("shell"),
+                      "a top-level custom tool is lowered to a function and tracked");
+    failures += check(request.tools[0].at("type") == "custom" &&
+                          request.tools[0].contains("input_schema") &&
+                          !request.tools[0].contains("parameters"),
+                      "the custom tool echoes back with input_schema, not parameters");
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.text.clear();
+    outcome.reasoning.clear();
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "shell", .arguments_json = R"({"command":"ls"})"});
+    OpenAIResponsesRuntimeValues runtime;
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_custom", 123, request, runtime, outcome);
+    const Json& item = built.body.at("output").at(0);
+    failures += check(item.at("type") == "custom_tool_call" && item.at("input") == R"({"command":"ls"})",
+                      "a custom tool call is emitted as a custom_tool_call Item with raw input");
+
+    // Multi-turn history: an assistant custom_tool_call followed by its custom_tool_call_output.
+    const Json history = {{"model", "m"},
+                          {"input",
+                           Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "list"}},
+                                        Json{{"type", "custom_tool_call"},
+                                             {"call_id", "call_s1"},
+                                             {"name", "shell"},
+                                             {"input", R"({"command":"ls"})"},
+                                             {"status", "completed"}},
+                                        Json{{"type", "custom_tool_call_output"},
+                                             {"call_id", "call_s1"},
+                                             {"output", "README.md"},
+                                             {"status", "completed"}}})}};
+    const OpenAIResponsesCreateRequest replayed =
+        parse_openai_responses_create_request(history, limits());
+    failures += check(replayed.prompt.input_turns.back().role == ninfer::ChatRole::Tool &&
+                          replayed.prompt.input_turns.back().tool_call_id == "call_s1",
+                      "a custom_tool_call_output is lowered to a Tool turn in model history");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1086,6 +1140,7 @@ int main() {
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
+    failures += test_custom_tool_lowering();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }

@@ -8,8 +8,11 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
-#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_contract.h"
+#include "models/qwen3_5/frontend/tool_grammar.h"
 #include "text/unicode.h"
+#include "text/grammar.h"
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -567,7 +570,8 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
-        sampling = default_sampling(options.architecture);
+        sampling            = default_sampling(options.architecture);
+        grammar_cache_bytes = options.grammar_cache_bytes;
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -605,8 +609,25 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool vision_enabled       = true;
-    std::uint32_t max_context = 0;
+    bool vision_enabled             = true;
+    std::uint32_t max_context       = 0;
+    std::size_t grammar_cache_bytes = 0;
+    mutable std::once_flag grammar_once;
+    mutable std::unique_ptr<text::GrammarCompiler> grammar_compiler;
+
+    text::GrammarCompiler& grammars() const {
+        std::call_once(grammar_once, [&] {
+            std::vector<std::string> vocab(tokenizer->vocab_size());
+            for (std::size_t id = 0; id < vocab.size(); ++id) {
+                if (!tokenizer->is_valid_token(static_cast<TokenId>(id))) { continue; }
+                const auto decoded = tokenizer->decoded_token(static_cast<TokenId>(id));
+                if (!decoded.special) { vocab[id] = decoded.bytes; }
+            }
+            grammar_compiler = std::make_unique<text::GrammarCompiler>(
+                std::move(vocab), defaults.token_ids, grammar_cache_bytes);
+        });
+        return *grammar_compiler;
+    }
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -698,8 +719,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output =
-        fi::build_tool_call_output_contract(options.tool_jsons, !options.tool_jsons.empty());
+    const auto tool_call_output = fi::build_tool_call_output_contract(options.tool_jsons);
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
@@ -737,11 +757,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                   control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
-        result.starts_in_reasoning = processed.starts_in_reasoning;
-        result.token_types         = std::move(processed.token_types);
-        result.positions           = std::move(processed.positions);
-        result.rope_delta          = processed.rope_delta;
-        result.media_payloads      = std::move(processed.media_payloads);
+        result.starts_in_reasoning  = processed.starts_in_reasoning;
+        result.continuation_content = std::move(processed.continuation_content);
+        result.token_types          = std::move(processed.token_types);
+        result.positions            = std::move(processed.positions);
+        result.rope_delta           = processed.rope_delta;
+        result.media_payloads       = std::move(processed.media_payloads);
         result.vision_items.reserve(processed.vision_items.size());
         for (fi::VisionItem& item : processed.vision_items) {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
@@ -770,6 +791,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
         result.starts_in_reasoning  = rendered.starts_in_reasoning;
+        result.continuation_content = rendered.continuation_content;
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
@@ -875,13 +897,68 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const std::optional<OutputConstraint>& constraint,
+                                            const ToolChoice& tool_choice) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    auto tool_contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
+    if (constraint && tool_contract && tool_contract->tools.empty()) tool_contract.reset();
+    const bool combined = constraint && tool_contract && !tool_contract->tools.empty();
+    if (combined) {
+        if (constraint->kind != OutputConstraintKind::JsonObject &&
+            constraint->kind != OutputConstraintKind::JsonSchema)
+            throw RequestError(text::constraint_error_kind(constraint->kind),
+                               "active tools can be combined with JSON output constraints");
+        if (!tool_contract->constrained) {
+            auto structured         = std::make_shared<fi::ToolCallOutputContract>(*tool_contract);
+            structured->constrained = true;
+            tool_contract           = std::move(structured);
+        }
+    }
+    const bool tool_constraint = tool_contract && tool_contract->constrained;
+    std::unique_ptr<text::GrammarSession> matcher;
+    if (constraint || tool_constraint) {
+        if (impl_->defaults.token_ids.empty() || !caller_stop.token_ids.empty() ||
+            !caller_stop.strings.empty() || !caller_stop.include_model_defaults ||
+            caller_stop.publish_stop_token || output.raw || output.preserve_special_tokens) {
+            throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
+                                               : text::constraint_error_kind(constraint->kind),
+                               "constraints require default EOS, text output, no custom stops, and "
+                               "one output language");
+        }
+        try {
+            const auto close = prompt.data_->starts_in_reasoning
+                                   ? fi::kCanonicalReasoningCloseSerialization
+                                   : std::string_view{};
+            if (tool_constraint) {
+                for (const auto& tool : tool_contract->tools) {
+                    if (tool.name.size() > output.tool_name_max_length ||
+                        !std::all_of(tool.name.begin(), tool.name.end(), [](unsigned char c) {
+                            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                   (c >= '0' && c <= '9') || c == '_' || c == '-';
+                        }))
+                        throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                                           "tool name is outside the output contract: " +
+                                               tool.name);
+                }
+                matcher = fi::compile_tool_grammar(impl_->grammars(), *tool_contract, close,
+                                                   prompt.data_->continuation_content, constraint);
+            } else {
+                matcher = impl_->grammars().compile(*constraint, close,
+                                                    prompt.data_->continuation_content);
+            }
+        } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
+            throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
+                                               : text::constraint_error_kind(constraint->kind),
+                               error.what());
+        }
+    }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+                         impl_->thinking_control_tokens, std::move(tool_contract),
+                         std::move(matcher), prompt.data_->continuation_content, combined);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

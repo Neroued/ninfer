@@ -7,6 +7,18 @@
 
 namespace ninfer::runtime {
 
+// Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
+class TokenMaskProvider {
+public:
+    virtual ~TokenMaskProvider()                                           = default;
+    [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
+    // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
+    // device mask. A dead end fails a row only if verification reaches that position.
+    [[nodiscard]] virtual std::uint32_t fill(std::size_t row, std::span<const TokenId> drafts,
+                                             std::span<std::uint32_t> words) = 0;
+    virtual void uploaded(std::size_t row, std::size_t bytes) noexcept       = 0;
+};
+
 struct LaneId {
     std::uint32_t value = 0;
 
@@ -23,6 +35,7 @@ enum class CommitDisposition : std::uint8_t {
     Active,
     Finishable,
     CancelledReleased,
+    FailedReleased,
 };
 
 // The product Engine only needs statistics for rows whose sequence is released by commit.
@@ -36,6 +49,7 @@ struct CommitDecision {
     std::uint32_t accepted_tokens = 0;
     bool terminal                 = false;
     bool cancelled                = false;
+    bool failed                   = false;
     // Copied unchanged from the corresponding OutputDecision; still relative to this row's
     // accepted span.
     std::optional<std::uint32_t> prefix_execution_split_after;

@@ -13,6 +13,8 @@ namespace ninfer::runtime {
 struct ExecutionTiming {
     std::uint64_t submit_host_ns = 0;
     std::uint64_t device_wait_ns = 0;
+    // Subset of device_wait_ns, recorded once per speculative batch.
+    std::uint64_t constraint_draft_wait_ns = 0;
     std::uint64_t post_host_ns   = 0;
     // CUDA-event intervals collected by the execution path, independent of Host phases.
     // Currently measures text-prefill chunks (including their backend work), after Vision
@@ -22,6 +24,7 @@ struct ExecutionTiming {
     ExecutionTiming& operator+=(ExecutionTiming other) noexcept {
         submit_host_ns += other.submit_host_ns;
         device_wait_ns += other.device_wait_ns;
+        constraint_draft_wait_ns += other.constraint_draft_wait_ns;
         post_host_ns += other.post_host_ns;
         gpu_elapsed_ns += other.gpu_elapsed_ns;
         return *this;
@@ -65,6 +68,16 @@ public:
     void begin_wait() noexcept { transition(ExecutionTimingPhase::Wait); }
 
     void end_wait() noexcept { transition(ExecutionTimingPhase::Post); }
+
+    void begin_constraint_wait() noexcept {
+        begin_wait();
+        constraint_wait_start_ = timing_.device_wait_ns;
+    }
+
+    void end_constraint_wait() noexcept {
+        end_wait();
+        timing_.constraint_draft_wait_ns += timing_.device_wait_ns - constraint_wait_start_;
+    }
 
     void resume_submit() noexcept { transition(ExecutionTimingPhase::Submit); }
 
@@ -136,6 +149,7 @@ private:
     Clock::time_point started_;
     ExecutionTimingPhase phase_ = ExecutionTimingPhase::Submit;
     ExecutionTiming timing_;
+    std::uint64_t constraint_wait_start_ = 0;
     std::optional<nvtx::ScopedRange> range_;
     ExecutionTiming* abandoned_timing_ = nullptr;
     bool finished_                     = false;

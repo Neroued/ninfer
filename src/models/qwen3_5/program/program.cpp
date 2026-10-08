@@ -130,9 +130,9 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
 
 std::optional<SourceCandidate>
 Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                        bool consume_private,
-                        std::span<const CheckpointHandle> private_points) const {
-    return impl_->inspect_source(base, checkpoint, consume_private, private_points);
+                        bool consume_source, std::span<const CheckpointHandle> private_points,
+                        std::span<const CheckpointHandle> retired_points) const {
+    return impl_->inspect_source(base, checkpoint, consume_source, private_points, retired_points);
 }
 
 PrefixShortlistKey Program::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
@@ -208,11 +208,9 @@ void Program::release_units(std::span<const SequenceHandle> units) noexcept {
     impl_->release_units(units);
 }
 
-runtime::ResourceReservation Program::start_binding(const RequestBasePlan& base,
-                                                    runtime::LaneId lane,
-                                                    const SourceCandidate& source,
-                                                    ResumeState* resume, ExecutionUnitKind kind,
-                                                    std::uint32_t tokens) {
+BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                          const SourceCandidate& source, ResumeState* resume,
+                                          ExecutionUnitKind kind, std::uint32_t tokens) {
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
@@ -258,8 +256,9 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
-PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t) {
-    return impl_->advance_prefill(h, t);
+PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
+                                         runtime::TokenMaskProvider* m) {
+    return impl_->advance_prefill(h, t, m);
 }
 
 ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTiming* t) {
@@ -267,8 +266,9 @@ ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTimin
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> s,
-                             std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t) {
-    return impl_->decode(s, b, t);
+                             std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t,
+                             runtime::TokenMaskProvider* m) {
+    return impl_->decode(s, b, t, m);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(

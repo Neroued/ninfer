@@ -131,18 +131,6 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& format = body.at("response_format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("response_format must contain a string type", "response_format");
-        }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
-                "response_format", "response_format_not_supported");
-        }
-    }
 
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
@@ -198,26 +186,6 @@ void validate_standard_output_controls(const Json& body) {
                 "provide",
                 "store", "store_not_supported");
         }
-    }
-}
-
-void validate_constrained_decoding_extensions(const Json& body) {
-    // llama.cpp exposes grammar; vLLM uses structured_outputs and previously exposed the
-    // guided_* spellings. Each promises constrained generation rather than an advisory hint.
-    static constexpr const char* fields[] = {
-        "grammar",      "structured_outputs", "guided_json",
-        "guided_regex", "guided_choice",      "guided_grammar",
-    };
-    for (const char* field : fields) {
-        if (!body.contains(field) || body.at(field).is_null()) { continue; }
-        const Json& value = body.at(field);
-        if (std::string_view(field) == "grammar" && value.is_string() &&
-            value.get_ref<const std::string&>().empty()) {
-            continue;
-        }
-        bad_request(std::string(field) +
-                        " requests constrained decoding, which NInfer does not provide",
-                    field, "constrained_decoding_not_supported");
     }
 }
 
@@ -607,6 +575,7 @@ void parse_tools(const Json& body, GenerationRequest& output) {
         }
         const Json& function = item.at("function");
         ToolDefinition tool;
+        tool.schema_param = "tools/" + std::to_string(output.tools.size()) + "/function/parameters";
         tool.name = require_function_name(function, "tools");
         if (function.contains("description") && !function.at("description").is_null()) {
             if (!function.at("description").is_string()) {
@@ -626,12 +595,7 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            if (function.at("strict").get<bool>()) {
-                bad_request(
-                    "strict=true requires generated function arguments to satisfy the declared "
-                    "JSON Schema, which NInfer cannot guarantee",
-                    "tools", "strict_tools_not_supported");
-            }
+            tool.strict = function.at("strict").get<bool>();
         }
         output.tools.push_back(std::move(tool));
     }
@@ -676,18 +640,8 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         }
     }
 
-    if (mode == "required") {
-        bad_request(
-            "tool_choice.allowed_tools mode='required' requires at least one tool call, which "
-            "NInfer cannot guarantee",
-            "tool_choice", "tool_choice_not_supported");
-    }
-
-    std::erase_if(output.tools, [&](const ToolDefinition& tool) {
-        return std::find(allowed_names.begin(), allowed_names.end(), tool.name) ==
-               allowed_names.end();
-    });
-    output.tool_choice.mode = ToolChoiceMode::Auto;
+    output.tool_choice.allowed_names = std::move(allowed_names);
+    output.tool_choice.mode = mode == "required" ? ToolChoiceMode::Required : ToolChoiceMode::Auto;
 }
 
 void parse_tool_choice(const Json& body, GenerationRequest& output) {
@@ -700,10 +654,7 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
         } else if (value == "none") {
             output.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            bad_request(
-                "tool_choice='required' requires at least one tool call, which NInfer cannot "
-                "guarantee",
-                "tool_choice", "tool_choice_not_supported");
+            output.tool_choice.mode = ToolChoiceMode::Required;
         } else {
             bad_request("tool_choice must be 'auto', 'none', 'required', or a function choice",
                         "tool_choice");
@@ -720,11 +671,10 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             if (!choice.contains("function") || !choice.at("function").is_object()) {
                 bad_request("function tool_choice must contain a function object", "tool_choice");
             }
-            const std::string name = require_function_name(choice.at("function"), "tool_choice");
-            bad_request(
-                "tool_choice for function '" + name +
-                    "' requires that exact function to be called, which NInfer cannot guarantee",
-                "tool_choice", "tool_choice_not_supported");
+            const std::string name  = require_function_name(choice.at("function"), "tool_choice");
+            output.tool_choice.mode = ToolChoiceMode::Required;
+            output.tool_choice.allowed_names = std::vector<std::string>{name};
+            output.tool_choice.parallel      = false;
         } else if (type == "custom") {
             bad_request(
                 "custom tool_choice requires custom tool output, which NInfer does not provide",
@@ -737,19 +687,14 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
     }
 }
 
-void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output) {
+void parse_parallel_tool_calls(const Json& body, GenerationRequest& output) {
     if (!body.contains("parallel_tool_calls") || body.at("parallel_tool_calls").is_null()) {
         return;
     }
     if (!body.at("parallel_tool_calls").is_boolean()) {
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
-    if (!body.at("parallel_tool_calls").get<bool>() && output.uses_tools()) {
-        bad_request(
-            "parallel_tool_calls=false requires the model to emit at most one tool call, which "
-            "NInfer cannot guarantee while tools are enabled",
-            "parallel_tool_calls", "parallel_tool_calls_not_supported");
-    }
+    output.tool_choice.parallel &= body.at("parallel_tool_calls").get<bool>();
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
@@ -882,7 +827,6 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
-    validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
@@ -908,6 +852,10 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    if (body.contains("response_format") && !body["response_format"].is_null())
+        parse_json_output_format(body["response_format"], output.generation, "response_format",
+                                 JsonFormatProtocol::Chat);
+    parse_structured_outputs(body, output.generation);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }

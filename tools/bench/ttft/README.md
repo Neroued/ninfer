@@ -207,9 +207,13 @@ committed work; those counts do not establish that the client received it.
 [`first_output_timing`](../../../docs/serving.md#structured-request-log) snapshot to partition
 streaming TTFT into preparation, initial Engine queue, initial binding, paused time, remaining
 resident time and HTTP residual. Each stage retains its duration and percentage of client TTFT;
-the residual includes transport and publication outside the Engine boundary. Missing observations
-remain unavailable, and negative residuals remain visible as inconsistent measurements. Aggregate
-responses finish at a different boundary and do not receive this streaming attribution.
+the residual includes transport and publication outside the Engine boundary.
+Admission columns retain the preferred reuse frontier, source-wait milliseconds, revoked checkpoint
+count and fallback reason from Engine. Source waiting is already included in queue time. Historical
+logs without these observations leave the columns unavailable.
+Missing observations remain unavailable, and negative residuals remain visible as inconsistent
+measurements. Aggregate responses finish at a different boundary and do not receive this streaming
+attribution.
 
 Separate columns report Host exposure, this request's prefill/replay submission, completion wait,
 postprocessing and GPU stream intervals, plus completed context-transfer time and bytes. These

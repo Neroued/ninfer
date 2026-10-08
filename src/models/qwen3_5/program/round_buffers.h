@@ -26,6 +26,11 @@ struct RoundStateSpec {
     bool causal_scoring          = false;
 };
 
+struct PrefillRoundHost {
+    TokenId sampled_token = 0;
+    ops::SamplingConfig sampling;
+};
+
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
 // once per round; only its exact-B prefixes are consumed by the model schedule.
 struct OrdinaryDecodeIngress {

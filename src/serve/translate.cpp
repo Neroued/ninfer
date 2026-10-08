@@ -87,18 +87,10 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
-std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
-    std::vector<const ToolDefinition*> tools;
-    if (!request.uses_tools()) { return tools; }
-    tools.reserve(request.tools.size());
-    for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
-    return tools;
-}
-
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
     Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
     if (!tool.description.empty()) { function["description"] = tool.description; }
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
@@ -284,20 +276,20 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         }
     }
 
-    input.options.continuation                     = request.continuation;
-    input.options.enable_thinking                  = semantics.enable_thinking;
-    input.options.reasoning_effort                 = semantics.reasoning_effort;
-    input.options.preserve_thinking                = semantics.preserve_thinking;
-    input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
-    input.options.add_vision_id                    = false;
-    const std::vector<const ToolDefinition*> tools = effective_tools(request);
+    input.options.continuation              = request.continuation;
+    input.options.enable_thinking           = semantics.enable_thinking;
+    input.options.reasoning_effort          = semantics.reasoning_effort;
+    input.options.preserve_thinking         = semantics.preserve_thinking;
+    input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
+    input.options.add_vision_id             = false;
+    const auto& tools                       = request.tools;
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
-        if (tools[index]->cache_boundary_after) {
+        input.options.tool_jsons.push_back(render_tool_definition(tools[index]));
+        if (tools[index].cache_boundary_after) {
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                .kind             = tools[index]->cache_boundary_after->kind,
-                .evidence         = tools[index]->cache_boundary_after->evidence,
+                .kind             = tools[index].cache_boundary_after->kind,
+                .evidence         = tools[index].cache_boundary_after->evidence,
                 .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
                 .after_tool_count = static_cast<std::uint32_t>(index + 1U),
             });
@@ -313,6 +305,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse) {
     ninfer::RequestOptions options;
+    options.constraint                        = request.constraint;
+    options.tool_choice                       = request.tool_choice;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking != false) {
@@ -321,7 +315,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.output.preserve_special_tokens = !request.constraint && !request.constrains_tools() &&
+                                             (request.uses_tools() || request.has_tool_history());
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));

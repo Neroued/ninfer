@@ -11,6 +11,7 @@
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,6 +81,8 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string input_schema_json;
+    std::string schema_param; // Original protocol path; never included in the model prompt.
+    bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
 };
@@ -90,14 +93,8 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-enum class ToolChoiceMode {
-    Auto,
-    None,
-};
-
-struct ToolChoice {
-    ToolChoiceMode mode = ToolChoiceMode::Auto;
-};
+using ToolChoiceMode = ninfer::ToolChoiceMode;
+using ToolChoice     = ninfer::ToolChoice;
 
 struct ChatTurn {
     ChatRole role = ChatRole::User;
@@ -171,6 +168,8 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
+    std::optional<OutputConstraint> constraint;
+    std::string constraint_param;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
@@ -188,7 +187,18 @@ struct GenerationRequest {
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {
-        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
+        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None &&
+               (!tool_choice.allowed_names || !tool_choice.allowed_names->empty());
+    }
+
+    [[nodiscard]] bool constrains_tools() const noexcept {
+        if (tools.empty() || constraint) return false;
+        if (!uses_tools()) return true;
+        if (tool_choice.mode == ToolChoiceMode::Required || !tool_choice.parallel ||
+            tool_choice.allowed_names || tool_choice.constraints == ToolConstraintMode::Basic)
+            return true;
+        return std::any_of(tools.begin(), tools.end(),
+                           [](const auto& tool) { return tool.strict; });
     }
 
     [[nodiscard]] std::size_t media_item_count() const noexcept {

@@ -1,4 +1,5 @@
 #include "serve/anthropic_messages.h"
+#include "product/constraint_observation.h"
 
 #include "serve/generation_service.h"
 
@@ -58,7 +59,9 @@ struct StopPresentation {
 };
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
-    if (!outcome.tool_calls.empty()) { return StopPresentation{.reason = "tool_use"}; }
+    if (!outcome.tool_calls.empty() && (outcome.finish_reason == ninfer::FinishReason::StopToken ||
+                                        outcome.finish_reason == ninfer::FinishReason::None))
+        return StopPresentation{.reason = "tool_use"};
     switch (outcome.finish_reason) {
     case ninfer::FinishReason::OutputLimit:
         return StopPresentation{.reason = "max_tokens"};
@@ -170,8 +173,10 @@ ApiError normalize_anthropic_error(ApiError error) {
 
 std::string make_anthropic_error_body(const ApiError& api_error, const std::string& request_id) {
     const ApiError error = normalize_anthropic_error(api_error);
+    const std::string message =
+        error.param.empty() ? error.message : error.param + ": " + error.message;
     return Json{{"type", "error"},
-                {"error", Json{{"type", error.type}, {"message", error.message}}},
+                {"error", Json{{"type", error.type}, {"message", message}}},
                 {"request_id", request_id}}
         .dump();
 }
@@ -201,15 +206,17 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                                       {"input", parse_tool_input(call)}});
     }
     const StopPresentation stop = stop_presentation(outcome);
-    return OrderedJson{{"id", identity.message_id},
-                       {"type", "message"},
-                       {"role", "assistant"},
-                       {"model", identity.model},
-                       {"content", std::move(content)},
-                       {"stop_reason", stop.reason},
-                       {"stop_sequence", stop.sequence},
-                       {"usage", final_usage(outcome)}}
-        .dump();
+    OrderedJson response{{"id", identity.message_id},
+                         {"type", "message"},
+                         {"role", "assistant"},
+                         {"model", identity.model},
+                         {"content", std::move(content)},
+                         {"stop_reason", stop.reason},
+                         {"stop_sequence", stop.sequence},
+                         {"usage", final_usage(outcome)}};
+    if (outcome.constraint)
+        response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    return response.dump();
 }
 
 std::string make_anthropic_count_tokens_response(int input_tokens) {
@@ -349,10 +356,12 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     }
 
     const StopPresentation stop = stop_presentation(outcome);
-    events.push_back(event("message_delta", Json{{"type", "message_delta"},
-                                                 {"delta", Json{{"stop_reason", stop.reason},
-                                                                {"stop_sequence", stop.sequence}}},
-                                                 {"usage", final_usage(outcome)}}));
+    Json terminal{{"type", "message_delta"},
+                  {"delta", Json{{"stop_reason", stop.reason}, {"stop_sequence", stop.sequence}}},
+                  {"usage", final_usage(outcome)}};
+    if (outcome.constraint)
+        terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;
     return events;

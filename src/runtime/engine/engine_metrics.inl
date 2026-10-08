@@ -124,6 +124,7 @@ void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing
     stats.program_submit_ns += timing.submit_host_ns;
     stats.program_post_ns += timing.post_host_ns;
     stats.device_wait_ns += timing.device_wait_ns;
+    stats.constraint_draft_wait_ns += timing.constraint_draft_wait_ns;
     add_class_host_time(timing.host_ns(), timing.device_wait_ns);
     for (std::size_t i = 0; i < exposed.size; ++i) {
         const ActiveExposure& exposure = exposed.entries[i];

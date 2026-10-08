@@ -546,6 +546,14 @@ std::string join_labels(const std::vector<std::string>& labels) {
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
+    if (point.qtype == QType::Q8_G32_FP16 &&
+        ((point.n == 2560 && point.k == 6144) || (point.n == 6144 && point.k == 2560) ||
+         (point.n == 10240 && point.k == 2560) || (point.n == 12288 && point.k == 2560) ||
+         (point.n == 16384 && point.k == 2560)) &&
+        point.t > 1) {
+        profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+    }
     if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         (((point.n == 14336 || point.n == 16384) && point.k == 5120) ||
          (point.n == 5120 && (point.k == 6144 || point.k == 17408))) &&
@@ -567,8 +575,25 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "MXFP8_F32ACC";
         return kRtx5090MxFp8Fp32AccumulateTFLOPs;
     }
-    if (point.qtype == QType::BF16 && point.policy == LinearPolicy::A16Only && point.n == 256 &&
-        point.k == 5120) {
+    if (point.qtype == QType::BF16 &&
+        ((point.n == 256 && point.k == 5120) ||
+         ((point.n == 48 || point.n == 96) && point.k == 2560 && point.t >= 17) ||
+         (point.n == 1664 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 2560 && point.k == 4608 && point.t >= 3) ||
+         (point.n == 4608 && point.k == 4608 && point.t >= 3) ||
+         (point.n == 4304 && point.k == 1152 && point.t >= 4) ||
+         (point.n == 1152 && point.k == 4304 && point.t >= 4) ||
+         (point.n == 1152 && point.k == 1152 && point.t >= 8) ||
+         (point.n == 1152 && point.k == 1536 && point.t >= 4) ||
+         (point.n == 3456 && point.k == 1152 && point.t >= 4) ||
+         (point.n == 2560 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 2560 && point.k == 6144 && point.t >= 2) ||
+         (point.n == 13952 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 248320 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 12800 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 10240 && point.k == 320 && point.t >= 2) ||
+         (point.n == 320 && point.k == 10240 && point.t >= 9) ||
+         (point.n == 324 && point.k == 10240 && point.t >= 9))) {
         profile = "BF16_F32ACC";
         return kRtx5090Bf16Fp32AccumulateTFLOPs;
     }

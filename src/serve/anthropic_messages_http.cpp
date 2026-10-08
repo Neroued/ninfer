@@ -67,8 +67,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepared = service_->prepare(
             request.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            {.scheduling  = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token = first_token_observer()},
+            {.phase_timings = true,
+             .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
+             .first_token   = first_token_observer()},
             [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());

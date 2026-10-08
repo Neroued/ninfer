@@ -36,6 +36,7 @@ struct GenerationMetrics {
     ninfer::GenerationEngineTiming engine_timing;
     std::optional<ninfer::GenerationFirstOutputTiming> first_output_timing;
     ninfer::GenerationSchedulingStats scheduling;
+    ninfer::GenerationAdmissionStats admission;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -58,6 +59,7 @@ struct GenerationOutcome {
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
+    std::optional<ninfer::ConstraintObservation> constraint;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
@@ -85,15 +87,21 @@ enum class GenerationConsumerMode : std::uint8_t {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+ApiError
+request_error_to_api_error(const ninfer::RequestError& exception,
+                           std::string_view constraint_param = "structured_outputs.grammar",
+                           std::span<const std::string> tool_schema_params = {});
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::string constraint_param;
+    std::vector<std::string> tool_schema_params;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    double prepare_seconds     = 0.0;
+    // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
+    double service_prepare_seconds = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;

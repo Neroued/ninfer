@@ -46,6 +46,48 @@ Changes to the file take effect after restarting NInfer:
   --chat-template tools/chat_templates/qwen3_8.jinja --prompt "Hello"
 ```
 
+`--grammar-file FILE` constrains the answer with a GBNF grammar whose entry rule is `root`:
+
+```bash
+printf 'root ::= "yes" | "no"\n' > answer.gbnf
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Is 17 prime?" --no-thinking --grammar-file answer.gbnf --max-new 64
+```
+
+`--choice TEXT` selects a literal candidate; repeat the flag to supply the candidate set.
+`--regex PATTERN` constrains the complete answer to a regular expression:
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Classify this review: the service was excellent." --no-thinking \
+  --choice positive --choice neutral --choice negative
+
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Return ticket TASK-0042." --no-thinking --regex '(BUG|TASK)-[0-9]{4}'
+```
+
+Candidates preserve exact text; `--choice ''` explicitly permits empty content. `--regex ''`
+permits only empty content. See the [language contract](maintainer/constrained-decoding.md#41-gbnf--regex--choice)
+for supported regex syntax.
+
+`--json-object` constrains the answer to a JSON object. `--json-schema-file FILE` applies a JSON
+Schema. All output constraint options are mutually exclusive:
+
+```bash
+printf '%s\n' '{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}' > answer.schema.json
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Return the answer to 6 times 7 as JSON." --no-thinking \
+  --json-schema-file answer.schema.json --max-new 64
+```
+
+GBNF supports recursive rules, Unicode character classes and repetition. All constraint modes work with
+ordinary decoding, MTP, DFlash and DFlash2. Thinking may precede the constrained answer; an output
+limit or cancellation can leave it incomplete. JSON modes can accompany tools supplied in messages:
+the answer is either JSON or a tool-call sequence. GBNF, choice and regex require no active tools.
+Constraints reject custom stops and `--raw-output`. JSON uses compact separators and declared property order. Describe
+the desired content in the prompt; the schema is not added to it automatically. See the
+[supported schema subset](maintainer/constrained-decoding.md#42-json-与-schema-的执行合同).
+
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
 `--reasoning-effort none` requests disabled thinking; other effort values cannot be combined with
 `--no-thinking`. The template interprets the selected effort. `--greedy` selects exact argmax

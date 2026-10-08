@@ -57,7 +57,9 @@ struct Source {
     std::uint32_t reused_tokens = 0;
     ninfer::runtime::PrefillWork remaining_work;
     std::vector<ninfer::runtime::ContextTransferRequirement> transfers;
-    bool consume_private = false;
+    bool consume_source = false;
+    bool take_private   = false;
+    std::vector<Handle> retired_points;
     std::vector<Handle> private_points;
 };
 
@@ -224,9 +226,12 @@ struct Program {
     [[nodiscard]] std::optional<Source> inspect_source(const Base& base,
                                                        std::optional<Handle> handle,
                                                        bool consume                    = false,
-                                                       std::span<const Handle> carried = {}) const {
+                                                       std::span<const Handle> carried = {},
+                                                       std::span<const Handle> retired = {}) const {
         Source source{.checkpoint = handle};
-        source.consume_private = consume;
+        source.consume_source = consume;
+        source.take_private   = consume;
+        source.retired_points.assign(retired.begin(), retired.end());
         for (const auto point : carried) {
             if (!handle || !valid_checkpoint(point)) { continue; }
             const auto& content = contents.at(point.index);
@@ -638,7 +643,7 @@ void test_private_continuation_advances_with_adoption_heat() {
     f.publish(entrant);
     const Base next{.tokens = {1, 2, 3}};
     auto choice = f.source(next, old);
-    require(choice.take_over && choice.owner == old_owner && choice.source.consume_private,
+    require(choice.take_over && choice.owner == old_owner && choice.source.consume_source,
             "anonymous private continuation cannot transfer its writer");
     require(f.program.release_checkpoint(old), "fixture consume failed");
     const auto owner = f.cache.adopt(f.program, choice, next, 20, {}, {&old, 1});
@@ -663,7 +668,7 @@ void test_branch_adoption_time_is_independent_of_finish_order() {
     const Base branch{.tokens = {1, 2, 3},
                       .advice = {.update_session_index = false, .session_key = 42}};
     const auto first_choice = f.source(branch, parent);
-    require(!first_choice.take_over && !first_choice.source.consume_private,
+    require(!first_choice.take_over && !first_choice.source.consume_source,
             "branch disabling session publication consumed its named predecessor");
     const auto first       = f.cache.adopt(f.program, first_choice, branch, 10);
     const auto first_used  = f.cache.retention(first).last_demand;
@@ -742,7 +747,7 @@ void test_resume_preserves_owner_and_does_not_create_a_hit() {
     require(f.program.valid_checkpoint(shared), "cancellation removed an independent public entry");
 }
 
-void test_rewind_preparation_retires_deeper_private_positions() {
+void test_rewind_evaluation_preserves_sources_until_binding() {
     Fixture f(64);
     const Base base{.tokens = {1, 2, 3, 4, 5, 6}};
     const auto owner    = f.begin(base);
@@ -763,21 +768,185 @@ void test_rewind_preparation_retires_deeper_private_positions() {
     const Base rewritten{.tokens = {1, 2, 5}};
     auto choice = f.source(rewritten, replay);
     require(f.cache.prepare_source(f.program, rewritten, choice), "rewind source became invalid");
-    require(!f.program.valid_checkpoint(endpoint) && !f.program.valid_checkpoint(deeper) &&
+    require(f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(deeper) &&
+                choice.source.retired_points == std::vector<Handle>({endpoint, deeper}) &&
                 f.program.valid_checkpoint(replay) && f.program.valid_checkpoint(anchor) &&
                 f.program.valid_checkpoint(leased) && f.program.valid_checkpoint(shared) &&
                 !f.cache.retention(owner).reused,
-            "rewind failed to retire deeper private history or damaged its source/readers/shared");
+            "read-only rewind evaluation retired history or granted retirement of a reader");
     require(choice.source.private_points == std::vector<Handle>({replay, anchor}),
             "rewind preparation bypassed Native inspection of the remaining compatible points");
 
     auto early = f.source(rewritten, anchor);
     require(f.cache.prepare_source(f.program, rewritten, early),
             "anchor rewind source became invalid");
-    require(!f.program.valid_checkpoint(replay) && f.program.valid_checkpoint(anchor) &&
+    require(f.program.valid_checkpoint(replay) && f.program.valid_checkpoint(anchor) &&
+                early.source.retired_points == std::vector<Handle>({replay, endpoint, deeper}) &&
                 f.program.valid_checkpoint(leased) && f.program.valid_checkpoint(shared) &&
                 early.source.private_points == std::vector<Handle>{anchor},
             "anchor rewind retained a deeper input replay or released its leased history");
+}
+
+void test_waiting_source_survives_catalog_replacement_and_transfers_ownership() {
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}};
+    const auto point = f.program.add(base.tokens, {}, Role::Continuation);
+    const auto owner = f.publish(point);
+    auto choice      = f.source(base, point);
+    f.cache.retain_source(f.program, 10, choice);
+    f.cache.abandon(f.program, owner);
+    require(f.program.valid_checkpoint(point), "catalog removal destroyed a waiting source");
+    require(f.cache.candidates(f.program, base).size() == 1,
+            "a waiting-only source became an advertised cache entry");
+    auto retained = f.cache.retained_source(10);
+    require(retained && f.cache.prepare_source(f.program, base, *retained, 10) &&
+                !retained->take_over && retained->source.consume_source,
+            "sole waiting owner could not consume its point independently of the old session");
+    f.cache.release_source(f.program, 10);
+    require(!f.program.valid_checkpoint(point), "last waiting reference leaked its checkpoint");
+}
+
+void test_waiting_sources_preserve_other_readers_and_obey_revocation_order() {
+    using ninfer::runtime::ReclaimPurpose;
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}};
+    const auto point = f.program.add(base.tokens, {}, Role::Continuation);
+    f.publish(point);
+    auto choice = f.source(base, point);
+    f.cache.retain_source(f.program, 10, choice);
+    f.cache.retain_source(f.program, 20, choice);
+    require(f.cache.prepare_source(f.program, base, choice, 10) && !choice.source.consume_source,
+            "a binder consumed another waiting request's immutable source");
+    require(!f.cache.erase(f.program, point, {ReclaimPurpose::OptionalWrite}) &&
+                !f.cache.erase(f.program, point, {ReclaimPurpose::FreshAdmission, 20}),
+            "optional write or younger admission revoked older waiting ownership");
+    require(f.cache.prepare_source(
+                f.program, base, choice, 10,
+                ninfer::runtime::ReclaimRights{ReclaimPurpose::FreshAdmission, 10}) &&
+                choice.source.consume_source && f.cache.source_revocations(20) == 0,
+            "read-only consumption grant either failed or revoked before acceptance");
+    f.cache.binding_started(10, {}, point);
+    require(!f.cache.retained_source(20) && f.cache.source_revocations(20) == 1 &&
+                f.cache.source_revocations(10) == 0,
+            "binding did not distinguish handed-off ownership from a revoked waiter");
+    f.cache.release_source(f.program, 10);
+    f.cache.release_source(f.program, 20);
+    require(f.program.valid_checkpoint(point), "releasing waiters destroyed the catalog owner");
+}
+
+void test_waiting_retention_allows_demotion_but_not_optional_deletion() {
+    using ninfer::runtime::ReclaimPurpose;
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}};
+    const auto point = f.program.add(base.tokens, {}, Role::Continuation);
+    f.program.contents[point.index].demotion_bytes = 16;
+    f.publish(point);
+    f.cache.retain_source(f.program, 10, f.source(base, point));
+    auto cursor =
+        f.cache.begin_reclaim(f.program, std::nullopt, {ReclaimPurpose::FreshAdmission, 20});
+    const auto progress = f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor);
+    require(progress != ninfer::runtime::ReclaimProgress::Blocked &&
+                f.program.valid_checkpoint(point) && !f.program.demoted.empty() &&
+                f.cache.source_revocations(10) == 0,
+            "waiting ownership pinned a Device replica or vanished during demotion");
+    f.program.transfer_in_progress = false;
+    require(!f.cache.erase(f.program, point, {ReclaimPurpose::OptionalWrite}),
+            "optional replacement erased a retained Host source");
+    require(f.cache.erase(f.program, point, {ReclaimPurpose::Execution, 20}) &&
+                f.cache.source_revocations(10) == 1 && !f.cache.retained_source(10),
+            "necessary progress could not revoke a waiting source");
+    f.cache.release_source(f.program, 10);
+}
+
+void test_shared_host_release_checks_every_waiting_owner() {
+    using ninfer::runtime::ReclaimPurpose;
+    Fixture f(64);
+    const auto block = f.program.host_block(64);
+    const auto a     = f.program.add({1}, {block});
+    const auto b     = f.program.add({2}, {block});
+    f.publish(a);
+    f.publish(b);
+    f.cache.retain_source(f.program, 10, f.source(Base{.tokens = {1}}, a));
+    f.cache.retain_source(f.program, 20, f.source(Base{.tokens = {2}}, b));
+    auto fresh =
+        f.cache.begin_reclaim(f.program, std::nullopt, {ReclaimPurpose::FreshAdmission, 15});
+    require(f.cache.reclaim(f.program, {.host_bytes = 64}, {}, fresh) ==
+                    ninfer::runtime::ReclaimProgress::Blocked &&
+                f.program.released.empty() && f.cache.source_revocations(10) == 0 &&
+                f.cache.source_revocations(20) == 0,
+            "partial revocation fabricated Host capacity still owned by an older waiter");
+    auto required = f.cache.begin_reclaim(f.program);
+    require(f.cache.reclaim(f.program, {.host_bytes = 64}, {}, required) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.physical_usage().occupied.host_bytes == 0 &&
+                f.cache.source_revocations(10) == 1 && f.cache.source_revocations(20) == 1,
+            "required Host release did not revoke its complete physical holder union");
+    f.cache.release_source(f.program, 10);
+    f.cache.release_source(f.program, 20);
+}
+
+void test_waiting_only_source_is_not_a_public_capture_fallback() {
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}};
+    const auto hidden = f.program.add(base.tokens, {}, Role::Continuation);
+    const auto owner  = f.publish(hidden);
+    f.cache.retain_source(f.program, 10, f.source(base, hidden));
+    f.cache.abandon(f.program, owner);
+    const auto cold = f.program.add({9});
+    f.publish(cold);
+    const auto admission = f.cache.capture_admission(f.program, 0, base, 3);
+    auto cursor          = f.cache.begin_reclaim(f.program, admission);
+    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                !f.program.valid_checkpoint(cold) && f.program.valid_checkpoint(hidden),
+            "an undiscoverable waiting point suppressed a useful public capture");
+    f.cache.release_source(f.program, 10);
+}
+
+void test_waiting_owner_cannot_take_over_an_advanced_session() {
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}, .advice = {.session_key = 42}};
+    const auto point = f.program.add(base.tokens, {}, Role::Continuation);
+    const auto owner = f.publish(point, 42);
+    auto choice      = f.source(base, point);
+    f.cache.retain_source(f.program, 10, choice);
+    const auto child = f.cache.adopt(f.program, choice, base, 20);
+    const auto next  = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
+    f.cache.publish(f.program, child, next);
+    f.cache.finish(f.program, child, base, 20);
+    require(f.cache.prepare_source(f.program, base, choice, 10) && !choice.take_over &&
+                choice.source.consume_source && f.program.valid_checkpoint(point),
+            "waiting source overwrote the newer session or lost its own independent contents");
+    const auto branch = f.cache.adopt(f.program, choice, base, 10);
+    require(branch != owner && f.program.valid_checkpoint(next),
+            "a stale continuation alias replaced the advanced owner's recovery points");
+    f.cache.release_source(f.program, 10);
+}
+
+void test_older_waiter_does_not_take_over_a_newer_catalog_version() {
+    Fixture f(128);
+    const Base base{.tokens = {1, 2, 3}, .advice = {.session_key = 42}};
+    const auto input = f.program.add(base.tokens, {}, Role::InputReplay);
+    const auto owner = f.publish(input, 42);
+    auto old         = f.source(base, input);
+    f.cache.retain_source(f.program, 10, old);
+    const std::array carried{input};
+    require(f.cache.adopt(f.program, old, base, 20, carried) == owner,
+            "newer session could not preserve its existing input point");
+    const auto endpoint = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
+    f.cache.publish(f.program, owner, endpoint);
+    f.cache.finish(f.program, owner, base, 20);
+    const auto choices = f.cache.candidates(f.program, base, UINT32_MAX, std::nullopt, 10, 10);
+    const auto found   = std::find_if(choices.begin(), choices.end(),
+                                      [&](const auto& c) { return c.source.checkpoint == input; });
+    require(found != choices.end() && !found->take_over && !found->source.consume_source &&
+                found->source.retired_points.empty(),
+            "re-querying a newer catalog bypassed the waiting request's publication order");
+    const auto branch = f.cache.adopt(f.program, *found, base, 10);
+    f.cache.finish(f.program, branch, base, 10);
+    require(branch != owner && f.program.valid_checkpoint(endpoint),
+            "older completion overwrote a newer session's recovery point");
+    f.cache.release_source(f.program, 10);
 }
 
 void test_session_submission_order_controls_only_the_named_hint() {
@@ -1740,7 +1909,14 @@ int main() {
         test_shared_source_does_not_inherit_private_heat();
         test_private_role_wins_same_position_without_erasing_shared();
         test_resume_preserves_owner_and_does_not_create_a_hit();
-        test_rewind_preparation_retires_deeper_private_positions();
+        test_rewind_evaluation_preserves_sources_until_binding();
+        test_waiting_source_survives_catalog_replacement_and_transfers_ownership();
+        test_waiting_sources_preserve_other_readers_and_obey_revocation_order();
+        test_waiting_retention_allows_demotion_but_not_optional_deletion();
+        test_shared_host_release_checks_every_waiting_owner();
+        test_waiting_only_source_is_not_a_public_capture_fallback();
+        test_waiting_owner_cannot_take_over_an_advanced_session();
+        test_older_waiter_does_not_take_over_a_newer_catalog_version();
         test_session_submission_order_controls_only_the_named_hint();
         test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity();
         test_explicit_anchor_updates_remain_bounded_across_requests();

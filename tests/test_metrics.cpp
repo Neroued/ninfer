@@ -84,5 +84,19 @@ int main() {
           "durations");
     check(final.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos,
           "request settlement must not count the first token again");
+    outcome.constraint = ConstraintObservation{.complete          = true,
+                                               .terminated        = false,
+                                               .cache             = ConstraintCacheAccess::Built,
+                                               .mask_positions    = 5,
+                                               .mask_upload_bytes = 128};
+    metrics.done(outcome);
+    const auto constrained = metrics.render(running, false);
+    check(constrained.find(
+              "ninfer_constraint_requests_total{outcome=\"complete_interrupted\"} 1\n") !=
+                  std::string::npos &&
+              constrained.find("ninfer_constraint_mask_positions_total 5\n") != std::string::npos &&
+              constrained.find("ninfer_constraint_mask_upload_bytes_total 128\n") !=
+                  std::string::npos,
+          "interrupted complete constraint lost its state or actual work");
     return failures == 0 ? 0 : 1;
 }

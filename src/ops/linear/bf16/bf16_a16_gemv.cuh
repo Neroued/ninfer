@@ -102,8 +102,13 @@ __device__ __forceinline__ std::int32_t bf16_phase_offset(int phase, int warp_in
 
 template <class Schedule>
 __device__ __forceinline__ Bf16GemvPack<Schedule::kValuesPerLane>
-load_bf16_activation_phase(const __nv_bfloat16* activation, int phase, int warp_in_row, int lane) {
+load_bf16_activation_phase(const __nv_bfloat16* activation, int phase, int warp_in_row, int lane,
+                           int input_rows) {
     const int offset = bf16_phase_offset<Schedule>(phase, warp_in_row, lane);
+    if constexpr (bf16_predicated_k<Schedule>) {
+        const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+        if (offset >= K) return {};
+    }
     return load_bf16_pack<Schedule::kValuesPerLane>(activation + offset);
 }
 
@@ -113,6 +118,9 @@ load_bf16_weight_phase(const __nv_bfloat16* weight, int row, int phase, int warp
                        int input_rows) {
     const int K      = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     const int offset = bf16_phase_offset<Schedule>(phase, warp_in_row, lane);
+    if constexpr (bf16_predicated_k<Schedule>) {
+        if (offset >= K) return {};
+    }
     return load_bf16_weight_pack<Schedule::kWeightCache, Schedule::kValuesPerLane>(
         weight + static_cast<std::int64_t>(row) * K + offset);
 }
@@ -137,15 +145,16 @@ compute_bf16_gemv_rows(const __nv_bfloat16* activation, const __nv_bfloat16* wei
                        int input_rows) {
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
-    const int phases              = K / kValuesPerPhase;
-    using Pack                    = Bf16GemvPack<Schedule::kValuesPerLane>;
+    const int phases =
+        K / kValuesPerPhase + (bf16_predicated_k<Schedule> && K % kValuesPerPhase != 0);
+    using Pack = Bf16GemvPack<Schedule::kValuesPerLane>;
 
     if constexpr (Schedule::kPrefetchDepth == 1) {
 #pragma unroll Schedule::kPhaseUnroll
         for (int iteration = 0; iteration < phases; ++iteration) {
             const int phase = bf16_phase_index<Schedule>(iteration, row0, phases);
             const Pack x_values =
-                load_bf16_activation_phase<Schedule>(activation, phase, warp_in_row, lane);
+                load_bf16_activation_phase<Schedule>(activation, phase, warp_in_row, lane, K);
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const Pack w_values = load_bf16_weight_phase<Schedule>(weight, row0 + local_row,
@@ -156,7 +165,7 @@ compute_bf16_gemv_rows(const __nv_bfloat16* activation, const __nv_bfloat16* wei
     } else {
         const int first_phase = bf16_phase_index<Schedule>(0, row0, phases);
         Pack current_x =
-            load_bf16_activation_phase<Schedule>(activation, first_phase, warp_in_row, lane);
+            load_bf16_activation_phase<Schedule>(activation, first_phase, warp_in_row, lane, K);
         Pack current_w[Schedule::kRowsPerWarp];
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -170,8 +179,8 @@ compute_bf16_gemv_rows(const __nv_bfloat16* activation, const __nv_bfloat16* wei
             Pack next_w[Schedule::kRowsPerWarp];
             if (iteration + 1 < phases) {
                 const int next_phase = bf16_phase_index<Schedule>(iteration + 1, row0, phases);
-                next_x =
-                    load_bf16_activation_phase<Schedule>(activation, next_phase, warp_in_row, lane);
+                next_x = load_bf16_activation_phase<Schedule>(activation, next_phase, warp_in_row,
+                                                              lane, K);
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     next_w[local_row] = load_bf16_weight_phase<Schedule>(

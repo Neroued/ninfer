@@ -764,6 +764,34 @@ std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& 
     return ContextRelease{plan->sources, *released, std::move(plan)};
 }
 
+std::optional<runtime::ContextResourceUsage>
+ProgramImpl::checkpoint_release_resources(std::span<const CheckpointHandle> handles,
+                                          runtime::ContextResourceUsage shortage) const {
+    runtime::ContextResourceUsage result;
+    if (handles.empty()) { return result; }
+    for (const auto handle : handles) {
+        if (!can_release_checkpoint(handle)) { return std::nullopt; }
+    }
+    // Reuse the reclamation inventory: suffixes and shared pages are credited only when
+    // this complete retirement set really releases their last physical owner.
+    const std::array shortages{
+        runtime::ContextResourceUsage{.state_slots = shortage.state_slots},
+        runtime::ContextResourceUsage{.main_kv_pages = shortage.main_kv_pages},
+        runtime::ContextResourceUsage{.backend_kv_pages = shortage.backend_kv_pages}};
+    for (const auto pool : shortages) {
+        if (!pool.state_slots && !pool.main_kv_pages && !pool.backend_kv_pages) { continue; }
+        PhysicalFacts facts(*this, pool);
+        ReleaseScratch scratch;
+        ReleasedPages pages;
+        if (const auto released = released_resources(*this, facts, handles, pool, scratch, pages)) {
+            result.state_slots += released->state_slots;
+            result.main_kv_pages += released->main_kv_pages;
+            result.backend_kv_pages += released->backend_kv_pages;
+        }
+    }
+    return result;
+}
+
 ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                              std::span<const CheckpointHandle> excluded,
                                              runtime::ContextResourceUsage shortage) const {

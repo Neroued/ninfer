@@ -20,10 +20,18 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeDFlash2Proposal       = 5,
 };
 
-// Device-resident sampling parameters. token_counts is an optional device I32
+// Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
+// Each consumed position must have at least one legal token. The caller carries dead-end status
+// separately and supplies a safe filler for dead/unreachable speculative positions.
+struct SamplingMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0;
+};
+
+// Device-resident sampling parameters and operands. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
+    float temperature          = 0.0f; // <= 0 => greedy argmax over allowed tokens
     std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
@@ -31,6 +39,7 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    SamplingMask mask;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -46,6 +55,8 @@ struct SamplingConfig {
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
+ * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
+ * consumes mask position zero; speculative acceptance consumes its corresponding verify position.
  *
  * For row b with configs[b].temperature<=0:
  *

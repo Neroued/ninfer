@@ -525,6 +525,21 @@ int main() {
                               Json::array({17, 151645}) &&
                           observed_done.at("result").at("completion_tokens") == 2,
                       "request diagnostics lost exact generated token IDs or schema version");
+    observed.metrics.admission = {.preferred_reused_tokens = 19057,
+                                  .source_wait_seconds     = 0.25,
+                                  .revoked_checkpoints     = 1,
+                                  .fallback_reason =
+                                      ninfer::AdmissionFallbackReason::SourceRevoked};
+    const auto admission_done =
+        Json::parse(format_request_done_json("serve-test", 3002, context, observed));
+    failures +=
+        check(admission_done.at("generation").at("admission") ==
+                  Json{{"preferred_reused_tokens", 19057},
+                       {"source_wait_seconds", 0.25},
+                       {"revoked_checkpoints", 1},
+                       {"fallback_reason", "source_revoked"}},
+              "admission observation lost selected source, queue subset or revocation reason");
+
     const ninfer::GenerationSchedulingObservation scheduling{
         .transition              = ninfer::GenerationSchedulingTransition::ReplayComplete,
         .route                   = ninfer::GenerationRecoveryRoute::Replay,

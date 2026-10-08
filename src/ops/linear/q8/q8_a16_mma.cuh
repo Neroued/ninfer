@@ -60,8 +60,9 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     const auto* __restrict__ x      = operands.x;
     const auto* __restrict__ codes  = operands.codes;
     const auto* __restrict__ scales = operands.scales;
-    const int m = operands.rows, k = operands.k, n = token_begin + token_count;
-    const int padded_k              = operands.padded_k;
+    const int m = operands.rows, k = Cfg::kStaticK > 0 ? Cfg::kStaticK : operands.k,
+              n                     = token_begin + token_count;
+    const int padded_k              = Cfg::kStaticK > 0 ? Cfg::kStaticK : operands.padded_k;
     constexpr int BM                = Cfg::kBlockRows;
     constexpr int BN                = Cfg::kBlockTokens;
     constexpr int BK                = Cfg::kBlockK;
@@ -230,7 +231,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     stage_w(0);
     ninfer::ops::cp_commit();
 
-#pragma unroll 4
+#pragma unroll Cfg::kKLoopUnroll
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::kStages;
         ninfer::ops::cp_wait<0>();

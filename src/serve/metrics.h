@@ -35,6 +35,13 @@ private:
         std::uint64_t failed            = 0;
         std::uint64_t rejected          = 0;
         std::uint64_t response_failures = 0;
+        std::array<std::uint64_t, 3> constraint_outcomes{};
+        std::array<std::uint64_t, 3> constraint_cache{};
+        double constraint_prepare_seconds     = 0;
+        double constraint_mask_seconds        = 0;
+        double constraint_matcher_seconds     = 0;
+        std::uint64_t constraint_positions    = 0;
+        std::uint64_t constraint_upload_bytes = 0;
         Histogram ttft;
         Histogram duration;
         Histogram queue;

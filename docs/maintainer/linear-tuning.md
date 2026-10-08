@@ -92,7 +92,7 @@ requirements for the large-extent region, not a mandatory position in the develo
 ## 4. Report format
 
 This section applies when a retained absolute-performance report is requested; routine changes do
-not require a new report or plot. Task summaries still follow [AGENTS.md](../../AGENTS.md#reporting-and-completion),
+not require a new report or plot. Task summaries follow [AGENTS.md](../../AGENTS.md#verification-and-reporting),
 including comparative results, regressions, and limitations.
 
 A retained Linear performance report describes the final implementation's absolute performance.

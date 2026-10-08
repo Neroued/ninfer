@@ -612,8 +612,9 @@ int test_tools_and_effective_subset() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
-    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "clock",
+    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"clock"},
                       "wire tool list and effective callable subset remain distinct");
 
     Json none           = body;
@@ -628,6 +629,10 @@ int test_tools_and_effective_subset() {
         R"({"model":"m","input":"probe","tools":[{"type":"function","name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}]})");
     const OpenAIResponsesCreateRequest ordered_request =
         parse_openai_responses_create_request(ordered, limits());
+    failures += check(ordered_request.prompt.generation.constrains_tools() &&
+                          !to_request_options(ordered_request.prompt.generation, {}, {}, true)
+                               .output.preserve_special_tokens,
+                      "ordinary Responses tools did not select constrained output");
     const ninfer::PromptInput ordered_prompt =
         to_prompt_input(ordered_request.prompt.generation, ResolvedPromptSemantics{}, {});
     failures += check(
@@ -670,11 +675,13 @@ int test_namespace_tools() {
     failures += check(request.tools.size() == 2 && request.tools[0].at("type") == "namespace" &&
                           request.tools[0].at("tools")[0].at("name") == "now",
                       "wire namespace grouping is retained in the response echo");
-    failures += check(request.prompt.generation.tools.size() == 1 &&
+    failures += check(request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"mcp__clock__now"} &&
                           request.prompt.generation.tools[0].name == "mcp__clock__now" &&
                           request.prompt.generation.tools[0].description ==
                               "Clock service\n\nRead the current time",
-                      "allowed namespace function lowers to one Engine tool with shared context");
+                      "namespace selection keeps all Engine declarations and shared context");
     failures +=
         check(request.tool_identities.at("mcp__clock__now").name == "now" &&
                   request.tool_identities.at("mcp__clock__now").wire_namespace == "mcp__clock",
@@ -804,17 +811,16 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    failures += check(
+        parse_openai_responses_create_request(value, limits()).prompt.generation.tools[0].strict,
+        "strict function schema reaches generation");
 
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
+    failures += check(api_error([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }).param == "text.format.name",
+                      "malformed output schema is rejected");
 
     value               = base;
     value["background"] = true;
@@ -975,6 +981,19 @@ int test_response_object() {
                           tool_response.output_history[0].tool_calls[0].id ==
                               item.at("call_id").get<std::string>(),
                       "wire and continuation history share one stable function call_id");
+    tools.finish_reason = ninfer::FinishReason::OutputLimit;
+    const auto partial  = make_openai_response_object("resp_partial", 123, request, runtime, tools);
+    failures +=
+        check(partial.body.at("status") == "incomplete" && partial.body.at("output").size() == 1 &&
+                  partial.body.at("output")[0].at("arguments") == R"({"city":"Paris"})",
+              "truncation lost a completed call or hid the incomplete response");
+    OpenAIResponsesEventStream stream("resp_partial_stream", 123, request, runtime);
+    (void)stream.start();
+    const auto finish   = stream.finish(tools);
+    const auto terminal = parse_event(stream.terminal(finish.response));
+    failures += check(terminal.at("type") == "response.incomplete" &&
+                          terminal.at("response").at("output")[0].at("type") == "function_call",
+                      "streamed completed call hid a later truncation");
     return failures;
 }
 
@@ -987,7 +1006,10 @@ int test_sse_sequence_and_failures() {
     wire.insert(wire.end(), next.begin(), next.end());
     next = encoder.content_delta("ans");
     wire.insert(wire.end(), next.begin(), next.end());
-    OpenAIResponsesStreamFinish finish = encoder.finish(sample_outcome());
+    auto outcome       = sample_outcome();
+    outcome.constraint = ninfer::ConstraintObservation{
+        .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
+    OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
                 finish.events_before_terminal.end());
     wire.push_back(encoder.terminal(finish.response));
@@ -1009,6 +1031,11 @@ int test_sse_sequence_and_failures() {
                           parse_event(wire.back()).at("type") == "response.completed" &&
                           text_deltas == "answer",
                       "SSE starts, reconstructs output, and terminates canonically");
+    failures +=
+        check(parse_event(wire.back())["response"]["constraint"]["complete"] == true &&
+                  parse_event(wire.back())["response"]["constraint"]["terminated"] == true &&
+                  !parse_event(wire.front())["response"].contains("constraint"),
+              "Responses constraint state must appear in the terminal response");
 
     OpenAIResponsesEventStream failed("resp_failed", 123, std::move(request), {});
     (void)failed.start();
@@ -1121,6 +1148,63 @@ int test_custom_tool_lowering() {
     failures += check(replayed.prompt.input_turns.back().role == ninfer::ChatRole::Tool &&
                           replayed.prompt.input_turns.back().tool_call_id == "call_s1",
                       "a custom_tool_call_output is lowered to a Tool turn in model history");
+int test_constrained_decoding() {
+    int failures = 0;
+    Json body{{"model", "qwen"},
+              {"input", "hello"},
+              {"structured_outputs", {{"grammar", "root ::= \"yes\""}}}};
+    const auto request = parse_openai_responses_create_request(body, limits());
+    OpenAIResponsesStore store(8, 1024 * 1024);
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        auto changed                  = body;
+        changed["structured_outputs"] = value;
+        const auto parsed             = parse_openai_responses_create_request(changed, limits());
+        const auto selected =
+            resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+        failures +=
+            check(to_request_options(selected.generation, {}, {}, true).constraint ==
+                      (value.contains("choice") ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                                : ninfer::OutputConstraint::regex("[a-z]+")),
+                  "Responses choice/regex lost through prompt resolution");
+    }
+    const auto resolved =
+        resolve_openai_responses_prompt(request.prompt, store, std::nullopt, false);
+    failures += check(to_request_options(resolved.generation, {}, {}, true).constraint->source ==
+                          "root ::= \"yes\"",
+                      "Responses GBNF extension was lost in resolution or Engine translation");
+    body["tools"] = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "structured_outputs.grammar",
+                      "grammar admitted active tools");
+    body["tool_choice"] = "none";
+    failures += check(parse_openai_responses_create_request(body, limits())
+                              .prompt.generation.constraint->source == "root ::= \"yes\"",
+                      "inactive tools blocked grammar");
+    body["structured_outputs"] = Json{{"grammar", ""}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "structured_outputs.grammar",
+                      "empty grammar was accepted");
+    body                      = Json{{"model", "qwen"},
+                                     {"input", "hello"},
+                                     {"text",
+                                      {{"format",
+                                        {{"type", "json_schema"},
+                                         {"name", "answer"},
+                                         {"strict", true},
+                                         {"schema", {{"type", "object"}}}}}}}};
+    const auto schema_request = parse_openai_responses_create_request(body, limits());
+    const auto response =
+        make_openai_response_object("resp_test", 1, schema_request, {}, sample_outcome());
+    failures += check(response.body["text"]["format"] == schema_request.text_format &&
+                          schema_request.prompt.generation.constraint_param == "text.format.schema",
+                      "Responses format echo or source path lost");
+    body["tools"]       = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
+    const auto combined = parse_openai_responses_create_request(body, limits()).prompt.generation;
+    failures += check(combined.constraint && combined.uses_tools() &&
+                          combined.tools[0].schema_param == "tools/0/parameters",
+                      "Responses JSON/tool composition or diagnostic origin lost");
     return failures;
 }
 
@@ -1128,6 +1212,7 @@ int test_custom_tool_lowering() {
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();

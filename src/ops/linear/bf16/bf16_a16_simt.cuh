@@ -76,7 +76,7 @@ __device__ __forceinline__ void bf16_simt_accumulate_direct_phase(
                 if (token < ActiveTokens) {
                     activation[local_token] = load_bf16_activation_phase<Schedule>(
                         x + static_cast<std::int64_t>(min(token, live_tokens - 1)) * K, phase,
-                        warp_in_row, lane);
+                        warp_in_row, lane, K);
                 }
             }
 #pragma unroll
@@ -99,11 +99,12 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
     int live_tokens, int input_rows) {
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
-    const int kPhases             = K / kValuesPerPhase;
-    using Pack                    = Bf16GemvPack<Schedule::kValuesPerLane>;
-    const int phase0              = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
-                                        ? 0
-                                        : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
+    const int kPhases =
+        K / kValuesPerPhase + (bf16_predicated_k<Schedule> && K % kValuesPerPhase != 0);
+    using Pack       = Bf16GemvPack<Schedule::kValuesPerLane>;
+    const int phase0 = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
+                           ? 0
+                           : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
 
     if constexpr (Schedule::kActivationAccess == Bf16SimtActivationAccess::WarpPacked) {
 #pragma unroll Schedule::kPhaseUnroll
@@ -115,7 +116,7 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
             for (int token = 0; token < ActiveTokens; ++token) {
                 activation[token] = load_bf16_activation_phase<Schedule>(
                     x + static_cast<std::int64_t>(min(token, live_tokens - 1)) * K, phase,
-                    warp_in_row, lane);
+                    warp_in_row, lane, K);
             }
 
 #pragma unroll

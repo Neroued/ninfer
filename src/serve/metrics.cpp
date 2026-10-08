@@ -68,6 +68,16 @@ void Metrics::done(const GenerationOutcome& outcome) {
     } else {
         ++requests_.completed;
     }
+    if (outcome.constraint) {
+        const auto& c = *outcome.constraint;
+        ++requests_.constraint_outcomes[c.terminated ? 0 : c.complete ? 1 : 2];
+        ++requests_.constraint_cache[static_cast<unsigned>(c.cache)];
+        requests_.constraint_prepare_seconds += c.prepare_seconds;
+        requests_.constraint_mask_seconds += c.mask_seconds;
+        requests_.constraint_matcher_seconds += c.matcher_seconds;
+        requests_.constraint_positions += c.mask_positions;
+        requests_.constraint_upload_bytes += c.mask_upload_bytes;
+    }
     requests_.duration.observe(outcome.metrics.total_seconds);
     requests_.queue.observe(outcome.metrics.engine_timing.queue_wait_seconds);
 }
@@ -113,6 +123,31 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
         header(name, "counter", help);
         out << "ninfer_" << name << ' ' << current - baseline << '\n';
     };
+    header("constraint_requests_total", "counter",
+           "Settled constrained requests by language completion.");
+    const char* outcomes[]    = {"terminated", "complete_interrupted", "incomplete_interrupted"};
+    const char* cache_names[] = {"hit", "built", "waited"};
+    for (std::size_t i = 0; i < 3; ++i)
+        out << "ninfer_constraint_requests_total{outcome=\"" << outcomes[i] << "\"} "
+            << requests.constraint_outcomes[i] << '\n';
+    header("constraint_cache_total", "counter",
+           "Compilation cache access for settled constrained requests.");
+    for (std::size_t i = 0; i < 3; ++i)
+        out << "ninfer_constraint_cache_total{result=\"" << cache_names[i] << "\"} "
+            << requests.constraint_cache[i] << '\n';
+    counter("constraint_prepare_seconds_total", requests.constraint_prepare_seconds, 0.0,
+            "Observed constraint preparation work.");
+    counter("constraint_mask_seconds_total", requests.constraint_mask_seconds, 0.0,
+            "Observed CPU mask work, including lookahead rollback.");
+    counter("constraint_matcher_seconds_total", requests.constraint_matcher_seconds, 0.0,
+            "Observed matcher acceptance and discard work.");
+    counter("constraint_mask_positions_total", requests.constraint_positions, 0,
+            "Evaluated constrained prediction positions.");
+    counter("constraint_mask_upload_bytes_total", requests.constraint_upload_bytes, 0,
+            "Submitted mask payload bytes.");
+    counter("constraint_draft_wait_seconds_total", stats.host_work.constraint_draft_wait_ns * 1e-9,
+            baseline_.host_work.constraint_draft_wait_ns * 1e-9,
+            "Draft-ready wait, counted once per batch.");
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
           "Unix time at service attachment after warmup.");

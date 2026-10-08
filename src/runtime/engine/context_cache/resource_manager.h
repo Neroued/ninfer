@@ -62,6 +62,7 @@ public:
         std::optional<Admission> admission;
         std::optional<std::uint64_t> gain_limit;
         std::uint64_t sacrificed = 0;
+        ReclaimRights rights;
     };
 
     struct SourceChoice {
@@ -80,7 +81,8 @@ public:
 
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
-               std::optional<OwnerToken> own_resume = std::nullopt) {
+               std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
+               std::uint64_t publication_order = UINT64_MAX) {
         prune(program);
         std::vector<SourceChoice> result;
         if (enabled_) {
@@ -93,15 +95,13 @@ public:
                     if (point == owner.points.end()) { continue; }
                     const auto& advice = base.context_cache();
                     const bool take =
-                        own_resume ? *own_resume == owner.token
-                                   : !owner.active &&
-                                         (!owner.session || (advice.update_session_index &&
-                                                             advice.session_key == owner.session));
-                    const auto carried = points(own_resume.value_or(owner.token));
-                    auto source        = program.inspect_source(base, handle, take, carried);
-                    if (!source) { continue; }
+                        own_resume
+                            ? *own_resume == owner.token
+                            : !owner.active && owner.publication_order <= publication_order &&
+                                  (!owner.session || (advice.update_session_index &&
+                                                      advice.session_key == owner.session));
                     result.push_back(
-                        {.source            = std::move(*source),
+                        {.source            = Source{.checkpoint = handle},
                          .owner             = owner.token,
                          .take_over         = take,
                          .resume_owner      = own_resume,
@@ -111,20 +111,21 @@ public:
                 }
                 for (const auto& shared : shared_) {
                     if (shared.handle != handle) { continue; }
-                    const auto carried = own_resume ? points(*own_resume) : std::vector<Handle>{};
-                    auto source        = program.inspect_source(base, handle, false, carried);
-                    if (!source) { continue; }
-                    result.push_back({.source       = std::move(*source),
+                    result.push_back({.source       = Source{.checkpoint = handle},
                                       .shared_entry = shared.ordinal,
                                       .resume_owner = own_resume,
                                       .ordinal      = shared.ordinal});
                 }
             }
         }
-        const auto carried = own_resume ? points(*own_resume) : std::vector<Handle>{};
-        if (auto root = program.inspect_source(base, std::nullopt, false, carried)) {
-            result.push_back({.source = std::move(*root), .resume_owner = own_resume});
+        result.push_back({.source = Source{}, .resume_owner = own_resume});
+        if (const auto* waiting = find_waiting(request);
+            waiting && waiting->choice.source.checkpoint &&
+            contains(waiting->held, *waiting->choice.source.checkpoint)) {
+            result.push_back(waiting->choice);
         }
+        std::erase_if(
+            result, [&](auto& choice) { return !prepare_source(program, base, choice, request); });
         const auto cost = [&](const Source& source) {
             const auto transfer = price_context_transfer_requirements(costs_, source.transfers);
             const auto prefill  = costs_.prefill_ns(source.remaining_work);
@@ -160,7 +161,7 @@ public:
             const auto duplicate =
                 std::any_of(unique.begin(), unique.end(), [&](const auto& prior) {
                     return prior.source.checkpoint == choice.source.checkpoint &&
-                           prior.source.consume_private == choice.source.consume_private &&
+                           prior.source.consume_source == choice.source.consume_source &&
                            prior.source.private_points == choice.source.private_points;
                 });
             if (!duplicate) { unique.push_back(std::move(choice)); }
@@ -168,31 +169,113 @@ public:
         return unique;
     }
 
-    // This runs only for the candidate being attempted, after read-only source ranking. A
-    // rewind retires deeper private positions before Native decides whether its history can move.
-    [[nodiscard]] bool prepare_source(Program& program, const Base& base, SourceChoice& choice) {
+    // Evaluation grants consumption rights but does not retire anything. Native checks the
+    // complete binding before applying these grants in its ownership handoff.
+    [[nodiscard]] bool prepare_source(Program& program, const Base& base, SourceChoice& choice,
+                                      std::uint64_t request                   = 0,
+                                      std::optional<ReclaimRights> revocation = std::nullopt) {
         const auto selected = choice.source.checkpoint;
         if (selected && !program.valid_checkpoint(*selected)) { return false; }
         auto* owner = find_owner(choice.owner);
+        if (choice.take_over && (!owner || owner->publication_order != choice.publication_order ||
+                                 (owner->active && choice.resume_owner != choice.owner))) {
+            choice.take_over = false;
+        }
+        std::vector<Handle> retired;
         if (choice.take_over && selected && owner) {
             const auto frontier = program.checkpoint_metadata(*selected).frontier;
-            std::vector<Handle> retired;
             for (const auto& point : owner->points) {
                 if (point.handle == *selected || !program.valid_checkpoint(point.handle)) {
                     continue;
                 }
                 const auto summary = program.checkpoint_metadata(point.handle);
-                if (summary.frontier > frontier && !summary.leased) {
+                if (summary.frontier > frontier && !summary.leased &&
+                    consumable(point.handle, owner->token, request, revocation)) {
                     retired.push_back(point.handle);
                 }
             }
-            for (const auto handle : retired) { (void)remove_point(program, *owner, handle); }
         }
-        const auto carried = points(choice.resume_owner.value_or(choice.owner));
-        auto inspected     = program.inspect_source(base, selected, choice.take_over, carried);
+        auto carried = points(choice.resume_owner.value_or(choice.owner));
+        if (const auto* waiting = find_waiting(request);
+            waiting && waiting->choice.source.checkpoint == selected) {
+            carried = waiting->choice.source.private_points;
+            std::erase_if(carried, [&](auto point) { return !contains(waiting->held, point); });
+        }
+        const auto private_owner =
+            choice.resume_owner.value_or(choice.take_over ? choice.owner : 0);
+        const bool consume = selected && consumable(*selected, private_owner, request, revocation);
+        auto inspected     = program.inspect_source(base, selected, consume, carried, retired);
         if (!inspected) { return false; }
+        inspected->take_private =
+            std::all_of(inspected->private_points.begin(), inspected->private_points.end(),
+                        [&](auto point) { return consumable(point, private_owner, request); });
         choice.source = std::move(*inspected);
         return true;
+    }
+
+    void retain_source(Program& program, std::uint64_t request, const SourceChoice& choice) {
+        std::vector<Handle> held;
+        if (choice.source.checkpoint) { held.push_back(*choice.source.checkpoint); }
+        for (const auto point : choice.source.private_points) {
+            if (!contains(held, point)) { held.push_back(point); }
+        }
+        auto* waiting = find_waiting(request);
+        if (!waiting) {
+            if (held.empty()) { return; }
+            waiting_.push_back({.request = request, .choice = choice, .held = std::move(held)});
+            return;
+        }
+        auto old        = std::move(waiting->held);
+        waiting->choice = choice;
+        waiting->held   = std::move(held);
+        for (const auto point : old) { release_unreferenced(program, point); }
+    }
+
+    [[nodiscard]] std::optional<SourceChoice> retained_source(std::uint64_t request) const {
+        const auto* waiting = find_waiting(request);
+        if (!waiting || !waiting->choice.source.checkpoint ||
+            !contains(waiting->held, *waiting->choice.source.checkpoint)) {
+            return std::nullopt;
+        }
+        return waiting->choice;
+    }
+
+    [[nodiscard]] bool has_source_record(std::uint64_t request) const {
+        return find_waiting(request) != nullptr;
+    }
+
+    [[nodiscard]] bool can_transfer_private(OwnerToken owner, std::uint64_t request) const {
+        const auto carried = points(owner);
+        return std::all_of(carried.begin(), carried.end(),
+                           [&](auto point) { return consumable(point, owner, request); });
+    }
+
+    [[nodiscard]] std::uint32_t source_revocations(std::uint64_t request) const {
+        const auto* waiting = find_waiting(request);
+        return waiting ? waiting->revocations : 0;
+    }
+
+    void binding_started(std::uint64_t request, std::span<const Handle> retired,
+                         std::optional<Handle> consumed) {
+        if (auto* waiting = find_waiting(request)) { waiting->binding = true; }
+        for (const auto handle : retired) { forget(handle); }
+        if (consumed) {
+            for (auto& waiting : waiting_) {
+                if (waiting.request != request && std::erase(waiting.held, *consumed)) {
+                    ++waiting.revocations;
+                }
+            }
+        }
+    }
+
+    void release_source(Program& program, std::uint64_t request) {
+        const auto found = std::find_if(waiting_.begin(), waiting_.end(), [=](const auto& entry) {
+            return entry.request == request;
+        });
+        if (found == waiting_.end()) { return; }
+        auto held = std::move(found->held);
+        waiting_.erase(found);
+        for (const auto handle : held) { release_unreferenced(program, handle); }
     }
 
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
@@ -392,11 +475,13 @@ public:
     }
 
     [[nodiscard]] ReclaimCursor begin_reclaim(Program& program,
-                                              std::optional<Admission> admission = std::nullopt) {
+                                              std::optional<Admission> admission = std::nullopt,
+                                              ReclaimRights rights               = {}) {
         prune(program);
         balance_reused(program);
         auto cursor      = reclaim_order(program);
         cursor.admission = admission;
+        cursor.rights    = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         if (admission && !admission->demand.reused) {
             cursor.gain_limit = recovery_gain(program, *admission, surviving(program, {}));
         }
@@ -408,14 +493,15 @@ public:
                  std::span<const Handle> later_snapshots = {},
                  std::span<const Handle> excluded        = {},
                  std::optional<Admission> admission      = std::nullopt,
-                 const ReclaimCursor* decision           = nullptr) {
+                 const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
         prune(program);
         Evaluation evaluation;
         if (decision) {
             return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded,
                                          decision->admission, *decision, evaluation);
         }
-        const auto cursor = reclaim_order(program);
+        auto cursor   = reclaim_order(program);
+        cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded, admission,
                                      cursor, evaluation);
     }
@@ -425,8 +511,9 @@ public:
         commit_release(program, handles, cursor);
     }
 
-    bool erase(Program& program, Handle handle) {
+    bool erase(Program& program, Handle handle, ReclaimRights rights = {}) {
         if (!references(handle)) { return false; }
+        if (!may_revoke({&handle, 1}, rights)) { return false; }
         if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
             return false;
         }
@@ -515,6 +602,7 @@ public:
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
             const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
             rank.loss            = host_rank.loss;
+            rank.waiting         = host_rank.waiting;
             rank.order           = std::max(rank.order, host_rank.order);
             if (host_rank.priority.reused &&
                 (!rank.priority.reused ||
@@ -607,6 +695,7 @@ public:
         index_.clear();
         owners_.clear();
         shared_.clear();
+        waiting_.clear();
         demand_.clear();
         for (const auto handle : handles) {
             if (program.valid_checkpoint(handle)) { (void)program.release_checkpoint(handle); }
@@ -614,6 +703,74 @@ public:
     }
 
 private:
+    struct WaitingSource {
+        std::uint64_t request;
+        SourceChoice choice;
+        std::vector<Handle> held;
+        std::uint32_t revocations = 0;
+        bool binding              = false;
+    };
+
+    WaitingSource* find_waiting(std::uint64_t request) {
+        const auto found = std::find_if(waiting_.begin(), waiting_.end(),
+                                        [=](const auto& item) { return item.request == request; });
+        return found == waiting_.end() ? nullptr : &*found;
+    }
+
+    const WaitingSource* find_waiting(std::uint64_t request) const {
+        const auto found = std::find_if(waiting_.begin(), waiting_.end(),
+                                        [=](const auto& item) { return item.request == request; });
+        return found == waiting_.end() ? nullptr : &*found;
+    }
+
+    bool consumable(Handle handle, OwnerToken owner, std::uint64_t request,
+                    std::optional<ReclaimRights> revocation = std::nullopt) const {
+        std::size_t allowed = 0;
+        if (const auto* entry = find_owner(owner)) {
+            allowed = std::count_if(entry->points.begin(), entry->points.end(),
+                                    [&](const auto& point) { return point.handle == handle; });
+        }
+        if (catalog_reference_count(handle) != allowed) { return false; }
+        for (const auto& waiting : waiting_) {
+            if (!contains(waiting.held, handle)) { continue; }
+            if (waiting.binding) { return false; }
+            if (waiting.request != request &&
+                (!revocation || revocation->purpose == ReclaimPurpose::OptionalWrite ||
+                 (revocation->purpose == ReclaimPurpose::FreshAdmission &&
+                  waiting.request <= revocation->request))) {
+                return false;
+            }
+            ++allowed;
+        }
+        return allowed != 0;
+    }
+
+    [[nodiscard]] std::uint64_t waiting_ticket(std::span<const Handle> handles) const {
+        std::uint64_t oldest = 0;
+        for (const auto& waiting : waiting_) {
+            if (std::any_of(handles.begin(), handles.end(),
+                            [&](auto handle) { return contains(waiting.held, handle); })) {
+                oldest = oldest ? std::min(oldest, waiting.request) : waiting.request;
+            }
+        }
+        return oldest;
+    }
+
+    bool may_revoke(std::span<const Handle> handles, ReclaimRights rights) const {
+        for (const auto& waiting : waiting_) {
+            if (!std::any_of(handles.begin(), handles.end(),
+                             [&](auto handle) { return contains(waiting.held, handle); })) {
+                continue;
+            }
+            if (waiting.binding || rights.purpose == ReclaimPurpose::OptionalWrite ||
+                (rights.purpose == ReclaimPurpose::FreshAdmission &&
+                 waiting.request <= rights.request)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     struct Demand {
         DemandKey key;
         std::uint64_t request_id;
@@ -696,7 +853,7 @@ private:
         return it == shared_.end() ? nullptr : &*it;
     }
 
-    std::size_t reference_count(Handle handle) const {
+    std::size_t catalog_reference_count(Handle handle) const {
         std::size_t count = 0;
         for (const auto& owner : owners_) {
             count += std::count_if(owner.points.begin(), owner.points.end(),
@@ -704,6 +861,12 @@ private:
         }
         count += std::count_if(shared_.begin(), shared_.end(),
                                [&](const auto& entry) { return entry.handle == handle; });
+        return count;
+    }
+
+    std::size_t reference_count(Handle handle) const {
+        auto count = catalog_reference_count(handle);
+        for (const auto& waiting : waiting_) { count += contains(waiting.held, handle); }
         return count;
     }
 
@@ -715,7 +878,7 @@ private:
             return false;
         }
         std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
-        if (!references(handle)) { index_.erase(handle); }
+        if (!catalog_reference_count(handle)) { index_.erase(handle); }
         return true;
     }
 
@@ -725,11 +888,14 @@ private:
             std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
         }
         std::erase_if(shared_, [&](const auto& entry) { return entry.handle == handle; });
+        for (auto& waiting : waiting_) {
+            if (std::erase(waiting.held, handle) && !waiting.binding) { ++waiting.revocations; }
+        }
     }
 
     void release_unreferenced(Program& program, Handle handle) {
+        if (!catalog_reference_count(handle)) { index_.erase(handle); }
         if (references(handle)) { return; }
-        index_.erase(handle);
         if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
             throw std::logic_error("Native could not release an unreferenced checkpoint owner");
         }
@@ -762,6 +928,9 @@ private:
             for (const auto& point : owner.points) { inspect(point.handle); }
         }
         for (const auto& shared : shared_) { inspect(shared.handle); }
+        for (const auto& waiting : waiting_) {
+            for (const auto handle : waiting.held) { inspect(handle); }
+        }
         for (const auto handle : stale) { forget(handle); }
         std::erase_if(owners_,
                       [](const auto& owner) { return !owner.active && owner.points.empty(); });
@@ -814,6 +983,9 @@ private:
         for (const auto& shared : shared_) {
             add(shared.handle, shared.priority, shared.retained_at);
         }
+        for (const auto& waiting : waiting_) {
+            for (const auto handle : waiting.held) { add(handle, {}, waiting.request); }
+        }
         std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
             if (a.priority.reused != b.priority.reused) { return !a.priority.reused; }
             return (a.priority.reused ? a.priority.last_demand : a.age) <
@@ -851,6 +1023,8 @@ private:
 
     [[nodiscard]] std::vector<Handle> surviving(Program& program,
                                                 std::span<const Handle> removed) const {
+        // Only advertised entries can replace a future cache lookup. Waiting-only
+        // checkpoints remain physical holders, but are not a caller's lookup fallback.
         std::vector<Handle> kept;
         const auto include = [&](Handle handle) {
             if (!contains(removed, handle) && program.valid_checkpoint(handle) &&
@@ -991,9 +1165,10 @@ private:
 
     struct ActionRank {
         CacheRetentionPriority priority;
-        std::uint64_t loss  = 0;
-        std::uint64_t units = 0;
-        std::size_t order   = 0;
+        std::uint64_t loss    = 0;
+        std::uint64_t units   = 0;
+        std::size_t order     = 0;
+        std::uint64_t waiting = 0;
     };
 
     [[nodiscard]] ActionRank rank_action(Program& program, std::span<const Handle> sources,
@@ -1002,10 +1177,13 @@ private:
         return {.priority = facts.priority,
                 .loss     = preserving ? 0 : action_loss(program, sources, facts, evaluation),
                 .units    = units,
-                .order    = facts.order};
+                .order    = facts.order,
+                .waiting  = preserving ? 0 : waiting_ticket(sources)};
     }
 
     static bool less_rank(const ActionRank& left, const ActionRank& right) {
+        if (bool(left.waiting) != bool(right.waiting)) { return !left.waiting; }
+        if (left.waiting != right.waiting) { return left.waiting > right.waiting; }
         if (left.priority.reused != right.priority.reused) { return !left.priority.reused; }
         if (left.priority.reused && left.priority.last_demand != right.priority.last_demand) {
             return left.priority.last_demand < right.priority.last_demand;
@@ -1070,6 +1248,7 @@ private:
                               const std::optional<Admission>& admission,
                               const ReclaimCursor& cursor, Evaluation& evaluation,
                               bool preserving = false) const {
+        if (!preserving && !may_revoke(removed, cursor.rights)) { return false; }
         if (!admission) { return true; }
         const auto victim = facts.priority;
         if (victim.reused && (!admission->priority.reused ||
@@ -1092,6 +1271,9 @@ private:
     void commit_release(Program& program, std::span<const Handle> handles, ReclaimCursor& cursor,
                         std::optional<std::uint64_t> quoted_loss = std::nullopt) {
         if (handles.empty()) { return; }
+        if (!may_revoke(handles, cursor.rights)) {
+            throw std::logic_error("cache release lacks waiting-source revocation rights");
+        }
         const auto loss =
             cursor.gain_limit
                 ? (quoted_loss
@@ -1099,7 +1281,7 @@ private:
                        : program.checkpoint_recovery_loss(handles, surviving(program, handles)))
                 : 0;
         for (const auto handle : handles) {
-            if (!erase(program, handle)) {
+            if (!erase(program, handle, cursor.rights)) {
                 throw std::logic_error("quoted cache release changed before commit");
             }
         }
@@ -1270,6 +1452,7 @@ private:
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
+    std::vector<WaitingSource> waiting_;
     static constexpr std::size_t kDemandCapacity = 256;
     std::vector<Demand> demand_;
     std::uint64_t clock_   = 0;

@@ -298,13 +298,7 @@ ColdTiming measure_cold_launch(Launch&& launch, L2FlushBuffer& flush, cudaStream
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    std::sort(samples.begin(), samples.end());
-    return {
-        samples[samples.size() / 2],
-        samples.front(),
-        samples[std::min(samples.size() - 1,
-                         static_cast<std::size_t>(0.95 * static_cast<double>(samples.size())))],
-    };
+    return summarize_timings(std::move(samples));
 }
 
 inline ColdTiming measure_cold_graph(const TimedGraph& graph, L2FlushBuffer& flush,
@@ -325,14 +319,7 @@ inline ColdTiming measure_cold_graph(const TimedGraph& graph, L2FlushBuffer& flu
         flush_l2(flush, stream);
         samples.push_back(graph.launch_timed(stream));
     }
-    std::sort(samples.begin(), samples.end());
-    const auto percentile = [&](double fraction) {
-        const std::size_t index =
-            std::min(samples.size() - 1,
-                     static_cast<std::size_t>(fraction * static_cast<double>(samples.size() - 1)));
-        return samples[index];
-    };
-    return {percentile(0.50), samples.front(), percentile(0.95)};
+    return summarize_timings(std::move(samples));
 }
 
 template <class Prepare, class Launch>

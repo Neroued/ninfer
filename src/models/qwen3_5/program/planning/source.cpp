@@ -24,8 +24,8 @@ bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
 
 std::optional<SourceCandidate>
 ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> handle,
-                            bool consume_private,
-                            std::span<const CheckpointHandle> private_points) const {
+                            bool consume_source, std::span<const CheckpointHandle> private_points,
+                            std::span<const CheckpointHandle> retired_points) const {
     if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
@@ -42,12 +42,46 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     }
     if (!handle) { return candidate; }
-    const auto& record        = checkpoint(*handle);
-    candidate.consume_private = consume_private;
-    const auto& rewrite       = prompt.identity.rewrite_checkpoint;
-    const auto desired        = rewrite ? rewrite->recovery_frontier : base.summary().prompt_tokens;
+    const auto& record       = checkpoint(*handle);
+    candidate.consume_source = consume_source;
+    candidate.take_private   = consume_source;
+    for (const auto point : retired_points) {
+        if (point == handle || !can_release_checkpoint(point)) { return std::nullopt; }
+        if (std::find(candidate.retired_points.begin(), candidate.retired_points.end(), point) ==
+            candidate.retired_points.end()) {
+            candidate.retired_points.push_back(point);
+        }
+    }
+    const auto retires = [&](CheckpointHandle point) {
+        return std::find(candidate.retired_points.begin(), candidate.retired_points.end(), point) !=
+               candidate.retired_points.end();
+    };
+    auto state_references = state_store->checkpoint_references(record.state);
+    for (const auto point : candidate.retired_points) {
+        if (checkpoint(point).state == record.state) { --state_references; }
+    }
+    auto occupied_states = state_store->device_occupied();
+    for (std::size_t i = 0; i < candidate.retired_points.size(); ++i) {
+        const auto state = checkpoint(candidate.retired_points[i]).state;
+        if (std::any_of(candidate.retired_points.begin(), candidate.retired_points.begin() + i,
+                        [&](auto point) { return checkpoint(point).state == state; })) {
+            continue;
+        }
+        const auto references = static_cast<std::uint32_t>(
+            std::count_if(candidate.retired_points.begin(), candidate.retired_points.end(),
+                          [&](auto point) { return checkpoint(point).state == state; }));
+        if (references == state_store->checkpoint_references(state) &&
+            state_store->device_resident(state) &&
+            state_store->can_release_after_checkpoint_references(state, references)) {
+            --occupied_states;
+        }
+    }
+    const auto& rewrite = prompt.identity.rewrite_checkpoint;
+    const auto desired  = rewrite ? rewrite->recovery_frontier : base.summary().prompt_tokens;
     for (const auto point : private_points) {
-        if (!valid_checkpoint(point) || !checkpoint_matches(point, base)) { continue; }
+        if (!valid_checkpoint(point) || retires(point) || !checkpoint_matches(point, base)) {
+            continue;
+        }
         const auto& kept = checkpoint(point);
         if (kept.frontier > record.frontier) { continue; }
         const bool input =
@@ -60,16 +94,14 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const bool keep_source =
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
-    candidate.move_state = consume_private && !keep_source &&
-                           checkpoints[handle->index].pins == 0 &&
-                           state_store->checkpoint_references(record.state) == 1 &&
-                           state_store->source_pins(record.state) == 0;
+    candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
+                           state_references == 1 && state_store->source_pins(record.state) == 0;
     candidate.split_state =
-        !candidate.move_state && state_store->device_occupied() == state_store->device_capacity() &&
+        !candidate.move_state && occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->host_resident(record.state) &&
         state_store->source_pins(record.state) == 0;
     if (!candidate.move_state && !candidate.split_state &&
-        state_store->device_occupied() == state_store->device_capacity() &&
+        occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->source_pins(record.state) == 0 &&
         checkpoints[handle->index].pins == 0) {
         if (host_context_arena &&
@@ -77,10 +109,9 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             candidate.backup_state = candidate.split_state = true;
             candidate.transfers.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
-        } else if (consume_private && state_store->checkpoint_references(record.state) == 1) {
+        } else if (consume_source && state_references == 1) {
             // One physical slot cannot retain its immutable recovery image and a writer.
             // Consume this optional point while preserving its already computed execution input.
-            std::erase(candidate.private_points, *handle);
             candidate.move_state = true;
         }
     }
@@ -98,14 +129,17 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                                       ? record.frontier - 1U
                                       : record.backend_frontier;
     candidate.move_history =
-        consume_private &&
+        consume_source &&
         movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier) &&
         (!record.kv->backend ||
          movable(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, backend_frontier));
     if (candidate.move_history) {
         for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
             const auto& slot = checkpoints[index];
-            if (!slot.value || index == handle->index || slot.value->kv != record.kv) { continue; }
+            if (!slot.value || index == handle->index || slot.value->kv != record.kv ||
+                retires({this, index, slot.generation})) {
+                continue;
+            }
             if (slot.value->frontier > record.frontier ||
                 slot.value->backend_frontier > backend_frontier) {
                 candidate.move_history = false;

@@ -523,7 +523,9 @@ public:
                     paused.paused->frontier() == prompt_tokens + 1,
                 "independent-history Replay pause lost A's committed target");
         check_independent();
-        const auto source      = program_.inspect_source(base, source_b, false, points_a);
+        auto source = program_.inspect_source(base, source_b, false, points_a);
+        require(source.has_value(), "independent replay source did not match");
+        source->take_private   = true; // A owns these points even though B supplies the source.
         const auto before_bind = program_.physical_usage();
         require(source &&
                     static_cast<bool>(program_.start_binding(base, {1}, *source, &*paused.paused)),
@@ -548,6 +550,7 @@ public:
         check_independent();
         auto snapshot_source = root(base);
         snapshot_source.private_points.assign(points_a.begin(), points_a.end());
+        snapshot_source.take_private = true;
         require(static_cast<bool>(
                     program_.start_binding(base, {0}, snapshot_source, &*snapshot.paused)),
                 "cross-source snapshot could not restore with its independent input point");
@@ -963,6 +966,173 @@ public:
         cancelled.paused.reset();
         expect_empty("destroyed paused replay retained typed resources");
         next_request();
+    }
+
+    void retired_host_image_preserves_input() {
+        auto base         = request(65, true);
+        const auto active = bind(base);
+        reserve(active, qwen::ExecutionUnitKind::Prefill);
+        auto begin = program_.advance_prefill(active);
+        require(begin.pending.has_value(), "Host retirement fixture did not begin");
+        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+        require(program_.commit(std::move(*begin.pending), accepted).capture_ready[0],
+                "Host retirement fixture did not offer its input point");
+        const auto input = capture(active, 65, runtime::CheckpointRole::InputReplay);
+        reserve(active, qwen::ExecutionUnitKind::Decode, 1);
+        const std::array<qwen::SequenceHandle, 1> members{active};
+        const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
+        auto output = program_.decode(members, budgets);
+        const std::array<runtime::CommitDecision, 1> terminal{
+            {{.accepted_tokens = 1, .terminal = true}}};
+        (void)program_.commit(std::move(output), terminal);
+        const auto finished = program_.finish(active);
+        require(finished.checkpoint.has_value(), "Host retirement fixture lost its endpoint");
+        const auto endpoint      = *finished.checkpoint;
+        const auto offload_state = [&](qwen::CheckpointHandle point) {
+            const std::array handles{point};
+            const auto plans = program_.plan_reclaim(handles, {}, {.state_slots = 1});
+            const auto found =
+                std::find_if(plans.demotions.begin(), plans.demotions.end(),
+                             [](const auto& p) { return p.released.state_slots == 1; });
+            require(found != plans.demotions.end() && program_.start_demote(*found),
+                    "Host retirement fixture could not offload its State image");
+            const auto bytes = found->host_bytes;
+            require(settle().published, "Host retirement State transfer failed");
+            return bytes;
+        };
+        const auto image_bytes = offload_state(endpoint);
+        require(image_bytes != 0, "Host retirement fixture has no image allocation");
+        std::vector<qwen::CheckpointHandle> fillers;
+        auto filler = request(32, true);
+        while (program_.physical_usage().capacity.host_bytes -
+                   program_.physical_usage().occupied.host_bytes >=
+               image_bytes) {
+            fillers.push_back(checkpoint(filler));
+            (void)offload_state(fillers.back());
+        }
+        while (program_.physical_usage().occupied.state_slots <
+               program_.physical_usage().capacity.state_slots) {
+            fillers.push_back(checkpoint(filler));
+        }
+        const std::array points{input};
+        const std::array retired{endpoint};
+        auto source = program_.inspect_source(base, input, true, points, retired);
+        require(source && source->move_state,
+                "Host retirement fixture did not require consuming its input before retirement");
+        const auto binding = program_.start_binding(base, {0}, *source);
+        require(binding && !binding.consumed_source,
+                "binding discarded input despite the Host destination freed by retirement");
+        const auto bound = settle();
+        require(bound.sequence && program_.valid_checkpoint(input) &&
+                    bound.private_points == std::vector(points.begin(), points.end()) &&
+                    transferred(bound, runtime::ContextTransferDirection::DeviceToHost,
+                                runtime::ContextResourceClass::State),
+                "retired Host space did not preserve the complete input recovery image");
+        require(program_.abort(*bound.sequence).status == runtime::ConsumeStatus::Consumed &&
+                    program_.release_checkpoint(input),
+                "Host retirement fixture could not release its binding and input");
+        for (const auto point : fillers) {
+            require(program_.release_checkpoint(point), "Host retirement filler leaked ownership");
+        }
+        expect_empty("Host retirement preservation leaked resources");
+    }
+
+    void rewind_binding_retirement() {
+        require(program_.physical_usage().capacity.main_kv_pages == 8,
+                "rewind fixture requires the eight-page Main pool");
+        for (const bool releases_suffix : {false, true}) {
+            constexpr std::uint32_t prefix = 65;
+            auto original                  = request(prefix, true);
+            const auto active              = bind(original);
+            reserve(active, qwen::ExecutionUnitKind::Prefill);
+            auto begin = program_.advance_prefill(active);
+            require(begin.pending.has_value(), "rewind fixture did not complete input");
+            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+            require(program_.commit(std::move(*begin.pending), accepted).capture_ready[0],
+                    "rewind fixture did not offer input recovery");
+            const auto input = capture(active, prefix, runtime::CheckpointRole::InputReplay);
+            const std::array<qwen::SequenceHandle, 1> members{active};
+            if (releases_suffix) {
+                std::array<TokenId, kChunk> forced;
+                forced.fill(198);
+                const std::array<std::optional<std::uint32_t>, 1> splits{std::nullopt};
+                reserve(active, qwen::ExecutionUnitKind::Control, forced.size());
+                (void)program_.append_forced_tokens(members, forced, forced.size(), splits);
+            }
+            reserve(active, qwen::ExecutionUnitKind::Decode, 1);
+            const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
+            auto output = program_.decode(members, budgets);
+            const std::array<runtime::CommitDecision, 1> terminal{
+                {{.accepted_tokens = 1, .terminal = true}}};
+            (void)program_.commit(std::move(output), terminal);
+            auto finished = program_.finish(active);
+            require(finished.checkpoint.has_value(), "rewind fixture lost its deeper endpoint");
+            const auto endpoint = *finished.checkpoint;
+            auto competing      = request(kPromptTokens);
+            const auto blocker  = bind(competing, 1);
+            if (releases_suffix) {
+                prefill_prefix(blocker, 2 * kChunk);
+            } else {
+                finish_prefill(blocker, kPromptTokens, false);
+            }
+            require(program_.physical_usage().occupied.main_kv_pages == 8,
+                    "rewind fixture did not fill its Main pool");
+            auto rewritten = request(kCapacity, true);
+            const std::array<qwen::CheckpointHandle, 1> retirement{endpoint};
+            auto choice = program_.inspect_source(rewritten, input, true, {}, retirement);
+            require(choice && choice->move_history && choice->move_state &&
+                        program_.valid_checkpoint(input) && program_.valid_checkpoint(endpoint),
+                    "rewind evaluation mutated history or missed the authorized Move");
+            const auto before = program_.physical_usage();
+            auto binding      = program_.start_binding(rewritten, {0}, *choice);
+            if (!releases_suffix) {
+                require(!binding && binding.source_valid && binding.shortage.main_kv_pages == 2 &&
+                            !program_.has_context_transaction() &&
+                            program_.valid_checkpoint(endpoint) && program_.valid_checkpoint(input),
+                        "failed rewind retired a still-useful checkpoint");
+                expect_usage(before, "failed rewind changed live resources");
+                require(program_.abort(blocker).status == runtime::ConsumeStatus::Consumed,
+                        "rewind blocker could not release its resources");
+                binding = program_.start_binding(rewritten, {0}, *choice);
+            }
+            require(binding &&
+                        binding.retired_points ==
+                            std::vector(retirement.begin(), retirement.end()) &&
+                        !program_.valid_checkpoint(endpoint),
+                    "binding failed to fund its reservation from the authorized retired suffix");
+            const auto bound = settle();
+            require(bound.sequence && bound.operations.state_moves == 1 &&
+                        bound.operations.state_forks == 0 && !program_.valid_checkpoint(input),
+                    "rewind ownership handoff needlessly forked or retained its consumed source");
+            require(program_.abort(*bound.sequence).status == runtime::ConsumeStatus::Consumed,
+                    "rewind binding could not release its writer");
+            if (releases_suffix) {
+                require(program_.abort(blocker).status == runtime::ConsumeStatus::Consumed,
+                        "rewind suffix fixture leaked its blocking request");
+            }
+            expect_empty("rewind binding leaked retired history or unit reservations");
+        }
+    }
+
+    void fork_exceeds_physical_capacity() {
+        auto prefix       = request(kCapacity - 1, true);
+        const auto point  = checkpoint(prefix);
+        auto full         = request(kCapacity, true);
+        const auto source = program_.inspect_source(full, point);
+        require(source && !source->move_history, "fork capacity fixture consumed its source");
+        const auto before  = program_.physical_usage();
+        const auto blocked = program_.start_binding(full, {0}, *source);
+        require(!blocked && blocked.source_valid && !blocked.capacity_possible &&
+                    blocked.shortage.main_kv_pages == 1 && program_.valid_checkpoint(point),
+                "a full-pool fork waited for capacity that its extra tail can never obtain");
+        expect_usage(before, "impossible fork changed its immutable source");
+        require(program_.release_checkpoint(point), "fork capacity fixture leaked its source");
+        const auto cold = bind(full);
+        finish_prefill(cold, kCapacity, true);
+        const auto finished = program_.finish(cold);
+        require(finished.checkpoint && program_.release_checkpoint(*finished.checkpoint),
+                "the same request could not finish through the feasible root route");
+        expect_empty("fork capacity fallback leaked physical resources");
     }
 
     void recovery_capacity_and_progress() {
@@ -1486,6 +1656,46 @@ public:
         expect_empty("snapshot fact fixture leaked physical resources");
     }
 
+    void grammar_row_failure() {
+        struct Masks final : runtime::TokenMaskProvider {
+            void uploaded(std::size_t, std::size_t) noexcept override {}
+
+            bool constrained(std::size_t row) const noexcept override { return row == 0; }
+
+            std::uint32_t fill(std::size_t, std::span<const TokenId> drafts,
+                               std::span<std::uint32_t> words) override {
+                std::fill(words.begin(), words.end(), 0);
+                const auto stride = words.size() / (drafts.size() + 1);
+                for (std::size_t col = 0; col <= drafts.size(); ++col) words[col * stride] = 1;
+                return 1; // The first predicted position is a real dead end.
+            }
+        } masks;
+
+        auto base        = request(32);
+        const auto first = bind(base, 0);
+        finish_prefill(first, 32, false);
+        const auto second = bind(base, 1);
+        finish_prefill(second, 32, false);
+        const std::array<qwen::SequenceHandle, 2> members{first, second};
+        const std::array<qwen::ExecutionUnit, 2> units{
+            {{first, qwen::ExecutionUnitKind::Decode, 1},
+             {second, qwen::ExecutionUnitKind::Decode, 1}}};
+        require(static_cast<bool>(program_.reserve_units(units)), "grammar mixed unit reservation");
+        const std::array<runtime::RoundBudget, 2> budgets{{{1}, {1}}};
+        auto pending = program_.decode(members, budgets, nullptr, &masks);
+        require(pending.constraint_failed(0) && !pending.constraint_failed(1),
+                "grammar failure lost its row");
+        const std::array<runtime::CommitDecision, 2> decisions{
+            {{.terminal = true, .failed = true}, {.accepted_tokens = 1}}};
+        auto committed = program_.commit(std::move(pending), decisions);
+        require(committed.rows[0].disposition == runtime::CommitDisposition::FailedReleased &&
+                    committed.rows[1].disposition == runtime::CommitDisposition::Active,
+                "grammar failure contaminated a healthy row");
+        require(program_.abort(second).status == runtime::ConsumeStatus::Consumed,
+                "healthy row was released by another row's grammar error");
+        expect_empty("grammar row failure leaked physical resources");
+    }
+
 
 private:
     DeviceContext& device_;
@@ -1522,7 +1732,7 @@ void shared_capture_alignment(DeviceContext& device, const qwen::execution::Para
             {{sequence, qwen::ExecutionUnitKind::Prefill}}};
         require(static_cast<bool>(program.reserve_units(units)),
                 "aligned capture could not reserve its prefill unit");
-        auto step = program.advance_prefill(sequence, nullptr);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
         if (step.pending) {
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
             const auto committed = program.commit(std::move(*step.pending), accepted, {}, nullptr);
@@ -1689,7 +1899,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
 
     const auto initial = bind(0, nullptr);
     reserve(initial, qwen::ExecutionUnitKind::Prefill);
-    auto begin = program.advance_prefill(initial, nullptr);
+    auto begin = program.advance_prefill(initial, nullptr, nullptr);
     require(begin.complete && begin.pending && begin.pending->tokens().size() == 1,
             "sampling-count fixture did not produce exactly one Begin token");
     const TokenId first = begin.pending->tokens().front();
@@ -1815,6 +2025,7 @@ int main(int argc, char** argv) {
             fixture.active_input_zero_growth_binding();
             fixture.replay_carries_independent_input();
             fixture.retained_input_host_suffix();
+            fixture.retired_host_image_preserves_input();
             fixture.raw_identity_opt_out();
             fixture.cancel_gpu_binding();
             fixture.cancel_host_restore();
@@ -1824,6 +2035,7 @@ int main(int argc, char** argv) {
             fixture.demotion_holder_changes();
             fixture.batched_physical_demotions();
             fixture.physical_facts();
+            fixture.grammar_row_failure();
         }
         program.reset();
         options.kv_capacity    = KvCapacityPolicy::explicit_capacity(kCapacity);
@@ -1832,6 +2044,8 @@ int main(int argc, char** argv) {
         auto full_pool = qwen::create_program(parameters, std::move(full_pool_plan), device, {});
         {
             Fixture full_pool_fixture(device, *full_pool, frontend);
+            full_pool_fixture.rewind_binding_retirement();
+            full_pool_fixture.fork_exceeds_physical_capacity();
             full_pool_fixture.recovery_capacity_and_progress();
             full_pool_fixture.restore_full_pool_snapshot();
         }

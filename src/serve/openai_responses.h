@@ -42,6 +42,7 @@ struct OpenAIResponsesPromptRequest {
 
 struct OpenAIResponsesCreateRequest {
     OpenAIResponsesPromptRequest prompt;
+    nlohmann::json text_format = {{"type", "text"}};
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";

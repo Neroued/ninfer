@@ -451,6 +451,11 @@ def first_output_event():
 def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
+    done["schema_version"] = 25
+    done["generation"]["admission"] = {
+        "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
+        "revoked_checkpoints": 1, "fallback_reason": "source_revoked",
+    }
     start = {**done, "event": "request_start",
              "preparation_seconds": {"total": 0.015, "acquisition": 0.003, "tokenize": 0.010}}
     loaded = logged_campaign(tmp_path, [measured], [start, done])
@@ -460,6 +465,11 @@ def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path
     assert diagnostics["preparation_seconds"]["tokenize"] == 0.010
     summary = summarize_campaign(loaded)
     row = summary["request_timing_analysis"][0]
+    assert row["preferred_reused_tokens"] == 19057
+    assert row["source_wait_ms"] == 3.0
+    assert row["revoked_checkpoints"] == 1
+    assert row["admission_fallback_reason"] == "source_revoked"
+
     assert row["analysis_status"] == "available"
     assert row["ttft_ms"] == 100
     assert row["prepare_ms"] == 20

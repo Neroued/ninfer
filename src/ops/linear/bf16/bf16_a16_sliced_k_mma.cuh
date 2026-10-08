@@ -15,7 +15,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     constexpr int kBlockTokens = Schedule::kBlockTokens;
     constexpr int kTokenMmas   = Schedule::kMmaTokens;
     constexpr int kBlockK      = Schedule::kBlockK;
-    const int kGroups          = kHidden / kBlockK;
+    const int kGroups = kHidden / kBlockK + (bf16_predicated_k<Schedule> && kHidden % kBlockK != 0);
     static_assert((kMmaK % 16) == 0);
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
@@ -51,21 +51,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         for (int item = tid; item < kWeightVectors; item += Schedule::kThreads) {
             const int row = item / (kBlockK / 8);
             const int k8  = item - row * (kBlockK / 8);
-            cp_async<16, Schedule::kWeightCache>(
-                &weight_shared[row * kBlockK + bf16_mma_shared_col<Schedule>(row, k8 * 8)],
-                &weight[static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8]);
+            auto* dst = &weight_shared[row * kBlockK + bf16_mma_shared_col<Schedule>(row, k8 * 8)];
+            if constexpr (bf16_predicated_rows<Schedule> || bf16_predicated_k<Schedule>) {
+                const bool valid = (!bf16_predicated_rows<Schedule> || row0 + row < rows) &&
+                                   (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
+                const auto source =
+                    valid ? static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
+                cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
+            } else {
+                cp_async<16, Schedule::kWeightCache>(
+                    dst,
+                    &weight[static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8]);
+            }
         }
 
         constexpr int kActivationVectors = kBlockTokens * (kBlockK / 8);
         for (int item = tid; item < kActivationVectors; item += Schedule::kThreads) {
-            const int token        = item / (kBlockK / 8);
-            const int k8           = item - token * (kBlockK / 8);
-            const bool valid_token = token0 + token < tokens;
-            const int source_token = valid_token ? token0 + token : 0;
+            const int token  = item / (kBlockK / 8);
+            const int k8     = item - token * (kBlockK / 8);
+            const bool valid = token0 + token < tokens &&
+                               (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
+            const auto source =
+                valid ? static_cast<std::int64_t>(token0 + token) * kHidden + group_k0 + k8 * 8 : 0;
             cp_async_zfill<16, Schedule::kActivationCache>(
                 &x_shared[token * kBlockK + bf16_mma_shared_col<Schedule>(token, k8 * 8)],
-                &x[static_cast<std::int64_t>(source_token) * kHidden + group_k0 + k8 * 8],
-                valid_token ? 16 : 0);
+                x + source, valid ? 16 : 0);
         }
     };
 
@@ -142,8 +152,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t partner_base =
                 (static_cast<std::int64_t>(warp + 1) * kFragments + fragment) * 32 * 4;
-            const float4 partner =
-                load_vec<float4>(partial + partner_base + static_cast<std::int64_t>(lane) * 4);
+            float4 partner = {};
+            if constexpr (kKWarps % 2 == 0) {
+                partner =
+                    load_vec<float4>(partial + partner_base + static_cast<std::int64_t>(lane) * 4);
+            } else if (warp + 1 < kKWarps) {
+                partner =
+                    load_vec<float4>(partial + partner_base + static_cast<std::int64_t>(lane) * 4);
+            }
             accum[fragment][0] += partner.x;
             accum[fragment][1] += partner.y;
             accum[fragment][2] += partner.z;
@@ -177,8 +193,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             }
             const int mi = fragment / kTokenMmas, ni = fragment % kTokenMmas;
             const int token = token0 + ni * 8 + 2 * lid;
-            bf16_finish_fragment<false>(destination, epilogue, row0 + mi * 16 + gid, token, sum,
-                                        rows, tokens);
+            bf16_finish_fragment<false, decltype(destination), Epilogue,
+                                 !bf16_predicated_rows<Schedule>>(
+                destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
         }
     }
 }

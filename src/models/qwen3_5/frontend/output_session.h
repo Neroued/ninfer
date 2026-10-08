@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+namespace ninfer::text {
+class GrammarSession;
+}
+
 namespace ninfer::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
@@ -73,6 +77,13 @@ public:
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
+    void discard_preview();
+    [[nodiscard]] bool constrained() const noexcept;
+    void observe_constraint(bool timings, double prepare_seconds) noexcept;
+    void constraint_uploaded(std::size_t bytes) noexcept;
+    [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;
+    [[nodiscard]] std::uint32_t grammar_masks(std::span<const TokenId> drafts,
+                                              std::span<std::uint32_t> words);
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
@@ -84,7 +95,9 @@ private:
     OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-                  std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output);
+                  std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+                  std::unique_ptr<text::GrammarSession> grammar = {},
+                  std::string_view continuation = {}, bool combined = false);
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

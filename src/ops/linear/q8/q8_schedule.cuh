@@ -58,11 +58,13 @@ enum class Q8MmaFragmentPipeline { Serial, PingPong };
 
 // Quant codes are prefetched while MMA consumes the decoded BF16 weight tile.
 // Eight G32 scales are cached per row. Activations may use one or two buffers.
+// Padding-free problems can fix K and specialize the outer-loop unroll factor.
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens,
           int ActivationStages, int MinBlocksPerSm,
           Q8MmaFragmentPipeline FragmentPipeline = Q8MmaFragmentPipeline::PingPong,
           Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg,
-          Cache PredicatedCache = Cache::ca, bool Predicated = false>
+          Cache PredicatedCache = Cache::ca, bool Predicated = false, int StaticK = 0,
+          int KLoopUnroll = 4>
 struct Q8A16MmaSchedule {
     static constexpr int kBlockRows         = BlockRows;
     static constexpr int kBlockTokens       = BlockTokens;
@@ -77,6 +79,8 @@ struct Q8A16MmaSchedule {
     static constexpr auto kActivationCache  = ActivationCache;
     static constexpr auto kPredicatedCache  = PredicatedCache;
     static constexpr bool kPredicated       = Predicated;
+    static constexpr int kStaticK           = StaticK;
+    static constexpr int kKLoopUnroll       = KLoopUnroll;
     static constexpr int kWarpGridRows      = BlockRows / WarpRows;
     static constexpr int kWarpGridTokens    = BlockTokens / WarpTokens;
     static constexpr int kWarps             = kWarpGridRows * kWarpGridTokens;
@@ -92,6 +96,8 @@ struct Q8A16MmaSchedule {
     static_assert(BlockRows % WarpRows == 0 && BlockTokens % WarpTokens == 0);
     static_assert(WarpRows % 16 == 0 && WarpTokens % 8 == 0);
     static_assert(BlockK == 64 || BlockK == 128);
+    static_assert(StaticK == 0 || (StaticK > 0 && StaticK % BlockK == 0));
+    static_assert(KLoopUnroll > 0);
     static_assert(ActivationStages == 1 || ActivationStages == 2);
     static_assert(kThreads <= 1024 && MinBlocksPerSm > 0);
     static_assert(kSharedBytes <= 99 * 1024);

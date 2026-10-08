@@ -106,6 +106,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
     : model(std::move(source)), parameters(*model),
       frontend(models::qwen3_5::make_frontend(
           model->resources(), {.chat_template_path       = options.chat_template_path,
+                               .grammar_cache_bytes      = options.grammar_cache_bytes,
                                .architecture             = model->config().text.architecture,
                                .vision_enabled           = options.enable_vision,
                                .max_context              = options.max_context,

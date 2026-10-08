@@ -190,6 +190,29 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+std::uint32_t ProgramImpl::initial_mtp_extent(const RequestBasePlanImpl& base) const {
+    const auto prompt = base.summary.prompt_tokens;
+    return speculative_backend == SpeculativeBackend::Mtp
+               ? std::min({draft_window,
+                           base.summary.effective_output_tokens > 1
+                               ? base.summary.effective_output_tokens - 2U
+                               : 0U,
+                           capacity > prompt ? capacity - prompt - 1U : 0U})
+               : 0U;
+}
+
+UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
+                                     std::uint32_t mtp_extent) const {
+    UnitDemand demand{.kind = ExecutionUnitKind::Prefill};
+    demand.main_frontier    = std::min(prompt, cursor + prefill_chunk);
+    demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
+    if (speculative_backend == SpeculativeBackend::Mtp && demand.main_frontier == prompt &&
+        mtp_extent != 0) {
+        demand.backend_frontier = std::min(capacity, prompt + mtp_extent - 1U);
+    }
+    return demand;
+}
+
 UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
                                   ExecutionUnitKind kind, std::uint32_t tokens) const {
     UnitDemand demand{.kind = kind, .tokens = tokens};
@@ -199,15 +222,8 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
         if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
             throw std::logic_error("prefill demand requires a prefill cursor");
         }
-        const auto& staged      = *request.prefill;
-        demand.main_frontier    = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk);
-        demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
-        if (speculative_backend == SpeculativeBackend::Mtp &&
-            demand.main_frontier == staged.prompt_tokens && staged.initial_mtp_extent != 0) {
-            demand.backend_frontier =
-                std::min(capacity, staged.prompt_tokens + staged.initial_mtp_extent - 1U);
-        }
-        break;
+        const auto& staged = *request.prefill;
+        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent);
     }
     case ExecutionUnitKind::Replay:
         if (request.lifecycle != Lifecycle::Replaying) {

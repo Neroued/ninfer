@@ -247,6 +247,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         .control_variables = control_variables};
     auto output = compiled_.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
+    std::string continuation_content;
     if (continuation) {
         const auto content = unique_output_region(output, sources.back().tag);
         if (!content || layout.messages.empty())
@@ -258,6 +259,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             throw std::invalid_argument(
                 "chat template cannot continue the final assistant content unambiguously");
         }
+        continuation_content = output.text.substr(content->begin, content->end - content->begin);
         output.text.resize(content->end);
         std::erase_if(output.regions,
                       [&](const auto& region) { return region.begin > output.text.size(); });
@@ -270,6 +272,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         layout = inspect_prompt_layout(output, media);
     }
     RenderedChat result;
+    result.continuation_content         = std::move(continuation_content);
     result.starts_in_reasoning          = layout.starts_in_reasoning;
     result.media_placeholders           = layout.media_placeholders;
     result.rewrite_execution_boundaries = layout.execution_boundaries;

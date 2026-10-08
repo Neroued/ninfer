@@ -31,7 +31,40 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
+                               "--choice", "a|b", "--choice", "你好"});
+    failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
+                      "choice flags changed literal text or order");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
+              "empty regex must be distinct from no regex");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", "",
+                                       "--choice", "yes"});
+                      }),
+                      "regex and choice were accepted together");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex",
+                                       "a", "--json-object"});
+                      }),
+                      "regex and JSON were accepted together");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
+              "JSON object CLI option lost");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file", "answer.json"})
+                .json_schema_path == "answer.json",
+        "schema file CLI option lost");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                       "--json-object", "--grammar-file", "a.gbnf"});
+                      }),
+                      "conflicting CLI constraints accepted");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

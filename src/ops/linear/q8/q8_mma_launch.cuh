@@ -9,6 +9,10 @@ template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class O
 void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                        cudaStream_t stream, RowPolicy row_policy = {}) {
     validate_q8_operands(operands);
+    if constexpr (Schedule::kStaticK > 0) {
+        if (operands.k != Schedule::kStaticK || operands.padded_k != Schedule::kStaticK)
+            throw std::invalid_argument("Q8 MMA static K requires matching, padding-free operands");
+    }
     if (operands.k % 8 != 0 || operands.padded_k % Schedule::kBlockK != 0)
         throw std::invalid_argument("Q8 MMA requires K aligned to 8 and complete padded K tiles");
     static_assert(Schedule::kBlockRows % RowPolicy::kOutputRowsPerCta == 0);

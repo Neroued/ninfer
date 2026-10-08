@@ -5,10 +5,12 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -59,7 +61,9 @@ bool has_decode_tests(const std::vector<ninfer::bench::BenchTest>& tests) {
     return false;
 }
 
-ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
+ninfer::RequestOptions
+benchmark_request(const ninfer::bench::BenchTest& test,
+                  const std::optional<ninfer::OutputConstraint>& constraint) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
     options.execution.allow_prefix_reuse      = false;
@@ -67,34 +71,65 @@ ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
     options.output.preserve_special_tokens    = true;
+    if (constraint) {
+        options.constraint                     = constraint;
+        options.stop.include_model_defaults    = true;
+        options.output.raw                     = false;
+        options.output.preserve_special_tokens = false;
+    }
     return options;
 }
 
-ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
-                                        const ninfer::bench::BenchTest& test,
-                                        const std::vector<ninfer::TokenId>& corpus) {
+void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironment& env,
+                    const ninfer::bench::BenchTest& test,
+                    const std::vector<ninfer::TokenId>& corpus,
+                    ninfer::bench::TestResult* measured = nullptr) {
     const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
                                   ? ninfer::bench::kDecodeSeedTokens
                                   : test.n_prompt;
-    auto prompt = engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false);
-    ninfer::GenerationResult generated =
-        engine.generate(std::move(prompt), benchmark_request(test));
-
-    const std::uint32_t expected = test.requested_output_tokens();
-    if (generated.generated_token_ids.size() != expected) {
-        throw std::runtime_error(test.label + " generated " +
-                                 std::to_string(generated.generated_token_ids.size()) +
-                                 " tokens; expected " + std::to_string(expected));
+    std::vector<ninfer::PreparedPrompt> prompts;
+    std::vector<ninfer::GenerationHandle> handles;
+    std::vector<ninfer::GenerationResult> generated;
+    prompts.reserve(env.concurrency);
+    handles.reserve(env.concurrency);
+    generated.reserve(env.concurrency);
+    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
+        prompts.push_back(
+            engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false));
     }
-    if (generated.finish_reason != ninfer::FinishReason::OutputLimit) {
-        throw std::runtime_error(test.label + " did not finish at the requested output limit");
+    const auto started = std::chrono::steady_clock::now();
+    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
+        const bool constrained =
+            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
+        handles.push_back(
+            engine.submit(std::move(prompts[row]),
+                          benchmark_request(test, constrained ? env.constraint : std::nullopt),
+                          ninfer::OutputConsumerMode::Aggregate, {.phase_timings = true}));
     }
-
-    ninfer::bench::RepTiming timing;
-    timing.timings                 = generated.timings;
-    timing.speculative             = std::move(generated.speculative);
-    timing.generated_output_tokens = expected;
-    return timing;
+    for (auto& handle : handles) { generated.push_back(handle.wait()); }
+    const double wall_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
+        auto& result           = generated[row];
+        const bool constrained =
+            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
+        const auto count       = static_cast<std::uint32_t>(result.generated_token_ids.size());
+        const bool at_limit    = result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              count == test.requested_output_tokens();
+        const bool grammar_done = constrained &&
+                                  result.finish_reason == ninfer::FinishReason::StopToken &&
+                                  count <= test.requested_output_tokens();
+        if (!at_limit && !grammar_done) {
+            throw std::runtime_error(test.label +
+                                     " did not finish at its output limit or grammar EOS");
+        }
+        if (measured) {
+            measured->reps.push_back({result.timings, std::move(result.speculative), count,
+                                      result.constraint,
+                                      result.engine_timing.constraint_draft_wait_exposed_seconds});
+        }
+    }
+    if (measured) { measured->repetition_wall_seconds.push_back(wall_seconds); }
 }
 
 void prime_decode_graph(ninfer::Engine& engine, ninfer::bench::BenchEnvironment& env,
@@ -103,7 +138,7 @@ void prime_decode_graph(ninfer::Engine& engine, ninfer::bench::BenchEnvironment&
     const int decode_tokens = static_cast<int>(env.decode_graph_prime_output_tokens - 1);
     const ninfer::bench::BenchTest prime{ninfer::bench::TestKind::Decode, 0, decode_tokens,
                                          "decode-graph-prime"};
-    (void)run_repetition(engine, prime, corpus);
+    run_repetition(engine, env, prime, corpus);
     env.decode_graph_primed = true;
 }
 
@@ -148,12 +183,19 @@ int main(int argc, char** argv) {
             tests, options.max_context, options.speculative, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path = options.artifact_path;
-        engine_options.device        = options.device;
-        engine_options.max_context   = max_context;
-        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
-        engine_options.prefill_chunk = options.prefill_chunk;
-        engine_options.kv_cache      = options.kv_cache;
+        engine_options.artifact_path   = options.artifact_path;
+        engine_options.device          = options.device;
+        engine_options.max_context     = max_context;
+        engine_options.max_concurrency = options.concurrency;
+        const std::uint64_t kv_capacity =
+            ((static_cast<std::uint64_t>(max_context) + 63U) / 64U) * 64U * options.concurrency;
+        if (kv_capacity > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::invalid_argument("concurrent benchmark KV capacity exceeds uint32");
+        }
+        engine_options.kv_capacity =
+            ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(kv_capacity));
+        engine_options.prefill_chunk                     = options.prefill_chunk;
+        engine_options.kv_cache                          = options.kv_cache;
         engine_options.context_cache.enabled             = false;
         engine_options.context_cache.device_state_slots  = 0;
         engine_options.context_cache.host_capacity_bytes = 0;
@@ -172,6 +214,18 @@ int main(int argc, char** argv) {
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;
         env.corpus_tokens            = corpus.size();
+        env.concurrency              = options.concurrency;
+        env.constraint_file          = options.constraint_file;
+        env.constraint               = options.constraint;
+        env.mixed_constraints        = options.mixed_constraints;
+        if (env.constraint && (env.constraint->kind == ninfer::OutputConstraintKind::Grammar ||
+                               env.constraint->kind == ninfer::OutputConstraintKind::JsonSchema)) {
+            std::ifstream input(options.constraint_file, std::ios::binary);
+            if (!input)
+                throw std::runtime_error("cannot read constraint: " + options.constraint_file);
+            env.constraint->source.assign(std::istreambuf_iterator<char>(input), {});
+            if (input.bad()) throw std::runtime_error("failed to read constraint file");
+        }
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =
                 ninfer::bench::decode_graph_prime_output_tokens(options.speculative);
@@ -196,18 +250,19 @@ int main(int argc, char** argv) {
                       << " reps=" << options.repetitions << '\n';
 
             ninfer::bench::TestResult result;
-            result.test = test;
+            result.test        = test;
+            result.concurrency = env.concurrency;
             engine.reset_memory_peaks();
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
-                (void)run_repetition(engine, test, corpus);
+                run_repetition(engine, env, test, corpus);
             }
-            result.reps.reserve(static_cast<std::size_t>(options.repetitions));
+            result.reps.reserve(static_cast<std::size_t>(options.repetitions) * env.concurrency);
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile pre-boundary synchronize");
                 require_cuda(cudaProfilerStart(), "cudaProfilerStart");
             }
             for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-                result.reps.push_back(run_repetition(engine, test, corpus));
+                run_repetition(engine, env, test, corpus, &result);
             }
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");

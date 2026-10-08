@@ -27,6 +27,41 @@ int expect_value(void* device, std::uint32_t expected, const char* label) {
     return 1;
 }
 
+int check_external_event(ninfer::DeviceContext& device) {
+    ninfer::DeviceArena storage(sizeof(std::uint32_t));
+    ninfer::PinnedHostBuffer host(sizeof(std::uint32_t));
+    ninfer::CudaCompletionEvent ready(device);
+    ninfer::DecodeGraphDefinition definitions[2];
+    for (int i = 0; i < 2; ++i) {
+        definitions[i].capture(device.stream, [&] {
+            CUDA_CHECK(
+                cudaMemsetAsync(storage.base(), i + 1, sizeof(std::uint32_t), device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(host.data(), storage.base(), sizeof(std::uint32_t),
+                                       cudaMemcpyDeviceToHost, device.stream));
+            ready.record_external(device.stream);
+            // The handoff exposes the prefix, even though later graph nodes overwrite the source.
+            CUDA_CHECK(cudaMemsetAsync(storage.base(), 0xff, sizeof(std::uint32_t), device.stream));
+        });
+    }
+    ninfer::DecodeGraphExecutable executable;
+    executable.instantiate(definitions[0]);
+    int failures = 0;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        const auto value = static_cast<std::uint32_t>(iteration % 2 + 1) * 0x01010101U;
+        executable.update(definitions[iteration % 2]);
+        *static_cast<std::uint32_t*>(host.data()) = 0;
+        executable.launch(device.stream);
+        ready.synchronize();
+        if (*static_cast<std::uint32_t*>(host.data()) != value) {
+            std::cerr << "external event exposed stale data after replay/update\n";
+            ++failures;
+        }
+        device.synchronize();
+        failures += expect_value(storage.base(), 0xffffffffU, "graph suffix");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -75,6 +110,7 @@ int main() {
         executable.launch(device.stream);
         device.synchronize();
         failures += expect_value(storage.base(), 0x22222222U, "updated graph launch");
+        failures += check_external_event(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "decode graph test failed: " << error.what() << '\n';

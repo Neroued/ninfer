@@ -38,4 +38,4 @@ ninfer_add_op_test(ninfer_linear_fp8_a8_test
 
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_linear_test_support)

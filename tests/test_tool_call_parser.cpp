@@ -16,8 +16,6 @@ namespace {
 using Json   = nlohmann::json;
 namespace fi = ninfer::models::qwen3_5::frontend;
 
-const fi::ToolCallOutputContract kLegacyContract;
-
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
     return 1;
@@ -36,8 +34,7 @@ std::string tool_definition(const std::string& tool_name, Json properties,
 
 std::shared_ptr<const fi::ToolCallOutputContract>
 contract_from_definitions(const std::vector<std::string>& definitions) {
-    return fi::build_tool_call_output_contract(
-        std::span<const std::string>(definitions.data(), definitions.size()), true);
+    return fi::build_tool_call_output_contract(definitions);
 }
 
 std::shared_ptr<const fi::ToolCallOutputContract> output_contract_for(const std::string& tool_name,
@@ -94,32 +91,35 @@ int check_parameter_schema_mismatch(const fi::ToolCallOutputContract& contract,
         std::string(message));
 }
 
-int test_basic_legacy_parsing() {
-    const auto parsed = fi::parse_qwen_tool_call_output("Calling weather.\n"
-                                                        "<tool_call>\n"
-                                                        "<function=get_weather>\n"
-                                                        "<parameter=city>\nParis\n</parameter>\n"
-                                                        "<parameter=days>\n2\n</parameter>\n"
-                                                        "</function>\n"
-                                                        "</tool_call>",
-                                                        64, kLegacyContract);
+int test_untyped_parameters() {
+    const auto contract = contract_for("get_weather", Json::object());
+    const auto parsed   = fi::parse_qwen_tool_call_output("Calling weather.\n"
+                                                            "<tool_call>\n"
+                                                            "<function=get_weather>\n"
+                                                            "<parameter=city>\nParis\n</parameter>\n"
+                                                            "<parameter=days>\n2\n</parameter>\n"
+                                                            "</function>\n"
+                                                            "</tool_call>",
+                                                          64, contract);
 
     int failures = 0;
-    failures += check(parsed.is_tool_call_response, "legacy call was not parsed");
+    failures += check(parsed.is_tool_call_response, "untyped call was not parsed");
     failures += check(parsed.content == "Calling weather.", "content prefix was not trimmed");
-    failures += check(parsed.tool_calls.size() == 1, "legacy call count changed");
+    failures += check(parsed.tool_calls.size() == 1, "untyped call count changed");
     if (parsed.tool_calls.size() != 1) { return failures; }
     failures += check(parsed.tool_calls.front().name == "get_weather", "function name changed");
     const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
-    failures += check(args.at("city") == "Paris", "legacy string inference changed");
-    failures += check(args.at("days") == 2, "legacy JSON inference changed");
+    failures += check(args.at("city") == "Paris", "untyped string inference changed");
+    failures += check(args.at("days") == 2, "untyped JSON inference changed");
     return failures;
 }
 
 int test_multiple_calls() {
+    const auto contract = contract_from_definitions(
+        {tool_definition("first", Json::object()), tool_definition("second", Json::object())});
     const std::string text = tool_call("first", {{"payload", "{\"ok\":true,\"items\":[1,2]}"}}) +
                              "\n" + tool_call("second", {{"value", "plain text"}});
-    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, kLegacyContract);
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract);
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2,
@@ -574,19 +574,20 @@ int test_strict_structure_and_active_tool_set() {
                        "undeclared tool name was accepted");
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
-    failures += check_rejected(invalid_name, kLegacyContract,
-                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
-                               "invalid function-name character was accepted");
+    failures +=
+        check_rejected(invalid_name, contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                       "invalid function-name character was accepted");
     return failures;
 }
 
 int test_name_limits_and_non_strict_omissions() {
     const std::string name(128, 'a');
+    const auto name_contract        = contract_for(name, Json::object());
     const std::string text          = tool_call(name);
-    const auto anthropic            = fi::parse_qwen_tool_call_output(text, 128, kLegacyContract);
-    const auto openai               = fi::parse_qwen_tool_call_output(text, 64, kLegacyContract);
+    const auto anthropic            = fi::parse_qwen_tool_call_output(text, 128, name_contract);
+    const auto openai               = fi::parse_qwen_tool_call_output(text, 64, name_contract);
     const std::string too_long_text = tool_call(std::string(129, 'a'));
-    const auto too_long = fi::parse_qwen_tool_call_output(too_long_text, 128, kLegacyContract);
+    const auto too_long = fi::parse_qwen_tool_call_output(too_long_text, 128, name_contract);
 
     int failures = 0;
     failures += check(anthropic.is_tool_call_response && anthropic.tool_calls.size() == 1,
@@ -606,32 +607,16 @@ int test_name_limits_and_non_strict_omissions() {
     return failures;
 }
 
-int test_conflicting_duplicate_tool_contracts_use_legacy_normalization() {
-    const std::string integer_definition =
+int test_duplicate_tool_contracts_rejected() {
+    const auto definition =
         tool_definition("configure", Json{{"value", Json{{"type", "integer"}}}});
-    const std::string string_definition =
-        tool_definition("configure", Json{{"value", Json{{"type", "string"}}}});
-
-    const std::vector<std::string> identical_definitions = {integer_definition, integer_definition};
-    const auto identical = contract_from_definitions(identical_definitions);
-    const auto accepted =
-        fi::parse_qwen_tool_call_output(tool_call("configure", {{"value", "7"}}), 64, *identical);
-
-    const std::vector<std::string> conflicting_definitions = {integer_definition,
-                                                              string_definition};
-    const auto conflicting      = contract_from_definitions(conflicting_definitions);
-    const std::string ambiguous = tool_call("configure", {{"value", "7"}});
-    const auto ambiguous_parsed = fi::parse_qwen_tool_call_output(ambiguous, 64, *conflicting);
-
-    int failures = 0;
-    failures += check(accepted.is_tool_call_response && accepted.tool_calls.size() == 1,
-                      "identical duplicate tool contracts became ambiguous");
-    failures +=
-        check(ambiguous_parsed.is_tool_call_response && ambiguous_parsed.tool_calls.size() == 1 &&
-                  ambiguous_parsed.tool_calls.front().arguments_json == "{\"value\":7}" &&
-                  ambiguous_parsed.diagnostics.schema_mismatch_arguments == 0,
-              "conflicting duplicate tool contracts did not use legacy normalization");
-    return failures;
+    try {
+        (void)contract_from_definitions({definition, definition});
+    } catch (const ninfer::RequestError& error) {
+        return check(error.kind() == ninfer::RequestErrorKind::InvalidToolConstraint,
+                     "duplicate declaration error kind");
+    }
+    return check(false, "duplicate declarations were accepted");
 }
 
 int test_all_or_nothing_structural_commit() {
@@ -643,7 +628,7 @@ int test_all_or_nothing_structural_commit() {
 }
 
 int test_incremental_valid_and_boolean() {
-    fi::ToolCallOutputDecoder legacy(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    fi::ToolCallOutputDecoder legacy(output_contract_for("get_weather", Json::object()), 64);
     std::string visible;
     visible += legacy.feed("Calling weather.  \n<tool_");
     visible += legacy.feed("call>\n<function=get_weather>");
@@ -676,7 +661,7 @@ int test_incremental_valid_and_boolean() {
 
 int test_incremental_fallback_preserves_bytes() {
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
-    fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    fi::ToolCallOutputDecoder malformed(output_contract_for("broken", Json::object()), 64);
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
@@ -733,11 +718,44 @@ int test_incremental_embedded_parameter_markup() {
     return failures;
 }
 
+int test_free_tool_continuation() {
+    const auto contract = output_contract_for("echo", Json{{"value", {{"type", "string"}}}});
+    int failures        = 0;
+    for (const auto& [prefix, suffix] :
+         std::initializer_list<std::pair<std::string_view, std::string_view>>{
+             {"Earlier <tool_ca", "broken"},
+             {"Earlier <tool_ca", "ll>broken"},
+             {"Earlier <tool_call>\n<function=echo>", "broken"}}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        decoder.initialize_continuation(prefix);
+        std::string visible = decoder.feed(suffix);
+        visible += decoder.finish(ninfer::FinishReason::OutputLimit).content;
+        failures += check(visible == suffix, "free continuation republished its prompt prefix");
+    }
+    const auto complete = tool_call("echo", {{"value", "hello"}});
+    const auto split    = complete.find("hello") + 2;
+    fi::ToolCallOutputDecoder decoder(contract, 64);
+    decoder.initialize_continuation(std::string_view(complete).substr(0, split));
+    (void)decoder.feed(std::string_view(complete).substr(split));
+    const auto result = decoder.finish();
+    failures += check(result.tool_calls.size() == 1 && result.content.empty() &&
+                          result.tool_calls[0].arguments_json == R"({"value":"hello"})",
+                      "free continuation lost the completed call");
+    bool rejected = false;
+    try {
+        fi::ToolCallOutputDecoder completed(contract, 64);
+        completed.initialize_continuation(complete);
+    } catch (const ninfer::RequestError&) { rejected = true; }
+    failures += check(rejected, "free continuation accepted an already published call");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
-    failures += test_basic_legacy_parsing();
+    failures += test_free_tool_continuation();
+    failures += test_untyped_parameters();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
@@ -751,7 +769,7 @@ int main() {
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
-    failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
+    failures += test_duplicate_tool_contracts_rejected();
     failures += test_all_or_nothing_structural_commit();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();

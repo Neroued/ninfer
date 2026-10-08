@@ -5,6 +5,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
+#include "ops/direct_bf16_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -247,6 +248,17 @@ quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, s
     return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
 }
 
+quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k,
+                                                std::uint32_t seed) {
+    const auto host = direct_bf16_weight::make_patterned(n, k, seed);
+    quantized_weight::PackedWeight result;
+    result.payload.resize(host.bits.size() * sizeof(std::uint16_t));
+    std::memcpy(result.payload.data(), host.bits.data(), result.payload.size());
+    result.weight           = host.device_weight(result.payload.data());
+    result.code_plane_bytes = result.payload.size();
+    return result;
+}
+
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t) {
     if (weight == nullptr || activation == nullptr || output == nullptr || n <= 0 || k <= 0 ||
@@ -309,8 +321,23 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
     const std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
-    const std::vector<std::uint16_t> activation_bits =
+    std::vector<std::uint16_t> activation_bits =
         make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
+    if (shape.activation_pattern != ActivationPattern::Dense) {
+        for (int token = 0; token < maximum->t; ++token) {
+            for (int column = 0; column < shape.k; ++column) {
+                float value = 0.0F;
+                if (shape.activation_pattern == ActivationPattern::Cancellation) {
+                    value = (column & 1) ? -0.25F : 0.25F;
+                    if (column == shape.k - 1) value = 0.125F;
+                } else if (column >= shape.k - 16) {
+                    value = static_cast<float>((column + token) % 3 - 1) * 0.25F;
+                }
+                activation_bits[static_cast<std::size_t>(token) * shape.k + column] =
+                    test::f32_to_bf16(value);
+            }
+        }
+    }
 
     DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);

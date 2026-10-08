@@ -247,6 +247,9 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + v / 32] & (1u << (v % 32)))) {
+        return -CUDART_INF_F;
+    }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
@@ -302,32 +305,39 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
                                                   int n) {
     const int tid = threadIdx.x;
     if (tid == 0) {
-        const float inv_temp = 1.0f / cfg.temperature;
-        const float m        = cand_val[0] * inv_temp;
-        float sum            = 0.0f;
-        for (int j = 0; j < n; ++j) {
-            const float e = __expf(cand_val[j] * inv_temp - m);
-            prob[j]       = e;
-            sum += e;
+        while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
+        if (n == 0 || !isfinite(cand_val[0])) {
+            // The caller provides nonempty masks. Missing finite support is a model execution
+            // failure, not a distribution from which a placeholder token can be published.
+            asm volatile("trap;");
+        } else {
+            const float inv_temp = 1.0f / cfg.temperature;
+            const float m        = cand_val[0] * inv_temp;
+            float sum            = 0.0f;
+            for (int j = 0; j < n; ++j) {
+                const float e = __expf(cand_val[j] * inv_temp - m);
+                prob[j]       = e;
+                sum += e;
+            }
+            const float e0           = prob[0];
+            const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
+            const bool top_p_active  = (cfg.top_p < 1.0f);
+            const float top_p_target = cfg.top_p * sum;
+            float cum                = 0.0f;
+            int support              = 0;
+            for (int j = 0; j < n; ++j) {
+                if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
+                cum += prob[j];
+                support = j + 1;
+                if (top_p_active && cum >= top_p_target) { break; }
+            }
+            if (support < 1) { support = 1; }
+            float ssum = 0.0f;
+            for (int j = 0; j < support; ++j) { ssum += prob[j]; }
+            const float inv = 1.0f / ssum;
+            for (int j = 0; j < support; ++j) { prob[j] *= inv; }
+            *n_support = support;
         }
-        const float e0           = prob[0];
-        const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
-        const bool top_p_active  = (cfg.top_p < 1.0f);
-        const float top_p_target = cfg.top_p * sum;
-        float cum                = 0.0f;
-        int support              = 0;
-        for (int j = 0; j < n; ++j) {
-            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
-            cum += prob[j];
-            support = j + 1;
-            if (top_p_active && cum >= top_p_target) { break; }
-        }
-        if (support < 1) { support = 1; }
-        float ssum = 0.0f;
-        for (int j = 0; j < support; ++j) { ssum += prob[j]; }
-        const float inv = 1.0f / ssum;
-        for (int j = 0; j < support; ++j) { prob[j] *= inv; }
-        *n_support = support;
     }
     __syncthreads();
 }

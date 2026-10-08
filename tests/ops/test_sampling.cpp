@@ -43,7 +43,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
+           a.mask.stride == b.mask.stride;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -83,14 +84,17 @@ std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_ro
 
 Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
                                  const ops::SamplingConfig& config,
-                                 const std::vector<int>* counts = nullptr) {
-    std::vector<Candidate> candidates(static_cast<std::size_t>(token_domain));
+                                 const std::vector<int>* counts         = nullptr,
+                                 const std::vector<std::uint32_t>* mask = nullptr) {
+    std::vector<Candidate> candidates;
+    candidates.reserve(token_domain);
     for (int token = 0; token < token_domain; ++token) {
+        if (mask && !((*mask)[token / 32] & (1u << (token % 32)))) { continue; }
         const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
         double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
         if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
         adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
-        candidates[static_cast<std::size_t>(token)] = {adjusted, token};
+        candidates.push_back({adjusted, token});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
@@ -99,7 +103,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
 
     int cap = 20;
     if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
-    cap = std::min(cap, token_domain);
+    cap = std::min(cap, static_cast<int>(candidates.size()));
     candidates.resize(static_cast<std::size_t>(cap));
 
     std::vector<double> weights(static_cast<std::size_t>(cap));
@@ -591,6 +595,34 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int grammar_mask_contract() {
+    int failures = 0;
+    for (int domain : {64, 257, 248077}) {
+        // Legal candidates rank below the unmasked top-20. Only two legal tokens remain.
+        std::vector<float> column(domain + 3, 10.0f);
+        column[domain - 1] = 1.0f;
+        column[domain - 2] = 0.0f;
+        std::vector<std::uint32_t> mask((domain + 31) / 32, 0);
+        for (int token : {domain - 1, domain - 2}) mask[token / 32] |= 1u << (token % 32);
+        auto device_mask = to_device(mask);
+        ops::SamplingConfig config;
+        config.mask       = {static_cast<const std::uint32_t*>(device_mask.p),
+                             static_cast<int>(mask.size())};
+        const auto greedy = run_homogeneous_batch(repeat_column(column, 8), domain + 3, domain, 8,
+                                                  config, 0, ops::kSamplePurposeDecode);
+        failures += greedy.integrity_failures;
+        failures += verify_exact("masked greedy", greedy.tokens, std::vector<int>(8, domain - 1));
+        config.temperature = 0.75f;
+        config.seed        = 713179;
+        const auto oracle  = distribution_oracle(column, domain, config, nullptr, &mask);
+        const auto sampled =
+            run_repeated(column, domain, 4096, 8, config, 100, ops::kSamplePurposeDecode);
+        failures += sampled.integrity_failures;
+        failures += verify_distribution("masked distribution", sampled.tokens, oracle);
+    }
+    return failures;
+}
+
 int increment_counts_contract() {
     const std::vector<std::int32_t> ids{1, 3, 1, 7};
     const std::vector<std::int32_t> initial{0, 2, 0, 4, 0, 0, 0, 1};
@@ -642,6 +674,7 @@ int main() {
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
     failures += increment_counts_contract();
+    failures += grammar_mask_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

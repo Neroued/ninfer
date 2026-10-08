@@ -251,6 +251,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
+        out.grammar_masks =
+            add_tensor(builder, DType::I32,
+                       {dimension((parameters.model.resources().public_token_count + 31) / 32),
+                        static_cast<std::int32_t>(plan.draft_window + 1),
+                        static_cast<std::int32_t>(plan.max_concurrency)},
+                       "grammar token masks");
         out.token_counts        = add_tensor(builder, DType::I32,
                                              {dimension(parameters.model.resources().public_token_count),
                                               static_cast<std::int32_t>(plan.max_concurrency)},
@@ -871,11 +877,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                    return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                    // Long profiles also materialize driver execution storage; that shared
+                    // cost does not shrink with the number of graph executables.
+                    return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
                 },
                 "DFlash graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "DFlash exact-b graph allowance");
+            // Forward retains the draft's topology classes; finish has one small executable
+            // per exact B, independently of context length.
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch_allowance + 8ULL * kMiB, impl->max_concurrency,
+                            "DFlash exact-b graph allowance");
         }
     }
 

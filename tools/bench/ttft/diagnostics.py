@@ -49,6 +49,10 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         "cached_tokens": result.get("prefix_cache_hit_tokens"),
         "terminal_computed_prefill_tokens": result.get("computed_prefill_tokens"),
         "first_computed_prefill_tokens": None,
+        "preferred_reused_tokens": None,
+        "source_wait_ms": None,
+        "revoked_checkpoints": None,
+        "admission_fallback_reason": None,
         "engine_elapsed_ms": None,
         **{f"{stage}_{suffix}": None for stage in TTFT_STAGES for suffix in ("ms", "pct")},
         **{f"host_{phase}_ms": None for phase in ENGINE_HOST_PHASES},
@@ -71,6 +75,13 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
 
     def milliseconds(value: float | None) -> float | None:
         return value * 1000 if value is not None else None
+
+    admission = diagnostics.get("admission")
+    if isinstance(admission, dict):
+        row["preferred_reused_tokens"] = admission.get("preferred_reused_tokens")
+        row["source_wait_ms"] = milliseconds(read_seconds(admission, "source_wait_seconds"))
+        row["revoked_checkpoints"] = admission.get("revoked_checkpoints")
+        row["admission_fallback_reason"] = admission.get("fallback_reason")
 
     if request.get("stream") is not True:
         row["analysis_reason"] = "aggregate_response_is_terminal"
@@ -154,7 +165,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     servers = {event.get("server_instance_id") for event in events}
     if len(servers) != 1 or not all(isinstance(server, str) and server for server in servers):
         return {"status": "unavailable", "reason": "ambiguous_server_instance"}
-    if any(event.get("schema_version") not in (23, 24) for event in intervals):
+    if any(event.get("schema_version") not in (23, 24, 25) for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
     def values_at(path: Sequence[str]) -> list[int | float] | None:
@@ -242,7 +253,7 @@ def _scheduling_observations(
     intervals = []
     incomplete_requests = []
     unavailable = False
-    supported = any(event.get("schema_version") == 24 for event in events)
+    supported = any(event.get("schema_version") in (24, 25) for event in events)
     for request in requests:
         diagnostic = request.get("diagnostics", {})
         engine_id = diagnostic.get("engine_request_id")
@@ -391,7 +402,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
             "matched_by": [field for field, value in wire.items() if value in identities[field]],
         }
         starts = [item for item in events if item.get("event") == "request_start"
-                  and item.get("schema_version") in (23, 24)]
+                  and item.get("schema_version") in (23, 24, 25)]
         preparation = starts[0].get("preparation_seconds") if len(starts) == 1 else None
         identity.update(
             preparation_seconds=preparation,
@@ -407,7 +418,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         scheduling = generation.get("scheduling") if isinstance(generation, dict) else None
         engine_id = generation.get("engine_request_id") if isinstance(generation, dict) else None
         if (
-            event.get("schema_version") not in (23, 24)
+            event.get("schema_version") not in (23, 24, 25)
             or type(engine_id) is not int or engine_id <= 0
             or not isinstance(scheduling, dict)
             or any(type(scheduling.get(field)) is not int or scheduling[field] < 0
@@ -419,6 +430,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         request["diagnostics"] = {
             "status": "available", **identity, "engine_request_id": engine_id,
             "scheduling": counts,
+            "admission": generation.get("admission"),
             "mechanisms": {
                 name: "observed" if counts[counter] > 0 else "not_observed"
                 for name, counter in MECHANISM_COUNTERS.items()

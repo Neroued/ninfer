@@ -33,6 +33,8 @@ struct Invocation {
     bool graph_replay        = false;
 };
 
+enum class ActivationPattern : std::uint8_t { Dense, KTail, Cancellation };
+
 struct ShapeCase {
     std::int32_t n;
     std::int32_t k;
@@ -40,10 +42,13 @@ struct ShapeCase {
     Comparison comparison;
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
+    ActivationPattern activation_pattern = ActivationPattern::Dense;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,
                                                            std::uint32_t);
+
+quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 
 quantized_weight::PackedWeight make_q4_g64_fp16_weight(std::int32_t n, std::int32_t k,
                                                        std::uint32_t seed);

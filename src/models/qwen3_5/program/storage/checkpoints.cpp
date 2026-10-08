@@ -113,6 +113,10 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
     } catch (...) { std::terminate(); }
 }
 
+bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
+    return checkpoint_releasable(*this, handle);
+}
+
 ResumeStateImpl::~ResumeStateImpl() {
     if (snapshot && owner && !owner->release_checkpoint(*snapshot)) { std::terminate(); }
 }

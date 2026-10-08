@@ -194,7 +194,8 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 } // namespace
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
-                                             runtime::ExecutionTiming* timing) {
+                                             runtime::ExecutionTiming* timing,
+                                             runtime::TokenMaskProvider* masks) {
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
@@ -206,6 +207,16 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     if (state.kv->backend) {
         set_device_i32(io.backend_kv_table_row,
                        backend_kv_addresses->bound_row(*state.kv->backend));
+    }
+    grammar_dead_positions[0] = 0;
+    if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
+        masks && masks->constrained(0)) {
+        auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
+        config             = requests[lane].sampling_host;
+        config.mask        = fill_grammar_mask(masks, 0, {});
+        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
+                                   cudaMemcpyHostToDevice, device.stream));
     }
     auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
     if (!progress.complete) { settle_unit(lane); }
@@ -230,12 +241,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bo
 
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
-    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> discarded,
     std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
-        terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
+        terminal.size() != lanes.size() || discarded.size() != lanes.size() ||
         prefix_execution_splits.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
@@ -246,9 +257,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         if (requests[lane].lifecycle != Lifecycle::Pending) {
             throw std::logic_error("prefill pending token no longer matches Program state");
         }
-        if (cancelled.front()) {
+        if (discarded.front()) {
             if (accepted_tokens.front() != 0 || !terminal.front()) {
-                throw std::logic_error("cancelled prefill pending decision is invalid");
+                throw std::logic_error("discarded prefill pending decision is invalid");
             }
             clear_lane(active_sequence(lane), requests[lane]);
         } else {
@@ -268,7 +279,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 requests[lane].pending.kind != PendingKind::Ordinary) {
                 throw std::logic_error("ordinary pending batch no longer matches Program state");
             }
-            if (cancelled[row]) {
+            if (discarded[row]) {
                 clear_lane(active_sequence(lane), requests[lane]);
             } else {
                 timing.pause();
@@ -308,9 +319,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
              sequence.dflash_context_frontier != pending.base_E)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
-        const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
-        if ((cancelled[row] && accepted_tokens[row] != 0) ||
-            (!cancelled[row] && (committed == 0 || committed > pending.produced ||
+        const std::uint32_t committed = discarded[row] ? 0U : accepted_tokens[row];
+        if ((discarded[row] && accepted_tokens[row] != 0) ||
+            (!discarded[row] && (committed == 0 || committed > pending.produced ||
                                  (!terminal[row] && committed != pending.produced)))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
@@ -320,7 +331,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                                   .destination_state_slot = selectors.destination,
                                   .commit_columns         = static_cast<std::int32_t>(committed)};
         const bool partial_terminal =
-            !cancelled[row] && terminal[row] && committed < pending.produced;
+            !discarded[row] && terminal[row] && committed < pending.produced;
         hidden_selectors[row] =
             static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
         needs_hidden_correction = needs_hidden_correction || partial_terminal;
@@ -335,7 +346,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
+                if (discarded[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;
                 }
                 const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
@@ -386,7 +397,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
             std::size_t append_size = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (!cancelled[row] && terminal[row]) {
+                if (!discarded[row] && terminal[row]) {
                     append_lanes[append_size]  = lanes[row];
                     append_starts[append_size] = requests[lanes[row]].pending.base_E;
                     append_counts[append_size] = accepted_tokens[row];
@@ -420,7 +431,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
             RequestControl& request = requests[lanes[row]];
-            if (cancelled[row]) {
+            if (discarded[row]) {
                 clear_lane(sequence, request);
                 continue;
             }

@@ -246,7 +246,9 @@ struct PackedWeight {
             w.qhigh  = high_plane_bytes == 0
                            ? nullptr
                            : static_cast<std::uint8_t*>(device_payload) + high_plane_offset;
-            w.scales = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
+            w.scales = w.qtype == QType::BF16
+                           ? nullptr
+                           : static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
         } else {
             w.qdata  = nullptr;
             w.qhigh  = nullptr;
@@ -645,6 +647,15 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     const Weight& weight = packed.weight;
     if (row < 0 || row >= weight.shape[0] || column < 0 || column >= weight.shape[1]) {
         throw std::out_of_range("quantized-weight fixture: logical index out of range");
+    }
+
+    if (weight.qtype == QType::BF16) {
+        if (weight.layout != QuantLayout::Contiguous || weight.padded_shape[0] != weight.n ||
+            weight.padded_shape[1] != weight.k)
+            throw std::invalid_argument("linear-weight fixture: invalid contiguous BF16 metadata");
+        const auto offset = (static_cast<std::size_t>(row) * weight.k + column) * 2;
+        return static_cast<double>(
+            detail::bf16_to_f32(detail::load_u16_le(packed.payload, offset)));
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {

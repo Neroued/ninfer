@@ -4,10 +4,10 @@ This document defines the repository-wide rules for admitting, specifying, ownin
 qualifying, and measuring NInfer Ops. An **Op** is a semantic execution contract. A CUDA
 **kernel** is one implementation, or one stage of an implementation, of an Op.
 
-Repository-wide product scope, numerical principles, and evidence requirements remain in
-[`AGENTS.md`](../../AGENTS.md). When this document and a concrete Op contract differ about that
-Op's represented inputs, formula, supported domain, or observable effects, the contract in
-`include/ninfer/ops/` is the concrete authority and the inconsistency must be resolved.
+Repository-wide product scope and engineering policies are defined in [`AGENTS.md`](../../AGENTS.md).
+This document owns Op qualification and performance-evidence rules. When it and a concrete Op
+contract differ about that Op's represented inputs, formula, supported domain, or observable effects,
+the contract in `include/ninfer/ops/` is the concrete authority and the inconsistency must be resolved.
 
 ## 1. Scope and authorities
 

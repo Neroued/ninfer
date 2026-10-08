@@ -82,6 +82,9 @@ public:
     CudaCompletionEvent& operator=(CudaCompletionEvent&& other) noexcept;
 
     void record(cudaStream_t stream);
+    // Capture a record node observable by the host while later graph nodes are still running.
+    // Only call during stream capture; this event must outlive every graph referencing it.
+    void record_external(cudaStream_t stream);
     void wait(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;

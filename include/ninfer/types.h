@@ -145,6 +145,7 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
@@ -254,7 +255,54 @@ struct OutputOptions {
     std::uint32_t tool_name_max_length = 128;
 };
 
+enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema, Choice, Regex };
+
+// Constrains generated content; Chat reasoning retains the model's framing. Source is owning
+// GBNF, JSON Schema or regex text. Choice owns literal alternatives; JsonObject has no payload.
+struct OutputConstraint {
+    OutputConstraintKind kind = OutputConstraintKind::Grammar;
+    std::string source;
+    std::vector<std::string> choices;
+
+    [[nodiscard]] static OutputConstraint grammar(std::string source) {
+        return {OutputConstraintKind::Grammar, std::move(source), {}};
+    }
+
+    [[nodiscard]] static OutputConstraint json_object() {
+        return {OutputConstraintKind::JsonObject, {}, {}};
+    }
+
+    [[nodiscard]] static OutputConstraint json_schema(std::string source) {
+        return {OutputConstraintKind::JsonSchema, std::move(source), {}};
+    }
+
+    [[nodiscard]] static OutputConstraint choice(std::vector<std::string> values) {
+        return {OutputConstraintKind::Choice, {}, std::move(values)};
+    }
+
+    [[nodiscard]] static OutputConstraint regex(std::string pattern) {
+        return {OutputConstraintKind::Regex, std::move(pattern), {}};
+    }
+
+    bool operator==(const OutputConstraint&) const = default;
+};
+
+enum class ToolChoiceMode : std::uint8_t { Auto, None, Required };
+// Basic protects every tool call. Automatic applies constraints only for strict tools or an
+// explicit selection/count policy.
+enum class ToolConstraintMode : std::uint8_t { Automatic, Basic };
+
+// Declarations belong to PromptOptions. Selection and cardinality affect this generation only.
+struct ToolChoice {
+    ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::optional<std::vector<std::string>> allowed_names;
+    bool parallel                  = true;
+    ToolConstraintMode constraints = ToolConstraintMode::Basic;
+};
+
 struct RequestOptions {
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
@@ -290,9 +338,9 @@ struct GeneratedToolCall {
     std::string arguments_json;
 };
 
-// Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// Diagnostics for model-origin tool-call markup. Free generation uses schema-guided value
+// normalization and can return malformed markup as text. Constrained calls use the model's
+// parameter encoding contract and publish only complete calls.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -478,6 +526,14 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    InvalidToolConstraint,
+    InvalidGrammar,
+    InvalidChoice,
+    InvalidRegex,
+    InvalidJsonSchema,
+    UnsupportedJsonSchema,
+    UnsatisfiableJsonSchema,
+    ConstraintDeadEnd,
     ContextLengthExceeded,
     ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,
@@ -488,15 +544,25 @@ enum class RequestErrorKind : std::uint8_t {
     Unavailable,
 };
 
+enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
+
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
+                 RequestErrorSource source = RequestErrorSource::OutputConstraint)
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
+          source_(source) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
+
+    [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
+
 private:
     RequestErrorKind kind_;
+    std::string pointer_;
+    RequestErrorSource source_;
 };
 
 struct PromptSummary {
@@ -690,18 +756,19 @@ struct GenerationTimings {
 // elapsed time, so values from concurrent requests must not be summed. Device wait is reported
 // separately from Host-active work.
 struct GenerationEngineTiming {
-    double queue_wait_seconds                   = 0.0;
-    double engine_boundary_exposed_seconds      = 0.0;
-    double program_submit_exposed_seconds       = 0.0;
-    double program_post_exposed_seconds         = 0.0;
-    double engine_commit_output_exposed_seconds = 0.0;
-    double engine_maintenance_exposed_seconds   = 0.0;
-    double device_wait_exposed_seconds          = 0.0;
-    double decode_host_exposed_seconds          = 0.0;
-    double decode_device_wait_exposed_seconds   = 0.0;
-    std::uint64_t prefill_units                 = 0;
-    std::uint64_t decode_rounds                 = 0;
-    std::uint64_t control_units                 = 0;
+    double queue_wait_seconds                    = 0.0;
+    double engine_boundary_exposed_seconds       = 0.0;
+    double program_submit_exposed_seconds        = 0.0;
+    double program_post_exposed_seconds          = 0.0;
+    double engine_commit_output_exposed_seconds  = 0.0;
+    double engine_maintenance_exposed_seconds    = 0.0;
+    double device_wait_exposed_seconds           = 0.0;
+    double constraint_draft_wait_exposed_seconds = 0.0;
+    double decode_host_exposed_seconds           = 0.0;
+    double decode_device_wait_exposed_seconds    = 0.0;
+    std::uint64_t prefill_units                  = 0;
+    std::uint64_t decode_rounds                  = 0;
+    std::uint64_t control_units                  = 0;
 };
 
 // Request-owned scheduling observations. Restore counters count completed restorations;
@@ -771,9 +838,46 @@ struct ThinkingBudgetStats {
     bool applied                  = false;
 };
 
+enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
+enum class ConstraintOutputBranch : std::uint8_t { Undecided, Content, Tools };
+
+// State describes the committed output language, including an assistant continuation prefix.
+// Work includes speculative lookahead that was subsequently rolled back. Times are subintervals
+// of existing request timings, not extra latency to add to them.
+struct ConstraintObservation {
+    ConstraintOutputBranch branch   = ConstraintOutputBranch::Undecided;
+    bool complete                   = false;
+    bool terminated                 = false;
+    ConstraintCacheAccess cache     = ConstraintCacheAccess::Hit;
+    bool timings_collected          = false;
+    double prepare_seconds          = 0.0;
+    double mask_seconds             = 0.0;
+    double matcher_seconds          = 0.0;
+    std::uint64_t mask_positions    = 0;
+    std::uint64_t mask_upload_bytes = 0;
+};
+
 enum class PrefixReusePath : std::uint8_t {
     Root,
     Checkpoint,
+};
+
+enum class AdmissionFallbackReason : std::uint8_t {
+    None,
+    SourceInvalid,
+    SourceRevoked,
+    CostChanged,
+    CapacityLimit,
+    IsolatedCapacity,
+};
+
+struct GenerationAdmissionStats {
+    std::uint32_t preferred_reused_tokens = 0;
+    // Subset of initial queue wait, not additional TTFT. Includes waiting for a lane
+    // after a useful source has been selected.
+    double source_wait_seconds              = 0.0;
+    std::uint32_t revoked_checkpoints       = 0;
+    AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
 
 struct GenerationResult {
@@ -795,9 +899,11 @@ struct GenerationResult {
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
+    GenerationAdmissionStats admission;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
+    std::optional<ConstraintObservation> constraint;
 };
 
 struct ArenaMemorySummary {
@@ -854,12 +960,13 @@ struct MemorySummary {
 // device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
 // are subsets of a top-level phase and must not be added to Host-active time again.
 struct RuntimeHostWorkStats {
-    std::uint64_t engine_boundary_ns      = 0;
-    std::uint64_t program_submit_ns       = 0;
-    std::uint64_t program_post_ns         = 0;
-    std::uint64_t engine_commit_output_ns = 0;
-    std::uint64_t engine_maintenance_ns   = 0;
-    std::uint64_t device_wait_ns          = 0;
+    std::uint64_t engine_boundary_ns       = 0;
+    std::uint64_t program_submit_ns        = 0;
+    std::uint64_t program_post_ns          = 0;
+    std::uint64_t engine_commit_output_ns  = 0;
+    std::uint64_t engine_maintenance_ns    = 0;
+    std::uint64_t device_wait_ns           = 0;
+    std::uint64_t constraint_draft_wait_ns = 0;
 
     std::uint64_t decode_host_ns         = 0;
     std::uint64_t decode_device_wait_ns  = 0;

@@ -13,4 +13,11 @@ struct CacheRetentionPriority {
 
 enum class ReclaimProgress : std::uint8_t { Blocked, Changed, Transferring };
 
+enum class ReclaimPurpose : std::uint8_t { Execution, FreshAdmission, OptionalWrite };
+
+struct ReclaimRights {
+    ReclaimPurpose purpose = ReclaimPurpose::Execution;
+    std::uint64_t request  = 0;
+};
+
 } // namespace ninfer::runtime

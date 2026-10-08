@@ -134,8 +134,8 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "malformed schema was accepted");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -381,28 +381,33 @@ int test_tools() {
     int failures = check(request.uses_tools() && rendered["function"]["name"] == "weather" &&
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
+    failures += check(request.constrains_tools() &&
+                          !to_request_options(request, {}, semantics(request), true)
+                               .output.preserve_special_tokens,
+                      "ordinary Anthropic tools did not select constrained output");
 
     body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    failures += check(parse(body).generation.tools[0].strict, "strict reaches generation");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
-    failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
-                      "tool_choice:none did not neutralize inactive tool guarantees");
+    failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.size() == 1,
+                      "tool_choice:none keeps prompt declarations");
 
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "forced any-tool choice was silently downgraded");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "any requires at least one invocation");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "named tool choice was silently downgraded");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required &&
+                          parse(body).generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
+                      "named choice requires the selected function");
     body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "disable_parallel_tool_use reaches generation");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});
@@ -636,6 +641,15 @@ int test_aggregate_and_errors() {
                           error["request_id"] == "req_error" &&
                           error["error"]["type"] == "overloaded_error",
                       "Anthropic overload or request-id error mapping is wrong");
+    ApiError schema_error;
+    schema_error.status        = 400;
+    schema_error.code          = "unsupported_json_schema";
+    schema_error.param         = "tools/1/input_schema/properties/date/format";
+    schema_error.message       = "unsupported schema keyword: format";
+    const Json schema_response = Json::parse(make_anthropic_error_body(schema_error, "req_error"));
+    failures += check(schema_response["error"]["message"] ==
+                          schema_error.param + ": " + schema_error.message,
+                      "Anthropic schema error lost its request field location");
     return failures;
 }
 
@@ -643,8 +657,10 @@ int test_tool_call_presentation() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_tool", "claude-local");
     GenerationOutcome outcome;
-    outcome.text                = "I need one more check.";
-    outcome.finish_reason       = ninfer::FinishReason::StopToken;
+    outcome.text          = "I need one more check.";
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.constraint    = ninfer::ConstraintObservation{
+           .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = true};
     const std::string arguments = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name           = "Edit",
@@ -670,11 +686,19 @@ int test_tool_call_presentation() {
     events.insert(events.end(), std::make_move_iterator(terminal.begin()),
                   std::make_move_iterator(terminal.end()));
 
-    bool saw_edit_start = false;
-    bool saw_arguments  = false;
-    bool saw_tool_stop  = false;
+    bool saw_edit_start   = false;
+    bool saw_arguments    = false;
+    bool saw_tool_stop    = false;
+    int constraint_events = 0;
     for (const std::string& wire : events) {
         const Json event = parse_event(wire);
+        if (event.contains("constraint")) {
+            ++constraint_events;
+            failures += check(event["type"] == "message_delta" &&
+                                  event["constraint"]["branch"] == "tools" &&
+                                  event["constraint"]["terminated"] == true,
+                              "Anthropic constraint state must accompany terminal message_delta");
+        }
         if (event.at("type") == "content_block_start" &&
             event.at("content_block").at("type") == "tool_use") {
             saw_edit_start = event.at("content_block").at("name") == "Edit";
@@ -685,8 +709,15 @@ int test_tool_call_presentation() {
             saw_tool_stop = event.at("delta").at("stop_reason") == "tool_use";
         }
     }
-    failures += check(saw_edit_start && saw_arguments && saw_tool_stop,
+    failures += check(saw_edit_start && saw_arguments && saw_tool_stop && constraint_events == 1,
                       "Anthropic stream did not terminate the recovered Edit as tool_use");
+    outcome.finish_reason          = ninfer::FinishReason::OutputLimit;
+    outcome.constraint->terminated = false;
+    const auto partial = Json::parse(make_anthropic_messages_response(identity, outcome));
+    failures += check(partial["stop_reason"] == "max_tokens" && partial["content"].size() == 2 &&
+                          partial["constraint"]["complete"] == true &&
+                          partial["constraint"]["terminated"] == false,
+                      "completed tool before truncation lost its call or stop reason");
     return failures;
 }
 
@@ -767,10 +798,57 @@ int test_stream() {
     return failures;
 }
 
+int test_constrained_decoding() {
+    int failures = 0;
+    auto body    = base_request();
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        body["structured_outputs"] = value;
+        const auto request         = parse(body).generation;
+        const auto constraint =
+            to_request_options(request, {}, semantics(request), true).constraint;
+        failures += check(constraint == (value.contains("choice")
+                                             ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                             : ninfer::OutputConstraint::regex("[a-z]+")),
+                          "Anthropic choice/regex lost in Engine translation");
+    }
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
+    const auto request         = parse(body);
+    failures +=
+        check(to_request_options(request.generation, {}, semantics(request.generation), true)
+                      .constraint->source == "root ::= \"yes\"",
+              "Anthropic GBNF extension was lost in Engine translation");
+    body["tools"] = Json::array({ordinary_tool()});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted active tools");
+    body["tool_choice"] = Json{{"type", "none"}};
+    failures += check(parse(body).generation.constraint->source == "root ::= \"yes\"",
+                      "inactive tools blocked grammar");
+    body["stop_sequences"] = Json::array({"yes"});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted custom stop sequences");
+    body = base_request();
+    body["output_config"] =
+        Json{{"format", {{"type", "json_schema"}, {"schema", {{"type", "object"}}}}}};
+    const auto schema_request = parse(body).generation;
+    failures += check(schema_request.constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          schema_request.constraint_param == "output_config.format.schema",
+                      "Anthropic JSON schema source lost");
+    body["tools"] = Json::array({Json{{"name", "lookup"}, {"input_schema", {{"type", "object"}}}}});
+    const auto combined = parse(body).generation;
+    failures += check(combined.constraint && combined.uses_tools() &&
+                          combined.tools[0].schema_param == "tools/0/input_schema",
+                      "Anthropic JSON/tool composition or diagnostic origin lost");
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "Anthropic conflicting output formats accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

@@ -68,8 +68,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpCausalAttentionEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+                           MtpCausalAttentionEnvelopes envelopes, SpeculativePhase phase) {
+    return [&state, batch_size, k, envelopes, phase] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
@@ -77,9 +77,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        state.execution.work.reset();
+        if (phase == SpeculativePhase::Forward) {
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
+                                       state.execution.device.stream));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -116,37 +119,38 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
-        ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
-                                               verify_ids, target_positions,
-                                               state.execution.device.stream);
-        {
+        TargetVerifyFrameView verify{
+            .ids                     = verify_ids,
+            .cache_positions         = target_positions,
+            .rope_positions          = target_rope,
+            .valid_columns           = target_valid,
+            .kv_table_rows           = text_rows,
+            .state_source_slots      = state_sources,
+            .state_destination_slots = state_destinations,
+            .target_hidden           = target_hidden,
+            .target_logits           = target_logits,
+            .target_tokens           = target_tokens,
+            .drafts                  = current_drafts,
+            .current_extents         = current_extents,
+            .frontiers               = frontiers,
+            .anchors                 = anchors,
+            .licensed_tokens         = licensed_tokens,
+            .licensed_counts         = licensed_counts,
+            .accepted_drafts         = accepted,
+            .selected_hidden         = selected_hidden,
+            .replay_records          = state.execution.replay_records,
+            .sampling                = frame.sampling,
+        };
+        if (phase == SpeculativePhase::Forward) {
+            ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers,
+                                                   current_extents, verify_ids, target_positions,
+                                                   state.execution.device.stream);
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                 TargetVerifyFrameView{
-                                     .ids                     = verify_ids,
-                                     .cache_positions         = target_positions,
-                                     .rope_positions          = target_rope,
-                                     .valid_columns           = target_valid,
-                                     .kv_table_rows           = text_rows,
-                                     .state_source_slots      = state_sources,
-                                     .state_destination_slots = state_destinations,
-                                     .target_hidden           = target_hidden,
-                                     .target_logits           = target_logits,
-                                     .target_tokens           = target_tokens,
-                                     .drafts                  = current_drafts,
-                                     .current_extents         = current_extents,
-                                     .frontiers               = frontiers,
-                                     .anchors                 = anchors,
-                                     .licensed_tokens         = licensed_tokens,
-                                     .licensed_counts         = licensed_counts,
-                                     .accepted_drafts         = accepted,
-                                     .selected_hidden         = selected_hidden,
-                                     .replay_records          = state.execution.replay_records,
-                                     .sampling                = frame.sampling,
-                                 },
-                                 envelopes.target_verify);
+            target_verify_forward(state.execution, card, verify, envelopes.target_verify);
+            return;
         }
+        target_accept(state.execution, state.continuation_hidden_store, verify);
 
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
@@ -200,14 +204,15 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes,
-                              DecodeGraphDefinition& definition) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+                              DecodeGraphDefinition& definition, SpeculativePhase phase) {
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, phase);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
+                      SpeculativePhase phase) {
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, phase);
     run_prepared(state, executable, body);
 }
 

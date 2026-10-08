@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -15,6 +16,33 @@
 
 namespace ninfer::bench {
 namespace {
+std::string_view constraint_name(const std::optional<OutputConstraint>& constraint) {
+    if (!constraint) return "none";
+    switch (constraint->kind) {
+    case OutputConstraintKind::Grammar:
+        return "grammar";
+    case OutputConstraintKind::JsonObject:
+        return "json_object";
+    case OutputConstraintKind::JsonSchema:
+        return "json_schema";
+    case OutputConstraintKind::Choice:
+        return "choice";
+    case OutputConstraintKind::Regex:
+        return "regex";
+    }
+    throw std::logic_error("unknown output constraint");
+}
+
+std::string constraint_choices(const std::optional<OutputConstraint>& constraint) {
+    std::string result = "[";
+    if (constraint) {
+        for (std::size_t i = 0; i < constraint->choices.size(); ++i) {
+            if (i) result += ',';
+            result += '"' + json_escape(constraint->choices[i]) + '"';
+        }
+    }
+    return result + ']';
+}
 
 int parse_int(std::string_view text, const char* label) {
     if (text.empty()) { throw std::invalid_argument(std::string(label) + " is empty"); }
@@ -186,7 +214,9 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
 
 std::uint64_t decode_engine_tokens(const TestResult& result, const RepTiming& rep) {
     if (!result.test.has_decode()) { return 0; }
-    if (!rep.speculative.enabled) { return static_cast<std::uint64_t>(result.test.n_gen); }
+    if (!rep.speculative.enabled) {
+        return rep.generated_output_tokens ? rep.generated_output_tokens - 1U : 0U;
+    }
     return rep.speculative.rounds + rep.speculative.accepted_tokens +
            rep.speculative.fallback_steps;
 }
@@ -288,6 +318,15 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
+        << "  --concurrency <1..8>       simultaneous requests per repetition (default: 1)\n"
+        << "  --grammar-file <path>      constrain output with GBNF\n"
+        << "  --json-object              constrain output to a JSON object\n"
+        << "  --json-schema-file <path>  constrain output with JSON Schema\n"
+        << "  --regex <pattern>          constrain the complete output with regex\n"
+        << "  --choice <text>            literal output candidate; repeat to supply choices\n"
+        << "  --mixed-constraints        apply constraints to alternate requests; requires "
+           "concurrency "
+           ">= 2\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -319,7 +358,7 @@ BenchOptions parse_args(int argc, char** argv) {
     bool saw_artifact = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
-        auto value = [&](const char* flag) -> std::string {
+        auto value = [&](std::string_view flag) -> std::string {
             if (i + 1 >= argc) {
                 throw std::invalid_argument(std::string(flag) + " requires value");
             }
@@ -334,6 +373,27 @@ BenchOptions parse_args(int argc, char** argv) {
             saw_artifact          = true;
         } else if (arg == "--corpus") {
             options.corpus_path = value("--corpus");
+        } else if (arg == "--concurrency") {
+            options.concurrency = parse_u32(value("--concurrency"), "concurrency");
+        } else if (arg == "--grammar-file" || arg == "--json-schema-file" ||
+                   arg == "--json-object" || arg == "--regex" || arg == "--choice") {
+            if (options.constraint &&
+                !(arg == "--choice" && options.constraint->kind == OutputConstraintKind::Choice))
+                throw std::invalid_argument("select only one output constraint");
+            if (arg == "--choice") {
+                if (!options.constraint) options.constraint = OutputConstraint::choice({});
+                options.constraint->choices.push_back(value(arg));
+            } else if (arg == "--regex") {
+                options.constraint = OutputConstraint::regex(value(arg));
+            } else if (arg == "--json-object") {
+                options.constraint = OutputConstraint::json_object();
+            } else {
+                options.constraint      = arg == "--grammar-file" ? OutputConstraint::grammar({})
+                                                                  : OutputConstraint::json_schema({});
+                options.constraint_file = value(arg);
+            }
+        } else if (arg == "--mixed-constraints") {
+            options.mixed_constraints = true;
         } else if (arg == "-p" || arg == "--n-prompt") {
             auto parsed = parse_int_list(value("--n-prompt"), "n-prompt");
             options.n_prompt.insert(options.n_prompt.end(), parsed.begin(), parsed.end());
@@ -383,6 +443,13 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
+    if (options.concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("--concurrency must be in [1,8]");
+    }
+    if (options.mixed_constraints && (!options.constraint || options.concurrency < 2)) {
+        throw std::invalid_argument(
+            "--mixed-constraints requires an output constraint and concurrency >= 2");
+    }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
@@ -526,7 +593,8 @@ std::vector<double> decode_output_tok_s_series(const TestResult& result) {
     if (!result.test.has_decode()) { return out; }
     for (const RepTiming& rep : result.reps) {
         if (rep.timings.decode_seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_gen) / rep.timings.decode_seconds);
+            const auto tokens = rep.generated_output_tokens ? rep.generated_output_tokens - 1U : 0U;
+            out.push_back(static_cast<double>(tokens) / rep.timings.decode_seconds);
         }
     }
     return out;
@@ -540,6 +608,18 @@ std::vector<double> decode_engine_tok_s_series(const TestResult& result) {
             out.push_back(static_cast<double>(decode_engine_tokens(result, rep)) /
                           rep.timings.decode_seconds);
         }
+    }
+    return out;
+}
+
+std::vector<double> output_tok_s_series(const TestResult& result) {
+    std::vector<double> out;
+    for (std::size_t i = 0; i < result.repetition_wall_seconds.size(); ++i) {
+        std::uint64_t tokens = 0;
+        for (std::uint32_t row = 0; row < result.concurrency; ++row) {
+            tokens += result.reps.at(i * result.concurrency + row).generated_output_tokens;
+        }
+        out.push_back(static_cast<double>(tokens) / result.repetition_wall_seconds[i]);
     }
     return out;
 }
@@ -595,7 +675,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " kv_cache=" << kv_cache_name(env.kv_cache)
+        << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
+        << (env.mixed_constraints ? " (mixed)" : "") << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
@@ -606,10 +687,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                 : "n/a")
         << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
 
-    constexpr std::size_t cols                   = 9;
+    constexpr std::size_t cols                   = 10;
     const std::array<std::string, cols> headings = {
-        "test",           "n_prompt", "n_gen",         "prefill t/s", "decode out t/s",
-        "decode eng t/s", "spec acc", "spec round/fb", "work peak"};
+        "test",           "n_prompt",      "n_gen",    "prefill t/s",   "decode out t/s",
+        "decode eng t/s", "batch out t/s", "spec acc", "spec round/fb", "work peak"};
     std::vector<std::array<std::string, cols>> rows;
     for (const TestResult& result : results) {
         const SpeculativeStats spec  = aggregate_speculative(result);
@@ -623,7 +704,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         rows.push_back({result.test.label, std::to_string(result.test.n_prompt),
                         std::to_string(result.test.n_gen), rate_cell(prefill_tok_s_series(result)),
                         rate_cell(decode_output_tok_s_series(result)),
-                        rate_cell(decode_engine_tok_s_series(result)), acceptance, rounds,
+                        rate_cell(decode_engine_tok_s_series(result)),
+                        rate_cell(output_tok_s_series(result)), acceptance, rounds,
                         format_bytes(result.workspace_peak_bytes)});
     }
 
@@ -710,6 +792,13 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
+        << "    \"concurrency\": " << env.concurrency << ",\n"
+        << "    \"constraint_file\": \"" << json_escape(env.constraint_file) << "\",\n"
+        << "    \"constraint_type\": \"" << constraint_name(env.constraint) << "\",\n"
+        << "    \"constraint_source\": \""
+        << json_escape(env.constraint ? env.constraint->source : "") << "\",\n"
+        << "    \"constraint_choices\": " << constraint_choices(env.constraint) << ",\n"
+        << "    \"mixed_constraints\": " << (env.mixed_constraints ? "true" : "false") << ",\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
@@ -746,6 +835,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         out << ",\n";
         append_stat(out, "decode_engine_tok_s", decode_engine_tok_s_series(result), "      ");
         out << ",\n";
+        append_stat(out, "output_tok_s", output_tok_s_series(result), "      ");
+        out << ",\n";
         append_stat(out, "prepare_seconds", prepare_time_series(result), "      ");
         out << ",\n";
         append_stat(out, "prefill_seconds", prefill_time_series(result), "      ");
@@ -757,17 +848,32 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
             << ",\n      \"workspace_allocator_peak_bytes\": "
             << result.workspace_allocator_peak_bytes << ",\n";
         append_speculative_json(out, aggregate_speculative(result), "      ");
-        out << ",\n      \"reps\": [\n";
+        out << ",\n      \"repetition_wall_seconds\": [";
+        for (std::size_t r = 0; r < result.repetition_wall_seconds.size(); ++r) {
+            if (r) { out << ", "; }
+            out << number(result.repetition_wall_seconds[r]);
+        }
+        out << "],\n      \"reps\": [\n";
         for (std::size_t r = 0; r < result.reps.size(); ++r) {
             const RepTiming& rep = result.reps[r];
             out << "        {\n"
+                << "          \"repetition\": " << r / result.concurrency << ",\n"
+                << "          \"row\": " << r % result.concurrency << ",\n"
                 << "          \"generated_output_tokens\": " << rep.generated_output_tokens << ",\n"
                 << "          \"decode_output_tokens\": "
-                << (result.test.has_decode() ? std::to_string(result.test.n_gen) : "null") << ",\n"
+                << (result.test.has_decode()
+                        ? std::to_string(
+                              rep.generated_output_tokens ? rep.generated_output_tokens - 1U : 0U)
+                        : "null")
+                << ",\n"
                 << "          \"decode_engine_tokens\": "
                 << (result.test.has_decode() ? std::to_string(decode_engine_tokens(result, rep))
                                              : "null")
                 << ",\n";
+            out << "          \"constraint\": "
+                << product::constraint_observation_json(rep.constraint).dump() << ",\n"
+                << "          \"constraint_draft_wait_exposed_seconds\": "
+                << number(rep.constraint_draft_wait_exposed_seconds) << ",\n";
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");
@@ -794,7 +900,8 @@ std::string csv_field(std::string_view value) {
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
-           "context,prefill_chunk,"
+           "context,prefill_chunk,concurrency,constraint_type,constraint_file,constraint_source,"
+           "constraint_choices,mixed_constraints,"
            "speculative_"
            "backend,draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
@@ -805,7 +912,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
-           "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean\n";
+           "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean,"
+           "output_tok_s_mean,output_tok_s_stddev\n";
     const auto mean = [](const std::vector<double>& values) {
         return values.empty() ? std::string() : number(compute_stats(values).mean);
     };
@@ -822,7 +930,12 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.architecture
             << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
             << csv_field(env.artifact_path) << ',' << env.max_context << ',' << env.prefill_chunk
-            << ',' << product::speculative_backend_name(env.speculative.backend) << ','
+            << ',' << env.concurrency << ',' << constraint_name(env.constraint) << ','
+            << csv_field(env.constraint_file) << ','
+            << csv_field(env.constraint ? env.constraint->source : "") << ','
+            << csv_field(constraint_choices(env.constraint)) << ','
+            << (env.mixed_constraints ? "true" : "false") << ','
+            << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
@@ -839,14 +952,17 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                     : std::string())
             << ',' << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes
             << ',' << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
-            << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
-            << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
-            << ',' << mean(decode_output_tok_s_series(result)) << ','
+            << spec.fallback_steps << ',' << acceptance << ','
+            << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
+            << ',' << stddev(prefill_tok_s_series(result)) << ','
+            << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
             << mean(decode_engine_tok_s_series(result)) << ','
             << stddev(decode_engine_tok_s_series(result)) << ','
             << mean(prepare_time_series(result)) << ',' << mean(prefill_time_series(result)) << ','
-            << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << '\n';
+            << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << ','
+            << mean(output_tok_s_series(result)) << ',' << stddev(output_tok_s_series(result))
+            << '\n';
     }
     return out.str();
 }

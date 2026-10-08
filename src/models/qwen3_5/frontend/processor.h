@@ -100,6 +100,7 @@ struct ProcessorOptions {
 
 struct ProcessedInput {
     bool starts_in_reasoning = false;
+    std::string continuation_content;
     std::vector<int> input_ids;
     std::vector<std::uint8_t> token_types;
     // Axis-major [3, input_ids.size()] in temporal, height, width order.

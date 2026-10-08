@@ -15,6 +15,10 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 
 namespace ninfer::models::qwen3_5::detail {
 struct ContractAccess {
+    static void constraint_failed(PendingBatch& pending, std::size_t row, bool failed) {
+        pending.constraint_failed_.at(row) = failed;
+    }
+
     static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,
                                         std::uint64_t epoch) noexcept {
         SequenceHandle out;

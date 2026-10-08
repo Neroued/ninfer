@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 15
+REPORT_SCHEMA_VERSION = 19
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -287,6 +287,10 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "prefill_signature": load.get("prefill_signature"),
             "artifact_path": report.get("artifact", {}).get("path"),
             "max_context": config.get("max_context"),
+            "concurrency": config.get("concurrency"),
+            "constraint_type": config.get("constraint_type"),
+            "constraint_file": config.get("constraint_file"),
+            "mixed_constraints": config.get("mixed_constraints"),
             "kv_capacity": memory.get("kv_capacity"),
             "prefill_chunk": config.get("prefill_chunk"),
             "kv_cache": config.get("kv_cache"),
@@ -318,6 +322,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "workspace_allocator_peak_bytes": test.get("workspace_allocator_peak_bytes"),
             "prefill_tok_s_mean": test.get("prefill_tok_s_mean"),
             "prefill_tok_s_stddev": test.get("prefill_tok_s_stddev"),
+            "output_tok_s_mean": test.get("output_tok_s_mean"),
+            "output_tok_s_stddev": test.get("output_tok_s_stddev"),
             "decode_output_tok_s_mean": test.get("decode_output_tok_s_mean"),
             "decode_output_tok_s_stddev": test.get("decode_output_tok_s_stddev"),
             "decode_engine_tok_s_mean": test.get("decode_engine_tok_s_mean"),

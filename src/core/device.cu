@@ -274,6 +274,13 @@ void CudaCompletionEvent::wait(cudaStream_t stream) const {
     CUDA_CHECK(cudaStreamWaitEvent(stream, event_, 0));
 }
 
+void CudaCompletionEvent::record_external(cudaStream_t stream) {
+    if (event_ == nullptr || stream == nullptr) {
+        throw std::logic_error("CUDA completion event is not recordable");
+    }
+    CUDA_CHECK(cudaEventRecordWithFlags(event_, stream, cudaEventRecordExternal));
+}
+
 bool CudaCompletionEvent::ready() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
     const cudaError_t status = cudaEventQuery(event_);

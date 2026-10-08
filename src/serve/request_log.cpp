@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/constraint_observation.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
@@ -336,6 +337,35 @@ Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
                 {"host_to_device_bytes", stats.host_to_device_bytes}};
 }
 
+Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
+    const char* reason = nullptr;
+    switch (stats.fallback_reason) {
+    case ninfer::AdmissionFallbackReason::None:
+        reason = "none";
+        break;
+    case ninfer::AdmissionFallbackReason::SourceInvalid:
+        reason = "source_invalid";
+        break;
+    case ninfer::AdmissionFallbackReason::SourceRevoked:
+        reason = "source_revoked";
+        break;
+    case ninfer::AdmissionFallbackReason::CostChanged:
+        reason = "cost_changed";
+        break;
+    case ninfer::AdmissionFallbackReason::CapacityLimit:
+        reason = "capacity_limit";
+        break;
+    case ninfer::AdmissionFallbackReason::IsolatedCapacity:
+        reason = "isolated_capacity";
+        break;
+    }
+    if (!reason) { throw std::logic_error("invalid admission fallback reason"); }
+    return Json{{"preferred_reused_tokens", stats.preferred_reused_tokens},
+                {"source_wait_seconds", stats.source_wait_seconds},
+                {"revoked_checkpoints", stats.revoked_checkpoints},
+                {"fallback_reason", reason}};
+}
+
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-9;
 }
@@ -361,6 +391,7 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
               {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
               {"total", request_host_exposed_seconds(timing)}}},
         {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
+        {"constraint_draft_wait_exposed_seconds", timing.constraint_draft_wait_exposed_seconds},
         {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
                         {"rounds", timing.decode_rounds}}},
@@ -408,6 +439,8 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
         .engine_maintenance_ns =
             monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns),
         .device_wait_ns = monotonic_delta(previous.device_wait_ns, current.device_wait_ns),
+        .constraint_draft_wait_ns =
+            monotonic_delta(previous.constraint_draft_wait_ns, current.constraint_draft_wait_ns),
         .decode_host_ns = monotonic_delta(previous.decode_host_ns, current.decode_host_ns),
         .decode_device_wait_ns =
             monotonic_delta(previous.decode_device_wait_ns, current.decode_device_wait_ns),
@@ -626,13 +659,15 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["constraint"]    = product::constraint_observation_json(outcome.constraint);
     record["first_output_timing"] =
         outcome.metrics.first_output_timing
             ? first_output_timing_json(*outcome.metrics.first_output_timing)
             : Json(nullptr);
     record["speculative"] = speculative_json(outcome.metrics);
     record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
-                                 {"scheduling", scheduling_json(outcome.metrics.scheduling)}};
+                                 {"scheduling", scheduling_json(outcome.metrics.scheduling)},
+                                 {"admission", admission_json(outcome.metrics.admission)}};
     return record.dump();
 }
 
@@ -699,6 +734,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"engine_maintenance", nanoseconds_to_seconds(host.engine_maintenance_ns)},
                  {"total", nanoseconds_to_seconds(active_host)}}},
            {"device_wait_seconds", nanoseconds_to_seconds(host.device_wait_ns)},
+           {"constraint_draft_wait_seconds", nanoseconds_to_seconds(host.constraint_draft_wait_ns)},
            {"work_class_seconds",
             Json{{"decode_host", nanoseconds_to_seconds(host.decode_host_ns)},
                  {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},

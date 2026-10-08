@@ -13,6 +13,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
     const int tokens      = token_offset + count;
     const int split_k     = K / Splits;
     const int split_begin = static_cast<int>(blockIdx.z) * split_k;
+    const int split_end   = split_begin + split_k;
     constexpr int BM      = Schedule::kBlockRows;
     constexpr int BN      = Schedule::kBlockTokens;
     constexpr int BK      = Schedule::kBlockK;
@@ -29,7 +30,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
     const int warp = tid >> 5;
     const int lane = tid & 31;
 
-    const int tiles_m = M / BM;
+    const int tiles_m = bf16_predicated_rows<Schedule> ? (M + BM - 1) / BM : M / BM;
     const int tiles_n = count / BN + static_cast<int>(count % BN != 0);
     int tile_m        = 0;
     int tile_n        = 0;
@@ -50,9 +51,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
             const int row = item / (BK / 8);
             const int k8  = item - row * (BK / 8);
             const int kk  = k8 * 8;
-            cp_async<16, Schedule::kWeightCache>(
-                &a_stage[row * BK + bf16_mma_shared_col<Schedule>(row, kk)],
-                &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
+            auto* dst     = &a_stage[row * BK + bf16_mma_shared_col<Schedule>(row, kk)];
+            if constexpr (bf16_predicated_rows<Schedule> || bf16_predicated_k<Schedule>) {
+                const bool valid = (!bf16_predicated_rows<Schedule> || m0 + row < M) &&
+                                   (!bf16_predicated_k<Schedule> || k0 + kk < split_end);
+                const auto source = valid ? static_cast<std::int64_t>(m0 + row) * K + k0 + kk : 0;
+                cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
+            } else {
+                cp_async<16, Schedule::kWeightCache>(
+                    dst, &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
+            }
         }
 
 #pragma unroll 1
@@ -62,19 +70,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
             const int kk    = k8 * 8;
             auto* dst       = &b_stage[col * BK + bf16_mma_shared_col<Schedule>(col, kk)];
             const int token = n0 + col;
-            if constexpr (FullTokens) {
+            if constexpr (FullTokens && !bf16_predicated_k<Schedule>) {
                 cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(token) * K + k0 + kk]);
             } else {
-                const bool valid = token < tokens;
-                cp_async_zfill<16, Schedule::kActivationCache>(
-                    dst, &x[static_cast<std::int64_t>(valid ? token : 0) * K + k0 + kk],
-                    valid ? 16 : 0);
+                const bool valid = (FullTokens || token < tokens) &&
+                                   (!bf16_predicated_k<Schedule> || k0 + kk < split_end);
+                const auto source = valid ? static_cast<std::int64_t>(token) * K + k0 + kk : 0;
+                cp_async_zfill<16, Schedule::kActivationCache>(dst, x + source, valid ? 16 : 0);
             }
         }
     };
 
-    const int kTiles = split_k / BK;
+    const int kTiles = split_k / BK + (bf16_predicated_k<Schedule> && split_k % BK != 0);
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
         if (stage < kTiles) {

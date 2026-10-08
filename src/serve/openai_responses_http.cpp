@@ -156,7 +156,9 @@ void redact_input_image_urls(Json& item) {
         }
     };
     if (item.contains("content")) { redact_parts(item["content"]); }
-    if (item.value("type", "") == "function_call_output" && item.contains("output")) {
+    if ((item.value("type", "") == "function_call_output" ||
+         item.value("type", "") == "custom_tool_call_output") &&
+        item.contains("output")) {
         redact_parts(item["output"]);
     }
 }

@@ -226,6 +226,82 @@ int test_inherited_socket_liveness() {
         "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
     return failures;
 }
+
+using SocketSetup = void (*)(int);
+
+void configure_http_listener(int socket) { ninfer::serve::configure_http_server_socket(socket); }
+
+// The listener setup of servers such as llama.cpp and uvicorn.
+void reuse_address_only(int socket) {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+}
+
+// Leaves a server-closed connection in TIME_WAIT on a loopback port whose
+// listener was prepared by `setup`, and closes that listener. Returns the
+// port's address, or a zero port on failure.
+sockaddr_in leave_server_time_wait(SocketSetup setup) {
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    if (listener.get() < 0) { return {}; }
+    setup(listener.get());
+    socklen_t address_size = sizeof(address);
+    if (::bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(listener.get(), 1) != 0 ||
+        ::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+        return {};
+    }
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) != 0) {
+        return {};
+    }
+    {
+        // The server closes first, so its side of the connection enters TIME_WAIT.
+        Socket accepted(::accept(listener.get(), nullptr, nullptr));
+        if (accepted.get() < 0) { return {}; }
+    }
+    char byte = 0;
+    if (::recv(client.get(), &byte, 1, 0) != 0) { return {}; }
+    return address;
+}
+
+bool successor_binds(const sockaddr_in& address, SocketSetup setup) {
+    Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+    if (successor.get() < 0) { return false; }
+    setup(successor.get());
+    return ::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
+           0;
+}
+
+int test_successor_binds_over_time_wait() {
+    struct Case {
+        SocketSetup previous;
+        SocketSetup next;
+        const char* message;
+    };
+
+    const Case cases[] = {
+        {configure_http_listener, reuse_address_only,
+         "a SO_REUSEADDR server could not bind over the HTTP listener's TIME_WAIT connection"},
+        {reuse_address_only, configure_http_listener,
+         "the HTTP listener could not bind over a SO_REUSEADDR server's TIME_WAIT connection"},
+        {configure_http_listener, configure_http_listener,
+         "the HTTP listener could not bind over its own TIME_WAIT connection"},
+    };
+    int failures = 0;
+    for (const Case& test_case : cases) {
+        const sockaddr_in address = leave_server_time_wait(test_case.previous);
+        if (address.sin_port == 0) {
+            failures += check(false, "failed to leave a TIME_WAIT test connection");
+            continue;
+        }
+        failures += check(successor_binds(address, test_case.next), test_case.message);
+    }
+    return failures;
+}
 #endif
 
 } // namespace
@@ -235,6 +311,7 @@ int main() {
                    test_prompt_json_member_order() + test_schema_number_precision();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
+    failures += test_successor_binds_over_time_wait();
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

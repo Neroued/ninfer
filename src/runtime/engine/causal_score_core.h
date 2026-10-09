@@ -78,6 +78,13 @@ public:
         return result.get();
     }
 
+    [[nodiscard]] std::vector<std::uint16_t> decision_hidden(PreparedPrompt prompt) {
+        std::scoped_lock call_lock(call_mutex_);
+        std::scoped_lock lock(execution_mutex_);
+        device_.bind_to_current_thread();
+        return instance_.program->decision_hidden(std::move(prompt));
+    }
+
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();

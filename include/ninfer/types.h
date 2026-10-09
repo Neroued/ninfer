@@ -36,6 +36,8 @@ enum class KvCacheStorage : std::uint8_t {
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
+    // Noncausal single-pass decision forward: one reset prefill chunk of up to max_context tokens.
+    Decision,
 };
 
 enum class KvCapacityMode : std::uint8_t {

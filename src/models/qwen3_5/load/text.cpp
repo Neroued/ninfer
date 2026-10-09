@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <set>
 
@@ -140,6 +142,45 @@ ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,
             }
         }
     }
+    return out;
+}
+
+DecisionHead bind_decision(Bindings& b, const artifact::Directory& directory,
+                           const TextConfig& text) {
+    const auto found = directory.components.find("decision");
+    if (found == directory.components.end()) {
+        throw artifact::ArtifactError("Decision purpose requires a decision component");
+    }
+    const auto& config = found->second.config;
+    artifact::require_members(config,
+                              {"attention_mode", "pooling", "temperature", "codes", "token_ids"},
+                              {}, "decision config");
+    if (config.at("attention_mode") != "noncausal_full_attention" ||
+        config.at("pooling") != "last") {
+        throw artifact::ArtifactError("unsupported decision attention_mode or pooling");
+    }
+    DecisionHead out;
+    out.temperature = config.at("temperature").get<float>();
+    if (!std::isfinite(out.temperature) || out.temperature <= 0) {
+        throw artifact::ArtifactError("decision temperature must be positive finite");
+    }
+    out.codes     = config.at("codes").get<std::vector<std::string>>();
+    out.token_ids = config.at("token_ids").get<std::vector<std::int32_t>>();
+    const auto rows = out.codes.size();
+    if (rows == 0 || rows != out.token_ids.size()) {
+        throw artifact::ArtifactError("decision codes and token_ids must match");
+    }
+    std::set<std::int32_t> unique;
+    for (const auto id : out.token_ids) {
+        if (id < 0 || std::uint32_t(id) >= text.vocab_size || !unique.insert(id).second) {
+            throw artifact::ArtifactError("decision token IDs must be unique and in vocabulary");
+        }
+    }
+    const auto readout = b.binder.parameter("decision/readout", {rows, text.hidden_size},
+                                            artifact::Residency::Values, QType::BF16);
+    const auto values = b.binder.values(readout.binding, QType::BF16);
+    out.readout.resize(values.data.size() / 2);
+    std::memcpy(out.readout.data(), values.data.data(), values.data.size());
     return out;
 }
 

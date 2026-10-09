@@ -14,6 +14,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/packed_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/noncausal_gqa/noncausal_gqa_attention.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/noncausal_gqa/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/context/context_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/context/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/sliding_window_attention.cpp"

@@ -15,6 +15,49 @@ TEXT_RESOURCES = (
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
 
+def decision_resources(model_dir: Path) -> dict[str, bytes]:
+    """Resources a pplx-decider checkpoint lacks or ships in a form the engine cannot read.
+
+    The checkpoint has no generation_config.json, its tokenizer_config.json lacks
+    added_tokens_decoder, and its tokenizer.json splits words with \\p{L}+ while its own
+    pretokenize_regex (the one the engine implements) also admits combining marks.
+    """
+    config = json.loads((model_dir / "tokenizer_config.json").read_text(encoding="utf-8"))
+    tokenizer = json.loads((model_dir / "tokenizer.json").read_text(encoding="utf-8"))
+    regex = config.get("pretokenize_regex")
+    if not isinstance(regex, str):
+        raise ValueError("decision checkpoint tokenizer_config.json lacks pretokenize_regex")
+    splits = [
+        step
+        for step in tokenizer["pre_tokenizer"]["pretokenizers"]
+        if step.get("type") == "Split"
+    ]
+    if len(splits) != 1:
+        raise ValueError("decision tokenizer.json must have exactly one Split pre-tokenizer")
+    splits[0]["pattern"] = {"Regex": regex}
+    # Qwen tokenizers never prepend BOS; the engine requires the flag to be explicit.
+    config.setdefault("add_bos_token", False)
+    if "added_tokens_decoder" not in config:
+        config["added_tokens_decoder"] = {
+            str(token["id"]): {
+                key: token[key]
+                for key in ("content", "single_word", "lstrip", "rstrip", "normalized", "special")
+            }
+            for token in tokenizer["added_tokens"]
+        }
+    # Decision scoring never generates; the Qwen3.5 default keeps the file well-formed.
+    eos_id = next(
+        (t["id"] for t in tokenizer["added_tokens"] if t["content"] == "<|endoftext|>"), None
+    )
+    if eos_id is None:
+        raise ValueError("decision tokenizer lacks <|endoftext|>")
+    return {
+        "tokenizer.json": json.dumps(tokenizer, ensure_ascii=False).encode(),
+        "tokenizer_config.json": json.dumps(config, ensure_ascii=False).encode(),
+        "generation_config.json": json.dumps({"eos_token_id": eos_id}).encode(),
+    }
+
+
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
 ) -> tuple[int, tuple[int, ...]]:
@@ -68,8 +111,10 @@ def load_resources(
     vocab_size: int,
     vision_config: Mapping[str, int] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
+    generated: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
     overrides = {} if overrides is None else dict(overrides)
+    generated = {} if generated is None else dict(generated)
     roles = {"text": TEXT_RESOURCES}
     if vision_config is not None:
         roles["vision"] = VISION_RESOURCES
@@ -85,7 +130,7 @@ def load_resources(
         references[component] = {}
         for role in names:
             path = Path(overrides[role]) if role in overrides else model_dir / role
-            data = path.read_bytes()
+            data = generated[role] if role in generated and role not in overrides else path.read_bytes()
             if not data:
                 raise ValueError(f"{path}: resource is empty")
             text = data.decode("utf-8")

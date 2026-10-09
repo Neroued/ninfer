@@ -57,6 +57,7 @@ struct PrefillContext {
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
     std::int32_t rope_delta                                    = 0;
     CudaEventTimer* prefill_gpu_timer                          = nullptr;
+    bool noncausal_prompt                                      = false;
 };
 
 struct OrdinaryBatchContext {

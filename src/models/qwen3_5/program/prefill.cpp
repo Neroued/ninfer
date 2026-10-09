@@ -79,6 +79,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card.set_noncausal_prompt(state.noncausal_prompt);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     const std::span<const int> prompt(ids.data(), ids.size());

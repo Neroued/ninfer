@@ -81,6 +81,18 @@ public:
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
 
+    // Noncausal single-pass forward over tokens (Decision Engine, tokens <= max_context): the BF16
+    // bits of the last token's final-norm hidden state.
+    [[nodiscard]] std::vector<std::uint16_t> decision_hidden(std::vector<TokenId> tokens);
+
+    // Decision readout metadata (Decision Engine): option codes in readout-row order.
+    [[nodiscard]] const std::vector<std::string>& decision_codes() const;
+
+    // Single-pass decision: noncausal forward, readout of the first `option_count` rows, BF16
+    // logits, temperature, FP32 softmax. The result is not renormalized after truncation.
+    [[nodiscard]] std::vector<float> decide(std::vector<TokenId> tokens,
+                                            std::uint32_t option_count);
+
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;

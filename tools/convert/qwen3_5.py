@@ -6,18 +6,26 @@ Official checkpoint names and quantization assignments live in official_recipes.
 
 from __future__ import annotations
 
+import json
 from math import isfinite, isqrt
 from pathlib import Path
 import struct
 from typing import Mapping
 
 from .model import Model, Parameter
-from .resources import load_resources
-from .sources.logical import LogicalSource, select_rows, transpose_source
+from .resources import decision_resources, load_resources
+from .sources.logical import (
+    LogicalSource,
+    array_source,
+    select_rows,
+    transpose_source,
+)
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
 
+_DECISION_ARCHITECTURE = "Qwen3_5Model"
 _TEXT_ARCHITECTURES = {
+    _DECISION_ARCHITECTURE: False,
     "Qwen3_5ForCausalLM": False,
     "Qwen3_5ForConditionalGeneration": False,
     "Qwen3_5MoeForCausalLM": True,
@@ -185,6 +193,30 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         _fixed(raw, "mtp_num_hidden_layers", 1, "text")
         _fixed(raw, "mtp_use_dedicated_embeddings", False, "text")
     return result
+
+
+def decision_config(raw: dict, text: dict) -> dict:
+    """Validate a pplx-decider decision_config.json against the text vocabulary."""
+    _fixed(raw, "attention_mode", "noncausal_full_attention", "decision")
+    _fixed(raw, "pooling", "last", "decision")
+    codes, ids = raw.get("codes"), raw.get("token_ids")
+    if (
+        not isinstance(codes, list)
+        or not codes
+        or any(not isinstance(code, str) for code in codes)
+        or not isinstance(ids, list)
+        or len(ids) != len(codes)
+        or any(type(i) is not int or not 0 <= i < text["vocab_size"] for i in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise ValueError("decision codes and token_ids must be matching unique lists")
+    return {
+        "attention_mode": "noncausal_full_attention",
+        "pooling": "last",
+        "temperature": _f32(raw.get("temperature"), "decision.temperature"),
+        "codes": list(codes),
+        "token_ids": list(ids),
+    }
 
 
 def vision_config(source: dict, text: dict) -> dict:
@@ -904,6 +936,24 @@ class _Builder:
                 )
 
 
+def _readout(base: SafetensorsSource, config: dict, hidden: int) -> Parameter:
+    """The small decision readout is read eagerly from readout.safetensors."""
+    rows = len(config["token_ids"])
+    with SafetensorsSource(base.root / "readout.safetensors") as readout:
+        info = readout.describe("weight")
+        if info.dtype != "BF16" or info.shape != (rows, hidden):
+            raise ValueError(
+                f"readout.safetensors: expected BF16 {(rows, hidden)}, got {info.dtype} {info.shape}"
+            )
+        values = readout.read_flat("weight").reshape(rows, hidden)
+    return Parameter(
+        "decision/readout",
+        (rows, hidden),
+        array_source(values, f"{readout.path}:weight"),
+        residency="decision",
+    )
+
+
 def build_model(
     base: SafetensorsSource,
     *,
@@ -939,8 +989,20 @@ def build_model(
                 "config": draft_config(companions[backend].config, config, backend),
                 "target": "text",
             }
+    if base.config.get("architectures") == [_DECISION_ARCHITECTURE]:
+        if selected - {"text"}:
+            raise ValueError("a decision checkpoint supports only the text component")
+        path = base.root / "decision_config.json"
+        if not path.is_file():
+            raise ValueError(f"{path}: decision checkpoint requires decision_config.json")
+        records["decision"] = {
+            "config": decision_config(json.loads(path.read_text()), config),
+            "target": "text",
+        }
+    generated = decision_resources(base.root) if "decision" in records else None
     refs, resources, count, special = load_resources(
         base.root,
+        generated=generated,
         vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,
@@ -952,13 +1014,20 @@ def build_model(
     )
     builder = _Builder(model)
     h, r = config["hidden_size"], config["vocab_size"]
-    text_prefix = "model.language_model." if "text_config" in base.config else "model."
+    decision = base.config.get("architectures") == [_DECISION_ARCHITECTURE]
+    if decision:
+        text_prefix = "language_model."
+    else:
+        text_prefix = (
+            "model.language_model." if "text_config" in base.config else "model."
+        )
     builder.add(
         "text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h)
     )
+    # A decision checkpoint has no language-model head; the unused head aliases the embedding.
     head_source = (
         text_prefix + "embed_tokens.weight"
-        if config["tie_word_embeddings"]
+        if config["tie_word_embeddings"] or decision
         else "lm_head.weight"
     )
     head_inputs = ("text/final_hidden",) + tuple(
@@ -987,6 +1056,8 @@ def build_model(
         builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
+    if decision:
+        model.add(_readout(base, records["decision"]["config"], h))
     for backend in ("dflash", "dflash2"):
         if backend in selected:
             if (

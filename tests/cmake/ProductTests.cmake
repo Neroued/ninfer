@@ -24,6 +24,12 @@ ninfer_add_test(ninfer_cli_options_test
 
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 
+ninfer_add_test(ninfer_decide_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decide.cpp" ${PROJECT_SOURCE_DIR}/apps/decide/decision.cpp
+  LIBRARIES ninfer::json)
+
+target_include_directories(ninfer_decide_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/decide)
+
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_schema.cpp"
   LIBRARIES ninfer_serve)

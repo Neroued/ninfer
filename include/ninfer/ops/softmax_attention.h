@@ -105,6 +105,32 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     std::int32_t min_segments, std::int32_t max_segments);
 
 /**
+ * Non-causal grouped-query dense attention over an in-memory prompt.
+ *
+ * The registered profile is D=256, Hq=24, Hkv=4 (group 6), scale=1/sqrt(256). q and out are
+ * contiguous BF16 [256,24,T]; k and v are contiguous BF16 [256,4,T]. Feature and head dimensions
+ * are contiguous; the token stride may be padded. This is the grouped-query, in-memory, non-causal
+ * form of packed_softmax_attention: query head h reads KV head floor(h / (Hq/Hkv)), and cu_seqlens
+ * is contiguous device I32 [S+1] delimiting independent non-causal segments (every query attends
+ * all keys in its segment; no score crosses a boundary). q/k/v/out are mutually non-overlapping,
+ * inputs are unchanged, out is completely overwritten, and the Op has no persistent state side
+ * effect. Opaque tile descriptors are allocated from workspace for the duration of the call; a
+ * single segment consumes no capacity.
+ */
+void noncausal_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                             AttentionHeadGeometry geometry, float scale, const Tensor& cu_seqlens,
+                             WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/**
+ * Return caller-owned transient capacity for every legal (T,S) pair in the inclusive envelope for
+ * noncausal_gqa_attention. A pair is legal when 1 <= S <= T. An envelope with no legal pair throws;
+ * a legal single-segment envelope may return zero.
+ */
+[[nodiscard]] std::size_t noncausal_gqa_attention_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, std::int32_t min_tokens, std::int32_t max_tokens,
+    std::int32_t min_segments, std::int32_t max_segments);
+
+/**
  * Append K/V for B independent rows and compute causal grouped-query attention.
  *
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with

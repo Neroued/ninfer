@@ -10,6 +10,8 @@
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -163,7 +165,7 @@ public:
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults   = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        if (options.purpose == EnginePurpose::CausalScoring) {
+        if (options.purpose != EnginePurpose::Generation) {
             core = std::make_unique<ScoringCore>(*active, device);
         } else {
             core = std::make_unique<GenerationCore>(*active, device, options,
@@ -268,6 +270,70 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;
+}
+
+std::vector<std::uint16_t> Engine::decision_hidden(std::vector<TokenId> tokens) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Decision) {
+        throw std::logic_error("decision_hidden requires a Decision Engine");
+    }
+    if (tokens.empty() || tokens.size() > impl_->options.max_context) {
+        throw std::invalid_argument("decision_hidden token count must be in [1,max_context]");
+    }
+    PreparedPrompt prompt = prepare_tokens(std::move(tokens), false);
+    return std::visit(
+        [&](auto& core) -> std::vector<std::uint16_t> {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->decision_hidden(std::move(prompt.impl_->value));
+            } else {
+                throw std::logic_error("Engine scoring core is unavailable");
+            }
+        },
+        impl_->core);
+}
+
+const std::vector<std::string>& Engine::decision_codes() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Decision) {
+        throw std::logic_error("decision_codes requires a Decision Engine");
+    }
+    return impl_->active->model->weights().decision->codes;
+}
+
+std::vector<float> Engine::decide(std::vector<TokenId> tokens, std::uint32_t option_count) {
+    const auto& codes = decision_codes();
+    if (option_count == 0 || option_count > codes.size()) {
+        throw std::invalid_argument("decide option_count must be in [1,readout rows]");
+    }
+    const auto& head           = *impl_->active->model->weights().decision;
+    const auto hidden          = decision_hidden(std::move(tokens));
+    const std::size_t width    = hidden.size();
+    const auto to_float        = [](std::uint16_t bits) {
+        return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+    };
+    const auto round_bf16 = [](float value) {
+        auto bits = std::bit_cast<std::uint32_t>(value);
+        bits += 0x7FFFU + ((bits >> 16) & 1U);
+        return std::bit_cast<float>(bits & 0xFFFF0000U);
+    };
+    std::vector<float> logits(option_count);
+    for (std::uint32_t row = 0; row < option_count; ++row) {
+        double sum = 0.0;
+        for (std::size_t i = 0; i < width; ++i) {
+            sum += static_cast<double>(to_float(hidden[i])) *
+                   static_cast<double>(to_float(head.readout[std::size_t{row} * width + i]));
+        }
+        logits[row] = round_bf16(static_cast<float>(sum)) / head.temperature;
+    }
+    const float peak = *std::max_element(logits.begin(), logits.end());
+    float total      = 0.0F;
+    for (auto& value : logits) {
+        value = std::exp(value - peak);
+        total += value;
+    }
+    for (auto& value : logits) { value /= total; }
+    return logits;
 }
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {

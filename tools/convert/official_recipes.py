@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .decider import pplx_decider_groupwise, pplx_decider_nvfp4
 from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
 
 Q4 = "q4_g64_fp16"
@@ -175,6 +176,8 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 
 
 RECIPES = {
+    "pplx_decider_groupwise": pplx_decider_groupwise,
+    "pplx_decider_nvfp4": pplx_decider_nvfp4,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

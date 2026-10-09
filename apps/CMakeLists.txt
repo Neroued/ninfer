@@ -18,3 +18,9 @@ add_executable(ninfer-perplexity
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+add_executable(ninfer-decide
+  decide/main.cpp
+  decide/decision.cpp)
+ninfer_internal_includes(ninfer-decide)
+target_link_libraries(ninfer-decide PRIVATE ninfer_engine Threads::Threads ninfer::json ninfer::httplib)

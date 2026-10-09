@@ -22,8 +22,8 @@ int main() {
 
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
-    options.purpose       = ninfer::EnginePurpose::CausalScoring;
-    options.max_context   = 1024;
+    options.purpose       = ninfer::EnginePurpose::Decision;
+    options.max_context   = 8192;
     ninfer::Engine engine(options);
     const std::vector<std::uint16_t> hidden = engine.decision_hidden(ids);
     for (const std::uint16_t word : hidden) { std::cout << std::hex << word << '\n'; }

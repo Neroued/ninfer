@@ -302,12 +302,13 @@ std::uint64_t VisionConfig::merger_width() const {
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     try {
         if (options.purpose != EnginePurpose::Generation &&
-            options.purpose != EnginePurpose::CausalScoring) {
+            options.purpose != EnginePurpose::CausalScoring &&
+            options.purpose != EnginePurpose::Decision) {
             throw ArtifactError("unknown loading purpose");
         }
-        if (options.purpose == EnginePurpose::CausalScoring &&
+        if (options.purpose != EnginePurpose::Generation &&
             (options.vision || options.speculative != SpeculativeBackend::None)) {
-            throw ArtifactError("CausalScoring loads the Text backbone only");
+            throw ArtifactError("scoring-class purposes load the Text backbone only");
         }
         if (options.speculative != SpeculativeBackend::None &&
             options.speculative_component().empty()) {

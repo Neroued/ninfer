@@ -913,7 +913,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
-        .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
+        .causal_scoring       = options.purpose != EnginePurpose::Generation,
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,

@@ -163,7 +163,7 @@ public:
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults   = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        if (options.purpose == EnginePurpose::CausalScoring) {
+        if (options.purpose != EnginePurpose::Generation) {
             core = std::make_unique<ScoringCore>(*active, device);
         } else {
             core = std::make_unique<GenerationCore>(*active, device, options,
@@ -272,8 +272,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::vector<std::uint16_t> Engine::decision_hidden(std::vector<TokenId> tokens) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (impl_->options.purpose != EnginePurpose::CausalScoring) {
-        throw std::logic_error("decision_hidden requires a CausalScoring Engine");
+    if (impl_->options.purpose != EnginePurpose::Decision) {
+        throw std::logic_error("decision_hidden requires a Decision Engine");
     }
     if (tokens.empty() || tokens.size() > impl_->options.max_context) {
         throw std::invalid_argument("decision_hidden token count must be in [1,max_context]");

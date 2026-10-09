@@ -83,6 +83,16 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.context_cache        = ContextCacheOptions{
                    .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
         break;
+    case EnginePurpose::Decision:
+        options.max_concurrency      = 1;
+        options.max_pending_requests = 1;
+        options.prefill_chunk        = (options.max_context + 127U) / 128U * 128U;
+        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.speculative          = {};
+        options.enable_vision        = false;
+        options.use_cuda_graph       = false;
+        options.context_cache        = ContextCacheOptions{.enabled = false};
+        break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }

@@ -26,6 +26,7 @@ from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix
+from .quantization.nvfp4 import quantize_rows as quantize_nvfp4_rows, weight_divisor_for
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -240,6 +241,35 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
+    """Quantize floating-point inputs to NVFP4 with a parent-wide weight divisor.
+
+    The divisor needs the parent's global max-abs, so the inputs are read twice.
+    """
+    if request.target.format != "nvfp4" or len(request.target.shape) != 2:
+        raise ValueError("nvfp4_absmax requires the NVFP4 matrix target")
+    _preflight(request)
+    n, k = request.target.shape
+    chunk = max(128, request.rows_per_chunk // 128 * 128)
+
+    def produce(output):
+        maximum = 0.0
+        for begin in range(0, n, chunk):
+            end = min(n, begin + chunk)
+            values = request.values(begin * k, end * k)
+            if not values.dtype.is_floating_point:
+                raise TypeError("nvfp4_absmax source must provide floating-point values")
+            maximum = max(maximum, float(values.float().abs().max()))
+        divisor = weight_divisor_for(maximum)
+        for begin in range(0, n, chunk):
+            end = min(n, begin + chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            encoded = quantize_nvfp4_rows(values, divisor)
+            output.write_codes(begin, encoded.codes, encoded.scales, divisor)
+
+    return request.job(produce=produce)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
     if (
@@ -297,5 +327,6 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
+    "nvfp4_absmax": nvfp4_absmax,
     "import_encoded": import_encoded,
 }

@@ -1,0 +1,31 @@
+#include "ninfer/engine.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+// Reads whitespace-separated token ids from NINFER_TEST_TOKENS and prints the BF16 bits of the
+// noncausal last-token hidden state, one hex word per line.
+int main() {
+    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* tokens   = std::getenv("NINFER_TEST_TOKENS");
+    if (artifact == nullptr || *artifact == '\0' || tokens == nullptr || *tokens == '\0') {
+        std::cout << "SKIP: NINFER_TEST_ARTIFACT or NINFER_TEST_TOKENS is not set\n";
+        return 77;
+    }
+    std::ifstream in(tokens);
+    std::vector<ninfer::TokenId> ids;
+    for (long long value = 0; in >> value;) { ids.push_back(static_cast<ninfer::TokenId>(value)); }
+
+    ninfer::EngineOptions options;
+    options.artifact_path = artifact;
+    options.purpose       = ninfer::EnginePurpose::CausalScoring;
+    options.max_context   = 1024;
+    ninfer::Engine engine(options);
+    const std::vector<std::uint16_t> hidden = engine.decision_hidden(ids);
+    for (const std::uint16_t word : hidden) { std::cout << std::hex << word << '\n'; }
+    return 0;
+}

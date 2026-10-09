@@ -128,6 +128,10 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), target);
 }
 
+std::vector<std::uint16_t> Program::decision_hidden(PreparedPrompt&& prompt) {
+    return impl_->decision_hidden(PreparedPromptAccess::take(std::move(prompt)));
+}
+
 std::optional<SourceCandidate>
 Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                         bool consume_source, std::span<const CheckpointHandle> private_points,

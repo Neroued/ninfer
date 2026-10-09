@@ -259,6 +259,7 @@ public:
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    [[nodiscard]] std::vector<std::uint16_t> decision_hidden(PreparedPromptData&&);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},

@@ -882,7 +882,21 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
+    if (noncausal_prompt_) {
+        if (active_sequence_batch_ != 0 || text_kv_base_ != 0 || ph != Phase::Prefill) {
+            throw std::logic_error("noncausal prompt attention requires one reset prefill chunk");
+        }
+        Tensor cu_seqlens                = work_.alloc(DType::I32, {2});
+        const std::int32_t segments[2]   = {0, T};
+        copy_i32(segments, cu_seqlens, s);
+        ops::noncausal_gqa_attention(
+            qn, kn, v,
+            {dimension(config_.attention->head_dim),
+             dimension(config_.attention->num_attention_heads),
+             dimension(config_.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            cu_seqlens, work_, a, s);
+    } else if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");

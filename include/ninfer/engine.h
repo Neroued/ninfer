@@ -81,6 +81,10 @@ public:
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
 
+    // Noncausal single-pass forward over tokens (CausalScoring Engine, tokens <= 1024): the BF16
+    // bits of the last token's final-norm hidden state.
+    [[nodiscard]] std::vector<std::uint16_t> decision_hidden(std::vector<TokenId> tokens);
+
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;

@@ -270,6 +270,27 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     return result;
 }
 
+std::vector<std::uint16_t> Engine::decision_hidden(std::vector<TokenId> tokens) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::CausalScoring) {
+        throw std::logic_error("decision_hidden requires a CausalScoring Engine");
+    }
+    if (tokens.empty() || tokens.size() > impl_->options.max_context) {
+        throw std::invalid_argument("decision_hidden token count must be in [1,max_context]");
+    }
+    PreparedPrompt prompt = prepare_tokens(std::move(tokens), false);
+    return std::visit(
+        [&](auto& core) -> std::vector<std::uint16_t> {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->decision_hidden(std::move(prompt.impl_->value));
+            } else {
+                throw std::logic_error("Engine scoring core is unavailable");
+            }
+        },
+        impl_->core);
+}
+
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->active->frontend.count_tokens(std::move(input), control);

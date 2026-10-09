@@ -393,6 +393,86 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     }
 }
 
+std::vector<std::uint16_t> ProgramImpl::decision_hidden(PreparedPromptData&& prompt) {
+    if (!causal_scoring || !score_hidden || workspace_plan.causal_score == 0) {
+        throw std::logic_error("Program was not constructed for scoring-class execution");
+    }
+    const std::size_t count = prompt.token_ids.size();
+    if (count == 0 || count > prefill_chunk || count > capacity) {
+        throw std::invalid_argument("decision prompt must fit one prefill chunk");
+    }
+    if (prompt.has_media()) { throw std::invalid_argument("decision accepts text tokens only"); }
+
+    const auto tokens = static_cast<std::uint32_t>(count);
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> address;
+    const auto cleanup = [&] {
+        if (address) {
+            if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
+            text_kv_addresses->release(*address);
+            address.reset();
+        }
+        if (state) {
+            state_store->release(*state);
+            state.reset();
+        }
+    };
+    try {
+        state = state_store->reserve_reset(device.stream);
+        if (!state) { throw std::bad_alloc(); }
+        address = text_kv_addresses->create_active(kv_pages_for_frontier(tokens), 0, device.stream);
+        if (!address) { throw std::bad_alloc(); }
+        text_kv_addresses->ensure_mapped_to_tokens(*address, tokens, device.stream);
+        const std::int32_t state_slot = state_store->physical_slot(*state);
+        execution::PrefillContext schedule_state{
+            {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+             prefill_chunk, proposal_head},
+            decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
+            {},
+            decoder->text_kv,
+            nullptr,
+            nullptr,
+            0,
+            nullptr,
+            nullptr,
+            state_slot,
+            state_slot,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            true};
+        mark_workspace_usage(workspace_plan.text_prefill);
+        const execution::PrefillChunkResult result = execution::prefill_text_chunk(
+            schedule_state, std::span<const TokenId>(prompt.token_ids), tokens, std::nullopt,
+            false);
+        if (result.processed_tokens != tokens) {
+            throw std::logic_error("decision prefill did not process the whole prompt");
+        }
+        std::vector<std::uint16_t> hidden(static_cast<std::size_t>(parameters.model.config().text.hidden_size));
+        Tensor last = prefill_hidden.slice(1, static_cast<std::int32_t>(tokens - 1), 1);
+        if (last.bytes() != hidden.size() * sizeof(std::uint16_t)) {
+            throw std::logic_error("decision hidden size mismatch");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(hidden.data(), last.data, last.bytes(), cudaMemcpyDeviceToHost,
+                                   device.stream));
+        device.synchronize();
+        work.reset();
+        cleanup();
+        return hidden;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        try {
+            cleanup();
+        } catch (...) {}
+        throw;
+    }
+}
+
 void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
     context_transfer_timers_[context_resource_index(resource)].start();
 }

@@ -407,6 +407,8 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // Noncausal single-pass forward: the final-norm hidden state (BF16 bits) of the last token.
+    [[nodiscard]] std::vector<std::uint16_t> decision_hidden(PreparedPrompt&& prompt);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool consume_source                              = false,

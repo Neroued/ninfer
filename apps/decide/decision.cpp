@@ -81,8 +81,8 @@ Decision parse_decision(const Json& row, const std::vector<std::string>& codes) 
         }
     } else if (type == "score") {
         if (!question.contains("criteria") || !question["criteria"].is_array() ||
-            question["criteria"].size() < 2) {
-            throw InvalidDecision("a score question needs a criteria array of at least two levels");
+            question["criteria"].size() < 2 || question["criteria"].size() > 10) {
+            throw InvalidDecision("a score question needs 2 to 10 criteria levels");
         }
         for (std::size_t i = 0; i < question["criteria"].size(); ++i) {
             out.keys.push_back(std::to_string(i));
@@ -90,6 +90,9 @@ Decision parse_decision(const Json& row, const std::vector<std::string>& codes) 
             shown.push_back(describe(question["criteria"][i]));
         }
     } else if (type == "noul") {
+        if (falsy(question.value("criteria", Json())) && falsy(question.value("instructions", Json()))) {
+            throw InvalidDecision("a noul question needs criteria or instructions");
+        }
         Json criteria = question.contains("criteria") && !falsy(question["criteria"])
                             ? question["criteria"]
                             : Json::object();

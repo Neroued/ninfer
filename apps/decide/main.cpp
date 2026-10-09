@@ -12,6 +12,8 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -37,7 +39,7 @@ void handle_signal(int) {
 const char* usage() {
     return "usage: ninfer-decide <model.ninfer> [--host H] [--port N] [--device N]\n"
            "                     [--model-id ID] [--api-key KEY]\n"
-           "Serves POST /v1/decide for a pplx-decider artifact (single request at a time).\n";
+           "Serves POST /v1/decisions (Perplexity/LiteLLM format) for a pplx-decider artifact (single request at a time).\n";
 }
 
 bool parse(int argc, char** argv, Options& out) {
@@ -114,15 +116,45 @@ int main(int argc, char** argv) {
             response.set_content(R"({"status":"ok"})", "application/json");
         });
 
-        server.Post("/v1/decide", [&](const httplib::Request& request, httplib::Response& response) {
+        server.Post("/v1/decisions", [&](const httplib::Request& request,
+                                         httplib::Response& response) {
             if (!authorized(request)) {
                 return fail(response, 401, "authentication_error", "invalid API key");
             }
-            Json body;
-            ninfer::decide::Decision decision;
+            std::vector<std::pair<std::string, ninfer::decide::Decision>> decisions;
+            std::string model = options.model_id;
             try {
-                body     = Json::parse(request.body);
-                decision = ninfer::decide::parse_decision(body, codes);
+                const Json body = Json::parse(request.body);
+                if (!body.is_object()) { throw std::invalid_argument("body must be an object"); }
+                for (const auto& [key, value] : body.items()) {
+                    if (key == "model") {
+                        if (!value.is_string()) { throw std::invalid_argument("model must be a string"); }
+                        model = value.get<std::string>();
+                    } else if (key != "state" && key != "questions") {
+                        throw std::invalid_argument("unknown field \"" + key + "\"");
+                    }
+                }
+                if (!body.contains("state") || body["state"].is_null()) {
+                    throw std::invalid_argument("state must be a string, an object or an array");
+                }
+                const Json& state = body["state"];
+                if (state.is_array()) {
+                    for (const auto& item : state) {
+                        if (item.is_object() && item.contains("type") && item["type"] != "text") {
+                            throw std::invalid_argument("images are not supported");
+                        }
+                    }
+                }
+                if (!body.contains("questions") || !body["questions"].is_object() ||
+                    body["questions"].empty() || body["questions"].size() > 128) {
+                    throw std::invalid_argument("questions must be an object of 1 to 128 questions");
+                }
+                for (const auto& [name, question] : body["questions"].items()) {
+                    if (name.empty()) { throw std::invalid_argument("question names must be nonempty"); }
+                    decisions.emplace_back(name, ninfer::decide::parse_decision(
+                                                     Json{{"state", state}, {"question", question}},
+                                                     codes));
+                }
             } catch (const Json::parse_error& error) {
                 return fail(response, 400, "invalid_request_error",
                             std::string("invalid JSON: ") + error.what());
@@ -132,32 +164,36 @@ int main(int argc, char** argv) {
                 return fail(response, 400, "invalid_request_error", error.what());
             }
             try {
-                const auto start  = std::chrono::steady_clock::now();
-                auto tokens       = engine.tokenize_text(ninfer::decide::render_chat(decision.prompt));
-                const auto length = tokens.size();
-                if (length > kMaxTokens) {
-                    return fail(response, 400, "context_length_exceeded",
-                                "Question branch exceeds the " + std::to_string(kMaxTokens) +
-                                    "-token limit; no input was truncated (" +
-                                    std::to_string(length) + " tokens).");
+                std::vector<std::vector<ninfer::TokenId>> prompts;
+                std::size_t total = 0;
+                for (const auto& [name, decision] : decisions) {
+                    prompts.push_back(
+                        engine.tokenize_text(ninfer::decide::render_chat(decision.prompt)));
+                    if (prompts.back().size() > kMaxTokens) {
+                        return fail(response, 400, "context_length_exceeded",
+                                    "Question \"" + name + "\" exceeds the " +
+                                        std::to_string(kMaxTokens) +
+                                        "-token limit; no input was truncated (" +
+                                        std::to_string(prompts.back().size()) + " tokens).");
+                    }
+                    total += prompts.back().size();
                 }
-                std::vector<float> probabilities;
+                Json answers = Json::object();
                 {
                     std::scoped_lock lock(gpu);
-                    probabilities = engine.decide(std::move(tokens),
-                                                  static_cast<std::uint32_t>(decision.keys.size()));
+                    for (std::size_t i = 0; i < decisions.size(); ++i) {
+                        auto probabilities = engine.decide(
+                            std::move(prompts[i]),
+                            static_cast<std::uint32_t>(decisions[i].second.keys.size()));
+                        answers[decisions[i].first] =
+                            ninfer::decide::answer(decisions[i].second, probabilities);
+                    }
                 }
-                Json result = ninfer::decide::answer(decision, probabilities);
-                const double seconds =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                response.set_content(
-                    Json{{"object", "decision"},
-                         {"model", options.model_id},
-                         {"answer", std::move(result)},
-                         {"usage", {{"input_tokens", length}}},
-                         {"timings", {{"total_seconds", seconds}}}}
-                        .dump(-1, ' ', false),
-                    "application/json");
+                response.set_content(Json{{"model", model},
+                                          {"answers", std::move(answers)},
+                                          {"usage", {{"input_tokens", total}, {"output_tokens", 0}}}}
+                                         .dump(-1, ' ', false),
+                                     "application/json");
             } catch (const std::exception& error) {
                 fail(response, 500, "server_error", error.what());
             }

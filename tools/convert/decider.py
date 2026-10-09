@@ -23,3 +23,18 @@ def pplx_decider_nvfp4(model, recipe, sources):
             recipe.separate(name)
             continue
         recipe.assign(name, format="nvfp4", method=nvfp4_absmax)
+
+
+def pplx_decider_groupwise(model, recipe, sources):
+    """Q4/Q5 groupwise backbone, usable at every prefill length without calibration.
+
+    The engine registers its fused NVFP4 MLP and GDN input projections for 16-bit
+    activations only through T=16, so a one-shot prompt prefill needs either
+    calibrated NVFP4 activation divisors or a groupwise representation.
+    """
+    from .official_recipes import qwen3_8_27b
+
+    if "decision" not in model.components:
+        raise ValueError("this recipe requires a decision checkpoint")
+    qwen3_8_27b(model, recipe, sources)
+    recipe.share("text/output_head", "text/token_embedding")

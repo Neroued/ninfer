@@ -24,7 +24,7 @@ constexpr std::uint32_t kMaxTokens = 8192;
 struct Options {
     std::string artifact;
     std::string host     = "127.0.0.1";
-    int port             = 1236;
+    int port             = 1234;
     int device           = 0;
     std::string model_id = "pplx-decider";
     std::string api_key;

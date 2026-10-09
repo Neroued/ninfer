@@ -419,8 +419,16 @@ Json evaluate(const Request& request, const Backend& backend) {
     std::uint32_t largest_batch         = 0;
     constexpr std::size_t context_batch = 8;
     const auto fields                   = request.fields.size();
-    const auto static_prompt            = backend.tokenize(request.system, "", "{\n");
+    // A stream of independent single-question judgments has a stable rubric and a
+    // changing state. Keep that rubric before the state, like ordinary decisions,
+    // so the retained root is reusable between requests, not just within one.
+    const bool single_question = fields == 1 && !request.fields.front().isolated_question.empty();
+    const auto system = single_question
+        ? request.system + "\n\nQuestion:\n" + request.fields.front().isolated_question
+        : request.system;
+    const auto static_prompt = backend.tokenize(system, "", "{\n");
     const bool isolated_state = request.contexts.size() == 1 &&
+        !single_question &&
         std::all_of(request.fields.begin(), request.fields.end(),
                     [](const Field& field) { return !field.isolated_question.empty(); });
     const auto state_prompt = isolated_state && request.cache_prompt
@@ -437,14 +445,14 @@ Json evaluate(const Request& request, const Backend& backend) {
             for (std::size_t f = 0; f < fields; ++f) {
                 const auto index  = c * fields + f;
                 const auto& field = request.fields[f];
-                const auto context = field.isolated_question.empty()
+                const auto context = field.isolated_question.empty() || single_question
                     ? request.contexts[begin + c]
                     : request.contexts[begin + c] + "\n\nQuestion:\n" + field.isolated_question;
                 const auto key = field.isolated_question.empty() ? field.name : std::string("answer");
                 for (const auto& value : field.encoded) {
                     backend.check_cancelled();
                     tries[index].add(
-                        backend.tokenize(request.system, context,
+                        backend.tokenize(system, context,
                                          "{\n  " + Json(key).dump() + ": " + value + "\n}"));
                 }
                 tries[index].build();

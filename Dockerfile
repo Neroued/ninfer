@@ -35,7 +35,7 @@ RUN apt-get update \
     && cmake --build /build --parallel --target \
         ninfer_decision_test ninfer_decision_fixtures_test ninfer_systemone_test ninfer_qwen3_5_decision_real_test
 
-CMD ["ctest", "--test-dir", "/build", "-R", "^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|systemone_test|qwen3_5_decision_real_test)$", "--output-on-failure"]
+CMD ["ctest", "--test-dir", "/build", "-R", "^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|decision_live_client_test|systemone_test|qwen3_5_decision_real_test)$", "--output-on-failure"]
 
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 

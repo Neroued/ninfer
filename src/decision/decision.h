@@ -19,8 +19,9 @@ using Tokens = std::vector<TokenId>;
 struct Field {
     std::string name;
     std::string description;
-    // System One questions append their own rubric after the shared state. Other questions
-    // and the caller's answer-map key are never included in this field's model input.
+    // System One questions have an isolated rubric. A single question places it before
+    // the changing state for cross-request reuse; multiple questions share the state
+    // before their rubrics. Other questions and caller IDs never enter this field's input.
     std::string isolated_question;
     std::string aggregate = "mode";
     std::vector<Json> values;

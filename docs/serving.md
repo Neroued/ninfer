@@ -310,14 +310,20 @@ served alias, not TypeSafe's hosted model name. For the TypeSafe JS SDK, set `ba
 Only System One inference is adapted: `/v1/models` remains OpenAI-shaped, not TypeSafe's
 hosted model directory, and hosted quotas/billing are not emulated.
 
-Each question's instructions and criteria are appended to the shared state independently.
+Each question's instructions and criteria are evaluated independently.
 Caller question IDs and sibling questions are excluded from its model input. Tokenization
 still uses the artifact's own template; all question tries feed the same shared-prefix,
-batched-suffix engine. The single state's token prefix is the cached root; each isolated
-question's complete common prefix is a reusable trunk. Multi-token choices therefore reuse
+batched-suffix engine. For a single question, the rubric precedes the changing state in
+the system prefix, so repeated question shapes reuse that stable root across messages.
+For multiple questions, the shared state's token prefix is the cached root and each isolated
+question follows it in a reusable trunk, preserving within-request large-state sharing.
+Multi-token choices therefore reuse
 their question rubric at every divergence instead of evaluating that rubric repeatedly.
 Boundaries are obtained from complete template tokenizations, not concatenated token IDs.
-An exact repeated state can reuse the root across calls; changing the state replaces it.
+On the multi-question path, an exact repeated state can reuse the root across calls;
+changing the state replaces it. The single-question path instead invalidates its root when
+the rubric changes. Adding/removing questions can change prompt ordering and hence scores.
+This is prefix-state reuse, not a cached answer or a model-generated schema translation.
 Disabling prefix reuse still disables both cache levels. Exhaustive tree scoring supplies
 the full probability distributions; there is no greedy shortcut on this endpoint.
 Many options or long labels can increase

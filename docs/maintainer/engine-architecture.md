@@ -115,10 +115,12 @@ trunks and evicts the retained root.
 The host compiler batches up to eight contexts and all their finite-trie divergences together.
 This is shared-prefix/batched-suffix execution, not one monolithic kernel or an unbounded batch.
 `src/serve/systemone.cpp` owns the optional TypeSafe protocol adapter. It compiles each question
-into an isolated rubric after the common state, hides caller question IDs from model input,
-and requests exhaustive distributions from the same compiler/worker. For a single isolated
-state, the compiler selects the state prefix as root and each question prefix as a trunk;
-multi-token answer divergences reuse the rubric. These are exact token-prefix markers on the
+into an isolated rubric, hides caller question IDs from model input,
+and requests exhaustive distributions from the same compiler/worker. A single question puts
+its rubric in the system prefix before the changing state, retaining that stable root across
+independent requests. Multiple questions retain a common-state root followed by isolated
+question trunks, avoiding repeated large-state prefill within a request. Multi-token answer
+divergences reuse the rubric. These are exact token-prefix markers on the
 existing branch API, with no new Program storage. Its host formatter owns
 Choice/Noul/Score answer shapes and confidence formulas. Internal probability retention is
 opt-in; ordinary `/v1/decision` wire results are unchanged. No Engine, Program or numerical

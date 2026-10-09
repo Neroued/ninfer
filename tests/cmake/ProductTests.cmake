@@ -40,6 +40,9 @@ ninfer_add_test(ninfer_decision_fixtures_test
 add_test(NAME ninfer_decision_smoke_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_decision_smoke.py")
 
+add_test(NAME ninfer_decision_live_client_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_decision_live.py")
+
 ninfer_add_test(ninfer_systemone_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_systemone.cpp"
   LIBRARIES ninfer_systemone)

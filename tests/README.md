@@ -94,7 +94,7 @@ docker build --target decision-tests -t ninfer:jev-tests .
 
 # Compiler/math, protocol adapters, fixtures and smoke validation. No GPU or model needed.
 docker run --rm ninfer:jev-tests ctest --test-dir /build \
-  -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|systemone_test)$' --output-on-failure
+  -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|decision_live_client_test|systemone_test)$' --output-on-failure
 
 # Stop the live model server first. Set the exact artifact file, not a directory/glob.
 ARTIFACT=/absolute/path/to/your-model.ninfer
@@ -103,7 +103,7 @@ docker run --rm --gpus all \
   -e NINFER_TEST_ARTIFACT=/models/test.ninfer ninfer:jev-tests
 ```
 
-The second run must report all five tests passed, **not a skipped real-artifact test**.
+The second run must report all six tests passed, **not a skipped real-artifact test**.
 Its numerical comparison must stay within the fixed 0.02 conditional-probability tolerance;
 do not relax the threshold to manufacture a pass. The test image builds focused test targets
 and includes Python only as a test/client interpreter. It is not the production serving image;
@@ -156,11 +156,56 @@ It checks published confidence examples against fixed numerical expectations, fu
 distributions, Noul's probability-of-true semantics, unrounded Score means, structured/null
 entries, limits and invalid distributions. A synthetic tokenizer/scorer exercises the real
 compiler to verify question/ID isolation, shared batch submission, state/question prefix reuse,
+stable single-question rubric roots across changing messages and invalidation on rubric changes,
 multi-token divergence reuse, cache opt-out and unchanged ordinary decision response shape.
 This is a host protocol oracle, not a claim of model accuracy or GPU performance.
 The Docker test stage includes this target; live usage is documented in
 [System One compatibility](../docs/serving.md#system-one-compatibility). The existing
 `tools/smoke/decision.py` client still targets `/v1/decision`, not `/v1/systemone`.
+
+### Both-endpoint qualification and chat replay
+
+`tests/decision_live.py` covers all eight Decision presets in auto/tree/greedy modes,
+cache opt-out and rejected inputs, plus SystemOne Choice/Noul/Score, mixed questions,
+structured/null/array inputs, escaped labels, confidence/mean formulas and rejected inputs.
+It then replays the 64 synthetic messages in `fixtures/decision/chat.json`, repeated to
+the requested finite count, independently through each endpoint. This is chat filtering,
+not connected Twitch moderation or a reproduction of another system's measured accuracy.
+
+```bash
+# No server required: response validation and lossless queue accounting oracles.
+python3 -B tests/test_decision_smoke.py
+python3 -B tests/test_decision_live.py
+
+# Live --jev server required. No additional Python packages or GPU on the client.
+python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
+  --build-label YOUR_SERVED_COMMIT --rates 8 24 48 0 \
+  --output .local/decision-live.json
+```
+
+There is no pending-queue/drop cap, duplicate filtering, answer cache or automatic retry.
+The replay sends one message per HTTP request, keeps up to `--concurrency` in flight
+(default 8), ends arrivals after `--count` (default 128), then drains **all** queued work.
+Per-request failures/timeouts remain explicit event records; interruption marks the run
+incomplete and fails it. A finite replay is not an unlimited throughput guarantee.
+Native server admission remains bounded: increasing client concurrency can expose genuine
+overload responses, which fail the run rather than being hidden by retries.
+
+Reports distinguish offered arrival rate, achieved completion rate, pending depth, request
+latency and end-to-end/queue p50/p95/p99. Rate `0` is an immediate finite saturation workload;
+the serial baseline reports request latency (its end-to-end figures include its queued burst).
+All configured rates run; queue growth does not silently stop escalation. Labels are
+illustrative quality observations, separate from contract pass/fail. No arbitrary semantic
+labels or speed claims are required for a protocol test to pass.
+
+For a measured parity gate, explicitly add `--min-throughput-ratio 0.95` with both routes
+and a rate-0 stage. It fails below that SystemOne/Decision completion-rate ratio; it is
+an optional performance acceptance criterion, not a CTest hardware-independent assertion.
+Compare identical CLI/workloads on the same server/hardware, with other traffic idle, and
+retain raw reports from before **and after rebuilding**. SystemOne always scores full
+distributions, so compare with Decision tree mode (the replay does), not greedy mode.
+The no-network `ninfer_decision_live_client_test` is registered in CTest and the Docker
+qualification image. Live HTTP tests are opt-in and do not run during ordinary CTest.
 
 ### Research and application evaluation
 

@@ -201,8 +201,15 @@ int main() {
         changed["questions"].erase("2");
         prompts.clear();
         (void)ninfer::decision::evaluate(parse_systemone_request(changed).decision, backend);
-        expect(std::equal(prompts.begin(), prompts.end(), original_prompts.begin()),
-               "removing unrelated questions changes input");
+        for (const auto& prompt : prompts) {
+            expect(prompt.find("Which team?") != std::string::npos &&
+                       prompt.find("Urgent?") == std::string::npos &&
+                       prompt.find("Severity?") == std::string::npos &&
+                       prompt.find("private_id") == std::string::npos,
+                   "single-question layout preserves the state and isolated rubric");
+        }
+        expect(prompts.back().find("Charged twice") != std::string::npos,
+               "single-question candidate still contains the state");
         const auto old_request  = ninfer::decision::parse_request(Json::parse(
             R"({"contexts":["hello"],"schema":{"yes":{"type":"boolean","description":"A greeting?"}}})"));
         const auto old_response = ninfer::decision::evaluate(old_request, backend);
@@ -212,14 +219,43 @@ int main() {
         auto branching = parse_systemone_request(Json::parse(R"({"state":"state text","questions":{
           "pick":{"type":"choice","instructions":"Select a label","criteria":{
             "aa":"First","ab":"Second","ba":"Third","bb":"Fourth"}}}})"));
+        prompts.clear();
         scored_prefixes.clear();
         scored_frontiers.clear();
         const auto cached = ninfer::decision::evaluate(branching.decision, backend);
+        const auto single_prompts = prompts;
         expect(scored_frontiers.size() == 3, "multi-token labels exercise three divergences");
         expect(scored_frontiers[0] == scored_frontiers[1] &&
                    scored_frontiers[1] == scored_frontiers[2] &&
                    scored_frontiers[0].back() == scored_prefixes[0].size(),
                "each divergence reuses one complete rubric rather than recomputing it");
+        const auto root_size = scored_frontiers.front().front();
+        const ninfer::decision::Tokens rubric_root(scored_prefixes.front().begin(),
+                                                   scored_prefixes.front().begin() + root_size);
+        const std::string root_text(rubric_root.begin(), rubric_root.end());
+        expect(root_text.find("Select a label") != std::string::npos &&
+                   root_text.find("Fourth") != std::string::npos &&
+                   root_text.find("state text") == std::string::npos,
+               "retained root includes the complete rubric but not the changing state");
+        auto renamed = branching;
+        renamed.decision.fields[0].name = "never-inject-this-id";
+        prompts.clear();
+        (void)ninfer::decision::evaluate(renamed.decision, backend);
+        expect(prompts == single_prompts, "single-question ID renaming changes model input");
+        auto next_state = branching;
+        next_state.decision.contexts[0] = "State:\na completely different message";
+        scored_prefixes.clear();
+        scored_frontiers.clear();
+        (void)ninfer::decision::evaluate(next_state.decision, backend);
+        expect(scored_frontiers.front().front() == root_size &&
+                   std::equal(rubric_root.begin(), rubric_root.end(), scored_prefixes.front().begin()),
+               "new messages reuse identical rubric root tokens");
+        next_state.decision.fields[0].isolated_question += " Changed instructions.";
+        scored_prefixes.clear();
+        scored_frontiers.clear();
+        (void)ninfer::decision::evaluate(next_state.decision, backend);
+        expect(!std::equal(rubric_root.begin(), rubric_root.end(), scored_prefixes.front().begin()),
+               "changed rubric cannot reuse a stale root");
         branching.decision.cache_prompt = false;
         scored_prefixes.clear();
         scored_frontiers.clear();

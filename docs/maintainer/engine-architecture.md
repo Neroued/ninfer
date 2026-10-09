@@ -74,6 +74,58 @@ Engine 在 submit 调用线程完成编译，再入队；Program 借用当轮的
 GPU 采样及 spec 验收。Matcher 与输出一起 preview/commit，抢占和 Replay 保留其已提交状态。
 执行时序及语义见[约束解码设计](constrained-decoding.md)。
 
+### 2.1.1 Finite decisions
+
+The opt-in `--jev` product lives in `src/decision/`; HTTP owns only admission and protocol
+translation. Its host compiler creates finite token tries and assembles typed JSON. It is separate
+from speculative token decoding, but reuses the public Generation Engine and resident model.
+`Engine::tokenize_prompt` exposes exact artifact-template continuation tokenization.
+`EngineOptions::enable_decisions` enables `Engine::score_branches`, a typed synchronous transaction
+on the existing GPU worker. Borrowed token spans remain owned by the caller until worker cleanup
+finishes, including cancellation. A separate bounded decision queue leaves chat admission
+accounting unchanged; shutdown and failure handling drain both queues. An admitted transaction
+runs nonpreemptively at a stable Program boundary; it does not create
+generation sessions, advance ordinary lane ledgers, or call a proposal head.
+
+Decisions leave the native startup arena, workspace capacity, KV capacity curve, graph budget
+and chat lane count unchanged. Their mutable resources are a temporary overlay of the existing
+general workspace, excluding live Vision handoff storage. A dry-run layout selects the largest
+batch B up to eight that fits, independently of chat `max_concurrency`, with 1+2B linear-state
+slots (root, B trunks, B branches), B width-16 ReplaySSM records, selected-tail buffers, private
+execution tables and a disjoint scratch subarena. A bounded prefix tile is sized in that same
+budget. The private tables reference the existing Main logical/physical KV pool; generation's
+table rows, mappings and StateImages are not borrowed. If no layout fits, startup still succeeds
+and decision admission reports overload. No runtime Device allocation, second model,
+backend-specific proposal state or new numerical Op is introduced.
+
+The common token root uses native prefill. Context trunks and field suffixes use Text's native
+multi-token target traversal with up to B rows, masked physical width 16, and explicit KV/state
+selectors. ReplaySSM folds only real columns; normalized hidden states are selected before padding
+and projected together through the full target head. KVAddressSpaceStore forks share full pages
+and copy partial tails; every fork copies both convolution and recurrent state. Cohorts are bounded
+by actual free shared-pool capacity, including COW tails and one leaf's headroom. Optional reuse
+is dropped when its extra retained pages would prevent a predictor from fitting. An exact-root
+cache retains decision-owned state/pages in the overlay but the entire overlay is released
+before chat admission or execution. Decisions do not reclaim chat checkpoints or live/paused
+state. Remaining pressure is a request overload, not an Engine failure. Cache opt-out uses zero
+trunks and evicts the retained root.
+
+The host compiler batches up to eight contexts and all their finite-trie divergences together.
+This is shared-prefix/batched-suffix execution, not one monolithic kernel or an unbounded batch.
+`src/serve/systemone.cpp` owns the optional TypeSafe protocol adapter. It compiles each question
+into an isolated rubric after the common state, hides caller question IDs from model input,
+and requests exhaustive distributions from the same compiler/worker. For a single isolated
+state, the compiler selects the state prefix as root and each question prefix as a trunk;
+multi-token answer divergences reuse the rubric. These are exact token-prefix markers on the
+existing branch API, with no new Program storage. Its host formatter owns
+Choice/Noul/Score answer shapes and confidence formulas. Internal probability retention is
+opt-in; ordinary `/v1/decision` wire results are unchanged. No Engine, Program or numerical
+Op contract is added by this protocol.
+The optional artifact test compares conditional scores with the existing independent causal
+prefill route and checks isolation from ordinary/speculative generation. GPU qualification and
+performance measurement remain distinct from host compiler tests. The endpoint and accounting are in
+[HTTP serving](../serving.md#parallel-decisions-jev).
+
 ### 2.2 EngineCore 与 Scheduler
 
 EngineCore 拥有 request record、等待队列、resident slots、paused queue、cancellation、deadline、

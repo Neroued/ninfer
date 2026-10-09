@@ -265,6 +265,13 @@ ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTimin
     return impl_->advance_replay(h, t);
 }
 
+BranchScoreResult Program::score_branches(std::span<const BranchScoreRow> rows,
+                                          const PreparationControl& control) {
+    return impl_->score_branches(rows, control);
+}
+
+bool Program::release_branch_cache() { return impl_->release_branch_cache(); }
+
 PendingBatch Program::decode(std::span<const SequenceHandle> s,
                              std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t,
                              runtime::TokenMaskProvider* m) {

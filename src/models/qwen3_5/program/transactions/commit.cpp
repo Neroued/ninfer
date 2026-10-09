@@ -550,6 +550,9 @@ void ProgramImpl::fail_all_cleanup() noexcept {
     try {
         device.synchronize();
     } catch (...) {}
+    try {
+        release_branch_cache();
+    } catch (...) {}
     abort_context();
     pending_transaction_.reset();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {

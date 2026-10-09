@@ -1,3 +1,7 @@
+add_library(ninfer_systemone STATIC systemone.cpp)
+ninfer_internal_includes(ninfer_systemone)
+target_link_libraries(ninfer_systemone PUBLIC ninfer_decision_math)
+
 add_library(ninfer_serve STATIC
   http_transport.cpp
   request_validation.cpp
@@ -19,10 +23,11 @@ add_library(ninfer_serve STATIC
   request_log.cpp
   metrics.cpp
   http_server.cpp
+  decision_http.cpp
   openai_responses_http.cpp
   serve_options.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine ninfer_decision ninfer_systemone Threads::Threads ninfer::json ninfer::httplib
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_grammar CUDA::cudart)

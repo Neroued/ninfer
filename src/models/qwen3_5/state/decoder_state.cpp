@@ -73,7 +73,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 }
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
-    : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
+    : owned_pages_(std::in_place, backing, layout.pages), pages_(*owned_pages_),
+      execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       layer_storage_(layout.layer_storage) {
     if (pages_.plane_count() !=
@@ -81,6 +82,12 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
 }
+
+PagedKVCache::PagedKVCache(DeviceSpan backing, const KVExecutionTableLayout& tables,
+                           PagedKVCache& shared)
+    : pages_(shared.page_pool()), execution_tables_(backing, tables, pages_),
+      layers_(shared.layers_), max_context_(shared.max_context_), kv_heads_(shared.kv_heads_),
+      layer_storage_(shared.layer_storage_) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}

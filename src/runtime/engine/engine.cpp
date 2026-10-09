@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -239,6 +240,13 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->active->frontend.tokenize_text(text);
 }
 
+std::vector<TokenId> Engine::tokenize_prompt(PromptInput input,
+                                            const PreparationControl& control) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    auto prompt = impl_->active->frontend.prepare(std::move(input), control);
+    return models::qwen3_5::PreparedPromptAccess::view(prompt).token_ids;
+}
+
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
@@ -273,6 +281,38 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->active->frontend.count_tokens(std::move(input), control);
+}
+
+BranchScoreResult Engine::score_branches(std::span<const BranchScoreRow> rows,
+                                         const PreparationControl& control) {
+    if (!impl_ || !impl_->options.enable_decisions ||
+        impl_->options.purpose != EnginePurpose::Generation) {
+        throw std::logic_error("branch scoring requires an enabled generation Engine");
+    }
+    if (rows.empty() || rows.size() > 65536) {
+        throw std::invalid_argument("branch scoring needs 1-65536 rows");
+    }
+    const auto vocabulary = impl_->active->model->resources().public_token_count;
+    for (const auto& row : rows) {
+        if (!row.size() || row.size() > impl_->options.max_context ||
+            row.trunk_tokens > row.prefix.size() || row.root_tokens > row.trunk_tokens ||
+            row.candidates.empty() || row.candidates.size() > 255) {
+            throw std::invalid_argument("branch scoring row exceeds its token/choice bounds");
+        }
+        const auto validate = [&](auto tokens) {
+            for (auto token : tokens) {
+                if (token < 0 || static_cast<std::uint64_t>(token) >= vocabulary) {
+                    throw std::invalid_argument(
+                        "branch scoring token is outside the public vocabulary");
+                }
+            }
+        };
+        validate(row.prefix);
+        validate(row.suffix);
+        validate(row.candidates);
+    }
+    return std::get<std::unique_ptr<Impl::GenerationCore>>(impl_->core)
+        ->score_branches(rows, control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {

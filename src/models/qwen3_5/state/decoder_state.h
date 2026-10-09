@@ -58,6 +58,8 @@ private:
 class PagedKVCache {
 public:
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    // Independent execution rows over the same physical page pool; no new KV payload.
+    PagedKVCache(DeviceSpan backing, const KVExecutionTableLayout& tables, PagedKVCache& shared);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -86,7 +88,8 @@ private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
-    DeviceKVPagePool pages_;
+    std::optional<DeviceKVPagePool> owned_pages_;
+    DeviceKVPagePool& pages_;
     KVExecutionTablePool execution_tables_;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;

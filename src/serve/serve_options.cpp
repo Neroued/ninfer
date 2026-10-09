@@ -126,13 +126,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--jev] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --jev enables native /v1/decision and /v1/systemone decisions\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -197,6 +198,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
+        } else if (arg == "--jev") {
+            options.jev = true;
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {

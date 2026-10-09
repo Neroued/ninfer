@@ -38,6 +38,9 @@ void ensure_http_request_id(const httplib::Request& request, httplib::Response& 
     } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
         response.set_header("x-request-id", new_openai_request_id());
     }
+    if (request.path == "/v1/systemone" && !response.has_header("x-typesafe-request-id")) {
+        response.set_header("x-typesafe-request-id", response.get_header_value("x-request-id"));
+    }
 }
 
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
@@ -112,6 +115,8 @@ bool report_has_activity(const ThroughputReport& report) {
 }
 
 const char* endpoint_name(std::string_view path) noexcept {
+    if (path == "/v1/systemone") { return "systemone"; }
+    if (path == "/v1/decision" || path == "/decision") { return "decision"; }
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
@@ -346,10 +351,10 @@ void HttpServer::register_routes() {
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Expose-Headers", "x-request-id, request-id"},
+             {"Access-Control-Expose-Headers", "x-request-id, request-id, x-typesafe-request-id"},
              {"Access-Control-Allow-Headers",
               "Authorization, Content-Type, X-API-Key, anthropic-version, anthropic-beta, "
-              "anthropic-user-profile-id"},
+              "anthropic-user-profile-id, X-TypeSafe-SDK, X-TypeSafe-Runtime, X-TypeSafe-Retry-Count"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -454,6 +459,17 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    if (options_.jev) {
+        server_.Post("/v1/systemone", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_systemone(req, res);
+        });
+        server_.Post("/v1/decision", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_decision(req, res);
+        });
+        server_.Post("/decision", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_decision(req, res);
+        });
+    }
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });

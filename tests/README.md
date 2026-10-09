@@ -34,6 +34,149 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
+## Decision engine
+
+The finite-schema compiler and probability oracle run without CUDA or model weights:
+
+```bash
+c++ -std=c++20 -O2 -Iinclude -Isrc -Ithird_party \
+  src/decision/decision.cpp tests/test_decision.cpp -o /tmp/ninfer-decision-test
+/tmp/ninfer-decision-test
+```
+
+The CMake target is `ninfer_decision_test`. It checks typed domains, validation, decimal and
+integer boundaries, token-prefix merging, independent exact probability calculations,
+multi-context cohorts, multi-round greedy traversal, cache opt-out and cancellation. These tests do not qualify GPU
+execution or establish model accuracy/performance.
+
+`ninfer_qwen3_5_decision_real_test` is an opt-in artifact execution comparison. Twelve rows cover
+two contexts, partial-page KV forks, zero/1/15/16/17/33-token suffixes, multiple tiles, full batches,
+cache hits/opt-out, mid-transaction cancellation and unchanged later ordinary/speculative output.
+After releasing the generation Engine, it compares each row with the existing causal-prefill
+scorer's full-vocabulary log probabilities, renormalized over the same candidates. The declared
+maximum absolute conditional-probability error is 0.02 for differing BF16 execution shapes;
+the test prints the worst error. This is an independent scheduling/execution reference, not a new
+mathematical kernel oracle, model accuracy benchmark or speed measurement. It skips with status 77
+without an artifact.
+Run it on the supported Linux/CUDA build, with the live model server stopped to free the GPU:
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --parallel --target ninfer_decision_test ninfer_qwen3_5_decision_real_test
+NINFER_TEST_ARTIFACT=/absolute/path/model.ninfer \
+  ctest --test-dir build -R '^ninfer_(decision_test|qwen3_5_decision_real_test)$' --output-on-failure
+```
+
+Optional `NINFER_DECISION_TEST_SPEC=mtp|dflash|dflash2` exercises the selected supported artifact
+component with three draft tokens (default `none`). `NINFER_DECISION_TEST_PROPOSAL_HEAD=1` also
+selects the optimized proposal head. Those options must match components present in the artifact.
+For HTTP/Docker use, see [decision serving](../docs/serving.md#parallel-decisions-jev).
+
+### Codacus fixtures and Docker qualification
+
+[`fixtures/decision/codacus.json`](fixtures/decision/codacus.json) contains all eight playground
+presets from [thecodacus/decision-playground at 843f72e](https://github.com/thecodacus/decision-playground/blob/843f72e61f5ebaa1c2225c4902849bd42af44c05/src/playground/presets.ts):
+arena, routing, eight-ticket routing, ticket triage, smart home, warehouse rover, robot arm,
+and the 30-field RTS squad. Instructions, schema values/descriptions and context text are unchanged;
+the playground's own separator/trim rule converts its context box to a `contexts` array.
+The source revision and SHA-256 are recorded in the fixture. No upstream code executes at test time.
+
+These are exact **demo inputs**, not a claimed copy of a Codacus golden-answer test suite.
+`ninfer_decision_fixtures_test` exercises each in auto/tree/greedy mode using synthetic byte
+tokenization and logits: 24 host contract cases, not model accuracy checks. The existing
+`ninfer_decision_test` remains the independent finite-probability oracle. The Python unit test
+checks that the HTTP smoke validator rejects malformed results; it does not contact a server.
+
+From the repository root on the Linux/WSL Docker host:
+
+```bash
+docker build --target decision-tests -t ninfer:jev-tests .
+
+# Compiler/math, protocol adapters, fixtures and smoke validation. No GPU or model needed.
+docker run --rm ninfer:jev-tests ctest --test-dir /build \
+  -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|systemone_test)$' --output-on-failure
+
+# Stop the live model server first. Set the exact artifact file, not a directory/glob.
+ARTIFACT=/absolute/path/to/your-model.ninfer
+docker run --rm --gpus all \
+  --mount "type=bind,src=$ARTIFACT,dst=/models/test.ninfer,readonly" \
+  -e NINFER_TEST_ARTIFACT=/models/test.ninfer ninfer:jev-tests
+```
+
+The second run must report all five tests passed, **not a skipped real-artifact test**.
+Its numerical comparison must stay within the fixed 0.02 conditional-probability tolerance;
+do not relax the threshold to manufacture a pass. The test image builds focused test targets
+and includes Python only as a test/client interpreter. It is not the production serving image;
+ordinary `docker build -t ninfer:jev .` still ends at the unchanged runtime stage.
+
+The real-artifact check first loads generation with decisions disabled, then enabled, using
+identical serving options. Minimum/actual reservations, the KV capacity increment, KV payload,
+persistent/workspace capacities and graph allowance must match exactly, as must greedy chat
+output. It also verifies that chat releases the temporary decision overlay before reuse.
+Decision batch bounds are independent of the configured chat lane count. With speculative
+decoding disabled it additionally compares KV payload with the causal reference engine.
+
+Start the server using the serving instructions, then replay real requests from another terminal:
+
+```bash
+python3 tools/smoke/decision.py --list
+python3 tools/smoke/decision.py --base-url http://127.0.0.1:8080 --all
+python3 tools/smoke/decision.py --preset arena --check-arena
+python3 tools/smoke/decision.py --preset routing-bulk --repeat 3
+```
+
+No Python packages are required. Alternatively, on the Linux/WSL Docker host use the built
+test image as the client: `docker run --rm --network host ninfer:jev-tests python3
+/src/tools/smoke/decision.py --all`. This client needs no GPU access and loads no model.
+Use `NINFER_API_KEY` if the server requires authentication; `--model` is optional and takes the
+served alias, not an artifact filename. `--mode tree` forces exhaustive finite-tree evaluation;
+`--no-cache` exercises the uncached route. JSON responses go to stdout; summaries/errors to stderr.
+
+`PASS contract` means typed domains, complete result shapes, finite probabilities, numeric
+intervals and token accounting are valid. It does **not** certify semantic correctness.
+`--check-arena` additionally checks five NInfer-authored expectations derived from the unchanged
+arena rules: move right, turn right by 33 degrees, do not fire, stand. These are not upstream
+golden labels. A wrong answer fails this optional quality check even when the engine contract
+passes. Printed timings are observations, not comparisons with Codacus's hardware or Jev.
+
+### System One adapter
+
+`ninfer_systemone_test` qualifies TypeSafe-shaped parsing and formatting without CUDA,
+a model, or a network connection:
+
+```bash
+c++ -std=c++20 -O2 -Iinclude -Isrc -Ithird_party \
+  src/decision/decision.cpp src/serve/systemone.cpp tests/test_systemone.cpp \
+  -o /tmp/ninfer-systemone-test
+/tmp/ninfer-systemone-test
+```
+
+It checks published confidence examples against fixed numerical expectations, full Choice
+distributions, Noul's probability-of-true semantics, unrounded Score means, structured/null
+entries, limits and invalid distributions. A synthetic tokenizer/scorer exercises the real
+compiler to verify question/ID isolation, shared batch submission, state/question prefix reuse,
+multi-token divergence reuse, cache opt-out and unchanged ordinary decision response shape.
+This is a host protocol oracle, not a claim of model accuracy or GPU performance.
+The Docker test stage includes this target; live usage is documented in
+[System One compatibility](../docs/serving.md#system-one-compatibility). The existing
+`tools/smoke/decision.py` client still targets `/v1/decision`, not `/v1/systemone`.
+
+### Research and application evaluation
+
+The attached research's [Jev in the Wild paper](https://arxiv.org/abs/2609.30216) is an ecosystem
+study, not a specification for reproducing Jev's proprietary model or an executable test suite.
+For realistic workloads, TypeSafe publishes [workflow evaluations](https://evals.typesafe.ai/)
+for customer service, invoice processing, security incidents and agent-trace observability.
+Their reference labels are model consensus, not human-verified ground truth.
+
+A downloadable evaluation source is [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions),
+used by [Type-Safe Is Not Error-Free](https://arxiv.org/abs/2609.26758). To evaluate it here,
+map each question to a field, preserve its criteria in the field description, use the state as
+context, and score held-out decisions against the supplied labels. This is an API adaptation,
+not a drop-in reproduction of Jev's distribution/calibration metrics. No dataset or additional
+checkpoint is downloaded by the tests. Also measure sensitivity to option names/order; a valid
+enum result alone does not prove that a model followed the option definitions.
+
 ## Build and run
 
 Select a Python environment with the dependencies for the tests first. The maintained environment

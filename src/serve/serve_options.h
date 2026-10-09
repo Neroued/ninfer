@@ -21,6 +21,7 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
+    bool jev            = false; // opt-in native finite-schema decision engine
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";

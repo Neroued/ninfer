@@ -6,6 +6,7 @@ add_subdirectory(media)
 add_subdirectory(ops)
 add_subdirectory(models)
 add_subdirectory(runtime)
+add_subdirectory(decision)
 
 if(NINFER_BUILD_PRODUCT_SUPPORT)
   add_subdirectory(product)

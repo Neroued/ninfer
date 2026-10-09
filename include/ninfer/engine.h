@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ninfer/branch_score.h"
 
 #include <chrono>
 #include <memory>
@@ -74,12 +75,23 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
+    // Exact artifact chat-template/tokenizer output, including assistant continuation mode.
+    // Useful for finite candidate trees: tokenize complete candidate serializations together
+    // with their prefixes, rather than assuming text boundaries are also token boundaries.
+    [[nodiscard]] std::vector<TokenId> tokenize_prompt(PromptInput input,
+                                                       const PreparationControl& control = {}) const;
+
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
+
+    // Opt-in, target-only branch transaction on the generation Engine's GPU worker. No
+    // generated tokens, output session, proposal head, or mutation of generation checkpoints.
+    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
+                                                   const PreparationControl& control = {});
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

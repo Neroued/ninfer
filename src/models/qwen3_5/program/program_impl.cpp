@@ -30,7 +30,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      causal_scoring(plan.causal_scoring), decision_scoring(plan.decision_scoring),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -66,6 +67,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         workspace_plan.vision.has_value() != vision_enabled ||
         causal_scoring != plan.persistent.score_hidden.has_value() ||
         causal_scoring != (workspace_plan.causal_score != 0) ||
+        (!decision_scoring && workspace_plan.branches.has_value()) ||
         (workspace_plan.vision &&
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
@@ -446,6 +448,9 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         }
     }
     std::size_t active_workspace_bytes = work.used();
+    if (branches) {
+        active_workspace_bytes = std::max(active_workspace_bytes, workspace_plan.branches->bytes);
+    }
     if (workspace_plan.vision && active_handoff_bytes != 0) {
         active_workspace_bytes =
             std::max(active_workspace_bytes,

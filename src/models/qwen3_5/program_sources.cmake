@@ -5,6 +5,7 @@ target_sources(ninfer_model_runtime PRIVATE
 
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program_impl.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/branch_scoring.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/context_work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"

@@ -1,5 +1,6 @@
 #pragma once
 #include "ninfer/types.h"
+#include "ninfer/branch_score.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -468,6 +469,10 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks = nullptr);
+    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
+                                                   const PreparationControl&);
+    // Decision cache is optional shared-pool occupancy; release before chat admission/work.
+    bool release_branch_cache();
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

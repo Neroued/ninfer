@@ -39,7 +39,7 @@ void handle_signal(int) {
 const char* usage() {
     return "usage: ninfer-decide <model.ninfer> [--host H] [--port N] [--device N]\n"
            "                     [--model-id ID] [--api-key KEY]\n"
-           "Serves POST /v1/decisions (Perplexity/LiteLLM format) for a pplx-decider artifact (single request at a time).\n";
+           "Serves POST /v1/systemone (TypeSafe System One format, as LiteLLM speaks it) for a pplx-decider artifact (single request at a time).\n";
 }
 
 bool parse(int argc, char** argv, Options& out) {
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
             response.set_content(R"({"status":"ok"})", "application/json");
         });
 
-        server.Post("/v1/decisions", [&](const httplib::Request& request,
+        server.Post("/v1/systemone", [&](const httplib::Request& request,
                                          httplib::Response& response) {
             if (!authorized(request)) {
                 return fail(response, 401, "authentication_error", "invalid API key");
@@ -134,6 +134,7 @@ int main(int argc, char** argv) {
                         throw std::invalid_argument("unknown field \"" + key + "\"");
                     }
                 }
+                if (!body.contains("model")) { throw std::invalid_argument("model is required"); }
                 if (!body.contains("state") || body["state"].is_null()) {
                     throw std::invalid_argument("state must be a string, an object or an array");
                 }
@@ -156,12 +157,12 @@ int main(int argc, char** argv) {
                                                      codes));
                 }
             } catch (const Json::parse_error& error) {
-                return fail(response, 400, "invalid_request_error",
+                return fail(response, 422, "invalid_request_error",
                             std::string("invalid JSON: ") + error.what());
             } catch (const std::invalid_argument& error) {
-                return fail(response, 400, "invalid_request_error", error.what());
+                return fail(response, 422, "invalid_request_error", error.what());
             } catch (const Json::exception& error) {
-                return fail(response, 400, "invalid_request_error", error.what());
+                return fail(response, 422, "invalid_request_error", error.what());
             }
             try {
                 std::vector<std::vector<ninfer::TokenId>> prompts;
@@ -170,7 +171,7 @@ int main(int argc, char** argv) {
                     prompts.push_back(
                         engine.tokenize_text(ninfer::decide::render_chat(decision.prompt)));
                     if (prompts.back().size() > kMaxTokens) {
-                        return fail(response, 400, "context_length_exceeded",
+                        return fail(response, 422, "context_length_exceeded",
                                     "Question \"" + name + "\" exceeds the " +
                                         std::to_string(kMaxTokens) +
                                         "-token limit; no input was truncated (" +

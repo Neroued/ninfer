@@ -79,6 +79,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         if (out->weights.mtp) { out->weights.mtp->output_head = out->weights.proposal->head; }
         if (out->weights.draft) { out->weights.draft->output_head = out->weights.proposal->head; }
     }
+    if (options.purpose == EnginePurpose::Decision) {
+        out->weights.decision = loading::bind_decision(bindings, reader.directory(), text);
+    }
     out->weights.text.output_head_use =
         bindings.use(out->weights.text.output_head, "text/final_hidden");
     if (out->weights.mtp) {

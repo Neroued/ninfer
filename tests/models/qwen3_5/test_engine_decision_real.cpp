@@ -25,6 +25,13 @@ int main() {
     options.purpose       = ninfer::EnginePurpose::Decision;
     options.max_context   = 8192;
     ninfer::Engine engine(options);
+    if (const char* count = std::getenv("NINFER_TEST_OPTIONS"); count != nullptr && *count != '\0') {
+        const auto probabilities =
+            engine.decide(ids, static_cast<std::uint32_t>(std::strtoul(count, nullptr, 10)));
+        std::cout.precision(9);
+        for (const float value : probabilities) { std::cout << value << '\n'; }
+        return 0;
+    }
     const std::vector<std::uint16_t> hidden = engine.decision_hidden(ids);
     for (const std::uint16_t word : hidden) { std::cout << std::hex << word << '\n'; }
     return 0;

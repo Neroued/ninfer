@@ -129,6 +129,14 @@ struct ProposalWeights {
     std::vector<std::int32_t> global_token_ids;
 };
 
+// Host-resident decision readout of a pplx-decider checkpoint; it never reaches the Device.
+struct DecisionHead {
+    float temperature = 1.0F;
+    std::vector<std::string> codes;
+    std::vector<std::int32_t> token_ids;
+    std::vector<std::uint16_t> readout; // BF16 bits, [codes.size(), hidden_size]
+};
+
 // Handles refer to the frozen model's weight array. No artifact ID lookup is needed in execution.
 struct ModelWeights {
     TextWeights text;
@@ -136,6 +144,7 @@ struct ModelWeights {
     std::optional<MtpWeights> mtp;
     std::optional<DraftWeights> draft;
     std::optional<ProposalWeights> proposal;
+    std::optional<DecisionHead> decision;
 };
 
 } // namespace ninfer::models::qwen3_5

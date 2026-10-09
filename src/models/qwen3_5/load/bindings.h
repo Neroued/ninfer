@@ -20,6 +20,11 @@ struct PendingWeight {
     std::vector<std::string> source_objects;
 };
 
+class Bindings;
+
+[[nodiscard]] DecisionHead bind_decision(Bindings& b, const artifact::Directory& directory,
+                                         const TextConfig& text);
+
 class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder(binder) {}

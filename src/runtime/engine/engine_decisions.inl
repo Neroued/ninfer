@@ -68,7 +68,7 @@ bool EngineCore<Instance>::release_branch_workspace_before_chat() {
         chat_pending = !pending_.empty();
     }
     if (chat_pending || !resident_empty() || !paused_.empty() || materializing_ || context_owner_) {
-        // Only decision-owned pages are released. Native chat cache policy is unchanged.
+        // Return decision-owned KV pages and StateImage leases; chat cache policy is unchanged.
         if (instance_.program->release_branch_cache()) {
             request_admission_check();
             scheduler_.capacity_released();

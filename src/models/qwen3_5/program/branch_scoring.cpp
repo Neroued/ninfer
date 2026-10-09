@@ -12,9 +12,11 @@
 namespace ninfer::models::qwen3_5::detail {
 
 BranchStorage::BranchStorage(DeviceSpan backing, const BranchLayout& layout,
-                             qwen3_5::PagedKVCache& shared_kv, LogicalKVPageStore& pages)
-    : kv(backing, layout.tables, shared_kv), batch_capacity(layout.batch_capacity),
-      states(backing, layout.states), records(backing, layout.records),
+                             qwen3_5::PagedKVCache& shared_kv, LogicalKVPageStore& pages,
+                             qwen3_5::StateImageDevicePool& images, StateImageStore& store,
+                             std::int32_t batch, cudaStream_t stream)
+    : kv(backing, layout.tables, shared_kv), batch_capacity(batch), states(images.linear()),
+      records(backing, layout.records),
       fold(records, states.all_layers_view()),
       addresses(pages, kv.execution_tables(), 1 + 2 * batch_capacity,
                 kv.execution_tables().logical_page_capacity()),
@@ -22,14 +24,33 @@ BranchStorage::BranchStorage(DeviceSpan backing, const BranchLayout& layout,
       counts(layout.counts.bind(backing)), rows(layout.rows.bind(backing)),
       slots(layout.slots.bind(backing)), hidden(layout.hidden.bind(backing)),
       tails(layout.tails.bind(backing)), logits(layout.logits.bind(backing)),
-      work(layout.scratch.bind(backing)) {
-    if (batch_capacity < 1 || batch_capacity > kBranchBatch) {
-        throw std::invalid_argument("decision batch capacity must be in [1,8]");
+      work(layout.scratch.bind(backing)), state_store(store) {
+    if (batch_capacity < 1 || batch_capacity > layout.batch_capacity) {
+        throw std::invalid_argument("decision batch exceeds its workspace layout");
+    }
+    state_handles.reserve(1 + 2 * batch_capacity);
+    try {
+        for (std::int32_t i = 0; i < 1 + 2 * batch_capacity; ++i) {
+            auto state = state_store.reserve_reset(stream);
+            if (!state) {
+                throw RequestError(RequestErrorKind::Overloaded,
+                                   "decision branches need available state slots");
+            }
+            state_handles.push_back(*state);
+        }
+    } catch (...) {
+        for (auto state : state_handles) {
+            if (!state_store.release(state)) { std::terminate(); }
+        }
+        throw;
     }
 }
 
 BranchStorage::~BranchStorage() {
     if (cached_address) { (void)addresses.release_after_deactivate(*cached_address); }
+    for (auto state : state_handles) {
+        if (!state_store.release(state)) { std::terminate(); }
+    }
 }
 
 void BranchStorage::release_cache() {
@@ -42,10 +63,9 @@ void BranchStorage::release_cache() {
 
 bool ProgramImpl::release_branch_cache() {
     if (!branches) { return false; }
-    const bool released_pages = branches->cached_address.has_value();
     branches->release_cache();
     branches.reset();
-    return released_pages;
+    return true; // State leases are returned even when no KV prefix was cached.
 }
 
 BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> rows,
@@ -58,9 +78,19 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                            "decision scratch does not fit the existing runtime workspace");
     }
     if (!branches) {
+        const auto free_states =
+            std::min(state_store->device_capacity() - state_store->device_occupied(),
+                     state_store->capacity() - state_store->occupied());
+        if (free_states < 3) {
+            throw RequestError(RequestErrorKind::Overloaded,
+                               "decision branches need three available state slots");
+        }
+        const auto batch = std::min(workspace_plan.branches->batch_capacity,
+                                   static_cast<std::int32_t>((free_states - 1) / 2));
         branches = std::make_unique<BranchStorage>(
             DeviceSpan{workspace_storage.base(), workspace_plan.general_capacity},
-            *workspace_plan.branches, decoder->text_kv, *text_kv_pages);
+            *workspace_plan.branches, decoder->text_kv, *text_kv_pages, *state_images,
+            *state_store, batch, device.stream);
     }
     auto& b                 = *branches;
     auto& work              = b.work;
@@ -119,7 +149,7 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
         auto address = b.addresses.create_active(pages_for(length), row, device.stream);
         if (!address) { throw std::logic_error("branch address capacity exhausted"); }
         owned.push_back(*address);
-        b.states.zero_slot(slot, device.stream);
+        b.states.zero_slot(b.state_slot(slot), device.stream);
         return Point{*address, 0, slot};
     };
     const auto fork = [&](const Point& source, std::uint32_t length, std::int32_t row,
@@ -137,7 +167,7 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                                            device.stream);
         }
         b.addresses.commit_prefix_fork(std::move(reservation), device.stream);
-        b.states.copy_slot(source.slot, slot, device.stream);
+        b.states.copy_slot(b.state_slot(source.slot), b.state_slot(slot), device.stream);
         copy_tail(source.slot, slot);
         return Point{*address, source.frontier, slot};
     };
@@ -176,8 +206,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                 lengths[r]       = static_cast<std::int32_t>(
                     std::min<std::uint32_t>(kBranchWidth, ends[index] - p.frontier));
                 table_rows[r]  = b.addresses.bound_row(p.address);
-                state_slots[r] = p.slot;
-                folds[r]       = {p.slot, p.slot, lengths[r]};
+                state_slots[r] = b.state_slot(p.slot);
+                folds[r]       = {state_slots[r], state_slots[r], lengths[r]};
                 b.addresses.ensure_mapped_to_tokens(p.address, p.frontier + lengths[r],
                                                     device.stream);
                 for (std::int32_t t = 0; t < kBranchWidth; ++t) {
@@ -306,8 +336,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
                 root.frontier,
                 nullptr,
                 nullptr,
-                0,
-                0,
+                b.state_slot(0),
+                b.state_slot(0),
                 0,
                 0,
                 nullptr};
@@ -458,12 +488,14 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
                 .count();
         cleanup();
+        if (!b.cached_address) { release_branch_cache(); }
         return result;
     } catch (...) {
         try {
             device.synchronize();
         } catch (...) {}
         cleanup();
+        release_branch_cache();
         throw;
     }
 }

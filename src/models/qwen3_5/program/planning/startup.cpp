@@ -283,26 +283,17 @@ BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch,
     b.prefill_chunk = chunk;
     b.tables = plan_kv_execution_tables(builder, {
         .logical_page_capacity = page_count(plan.capacity), .table_rows = batch});
-    const LinearAttentionStatePoolSpec linear{
-        .layers = config.linear_attention_layers,
-        .conv_channels = config.gdn ? dimension(config.gdn->conv_channels()) : 0,
-        .conv_width = config.gdn ? dimension(config.gdn->linear_conv_kernel_dim - 1) : 0,
-        .value_heads = config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0,
-        .value_head_dim = config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0,
-        .key_head_dim = config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0,
-        .slot_count = 1 + 2 * batch,
-        .conv_dtype = DType::BF16,
-    };
-    b.states = plan_linear_attention_state_pool(builder, linear);
+    // Full recurrent images already exist in StateImageStore. Only branch-specific transient
+    // buffers belong in scratch; duplicating images here can make even one branch never fit.
     b.records = plan_gdn_replay_records(builder, {
         .layers = dimension(config.linear_attention_layers),
         .record_capacity = batch,
         .width = kBranchWidth,
-        .conv_channels = linear.conv_channels,
+        .conv_channels = config.gdn ? dimension(config.gdn->conv_channels()) : 0,
         .qk_heads = config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0,
-        .value_heads = linear.value_heads,
-        .key_dim = linear.key_head_dim,
-        .value_dim = linear.value_head_dim,
+        .value_heads = config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0,
+        .key_dim = config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0,
+        .value_dim = config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0,
     });
     b.ids = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch ids");
     b.positions = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch positions");

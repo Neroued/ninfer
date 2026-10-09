@@ -88,14 +88,16 @@ runs nonpreemptively at a stable Program boundary; it does not create
 generation sessions, advance ordinary lane ledgers, or call a proposal head.
 
 Decisions leave the native startup arena, workspace capacity, KV capacity curve, graph budget
-and chat lane count unchanged. Their mutable resources are a temporary overlay of the existing
-general workspace, excluding live Vision handoff storage. A dry-run layout selects the largest
-batch B up to eight that fits, independently of chat `max_concurrency`, with 1+2B linear-state
-slots (root, B trunks, B branches), B width-16 ReplaySSM records, selected-tail buffers, private
-execution tables and a disjoint scratch subarena. A bounded prefix tile is sized in that same
-budget. The private tables reference the existing Main logical/physical KV pool; generation's
-table rows, mappings and StateImages are not borrowed. If no layout fits, startup still succeeds
-and decision admission reports overload. No runtime Device allocation, second model,
+and chat lane count unchanged. Transient buffers overlay the existing general workspace,
+excluding live Vision handoff storage. A dry-run layout selects the largest batch up to eight
+that fits, with width-16 ReplaySSM records, selected-tail buffers, private execution tables,
+a disjoint scratch subarena and a bounded prefix tile. At admission B is further bounded by
+free StateImage capacity: reserve_reset leases 1+2B slots (root, B trunks, B branches) through
+the native store, mapping local branch identities to its physical slots. No occupied state is
+borrowed or evicted. The private tables reference the existing Main logical/physical KV pool;
+generation's table rows and mappings remain untouched. If no layout or three free state slots
+are available, startup still succeeds and decision admission reports overload. Constructor
+failure, cancellation and uncached completion return leases. No runtime Device allocation, second model,
 backend-specific proposal state or new numerical Op is introduced.
 
 The common token root uses native prefill. Context trunks and field suffixes use Text's native
@@ -105,7 +107,7 @@ and projected together through the full target head. KVAddressSpaceStore forks s
 and copy partial tails; every fork copies both convolution and recurrent state. Cohorts are bounded
 by actual free shared-pool capacity, including COW tails and one leaf's headroom. Optional reuse
 is dropped when its extra retained pages would prevent a predictor from fitting. An exact-root
-cache retains decision-owned state/pages in the overlay but the entire overlay is released
+cache retains decision-owned state leases/pages, but the entire overlay and its leases are released
 before chat admission or execution. Decisions do not reclaim chat checkpoints or live/paused
 state. Remaining pressure is a request overload, not an Engine failure. Cache opt-out uses zero
 trunks and evicts the retained root.

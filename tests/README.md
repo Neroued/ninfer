@@ -112,7 +112,8 @@ ordinary `docker build -t ninfer:jev .` still ends at the unchanged runtime stag
 The real-artifact check first loads generation with decisions disabled, then enabled, using
 identical serving options. Minimum/actual reservations, the KV capacity increment, KV payload,
 persistent/workspace capacities and graph allowance must match exactly, as must greedy chat
-output. It also verifies that chat releases the temporary decision overlay before reuse.
+output. It also verifies native state-slot reservation, release on uncached completion and
+cancellation, and that chat releases the temporary decision overlay before reuse.
 Decision batch bounds are independent of the configured chat lane count. With speculative
 decoding disabled it additionally compares KV payload with the causal reference engine.
 

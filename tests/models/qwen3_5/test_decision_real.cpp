@@ -127,6 +127,12 @@ int main() {
             expect(!baseline.generated_token_ids.empty(), "empty ordinary generation");
             expect(baseline.generated_token_ids == native_output,
                    "enabling decisions changed ordinary generation");
+            const auto state_occupancy = [&] {
+                // Wait for the worker's publication boundary after its scoring promise resolves.
+                (void)engine.memory_summary();
+                return engine.runtime_stats().device_state_occupied_slots;
+            };
+            const auto chat_state_slots = state_occupancy();
 
             auto candidates = engine.tokenize_text("true false");
             std::sort(candidates.begin(), candidates.end());
@@ -151,12 +157,16 @@ int main() {
             }
             const auto batch = rows(cases, true);
             scored           = engine.score_branches(batch);
+            expect(state_occupancy() >= chat_state_slots + 3,
+                   "decision state was not reserved through the native pool");
             expect(scored.largest_batch >= 1 && scored.largest_batch <= 8 &&
                        scored.reused_tokens > 0,
                    "branches did not share a prefix and native batch");
             const auto cached = engine.score_branches(batch);
             expect(cached.computed_tokens < scored.computed_tokens, "exact root was not reused");
             const auto uncached = engine.score_branches(rows(cases, false));
+            expect(state_occupancy() == chat_state_slots,
+                   "uncached decision leaked native state reservations");
             expect(uncached.reused_tokens == 0 && uncached.largest_batch <= 8 &&
                        uncached.largest_batch >= scored.largest_batch,
                    "cache opt-out or full batch width was not honored");
@@ -182,6 +192,8 @@ int main() {
                 mid_cancel = error.kind() == ninfer::RequestErrorKind::Cancelled;
             }
             expect(mid_cancel && engine.is_available(), "cancelled branch poisoned the Engine");
+            expect(state_occupancy() == chat_state_slots,
+                   "cancelled decision leaked native state reservations");
             const auto recovered = engine.score_branches(batch);
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 worst = std::max(worst, compare(scored.logits[i], recovered.logits[i]));

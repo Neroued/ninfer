@@ -230,14 +230,18 @@ altering chat state or failing the engine.
 
 `--max-concurrency` still configures chat lanes, not decision batching. Enabling `--jev`
 does not change the native startup reservation, automatic KV sizing, graph budget, or resident
-lane count. Decision state, execution tables, ReplaySSM records and scratch temporarily overlay
-the existing general workspace at a stable worker boundary, outside live Vision handoff data.
-The largest batch up to eight rows that fits this workspace is selected independently of chat
-concurrency. Prefix prefill uses a bounded tile within the same budget. The overlay is released
-before chat uses the workspace again; no request-time Device allocation or second model is used.
-If even one branch cannot fit the available workspace, only the decision request is rejected
-with `429 server_overloaded`; startup and chat remain available. Hybrid recurrent state still
-needs real space during execution, even though it adds no permanent reservation.
+lane count. At a stable worker boundary, decisions temporarily reserve free recurrent-state
+slots through the native StateImage store; occupied chat/checkpoint state is never overwritten
+or evicted. Execution tables, ReplaySSM records, tails, logits and scratch overlay the existing
+general workspace, outside live Vision handoff data. The actual batch is bounded by both the
+workspace layout (up to eight rows) and free state capacity (one root plus two slots per row),
+not assigned from chat concurrency. Prefix prefill uses a bounded tile within the same budget.
+Uncached completion and cancellation return these leases; an optional cached root retains them
+until reuse or the next chat boundary. Chat releases the entire overlay and its leases before
+using the workspace again. No request-time Device allocation or second model is used.
+If no branch layout or three free state slots are available, only the decision request is
+rejected with `429 server_overloaded`; startup and chat remain available. Hybrid recurrent
+state still needs real space during execution, even though it adds no permanent reservation.
 This batches backbone work, not an arbitrarily large schema into one CUDA kernel. No measured
 speedup is claimed.
 

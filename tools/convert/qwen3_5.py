@@ -13,7 +13,7 @@ import struct
 from typing import Mapping
 
 from .model import Model, Parameter
-from .resources import load_resources
+from .resources import decision_resources, load_resources
 from .sources.logical import (
     LogicalSource,
     array_source,
@@ -999,8 +999,10 @@ def build_model(
             "config": decision_config(json.loads(path.read_text()), config),
             "target": "text",
         }
+    generated = decision_resources(base.root) if "decision" in records else None
     refs, resources, count, special = load_resources(
         base.root,
+        generated=generated,
         vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,

@@ -190,6 +190,21 @@ Per-request failures/timeouts remain explicit event records; interruption marks 
 incomplete and fails it. A finite replay is not an unlimited throughput guarantee.
 Native server admission remains bounded: increasing client concurrency can expose genuine
 overload responses, which fail the run rather than being hidden by retries.
+The HTTP executor has exactly the requested number of workers; it does not silently inherit
+Python's CPU-dependent default thread-pool limit. To exercise higher admission pressure,
+run a separate finite sweep after the comparable eight-in-flight baseline:
+
+```bash
+for concurrency in 16 32; do
+  python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
+    --build-label YOUR_SERVED_COMMIT --section replay --rates 0 \
+    --count 128 --concurrency "$concurrency" \
+    --output ".local/decision-live-c${concurrency}.json"
+done
+```
+
+Keep failed reports too: an overload probe is not a lossless pass just because the service
+survives it. A client concurrency setting is not the model's generation lane count.
 
 Reports distinguish offered arrival rate, achieved completion rate, pending depth, request
 latency and end-to-end/queue p50/p95/p99. Rate `0` is an immediate finite saturation workload;

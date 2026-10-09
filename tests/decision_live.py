@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -202,8 +203,9 @@ async def replay(events, rate, concurrency, invoke):
     try:
         for index, event in enumerate(events):
             due = origin + index / rate if rate else origin
-            delay = due - time.perf_counter()
-            if delay > 0:
+            # Some event loops can wake early by their clock resolution. Do not
+            # enqueue before the scheduled arrival or report negative queue age.
+            while (delay := due - time.perf_counter()) > 0:
                 await asyncio.sleep(delay)
             queue.put_nowait((index, event, due))
             peak_pending = max(peak_pending, queue.qsize())
@@ -223,6 +225,16 @@ async def replay(events, rate, concurrency, invoke):
             "dropped": 0, "peak_pending": peak_pending, "elapsed_s": elapsed,
             "completed_per_s": sum(r["ok"] for r in results) / elapsed,
             "records": sorted(results, key=lambda r: r["event"])}
+
+
+async def replay_http(client, route, fixture, events, rate, concurrency):
+    # asyncio.to_thread's default pool can silently cap a requested stress run
+    # below --concurrency (for example, twelve workers on an eight-core client).
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        async def invoke(event):
+            return await loop.run_in_executor(pool, classify, client, route, fixture, event)
+        return await replay(events, rate, concurrency, invoke)
 
 
 def summarize(stage):
@@ -281,12 +293,9 @@ def main():
                 for message in events[:2]:
                     classify(client, route, fixture, message)  # excluded warmups
 
-                async def invoke(event):
-                    return await asyncio.to_thread(classify, client, route, fixture, event)
-
                 for rate, concurrency, batch, name in [(0, 1, events[:16], "serial")] + [
                         (r, args.concurrency, events, "stream" if r else "saturation") for r in args.rates]:
-                    stage = asyncio.run(replay(batch, rate, concurrency, invoke))
+                    stage = asyncio.run(replay_http(client, route, fixture, batch, rate, concurrency))
                     stage.update(route=route, name=name)
                     report["stages"].append(stage)
                     failed |= stage["errors"] != 0

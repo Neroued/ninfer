@@ -2,9 +2,11 @@
 import asyncio
 import copy
 import json
+import threading
 import unittest
+from unittest.mock import patch
 
-from decision_live import CHAT, chat_request, replay, systemone_cases, validate_systemone
+from decision_live import CHAT, chat_request, replay, replay_http, systemone_cases, validate_systemone
 
 
 def response_for(request):
@@ -57,6 +59,31 @@ class ReplayTest(unittest.IsolatedAsyncioTestCase):
         stage = await replay(list(range(6)), 1000, 2, invoke)
         self.assertEqual((stage["received"], stage["completed"], stage["errors"], stage["dropped"]), (6, 5, 1, 0))
         self.assertIn("timeout", stage["records"][2]["error"])
+        self.assertTrue(all(r["queue_ms"] >= 0 for r in stage["records"]))
+
+    async def test_http_workers_honor_requested_concurrency(self):
+        concurrency = 16
+        barrier = threading.Barrier(concurrency, timeout=10)
+        lock = threading.Lock()
+        active = peak = 0
+
+        def classify_stub(client, route, fixture, event):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                return {"answer": event}
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch("decision_live.classify", classify_stub):
+            stage = await replay_http(None, "decision", {}, list(range(concurrency)), 0, concurrency)
+        self.assertEqual(stage["completed"], concurrency)
+        self.assertEqual(stage["errors"], 0)
+        self.assertEqual(peak, concurrency)
 
 
 class SystemOneValidatorTest(unittest.TestCase):

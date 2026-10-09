@@ -44,6 +44,7 @@ ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/noncausal_gqa.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
 

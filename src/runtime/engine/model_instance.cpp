@@ -73,6 +73,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::Generation:
         break;
     case EnginePurpose::CausalScoring:
+        if (options.enable_decisions) {
+            throw std::invalid_argument("decisions require a generation Engine");
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;

@@ -55,6 +55,8 @@ selected for this process.
 
 | Method and path | Behavior |
 |---|---|
+| `POST /v1/decision` (`/decision`) | finite-schema decisions; registered only with `--jev` |
+| `POST /v1/systemone` | TypeSafe-shaped questions over the same decision engine; requires `--jev` |
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
@@ -83,6 +85,127 @@ a dead or unacknowledging peer is normally cancelled within about 20 seconds, in
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
 connection when the downstream client disappears.
+
+## Parallel decisions: Jev
+
+Add `--jev` to the existing serving command to register `/v1/decision`, `/decision`
+and `/v1/systemone`. The normal build/Docker image contains these routes; no separate
+service or model is needed. Without the flag the routes are absent. Authentication,
+CORS, request IDs, payload bounds and disconnect handling follow the existing server.
+Responses use `Cache-Control: no-store`. These endpoints accept text, not images.
+
+```bash
+curl http://127.0.0.1:8080/v1/decision \
+  -H 'Content-Type: application/json' --data-binary @examples/decision/support.json
+```
+
+### Request and response
+
+| Member | Contract |
+|---|---|
+| `model` | Optional resident model alias |
+| `instructions` | Optional text policy; at most 1 MiB |
+| `contexts` | 1–256 strings, at most 1 MiB combined; results preserve order |
+| `schema` | 1–32 independent fields, compact or JSON Schema `properties` |
+| `mode` | `auto` (default), `tree`, or `greedy` |
+| `tree_max` | Auto-mode exhaustive-domain threshold, 1–255; default 128 |
+| `cache_prompt` | Reuse a retained exact root; false rebuilds it once, preserving within-request sharing; default true |
+
+Compact fields require a description; JSON Schema descriptions are optional. All declared
+fields are returned regardless of `required`. Field names and choice labels are limited
+to 4096 bytes; the compiled catalogue is limited to 1 MiB.
+
+| Field | Finite domain |
+|---|---|
+| `boolean` | true / false |
+| `enum` (`choice`, `selection`) | `choices` or `enum`, 1–255 distinct strings; JSON Schema string enums also work |
+| `integer` | Inclusive signed-64-bit minimum/maximum, at most 255 values |
+| `number` | Inclusive minimum/maximum and positive step, both endpoints on the grid, at most 255 values and nine decimal places |
+
+JSON Schema `multipleOf` additionally requires a zero-aligned grid. Numeric fields accept
+`aggregate` (or `x-aggregate`): mode, median or mean. Mean is projected to the nearest
+allowed value, ties to the earlier/lower value. Mean/median require exhaustive tree mode;
+explicit greedy aggregation is rejected. Unsupported keywords, conflicting aliases, nested
+domains, arbitrary strings and integer strides are rejected rather than approximated.
+
+Responses contain `object: "decision"`, `results[]`, `usage` and `timings`. Each result
+contains the typed `decision`, per-field `value/probability/scored_nodes/tree`, and usage.
+Tree-scored numeric fields also include `interval_p10_p90`.
+
+The artifact template/tokenizer encodes complete field/value continuations. Tree scoring
+normalizes logits over allowed next tokens and multiplies path probabilities; greedy mode
+follows the best edge and need not find the highest-probability leaf. Singleton fields need
+no scoring. Fields cannot see sibling answers. Probabilities are conditional on the supplied
+options, not calibrated truth estimates. Applications own thresholds and follow-up actions.
+
+### Execution and accounting
+
+Decisions use the resident target head, not MTP/DFlash proposal heads. Startup reservation,
+chat lanes, automatic KV sizing and graph budgets are unchanged. Temporary execution buffers
+overlay existing general workspace; free native state slots and shared KV pages bound batch
+capacity. Occupied chat/checkpoint state is not evicted. Up to eight contexts and finite-trie
+divergences are compiled together; actual row batches may be smaller. This is bounded
+shared-prefix execution, not one kernel for an arbitrary request.
+
+An exact-root cache retains decision-owned pages/state until reuse or the next chat boundary.
+`cache_prompt: false` discards the previous root at the first scoring call, then shares the
+fresh prefix across this request's branches and later rounds. The rebuilt root may be retained
+for a subsequent request. `--no-prefix-reuse` disables retained reads and writes for both chat
+and decisions, but branches within a scoring call still share work. Optional retention is
+dropped under pressure before rejecting work.
+No input truncation or request-time Device allocation is used. Insufficient workspace, fewer
+than three free state slots, or insufficient shared KV capacity returns `429 server_overloaded`.
+
+HTTP decision admission permits 17 outstanding requests including response delivery; the GPU
+queue permits 16 waiting scoring transactions. Decisions do not consume chat's admission
+budget or lanes, but an admitted scoring transaction is nonpreemptive and can delay chat.
+`--pending-timeout-ms` bounds each preparation/admission, not total admitted GPU runtime.
+Disconnect cancellation is checked between bounded prefix/branch units.
+
+`prompt_tokens` sums scored-branch prompt lengths and equals `cached_tokens + computed_tokens`.
+Here `cached_tokens` includes within-request sharing, even with `cache_prompt: false`.
+Physical padding is excluded. `context_tokens` measures the shared-static-to-field-trunk span;
+`scored_rows` counts divergent prompts. Timing `rounds` counts logical rounds,
+`forward_batches` counts backbone traversals including prefix chunks, and `largest_batch`
+reports actual row width. `prefill_ms` includes native projection/readback;
+`scoring_ms` is the remaining wall time including preparation, queueing and assembly.
+`total_ms` and `per_decision_ms` cover the native decision call, not HTTP or isolated kernels.
+Generation throughput logs do not measure decision throughput; use response/client timings.
+
+## System One compatibility
+
+`POST /v1/systemone` accepts `state`, `questions` and optional resident `model`.
+See [example request](../examples/decision/systemone.json).
+
+| Question | Criteria | Answer |
+|---|---|---|
+| `noul` | Optional true/false descriptions | `noul = P(true)`, no confidence field |
+| `choice` | 1–255 named options | Argmax choice, full probabilities, confidence |
+| `score` | 2–10 ordered levels | Unrounded probability-weighted level, legend, probabilities, confidence |
+
+State, optional instructions and descriptions accept string/object/array/null entries.
+An array is one state, not a request batch. Requests allow 1–32 questions and 1 MiB combined
+serialized state/rubrics; IDs and labels must be nonempty and at most 4096 bytes.
+Invalid shapes return 422; malformed JSON and runtime errors use NInfer's existing errors.
+The normal model context ceiling still applies without silent splitting.
+
+Caller IDs and sibling questions are excluded from a question's model input. One question
+puts the stable rubric before state for cross-request reuse; multiple questions share a
+state prefix followed by isolated rubrics. Changing layouts can change scores. This caches
+prefix state, not answers or API-shape conversions. SystemOne always scores full distributions.
+
+Confidence follows [TypeSafe's formulas](https://docs.typesafe.ai/confidence): Choice uses
+`(max(p)*n-1)/(n-1)` (singleton 1); Score uses
+`max(0,1-sum(p[i]*abs(i-mode))/mean(abs(i-(n-1)/2)))`, selecting the first maximum as mode.
+These measure concentration, not the accuracy/calibration of the hosted Jev model.
+
+Responses contain `model`, named `answers`, and `usage`. Input tokens use native
+scored-branch accounting; output tokens are zero because no completion is generated.
+Use the server origin as the SDK base URL and its resident alias as the model. The SDK's
+timeouts/retries remain client features. `x-typesafe-request-id` accompanies `x-request-id`.
+This adapts inference shapes, not hosted model discovery, billing, quotas or unknown options;
+`/v1/models` remains OpenAI-shaped. Some SDKs reject nullable entries before sending.
+Qualification commands and limitations are in [Tests](../tests/README.md#decision-engine).
 
 ## OpenAI Chat Completions
 

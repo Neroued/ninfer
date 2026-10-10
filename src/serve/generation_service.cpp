@@ -315,6 +315,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.enable_decisions         = options_.jev;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
@@ -324,30 +325,48 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    if (options_.jev) {
+        decision_engine_ = std::make_unique<decision::DecisionEngine>(*engine_);
+        // Independent admission for one executing and sixteen waiting decision requests.
+        decision_capacity_ = std::make_shared<RequestCapacity>(17);
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
 
+DecisionOutcome GenerationService::decide(const decision::Request& request,
+                                           std::function<bool()> is_cancelled) {
+    if (!decision_engine_) { throw std::logic_error("decision engine is disabled; start with --jev"); }
+    auto lifetime = acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, decision_capacity_);
+    // Each internal scoring submission has the Engine's normal pending timeout. An admitted
+    // multi-context decision is not killed merely because total GPU work exceeds that timeout.
+    PreparationControl control{.cancellation = CancellationView(std::move(is_cancelled))};
+    auto body = decision_engine_->run(request, control);
+    return {std::move(body), std::move(lifetime)};
+}
+
 std::shared_ptr<RequestLifetime>
-GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
+GenerationService::acquire_request_lifetime(
+    DeadlinePolicy deadline_policy, const std::shared_ptr<RequestCapacity>& capacity) const {
+    const auto& owner = capacity ? capacity : request_capacity_;
     const auto started = Clock::now();
     {
-        std::lock_guard lock(request_capacity_->mutex);
-        if (request_capacity_->active >= request_capacity_->maximum) {
+        std::lock_guard lock(owner->mutex);
+        if (owner->active >= owner->maximum) {
             throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
         }
-        ++request_capacity_->active;
+        ++owner->active;
     }
     try {
         const Clock::time_point deadline =
             deadline_policy == DeadlinePolicy::UnboundedStartup
                 ? Clock::time_point::max()
                 : started + std::chrono::milliseconds(options_.pending_timeout_ms);
-        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
+        return std::make_shared<RequestLifetime>(owner, started, deadline);
     } catch (...) {
-        std::lock_guard lock(request_capacity_->mutex);
-        --request_capacity_->active;
+        std::lock_guard lock(owner->mutex);
+        --owner->active;
         throw;
     }
 }

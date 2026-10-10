@@ -34,6 +34,80 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
+## Decision engine
+
+The decision suites follow the existing CMake/CTest build below:
+
+| Target | Coverage |
+|---|---|
+| `ninfer_decision_test` | Compiler, finite-probability oracle, numeric bounds, token tries, caching and cancellation |
+| `ninfer_decision_fixtures_test` | All eight pinned Codacus presets in auto/tree/greedy modes with synthetic logits |
+| `ninfer_systemone_test` | Parsing, fixed confidence/mean oracles, question isolation and prefix invalidation |
+| `ninfer_decision_smoke_test`, `ninfer_decision_live_client_test` | No-network HTTP validators and replay accounting |
+| `ninfer_qwen3_5_decision_real_test` | Artifact-backed numerical/state isolation checks |
+
+`fixtures/decision/codacus.json` preserves all eight inputs from
+[decision-playground at 843f72e](https://github.com/thecodacus/decision-playground/blob/843f72e61f5ebaa1c2225c4902849bd42af44c05/src/playground/presets.ts),
+including its context-separator rule and source hash. These are demos, not upstream golden
+answers. `tools/smoke/decision.py --check-arena` checks five explicit arena rules separately
+from response validity. Host tests do not establish GPU correctness or model accuracy.
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --parallel --target ninfer_decision_test ninfer_decision_fixtures_test \
+  ninfer_systemone_test ninfer_qwen3_5_decision_real_test
+ctest --test-dir build -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|decision_live_client_test|systemone_test)$' --output-on-failure
+```
+
+The existing Docker `build` stage can supply the same CUDA toolchain without changing the
+production Dockerfile: build with `--target build`, then run CMake/CTest inside that image.
+Python is needed for Python tests; select it using `Python3_EXECUTABLE` as in the normal test build.
+
+For the artifact test, stop other GPU model processes and set an explicit
+`NINFER_TEST_ARTIFACT` path. The test compares decision-enabled/disabled reservations and
+greedy chat output, fork/padding boundaries, fresh-root sharing, cache release and cancellation, then compares
+branch probabilities with the independent causal-prefill route. The fixed maximum absolute
+conditional-probability error is 0.02. Missing artifacts return skip code 77, not a pass.
+Optional `NINFER_DECISION_TEST_SPEC=mtp|dflash|dflash2` and
+`NINFER_DECISION_TEST_PROPOSAL_HEAD=1` select components that must exist in the artifact.
+
+```bash
+NINFER_TEST_ARTIFACT=/absolute/path/model.ninfer \
+  ctest --test-dir build -R '^ninfer_qwen3_5_decision_real_test$' --output-on-failure
+```
+
+Live HTTP checks are opt-in and use only Python's standard library. Start an existing
+`--jev` server first; `NINFER_API_KEY` supplies authentication if enabled.
+
+```bash
+python3 tools/smoke/decision.py --base-url http://127.0.0.1:8080 --all --check-arena
+python3 tests/decision_validation.py --base-url http://127.0.0.1:8080 \
+  --output .local/decision-validation.json
+python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
+  --build-label SERVED_COMMIT --rates 8 24 48 0 --output .local/decision-live.json
+```
+
+Validation exercises every preset/mode with and without caching, the Codacus README's
+support request, cold/warm/refresh work accounting, repeated/interleaved cache reuse, request bounds, and a
+self-contained 13-question workflow adapted from TypeSafe's
+[parallel-questions cookbook](https://docs.typesafe.ai/cookbooks/parallel_questions).
+It reports batched/single-question disagreement rather than asserting score identity across
+different prompt layouts. Repeated same-layout/cache comparisons use a fixed local 0.02 diagnostic
+tolerance, not a Codacus golden-answer criterion or proof of model accuracy;
+Decision comparisons retain changed values alongside selected-value probability deltas
+(the endpoint does not expose full distributions). A failed numerical comparison fails the run;
+explicit synthetic labels and arena rules are separate quality checks. No hosted model or
+external corpus is required at test time.
+
+Replay sends one message per HTTP request, without answer caching, filtering, drops or retries.
+`--concurrency` sets actual client HTTP workers (default 8), not generation lanes.
+`--count` ends arrivals, then the client drains its pending queue. Rate 0 is immediate finite
+saturation. Reports retain errors, pending depth, request/queue/end-to-end latency and per-event
+labels. A finite pass is not unlimited capacity. Use separate `--section replay --rates 0`
+runs at concurrency 16 and 32 for overload pressure; keep rejected requests in the report.
+Optional `--min-throughput-ratio 0.95` checks SystemOne/Decision tree-mode saturation parity,
+not model quality. Match client/server/workload revisions when comparing performance.
+
 ## Build and run
 
 Select a Python environment with the dependencies for the tests first. The maintained environment

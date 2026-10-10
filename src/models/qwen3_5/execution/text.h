@@ -140,6 +140,10 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
+    // Target traversal only: no proposal, sampling, or output-head projection.
+    void branch_forward_batch(const Tensor& ids, const Tensor& positions, const Tensor& counts,
+                              const Tensor& rows, const Tensor& slots,
+                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
@@ -178,7 +182,7 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor* logits, Tensor* target_tokens, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);

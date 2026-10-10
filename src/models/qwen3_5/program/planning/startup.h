@@ -10,6 +10,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
+#include "models/qwen3_5/program/branch_scoring.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +66,7 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    std::optional<BranchLayout> branches;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
@@ -82,6 +84,7 @@ struct SequencePlanningInputs {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool decision_scoring             = false;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
@@ -101,6 +104,7 @@ struct SequencePlanImpl {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool decision_scoring             = false;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;

@@ -715,7 +715,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
-                                           Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+                                           Tensor& hidden, Tensor* logits, Tensor* target_tokens,
                                            Tap& tap) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -735,9 +735,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
-                         "target verify batch logits");
-    require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
+    if (logits) {
+        require_tensor_shape(*logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
+                             "target verify batch logits");
+        require_tensor_shape(*target_tokens, DType::I32, {width, batch},
+                             "target verify batch tokens");
+    }
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -761,12 +764,14 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             tap.capture_positions(cache_positions, stream);
         }
         Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
-        Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
-        Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
-        ops::argmax(flat_logits, flat_tokens,
-                    dimension(parameters_.model.resources().public_token_count), stream);
+        if (logits) {
+            Tensor flat_logits = logits->view({dimension(config_.vocab_size), columns});
+            Tensor flat_tokens = target_tokens->view({columns});
+            project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+            ops::argmax(flat_logits, flat_tokens,
+                        dimension(parameters_.model.resources().public_token_count), stream);
+        }
     }
     work_.reset();
 }
@@ -779,7 +784,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
+                             linear_state_source_slots, envelope, hidden, &logits, &target_tokens,
                              tap);
 }
 
@@ -791,8 +796,18 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
+                             linear_state_source_slots, envelope, hidden, &logits, &target_tokens,
                              sink);
+}
+
+void TextContext::branch_forward_batch(const Tensor& ids, const Tensor& positions,
+                                       const Tensor& counts, const Tensor& rows,
+                                       const Tensor& slots,
+                                       ops::CausalAttentionExecutionEnvelope envelope,
+                                       Tensor& hidden) {
+    NullTap tap;
+    target_verify_batch_impl(ids, positions, positions, counts, rows, slots, envelope, hidden,
+                             nullptr, nullptr, tap);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,

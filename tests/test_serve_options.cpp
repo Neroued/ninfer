@@ -30,6 +30,9 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(!defaults.jev, "decision engine must be disabled by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--jev"}).jev,
+                      "--jev did not enable the decision engine");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

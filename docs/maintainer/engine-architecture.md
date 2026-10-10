@@ -74,6 +74,26 @@ Engine 在 submit 调用线程完成编译，再入队；Program 借用当轮的
 GPU 采样及 spec 验收。Matcher 与输出一起 preview/commit，抢占和 Replay 保留其已提交状态。
 执行时序及语义见[约束解码设计](constrained-decoding.md)。
 
+### 2.1.1 有限候选评分
+
+`--jev` 启用 `src/decision/` 的有限候选编译与 `Engine::score_branches`。
+HTTP 负责协议转换；编译器使用 artifact 模板构造 token trie，Program 在现有 GPU worker
+的稳定边界评分，Host 组装 typed JSON。借用的 token span 保留到取消清理结束。
+独立队列最多等待 16 个评分事务；事务不占 generation lane，但执行期间不可抢占。
+
+决策不增加 startup reservation。临时表、ReplaySSM records、tail/logits 和 scratch
+覆盖现有 general workspace，排除仍存活的 Vision handoff 区域。布局最多容纳八行；
+实际 B 还受空闲 StateImage 限制，通过原生 store 租用 1+2B 个 slot。KV fork 使用
+现有 Main pool 的共享整页与尾页 COW，复制完整 convolution/recurrent state。
+无可用布局或不足三个空闲 slot 时拒绝该请求，不覆盖或回收 chat/checkpoint 状态。
+
+每行按物理宽度 16 分块并屏蔽 padding，只投影最后一个真实 token 的 hidden state。
+精确 prefix cache 可保留决策租约；取消、失败及 chat 复用前释放。
+`cache_prompt: false` 首轮重建 root，但仍共享本请求各分支和后续轮次的前缀；
+`--no-prefix-reuse` 禁止跨评分调用的读写保留，不禁用调用内共享。
+SystemOne adapter 隔离问题与外部 ID，单问题缓存 rubric，多问题共享 state root；
+改变布局可能改变分数。协议和计量见[HTTP serving](../serving.md#parallel-decisions-jev)。
+
 ### 2.2 EngineCore 与 Scheduler
 
 EngineCore 拥有 request record、等待队列、resident slots、paused queue、cancellation、deadline、

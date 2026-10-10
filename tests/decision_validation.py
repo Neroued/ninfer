@@ -80,10 +80,21 @@ def workflow_labels(request, response):
     return wrong
 
 
+def validate_cache_refresh(cold, warm, refreshed):
+    first, hit, fresh = (r["usage"] for r in (cold, warm, refreshed))
+    require(first["cached_tokens"] > 0, "cold request did not share its branch prefixes")
+    require(hit["computed_tokens"] < first["computed_tokens"], "warm request did not reuse its root")
+    for key in ("computed_tokens", "cached_tokens"):
+        require(fresh[key] == first[key], f"refresh changed cold {key}")
+    require(refreshed["timings"]["forward_batches"] == cold["timings"]["forward_batches"],
+            "refresh changed cold forward work")
+
+
 class Run:
     def __init__(self, client, output):
         self.client, self.output = client, output
-        self.report = {"complete": False, "records": [], "comparisons": [], "quality": []}
+        self.report = {"complete": False, "records": [], "comparisons": [], "quality": [],
+                       "cache_work": []}
 
     def save(self):
         self.output.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +162,26 @@ def cache_reuse(run):
                          "description": "Rate support priority."}},
         "contexts": ["I was charged twice and need this fixed today."]}
     for mode in ("auto", "tree", "greedy"):
-        first = run.call("decision", f"readme:{mode}", {**payload, "mode": mode})
+        first = run.call("decision", f"readme:{mode}",
+                         {**payload, "mode": mode, "cache_prompt": False})
         second = run.call("decision", f"readme:{mode}:repeat", {**payload, "mode": mode})
+        refreshed = run.call("decision", f"readme:{mode}:refresh",
+                             {**payload, "mode": mode, "cache_prompt": False})
         if first and second:
             delta, changes = decision_difference(first, second)
             run.compare(f"readme:{mode}:repeat", delta, changed_values=changes)
+        if first and refreshed:
+            delta, changes = decision_difference(first, refreshed)
+            run.compare(f"readme:{mode}:refresh", delta, changed_values=changes)
+        if first and second and refreshed:
+            check = {"case": f"readme:{mode}:refresh", "ok": False}
+            try:
+                validate_cache_refresh(first, second, refreshed)
+                check["ok"] = True
+            except ValueError as error:
+                check["error"] = str(error)
+            run.report["cache_work"].append(check)
+            run.save()
     # Interleave an unrelated rubric; then require the original request to recover.
     run.call("systemone", "cache:interleave", {"state": "A blue circle.", "questions": {
         "shape": {"type": "choice", "criteria": {"circle": None, "square": None}}}})
@@ -265,6 +291,7 @@ def main():
     finally:
         run.save()
     failed = (any(not r["ok"] for r in run.report["records"]) or
+              any(not r["ok"] for r in run.report["cache_work"]) or
               any(r["required"] and not r["ok"] for r in run.report["comparisons"]) or
               any(r["wrong"] for r in run.report["quality"]))
     print(json.dumps({"requests": len(run.report["records"]), "failed": failed}))

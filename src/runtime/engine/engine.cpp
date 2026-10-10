@@ -284,7 +284,7 @@ std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& 
 }
 
 BranchScoreResult Engine::score_branches(std::span<const BranchScoreRow> rows,
-                                         const PreparationControl& control) {
+                                         const PreparationControl& control, bool reuse_prefix) {
     if (!impl_ || !impl_->options.enable_decisions ||
         impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("branch scoring requires an enabled generation Engine");
@@ -312,7 +312,7 @@ BranchScoreResult Engine::score_branches(std::span<const BranchScoreRow> rows,
         validate(row.candidates);
     }
     return std::get<std::unique_ptr<Impl::GenerationCore>>(impl_->core)
-        ->score_branches(rows, control);
+        ->score_branches(rows, control, reuse_prefix);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {

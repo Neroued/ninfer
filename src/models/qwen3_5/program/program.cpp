@@ -266,8 +266,8 @@ ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTimin
 }
 
 BranchScoreResult Program::score_branches(std::span<const BranchScoreRow> rows,
-                                          const PreparationControl& control) {
-    return impl_->score_branches(rows, control);
+                                          const PreparationControl& control, bool reuse_prefix) {
+    return impl_->score_branches(rows, control, reuse_prefix);
 }
 
 bool Program::release_branch_cache() { return impl_->release_branch_cache(); }

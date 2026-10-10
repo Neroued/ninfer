@@ -142,6 +142,7 @@ int main() {
 
         Backend backend;
         std::size_t calls       = 0;
+        std::vector<bool> cache_flags;
         backend.check_cancelled = [] {};
         backend.tokenize = [](const auto& system, const auto& context, const auto& continuation) {
             // Simulated context-sensitive tokenizer: the space and first answer character merge.
@@ -156,10 +157,11 @@ int main() {
         };
         backend.score = [&](std::vector<ScoreRow> rows, bool cache) {
             ++calls;
+            cache_flags.push_back(cache);
             ScoreBatch out;
             for (const auto& row : rows) {
                 expect(row.prompt_size() > 0 && row.candidates.size() >= 2, "native score row");
-                expect(cache == !row.cache_frontiers.empty(), "cache opt out reaches backend");
+                expect(!row.cache_frontiers.empty(), "cache opt-out preserves shared frontiers");
                 for (auto marker : row.cache_frontiers) {
                     expect(marker <= row.prompt_size(),
                            "cache boundary stays within branch prompt");
@@ -177,6 +179,8 @@ int main() {
                "merged boundary logits");
         request.cache_prompt = false;
         (void)evaluate(request, backend);
+        expect(cache_flags == std::vector<bool>({true, false}),
+               "cache opt-out refreshes prior-call state without erasing sharing");
         request.mode = "greedy";
         auto greedy  = evaluate(request, backend);
         expect(!greedy["results"][0]["fields"]["yes"]["tree"].get<bool>(), "greedy mode exposed");
@@ -185,7 +189,8 @@ int main() {
         backend.tokenize = [](const auto& system, const auto& context, const auto& continuation) {
             return bytes(system + "<user>" + context + "<assistant>" + continuation);
         };
-        backend.score = [](std::vector<ScoreRow> rows, bool) {
+        backend.score = [&](std::vector<ScoreRow> rows, bool cache) {
+            cache_flags.push_back(cache);
             ScoreBatch out;
             if (rows.size() == 4) {
                 expect(rows[0].prefix.data() == rows[1].prefix.data(),
@@ -208,7 +213,11 @@ int main() {
                             .4) < 1e-7,
                "exact tree differs from greedy and preserves context order");
         branching.mode = "greedy";
+        branching.cache_prompt = false;
+        cache_flags.clear();
         auto walked    = evaluate(branching, backend);
+        expect(cache_flags == std::vector<bool>({false, true}),
+               "cache opt-out rebuilds once then shares later greedy rounds");
         expect(walked["results"][0]["decision"]["pick"] == "aa" &&
                    walked["timings"]["rounds"] == 2 &&
                    std::abs(walked["results"][0]["fields"]["pick"]["probability"].get<double>() -
@@ -222,7 +231,10 @@ int main() {
             batch_sizes.push_back(rows.size());
             return oracle(std::move(rows), cache);
         };
+        cache_flags.clear();
         const auto cohorts = evaluate(branching, backend);
+        expect(cache_flags == std::vector<bool>({false, true}),
+               "later context cohorts share the request's rebuilt prefix");
         expect(batch_sizes == std::vector<std::size_t>({16, 2}) && cohorts["results"].size() == 9 &&
                    cohorts["timings"]["rounds"] == 2,
                "nine contexts use bounded cohorts without serializing fields");

@@ -82,6 +82,7 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           decisions_enabled_(options.enable_decisions),
+          branch_cache_enabled_(options.context_cache.enabled),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -121,7 +122,7 @@ public:
     EngineCore& operator=(const EngineCore&) = delete;
 
     BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
-                                     const PreparationControl& control);
+                                     const PreparationControl& control, bool reuse_prefix);
 
     class Submission {
     public:
@@ -2385,6 +2386,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool decisions_enabled_;
+    const bool branch_cache_enabled_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
@@ -2395,6 +2397,7 @@ private:
 
     struct BranchJob {
         std::vector<BranchScoreRow> rows;
+        bool reuse_prefix = true;
         PreparationControl control;
         Clock::time_point pending_deadline;
         std::promise<BranchScoreResult> result;

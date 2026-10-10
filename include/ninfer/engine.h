@@ -90,8 +90,10 @@ public:
 
     // Opt-in, target-only branch transaction on the generation Engine's GPU worker. No
     // generated tokens, output session, proposal head, or mutation of generation checkpoints.
+    // reuse_prefix=false rebuilds the retained root; rows still share work within this call.
     [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
-                                                   const PreparationControl& control = {});
+                                                   const PreparationControl& control = {},
+                                                   bool reuse_prefix = true);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

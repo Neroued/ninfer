@@ -88,7 +88,9 @@ HTTP 负责协议转换；编译器使用 artifact 模板构造 token trie，Pro
 无可用布局或不足三个空闲 slot 时拒绝该请求，不覆盖或回收 chat/checkpoint 状态。
 
 每行按物理宽度 16 分块并屏蔽 padding，只投影最后一个真实 token 的 hidden state。
-精确 prefix cache 可保留决策租约；uncached 完成、取消、失败及 chat 复用前释放。
+精确 prefix cache 可保留决策租约；取消、失败及 chat 复用前释放。
+`cache_prompt: false` 首轮重建 root，但仍共享本请求各分支和后续轮次的前缀；
+`--no-prefix-reuse` 禁止跨评分调用的读写保留，不禁用调用内共享。
 SystemOne adapter 隔离问题与外部 ID，单问题缓存 rubric，多问题共享 state root；
 改变布局可能改变分数。协议和计量见[HTTP serving](../serving.md#parallel-decisions-jev)。
 

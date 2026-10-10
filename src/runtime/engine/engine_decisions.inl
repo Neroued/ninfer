@@ -4,9 +4,11 @@ namespace ninfer::runtime {
 
 template <class Instance>
 BranchScoreResult EngineCore<Instance>::score_branches(std::span<const BranchScoreRow> rows,
-                                                       const PreparationControl& control) {
+                                                       const PreparationControl& control,
+                                                       bool reuse_prefix) {
     auto job = std::make_shared<BranchJob>();
     job->rows.assign(rows.begin(), rows.end());
+    job->reuse_prefix      = reuse_prefix;
     job->control          = control;
     job->pending_deadline = Clock::now() + pending_timeout_;
     if (control.deadline != Clock::time_point{}) {
@@ -50,7 +52,10 @@ bool EngineCore<Instance>::progress_branch_job() {
             std::lock_guard lock(queue_mutex_);
             return stopping_;
         });
-        job->result.set_value(instance_.program->score_branches(job->rows, control));
+        auto scored = instance_.program->score_branches(
+            job->rows, control, job->reuse_prefix && branch_cache_enabled_);
+        if (!branch_cache_enabled_) { (void)instance_.program->release_branch_cache(); }
+        job->result.set_value(std::move(scored));
     } catch (const RequestError&) {
         job->result.set_exception(std::current_exception());
     } catch (...) {

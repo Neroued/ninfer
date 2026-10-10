@@ -431,8 +431,9 @@ Json evaluate(const Request& request, const Backend& backend) {
         !single_question &&
         std::all_of(request.fields.begin(), request.fields.end(),
                     [](const Field& field) { return !field.isolated_question.empty(); });
-    const auto state_prompt = isolated_state && request.cache_prompt
+    const auto state_prompt = isolated_state
         ? backend.tokenize(request.system, request.contexts.front(), "{\n") : Tokens{};
+    bool reuse_prefix = request.cache_prompt;
     for (std::size_t begin = 0; begin < request.contexts.size(); begin += context_batch) {
         backend.check_cancelled();
         const auto contexts = std::min(context_batch, request.contexts.size() - begin);
@@ -468,22 +469,20 @@ Json evaluate(const Request& request, const Backend& backend) {
             const auto shared  = common_size(trunk, static_prompt);
             context_lengths[c] = trunk.size() - shared;
             context_tokens += context_lengths[c];
-            if (request.cache_prompt) {
-                const auto root = isolated_state ? common_size(trunk, state_prompt) : shared;
-                for (std::size_t f = 0; f < fields; ++f) {
-                    const auto index = c * fields + f;
-                    auto& points = frontiers[index];
-                    if (isolated_state) {
-                        // One state, many isolated questions: prefill the state once, then
-                        // each rubric once. Every divergence in a question reuses its rubric.
-                        // Compare complete template tokenizations; never concatenate BPE IDs.
-                        points = {static_cast<std::uint32_t>(root),
-                                  static_cast<std::uint32_t>(tries[index].prefix().size())};
-                    } else {
-                        if (shared) { points.push_back(static_cast<std::uint32_t>(shared)); }
-                        if (trunk.size() > shared) {
-                            points.push_back(static_cast<std::uint32_t>(trunk.size()));
-                        }
+            const auto root = isolated_state ? common_size(trunk, state_prompt) : shared;
+            for (std::size_t f = 0; f < fields; ++f) {
+                const auto index = c * fields + f;
+                auto& points     = frontiers[index];
+                if (isolated_state) {
+                    // One state, many isolated questions: prefill the state once, then
+                    // each rubric once. Every divergence in a question reuses its rubric.
+                    // Compare complete template tokenizations; never concatenate BPE IDs.
+                    points = {static_cast<std::uint32_t>(root),
+                              static_cast<std::uint32_t>(tries[index].prefix().size())};
+                } else {
+                    if (shared) { points.push_back(static_cast<std::uint32_t>(shared)); }
+                    if (trunk.size() > shared) {
+                        points.push_back(static_cast<std::uint32_t>(trunk.size()));
                     }
                 }
             }
@@ -513,7 +512,8 @@ Json evaluate(const Request& request, const Backend& backend) {
             }
             if (pending.empty()) { break; }
             backend.check_cancelled();
-            const auto scored = backend.score(std::move(pending), request.cache_prompt);
+            const auto scored = backend.score(std::move(pending), reuse_prefix);
+            reuse_prefix = true; // Later rounds/cohorts may reuse this request's rebuilt root.
             if (scored.logits.size() != locations.size()) {
                 throw std::logic_error("decision batch size mismatch");
             }

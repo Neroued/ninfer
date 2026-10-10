@@ -109,7 +109,7 @@ curl http://127.0.0.1:8080/v1/decision \
 | `schema` | 1–32 independent fields, compact or JSON Schema `properties` |
 | `mode` | `auto` (default), `tree`, or `greedy` |
 | `tree_max` | Auto-mode exhaustive-domain threshold, 1–255; default 128 |
-| `cache_prompt` | Reuse exact prefixes; default true |
+| `cache_prompt` | Reuse a retained exact root; false rebuilds it once, preserving within-request sharing; default true |
 
 Compact fields require a description; JSON Schema descriptions are optional. All declared
 fields are returned regardless of `required`. Field names and choice labels are limited
@@ -148,8 +148,11 @@ divergences are compiled together; actual row batches may be smaller. This is bo
 shared-prefix execution, not one kernel for an arbitrary request.
 
 An exact-root cache retains decision-owned pages/state until reuse or the next chat boundary.
-Cache opt-out releases it and disables shared trunks; `--no-prefix-reuse` disables both chat
-and decision reuse. Optional retention is dropped under pressure before rejecting work.
+`cache_prompt: false` discards the previous root at the first scoring call, then shares the
+fresh prefix across this request's branches and later rounds. The rebuilt root may be retained
+for a subsequent request. `--no-prefix-reuse` disables retained reads and writes for both chat
+and decisions, but branches within a scoring call still share work. Optional retention is
+dropped under pressure before rejecting work.
 No input truncation or request-time Device allocation is used. Insufficient workspace, fewer
 than three free state slots, or insufficient shared KV capacity returns `429 server_overloaded`.
 
@@ -160,6 +163,7 @@ budget or lanes, but an admitted scoring transaction is nonpreemptive and can de
 Disconnect cancellation is checked between bounded prefix/branch units.
 
 `prompt_tokens` sums scored-branch prompt lengths and equals `cached_tokens + computed_tokens`.
+Here `cached_tokens` includes within-request sharing, even with `cache_prompt: false`.
 Physical padding is excluded. `context_tokens` measures the shared-static-to-field-trunk span;
 `scored_rows` counts divergent prompts. Timing `rounds` counts logical rounds,
 `forward_batches` counts backbone traversals including prefix chunks, and `largest_batch`

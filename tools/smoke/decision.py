@@ -85,8 +85,7 @@ def validate_response(request: dict, response: dict) -> None:
         require(type(usage[key]) is int and usage[key] >= 0, f"invalid usage.{key}")
     require(usage["prompt_tokens"] == usage["computed_tokens"] + usage["cached_tokens"],
             "prompt accounting does not reconcile")
-    if not request.get("cache_prompt", True):
-        require(usage["cached_tokens"] == 0, "cache opt-out still reports reuse")
+    # cached_tokens includes work shared within this request, even with cache_prompt=false.
     for key in ("prefill_ms", "scoring_ms", "total_ms", "per_decision_ms"):
         require(finite(response["timings"][key]) and response["timings"][key] >= 0,
                 f"invalid timings.{key}")

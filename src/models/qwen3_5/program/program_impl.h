@@ -319,7 +319,7 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*);
     [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
-                                                   const PreparationControl&);
+                                                   const PreparationControl&, bool reuse_prefix);
     bool release_branch_cache();
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,

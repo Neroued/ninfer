@@ -164,6 +164,14 @@ int main() {
                    "branches did not share a prefix and native batch");
             const auto cached = engine.score_branches(batch);
             expect(cached.computed_tokens < scored.computed_tokens, "exact root was not reused");
+            const auto refreshed = engine.score_branches(batch, {}, false);
+            expect(refreshed.computed_tokens == scored.computed_tokens &&
+                       refreshed.reused_tokens == scored.reused_tokens &&
+                       refreshed.forward_batches == scored.forward_batches,
+                   "refresh changed within-request prefix sharing or reused the retained root");
+            const auto refreshed_again = engine.score_branches(batch, {}, false);
+            expect(refreshed_again.computed_tokens == refreshed.computed_tokens,
+                   "cache opt-out reused the preceding request's root");
             const auto uncached = engine.score_branches(rows(cases, false));
             expect(state_occupancy() == chat_state_slots,
                    "uncached decision leaked native state reservations");
@@ -172,6 +180,8 @@ int main() {
                    "cache opt-out or full batch width was not honored");
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 worst = std::max({worst, compare(scored.logits[i], cached.logits[i]),
+                                  compare(scored.logits[i], refreshed.logits[i]),
+                                  compare(refreshed.logits[i], refreshed_again.logits[i]),
                                   compare(scored.logits[i], uncached.logits[i])});
             }
             auto root_only = rows(cases, true);
@@ -223,7 +233,11 @@ int main() {
                     }
                 }
                 if (!cache) {
-                    expect(response.at("usage").at("cached_tokens") == 0, "cache opt-out ignored");
+                    const auto repeated = decisions.run(request);
+                    expect(response.at("usage").at("computed_tokens") ==
+                               repeated.at("usage").at("computed_tokens") &&
+                               response.at("usage").at("cached_tokens").get<std::uint64_t>() > 0,
+                           "cache opt-out must rebuild once while sharing current-request work");
                 }
             }
             (void)engine.score_branches(batch); // Retain a known root before chat reclaims it.
@@ -246,6 +260,23 @@ int main() {
             }
             expect(did_cancel && engine.is_available(),
                    "cancellation did not preserve Engine availability");
+        }
+        {
+            auto no_cache_options                  = options;
+            no_cache_options.context_cache.enabled = false;
+            ninfer::Engine engine(no_cache_options);
+            const auto batch = rows(cases, true);
+            const auto first = engine.score_branches(batch);
+            const auto again = engine.score_branches(batch);
+            expect(first.computed_tokens == scored.computed_tokens &&
+                       again.computed_tokens == first.computed_tokens && first.reused_tokens > 0,
+                   "global cache opt-out disabled sharing or reused a retained root");
+            (void)engine.memory_summary();
+            expect(engine.runtime_stats().device_state_occupied_slots == 0,
+                   "global cache opt-out retained decision state");
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                worst = std::max(worst, compare(scored.logits[i], again.logits[i]));
+            }
         }
         // Independent execution route: ordinary causal prefill + full-vocabulary log-softmax.
         // Destroy generation first so the model is never resident twice.

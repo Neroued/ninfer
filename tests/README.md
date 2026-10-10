@@ -65,7 +65,7 @@ Python is needed for Python tests; select it using `Python3_EXECUTABLE` as in th
 
 For the artifact test, stop other GPU model processes and set an explicit
 `NINFER_TEST_ARTIFACT` path. The test compares decision-enabled/disabled reservations and
-greedy chat output, fork/padding boundaries, cache release and cancellation, then compares
+greedy chat output, fork/padding boundaries, fresh-root sharing, cache release and cancellation, then compares
 branch probabilities with the independent causal-prefill route. The fixed maximum absolute
 conditional-probability error is 0.02. Missing artifacts return skip code 77, not a pass.
 Optional `NINFER_DECISION_TEST_SPEC=mtp|dflash|dflash2` and
@@ -88,11 +88,12 @@ python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
 ```
 
 Validation exercises every preset/mode with and without caching, the Codacus README's
-support request, repeated/interleaved cache reuse, request bounds, and a
+support request, cold/warm/refresh work accounting, repeated/interleaved cache reuse, request bounds, and a
 self-contained 13-question workflow adapted from TypeSafe's
 [parallel-questions cookbook](https://docs.typesafe.ai/cookbooks/parallel_questions).
 It reports batched/single-question disagreement rather than asserting score identity across
-different prompt layouts. Repeated same-layout/cache comparisons use a fixed 0.02 tolerance;
+different prompt layouts. Repeated same-layout/cache comparisons use a fixed local 0.02 diagnostic
+tolerance, not a Codacus golden-answer criterion or proof of model accuracy;
 Decision comparisons retain changed values alongside selected-value probability deltas
 (the endpoint does not expose full distributions). A failed numerical comparison fails the run;
 explicit synthetic labels and arena rules are separate quality checks. No hosted model or

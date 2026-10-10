@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from decision_live import CHAT, chat_request, replay, replay_http, systemone_cases, validate_systemone
-from decision_validation import answer_delta, decision_difference, distribution, workflow, workflow_labels
+from decision_validation import (answer_delta, decision_difference, distribution,
+                                 validate_cache_refresh, workflow, workflow_labels)
 
 
 def response_for(request):
@@ -140,6 +141,23 @@ class SystemOneValidatorTest(unittest.TestCase):
 
 
 class WorkflowValidatorTest(unittest.TestCase):
+    def test_cache_refresh_rebuilds_once_without_disabling_sharing(self):
+        cold = {"usage": {"computed_tokens": 10, "cached_tokens": 20},
+                "timings": {"forward_batches": 3}}
+        warm = {"usage": {"computed_tokens": 4, "cached_tokens": 26},
+                "timings": {"forward_batches": 2}}
+        validate_cache_refresh(cold, warm, copy.deepcopy(cold))
+        for broken in (warm,
+                       {**cold, "usage": {"computed_tokens": 30, "cached_tokens": 0}},
+                       {**cold, "timings": {"forward_batches": 4}}):
+            with self.assertRaises(ValueError):
+                validate_cache_refresh(cold, warm, broken)
+        with self.assertRaises(ValueError):
+            validate_cache_refresh(cold, cold, cold)
+        no_sharing = {**cold, "usage": {"computed_tokens": 30, "cached_tokens": 0}}
+        with self.assertRaises(ValueError):
+            validate_cache_refresh(no_sharing, warm, no_sharing)
+
     def test_mixed_workflow_labels_are_independent_of_confidence(self):
         request = workflow()
         response = response_for(request)

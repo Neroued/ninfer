@@ -65,8 +65,7 @@ class DecisionSmokeTest(unittest.TestCase):
             validate_response(self.request, self.response)
 
     def test_cache_opt_out_and_accounting(self):
-        with self.assertRaises(ValueError):
-            validate_response({**self.request, "cache_prompt": False}, self.response)
+        validate_response({**self.request, "cache_prompt": False}, self.response)
         self.response["usage"]["prompt_tokens"] = 5
         with self.assertRaises(ValueError):
             validate_response(self.request, self.response)

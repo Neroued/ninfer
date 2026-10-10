@@ -119,6 +119,8 @@ struct ScoreBatch {
 // Keeping this host algorithm explicit also allows deterministic tests without model weights.
 struct Backend {
     std::function<Tokens(const std::string&, const std::string&, const std::string&)> tokenize;
+    // The bool permits reuse of a root retained by an earlier score call. Row frontiers
+    // always describe within-call sharing, even when that retained root must be rebuilt.
     std::function<ScoreBatch(std::vector<ScoreRow>, bool)> score;
     std::function<void()> check_cancelled;
 };

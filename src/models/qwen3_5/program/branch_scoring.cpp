@@ -69,7 +69,7 @@ bool ProgramImpl::release_branch_cache() {
 }
 
 BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> rows,
-                                              const PreparationControl& control) {
+                                              const PreparationControl& control, bool reuse_prefix) {
     if (!decision_scoring || has_context_transaction() || pending_transaction_) {
         throw std::logic_error("branch scoring requires its enabled, stable Program boundary");
     }
@@ -253,6 +253,8 @@ BranchScoreResult ProgramImpl::score_branches(std::span<const BranchScoreRow> ro
 
     try {
         check();
+        // Cache policy controls prior-call reuse, not shared-prefix execution in this call.
+        if (!reuse_prefix) { b.release_cache(); }
 
         struct Group {
             std::span<const TokenId> trunk;

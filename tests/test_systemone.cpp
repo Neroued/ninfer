@@ -147,6 +147,7 @@ int main() {
         std::vector<std::string> prompts;
         std::vector<ninfer::decision::Tokens> scored_prefixes;
         std::vector<std::vector<std::uint32_t>> scored_frontiers;
+        std::vector<bool> cache_flags;
         backend.tokenize = [&](const std::string& system, const std::string& context,
                                const std::string& continuation) {
             prompts.push_back(system + "\n" + context + "\n" + continuation);
@@ -154,7 +155,8 @@ int main() {
         };
         backend.check_cancelled = [] {};
         std::size_t batches     = 0;
-        backend.score           = [&](std::vector<ninfer::decision::ScoreRow> rows, bool) {
+        backend.score           = [&](std::vector<ninfer::decision::ScoreRow> rows, bool cache) {
+            cache_flags.push_back(cache);
             ++batches;
             ninfer::decision::ScoreBatch result;
             for (const auto& row : rows) {
@@ -257,12 +259,14 @@ int main() {
         expect(!std::equal(rubric_root.begin(), rubric_root.end(), scored_prefixes.front().begin()),
                "changed rubric cannot reuse a stale root");
         branching.decision.cache_prompt = false;
+        cache_flags.clear();
         scored_prefixes.clear();
         scored_frontiers.clear();
         const auto uncached = ninfer::decision::evaluate(branching.decision, backend);
         expect(std::all_of(scored_frontiers.begin(), scored_frontiers.end(),
-                           [](const auto& points) { return points.empty(); }),
-               "cache opt-out also disables isolated-question frontiers");
+                           [](const auto& points) { return !points.empty(); }) &&
+                   !cache_flags.empty() && !cache_flags.front(),
+               "cache opt-out refreshes state while preserving isolated-question sharing");
         expect(cached["results"] == uncached["results"], "reuse hints cannot change host answers");
 
         auto invalid = body;

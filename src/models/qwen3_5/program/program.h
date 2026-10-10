@@ -470,7 +470,7 @@ public:
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
-                                                   const PreparationControl&);
+                                                   const PreparationControl&, bool reuse_prefix);
     // Decision cache is optional shared-pool occupancy; release before chat admission/work.
     bool release_branch_cache();
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,

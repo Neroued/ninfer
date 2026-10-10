@@ -39,18 +39,17 @@ Json DecisionEngine::run(const Request& request, const PreparationControl& contr
                                    : std::min(deadline, control.deadline);
         return engine_.tokenize_prompt(std::move(input), preparation);
     };
-    backend.score = [&](std::vector<ScoreRow> rows, bool cache) {
+    backend.score = [&](std::vector<ScoreRow> rows, bool reuse_prefix) {
         check();
-        cache = cache && engine_.options().context_cache.enabled;
         std::vector<BranchScoreRow> native;
         native.reserve(rows.size());
         for (const auto& row : rows) {
             native.push_back(
                 {row.prefix, row.suffix, row.candidates,
-                 cache && !row.cache_frontiers.empty() ? row.cache_frontiers.back() : 0,
-                 cache && !row.cache_frontiers.empty() ? row.cache_frontiers.front() : 0});
+                 !row.cache_frontiers.empty() ? row.cache_frontiers.back() : 0,
+                 !row.cache_frontiers.empty() ? row.cache_frontiers.front() : 0});
         }
-        auto result = engine_.score_branches(native, control);
+        auto result = engine_.score_branches(native, control, reuse_prefix);
         return ScoreBatch{std::move(result.logits), result.computed_tokens, result.reused_tokens,
                           result.prefill_ms,        result.forward_batches, result.largest_batch};
     };

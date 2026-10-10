@@ -36,207 +36,76 @@ weight decoding.
 
 ## Decision engine
 
-The finite-schema compiler and probability oracle run without CUDA or model weights:
+The decision suites follow the existing CMake/CTest build below:
 
-```bash
-c++ -std=c++20 -O2 -Iinclude -Isrc -Ithird_party \
-  src/decision/decision.cpp tests/test_decision.cpp -o /tmp/ninfer-decision-test
-/tmp/ninfer-decision-test
-```
+| Target | Coverage |
+|---|---|
+| `ninfer_decision_test` | Compiler, finite-probability oracle, numeric bounds, token tries, caching and cancellation |
+| `ninfer_decision_fixtures_test` | All eight pinned Codacus presets in auto/tree/greedy modes with synthetic logits |
+| `ninfer_systemone_test` | Parsing, fixed confidence/mean oracles, question isolation and prefix invalidation |
+| `ninfer_decision_smoke_test`, `ninfer_decision_live_client_test` | No-network HTTP validators and replay accounting |
+| `ninfer_qwen3_5_decision_real_test` | Artifact-backed numerical/state isolation checks |
 
-The CMake target is `ninfer_decision_test`. It checks typed domains, validation, decimal and
-integer boundaries, token-prefix merging, independent exact probability calculations,
-multi-context cohorts, multi-round greedy traversal, cache opt-out and cancellation. These tests do not qualify GPU
-execution or establish model accuracy/performance.
-
-`ninfer_qwen3_5_decision_real_test` is an opt-in artifact execution comparison. Twelve rows cover
-two contexts, partial-page KV forks, zero/1/15/16/17/33-token suffixes, multiple tiles, full batches,
-cache hits/opt-out, mid-transaction cancellation and unchanged later ordinary/speculative output.
-After releasing the generation Engine, it compares each row with the existing causal-prefill
-scorer's full-vocabulary log probabilities, renormalized over the same candidates. The declared
-maximum absolute conditional-probability error is 0.02 for differing BF16 execution shapes;
-the test prints the worst error. This is an independent scheduling/execution reference, not a new
-mathematical kernel oracle, model accuracy benchmark or speed measurement. It skips with status 77
-without an artifact.
-Run it on the supported Linux/CUDA build, with the live model server stopped to free the GPU:
+`fixtures/decision/codacus.json` preserves all eight inputs from
+[decision-playground at 843f72e](https://github.com/thecodacus/decision-playground/blob/843f72e61f5ebaa1c2225c4902849bd42af44c05/src/playground/presets.ts),
+including its context-separator rule and source hash. These are demos, not upstream golden
+answers. `tools/smoke/decision.py --check-arena` checks five explicit arena rules separately
+from response validity. Host tests do not establish GPU correctness or model accuracy.
 
 ```bash
 cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --parallel --target ninfer_decision_test ninfer_qwen3_5_decision_real_test
+cmake --build build --parallel --target ninfer_decision_test ninfer_decision_fixtures_test \
+  ninfer_systemone_test ninfer_qwen3_5_decision_real_test
+ctest --test-dir build -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|decision_live_client_test|systemone_test)$' --output-on-failure
+```
+
+The existing Docker `build` stage can supply the same CUDA toolchain without changing the
+production Dockerfile: build with `--target build`, then run CMake/CTest inside that image.
+Python is needed for Python tests; select it using `Python3_EXECUTABLE` as in the normal test build.
+
+For the artifact test, stop other GPU model processes and set an explicit
+`NINFER_TEST_ARTIFACT` path. The test compares decision-enabled/disabled reservations and
+greedy chat output, fork/padding boundaries, cache release and cancellation, then compares
+branch probabilities with the independent causal-prefill route. The fixed maximum absolute
+conditional-probability error is 0.02. Missing artifacts return skip code 77, not a pass.
+Optional `NINFER_DECISION_TEST_SPEC=mtp|dflash|dflash2` and
+`NINFER_DECISION_TEST_PROPOSAL_HEAD=1` select components that must exist in the artifact.
+
+```bash
 NINFER_TEST_ARTIFACT=/absolute/path/model.ninfer \
-  ctest --test-dir build -R '^ninfer_(decision_test|qwen3_5_decision_real_test)$' --output-on-failure
+  ctest --test-dir build -R '^ninfer_qwen3_5_decision_real_test$' --output-on-failure
 ```
 
-Optional `NINFER_DECISION_TEST_SPEC=mtp|dflash|dflash2` exercises the selected supported artifact
-component with three draft tokens (default `none`). `NINFER_DECISION_TEST_PROPOSAL_HEAD=1` also
-selects the optimized proposal head. Those options must match components present in the artifact.
-For HTTP/Docker use, see [decision serving](../docs/serving.md#parallel-decisions-jev).
-
-### Codacus fixtures and Docker qualification
-
-[`fixtures/decision/codacus.json`](fixtures/decision/codacus.json) contains all eight playground
-presets from [thecodacus/decision-playground at 843f72e](https://github.com/thecodacus/decision-playground/blob/843f72e61f5ebaa1c2225c4902849bd42af44c05/src/playground/presets.ts):
-arena, routing, eight-ticket routing, ticket triage, smart home, warehouse rover, robot arm,
-and the 30-field RTS squad. Instructions, schema values/descriptions and context text are unchanged;
-the playground's own separator/trim rule converts its context box to a `contexts` array.
-The source revision and SHA-256 are recorded in the fixture. No upstream code executes at test time.
-
-These are exact **demo inputs**, not a claimed copy of a Codacus golden-answer test suite.
-`ninfer_decision_fixtures_test` exercises each in auto/tree/greedy mode using synthetic byte
-tokenization and logits: 24 host contract cases, not model accuracy checks. The existing
-`ninfer_decision_test` remains the independent finite-probability oracle. The Python unit test
-checks that the HTTP smoke validator rejects malformed results; it does not contact a server.
-
-From the repository root on the Linux/WSL Docker host:
+Live HTTP checks are opt-in and use only Python's standard library. Start an existing
+`--jev` server first; `NINFER_API_KEY` supplies authentication if enabled.
 
 ```bash
-docker build --target decision-tests -t ninfer:jev-tests .
-
-# Compiler/math, protocol adapters, fixtures and smoke validation. No GPU or model needed.
-docker run --rm ninfer:jev-tests ctest --test-dir /build \
-  -R '^ninfer_(decision_test|decision_fixtures_test|decision_smoke_test|decision_live_client_test|systemone_test)$' --output-on-failure
-
-# Stop the live model server first. Set the exact artifact file, not a directory/glob.
-ARTIFACT=/absolute/path/to/your-model.ninfer
-docker run --rm --gpus all \
-  --mount "type=bind,src=$ARTIFACT,dst=/models/test.ninfer,readonly" \
-  -e NINFER_TEST_ARTIFACT=/models/test.ninfer ninfer:jev-tests
-```
-
-The second run must report all six tests passed, **not a skipped real-artifact test**.
-Its numerical comparison must stay within the fixed 0.02 conditional-probability tolerance;
-do not relax the threshold to manufacture a pass. The test image builds focused test targets
-and includes Python only as a test/client interpreter. It is not the production serving image;
-ordinary `docker build -t ninfer:jev .` still ends at the unchanged runtime stage.
-
-The real-artifact check first loads generation with decisions disabled, then enabled, using
-identical serving options. Minimum/actual reservations, the KV capacity increment, KV payload,
-persistent/workspace capacities and graph allowance must match exactly, as must greedy chat
-output. It also verifies native state-slot reservation, release on uncached completion and
-cancellation, and that chat releases the temporary decision overlay before reuse.
-Decision batch bounds are independent of the configured chat lane count. With speculative
-decoding disabled it additionally compares KV payload with the causal reference engine.
-
-Start the server using the serving instructions, then replay real requests from another terminal:
-
-```bash
-python3 tools/smoke/decision.py --list
-python3 tools/smoke/decision.py --base-url http://127.0.0.1:8080 --all
-python3 tools/smoke/decision.py --preset arena --check-arena
-python3 tools/smoke/decision.py --preset routing-bulk --repeat 3
-```
-
-No Python packages are required. Alternatively, on the Linux/WSL Docker host use the built
-test image as the client: `docker run --rm --network host ninfer:jev-tests python3
-/src/tools/smoke/decision.py --all`. This client needs no GPU access and loads no model.
-Use `NINFER_API_KEY` if the server requires authentication; `--model` is optional and takes the
-served alias, not an artifact filename. `--mode tree` forces exhaustive finite-tree evaluation;
-`--no-cache` exercises the uncached route. JSON responses go to stdout; summaries/errors to stderr.
-
-`PASS contract` means typed domains, complete result shapes, finite probabilities, numeric
-intervals and token accounting are valid. It does **not** certify semantic correctness.
-`--check-arena` additionally checks five NInfer-authored expectations derived from the unchanged
-arena rules: move right, turn right by 33 degrees, do not fire, stand. These are not upstream
-golden labels. A wrong answer fails this optional quality check even when the engine contract
-passes. Printed timings are observations, not comparisons with Codacus's hardware or Jev.
-
-### System One adapter
-
-`ninfer_systemone_test` qualifies TypeSafe-shaped parsing and formatting without CUDA,
-a model, or a network connection:
-
-```bash
-c++ -std=c++20 -O2 -Iinclude -Isrc -Ithird_party \
-  src/decision/decision.cpp src/serve/systemone.cpp tests/test_systemone.cpp \
-  -o /tmp/ninfer-systemone-test
-/tmp/ninfer-systemone-test
-```
-
-It checks published confidence examples against fixed numerical expectations, full Choice
-distributions, Noul's probability-of-true semantics, unrounded Score means, structured/null
-entries, limits and invalid distributions. A synthetic tokenizer/scorer exercises the real
-compiler to verify question/ID isolation, shared batch submission, state/question prefix reuse,
-stable single-question rubric roots across changing messages and invalidation on rubric changes,
-multi-token divergence reuse, cache opt-out and unchanged ordinary decision response shape.
-This is a host protocol oracle, not a claim of model accuracy or GPU performance.
-The Docker test stage includes this target; live usage is documented in
-[System One compatibility](../docs/serving.md#system-one-compatibility). The existing
-`tools/smoke/decision.py` client still targets `/v1/decision`, not `/v1/systemone`.
-
-### Both-endpoint qualification and chat replay
-
-`tests/decision_live.py` covers all eight Decision presets in auto/tree/greedy modes,
-cache opt-out and rejected inputs, plus SystemOne Choice/Noul/Score, mixed questions,
-structured/null/array inputs, escaped labels, confidence/mean formulas and rejected inputs.
-It then replays the 64 synthetic messages in `fixtures/decision/chat.json`, repeated to
-the requested finite count, independently through each endpoint. This is chat filtering,
-not connected Twitch moderation or a reproduction of another system's measured accuracy.
-
-```bash
-# No server required: response validation and lossless queue accounting oracles.
-python3 -B tests/test_decision_smoke.py
-python3 -B tests/test_decision_live.py
-
-# Live --jev server required. No additional Python packages or GPU on the client.
+python3 tools/smoke/decision.py --base-url http://127.0.0.1:8080 --all --check-arena
+python3 tests/decision_validation.py --base-url http://127.0.0.1:8080 \
+  --output .local/decision-validation.json
 python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
-  --build-label YOUR_SERVED_COMMIT --rates 8 24 48 0 \
-  --output .local/decision-live.json
+  --build-label SERVED_COMMIT --rates 8 24 48 0 --output .local/decision-live.json
 ```
 
-There is no pending-queue/drop cap, duplicate filtering, answer cache or automatic retry.
-The replay sends one message per HTTP request, keeps up to `--concurrency` in flight
-(default 8), ends arrivals after `--count` (default 128), then drains **all** queued work.
-Per-request failures/timeouts remain explicit event records; interruption marks the run
-incomplete and fails it. A finite replay is not an unlimited throughput guarantee.
-Native server admission remains bounded: increasing client concurrency can expose genuine
-overload responses, which fail the run rather than being hidden by retries.
-The HTTP executor has exactly the requested number of workers; it does not silently inherit
-Python's CPU-dependent default thread-pool limit. To exercise higher admission pressure,
-run a separate finite sweep after the comparable eight-in-flight baseline:
+Validation exercises every preset/mode with and without caching, the Codacus README's
+support request, repeated/interleaved cache reuse, request bounds, and a
+self-contained 13-question workflow adapted from TypeSafe's
+[parallel-questions cookbook](https://docs.typesafe.ai/cookbooks/parallel_questions).
+It reports batched/single-question disagreement rather than asserting score identity across
+different prompt layouts. Repeated same-layout/cache comparisons use a fixed 0.02 tolerance;
+Decision comparisons retain changed values alongside selected-value probability deltas
+(the endpoint does not expose full distributions). A failed numerical comparison fails the run;
+explicit synthetic labels and arena rules are separate quality checks. No hosted model or
+external corpus is required at test time.
 
-```bash
-for concurrency in 16 32; do
-  python3 tests/decision_live.py --base-url http://127.0.0.1:8080 \
-    --build-label YOUR_SERVED_COMMIT --section replay --rates 0 \
-    --count 128 --concurrency "$concurrency" \
-    --output ".local/decision-live-c${concurrency}.json"
-done
-```
-
-Keep failed reports too: an overload probe is not a lossless pass just because the service
-survives it. A client concurrency setting is not the model's generation lane count.
-
-Reports distinguish offered arrival rate, achieved completion rate, pending depth, request
-latency and end-to-end/queue p50/p95/p99. Rate `0` is an immediate finite saturation workload;
-the serial baseline reports request latency (its end-to-end figures include its queued burst).
-All configured rates run; queue growth does not silently stop escalation. Labels are
-illustrative quality observations, separate from contract pass/fail. No arbitrary semantic
-labels or speed claims are required for a protocol test to pass.
-
-For a measured parity gate, explicitly add `--min-throughput-ratio 0.95` with both routes
-and a rate-0 stage. It fails below that SystemOne/Decision completion-rate ratio; it is
-an optional performance acceptance criterion, not a CTest hardware-independent assertion.
-Compare identical CLI/workloads on the same server/hardware, with other traffic idle, and
-retain raw reports from before **and after rebuilding**. SystemOne always scores full
-distributions, so compare with Decision tree mode (the replay does), not greedy mode.
-The no-network `ninfer_decision_live_client_test` is registered in CTest and the Docker
-qualification image. Live HTTP tests are opt-in and do not run during ordinary CTest.
-
-### Research and application evaluation
-
-The attached research's [Jev in the Wild paper](https://arxiv.org/abs/2609.30216) is an ecosystem
-study, not a specification for reproducing Jev's proprietary model or an executable test suite.
-For realistic workloads, TypeSafe publishes [workflow evaluations](https://evals.typesafe.ai/)
-for customer service, invoice processing, security incidents and agent-trace observability.
-Their reference labels are model consensus, not human-verified ground truth.
-
-A downloadable evaluation source is [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions),
-used by [Type-Safe Is Not Error-Free](https://arxiv.org/abs/2609.26758). To evaluate it here,
-map each question to a field, preserve its criteria in the field description, use the state as
-context, and score held-out decisions against the supplied labels. This is an API adaptation,
-not a drop-in reproduction of Jev's distribution/calibration metrics. No dataset or additional
-checkpoint is downloaded by the tests. Also measure sensitivity to option names/order; a valid
-enum result alone does not prove that a model followed the option definitions.
+Replay sends one message per HTTP request, without answer caching, filtering, drops or retries.
+`--concurrency` sets actual client HTTP workers (default 8), not generation lanes.
+`--count` ends arrivals, then the client drains its pending queue. Rate 0 is immediate finite
+saturation. Reports retain errors, pending depth, request/queue/end-to-end latency and per-event
+labels. A finite pass is not unlimited capacity. Use separate `--section replay --rates 0`
+runs at concurrency 16 and 32 for overload pressure; keep rejected requests in the report.
+Optional `--min-throughput-ratio 0.95` checks SystemOne/Decision tree-mode saturation parity,
+not model quality. Match client/server/workload revisions when comparing performance.
 
 ## Build and run
 

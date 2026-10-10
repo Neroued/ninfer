@@ -219,13 +219,6 @@ docker run --rm \
 
 ## Capabilities and limits
 
-This fork adds an opt-in native finite-schema decision engine. Add `--jev` to
-`ninfer-serve` (including the Docker command above) to enable `POST /v1/decision`
-and the [TypeSafe-shaped `/v1/systemone` adapter](docs/serving.md#system-one-compatibility).
-It uses the already-loaded model, with no extra weights or service. See
-[decision serving](docs/serving.md#parallel-decisions-jev) for the API, execution
-boundaries, and a Docker example. Without `--jev`, the routes are not registered.
-
 The official artifacts provide the following capabilities, with optional components enabled at startup:
 
 - text generation with thinking and non-thinking prompt modes;

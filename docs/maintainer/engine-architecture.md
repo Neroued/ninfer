@@ -74,61 +74,23 @@ Engine 在 submit 调用线程完成编译，再入队；Program 借用当轮的
 GPU 采样及 spec 验收。Matcher 与输出一起 preview/commit，抢占和 Replay 保留其已提交状态。
 执行时序及语义见[约束解码设计](constrained-decoding.md)。
 
-### 2.1.1 Finite decisions
+### 2.1.1 有限候选评分
 
-The opt-in `--jev` product lives in `src/decision/`; HTTP owns only admission and protocol
-translation. Its host compiler creates finite token tries and assembles typed JSON. It is separate
-from speculative token decoding, but reuses the public Generation Engine and resident model.
-`Engine::tokenize_prompt` exposes exact artifact-template continuation tokenization.
-`EngineOptions::enable_decisions` enables `Engine::score_branches`, a typed synchronous transaction
-on the existing GPU worker. Borrowed token spans remain owned by the caller until worker cleanup
-finishes, including cancellation. A separate bounded decision queue leaves chat admission
-accounting unchanged; shutdown and failure handling drain both queues. An admitted transaction
-runs nonpreemptively at a stable Program boundary; it does not create
-generation sessions, advance ordinary lane ledgers, or call a proposal head.
+`--jev` 启用 `src/decision/` 的有限候选编译与 `Engine::score_branches`。
+HTTP 负责协议转换；编译器使用 artifact 模板构造 token trie，Program 在现有 GPU worker
+的稳定边界评分，Host 组装 typed JSON。借用的 token span 保留到取消清理结束。
+独立队列最多等待 16 个评分事务；事务不占 generation lane，但执行期间不可抢占。
 
-Decisions leave the native startup arena, workspace capacity, KV capacity curve, graph budget
-and chat lane count unchanged. Transient buffers overlay the existing general workspace,
-excluding live Vision handoff storage. A dry-run layout selects the largest batch up to eight
-that fits, with width-16 ReplaySSM records, selected-tail buffers, private execution tables,
-a disjoint scratch subarena and a bounded prefix tile. At admission B is further bounded by
-free StateImage capacity: reserve_reset leases 1+2B slots (root, B trunks, B branches) through
-the native store, mapping local branch identities to its physical slots. No occupied state is
-borrowed or evicted. The private tables reference the existing Main logical/physical KV pool;
-generation's table rows and mappings remain untouched. If no layout or three free state slots
-are available, startup still succeeds and decision admission reports overload. Constructor
-failure, cancellation and uncached completion return leases. No runtime Device allocation, second model,
-backend-specific proposal state or new numerical Op is introduced.
+决策不增加 startup reservation。临时表、ReplaySSM records、tail/logits 和 scratch
+覆盖现有 general workspace，排除仍存活的 Vision handoff 区域。布局最多容纳八行；
+实际 B 还受空闲 StateImage 限制，通过原生 store 租用 1+2B 个 slot。KV fork 使用
+现有 Main pool 的共享整页与尾页 COW，复制完整 convolution/recurrent state。
+无可用布局或不足三个空闲 slot 时拒绝该请求，不覆盖或回收 chat/checkpoint 状态。
 
-The common token root uses native prefill. Context trunks and field suffixes use Text's native
-multi-token target traversal with up to B rows, masked physical width 16, and explicit KV/state
-selectors. ReplaySSM folds only real columns; normalized hidden states are selected before padding
-and projected together through the full target head. KVAddressSpaceStore forks share full pages
-and copy partial tails; every fork copies both convolution and recurrent state. Cohorts are bounded
-by actual free shared-pool capacity, including COW tails and one leaf's headroom. Optional reuse
-is dropped when its extra retained pages would prevent a predictor from fitting. An exact-root
-cache retains decision-owned state leases/pages, but the entire overlay and its leases are released
-before chat admission or execution. Decisions do not reclaim chat checkpoints or live/paused
-state. Remaining pressure is a request overload, not an Engine failure. Cache opt-out uses zero
-trunks and evicts the retained root.
-
-The host compiler batches up to eight contexts and all their finite-trie divergences together.
-This is shared-prefix/batched-suffix execution, not one monolithic kernel or an unbounded batch.
-`src/serve/systemone.cpp` owns the optional TypeSafe protocol adapter. It compiles each question
-into an isolated rubric, hides caller question IDs from model input,
-and requests exhaustive distributions from the same compiler/worker. A single question puts
-its rubric in the system prefix before the changing state, retaining that stable root across
-independent requests. Multiple questions retain a common-state root followed by isolated
-question trunks, avoiding repeated large-state prefill within a request. Multi-token answer
-divergences reuse the rubric. These are exact token-prefix markers on the
-existing branch API, with no new Program storage. Its host formatter owns
-Choice/Noul/Score answer shapes and confidence formulas. Internal probability retention is
-opt-in; ordinary `/v1/decision` wire results are unchanged. No Engine, Program or numerical
-Op contract is added by this protocol.
-The optional artifact test compares conditional scores with the existing independent causal
-prefill route and checks isolation from ordinary/speculative generation. GPU qualification and
-performance measurement remain distinct from host compiler tests. The endpoint and accounting are in
-[HTTP serving](../serving.md#parallel-decisions-jev).
+每行按物理宽度 16 分块并屏蔽 padding，只投影最后一个真实 token 的 hidden state。
+精确 prefix cache 可保留决策租约；uncached 完成、取消、失败及 chat 复用前释放。
+SystemOne adapter 隔离问题与外部 ID，单问题缓存 rubric，多问题共享 state root；
+改变布局可能改变分数。协议和计量见[HTTP serving](../serving.md#parallel-decisions-jev)。
 
 ### 2.2 EngineCore 与 Scheduler
 

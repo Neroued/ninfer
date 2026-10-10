@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from decision_live import CHAT, chat_request, replay, replay_http, systemone_cases, validate_systemone
+from decision_validation import answer_delta, decision_difference, distribution, workflow, workflow_labels
 
 
 def response_for(request):
@@ -136,6 +137,50 @@ class SystemOneValidatorTest(unittest.TestCase):
             if previous is not None:
                 self.assertEqual(s["questions"], previous)
             previous = s["questions"]
+
+
+class WorkflowValidatorTest(unittest.TestCase):
+    def test_mixed_workflow_labels_are_independent_of_confidence(self):
+        request = workflow()
+        response = response_for(request)
+        self.assertEqual(len(request["questions"]), 13)
+        self.assertEqual(sum(q["type"] == "noul" for q in request["questions"].values()), 8)
+        for key, answer in response["answers"].items():
+            if answer["type"] == "noul":
+                answer["noul"] = .9 if request["state"]["controls"][key] else .1
+            elif answer["type"] == "choice":
+                answer["choice"] = request["state"][key]
+                answer["probabilities"] = {label: float(label == answer["choice"])
+                                           for label in answer["probabilities"]}
+            else:
+                answer["score"] = request["state"][key]
+                answer["probabilities"] = {label: float(int(label) == answer["score"])
+                                           for label in answer["probabilities"]}
+        validate_systemone(request, response)
+        self.assertEqual(workflow_labels(request, response), [])
+        response["answers"]["encrypted"]["noul"] = .1
+        self.assertEqual(workflow_labels(request, response), [
+            {"question": "encrypted", "expected": True, "actual": False}])
+
+    def test_probability_comparison_uses_noul_true_not_winner(self):
+        a = {"q": {"type": "noul", "noul": .1}}
+        b = {"q": {"type": "noul", "noul": .2}}
+        self.assertEqual(distribution(a["q"]), {"true": .1, "false": .9})
+        self.assertAlmostEqual(answer_delta(a, b), .1)
+        self.assertEqual(answer_delta(a, a), 0)
+        with self.assertRaises(ValueError):
+            answer_delta(a, {})
+
+    def test_selected_probabilities_do_not_hide_changed_winners(self):
+        a = {"results": [{"fields": {"q": {"value": True, "probability": .75}}}]}
+        b = copy.deepcopy(a)
+        self.assertEqual(decision_difference(a, b), (0, []))
+        b["results"][0]["fields"]["q"]["value"] = False
+        delta, changed = decision_difference(a, b)
+        self.assertEqual(delta, 0)
+        self.assertEqual(changed, [{"context": 0, "field": "q", "left": True, "right": False}])
+        with self.assertRaises(ValueError):
+            decision_difference(a, {"results": []})
 
 
 if __name__ == "__main__":

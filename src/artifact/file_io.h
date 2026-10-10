@@ -5,6 +5,10 @@
 #include <filesystem>
 #include <span>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace ninfer::artifact {
 
 // Direct reads require aligned offsets and buffers. A short final direct block is allowed;
@@ -24,8 +28,13 @@ public:
 
 private:
     std::filesystem::path path_;
+#if defined(_WIN32)
+    HANDLE fd_                = INVALID_HANDLE_VALUE;
+    mutable HANDLE direct_fd_ = INVALID_HANDLE_VALUE;
+#else
     int fd_                = -1;
     mutable int direct_fd_ = -1;
+#endif
     std::uint64_t bytes_   = 0;
 };
 

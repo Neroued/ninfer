@@ -54,8 +54,14 @@ void launch_fp8_a16_mma(const Fp8A16Operands& p, Output output, Epilogue epilogu
             constexpr auto kernel = fp8_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows>;
             const int bytes =
                 fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
+#if defined(_MSC_VER)
+            fp8_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows>
+                <<<grid, Schedule::kThreads, bytes, stream>>>(
+                    p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k, offset, count);
+#else
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
                 p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k, offset, count);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)
@@ -80,7 +86,12 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
     const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
+#if defined(_MSC_VER)
+        fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
+#else
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
 }
@@ -98,8 +109,14 @@ void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
             constexpr auto kernel = fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
                 fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+#if defined(_MSC_VER)
+            fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows>
+                <<<blocks, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset,
+                                                                count);
+#else
             kernel<<<blocks, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset,
                                                                   count);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)

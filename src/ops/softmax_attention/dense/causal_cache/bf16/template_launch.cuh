@@ -90,8 +90,14 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
         const int bytes =
             bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
         const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads);
+#if defined(_MSC_VER)
+        bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
+                                                          p.positions, p.scale, p.out, p.width);
+#else
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
                                                             p.positions, p.scale, p.out, p.width);
+#endif
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows) {

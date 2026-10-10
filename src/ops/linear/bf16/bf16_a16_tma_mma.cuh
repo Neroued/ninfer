@@ -90,8 +90,21 @@ inline constexpr int bf16_tma_scratch_bytes =
 template <class Schedule, bool FullTokens, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
-    const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
+#if defined(_MSC_VER)
+    // MSVC rejects the over-aligned (alignas(128)) descriptors as a by-value kernel parameter
+    // (C2719), so they travel as a device pointer on Windows; other compilers keep the
+    // __grid_constant__ by-value parameter. The body dereferences them identically.
+    const Bf16TmaDescriptors* descriptors,
+#else
+    const __grid_constant__ Bf16TmaDescriptors descriptors,
+#endif
+    Output output, Epilogue epilogue,
     int rows, int input_rows, int token_offset, int count) {
+#if defined(_MSC_VER)
+    const Bf16TmaDescriptors& tma = *descriptors;
+#else
+    const Bf16TmaDescriptors& tma = descriptors;
+#endif
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
     constexpr int S   = Schedule::kStages;
     const int K       = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -122,9 +135,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
-                bf16_tma_load<Schedule>(a + stage * BR * BK, &descriptors.weight, kt * (BK / 64),
+                bf16_tma_load<Schedule>(a + stage * BR * BK, &tma.weight, kt * (BK / 64),
                                         row_begin, full + stage);
-                bf16_tma_load<Schedule>(b + stage * BT * BK, &descriptors.activation,
+                bf16_tma_load<Schedule>(b + stage * BT * BK, &tma.activation,
                                         kt * (BK / 64), token_begin, full + stage);
             }
         }
@@ -152,6 +165,12 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                              cudaStream_t stream) {
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
+#if defined(_MSC_VER)
+    Bf16TmaDescriptors* device_descriptors = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&device_descriptors, sizeof(Bf16TmaDescriptors), stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(Bf16TmaDescriptors),
+                               cudaMemcpyHostToDevice, stream));
+#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
                                                           ? div_up(p.rows, Schedule::kBlockRows)
@@ -164,8 +183,16 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
             constexpr int bytes =
                 bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             bf16_prepare_shared<bytes, kernel>();
+#if defined(_MSC_VER)
+            // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+            // captured by this lambda (C2326), so reference the kernel template directly.
+            bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>
+                <<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
+                    device_descriptors, output, epilogue, p.rows, p.k, offset, count);
+#else
             kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
                 descriptors, output, epilogue, p.rows, p.k, offset, count);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)
@@ -173,6 +200,9 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
         else
             launch.template operator()<false>();
     });
+#if defined(_MSC_VER)
+    CUDA_CHECK(cudaFreeAsync(device_descriptors, stream));
+#endif
 }
 
 } // namespace ninfer::ops::detail

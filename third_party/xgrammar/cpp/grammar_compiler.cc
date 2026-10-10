@@ -1600,7 +1600,9 @@ CompiledGrammar GrammarCompiler::Impl::Compute(const UnionKey& key) {
         } else if constexpr (std::is_same_v<KeyType, BuiltinJSONGrammarKey>) {
           return this->no_cache_compiler_.CompileBuiltinJSONGrammar();
         } else {
-          XGRAMMAR_UNREACHABLE();
+          // MSVC's empty XGRAMMAR_UNREACHABLE() leaves this branch falling off the lambda's end
+          // (C4716). LogFatal's destructor is [[noreturn]], which every compiler understands.
+          XGRAMMAR_LOG(FATAL) << "Unhandled UnionKey alternative in GrammarCompiler::Impl::Compute";
         }
       },
       key

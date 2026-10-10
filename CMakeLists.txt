@@ -28,6 +28,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(WIN32)
+  # windows.h defines min/max macros that corrupt std::min/std::max and the CUDA
+  # headers; NOMINMAX is required for every translation unit on Windows.
+  add_compile_definitions(NOMINMAX)
+  # CCCL (bundled with CUDA 13) hard-requires the conforming MSVC preprocessor,
+  # and spdlog/fmt requires UTF-8 source encoding.
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS ninfer_link=1)
   set(CMAKE_JOB_POOL_LINK ninfer_link)

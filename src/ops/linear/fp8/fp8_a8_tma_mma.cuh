@@ -100,9 +100,22 @@ template <class Schedule, bool FullTokens, class Output, class Epilogue, bool Sp
           class RowPolicy = Fp8IdentityRows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
-    const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands, Output output,
+#if defined(_MSC_VER)
+    // MSVC rejects the over-aligned (alignas(128)) descriptors as a by-value kernel parameter
+    // (C2719), so they travel as a device pointer on Windows; other compilers keep the
+    // __grid_constant__ by-value parameter. The body dereferences them identically.
+    const Fp8TmaDescriptors* descriptors,
+#else
+    const __grid_constant__ Fp8TmaDescriptors descriptors,
+#endif
+    Fp8A8Operands operands, Output output,
     Epilogue epilogue, RowPolicy row_policy, int token_offset, int count, Fp8TmaSplitKPlan plan,
     float* partials) {
+#if defined(_MSC_VER)
+    const Fp8TmaDescriptors& tma = *descriptors;
+#else
+    const Fp8TmaDescriptors& tma = descriptors;
+#endif
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
     const int k = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
@@ -150,7 +163,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 cta_mbarrier_arrive_expect_tx(full + stage, (BT + BR) * BK);
-                fp8_tma_load(activation + stage * BT * BK, &descriptors.activation,
+                fp8_tma_load(activation + stage * BT * BK, &tma.activation,
                              (k_begin + kt) * BK, token_begin, full + stage);
                 if constexpr (RowPolicy::kPaired) {
                     // Each consumer warp owns both gate/up fragments. Load their contiguous
@@ -158,13 +171,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
                     constexpr int span = Schedule::kWarpRows / 2;
 #pragma unroll
                     for (int local = 0; local < BR; local += span) {
-                        fp8_tma_load(weight + (stage * BR + local) * BK, &descriptors.weight,
+                        fp8_tma_load(weight + (stage * BR + local) * BK, &tma.weight,
                                      (k_begin + kt) * BK,
                                      row_policy.weight_row(row_begin, local, operands.rows),
                                      full + stage);
                     }
                 } else {
-                    fp8_tma_load(weight + stage * BR * BK, &descriptors.weight, (k_begin + kt) * BK,
+                    fp8_tma_load(weight + stage * BR * BK, &tma.weight, (k_begin + kt) * BK,
                                  row_begin, full + stage);
                 }
             }
@@ -290,6 +303,12 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
     const Fp8TmaDescriptors descriptors{
         fp8_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK),
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
+#if defined(_MSC_VER)
+    Fp8TmaDescriptors* device_descriptors = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&device_descriptors, sizeof(Fp8TmaDescriptors), stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(Fp8TmaDescriptors),
+                               cudaMemcpyHostToDevice, stream));
+#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
@@ -300,8 +319,17 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
                 fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
+#if defined(_MSC_VER)
+            // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+            // captured by this lambda (C2326), so reference the kernel template directly.
+            fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy>
+                <<<grid, Schedule::kThreads, dynamic, stream>>>(
+                    device_descriptors, p, output, epilogue, row_policy, offset, count, plan,
+                    partials);
+#else
             kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
                 descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
+#endif
             CUDA_CHECK(cudaGetLastError());
             if constexpr (Split) {
                 fp8_a8_tma_split_k_reduce<Schedule>
@@ -330,6 +358,9 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
         else
             launch.template operator()<false, false>();
     });
+#if defined(_MSC_VER)
+    CUDA_CHECK(cudaFreeAsync(device_descriptors, stream));
+#endif
 }
 
 } // namespace ninfer::ops::detail

@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
 #include "runtime/engine/context_cache/types.h"
+#include "core/math_util.h"
 
 #include <algorithm>
 #include <array>
@@ -1189,9 +1190,14 @@ private:
             return left.priority.last_demand < right.priority.last_demand;
         }
         if (!left.priority.reused) {
-            const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
-            const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
-            if (a != b) { return a < b; }
+            // Rank by the loss-per-unit cross-products without __int128: multiply into
+            // 64-bit limbs and compare high words first.
+            std::uint64_t a_high = 0;
+            std::uint64_t b_high = 0;
+            const std::uint64_t a_low = core::u128_mul(left.loss, right.units, &a_high);
+            const std::uint64_t b_low = core::u128_mul(right.loss, left.units, &b_high);
+            if (a_high != b_high) { return a_high < b_high; }
+            if (a_low != b_low) { return a_low < b_low; }
         }
         return left.order < right.order;
     }

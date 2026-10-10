@@ -51,6 +51,19 @@ Machine-specific compiler and Python paths belong in the ignored `CMakeUserPrese
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 
 There is no install target or packaged binary distribution; run NInfer from its source build tree.
+
+### Windows (MSVC)
+
+Windows builds use MSVC with vcpkg-managed dependencies. Install [vcpkg](https://github.com/microsoft/vcpkg)
+and set the `VCPKG_ROOT` environment variable, then:
+
+```bash
+cmake --preset windows-vcpkg
+cmake --build build-win --config Release
+```
+
+FFmpeg and libcurl are declared in `vcpkg.json` with a pinned baseline; the vcpkg toolchain
+resolves them automatically. Linux builds continue to use `pkg-config` and are unaffected.
 Python tools run independently of CMake; the standalone HBM probe has its own
 [build command](tools/README.md#standalone-hbm-probe).
 

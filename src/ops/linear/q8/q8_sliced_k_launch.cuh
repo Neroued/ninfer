@@ -29,8 +29,14 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
             constexpr auto kernel =
                 q8_a16_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
             const int shared = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
+#if defined(_MSC_VER)
+            q8_a16_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>
+                <<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
+                                                              row_policy, offset);
+#else
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
                                                                  row_policy, offset);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (operands.rows % Schedule::kBlockRows == 0 && operands.k == operands.padded_k &&

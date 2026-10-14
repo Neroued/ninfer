@@ -6,11 +6,13 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import tempfile
 import time
 from typing import Callable
 
 import torch
 
+from tools.artifact.file_io import IO_CHUNK_BYTES
 from tools.artifact.schema import ResourceSpec
 from tools.artifact.tensor_output import TensorOutput
 from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
@@ -19,20 +21,34 @@ from .model import Model
 from .recipe import Recipe, WeightJob
 
 
+# Large weight objects must never expand a BytesIO to their full size, even
+# briefly for a write at a high offset (e.g. a separate quantization plane).
+_IN_MEMORY_OBJECT_BYTES = 8 * 1024 * 1024
+
+
 def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"conversion report cannot serialize {type(value).__name__}")
 
 
-class _BufferedObjectWriter:
-    """Private single-object sink used by one CPU conversion worker."""
+class _SpoolingObjectWriter:
+    """Private object sink, with large output backed by a temporary file."""
 
-    def __init__(self, obj):
+    def __init__(self, obj, directory: Path):
         self.by_id = {obj.id: obj}
         self._object = obj
-        self._data = bytearray(obj.bytes)
+        self._data = tempfile.SpooledTemporaryFile(
+            max_size=_IN_MEMORY_OBJECT_BYTES, mode="w+b", dir=directory
+        )
+        if obj.bytes > _IN_MEMORY_OBJECT_BYTES:
+            # Do this BEFORE any write: seeking past the RAM threshold can
+            # otherwise allocate the entire skipped range in BytesIO.
+            self._data.rollover()
         self._ranges = []
+
+    def close(self):
+        self._data.close()
 
     def _record(self, object_id, offset, length):
         if object_id != self._object.id:
@@ -48,10 +64,13 @@ class _BufferedObjectWriter:
     def write_region(self, object_id, offset, data):
         view = memoryview(data).cast("B")
         self._record(object_id, offset, len(view))
-        self._data[offset : offset + len(view)] = view
+        if view:
+            self._data.seek(offset)
+            self._data.write(view)
 
     def write_zeros(self, object_id, offset, length):
-        # bytearray() is already zero-filled. Only record coverage.
+        # Unwritten portions of the temporary file read as zero, including
+        # gaps between quantization planes and trailing alignment padding.
         self._record(object_id, offset, length)
 
     def finish(self):
@@ -75,13 +94,19 @@ class _BufferedObjectWriter:
                 f"at [{cursor},{self._object.bytes})"
             )
 
+        self._data.truncate(self._object.bytes)
+        self._data.seek(0)
         return self._data
 
 
-def _produce_buffered(job, obj):
-    sink = _BufferedObjectWriter(obj)
-    job.prepared.produce(TensorOutput(sink, job.spec.id))
-    return sink.finish()
+def _produce_spooled(job, obj, directory):
+    sink = _SpoolingObjectWriter(obj, directory)
+    try:
+        job.prepared.produce(TensorOutput(sink, job.spec.id))
+        return sink.finish()
+    except BaseException:
+        sink.close()
+        raise
 
 
 def convert(
@@ -179,46 +204,55 @@ def convert(
         else:
             total = len(prepared.weights)
             window = min(total, workers * 2)
+            futures = {}
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix="ninfer-convert",
+                ) as executor:
 
-            with ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="ninfer-convert",
-            ) as executor:
-                futures = {}
+                    def submit(index):
+                        job = prepared.weights[index]
+                        if progress is not None:
+                            progress(index, total, job)
+                        obj = writer.by_id[job.spec.id]
+                        futures[index] = executor.submit(
+                            _produce_spooled, job, obj, path.parent
+                        )
 
-                def submit(index):
-                    job = prepared.weights[index]
-                    if progress is not None:
-                        progress(index, total, job)
-                    obj = writer.by_id[job.spec.id]
-                    futures[index] = executor.submit(
-                        _produce_buffered,
-                        job,
-                        obj,
-                    )
+                    for index in range(window):
+                        submit(index)
 
-                for index in range(window):
-                    submit(index)
+                    next_submit = window
 
-                next_submit = window
+                    for index, job in enumerate(prepared.weights):
+                        future = futures.pop(index)
 
-                for index, job in enumerate(prepared.weights):
-                    future = futures.pop(index)
+                        try:
+                            data = future.result()
+                        except Exception as error:
+                            label = ", ".join(job.parameters[:4])
+                            raise ValueError(
+                                f"{label} [{job.method_name}/{job.spec.format}]: {error}"
+                            ) from error
 
-                    try:
-                        data = future.result()
-                    except Exception as error:
-                        label = ", ".join(job.parameters[:4])
-                        raise ValueError(
-                            f"{label} [{job.method_name}/{job.spec.format}]: {error}"
-                        ) from error
+                        # A single thread publishes complete objects, but
+                        # reads their staged bytes in bounded chunks.
+                        with data:
+                            writer.write_object(
+                                job.spec.id,
+                                iter(lambda: data.read(IO_CHUNK_BYTES), b""),
+                            )
 
-                    # Publication remains strictly ordered and single-threaded.
-                    writer.write_object(job.spec.id, data)
-
-                    if next_submit < total:
-                        submit(next_submit)
-                        next_submit += 1
+                        if next_submit < total:
+                            submit(next_submit)
+                            next_submit += 1
+            finally:
+                # Executor shutdown waits for submitted jobs. Close staged
+                # outputs that were never published after an earlier failure.
+                for future in futures.values():
+                    if future.done() and not future.cancelled() and future.exception() is None:
+                        future.result().close()
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()

@@ -5,6 +5,7 @@ import torch
 from safetensors.torch import save_file
 
 from tools.artifact.reader import Artifact
+from tools.convert import pipeline
 from tools.convert.model import Model, Parameter
 from tools.convert.pipeline import convert
 from tools.convert.recipe import Recipe
@@ -27,7 +28,12 @@ def _object_bytes(path):
         }
 
 
-def test_parallel_cpu_conversion_matches_serial_with_sharded_sources(tmp_path):
+def test_parallel_cpu_conversion_matches_serial_with_sharded_sources(
+    tmp_path, monkeypatch
+):
+    # Force every quantized output to the disk-backed path, including writes
+    # at large, out-of-order offsets in separate quantization planes.
+    monkeypatch.setattr(pipeline, "_IN_MEMORY_OBJECT_BYTES", 1024)
     source_dir = tmp_path / "source"
     source_dir.mkdir()
 

@@ -131,7 +131,11 @@ def main(argv=None):
         "--workers",
         type=int,
         default=1,
-        help="parallel CPU weight conversion workers; CUDA currently requires 1",
+        help=(
+            "parallel CPU weight conversion workers (default: 1); "
+            "CUDA requires 1; large objects use temporary disk space "
+            "in the output directory"
+        ),
     )
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import tempfile
 import time
 from typing import Callable
 
 import torch
 
+from tools.artifact.file_io import IO_CHUNK_BYTES
 from tools.artifact.schema import ResourceSpec
 from tools.artifact.tensor_output import TensorOutput
 from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
@@ -18,10 +21,92 @@ from .model import Model
 from .recipe import Recipe, WeightJob
 
 
+# Large weight objects must never expand a BytesIO to their full size, even
+# briefly for a write at a high offset (e.g. a separate quantization plane).
+_IN_MEMORY_OBJECT_BYTES = 8 * 1024 * 1024
+
+
 def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"conversion report cannot serialize {type(value).__name__}")
+
+
+class _SpoolingObjectWriter:
+    """Private object sink, with large output backed by a temporary file."""
+
+    def __init__(self, obj, directory: Path):
+        self.by_id = {obj.id: obj}
+        self._object = obj
+        self._data = tempfile.SpooledTemporaryFile(
+            max_size=_IN_MEMORY_OBJECT_BYTES, mode="w+b", dir=directory
+        )
+        if obj.bytes > _IN_MEMORY_OBJECT_BYTES:
+            # Do this BEFORE any write: seeking past the RAM threshold can
+            # otherwise allocate the entire skipped range in BytesIO.
+            self._data.rollover()
+        self._ranges = []
+
+    def close(self):
+        self._data.close()
+
+    def _record(self, object_id, offset, length):
+        if object_id != self._object.id:
+            raise ValueError(f"unexpected buffered object {object_id!r}")
+        if offset < 0 or length < 0 or offset + length > self._object.bytes:
+            raise ValueError(
+                f"{object_id}: buffered output [{offset},{offset+length}) "
+                f"exceeds {self._object.bytes} bytes"
+            )
+        if length:
+            self._ranges.append((offset, offset + length))
+
+    def write_region(self, object_id, offset, data):
+        view = memoryview(data).cast("B")
+        self._record(object_id, offset, len(view))
+        if view:
+            self._data.seek(offset)
+            self._data.write(view)
+
+    def write_zeros(self, object_id, offset, length):
+        # Unwritten portions of the temporary file read as zero, including
+        # gaps between quantization planes and trailing alignment padding.
+        self._record(object_id, offset, length)
+
+    def finish(self):
+        cursor = 0
+        for begin, end in sorted(self._ranges):
+            if begin < cursor:
+                raise ValueError(
+                    f"{self._object.id}: duplicate buffered coverage "
+                    f"at [{begin},{end})"
+                )
+            if begin > cursor:
+                raise ValueError(
+                    f"{self._object.id}: missing buffered coverage "
+                    f"at [{cursor},{begin})"
+                )
+            cursor = end
+
+        if cursor != self._object.bytes:
+            raise ValueError(
+                f"{self._object.id}: missing buffered coverage "
+                f"at [{cursor},{self._object.bytes})"
+            )
+
+        self._data.truncate(self._object.bytes)
+        self._data.seek(0)
+        return self._data
+
+
+def _produce_spooled(job, obj, directory):
+    sink = _SpoolingObjectWriter(obj, directory)
+    try:
+        job.prepared.produce(TensorOutput(sink, job.spec.id))
+        return sink.finish()
+    except BaseException:
+        sink.close()
+        raise
 
 
 def convert(
@@ -34,6 +119,7 @@ def convert(
     device: str = "cuda",
     rows_per_chunk: int = 512,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    workers: int = 1,
     progress: Callable[[int, int, WeightJob], None] | None = None,
 ) -> dict:
     path = Path(output)
@@ -45,6 +131,10 @@ def convert(
     chosen_device = torch.device(device)
     if chosen_device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA conversion requested but CUDA is unavailable")
+    if type(workers) is not int or workers <= 0:
+        raise ValueError("--workers must be a positive integer")
+    if chosen_device.type != "cpu" and workers != 1:
+        raise ValueError("--workers > 1 is currently supported only with --device cpu")
     start = time.perf_counter()
     prepared = recipe.prepare(device=str(chosen_device), rows_per_chunk=rows_per_chunk)
     preparation_seconds = time.perf_counter() - start
@@ -66,6 +156,7 @@ def convert(
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "rows_per_chunk": rows_per_chunk,
+        "workers": workers,
         "provenance": provenance,
         "preparation_seconds": preparation_seconds,
         "parameters": len(model.parameters),
@@ -99,16 +190,69 @@ def convert(
     ) as writer:
         for object_id, data in model.resources.items():
             writer.write_object(object_id, data)
-        for index, job in enumerate(prepared.weights):
-            if progress is not None:
-                progress(index, len(prepared.weights), job)
+        if workers == 1:
+            for index, job in enumerate(prepared.weights):
+                if progress is not None:
+                    progress(index, len(prepared.weights), job)
+                try:
+                    job.prepared.produce(TensorOutput(writer, job.spec.id))
+                except Exception as error:
+                    label = ", ".join(job.parameters[:4])
+                    raise ValueError(
+                        f"{label} [{job.method_name}/{job.spec.format}]: {error}"
+                    ) from error
+        else:
+            total = len(prepared.weights)
+            window = min(total, workers * 2)
+            futures = {}
             try:
-                job.prepared.produce(TensorOutput(writer, job.spec.id))
-            except Exception as error:
-                label = ", ".join(job.parameters[:4])
-                raise ValueError(
-                    f"{label} [{job.method_name}/{job.spec.format}]: {error}"
-                ) from error
+                with ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix="ninfer-convert",
+                ) as executor:
+
+                    def submit(index):
+                        job = prepared.weights[index]
+                        if progress is not None:
+                            progress(index, total, job)
+                        obj = writer.by_id[job.spec.id]
+                        futures[index] = executor.submit(
+                            _produce_spooled, job, obj, path.parent
+                        )
+
+                    for index in range(window):
+                        submit(index)
+
+                    next_submit = window
+
+                    for index, job in enumerate(prepared.weights):
+                        future = futures.pop(index)
+
+                        try:
+                            data = future.result()
+                        except Exception as error:
+                            label = ", ".join(job.parameters[:4])
+                            raise ValueError(
+                                f"{label} [{job.method_name}/{job.spec.format}]: {error}"
+                            ) from error
+
+                        # A single thread publishes complete objects, but
+                        # reads their staged bytes in bounded chunks.
+                        with data:
+                            writer.write_object(
+                                job.spec.id,
+                                iter(lambda: data.read(IO_CHUNK_BYTES), b""),
+                            )
+
+                        if next_submit < total:
+                            submit(next_submit)
+                            next_submit += 1
+            finally:
+                # Executor shutdown waits for submitted jobs. Close staged
+                # outputs that were never published after an earlier failure.
+                for future in futures.values():
+                    if future.done() and not future.cancelled() and future.exception() is None:
+                        future.result().close()
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()

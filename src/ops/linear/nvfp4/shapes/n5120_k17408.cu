@@ -17,6 +17,7 @@ using C5      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 5, 1, Nvfp4SimtActivationAcces
                                      Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R32  = Nvfp4A4MmaSchedule<32, 32, 256, 2, 2, 4, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
@@ -44,6 +45,7 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
     if (tokens >= 1024) return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K17408>();
+    if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T32R32>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T32R128>();
     if (tokens <= 192) return nvfp4_a4_mma_route<Geometry, T64R128>();

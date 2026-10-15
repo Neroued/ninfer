@@ -13,6 +13,7 @@ namespace ninfer::ops::detail {
 namespace {
 
 using M32N64            = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using M32N32            = Nvfp4A4MmaSchedule<32, 32, 256, 2, 2, 4, 2>;
 using M32N128           = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
@@ -34,7 +35,9 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace worksp
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    if (tokens <= 64) {
+    if (tokens <= 16) {
+        launch_gemm<Geometry, M32N32>(weight, residual, workspace, tokens, stream);
+    } else if (tokens <= 64) {
         launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 128) {
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);

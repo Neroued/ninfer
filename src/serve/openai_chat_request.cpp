@@ -61,8 +61,8 @@ std::string require_function_name(const Json& object, const char* param) {
         bad_request("function name must be a string", param);
     }
     std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+    if (!valid_tool_name(name, 128)) {
+        bad_request("function name must match [A-Za-z0-9_-]{1,128}", param);
     }
     return name;
 }

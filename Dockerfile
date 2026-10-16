@@ -12,6 +12,7 @@ RUN apt-get update \
         libcurl4-openssl-dev \
         libhwloc-dev \
         libswscale-dev \
+        liburing-dev \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -38,6 +39,7 @@ RUN apt-get update \
         libcurl4t64 \
         libhwloc15 \
         libswscale7 \
+        liburing2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer

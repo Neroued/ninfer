@@ -49,6 +49,14 @@ Nvfp4LinearAddPlan select_nvfp4_add_n5120_k17408(LinearPolicy policy, std::int32
     if (!allows_a4(policy) || tokens < 8) return {select_a16(tokens)};
     if (tokens >= 1024)
         return {nullptr, launch_nvfp4_add_n5120_k17408_tma, Nvfp4ScaleLayout::Tiled256};
+    // At 64 rows per CTA the 5120 output rows are 80 CTAs on 170 SMs, so a speculative verify
+    // streams its 50 MB of weights from fewer than half the SMs: 46 us at T=8, about 1.1 TB/s.
+    // Halving the tile fills the device, and the long K loop then wants a deeper pipeline: 40 us
+    // at T=8 and T=16. Same per-row K order, so the bytes do not change. From 33 the narrower
+    // tile re-reads the weights for each token tile and loses, so 33..64 keep M32N64.
+    if (tokens <= 32)
+        return {nullptr,
+                launch_nvfp4_add_a4<Instance<Nvfp4A4MmaSchedule<32, 32, 256, 2, 4, 4, 2>>>};
     if (tokens <= 64)
         return {nullptr,
                 launch_nvfp4_add_a4<Instance<Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>>>};

@@ -47,6 +47,10 @@ int run_profile(const Profile& profile) {
             .tokens = 16, .policy = ops::LinearPolicy::AllowA4, .arithmetic = Arithmetic::A4},
         Invocation{
             .tokens = 32, .policy = ops::LinearPolicy::AllowA4, .arithmetic = Arithmetic::A4},
+        // 32 and 33 straddle the K=17408 narrow-tile seam: the last width M32N32 takes and the
+        // first that returns to M32N64.
+        Invocation{
+            .tokens = 33, .policy = ops::LinearPolicy::AllowA4, .arithmetic = Arithmetic::A4},
         Invocation{
             .tokens = 64, .policy = ops::LinearPolicy::AllowA4, .arithmetic = Arithmetic::A4},
         Invocation{

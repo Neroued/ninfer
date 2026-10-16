@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/transactions/reclaim.h"
 
 #include "core/device.h"
 #include "models/common/context/work.h"
@@ -417,56 +418,6 @@ struct ReleasePlan {
     ContextResources released;
     ReleasedPages pages;
 };
-
-template <typename Prefix>
-std::uint64_t recovery_loss(const ProgramImpl& program, std::span<const CheckpointHandle> removed,
-                            std::span<const CheckpointHandle> surviving, Prefix&& prefix) {
-    std::vector<CheckpointHandle> ordered;
-    for (const auto handle : removed) {
-        if (program.valid_checkpoint(handle) &&
-            std::find(ordered.begin(), ordered.end(), handle) == ordered.end()) {
-            ordered.push_back(handle);
-        }
-    }
-    std::sort(ordered.begin(), ordered.end(), [&](auto left, auto right) {
-        const auto l = program.checkpoint(left).frontier(),
-                   r = program.checkpoint(right).frontier();
-        return l != r ? l > r : left.index < right.index;
-    });
-
-    struct LineageLoss {
-        CheckpointHandle deepest;
-        std::uint32_t tokens;
-    };
-
-    std::vector<LineageLoss> lineages;
-    for (const auto handle : ordered) {
-        const auto& record     = program.checkpoint(handle);
-        std::uint32_t fallback = 0;
-        for (const auto retained : surviving) {
-            if (!program.valid_checkpoint(retained) ||
-                std::find(ordered.begin(), ordered.end(), retained) != ordered.end()) {
-                continue;
-            }
-            const auto& candidate = program.checkpoint(retained);
-            if (candidate.frontier() > fallback && prefix(retained, handle)) {
-                fallback = candidate.frontier();
-            }
-        }
-        const auto lost    = record.frontier() - fallback;
-        const auto lineage = std::find_if(lineages.begin(), lineages.end(), [&](const auto& item) {
-            return prefix(handle, item.deepest);
-        });
-        if (lineage == lineages.end()) {
-            lineages.push_back({handle, lost});
-        } else {
-            lineage->tokens = std::max(lineage->tokens, lost);
-        }
-    }
-    std::uint64_t result = 0;
-    for (const auto& lineage : lineages) { result += lineage.tokens; }
-    return result;
-}
 
 std::uint64_t
 ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,

@@ -3,7 +3,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ninfer/ops/moe.h"
-#include "models/common/moe/graph.h"
+#include "models/common/moe/schedule.h"
 
 #include <array>
 #include <functional>
@@ -17,7 +17,7 @@ namespace ninfer::models::qwen3_5::execution {
 // MoE definitions share exact-T bindings across the attention context profiles.
 struct TextGraphDefinition {
     DecodeGraphDefinition prefix, suffix;
-    std::vector<moe::LayerGraphDefinition> layers;
+    std::vector<std::shared_ptr<const moe::LayerGraphDefinition>> layers;
 
     explicit TextGraphDefinition(std::size_t layers, const TextGraphDefinition* shared = nullptr);
 };
@@ -54,11 +54,11 @@ public:
     void begin_layers();
     void end_layers();
     void finish();
-    void capture_layer(std::size_t layer, moe::Resources&, ExpertBankId, std::int32_t tokens,
+    void capture_layer(std::size_t layer, moe::Schedule&, ExpertBankId, std::int32_t tokens,
                        const std::function<void()>& mixer,
-                       const std::function<void(const moe::PreparedExecution&)>& gpu_moe,
+                       const std::function<void(const moe::GpuCall&)>& gpu_moe,
                        const std::function<void()>& feature = {});
-    void replay_layer(std::size_t layer, moe::Resources&, ExpertBankId, Tensor& output);
+    void replay_layer(std::size_t layer, Tensor& output);
 
 private:
     void first_submitted();

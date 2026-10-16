@@ -14,8 +14,6 @@ foreach(form IN ITEMS expand_norm grouped_rmsnorm combine combine_norm)
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${form}.cpp"
     LIBRARIES ninfer_hc_test_support)
 endforeach()
-if(NINFER_TARGET STREQUAL "rtx5090")
-  ninfer_add_op_test(ninfer_hc_mix_test
-    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mix.cpp"
-    LIBRARIES ninfer_hc_test_support)
-endif()
+ninfer_add_op_test(ninfer_hc_mix_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mix.cpp"
+  LIBRARIES ninfer_hc_test_support)

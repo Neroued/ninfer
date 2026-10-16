@@ -153,12 +153,21 @@ Engine 在大权重读取前消费无地址的 `ModelProfile`，规划固定权�
 MoE backing。权重加载后以少量物理 KV 页校准完整的 Graph 集合，保留实际 context、batch、
 speculative 配置与拓扑共享关系；临时 Host context cache 为零。校准资源销毁后重新取得可用显存，
 扣除 Graph 重建估计，再确定正式 KV 与 expert cache 容量。静态容量曲线只计算显式 backing。
-Qwen3.5 MoE 在全量 GPU 候选不可行时选择 Host Main experts；Qwen4Exp Main 当前固定使用
-Host 来源及 Program 所有的 GPU 副本。放置候选由原生 Startup 提供，两个候选不同时持有模型，
+Qwen3.5 MoE 与 Qwen4Exp 均优先尝试全量 GPU 放置；5090 的候选还包括 Host Main experts
+及 Program 所有的 GPU 副本。Spark 提供全量 GPU 放置。候选由原生 Startup 提供，
+ModelProfile 只记录表示与几何；Runtime 不解释 MoE cache/team 计划。候选不同时持有模型，
 见[Expert 权重缓存](expert-weight-cache.md)。
 `NINFER_VRAM_BUDGET_MIB` 限定引擎 Device 预算，实际可用显存构成另一上限。
+Spark 的 GPU 与 Host 分配共享物理内存，预算快照采用 Linux `MemAvailable`，并以 CUDA
+总容量为上限；CUDA 可以在分配时回收其空闲查询没有计入的文件缓存。容量规划还计入 PLE
+准备区及 pinned ingress/egress 等已知 Host 分配。启用 Vision 时，另为 Frontend 的
+`media_live_bytes` 留出容量；该上限已包含 retained cache，不重复加 `media_cache_bytes`。
+这部分预留在正式 Program 建立后仍须保留，计入报告的总 headroom。5090 继续使用 CUDA 空闲容量。
+Spark 不建立 Host State/KV cache，保留 Device 前缀复用和 Replay；PLE 磁盘准备缓冲独立计费。
 Runtime 的 `model_startup.h` 统一预算、候选选择、校准收敛和有界重建；模型侧 `Startup` 提供
-权重放置、容量计划、Frontend 构造和 Graph 校准合同。公共启动流程不解释具体层布局。
+权重放置、容量计划、Frontend 构造和 Graph 校准合同。公共启动流程不解释具体层布局，
+只传递模型拥有的准备描述；实体执行布局移交 Program 后，
+校准与重试所需的描述仍然有效。PLE 规划使用独立几何，不借用可能被销毁的候选 Model。
 ModelInstance 持有 Model、const Parameters、Frontend 与 Program；Parameters 持有与最终
 容量计划相同的不可变执行 profile。纯逻辑加载不要求建立执行 profile。
 
@@ -422,7 +431,8 @@ forward 重叠；两段共享同一个资源预留和提交边界。
 
 MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。
 稳定缓存合并 mixer 与 MoE GPU 提交；恢复和流式加载时分开，保留 mixer 与上传重叠。
-`models/common/moe/graph` 负责单层 GPU subset 图及 CPU/cache 交接；调用方提供 mixer、MoE 和
+`models/common/moe/schedule` 向模型提供图交接接口，`offload/graph` 实现 GPU subset 图及
+CPU/cache 交接；调用方提供 mixer、MoE 和
 可选 feature 的 GPU body。Text 与 speculative 的 prefix/suffix、层遍历及跨拓扑共享关系仍由原生
 Program 定义。
 Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照。释放后仍保留的驱动开销
@@ -432,8 +442,9 @@ Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照�
 这些差值包含 CUDA 延迟加载和驱动缓存，不作为纯 Graph allocation 的精确归因。
 `runtime_reservation_bytes` 仅包含显式 Program backing。
 正式准备的增长单独报告，以实际总占用是否满足 Device 预算判断启动，不要求它小于估计值。
-显式与自动 KV 容量统一使用至少 1 GiB headroom，自动容量显式要求更大余量时取其值。
-这部分是容量规划缓冲，用于容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑类重复预留。
+显式与自动 KV 容量统一使用至少 1 GiB 基础 headroom，自动容量显式要求更大余量时取其值。
+基础 headroom 用于容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑类重复预留。
+Spark Vision 的 live media 预留另行计入总 headroom，正式 Program 建立后仍保留这部分容量。
 正式分配不足时最多进行一次容量纠偏重建；只调整自动 KV 或可选 expert cache，保持显式容量与执行功能。
 Device 分配不足可以回收，
 执行错误与 Host 内存分配失败不作为缩减 GPU 容量的理由。

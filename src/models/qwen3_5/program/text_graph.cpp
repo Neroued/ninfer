@@ -1,23 +1,20 @@
 #include "models/qwen3_5/program/text_graph.h"
-#include "models/common/moe/plan.h"
 
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
 TextGraphDefinition::TextGraphDefinition(std::size_t count, const TextGraphDefinition* shared)
     : layers(count) {
-    for (std::size_t i = 0; i < count; ++i)
-        layers[i].moe =
-            shared ? shared->layers.at(i).moe : std::make_shared<moe::SubsetGraphDefinitions>();
+    if (shared) layers = shared->layers;
 }
 
 struct TextGraphExecutable::Target {
-    std::vector<moe::LayerGraphExecutable> layers;
+    std::vector<std::unique_ptr<moe::LayerGraphExecutable>> layers;
     const TextGraphDefinition* installed;
 
     explicit Target(const TextGraphDefinition& definition) : installed(&definition) {
         layers.reserve(definition.layers.size());
-        for (const auto& layer : definition.layers) layers.emplace_back(layer);
+        for (const auto& layer : definition.layers) layers.push_back(layer->instantiate());
     }
 };
 
@@ -39,14 +36,14 @@ void TextGraphExecutable::activate(const TextGraphDefinition& definition) {
     if (target_->layers.size() != definition.layers.size())
         throw std::logic_error("text graph layer count changed");
     for (std::size_t i = 0; i < target_->layers.size(); ++i)
-        target_->layers[i].update(definition.layers[i]);
+        target_->layers[i]->update(*definition.layers[i]);
     target_->installed = &definition;
 }
 
 void TextGraphExecutable::upload(cudaStream_t stream) {
     prefix_.upload(stream);
     suffix_.upload(stream);
-    for (auto& layer : target_->layers) layer.upload(stream);
+    for (auto& layer : target_->layers) layer->upload(stream);
 }
 
 TextGraphRun::TextGraphRun(TextGraphDefinition& definition, CudaExecutionView cuda)
@@ -92,18 +89,16 @@ void TextGraphRun::first_submitted() {
     }
 }
 
-void TextGraphRun::capture_layer(std::size_t layer, moe::Resources& resources, ExpertBankId bank,
+void TextGraphRun::capture_layer(std::size_t layer, moe::Schedule& resources, ExpertBankId bank,
                                  std::int32_t tokens, const std::function<void()>& mixer,
-                                 const std::function<void(const moe::PreparedExecution&)>& gpu_moe,
+                                 const std::function<void(const moe::GpuCall&)>& gpu_moe,
                                  const std::function<void()>& feature) {
-    moe::capture_layer(definition_->layers.at(layer), resources, bank, cuda_, tokens, mixer,
-                       gpu_moe, feature);
+    auto& definition = definition_->layers.at(layer);
+    definition = resources.capture_layer(bank, cuda_, tokens, mixer, gpu_moe, feature, definition);
 }
 
-void TextGraphRun::replay_layer(std::size_t layer, moe::Resources& resources, ExpertBankId bank,
-                                Tensor& output) {
-    executable_->target_->layers.at(layer).replay(resources, bank, output, cuda_,
-                                                  [this] { first_submitted(); });
+void TextGraphRun::replay_layer(std::size_t layer, Tensor& output) {
+    executable_->target_->layers.at(layer)->replay(output, cuda_, [this] { first_submitted(); });
 }
 
 } // namespace ninfer::models::qwen3_5::execution

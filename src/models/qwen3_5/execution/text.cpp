@@ -1,7 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/program/speculative/mtp_alignment.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/schedule.h"
 #include "models/qwen3_5/program/text_graph.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/dense_mlp.h"
@@ -232,7 +232,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          LinearAttentionStateView& state, qwen3_5::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv, moe::Resources* moe)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv, moe::Schedule* moe)
     : moe_(moe), ctx_(ctx), execution_(ctx.execution_view()), parameters_(weights),
       config_(weights.model.config().text), work_(work), mtp_kv_(mtp_kv),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io),
@@ -1095,7 +1095,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill   = ph == Phase::Prefill;
     const bool recording = graphs_ && graphs_->recording();
     if (graphs_) graphs_->begin_layers();
-    const auto cpu_activity = moe_ && !recording ? moe_->begin(x.ne[1]) : std::nullopt;
+    const auto expert_activity = moe_ && !recording ? moe_->begin(x.ne[1]) : std::nullopt;
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const auto* routed = std::get_if<moe::Parameters>(&block.ffn);
@@ -1116,13 +1116,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             else
                 gdn_mix(block, x, compact, ph);
         };
-        const auto gpu_moe = [&](const moe::PreparedExecution& call, moe::GpuSubmission mode) {
+        const auto gpu_moe = [&](const moe::GpuCall& call) {
             auto scope    = work_.scope();
             Tensor hidden = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
             ops::rmsnorm(x, block.post_attention_norm, config_.rms_norm_eps, true, hidden,
                          execution_);
-            moe::enqueue_gpu(hidden, call, x, work_, mode,
-                             next_projection_hints(static_cast<int>(layer)));
+            call(hidden, x, work_, next_projection_hints(static_cast<int>(layer)));
         };
         try {
             if (!graphs_) {
@@ -1149,14 +1148,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                             tap.capture_layer(static_cast<int>(layer), x, execution_);
                         };
                 }
-                graphs_->capture_layer(
-                    layer, *moe_, routed->bank, x.ne[1], mixer,
-                    [&](const moe::PreparedExecution& call) {
-                        gpu_moe(call, moe::GpuSubmission::Capture);
-                    },
-                    feature);
+                graphs_->capture_layer(layer, *moe_, routed->bank, x.ne[1], mixer, gpu_moe,
+                                       feature);
             } else {
-                graphs_->replay_layer(layer, *moe_, routed->bank, x);
+                graphs_->replay_layer(layer, x);
             }
         } catch (const DeviceAllocationError&) { throw; } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +

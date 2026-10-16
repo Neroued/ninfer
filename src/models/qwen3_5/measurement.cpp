@@ -27,13 +27,13 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
         auto& execution = facts["moe_execution"];
         execution       = {{"implementation", "eager-fixed-windows-2"},
                            {"chunk", chunk},
-                           {"workers", moe->team.worker_cpus.size()},
-                           {"cache_bytes", moe->cache.config.capacity_bytes},
-                           {"fixed_bytes", moe->cache.config.fixed_bytes},
-                           {"window_count", moe->window_count},
+                           {"workers", moe->description().cpu_workers},
+                           {"cache_bytes", moe->description().cache_bytes},
+                           {"fixed_bytes", moe->description().fixed_bytes},
+                           {"window_count", moe->description().window_count},
                            {"layers", Json::array()}};
-        for (const auto& layer : moe->layers) {
-            execution["layers"].push_back({layer.hybrid_max_tokens, layer.spec.priority,
+        for (const auto& layer : moe->description().layers) {
+            execution["layers"].push_back({layer.hybrid_max_tokens, layer.priority,
                                            layer.fixed_experts, layer.cache_experts});
         }
     }

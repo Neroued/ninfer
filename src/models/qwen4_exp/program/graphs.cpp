@@ -138,7 +138,7 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
     const execution::TextExecution execution{r.workspace,
                                              *r.states,
                                              r.main->cache,
-                                             *r.experts,
+                                             r.experts.get(),
                                              r.tensor(buffers.main_qsa.keys),
                                              r.tensor(buffers.main_qsa.coordinates),
                                              r.tensor(buffers.ple_records)};
@@ -154,14 +154,14 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
         run.consume_ple(ple[0]);
         run.suffix(output);
         p.device.synchronize();
-        selected.prepare(run, p.parameters, *r.experts, bounds_, ple, output, tokens * batch,
+        selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, tokens * batch,
                          r.workspace, p.device);
     }
     selected.select(bounds_.back());
     execution::TextRun run(p.parameters, execution, call, update, p.cuda);
-    selected.prefix(*r.experts, run.block_output(), p.cuda);
+    selected.prefix(p.cuda);
     selected.consume_ple(0, p.cuda);
-    selected.suffix(*r.experts, run.block_output(), p.cuda);
+    selected.suffix(p.cuda);
     p.device.synchronize();
 }
 
@@ -194,7 +194,8 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
 void Graphs::prepare() {
     auto& p = owner_;
     auto& r = p.resources;
-    moe::Resources::Preparation preparation(*r.experts);
+    std::optional<moe::Schedule::Preparation> preparation;
+    if (r.experts) preparation.emplace(*r.experts);
     CaptureInputs inputs(p);
     inputs.prepare();
     batches_.resize(p.shape.max_concurrency);
@@ -226,7 +227,7 @@ void Graphs::prepare() {
             graph.accept_workspace = r.workspace.peak_used();
         }
     }
-    r.experts->restore_cache_after_preparation();
+    if (r.experts) r.experts->restore_cache_after_preparation();
     p.device.synchronize();
     r.workspace.reset_peak();
 }
@@ -276,8 +277,7 @@ void ProgramImpl::initialize_graphs() {
 }
 
 void ProgramImpl::release_graphs() {
-    device.synchronize();
-    resources.experts->synchronize();
+    resources.synchronize();
     graphs.reset();
 }
 

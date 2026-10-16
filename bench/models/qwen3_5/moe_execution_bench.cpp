@@ -2,7 +2,7 @@
 #include "core/transfer.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/load.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/offload/resources.h"
 #include "ninfer/ops/sum_contributions.h"
 
 #include <cuda_profiler_api.h>
@@ -22,10 +22,11 @@
 
 namespace {
 using namespace ninfer;
-namespace model  = ninfer::models::qwen3_5;
-namespace shared = ninfer::models::moe;
-using Clock      = std::chrono::steady_clock;
-using Kind       = ops::ExpertSubsetKind;
+namespace model     = ninfer::models::qwen3_5;
+namespace model_moe = ninfer::models::moe;
+namespace offload   = model_moe::offload;
+using Clock         = std::chrono::steady_clock;
+using Kind          = ops::ExpertSubsetKind;
 
 struct Options {
     std::string artifact;
@@ -113,7 +114,7 @@ std::uint16_t bf16(float value) {
 struct Layer {
     artifact::MaterializedArtifact backing;
     ExpertBankSource source;
-    shared::Parameters parameters;
+    model_moe::Parameters parameters;
 
     Layer(const Options& options, DeviceContext& device) {
         artifact::Reader reader(options.artifact);
@@ -218,8 +219,8 @@ MemorySpan bytes(const Tensor& tensor, bool pinned = false) {
     return {tensor.data, tensor.bytes(), tensor.device, pinned};
 }
 
-void serial(const Tensor& x, const shared::Parameters& p, shared::PartitionView partition,
-            Tensor& residual, MemoryArena& work, shared::ExecutionView execution,
+void serial(const Tensor& x, const model_moe::Parameters& p, offload::PartitionView partition,
+            Tensor& residual, MemoryArena& work, offload::ExecutionView execution,
             SerialFrame& frame, const ExpertBankSource& source, const ExpertBankDeviceView& bank) {
     auto& host = *execution.host;
     ops::topk_softmax_route(
@@ -293,11 +294,11 @@ void run(const Options& options) {
     selected.resize(options.gpu_experts);
     std::vector<bool> on_gpu(e);
     for (const auto id : selected) on_gpu[id] = true;
-    shared::Partition partition({0}, e, selected, device);
+    offload::Partition partition({0}, e, selected, device);
     const auto requirements =
-        shared::describe_execution(p.profile, partition.gpu_kind(), ops::MoeEpilogue::AddResidual,
-                                   options.tokens, options.tokens);
-    shared::Bridge resources(requirements, topology, team, device);
+        offload::describe_execution(p.profile, partition.gpu_kind(), ops::MoeEpilogue::AddResidual,
+                                    options.tokens, options.tokens);
+    offload::Bridge resources(requirements, topology, team, device);
     auto execution = resources.execution_view();
     const auto route_scratch =
         ops::topk_softmax_route_workspace_capacity_bytes({h, e, k}, options.tokens, options.tokens);
@@ -396,8 +397,8 @@ void run(const Options& options) {
     auto use = cache.acquire(partition.gpu_keys(), execution.cuda);
     if (!use) throw std::logic_error("benchmark GPU assignment not published");
     const auto prepared =
-        shared::prepare_execution(p, partition.view(), layer.source, cache.view({0}),
-                                  ops::MoeEpilogue::AddResidual, options.tokens, execution);
+        offload::prepare_execution(p, partition.view(), layer.source, cache.view({0}),
+                                   ops::MoeEpilogue::AddResidual, options.tokens, execution);
     std::vector<DecodeGraphExecutable> graphs;
     if (options.execution == "graph") {
         graphs.resize(inputs.size());
@@ -405,7 +406,7 @@ void run(const Options& options) {
             Tensor x(inputs[i].span(), DType::BF16, {h, options.tokens});
             DecodeGraphDefinition definition;
             definition.capture(execution.cuda.stream(), [&] {
-                shared::enqueue_gpu(x, prepared, residual, work, shared::GpuSubmission::Capture);
+                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Capture);
             });
             graphs[i].instantiate(definition);
             graphs[i].upload(execution.cuda.stream());
@@ -419,10 +420,10 @@ void run(const Options& options) {
                    cache.view({0}));
         else if (!graphs.empty()) {
             graphs[sample % graphs.size()].launch(execution.cuda.stream());
-            (void)shared::complete(prepared, residual);
+            (void)offload::complete(prepared, residual);
         } else
-            shared::execute(x, p, partition.view(), layer.source, cache.view({0}),
-                            ops::MoeEpilogue::AddResidual, residual, work, execution);
+            offload::execute(x, p, partition.view(), layer.source, cache.view({0}),
+                             ops::MoeEpilogue::AddResidual, residual, work, execution);
         device.synchronize();
     };
     // Both schedules use the same team, input corpus, partition, transfers, kernels and output.

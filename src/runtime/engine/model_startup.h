@@ -30,12 +30,12 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
     for (;;) {
         auto probe_options          = options;
         probe_options.prefill_chunk = candidate.chunk;
-        const auto key              = setup.graph_plan(probe_options, candidate.moe.get());
+        const auto key              = setup.graph_plan(probe_options, candidate.preparation);
         auto found                  = std::find_if(measured.begin(), measured.end(),
                                                    [&](const auto& item) { return item.plan == key; });
         if (found == measured.end()) {
             measured.push_back(
-                setup.calibrate(instance.parameters, device, probe_options, candidate.moe));
+                setup.calibrate(instance.parameters, device, probe_options, candidate.preparation));
             found = std::prev(measured.end());
         }
         const auto graph_bytes = std::max(found->rebuild_bytes, minimum_rebuild);
@@ -46,9 +46,9 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
         };
         const auto available = budget.available(device_memory_snapshot(device.device()));
         if (graph_bytes > available) return std::nullopt;
-        auto next = setup.plan(device, options, candidate.host_experts, available - graph_bytes);
+        auto next = setup.plan(device, options, candidate.placement, available - graph_bytes);
         if (!next) return std::nullopt;
-        const auto next_key = setup.graph_plan(probe_options, next->moe.get());
+        const auto next_key = setup.graph_plan(probe_options, next->preparation);
         if (next_key == key) return CalibratedPlan{std::move(*next), graph};
         const bool revisited = std::any_of(measured.begin(), measured.end(),
                                            [&](const auto& item) { return item.plan == next_key; });
@@ -58,8 +58,8 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
             auto high = available - graph_bytes;
             while (low < high) {
                 const auto middle = low + (high - low + 1) / 2;
-                auto trial        = setup.plan(device, options, candidate.host_experts, middle);
-                if (trial && setup.graph_plan(probe_options, trial->moe.get()) == key) {
+                auto trial        = setup.plan(device, options, candidate.placement, middle);
+                if (trial && setup.graph_plan(probe_options, trial->preparation) == key) {
                     low       = middle;
                     candidate = std::move(*trial);
                 } else
@@ -115,7 +115,7 @@ prepare_program(const Setup& setup, ModelInstance<typename Setup::Types>& instan
             // A failed preparation invalidates its observation; the next probe measures it again.
             auto probe_options          = options;
             probe_options.prefill_chunk = startup.chunk;
-            const auto key              = setup.graph_plan(probe_options, startup.moe.get());
+            const auto key              = setup.graph_plan(probe_options, startup.preparation);
             std::erase_if(measured, [&](const auto& entry) { return entry.plan == key; });
         }
         instance.program.reset();
@@ -130,7 +130,7 @@ prepare_program(const Setup& setup, ModelInstance<typename Setup::Types>& instan
             std::max(plan.graph.rebuild_estimate_bytes,
                      static_cast<std::size_t>(std::max<std::int64_t>(0, recovered)));
         if (reserve > available) return std::nullopt;
-        auto candidate = setup.plan(device, options, startup.host_experts, available - reserve);
+        auto candidate = setup.plan(device, options, startup.placement, available - reserve);
         if (!candidate) return std::nullopt;
         auto corrected = calibrate_plan(setup, instance, device, options, budget,
                                         std::move(*candidate), measured, reserve);
@@ -168,7 +168,7 @@ initialize_program(const Setup& setup, ModelInstance<typename Setup::Types>& ins
             const auto before    = device_memory_snapshot(device.device());
             const auto available = budget.available(before);
             if (reserve > available) return {};
-            auto plan = setup.plan(device, options, candidate.host_experts, available - reserve);
+            auto plan = setup.plan(device, options, candidate.placement, available - reserve);
             if (!plan) return {};
             const auto explicit_bytes = plan->sequence.device_reservation_bytes();
             const auto host_bytes     = plan->sequence.host_capacity_bytes();
@@ -213,15 +213,19 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
             const StartupMemoryBudget& budget, std::chrono::steady_clock::time_point start) {
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     Setup setup(reader, options, device.device());
-    const auto& weights          = setup.weights;
-    const auto initial_available = budget.available(device_memory_snapshot(device.device()));
-    auto candidate =
-        weights.resident_bytes && *weights.resident_bytes <= initial_available
-            ? setup.plan(device, options, false, initial_available - *weights.resident_bytes)
-            : std::nullopt;
-    bool host_experts = !candidate.has_value();
-    if (host_experts && weights.offload && weights.fixed_bytes <= initial_available)
-        candidate = setup.plan(device, options, true, initial_available - weights.fixed_bytes);
+    const auto choices   = setup.placements();
+    std::size_t selected = 0;
+    const auto choose    = [&](std::size_t available) {
+        for (; selected < choices.size(); ++selected) {
+            const auto& choice = choices[selected];
+            if (choice.device_bytes > available) continue;
+            auto plan =
+                setup.plan(device, options, choice.placement, available - choice.device_bytes);
+            if (plan) return plan;
+        }
+        return std::optional<typename Setup::ExecutionPlan>{};
+    };
+    auto candidate = choose(budget.available(device_memory_snapshot(device.device())));
     if (!candidate)
         throw std::invalid_argument(
             "Device budget cannot hold model weights and required execution resources");
@@ -232,47 +236,45 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
     std::size_t available_after_weights = 0;
     LoadSummary summary;
     for (;;) {
-        auto model = setup.materialize(device, host_experts, options.startup_observer);
-        device.synchronize();
-        available_after_weights = device_memory_snapshot(device.device()).free_bytes;
-        const auto& stats       = model->storage_stats();
-        summary.upload_seconds += stats.upload_seconds;
-        summary.artifact_bytes_read += stats.read_bytes;
-        summary.host_to_device_bytes += stats.h2d_bytes;
-        summary.peak_staging_bytes = std::max(summary.peak_staging_bytes, stats.peak_staging_bytes);
-        {
-            StartupPhaseScope phase(options.startup_observer, StartupPhase::FrontendInitialize);
-            auto frontend = setup.frontend(*model, options);
-            instance      = std::make_unique<ModelInstance<typename Setup::Types>>(
-                std::move(model), std::move(frontend), setup.profile);
-            phase.complete();
-        }
         try {
+            auto model =
+                setup.materialize(device, choices[selected].placement, options.startup_observer);
+            device.synchronize();
+            available_after_weights = device_memory_snapshot(device.device()).free_bytes;
+            const auto& stats       = model->storage_stats();
+            summary.upload_seconds += stats.upload_seconds;
+            summary.artifact_bytes_read += stats.read_bytes;
+            summary.host_to_device_bytes += stats.h2d_bytes;
+            summary.peak_staging_bytes =
+                std::max(summary.peak_staging_bytes, stats.peak_staging_bytes);
+            {
+                StartupPhaseScope phase(options.startup_observer, StartupPhase::FrontendInitialize);
+                auto frontend = setup.frontend(*model, options);
+                instance      = std::make_unique<ModelInstance<typename Setup::Types>>(
+                    std::move(model), std::move(frontend), setup.profile);
+                phase.complete();
+            }
             calibrated = initialize_program(setup, *instance, device, options, budget,
                                             std::move(*candidate), preparation_attempts);
         } catch (const DeviceAllocationError&) {
-            if (host_experts || !weights.offload) throw;
+            if (selected + 1 == choices.size()) throw;
             calibrated.reset();
         }
         if (calibrated) break;
         instance.reset();
         device.synchronize();
-        if (host_experts || !weights.offload || preparation_attempts == 2)
+        if (++selected == choices.size() || preparation_attempts == 2)
             throw std::invalid_argument(
                 "Device budget cannot hold the calibrated runtime and requested KV capacity");
-        host_experts         = true;
-        const auto available = budget.available(device_memory_snapshot(device.device()));
-        if (weights.fixed_bytes > available)
-            throw std::invalid_argument("Device budget cannot hold fixed model weights");
-        candidate = setup.plan(device, options, true, available - weights.fixed_bytes);
+        candidate = choose(budget.available(device_memory_snapshot(device.device())));
         if (!candidate)
-            throw std::invalid_argument("Device budget cannot hold MoE execution resources");
+            throw std::invalid_argument("Device budget cannot hold model execution resources");
     }
     instance->kv_capacity_resolution.available_after_weights_bytes = available_after_weights;
     instance->kv_capacity_resolution.available_after_startup_bytes =
         device_memory_snapshot(device.device()).free_bytes;
-    const auto signature =
-        prefill_signature(*instance->model, calibrated->startup.moe.get(), options.prefill_chunk);
+    const auto signature = setup.prefill_signature(
+        *instance->model, calibrated->startup.preparation, options.prefill_chunk);
     auto context_cost = resolve_context_machine_cost(
         {.hardware_class = context_cost_hardware_class(
              device.properties().name, device.properties().major, device.properties().minor),

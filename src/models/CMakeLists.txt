@@ -14,9 +14,11 @@ target_sources(ninfer_model_runtime PRIVATE
   qwen4_exp/ple/disk/prepare.cpp
 )
 ninfer_internal_includes(ninfer_model_runtime)
+target_compile_definitions(ninfer_model_runtime PUBLIC
+  NINFER_SHARED_PHYSICAL_MEMORY=${NINFER_SHARED_PHYSICAL_MEMORY})
 target_link_libraries(ninfer_model_runtime
   PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support
-  PRIVATE ninfer_cpu_executor ninfer_media_decode ninfer_jinja ninfer_grammar ninfer_xgrammar)
+  PRIVATE ninfer_media_decode ninfer_jinja ninfer_grammar ninfer_xgrammar)
 target_include_directories(ninfer_model_runtime PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
@@ -30,10 +32,21 @@ target_sources(ninfer_model_runtime PRIVATE
   common/context/kv_history.cpp
   common/context/work.cpp
   common/context/migration.cpp
-  common/moe/graph.cpp
-  common/moe/plan.cpp
   common/moe/execution.cpp
-  common/moe/resources.cpp)
+  common/moe/schedule.cpp)
+
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_compile_definitions(ninfer_model_runtime PRIVATE NINFER_EXPERT_OFFLOAD=1)
+  target_link_libraries(ninfer_model_runtime PRIVATE ninfer_cpu_executor)
+  target_sources(ninfer_model_runtime PRIVATE
+    common/moe/offload/plan.cpp
+    common/moe/offload/resources.cpp
+    common/moe/offload/execution.cpp
+    common/moe/offload/graph.cpp
+    common/moe/offload/schedule.cpp)
+else()
+  target_compile_definitions(ninfer_model_runtime PRIVATE NINFER_EXPERT_OFFLOAD=0)
+endif()
 
 include(qwen3_5/loading_sources.cmake)
 include(qwen4_exp/loading_sources.cmake)

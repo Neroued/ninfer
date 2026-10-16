@@ -99,8 +99,11 @@ ninfer::EngineOptions engine_options(const std::filesystem::path& artifact,
     options.max_pending_requests = 2;
     options.speculative.backend  = selected;
     if (selected != ninfer::SpeculativeBackend::None) {
-        options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.speculative.draft_tokens = 3;
+        const auto head                  = setting("NINFER_TEST_PROPOSAL_HEAD", "optimized");
+        require(head == "full" || head == "optimized", "unknown test proposal head");
+        options.speculative.proposal_head =
+            head == "full" ? ninfer::ProposalHead::Full : ninfer::ProposalHead::Optimized;
     }
     // History is deliberately disabled: the two cases exercise only the requests' own recovery.
     options.context_cache.enabled             = false;

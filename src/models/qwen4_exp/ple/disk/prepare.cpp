@@ -377,7 +377,7 @@ std::size_t PrepareService::memory_bytes() const noexcept {
            p.reader.memory_bytes();
 }
 
-std::size_t PrepareService::memory_bytes(const Table& table, const PrepareOptions& options,
+std::size_t PrepareService::memory_bytes(TableGeometry table, const PrepareOptions& options,
                                          std::uint32_t slots) {
     if (!options.max_positions || options.max_positions > UINT32_MAX / kHeads || !slots)
         throw std::invalid_argument("invalid PLE preparation capacity");

@@ -5,7 +5,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/schedule.h"
 
 namespace ninfer::models::qwen4_exp::execution {
 
@@ -13,7 +13,7 @@ struct TextExecution {
     MemoryArena& workspace;
     const StateViews& states;
     const QsaCache& cache;
-    moe::Resources& experts;
+    moe::Schedule* experts = nullptr;
     Tensor qsa_raw_records, qsa_coordinate_records, ple_records;
 };
 
@@ -29,7 +29,8 @@ public:
     // GPU bodies share the same activation frame in eager execution and graph capture.
     void stem(std::optional<VisualEmbeddingView> = {});
     void mixer(std::uint32_t layer);
-    void gpu_moe(const moe::PreparedExecution&);
+    void resident_moe(std::uint32_t layer);
+    void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);
     void finish(TextOutputs);
 
@@ -46,7 +47,7 @@ private:
     CudaExecutionView cuda_;
     MemoryArena::Scope scope_;
     workspace::Roots roots_;
-    std::optional<CpuExecutionView::ActiveScope> cpu_activity_;
+    std::optional<moe::Schedule::Activity> expert_activity_;
 };
 
 void project_head(const Tensor& sample, const LinearParameters&, Tensor& logits, MemoryArena&,

@@ -103,13 +103,14 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--prefill-chunk requires a positive multiple of 128; defaults to 1024, or 4096 with "
-           "CPU expert offload.\n"
+           "--prefill-chunk requires a positive multiple of 128; defaults to 4096 for Qwen4Exp "
+           "or CPU expert offload, otherwise 1024.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "Startup uses " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of planning headroom for both explicit and automatic KV capacity.\n"
+           " MiB of planning headroom; DGX Spark Vision additionally reserves live media "
+           "capacity.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }

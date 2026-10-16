@@ -2,7 +2,7 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for a single NVIDIA GeForce RTX 5090.
+NInfer is a from-scratch C++/CUDA inference engine for a single NVIDIA GeForce RTX 5090 or DGX Spark GPU.
 Qwen3.5 Dense/MoE and Qwen4Exp (Qwen3.8-Flash-Next) support text, image/video prompts and native MTP.
 They use the local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime uses one GPU, one
 resident model, and one to eight execution lanes fixed at startup.
@@ -28,13 +28,14 @@ the weights again.
 
 ## Quick start
 
-The complete Engine requires x86-64 Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
+The Engine builds natively on Linux: x86-64/`sm_120a` for RTX 5090, or AArch64/`sm_121a`
+for DGX Spark. Both require a CUDA toolkit supporting the selected architecture,
 CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), `hwloc >= 2.5`, `liburing >= 2.5`,
 and `libcurl >= 7.85`.
 CUDA 13.4 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The `rtx5090` build targets `sm_120a`. Use `dgx-spark-ops` for native Core, Artifact and Ops
-development on AArch64/`sm_121a` DGX Spark.
+RTX 5090 supports resident and CPU expert offload execution. DGX Spark uses resident GPU
+weights and Device context storage; Flash Next Text/Vision/MTP shares the same model implementation.
 
 Build the product binaries:
 
@@ -46,10 +47,12 @@ cmake --preset rtx5090-release
 cmake --build build/rtx5090-release -j
 ```
 
-Tests and benchmarks are excluded from the product preset. `cmake --preset rtx5090-dev`
-enables both and finds a Python 3 interpreter. The `rtx5090-ops` and `dgx-spark-ops` presets
-build Core, Artifact and Ops with their tests and benchmarks. Each preset uses its own
-`build/<preset-name>/` directory.
+On DGX Spark, use `dgx-spark-release` and `build/dgx-spark-release` in these commands.
+
+Tests and benchmarks are excluded from the product presets. `cmake --preset rtx5090-dev`
+or `cmake --preset dgx-spark-dev` enables both and finds a Python 3 interpreter. The `rtx5090-ops`
+and `dgx-spark-ops` presets build Core, Artifact and Ops with their tests and benchmarks.
+Each preset uses its own `build/<preset-name>/` directory.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 

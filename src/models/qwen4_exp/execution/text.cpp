@@ -15,7 +15,8 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
       scope_(execution.workspace.scope()),
       roots_(
           workspace::roots(execution.workspace, p.model.config().text, batch.tokens * batch.batch)),
-      cpu_activity_(execution.experts.begin(batch.tokens * batch.batch)) {
+      expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch)
+                                         : std::nullopt) {
     if (batch.tokens <= 0 || batch.batch < 1 || batch.batch > kMaximumConcurrency ||
         (std::holds_alternative<SequenceSlots>(update) && batch.batch != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
@@ -41,12 +42,15 @@ void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
 void TextRun::layer(std::uint32_t i) {
     nvtx::ScopedRange layer(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
     const auto& p = parameters_.text.layers[i];
-    execution_.experts.before_layer(p.moe.bank);
+    if (execution_.experts) execution_.experts->before_layer(p.moe.bank);
     mixer(i);
     {
         auto scratch = execution_.workspace.scope();
-        execution_.experts.execute(p.moe.bank, roots_.input, roots_.output, execution_.workspace,
-                                   {});
+        if (execution_.experts)
+            execution_.experts->execute(p.moe.bank, roots_.input, roots_.output,
+                                        execution_.workspace, {});
+        else
+            resident_moe(i);
     }
     combine(i);
 }
@@ -89,10 +93,15 @@ void TextRun::mixer(std::uint32_t i) {
     }
 }
 
-void TextRun::gpu_moe(const moe::PreparedExecution& call) {
+void TextRun::resident_moe(std::uint32_t i) {
+    const auto& p = parameters_.text.layers[i].moe;
+    moe::execute(roots_.input, p, p.resident, ops::MoeEpilogue::Write, roots_.output,
+                 execution_.workspace, cuda_);
+}
+
+void TextRun::gpu_moe(const moe::GpuCall& call) {
     auto scratch = execution_.workspace.scope();
-    moe::enqueue_gpu(roots_.input, call, roots_.output, execution_.workspace,
-                     moe::GpuSubmission::Capture);
+    call(roots_.input, roots_.output, execution_.workspace, {});
 }
 
 void TextRun::combine(std::uint32_t i) {

@@ -43,7 +43,7 @@ void run(const char* path) {
     write(static_cast<std::uint32_t>(starts.size()));
     for (auto row : starts) write(*table.row(row).lut);
 
-    std::vector<ReadSegment> segments(table.max_row_segments());
+    std::vector<ReadSegment> segments(table.geometry().max_row_segments);
     std::vector<io::DirectReadWindow> windows(segments.size());
     HostBuffer slab(4096 * segments.size(), 4096);
     std::vector<MemorySpan> buffers;

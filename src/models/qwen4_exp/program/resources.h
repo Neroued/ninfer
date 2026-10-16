@@ -4,7 +4,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/execution/batch.h"
 #include "models/common/context/migration.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 
 namespace ninfer::models::qwen4_exp {
@@ -40,6 +40,8 @@ public:
 
     [[nodiscard]] CudaExecutionView ple_transfer() const { return ple_transfer_; }
 
+    void synchronize() const;
+
     [[nodiscard]] std::uint32_t pool_count() const { return mtp ? 2 : 1; }
 
     [[nodiscard]] ContextPool& pool(std::uint32_t index) const { return index == 0 ? *main : *mtp; }
@@ -70,7 +72,7 @@ public:
     std::unique_ptr<context::MigrationContext> migration;
     std::optional<GdnReplayRecords> gdn_records;
     std::optional<ops::GdnReplayFoldPlan> gdn_fold;
-    std::unique_ptr<moe::Resources> experts;
+    std::unique_ptr<moe::Schedule> experts;
     std::unique_ptr<ple::UploadSlots> ple_upload;
     std::unique_ptr<ple::disk::PrepareService> ple_prepare;
 };

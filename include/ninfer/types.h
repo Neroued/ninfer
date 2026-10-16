@@ -129,8 +129,8 @@ struct ContextCacheOptions {
     bool enabled = true;
     // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
     std::optional<std::uint32_t> device_state_slots;
-    // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations. Native
-    // startup defaults to 8 GiB plus eight Host StateImages using the model's actual layout.
+    // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations.
+    // RTX 5090 defaults to 8 GiB plus eight model StateImages; DGX Spark resolves this to zero.
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
@@ -163,7 +163,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    // Zero uses 1024 tokens, or 4096 with CPU expert offload.
+    // Zero uses 4096 for Qwen4Exp or CPU expert offload, otherwise 1024.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;

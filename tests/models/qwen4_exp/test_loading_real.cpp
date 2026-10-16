@@ -15,15 +15,22 @@ namespace q4 = models::qwen4_exp;
 using test::artifact_fixture::require;
 constexpr std::size_t GiB = 1024ULL * 1024 * 1024;
 
-void placement(const q4::LoadPlan& load, Device device) {
-    const auto plan = load.placement(device);
+void placement(const q4::LoadPlan& load, Device device, bool host) {
+    const auto plan = load.placement(device, host ? Device::cpu() : device);
+    require(load.ple_table().parameters().rows == 320001536, "PLE table extent");
+    if (!host) {
+        require(plan.registered_host_objects.empty() && plan.registered_host_bytes == 0,
+                "resident weights retained Host expert backing");
+        require(plan.device_capacity_bytes > 63 * GiB && plan.device_capacity_bytes < 76 * GiB,
+                "resident weight capacity differs");
+        return;
+    }
     require(plan.registered_host_objects.size() == 96,
             "Main banks must have one Host backing per parent");
     require(plan.registered_host_bytes >= 67947921408ULL &&
                 plan.registered_host_bytes < 67947921408ULL + 2 * 1024 * 1024,
             "Main Host bank capacity differs");
     require(plan.device_capacity_bytes < 11 * GiB, "PLE or Main banks were placed on GPU");
-    require(load.ple_table().parameters().rows == 320001536, "PLE table extent");
 }
 
 void payloads(const artifact::Reader& reader, const q4::Model& model) {
@@ -50,14 +57,21 @@ void payloads(const artifact::Reader& reader, const q4::Model& model) {
     }
 }
 
-void check_parameters(const q4::Model& model, const q4::execution::Parameters& p) {
+void check_parameters(const q4::Model& model, const q4::execution::Parameters& p, bool host) {
     require(model.expert_banks().size() == 49, "Main/MTP bank count");
     for (std::size_t l = 0; l < 48; ++l) {
         const auto& source = model.expert_banks()[l];
-        require(source.gate_up.parent->device == Device::cpu() &&
-                    source.gate_up_upload.device_address,
-                "Main source must remain registered Host memory");
-        require(!p.text.layers[l].moe.resident.count, "Main Parameters acquired mutable GPU cache");
+        if (host) {
+            require(source.gate_up.parent->device == Device::cpu() &&
+                        source.gate_up_upload.device_address,
+                    "Main source must remain registered Host memory");
+            require(!p.text.layers[l].moe.resident.count,
+                    "Host Main Parameters acquired mutable GPU cache");
+        } else {
+            require(source.gate_up.parent->device.type() == DeviceType::CUDA &&
+                        p.text.layers[l].moe.resident.count == 512,
+                    "Main resident bank was not bound");
+        }
         for (std::uint32_t e : {0U, 17U, 511U}) {
             const auto gu   = matrix_weight(source.gate_up, e);
             const auto down = matrix_weight(source.down, e);
@@ -116,7 +130,22 @@ int main(int argc, char** argv) {
     if (argc < 2) return 77;
     try {
         DeviceContext device;
-        const bool materialize = argc > 2 && std::string_view(argv[2]) == "--materialize";
+        bool materialize = false, host = false;
+        for (int i = 2; i < argc; ++i) {
+            const std::string_view arg(argv[i]);
+            if (arg == "--materialize")
+                materialize = true;
+            else if (arg == "--host-experts")
+                host = true;
+            else
+                throw std::invalid_argument("expected --materialize or --host-experts");
+        }
+        const auto plan_for = [&](const auto& profile, const auto& geometry,
+                                  const EngineOptions& options, std::size_t available) {
+            auto prototype = host ? q4::describe_moe_plan(*profile, options.moe) : nullptr;
+            require(!host || prototype != nullptr, "target does not provide expert offload");
+            return q4::plan_execution(profile, geometry, options, device, available, prototype);
+        };
         std::unique_ptr<q4::Model> model;
         std::shared_ptr<const q4::execution::ModelProfile> profile;
         std::optional<q4::ExecutionPlan> selected;
@@ -134,7 +163,7 @@ int main(int argc, char** argv) {
                      .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
                 auto load       = q4::plan_load(reader, models::load_options(scoring));
                 auto p          = q4::execution::describe_model(load);
-                const auto plan = q4::plan_execution(p, load.ple_table(), scoring, device, 8 * GiB);
+                const auto plan = plan_for(p, load.ple_table().geometry(), scoring, 8 * GiB);
                 require(plan && !plan->persistent.buffers.logits &&
                             !plan->persistent.buffers.token_counts &&
                             plan->pinned_output_bytes == 4096 &&
@@ -157,11 +186,13 @@ int main(int argc, char** argv) {
                     }
                     auto load = q4::plan_load(reader, models::load_options(options));
                     profile   = q4::execution::describe_model(load);
-                    placement(load, device.device());
-                    const auto weights = load.placement(device.device()).device_capacity_bytes;
-                    selected = q4::plan_execution(profile, load.ple_table(), options, device,
-                                                  16 * GiB - weights - 256 * 1024 * 1024);
-                    require(selected.has_value(), "16 GiB plan must fit this context");
+                    placement(load, device.device(), host);
+                    const auto weights =
+                        load.placement(device.device(), host ? Device::cpu() : device.device())
+                            .device_capacity_bytes;
+                    const auto available = host ? 16 * GiB - weights - 256 * 1024 * 1024 : 16 * GiB;
+                    selected = plan_for(profile, load.ple_table().geometry(), options, available);
+                    require(selected.has_value(), "runtime plan must fit the supplied capacity");
                     require(selected->ple.max_positions == 4096,
                             "PLE Mmax differs from actual call capacity");
                     require(selected->profile->mtp.has_value() == mtp &&
@@ -178,9 +209,10 @@ int main(int argc, char** argv) {
                     std::cout << "vision=" << vision << " mtp=" << mtp << " weights=" << weights
                               << " state_stride=" << selected->persistent.state.images.image_stride
                               << " persistent=" << selected->persistent.bytes
-                              << " workspace=" << selected->workspace.bytes
-                              << " cache=" << selected->moe->cache.config.capacity_bytes
-                              << " windows=" << selected->moe->window_count
+                              << " workspace=" << selected->workspace.bytes << " cache="
+                              << (selected->moe ? selected->moe->description().cache_bytes : 0)
+                              << " windows="
+                              << (selected->moe ? selected->moe->description().window_count : 0)
                               << " runtime=" << selected->device_bytes()
                               << " ple_host=" << selected->ple_prepare_bytes << '\n';
                     if (vision == mtp) {
@@ -192,27 +224,31 @@ int main(int argc, char** argv) {
                               KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                               KvCacheStorage::Fp8KeyNvfp4Value}) {
                             multi.kv_cache = format;
-                            auto plan = q4::plan_execution(profile, load.ple_table(), multi, device,
-                                                           16 * GiB - weights - 256 * 1024 * 1024);
-                            require(plan && plan->capacity.resolved_tokens == 4096 &&
+                            auto plan =
+                                plan_for(profile, load.ple_table().geometry(), multi, available);
+                            const auto expected_capacity =
+                                host ? 4096U : multi.max_context * multi.max_concurrency;
+                            require(plan && plan->capacity.resolved_tokens == expected_capacity &&
                                         plan->ple.max_positions == 4096,
                                     "mixed-batch automatic capacity");
-                            require(plan->device_bytes() <= 16 * GiB - weights - 256 * 1024 * 1024,
+                            require(plan->device_reservation_bytes() <= available,
                                     "execution exceeds Device budget");
                         }
-                        require(!q4::plan_execution(profile, load.ple_table(), options, device, 1),
+                        require(!plan_for(profile, load.ple_table().geometry(), options, 1),
                                 "insufficient Device budget admitted");
                     }
                     if (vision && mtp && materialize) {
                         model = q4::materialize_model(
-                            q4::resolve_load(std::move(load), device.device()), device);
+                            q4::resolve_load(std::move(load), device.device(),
+                                             host ? Device::cpu() : device.device()),
+                            device);
                         payloads(reader, *model);
                     }
                 }
         }
         if (materialize) {
             const q4::execution::Parameters parameters(*model, profile);
-            check_parameters(*model, parameters);
+            check_parameters(*model, parameters, host);
             q4::Resources resources(parameters, std::move(*selected), device);
             ple_window(resources, *model, device);
 

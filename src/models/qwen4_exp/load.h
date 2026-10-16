@@ -22,14 +22,14 @@ public:
     [[nodiscard]] const ple::disk::Table& ple_table() const;
     [[nodiscard]] ops::WeightInput input(WeightId) const;
     [[nodiscard]] std::span<const moe::BankDescription> expert_banks() const;
-    [[nodiscard]] artifact::MaterializationPlan placement(Device) const;
+    [[nodiscard]] artifact::MaterializationPlan placement(Device, Device main_experts) const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl>);
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
-    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device);
+    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, Device main_experts);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
 };
@@ -40,7 +40,7 @@ public:
         return placement_;
     }
 private:
-    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device);
+    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, Device main_experts);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     ResolvedLoadPlan(LoadPlan&&, artifact::MaterializationPlan, std::vector<Device>,
@@ -51,7 +51,7 @@ private:
 };
 
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader&, LoadOptions = {});
-[[nodiscard]] ResolvedLoadPlan resolve_load(LoadPlan&&, Device);
+[[nodiscard]] ResolvedLoadPlan resolve_load(LoadPlan&&, Device, Device main_experts);
 [[nodiscard]] std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                        const StartupObserver* = nullptr);
 } // namespace ninfer::models::qwen4_exp

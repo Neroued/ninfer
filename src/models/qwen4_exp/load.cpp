@@ -99,16 +99,18 @@ struct Placement {
 };
 
 template <class Data>
-Placement placement(const Data& data, Device device) {
+Placement placement(const Data& data, Device device, Device main_experts) {
     if (device.type() != DeviceType::CUDA)
         throw artifact::ArtifactError("Qwen4Exp requires a CUDA device");
+    if (main_experts != device && main_experts != Device::cpu())
+        throw artifact::ArtifactError("Main experts require the model CUDA device or CPU backing");
     Placement out;
     out.weights.assign(data.pending.size(), device);
     out.banks.assign(data.banks.size(), device);
     for (const auto& layer : data.weights.text.layers) {
         const auto& w = layer.moe;
-        for (auto id : {w.gate, w.up, w.down}) out.weights[id.index] = Device::cpu();
-        out.banks[w.bank.index] = Device::cpu();
+        for (auto id : {w.gate, w.up, w.down}) out.weights[id.index] = main_experts;
+        out.banks[w.bank.index] = main_experts;
     }
     std::vector<artifact::PlacementRequest> requests;
     for (std::size_t i = 0; i < data.pending.size(); ++i)
@@ -121,8 +123,8 @@ Placement placement(const Data& data, Device device) {
 }
 } // namespace
 
-artifact::MaterializationPlan LoadPlan::placement(Device device) const {
-    return qwen4_exp::placement(*impl_, device).storage;
+artifact::MaterializationPlan LoadPlan::placement(Device device, Device main_experts) const {
+    return qwen4_exp::placement(*impl_, device, main_experts).storage;
 }
 
 ResolvedLoadPlan::ResolvedLoadPlan(LoadPlan&& logical, artifact::MaterializationPlan storage,
@@ -130,9 +132,9 @@ ResolvedLoadPlan::ResolvedLoadPlan(LoadPlan&& logical, artifact::Materialization
     : logical_(std::move(logical)), placement_(std::move(storage)), weights_(std::move(weights)),
       banks_(std::move(banks)) {}
 
-ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device device) {
+ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device device, Device main_experts) {
     if (!plan.impl_) throw artifact::ArtifactError("Qwen4Exp load plan was consumed");
-    auto placed              = placement(*plan.impl_, device);
+    auto placed              = placement(*plan.impl_, device, main_experts);
     placed.storage.resources = std::move(plan.impl_->prepared_resources);
     return {std::move(plan), std::move(placed.storage), std::move(placed.weights),
             std::move(placed.banks)};

@@ -73,11 +73,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, minimum, columns));
         scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns));
         if (!mtp && offload) {
-            const auto limit = std::min(columns, offload->layer(layer.moe.bank).hybrid_max_tokens);
-            if (minimum <= limit)
-                scratch(moe::describe_execution(layer.moe.math, ops::ExpertSubsetKind::MaskOnes,
-                                                ops::MoeEpilogue::Write, minimum, limit)
-                            .gpu_workspace_bytes);
+            scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns));
         }
     };
     if (mtp)

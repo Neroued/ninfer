@@ -21,8 +21,9 @@ std::vector<ExpertBankCacheSpec> bank_specs(const LoadPlan& source) {
 
 } // namespace
 
-moe::Plan describe_moe_plan(const LoadPlan& source, const execution::ModelProfile& profile,
-                            const MoeOptions& options) {
+std::shared_ptr<const moe::Plan> describe_moe_plan(const LoadPlan& source,
+                                                   const execution::ModelProfile& profile,
+                                                   const MoeOptions& options) {
     if (options.expert_priority && options.expert_priority->size() != profile.text.layers.size())
         throw std::invalid_argument("MoE expert priority must provide every Main layer");
     std::vector<moe::LayerSpec> layers;

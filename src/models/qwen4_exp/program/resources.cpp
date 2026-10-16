@@ -11,8 +11,8 @@ std::uint32_t count(std::uint64_t n) {
 }
 
 ExecutionPlan checked_plan(const execution::Parameters& p, ExecutionPlan plan) {
-    if (plan.profile != p.profile || !plan.moe ||
-        plan.capacity.runtime_reservation_bytes != plan.device_bytes())
+    if (plan.profile != p.profile ||
+        plan.capacity.runtime_reservation_bytes != plan.device_reservation_bytes())
         throw std::invalid_argument("Qwen4Exp resources require the finalized parameter plan");
     return plan;
 }
@@ -66,12 +66,13 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
         gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view());
     }
-    std::vector<const moe::Parameters*> layers;
-    for (const auto& layer : p.text.layers) layers.push_back(&layer.moe);
-    experts =
-        std::make_unique<moe::Resources>(plan.moe, layers, p.model.expert_banks(), device,
-                                         plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
-                                                          : moe::ResourcePurpose::Execution);
+    if (plan.moe) {
+        std::vector<const moe::Parameters*> layers;
+        for (const auto& layer : p.text.layers) layers.push_back(&layer.moe);
+        experts = plan.moe->create(layers, p.model.expert_banks(), device,
+                                   plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
+                                                    : moe::ResourcePurpose::Execution);
+    }
     ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
     ple_prepare = std::make_unique<ple::disk::PrepareService>(
         p.model.ple_table(), p.model.config().text.ple.eos, plan.ple, ple_upload->host_slots());
@@ -97,9 +98,14 @@ Resources::~Resources() {
     try {
         ple_prepare.reset();
         ple_upload.reset();
-        if (experts) experts->synchronize();
-        device_.synchronize();
+        synchronize();
     } catch (...) { std::terminate(); }
+}
+
+void Resources::synchronize() const {
+    if (experts) experts->synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(ple_transfer_.stream()));
+    device_.synchronize();
 }
 
 Tensor Resources::tensor(const TensorRegion& region) { return region.bind(persistent()); }

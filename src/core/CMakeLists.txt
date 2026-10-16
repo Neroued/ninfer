@@ -19,6 +19,7 @@ add_library(ninfer_core STATIC
   transfer.cpp
   transfer.cu
   device.cu
+  device_memory.cpp
   dtype.cpp
   nf4.cpp
   io/file.cpp
@@ -38,6 +39,8 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
 )
 ninfer_internal_includes(ninfer_core)
+target_compile_definitions(ninfer_core PRIVATE
+  NINFER_SHARED_PHYSICAL_MEMORY=${NINFER_SHARED_PHYSICAL_MEMORY})
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
 target_link_libraries(ninfer_core PRIVATE PkgConfig::URING)

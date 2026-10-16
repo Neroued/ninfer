@@ -304,7 +304,7 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
             resources.workspace,
             *resources.states,
             resources.main->cache,
-            *resources.experts,
+            resources.experts.get(),
             buffers.main_qsa.keys.bind(resources.persistent()),
             buffers.main_qsa.coordinates.bind(resources.persistent()),
             buffers.ple_records.bind(resources.persistent())};
@@ -312,7 +312,7 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
                                execution::VerifyRecords{*resources.gdn_records}, cuda);
         auto* graph = graphs ? &graphs->main(batch, true, maximum) : nullptr;
         if (graph)
-            graph->prefix(*resources.experts, run.block_output(), cuda);
+            graph->prefix(cuda);
         else
             run.prefix();
         auto embedding = ple.consume(ticket);
@@ -326,7 +326,7 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
             run.consume_ple(embedding);
         ple.consumed(ticket);
         if (graph)
-            graph->suffix(*resources.experts, run.block_output(), cuda);
+            graph->suffix(cuda);
         else
             run.suffix({sample, conditioning});
     }

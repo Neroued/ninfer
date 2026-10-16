@@ -7,32 +7,41 @@
 
 namespace ninfer::models::qwen3_5 {
 
+struct ExecutionPreparation {
+    std::shared_ptr<const moe::Plan> experts;
+};
+
 // Native loading and execution planning. Runtime owns the budget, calibration loop and retries.
 class Startup {
 public:
     static constexpr bool supports_graph = true;
     using Types                          = RuntimeTypes;
-    using ExecutionPlan                  = models::ExecutionPlan<SequencePlan>;
-    using Calibration                    = GraphCalibration;
+    using ExecutionPlan = models::ExecutionPlan<SequencePlan, ExecutionPreparation>;
+    using Calibration   = GraphCalibration;
 
     Startup(const artifact::Reader&, const EngineOptions&, Device);
 
     [[nodiscard]] Architecture architecture() const noexcept { return architecture_; }
 
     [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
-                                                    bool host_experts, std::size_t available) const;
-    [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, bool host_experts,
+                                                    WeightPlacement, std::size_t available) const;
+    [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, WeightPlacement,
                                                      const StartupObserver&);
     [[nodiscard]] qwen::Frontend frontend(const Model&, const EngineOptions&) const;
-    [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&, const moe::Plan*) const;
+    [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&,
+                                                  const ExecutionPreparation&) const;
     [[nodiscard]] Calibration calibrate(const execution::Parameters&, DeviceContext&,
-                                        const EngineOptions&,
-                                        std::shared_ptr<const moe::Plan>) const;
+                                        const EngineOptions&, const ExecutionPreparation&) const;
 
-    WeightPlacement weights;
+    [[nodiscard]] std::span<const WeightCandidate> placements() const { return placements_; }
+
+    [[nodiscard]] std::string prefill_signature(const Model&, const ExecutionPreparation&,
+                                                std::uint32_t chunk) const;
     std::shared_ptr<const execution::ModelProfile> profile;
 
 private:
+    std::vector<WeightCandidate> placements_;
+    std::shared_ptr<const moe::Plan> offload_;
     const artifact::Reader& reader_;
     LoadOptions selection_;
     std::optional<LoadPlan> source_;

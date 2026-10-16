@@ -161,10 +161,12 @@ CommitResult Program::commit(PendingBatch&& batch,
             stats.accepted_tokens += accepted;
             stats.fallback_steps += drafted == 0;
             for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
-            out.rows[row].speculative_counters = {1, drafted, accepted, drafted == 0};
             s.timings.decode_seconds += post_seconds;
         }
-        out.rows[row].speculative = s.speculative;
+        const auto& stats                  = s.speculative;
+        out.rows[row].speculative_counters = {stats.rounds, stats.drafted_tokens,
+                                              stats.accepted_tokens, stats.fallback_steps};
+        out.rows[row].speculative          = s.speculative;
         if (d.cancelled || d.failed) {
             out.rows[row].timings     = s.timings;
             out.rows[row].disposition = d.cancelled ? runtime::CommitDisposition::CancelledReleased

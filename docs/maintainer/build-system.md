@@ -48,9 +48,9 @@ conversion/evaluation scripts run separately from CMake and CTest.
 
 Shared CPU topology, affinity, worker startup and `TaskPool` belong to the ordinary C++
 `ninfer_cpu` library, linked with hwloc >= 2.5 and Threads. The x86 collective executor and CPUID
-implementation belong to `ninfer_cpu_executor`, compiled only for `rtx5090`. CPU MoE, mixed model
-execution and executor tests/benchmarks link it explicitly. Spark has no CPU expert executor or
-AVX objects; its CPU MoE Op entry reports unsupported. Artifact Host page population uses shared
+implementation belong to `ninfer_cpu_executor`, compiled only for `rtx5090`. CPU MoE, the model runtime
+when built with offload, and executor tests/benchmarks link it explicitly. Spark has no CPU expert
+executor or AVX objects; its CPU MoE Op entry reports unsupported. Artifact Host page population uses shared
 worker startup/affinity facilities directly, without depending on the arithmetic executor.
 Core's direct-file I/O uses liburing >= 2.5.
 Its registered files and buffers are caller-owned; the queue creates no CUDA resources or threads.
@@ -64,7 +64,9 @@ The checked-in presets use independent `build/<preset-name>/` directories:
 - `rtx5090-release`: product binaries;
 - `rtx5090-dev`: products, tests and benchmarks;
 - `rtx5090-ops`: Core, Artifact and Ops with their tests and benchmarks;
-- `dgx-spark-ops`: the corresponding AArch64/SM121a development build.
+- `dgx-spark-release`: AArch64/SM121a product binaries;
+- `dgx-spark-dev`: AArch64/SM121a products, tests and benchmarks;
+- `dgx-spark-ops`: AArch64/SM121a Core, Artifact and Ops development.
 
 Each has a matching build preset; development presets also have test presets. For example:
 
@@ -130,6 +132,8 @@ with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE
 - Models retain distinct immutable-loading and mutable-runtime targets. Native loading, execution
   and Program manifests own architecture code; `common/qwen/sources.cmake` owns shared Frontend
   and Vision sources. Shared bindings and context/MoE mechanisms have explicit target entries.
+  `common/moe/execution.*` owns the shared GPU calls; `schedule.*` bounds model-facing offload
+  planning and traversal. `common/moe/offload/` is compiled only for `rtx5090`.
   Runtime startup orchestration links model runtime; native startup planners only depend on
   runtime support/contracts. Checkpoints/recipes do not define additional compile owners.
 - New files require an explicit manifest edit. New families require an explicit parent include.
@@ -141,6 +145,9 @@ dispatch remain in C++; CMake only selects translation units. A family may expli
 `${NINFER_TARGET}/sources.cmake` where target-private implementations exist. Shared sources are
 registered once in the parent; a target must not include another target's private route catalog.
 No automatic directory scan, missing-file fallback or global shape registry selects implementations.
+Shared implementations remain shared while their selectors are identical;
+Q8 projection and HC mix use the same production sources on both targets. Introduce target-private
+selectors when there is an actual target-specific implementation or tuning policy.
 
 ## CUDA compilation boundaries
 

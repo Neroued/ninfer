@@ -32,8 +32,9 @@ when running alone. Requests acquire KV pages as execution advances; if concurre
 the pool, the scheduler can pause a request and restore it later.
 
 With `C=2` and two extra Device slots, the process owns four Device StateImages. The default shared
-pinned Host budget is 8 GiB plus eight model StateImages. It holds retained state, KV and pause
-snapshots, including in-flight destinations; `--host-context-mib` sets an explicit total instead.
+pinned Host budget on RTX 5090 is 8 GiB plus eight model StateImages. This pool holds retained
+state, KV and pause snapshots, including in-flight destinations; `--host-context-mib` sets an
+explicit total instead. DGX Spark uses Device context storage with zero Host context capacity.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
@@ -889,7 +890,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk; positive multiple of 128 | `1024`; CPU expert offload: `4096` |
+| `--prefill-chunk N` | text-prefill chunk; positive multiple of 128 | `4096` for Qwen4Exp or CPU expert offload; otherwise `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -911,7 +912,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
-| `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
+| `--host-context-mib N` | RTX 5090 pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; DGX Spark keeps this capacity at zero | `8192 MiB + 8 native StateImages` on RTX 5090; `0` on DGX Spark |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -1170,7 +1171,8 @@ outside the GPU executor and do not delay formation of the next batch.
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
 when sizing the pool; omitting the option makes it follow `--max-context`. Both explicit and automatic
-capacity use 1 GiB of startup planning headroom. Capacity resolves once at startup.
+capacity use 1 GiB of base startup planning headroom. On Spark, Vision additionally reserves
+`--media-live-mib` in shared memory. Capacity resolves once at startup.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

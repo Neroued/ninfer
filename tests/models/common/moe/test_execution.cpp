@@ -1,6 +1,6 @@
-#include "models/common/moe/resources.h"
+#include "models/common/moe/offload/resources.h"
 #include "core/decode_graph.h"
-#include "models/common/moe/plan.h"
+#include "models/common/moe/offload/plan.h"
 #include "ops/moe/fixture.h"
 
 #include <atomic>
@@ -11,9 +11,10 @@
 namespace {
 using namespace ninfer;
 using namespace ninfer::test;
-namespace shared = ninfer::models::moe;
-using shared::Partition;
-using shared::Bridge;
+namespace model_moe = ninfer::models::moe;
+namespace offload   = model_moe::offload;
+using offload::Partition;
+using offload::Bridge;
 using Clock    = std::chrono::steady_clock;
 using Kind     = ops::ExpertSubsetKind;
 using Epilogue = ops::MoeEpilogue;
@@ -80,7 +81,8 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     description           = describe_expert_cache(sources, config);
     ExpertCache cache(sources, description, device, device.transfer_view());
     const auto& weights = fixture.weights();
-    shared::Parameters parameters{fixture.profile(), weights.control, weights.shared, {0}, {}, {}};
+    model_moe::Parameters parameters{
+        fixture.profile(), weights.control, weights.shared, {0}, {}, {}};
     const auto team = plan_cpu_team(
         topology.info(), std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
     std::vector<std::int32_t> ids(moe::kExperts), half;
@@ -91,13 +93,13 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     Partition mixed({0}, moe::kExperts, half, device), none({0}, moe::kExperts, {}, device),
         all({0}, moe::kExperts, ids, device), other({1}, moe::kExperts, ids, device);
     auto requirements =
-        shared::describe_execution(parameters.profile, Kind::MaskOnes, epilogue, 1, 1024);
+        offload::describe_execution(parameters.profile, Kind::MaskOnes, epilogue, 1, 1024);
     for (auto kind : {Kind::All, Kind::None}) {
         requirements.include(
-            shared::describe_execution(parameters.profile, kind, epilogue, 1, 1024));
+            offload::describe_execution(parameters.profile, kind, epilogue, 1, 1024));
     }
     const auto all_requirements =
-        shared::describe_execution(parameters.profile, Kind::All, epilogue, 1, 128);
+        offload::describe_execution(parameters.profile, Kind::All, epilogue, 1, 128);
     require(all_requirements.pinned_frame_bytes == 0 && all_requirements.device_frame_bytes == 0 &&
                 all_requirements.cpu_workspace_bytes == 0,
             "All-GPU MoE reserved CPU resources");
@@ -107,7 +109,7 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     MemoryArena workspace(workspace_storage.span());
     int failures       = 0;
     const auto execute = [&](Call& call, const Partition& partition,
-                             shared::ExecutionView execution) {
+                             offload::ExecutionView execution) {
         std::optional<ExpertCacheUse> use;
         if (partition.gpu_kind() != Kind::None) {
             use = cache.acquire(partition.gpu_keys(), execution.cuda);
@@ -115,22 +117,22 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
         }
         try {
             if (graph) {
-                const auto prepared = shared::prepare_execution(
+                const auto prepared = offload::prepare_execution(
                     parameters, partition.view(), sources[0], cache.view({0}), epilogue,
                     call.device.x.ne[1], execution);
                 if (!call.graph.ready()) {
                     DecodeGraphDefinition definition;
                     definition.capture(execution.cuda.stream(), [&] {
-                        shared::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
-                                            shared::GpuSubmission::Capture);
+                        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                             offload::GpuSubmission::Capture);
                     });
                     call.graph.instantiate(definition);
                 }
                 call.graph.launch(execution.cuda.stream());
-                (void)shared::complete(prepared, call.destination);
+                (void)offload::complete(prepared, call.destination);
             } else {
-                shared::execute(call.device.x, parameters, partition.view(), sources[0],
-                                cache.view({0}), epilogue, call.destination, workspace, execution);
+                offload::execute(call.device.x, parameters, partition.view(), sources[0],
+                                 cache.view({0}), epilogue, call.destination, workspace, execution);
             }
         } catch (...) {
             if (use) cache.release(*use, execution.cuda);
@@ -272,10 +274,10 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
 
 void qualify_allocation() {
     for (const auto heterogeneous : {false, true}) {
-        shared::Plan plan;
+        offload::Plan plan;
         std::size_t total = 0, largest = 0;
         for (std::uint32_t i = 0; i < 4; ++i) {
-            shared::LayerPlan layer;
+            offload::LayerPlan layer;
             layer.spec.bank                   = {i};
             layer.spec.profile.routed.experts = 8;
             for (std::uint32_t e = 0; e < 8; ++e) layer.spec.priority.push_back(7 - e);
@@ -288,7 +290,7 @@ void qualify_allocation() {
         }
         for (std::size_t capacity = 0; capacity <= total + 256; capacity += 256) {
             plan.cache.config.capacity_bytes = capacity;
-            const bool feasible              = shared::plan_cache(plan);
+            const bool feasible              = offload::plan_cache(plan);
             require(feasible == (capacity >= largest), "streaming capacity admission differs");
             if (!feasible) continue;
             const auto fixed        = plan.cache.config.fixed_bytes;
@@ -350,17 +352,17 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     const std::array sources{ha.source(), hb.source(), ha.source(), hb.source()};
     const std::array<moe::Fixture*, 4> fixtures{&a, &a, &b, &b};
     const std::array<ExpertBankId, 4> order{{{2}, {0}, {3}, {1}}};
-    std::array<shared::Parameters, 4> parameters;
-    std::array<const shared::Parameters*, 4> inputs;
-    std::vector<shared::LayerSpec> specs;
-    shared::ExecutionRequirements bridge;
+    std::array<model_moe::Parameters, 4> parameters;
+    std::array<const model_moe::Parameters*, 4> inputs;
+    std::vector<model_moe::LayerSpec> specs;
+    offload::ExecutionRequirements bridge;
     const auto layout        = describe_expert_cache(sources, {});
     std::size_t largest_bank = 0;
     for (std::uint32_t i = 0; i < 4; ++i) {
         const auto& weights = fixtures[i]->weights();
         parameters[i] = {fixtures[i]->profile(), weights.control, weights.shared, order[i], {}, {}};
         inputs[i]     = &parameters[i];
-        shared::LayerSpec spec;
+        model_moe::LayerSpec spec;
         spec.bank     = order[i];
         spec.profile  = parameters[i].profile;
         spec.epilogue = i % 2 ? Epilogue::Write : Epilogue::AddResidual;
@@ -376,10 +378,10 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                 spec.priority.push_back(e);
         }
         const auto kind = Kind::MaskOnes;
-        bridge.include(shared::describe_execution(parameters[i].profile, kind, spec.epilogue, 1,
-                                                  spec.hybrid.max_tokens));
+        bridge.include(offload::describe_execution(parameters[i].profile, kind, spec.epilogue, 1,
+                                                   spec.hybrid.max_tokens));
         bridge.include(
-            shared::describe_execution(parameters[i].profile, Kind::All, spec.epilogue, 1, 1024));
+            offload::describe_execution(parameters[i].profile, Kind::All, spec.epilogue, 1, 1024));
         largest_bank =
             std::max(largest_bank, moe::kExperts * layout.banks[order[i].index].entry_bytes);
         specs.push_back(std::move(spec));
@@ -387,7 +389,7 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     std::vector<ExpertBankCacheSpec> bank_specs;
     for (const auto& source : sources)
         bank_specs.push_back({source.gate_up.layout, source.down.layout, false});
-    auto plan    = std::make_shared<shared::Plan>(shared::describe_plan(bank_specs, specs));
+    auto plan    = std::make_shared<offload::Plan>(offload::describe_plan(bank_specs, specs));
     plan->bridge = bridge;
     ExpertCacheConfig config;
     // Exercise both one-window admission and double buffering.
@@ -395,13 +397,13 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     config.upload_slots       = 12;
     config.max_in_flight_uses = 5;
     plan->cache               = describe_expert_cache(sources, config);
-    require(shared::plan_cache(*plan), "schedule fixture has insufficient capacity");
+    require(offload::plan_cache(*plan), "schedule fixture has insufficient capacity");
     plan->team = plan_cpu_team(topology.info(),
                                std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
-    shared::Resources resources(plan, inputs, sources, device,
-                                calibration ? shared::ResourcePurpose::GraphCalibration
-                                            : shared::ResourcePurpose::Execution);
-    std::optional<shared::Resources::Preparation> preparation;
+    offload::Resources resources(plan, inputs, sources, device,
+                                 calibration ? model_moe::ResourcePurpose::GraphCalibration
+                                             : model_moe::ResourcePurpose::Execution);
+    std::optional<offload::Resources::Preparation> preparation;
     if (calibration) preparation.emplace(resources);
     require(resources.cache_usage().ready_cache_bytes == (calibration ? 0 : plan->target_bytes),
             "startup returned before the initial expert cache became ready");
@@ -428,13 +430,13 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                                               : resources.prepare_layer(order[i]);
                     DecodeGraphDefinition definition;
                     definition.capture(device.stream(), [&] {
-                        shared::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
-                                            shared::GpuSubmission::Capture);
+                        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                             offload::GpuSubmission::Capture);
                     });
                     call.graph.instantiate(definition);
                     call.graph.launch(device.stream());
                     resources.gpu_submitted(order[i]);
-                    resources.finish_layer(shared::complete(prepared, call.destination));
+                    resources.finish_layer(offload::complete(prepared, call.destination));
                 } else {
                     resources.execute(order[i], calls[i]->device.x, calls[i]->destination,
                                       workspace, {});
@@ -456,7 +458,7 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
 
 namespace {
 void qualify_top10_bridge_routes(const DeviceContext& device, const CpuTopology& topology) {
-    shared::Parameters p;
+    model_moe::Parameters p;
     p.bank           = {0};
     p.profile.routed = {{2560, 640, QType::NVFP4, QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
                          QuantLayout::BlockScaleK16M128x4, ops::LinearPolicy::AllowA4,
@@ -477,7 +479,7 @@ void qualify_top10_bridge_routes(const DeviceContext& device, const CpuTopology&
     weight.n = weight.shape[0] = weight.padded_shape[0] = 513;
     weight.k = weight.shape[1] = weight.padded_shape[1] = 2560;
     const auto requirements =
-        shared::describe_execution(p.profile, Kind::None, Epilogue::Write, 1, 9);
+        offload::describe_execution(p.profile, Kind::None, Epilogue::Write, 1, 9);
     Bridge bridge(requirements, topology, plan_cpu_team(topology.info(), 1), device);
     GuardedDeviceBuffer scratch(requirements.gpu_workspace_bytes);
     MemoryArena workspace(scratch.span());
@@ -486,10 +488,10 @@ void qualify_top10_bridge_routes(const DeviceContext& device, const CpuTopology&
     parent.device = Device::cpu();
     const ExpertBankSource source{{&parent, {}}, {&parent, {}}, {}, {}};
     const ExpertBankDeviceView bank{{}, {}, 512, device.device()};
-    const shared::PartitionView partition{{0}, 512, Kind::None, {}, {}};
+    const offload::PartitionView partition{{0}, 512, Kind::None, {}, {}};
     for (int tokens : {1, 3, 8, 9}) {
-        auto prepared = shared::prepare_execution(p, partition, source, bank, Epilogue::Write,
-                                                  tokens, bridge.execution_view());
+        auto prepared = offload::prepare_execution(p, partition, source, bank, Epilogue::Write,
+                                                   tokens, bridge.execution_view());
         auto x = Tensor(inputs.span().subspan(0, 2560 * tokens * 2), DType::BF16, {2560, tokens});
         ops::topk_softmax_route(x, {2560, 512, 10}, p.control, prepared.frame.device_routes,
                                 prepared.frame.shared, workspace, device.execution_view());

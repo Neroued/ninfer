@@ -3,7 +3,7 @@
 #include "models/qwen4_exp/config.h"
 #include "ninfer/ops/moe.h"
 #include "ninfer/ops/gated_residual.h"
-#include "core/expert_cache.h"
+#include "core/weight_bank.h"
 
 #include <memory>
 #include <variant>
@@ -56,6 +56,10 @@ struct MtpProfile {
 };
 
 // Immutable, address-free descriptions of the selected actual representations.
+struct BankLayout {
+    WeightBankLayout gate_up, down;
+};
+
 struct ModelProfile {
     Config config;
     LoadOptions options;
@@ -63,7 +67,7 @@ struct ModelProfile {
     TextProfile text;
     std::optional<MtpProfile> mtp;
     std::optional<qwen::VisionProfile> vision;
-    std::vector<ExpertBankCacheSpec> banks;
+    std::vector<BankLayout> banks;
 };
 
 [[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const LoadPlan&);

@@ -69,8 +69,7 @@ void ProgramImpl::clear(Sequence& s) noexcept {
 
 void ProgramImpl::cleanup() noexcept {
     try {
-        device.synchronize();
-        resources.experts->synchronize();
+        resources.synchronize();
         ple.drain();
         cancel_operation();
         for (auto& s : sequences) {
@@ -200,7 +199,7 @@ MemorySummary Program::memory_summary() const {
             .handoff_peak_bytes     = p.vision_handoff_peak_bytes};
     }
     out.workspace_logical_peak_bytes = out.workspace.peak_used_bytes;
-    out.runtime_reservation_bytes    = plan.device_bytes();
+    out.runtime_reservation_bytes    = plan.device_reservation_bytes();
     const auto usage                 = p.usage();
     out.host_context_capacity_bytes  = usage.capacity.host_bytes;
     out.host_context_occupied_bytes  = usage.occupied.host_bytes;
@@ -209,30 +208,30 @@ MemorySummary Program::memory_summary() const {
     out.host_kv_occupied_bytes       = usage.host_kv_bytes;
     for (const auto& pool : p.pools)
         out.kv_payload_bytes += pool.device_page_bytes * pool.device_page_groups;
+    if (!p.resources.experts) return out;
     const auto cache = p.resources.experts->cache_usage();
-    const auto& m    = *plan.moe;
+    const auto& m    = plan.moe->description();
     out.moe.emplace();
     auto& summary                 = *out.moe;
     summary.host_weights_bytes    = weights.host_capacity_bytes;
     summary.registered_host_bytes = weights.registered_host_bytes;
-    summary.cache_bytes           = m.cache.config.capacity_bytes;
-    summary.fixed_bytes           = m.cache.config.fixed_bytes;
+    summary.cache_bytes           = m.cache_bytes;
+    summary.fixed_bytes           = m.fixed_bytes;
     summary.window_bytes          = summary.cache_bytes - summary.fixed_bytes;
     summary.window_count          = m.window_count;
     summary.used_bytes            = cache.used_bytes;
     summary.target_bytes          = m.target_bytes;
     summary.ready_bytes           = cache.ready_cache_bytes;
-    summary.cpu_workers           = m.team.worker_cpus.size();
-    summary.bridge_device_bytes   = m.bridge.device_frame_bytes;
-    summary.bridge_pinned_bytes   = m.bridge.pinned_frame_bytes;
-    summary.cpu_workspace_bytes   = m.bridge.cpu_workspace_bytes;
+    summary.cpu_workers           = m.cpu_workers;
+    summary.bridge_device_bytes   = m.bridge_device_bytes;
+    summary.bridge_pinned_bytes   = m.bridge_pinned_bytes;
+    summary.cpu_workspace_bytes   = m.cpu_workspace_bytes;
     summary.uploaded_bytes        = cache.data_bytes;
     summary.prefetched_bytes      = cache.prefetched_bytes;
     for (const auto& l : m.layers) {
         summary.fixed_experts_per_layer.push_back(l.fixed_experts);
         summary.target_experts_per_layer.push_back(l.cache_experts);
-        summary.ready_experts_per_layer.push_back(
-            cache.ready_experts_per_bank.at(l.spec.bank.index));
+        summary.ready_experts_per_layer.push_back(cache.ready_experts_per_bank.at(l.bank.index));
     }
     return out;
 }

@@ -42,7 +42,7 @@ public:
     [[nodiscard]] std::exception_ptr error(std::uint32_t owner) const;
     [[nodiscard]] ReadStats stats() const noexcept;
     [[nodiscard]] std::size_t memory_bytes() const noexcept;
-    [[nodiscard]] static std::size_t memory_bytes(const Table&, std::uint32_t owners,
+    [[nodiscard]] static std::size_t memory_bytes(TableGeometry, std::uint32_t owners,
                                                   std::uint32_t rows_per_owner,
                                                   std::uint32_t io_depth, std::size_t cache_bytes);
 

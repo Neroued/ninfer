@@ -7,6 +7,7 @@
 #include "models/qwen4_exp/ple/disk/prepare.h"
 #include "models/qwen4_exp/ple/upload.h"
 #include "runtime/engine/kv_capacity.h"
+#include "models/common/moe/schedule.h"
 
 namespace ninfer::models::qwen4_exp {
 struct PersistentLayout {
@@ -44,25 +45,27 @@ struct ExecutionPlan {
 
     [[nodiscard]] std::size_t device_bytes() const;
 
-    [[nodiscard]] std::size_t device_reservation_bytes() const { return device_bytes(); }
+    [[nodiscard]] std::size_t device_reservation_bytes() const;
 
     [[nodiscard]] std::size_t host_capacity_bytes() const { return host_context_bytes; }
 
     [[nodiscard]] std::uint32_t kv_capacity() const { return capacity.resolved_tokens; }
 };
 
-[[nodiscard]] moe::Plan describe_moe_plan(const execution::ModelProfile&, const MoeOptions&);
+[[nodiscard]] std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile&,
+                                                                 const MoeOptions&);
 
 [[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
                                                                      std::size_t layer);
 
 // Available bytes exclude immutable GPU weights and the caller's startup headroom.
-// Ordinary Host, registered expert backing, and pinned context capacity are independent budgets.
+// Shared-memory targets include planned Host preparation storage in the physical reservation.
 [[nodiscard]] std::optional<ExecutionPlan>
-plan_execution(std::shared_ptr<const execution::ModelProfile>, const ple::disk::Table&,
-               const EngineOptions&, DeviceContext&, std::size_t available_bytes);
+plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableGeometry,
+               const EngineOptions&, DeviceContext&, std::size_t available_bytes,
+               std::shared_ptr<const moe::Plan> prototype = {});
 
 [[nodiscard]] ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile>,
-                                             const ple::disk::Table&, const EngineOptions&,
+                                             ple::disk::TableGeometry, const EngineOptions&,
                                              DeviceContext&, std::shared_ptr<const moe::Plan>);
 } // namespace ninfer::models::qwen4_exp

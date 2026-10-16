@@ -17,21 +17,21 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 | 原生 MTP | draft 数 1–5，支持 Text/Vision、1–8 路、采样 penalty 和约束输出 |
 | CUDA Graph | ordinary、MTP draft/target/Finish、单列 control；Main 使用分段图 |
 | KV 存储 | BF16、INT8-G64、FP8-row256、NVFP4-G16、K8V4；index keys 固定 BF16 |
-| 上下文复用 | 完整 StateImage 与 Main/MTP 页组、前缀命中、Device/Host checkpoint、Snapshot/Replay 恢复 |
+| 上下文复用 | 完整 StateImage 与 Main/MTP 页组、Device 前缀命中、Snapshot/Replay；5090 还提供 Host 副本 |
 | 前端与服务 | thinking、thinking budget、tool call、GBNF/JSON/schema/choice/regex；共用 Qwen Frontend 和现有 HTTP 协议 |
 | CausalScoring | 公共 Engine 的单路 Text 评分；不启用 Vision 或 speculative backend |
-| Expert 放置 | Main 完整 registered Host backing，加 GPU 静态缓存与整层流式执行；MTP/shared 固定 GPU |
+| Expert 放置 | Main 支持 GPU resident；5090 还提供 registered Host backing、GPU 缓存及整层流式执行；MTP/shared 固定 GPU |
 | PLE | V3 磁盘表、Host hash/NF4 解码、有界行缓存、增量准备和双槽 H2D |
 
 当前限制：
 
 - Speculative backend 仅支持原生 MTP，使用完整共享 BF16 head；不支持 DFlash、DFlash2
   或 indexed proposal head，因此不使用 `--lm-head-draft`。
-- Main experts 始终保留完整 Host 来源。GPU 缓存没有请求自适应排序或 decode 动态换入；
+- Offload 模式保留完整 Host expert 来源。GPU 缓存没有请求自适应排序或 decode 动态换入；
   小批量缺失 expert 由 CPU 计算，没有按需换入 GPU 计算的第三条分工路径。
 - PLE 当前只有磁盘准备路径，没有整表 RAM/GPU lookup。
-- Prefill、Replay、Vision encode、MTP 历史对齐和最终状态采用走 eager。
-  Graph 改变 GPU 提交方式，不移除 CPU expert 或磁盘交接。
+- Prefill、Replay、Vision encode、MTP 历史对齐与状态采用均使用 eager。
+  Resident Graph 包含完整层的 GPU 计算；offload 保留 CPU expert 交接。两者均保留 PLE 磁盘交接。
 
 用户命令见 [CLI](../cli.md)与[Serving](../serving.md)，产物生成见
 [转换指南](../weight-conversion.md)。这些能力描述当前实现；公开的吞吐与质量结果由
@@ -59,7 +59,7 @@ HC 的四条 streams 是特征轴，GDN/QSA/MoE 的 token 数不乘四。
 | 所有者 | 内容 |
 |---|---|
 | Model | Config、Binding/Use、不可变 Host/GPU 权重、PLE 文件 backing、hash controls 和 LUT |
-| Program | StateImage、Main/MTP KV pools、records、workspace、expert cache/CPU bridge、PLE 服务与上传槽、Graphs |
+| Program | StateImage、Main/MTP KV pools、records、workspace、PLE 服务与上传槽、Graphs；offload 另持有 expert cache/CPU bridge |
 | 请求 continuation | 完整 state identity、Main/MTP frontiers、RoPE delta、PLE raw-ID tail |
 | Ops | 借用的输入输出和 scratch；计算或状态提取，不发布请求状态 |
 | Runtime / Frontend | 请求调度、保留策略、输出 preview/commit 和协议语义 |
@@ -139,7 +139,8 @@ Router/shared parent 的持久合并不强制一次计算；shared 始终在 GPU
 GPU 的完整融合与 routed subset 入口均已实现，CPU subset 产生 FP32 contribution，
 由公共 mixed execution 汇合并最终舍入。
 
-公共 `models/common/moe` 按实际 M 选择策略：
+Resident 路径直接调用完整 GPU 融合 MoE，bank 地址由 Model backing 保持稳定。
+Offload 路径由公共 `models/common/moe` 按实际 M 选择策略：
 
 - 小 M：GPU 计算 ready experts，CPU 计算补集；稳定时不搬运权重。
 - 大 M：固定缓存与窗口中补齐的缺失集合组成完整 bank，全 GPU 计算，并预取下一层。
@@ -347,7 +348,8 @@ Eager/capture 调用同一组 GPU body，CPU experts、缓存 lease 与磁盘 I/
 
 PLE 位于前序层之后的 Host 交接处：提交前序计算，等待当前 HostReady 并排入 H2D/event，
 选择对应上传槽的 PLE 消费图，再继续后续层。两个稳定 E 地址仅各自绑定 PLE 消费段。
-每层公共 MoE 图保留 CPU/cache 交接，不能把整个 Main 描述为一次完整图重放。
+Resident 每层捕获 `mixer → MoE → combine`；offload 每层保留 CPU/cache 交接。
+Main 仍由 stem、逐层图、PLE 段和 finish 组成。
 
 同一 exact-B 内，位置、valid columns、state selectors、table rows、page IDs、route/mask
 内容是 Device 输入。上下文 envelope 由 Program 选择并更新兼容图；GDN 定义和
@@ -361,21 +363,26 @@ Target 与 Finish 分开，Host 在 Finish 前生成约束 mask。最终接受�
 ### 8.2 容量规划
 
 加载前从 config、Binding/Use 和各 Op 容量查询建立执行 profile。
-权重 materialize 后，Graph probe 使用少量私有 KV 页和公共 MoE calibration bank，
-保留实际 batch、draft 数、KV 格式、context envelope 与图共享关系。
+Startup 提供 resident 与目标可用的 offload 放置候选；Loader 按选定位置建立原编码 backing。
+权重 materialize 后，Graph probe 使用少量私有 KV 页，并保留实际 batch、draft 数、
+KV 格式、context envelope 与图共享关系。Resident 直接借用已加载 GPU banks；offload
+使用公共 MoE calibration bank。Graph 准备描述区分两种执行方式。
 销毁 probe 后按实际可用显存和 Graph 重建估计规划正式资源，遵循公共启动的 1 GiB
 headroom 与有界容量纠偏规则。Graph 先于其引用的 workspace、bridge 和 events 销毁。
 
 Flash Next 的 prefill chunk 默认 4096，可显式指定 128 的正整数倍，
 实际窗口受剩余上下文、capture 点和媒体边界限制。没有启动自动 chunk 调优。
-自动 KV 先保证一个完整上下文，剩余预算用于 expert cache；显式 KV 容量必须兑现。
+Resident 的自动 KV 使用扣除必需资源后的剩余预算；offload 先保证一个完整上下文，
+剩余预算用于 expert cache。显式 KV 容量必须兑现。
 Device pool 在启动时固定，不在请求期间扩容或动态与 expert cache 交换配额。
 
 Workspace 对顺序互斥 scratch 取峰值，跨阶段存活的 records、conditioning 和视觉
 handoff 单独计入。PLE 容量为
 `Mmax=max(prefill_chunk,max_concurrency*(draft_tokens+1))`，
 两份 pinned E 和两份 Device E 各自共占 `2*Mmax*2560*2` B，
-另计 64 MiB row cache、I/O buffers 和有界 Host metadata。
+另计 64 MiB row cache、I/O buffers 和有界 Host metadata。PLE 容量查询使用独立的
+TableGeometry；启动重试不借用已销毁 Model 的 table。Spark 将这些 Host 分配与 GPU
+分配计入同一物理预算，Host State/KV cache 为零；Vision 的 live media 额度另在启动预算中预留。
 
 以下是本实例的逻辑 state payload，尚未计入 field/slot 对齐：
 

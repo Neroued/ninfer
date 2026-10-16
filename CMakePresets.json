@@ -7,17 +7,24 @@
   },
   "configurePresets": [
     {
-      "name": "rtx5090-release",
-      "displayName": "RTX 5090 product binaries",
+      "name": "product",
+      "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "NINFER_TARGET": "rtx5090",
         "NINFER_BUILD_ENGINE": "ON",
         "NINFER_BUILD_APPS": "ON",
         "BUILD_TESTING": "OFF",
         "NINFER_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "rtx5090-release",
+      "displayName": "RTX 5090 product binaries",
+      "inherits": "product",
+      "cacheVariables": {
+        "NINFER_TARGET": "rtx5090"
       }
     },
     {
@@ -39,11 +46,29 @@
       }
     },
     {
-      "name": "dgx-spark-ops",
-      "displayName": "DGX Spark Core, Artifact and Ops development",
-      "inherits": "rtx5090-ops",
+      "name": "dgx-spark-release",
+      "displayName": "DGX Spark product binaries",
+      "inherits": "product",
       "cacheVariables": {
         "NINFER_TARGET": "dgx_spark"
+      }
+    },
+    {
+      "name": "dgx-spark-dev",
+      "displayName": "DGX Spark products, tests and benchmarks",
+      "inherits": "dgx-spark-release",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "NINFER_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "dgx-spark-ops",
+      "displayName": "DGX Spark Core, Artifact and Ops development",
+      "inherits": "dgx-spark-dev",
+      "cacheVariables": {
+        "NINFER_BUILD_ENGINE": "OFF",
+        "NINFER_BUILD_APPS": "OFF"
       }
     }
   ],
@@ -63,6 +88,14 @@
     {
       "name": "dgx-spark-ops",
       "configurePreset": "dgx-spark-ops"
+    },
+    {
+      "name": "dgx-spark-release",
+      "configurePreset": "dgx-spark-release"
+    },
+    {
+      "name": "dgx-spark-dev",
+      "configurePreset": "dgx-spark-dev"
     }
   ],
   "testPresets": [
@@ -83,6 +116,13 @@
     {
       "name": "dgx-spark-ops",
       "configurePreset": "dgx-spark-ops",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dgx-spark-dev",
+      "configurePreset": "dgx-spark-dev",
       "output": {
         "outputOnFailure": true
       }

@@ -14,8 +14,8 @@ NINFER_VRAM_BUDGET_MIB=16384 ./build/rtx5090-release/apps/ninfer out/qwen3_6_35b
   --prompt "Explain how a compiler works." --max-context 8192 --max-new 128
 ```
 
-`--prefill-chunk N` sets a fixed positive multiple of 128. When omitted, the default is 1024 for
-resident models and 4096 for CPU expert offload. Serving and offline scoring use the same Engine
+`--prefill-chunk N` sets a fixed positive multiple of 128. When omitted, the default is 4096 for
+Qwen4Exp or CPU expert offload, and 1024 otherwise. Serving and offline scoring use the same Engine
 defaults. See [expert execution](maintainer/expert-weight-cache.md) for ownership and scheduling.
 
 Qwen3.8-Flash-Next uses Qwen4Exp Text/Vision/MTP. CUDA Graph decode is enabled by default:
@@ -26,8 +26,9 @@ Qwen3.8-Flash-Next uses Qwen4Exp Text/Vision/MTP. CUDA Graph decode is enabled b
   --prompt "Explain how sparse attention works." --max-new 256
 ```
 
-Main experts remain in registered Host memory, with GPU caching and streaming; the current recipe
-requires about 63.3 GiB of Host expert backing plus runtime and system memory. PLE reads its
+On RTX 5090, this recipe uses registered Host experts with GPU caching and streaming, requiring
+about 63.3 GiB of Host expert backing plus runtime and system memory. On DGX Spark, use
+`build/dgx-spark-release/apps/ninfer`; selected weights reside on the GPU without a Host expert copy. PLE reads its
 NF4 rows from the artifact on disk. Add `--vision` for image/video messages. Native MTP supports
 `--spec mtp --draft-tokens 1..5` with either Text or Vision, using the full shared BF16 head;
 omit `--lm-head-draft`. MTP's own experts remain on GPU. Serving uses the same execution path;
@@ -372,8 +373,9 @@ the 64-token page size. Startup plans the selected weights and complete enabled 
 from artifact metadata before allocating their backing. With resident weights,
 `--kv-capacity auto` chooses the largest legal page capacity within the available Device budget,
 including the selected speculative backend, fixed sequence state, unified workspace and
-measured CUDA Graph rebuilding cost. Both explicit and automatic capacity use 1 GiB of startup
-planning headroom. Startup calibration releases its temporary storage before sizing the final pools;
+measured CUDA Graph rebuilding cost. Both explicit and automatic capacity use 1 GiB of base startup
+planning headroom. On Spark, Vision also reserves the configured live media capacity in shared memory.
+Startup calibration releases its temporary storage before sizing the final pools;
 retained driver memory is already included in the remaining free memory. With CPU expert
 offload, `auto` reserves one full context and assigns the remaining budget to expert storage;
 set an explicit capacity when more shared KV is needed. Graph calibration runs only at startup;

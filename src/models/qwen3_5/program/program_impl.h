@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/common/context/migration.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/schedule.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
@@ -373,7 +373,7 @@ public:
     DeviceBuffer persistent;
     DeviceBuffer workspace_storage;
     MemoryArena work;
-    std::unique_ptr<moe::Resources> moe;
+    std::unique_ptr<moe::Schedule> moe;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;

@@ -21,6 +21,7 @@ private:
     std::size_t requested_bytes_;
 };
 
+// Allocatable physical capacity. Shared-memory targets include reclaimable Linux file cache.
 struct DeviceMemorySnapshot {
     std::size_t free_bytes = 0, total_bytes = 0;
 };

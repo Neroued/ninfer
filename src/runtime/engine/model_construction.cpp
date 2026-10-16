@@ -93,7 +93,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
-    ContextCacheOptions& cache      = options.context_cache;
+    ContextCacheOptions& cache = options.context_cache;
+    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0) cache.host_capacity_bytes = 0;
     const std::uint32_t concurrency = options.max_concurrency;
     cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
     const std::uint64_t total_device_state_slots =
@@ -111,7 +112,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     const auto limit   = device_budget(initial.free_bytes);
     const auto headroom =
         std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes);
-    StartupMemoryBudget budget(initial, limit, headroom);
+    // Retained and in-flight prepared media share the live-byte account.
+    const auto host_reservation = (NINFER_SHARED_PHYSICAL_MEMORY != 0) && options.enable_vision
+                                      ? options.media_live_bytes
+                                      : 0;
+    StartupMemoryBudget budget(initial, limit, headroom, host_reservation);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();

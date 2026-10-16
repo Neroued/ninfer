@@ -361,10 +361,10 @@ operand contracts and mathematical oracles remain outside those directories when
 Each target owns its tuning independently. The compiled Op defines its supported inputs;
 workspace queries and execution use the same admission rules and report unsupported calls there.
 
-Q8 projection demonstrates independent target catalogs under `linear/projection/q8/`. HC mix keeps
-its multi-stage Plan and launch decisions behind `gated_residual/mix/implementation.h`; workspace
-layout takes explicit scratch extents rather than a target's Plan. The public interfaces remain
-independent of platform selection.
+Keep a compatible implementation shared until a target actually needs independent selection or
+launch policy. Creating target directories must not remove an existing supported route. Workspace
+layout consumes the selected implementation's scratch extents; public interfaces remain independent
+of platform selection.
 
 ## 5. State, workspace, naming, and dependencies
 

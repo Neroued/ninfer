@@ -14,10 +14,6 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 if(NINFER_BUILD_APPS AND NOT NINFER_BUILD_ENGINE)
   message(FATAL_ERROR "NINFER_BUILD_APPS requires NINFER_BUILD_ENGINE")
 endif()
-if(NINFER_BUILD_ENGINE AND NINFER_TARGET STREQUAL "dgx_spark")
-  message(FATAL_ERROR
-    "NINFER_BUILD_ENGINE is not supported for dgx_spark; use the dgx-spark-ops preset")
-endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

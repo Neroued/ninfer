@@ -153,9 +153,9 @@ struct RowReader::Impl {
         }
     };
 
-    static Layout describe(const Table& table, std::uint32_t count, std::uint32_t per_owner,
+    static Layout describe(TableGeometry table, std::uint32_t count, std::uint32_t per_owner,
                            std::uint32_t depth, std::size_t cache_bytes) {
-        if (!depth || depth > 65535 || table.files().empty() || !count || !per_owner ||
+        if (!depth || depth > 65535 || !table.max_row_segments || !count || !per_owner ||
             (cache_bytes && cache_bytes < sizeof(CacheSet)))
             throw std::invalid_argument("invalid PLE row reader resources");
         // Later segments start at a V3 file's 4 KiB-aligned payload prefix. Only the
@@ -165,22 +165,19 @@ struct RowReader::Impl {
                    capacity(std::uint64_t(count) * per_owner),
                    0,
                    static_cast<std::uint32_t>(
-                       std::min<std::size_t>(kRowBytes, table.max_row_segments() + 1)),
+                       std::min<std::size_t>(kRowBytes, table.max_row_segments + 1)),
                    depth,
                    cache_bytes / sizeof(CacheSet),
-                   table.max_row_segments()};
-        out.fragments = capacity(std::uint64_t(out.rows) * out.parts);
-        for (const auto file : table.files()) {
-            out.alignment  = std::max(out.alignment, std::size_t(file.memory_alignment));
-            out.read_bytes = std::max({out.read_bytes, std::size_t(file.offset_alignment),
-                                       std::size_t(file.memory_alignment)});
-        }
+                   table.max_row_segments};
+        out.fragments  = capacity(std::uint64_t(out.rows) * out.parts);
+        out.alignment  = table.memory_alignment;
+        out.read_bytes = table.read_alignment;
         return out;
     }
 
     Impl(const Table& table, std::uint32_t count, std::uint32_t per_owner, std::uint32_t depth,
          std::size_t cache_bytes)
-        : Impl(table, describe(table, count, per_owner, depth, cache_bytes)) {}
+        : Impl(table, describe(table.geometry(), count, per_owner, depth, cache_bytes)) {}
 
     Impl(const Table& table, const Layout& layout)
         : table(table), owner_rows(layout.owner_rows), part_capacity(layout.parts),
@@ -580,7 +577,7 @@ std::size_t RowReader::memory_bytes() const noexcept {
                (sizeof(MemorySpan) + sizeof(io::ReadCompletion) + sizeof(std::uint32_t));
 }
 
-std::size_t RowReader::memory_bytes(const Table& table, std::uint32_t owners, std::uint32_t rows,
+std::size_t RowReader::memory_bytes(TableGeometry table, std::uint32_t owners, std::uint32_t rows,
                                     std::uint32_t depth, std::size_t cache) {
     return Impl::describe(table, owners, rows, depth, cache).bytes();
 }

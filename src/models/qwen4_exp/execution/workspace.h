@@ -2,7 +2,7 @@
 
 #include "core/layout.h"
 #include "models/qwen4_exp/execution/profile.h"
-#include "models/common/moe/plan.h"
+#include "models/common/moe/schedule.h"
 #include "models/common/qwen/vision/vision.h"
 
 namespace ninfer::models::qwen4_exp::execution {

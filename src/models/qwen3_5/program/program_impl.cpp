@@ -235,10 +235,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (const auto* layer = std::get_if<moe::Parameters>(&block.ffn))
                 layers.push_back(layer);
         }
-        moe = std::make_unique<moe::Resources>(
-            plan.moe, layers, parameters.model.expert_banks(), device,
-            plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
-                             : moe::ResourcePurpose::Execution);
+        moe = plan.moe->create(layers, parameters.model.expert_banks(), device,
+                               plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
+                                                : moe::ResourcePurpose::Execution);
     }
     device.synchronize();
 
@@ -449,28 +448,28 @@ MemorySummary ProgramImpl::memory_summary() const {
     out.max_context   = capacity;
     out.prefill_chunk = prefill_chunk;
     if (moe) {
-        const auto& plan = moe->plan();
+        const auto& plan = moe->description();
         MoeMemorySummary summary;
         summary.host_weights_bytes    = weights.host_capacity_bytes;
         summary.registered_host_bytes = weights.registered_host_bytes;
-        summary.cache_bytes           = plan.cache.config.capacity_bytes;
-        summary.fixed_bytes           = plan.cache.config.fixed_bytes;
+        summary.cache_bytes           = plan.cache_bytes;
+        summary.fixed_bytes           = plan.fixed_bytes;
         summary.window_bytes          = summary.cache_bytes - summary.fixed_bytes;
         summary.window_count          = plan.window_count;
         const auto usage              = moe->cache_usage();
         summary.used_bytes            = usage.used_bytes;
         summary.target_bytes          = plan.target_bytes;
         summary.ready_bytes           = usage.ready_cache_bytes;
-        summary.cpu_workers           = static_cast<std::uint32_t>(plan.team.worker_cpus.size());
+        summary.cpu_workers           = plan.cpu_workers;
         for (const auto& layer : plan.layers) {
             summary.fixed_experts_per_layer.push_back(layer.fixed_experts);
             summary.target_experts_per_layer.push_back(layer.cache_experts);
             summary.ready_experts_per_layer.push_back(
-                usage.ready_experts_per_bank.at(layer.spec.bank.index));
+                usage.ready_experts_per_bank.at(layer.bank.index));
         }
-        summary.bridge_device_bytes = plan.bridge.device_frame_bytes;
-        summary.bridge_pinned_bytes = plan.bridge.pinned_frame_bytes;
-        summary.cpu_workspace_bytes = plan.bridge.cpu_workspace_bytes;
+        summary.bridge_device_bytes = plan.bridge_device_bytes;
+        summary.bridge_pinned_bytes = plan.bridge_pinned_bytes;
+        summary.cpu_workspace_bytes = plan.cpu_workspace_bytes;
         summary.uploaded_bytes      = moe->uploaded_bytes();
         summary.prefetched_bytes    = usage.prefetched_bytes;
         out.moe                     = std::move(summary);

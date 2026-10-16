@@ -342,15 +342,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 auto bytes =
                     moe::workspace_bytes(p.math, ops::MoeEpilogue::AddResidual, first, last);
                 if (plan.moe) {
-                    const auto& layer = plan.moe->layer(p.bank);
-                    const auto end    = std::min(last, layer.hybrid_max_tokens);
-                    if (first <= end) {
-                        // The masked route also bounds the no-GPU-assignment route.
-                        bytes = std::max(bytes, moe::describe_execution(
-                                                    p.math, ops::ExpertSubsetKind::MaskOnes,
-                                                    ops::MoeEpilogue::AddResidual, first, end)
-                                                    .gpu_workspace_bytes);
-                    }
+                    bytes = std::max(bytes, plan.moe->workspace_bytes(p.bank, first, last));
                 }
                 scratch(layout, bytes);
             }
@@ -839,8 +831,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes =
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence device capacity");
     if (impl->moe) {
-        impl->device_reservation_bytes = checked_add(
-            impl->device_reservation_bytes, impl->moe->device_bytes, "MoE device capacity");
+        impl->device_reservation_bytes =
+            checked_add(impl->device_reservation_bytes, impl->moe->description().device_bytes,
+                        "MoE device capacity");
     }
     return impl;
 }

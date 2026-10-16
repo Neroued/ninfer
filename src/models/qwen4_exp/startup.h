@@ -8,11 +8,15 @@
 
 namespace ninfer::models::qwen4_exp {
 
+struct ExecutionPreparation {
+    std::shared_ptr<const moe::Plan> experts;
+};
+
 class Startup {
 public:
-    using Types                          = RuntimeTypes;
-    using ExecutionPlan                  = models::ExecutionPlan<qwen4_exp::ExecutionPlan>;
-    using Calibration                    = GraphCalibration;
+    using Types         = RuntimeTypes;
+    using ExecutionPlan = models::ExecutionPlan<qwen4_exp::ExecutionPlan, ExecutionPreparation>;
+    using Calibration   = GraphCalibration;
     static constexpr bool supports_graph = true;
 
     Startup(const artifact::Reader&, const EngineOptions&, Device);
@@ -20,19 +24,27 @@ public:
     [[nodiscard]] Architecture architecture() const noexcept { return Architecture::Qwen4Exp; }
 
     [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
-                                                    bool host_experts, std::size_t available) const;
-    [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, bool host_experts,
+                                                    WeightPlacement, std::size_t available) const;
+    [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, WeightPlacement,
                                                      const StartupObserver&);
     [[nodiscard]] qwen::Frontend frontend(const Model&, const EngineOptions&) const;
-    [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&, const moe::Plan*) const;
+    [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&,
+                                                  const ExecutionPreparation&) const;
     [[nodiscard]] Calibration calibrate(const execution::Parameters&, DeviceContext&,
-                                        const EngineOptions&,
-                                        std::shared_ptr<const moe::Plan>) const;
-    WeightPlacement weights;
+                                        const EngineOptions&, const ExecutionPreparation&) const;
+
+    [[nodiscard]] std::span<const WeightCandidate> placements() const { return placements_; }
+
+    [[nodiscard]] std::string prefill_signature(const Model&, const ExecutionPreparation&,
+                                                std::uint32_t chunk) const;
     std::shared_ptr<const execution::ModelProfile> profile;
 private:
-    LoadPlan source_;
-    const ple::disk::Table* table_;
+    std::vector<WeightCandidate> placements_;
+    std::shared_ptr<const moe::Plan> offload_;
+    const artifact::Reader& reader_;
+    LoadOptions selection_;
+    std::optional<LoadPlan> source_;
+    ple::disk::TableGeometry table_;
 };
 
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, ExecutionPlan&&,

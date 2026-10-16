@@ -296,7 +296,9 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Snapshot/Replay recovery and cancellation while paused or replaying; `NINFER_PREEMPTION_REAL_SCENARIO`
-selects `all`, `snapshot`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover
+selects `all`, `snapshot`, `replay`, `cancel-paused` or `cancel-replay`.
+`NINFER_TEST_PROPOSAL_HEAD=full` selects the full head for Qwen4Exp MTP; the default is `optimized`.
+On Spark, use the replay/cancellation cases with Device context storage. Native transaction tests cover
 physical state/KV ownership, binding, capture, reclamation and abort; their positional backend is
 `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the
@@ -458,14 +460,15 @@ build/rtx5090-dev/tests/ninfer_qwen3_5_loading_real_test --artifact out/qwen3_6_
 Qwen4Exp loading/resources can be checked independently of the public Engine route:
 
 ```bash
-./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer
-./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --materialize
+./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --host-experts
+./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --host-experts --materialize
 ```
 
 The first command plans component combinations, KV formats and concurrency without loading weight
 payloads. `--materialize` additionally loads one full-component model, checks stored words and
 parameter sharing, constructs its execution resources, and reads/uploads a PLE window. It needs
-about 64 GiB of available Host memory plus system headroom. These are loading/resource checks;
+about 64 GiB of available Host memory plus system headroom with `--host-experts`. For resident
+loading on Spark, use its build directory and omit `--host-experts`. These are loading/resource checks;
 Text/Vision/MTP generation, eager or CUDA Graph decode, and text causal scoring use the public Engine,
 with current support described in the [execution reference](../docs/maintainer/qwen4_exp-execution.md)
 and commands in the [CLI guide](../docs/cli.md).

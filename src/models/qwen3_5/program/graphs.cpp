@@ -144,7 +144,7 @@ DecodeGraphTopology& DecodeGraphFamily::install(DecodeGraphProfile& profile) {
 
 void ProgramImpl::prepare_graphs() {
     if (!use_cuda_graph) { return; }
-    std::optional<moe::Resources::Preparation> preparation;
+    std::optional<moe::Schedule::Preparation> preparation;
     if (moe) preparation.emplace(*moe);
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
 

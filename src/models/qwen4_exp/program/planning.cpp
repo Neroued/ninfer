@@ -28,13 +28,13 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
 
 } // namespace
 
-moe::Plan describe_moe_plan(const execution::ModelProfile& p, const MoeOptions& o) {
+std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile& p,
+                                                   const MoeOptions& o) {
     if (o.expert_priority && o.expert_priority->size() != p.text.layers.size())
         throw std::invalid_argument("expert priority must cover every Main layer");
     std::vector<moe::LayerSpec> layers;
     for (std::size_t i = 0; i < p.text.layers.size(); ++i) {
         const auto& m = p.text.layers[i].moe;
-        // Initial small-T limit; the integrated Qwen4Exp traversal will determine its crossover.
         moe::LayerSpec layer{m.bank, m.math, ops::MoeEpilogue::Write, {}, {64, 15}};
         if (o.expert_priority)
             layer.priority = (*o.expert_priority)[i];
@@ -46,7 +46,10 @@ moe::Plan describe_moe_plan(const execution::ModelProfile& p, const MoeOptions& 
         }
         layers.push_back(std::move(layer));
     }
-    return moe::describe_plan(p.banks, layers);
+    std::vector<ExpertBankCacheSpec> banks;
+    for (const auto& bank : p.banks) banks.push_back({bank.gate_up, bank.down, true});
+    for (const auto& layer : layers) banks[layer.bank.index].resident = false;
+    return moe::describe_plan(banks, layers);
 }
 
 namespace {
@@ -67,6 +70,7 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
         (o.max_concurrency != 1 || o.enable_vision ||
          o.speculative.backend != SpeculativeBackend::None))
         throw std::invalid_argument("scoring requires normalized single-lane text options");
+    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0) o.context_cache.host_capacity_bytes = 0;
     if (!o.prefill_chunk) o.prefill_chunk = 4096;
     if (o.prefill_chunk % 128)
         throw std::invalid_argument("prefill chunk must be a multiple of 128");
@@ -77,8 +81,8 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
 }
 
 ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profile,
-                            const ple::disk::Table& table, const EngineOptions& o,
-                            DeviceContext& device, std::uint32_t pages, const moe::Plan& schedule) {
+                            ple::disk::TableGeometry table, const EngineOptions& o,
+                            DeviceContext& device, std::uint32_t pages, const moe::Plan* schedule) {
     ExecutionPlan out;
     out.profile = std::move(profile);
     out.shape   = {
@@ -86,7 +90,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
         o.kv_cache,    o.purpose,         o.context_cache.enabled, o.use_cuda_graph};
     out.persistent = persistent(*out.profile, o, pages);
     out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
-                                               device.multiprocessor_count(), &schedule);
+                                               device.multiprocessor_count(), schedule);
     out.ple.max_positions =
         std::max(o.prefill_chunk, o.max_concurrency * (o.speculative.draft_tokens + 1));
     out.ple_upload         = ple::UploadSlots::memory(out.ple.max_positions, 2);
@@ -121,13 +125,21 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
 
 std::size_t ExecutionPlan::device_bytes() const {
     return persistent.bytes + workspace.bytes + ple_upload.device_bytes +
-           (moe ? moe->device_bytes : 0);
+           (moe ? moe->description().device_bytes : 0);
+}
+
+std::size_t ExecutionPlan::device_reservation_bytes() const {
+    const auto host = ple_prepare_bytes + ple_upload.ordinary_host_bytes +
+                      ple_upload.pinned_host_bytes + pinned_io_bytes + pinned_output_bytes +
+                      pinned_sampling_bytes + pinned_mtp_bytes;
+    return device_bytes() + ((NINFER_SHARED_PHYSICAL_MEMORY != 0) ? host : 0);
 }
 
 std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
-                                            const ple::disk::Table& table,
+                                            ple::disk::TableGeometry table,
                                             const EngineOptions& supplied, DeviceContext& device,
-                                            std::size_t available) {
+                                            std::size_t available,
+                                            std::shared_ptr<const moe::Plan> prototype) {
     if (!profile) throw std::invalid_argument("execution planning requires a model profile");
     ExecutionPlan out;
     out.profile                     = std::move(profile);
@@ -147,38 +159,40 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
             throw std::invalid_argument("KV capacity cannot cover active lanes");
     } else if (policy.mode != KvCapacityMode::Automatic || policy.explicit_tokens)
         throw std::invalid_argument("invalid KV capacity policy");
-    auto prototype  = describe_moe_plan(*out.profile, o.moe);
-    out             = physical_plan(out.profile, table, o, device, pages, prototype);
-    const auto base = out.device_bytes();
+    out             = physical_plan(out.profile, table, o, device, pages, prototype.get());
+    const auto base = out.device_reservation_bytes();
     if (base > available) return {};
-    CpuTopology topology;
-    auto plan = moe::resolve_plan(std::move(prototype), out.profile->banks, available - base,
-                                  out.ple.max_positions, topology, o.moe.cpu_workers);
-    if (!plan) return {};
-    out.moe = std::make_shared<moe::Plan>(std::move(*plan));
-    // The prototype covers all actual hybrid widths; the resolved worker count can only narrow
-    // them.
+    if (prototype) {
+        out.moe = prototype->resolve(available - base, out.ple.max_positions, o.moe.cpu_workers);
+        if (!out.moe) return {};
+    }
     const auto minimum  = persistent(*out.profile, o, minimum_pages).bytes;
     const auto adjacent = persistent(*out.profile, o, minimum_pages + 1).bytes;
-    runtime::SequenceCapacityCurve curve{64, minimum_pages, maximum_pages,
-                                         out.device_bytes() - out.persistent.bytes + minimum,
-                                         adjacent - minimum};
-    out.capacity = runtime::resolve_kv_capacity(KvCapacityPolicy::explicit_capacity(pages * 64),
-                                                curve, available);
-    out.capacity.mode = policy.mode;
+    runtime::SequenceCapacityCurve curve{
+        64, minimum_pages, maximum_pages,
+        out.device_reservation_bytes() - out.persistent.bytes + minimum, adjacent - minimum};
+    if (out.moe) {
+        out.capacity = runtime::resolve_kv_capacity(KvCapacityPolicy::explicit_capacity(pages * 64),
+                                                    curve, available);
+        out.capacity.mode = policy.mode;
+    } else {
+        out.capacity   = runtime::resolve_kv_capacity(policy, curve, available);
+        out.persistent = persistent(*out.profile, o, out.capacity.primary_page_groups);
+    }
     return out;
 }
 
 ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> profile,
-                               const ple::disk::Table& table, const EngineOptions& supplied,
+                               ple::disk::TableGeometry table, const EngineOptions& supplied,
                                DeviceContext& device, std::shared_ptr<const moe::Plan> schedule) {
     auto o                              = options(*profile, supplied);
     o.context_cache.host_capacity_bytes = 0;
-    auto plan = physical_plan(std::move(profile), table, o, device, o.max_concurrency, *schedule);
-    plan.moe  = std::move(schedule);
+    auto plan =
+        physical_plan(std::move(profile), table, o, device, o.max_concurrency, schedule.get());
+    plan.moe                                = std::move(schedule);
     plan.graph_probe                        = true;
     plan.capacity.resolved_tokens           = o.max_concurrency * 64;
-    plan.capacity.runtime_reservation_bytes = plan.device_bytes();
+    plan.capacity.runtime_reservation_bytes = plan.device_reservation_bytes();
     return plan;
 }
 

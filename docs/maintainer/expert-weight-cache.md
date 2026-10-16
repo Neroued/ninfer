@@ -62,8 +62,8 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
 `Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源。
 workspace 查询消费数学 profile；完整 GPU FFN 显式接受 resident/cached CUDA bank，
 混合单层执行另外借用原生 Host bank 和交接资源。
-Qwen3.5 MoE 在完整 GPU 放置不可行时使用 Host Main experts；Qwen4Exp Main 始终使用
-NVFP4 Host backing 和 Program GPU cache。Qwen4Exp 的 block-FP8 MTP experts 常驻 GPU，
+Qwen3.5 MoE 与 Qwen4Exp 均支持完整 GPU 放置；5090 预算不足时可选择 Host Main experts
+和 Program GPU cache。Spark 使用完整 GPU 放置。Qwen4Exp 的 block-FP8 MTP experts 常驻 GPU，
 模型编排见 [Qwen4Exp 执行](qwen4_exp-execution.md)。
 
 ## 副本容量与 GPU 寻址
@@ -235,8 +235,10 @@ Qwen3.5 的完整 GPU 放置可行时使用融合路径，不创建 Host expert 
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
 `moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
 
-`moe::Resources` 由 Program 持有。公共 plan 按实际 MoE 调用顺序组织，bank ID 与模型层号
-独立。模型提供 Main/MTP 的 bank 放置与优先级；混合计算阈值及参考 CPU 团队规模作为
+`moe::Schedule` 由 Program 持有，封装 offload traversal、CPU 活动和图交接；其具体
+`offload::Resources`、CPU/team 计划与分段图只在提供 offload 的目标编译。
+Resident 调用直接消费 Model bank，复用完整 GPU 融合 Op。公共 plan 按实际 MoE 调用顺序组织，
+bank ID 与模型层号独立。模型提供 Main/MTP 的 bank 放置与优先级；混合计算阈值及参考 CPU 团队规模作为
 计算 profile 的策略输入，缓存规划不固定任何模型几何。扣除固定资源、KV、workspace、bridge/masks 和索引后，
 剩余容量 C 分成固定区 R 和流式窗口。启动时联合求解均衡的固定额度及窗口容量：每层完整
 bank 为 W_l，固定 expert 为 R_l，每个窗口必须容纳 `max_l(W_l-R_l)`。不先扣除两个完整 bank。

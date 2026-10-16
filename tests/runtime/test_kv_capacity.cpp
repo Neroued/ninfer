@@ -53,7 +53,7 @@ int main() {
                       "automatic KV capacity accepted less than the minimum reservation");
 
     // The probe left 200 bytes in the driver; the new free snapshot already includes it.
-    const ninfer::runtime::StartupMemoryBudget budget({10000, 12000}, 8000, 500);
+    const ninfer::runtime::StartupMemoryBudget budget({10000, 12000}, 8000, 500, 0);
     failures += check(budget.available({7800, 12000}) == 5300,
                       "startup retained allocation was not charged exactly once");
     failures += check(budget.available({9800, 12000}) == 7300,
@@ -64,9 +64,15 @@ int main() {
                       "negative memory growth wrapped to a large unsigned estimate");
     failures += check(budget.fits({2100, 12000}) && !budget.fits({1900, 12000}),
                       "actual startup footprint did not obey the Device budget");
-    const ninfer::runtime::StartupMemoryBudget physical({3000, 12000}, 8000, 500);
+    const ninfer::runtime::StartupMemoryBudget physical({3000, 12000}, 8000, 500, 0);
     failures += check(physical.available({2000, 12000}) == 1500,
                       "physical availability did not bound the configured budget");
+
+    const ninfer::runtime::StartupMemoryBudget shared({10000, 12000}, 8000, 500, 1000);
+    failures += check(shared.available({7800, 12000}) == 4300 && shared.headroom() == 1500,
+                      "shared Host payload capacity was not reserved");
+    failures += check(shared.fits({3000, 12000}) && !shared.fits({2999, 12000}),
+                      "startup consumed the shared Host payload reservation");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

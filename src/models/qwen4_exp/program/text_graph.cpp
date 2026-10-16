@@ -4,6 +4,40 @@
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
+namespace {
+class ResidentDefinition;
+
+class ResidentExecutable final : public moe::LayerGraphExecutable {
+public:
+    explicit ResidentExecutable(const DecodeGraphDefinition& definition) {
+        executable_.instantiate(definition);
+    }
+
+    void update(const moe::LayerGraphDefinition&) override;
+
+    void upload(cudaStream_t stream) override { executable_.upload(stream); }
+
+    void replay(Tensor&, CudaExecutionView cuda, const std::function<void()>& submitted) override {
+        executable_.launch(cuda.stream());
+        if (submitted) submitted();
+    }
+private:
+    DecodeGraphExecutable executable_;
+};
+
+class ResidentDefinition final : public moe::LayerGraphDefinition {
+public:
+    DecodeGraphDefinition definition;
+
+    std::unique_ptr<moe::LayerGraphExecutable> instantiate() const override {
+        return std::make_unique<ResidentExecutable>(definition);
+    }
+};
+
+void ResidentExecutable::update(const moe::LayerGraphDefinition& source) {
+    executable_.update(dynamic_cast<const ResidentDefinition&>(source).definition);
+}
+} // namespace
 
 void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& body) {
     definition.capture(cuda.stream(), body);
@@ -12,12 +46,13 @@ void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& 
 }
 
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
-                        moe::Resources& experts, std::span<const std::uint32_t> bounds,
+                        moe::Schedule* experts, std::span<const std::uint32_t> bounds,
                         std::array<Tensor, 2> ple, execution::TextOutputs output,
                         std::int32_t columns, MemoryArena& workspace, DeviceContext& device) {
     const auto cuda    = device.execution_view();
     const auto& config = parameters.model.config().text;
     ple_layer_         = config.ple.layer;
+    block_output_      = run.block_output();
     for (const auto& layer : parameters.text.layers) banks_.push_back(layer.moe.bank);
     workspace.reset_peak();
     stem_.prepare(cuda, [&] { run.stem(); });
@@ -38,13 +73,20 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
                 profile.layers.push_back(*shared);
                 continue;
             }
-            auto layer = std::make_shared<moe::LayerGraphDefinition>();
-            layer->moe = shared ? (*shared)->moe : std::make_shared<moe::SubsetGraphDefinitions>();
-            moe::capture_layer(
-                *layer, experts, banks_[i], cuda, columns, [&] { run.mixer(i); },
-                [&](const moe::PreparedExecution& call) { run.gpu_moe(call); },
-                [&] { run.combine(i); });
-            profile.layers.push_back(std::move(layer));
+            if (experts) {
+                profile.layers.push_back(experts->capture_layer(
+                    banks_[i], cuda, columns, [&] { run.mixer(i); },
+                    [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); },
+                    shared ? *shared : nullptr));
+            } else {
+                auto layer = std::make_shared<ResidentDefinition>();
+                layer->definition.capture(cuda.stream(), [&] {
+                    run.mixer(i);
+                    run.resident_moe(i);
+                    run.combine(i);
+                });
+                profile.layers.push_back(std::move(layer));
+            }
         }
         profile.workspace_bytes = std::max(fixed_workspace, workspace.peak_used());
         if (!profiles_.empty())
@@ -53,11 +95,11 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
         profiles_.push_back(std::move(profile));
     }
     layers_.reserve(banks_.size());
-    for (const auto& layer : profiles_.front().layers) layers_.emplace_back(*layer);
+    for (const auto& layer : profiles_.front().layers) layers_.push_back(layer->instantiate());
     // Exercise every update before accepting requests, including the return to the first tier.
     for (const auto bound : bounds) {
         select(bound);
-        for (auto& layer : layers_) layer.upload(cuda.stream());
+        for (auto& layer : layers_) layer->upload(cuda.stream());
         device.synchronize();
     }
     select(bounds.front());
@@ -70,21 +112,20 @@ void TextGraph::select(std::uint32_t visible) {
     const auto next = static_cast<std::size_t>(it - profiles_.begin());
     if (next == installed_) return;
     for (std::size_t i = 0; i < layers_.size(); ++i)
-        if (it->layers[i] != profiles_[installed_].layers[i]) layers_[i].update(*it->layers[i]);
+        if (it->layers[i] != profiles_[installed_].layers[i]) layers_[i]->update(*it->layers[i]);
     installed_ = next;
 }
 
-void TextGraph::traverse(std::uint32_t begin, std::uint32_t end, moe::Resources& experts,
-                         Tensor& output, CudaExecutionView cuda) {
+void TextGraph::traverse(std::uint32_t begin, std::uint32_t end, CudaExecutionView cuda) {
     for (auto i = begin; i < end; ++i) {
         nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
-        layers_[i].replay(experts, banks_[i], output, cuda);
+        layers_[i]->replay(block_output_, cuda);
     }
 }
 
-void TextGraph::prefix(moe::Resources& experts, Tensor& output, CudaExecutionView cuda) {
+void TextGraph::prefix(CudaExecutionView cuda) {
     stem_.executable.launch(cuda.stream());
-    traverse(0, ple_layer_, experts, output, cuda);
+    traverse(0, ple_layer_, cuda);
 }
 
 void TextGraph::consume_ple(std::uint32_t slot, CudaExecutionView cuda) {
@@ -92,8 +133,8 @@ void TextGraph::consume_ple(std::uint32_t slot, CudaExecutionView cuda) {
     ple_[slot].executable.launch(cuda.stream());
 }
 
-void TextGraph::suffix(moe::Resources& experts, Tensor& output, CudaExecutionView cuda) {
-    traverse(ple_layer_, banks_.size(), experts, output, cuda);
+void TextGraph::suffix(CudaExecutionView cuda) {
+    traverse(ple_layer_, banks_.size(), cuda);
     finish_.executable.launch(cuda.stream());
 }
 

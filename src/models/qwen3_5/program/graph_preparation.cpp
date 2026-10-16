@@ -17,8 +17,8 @@ GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
                            ? 1U
                            : options.speculative.draft_tokens + 1;
     for (std::uint32_t batch = 1; batch <= options.max_concurrency; ++batch)
-        for (const auto& layer : moe->layers)
-            out.layers_by_batch.push_back(moe::graph_plan(*moe, layer.spec.bank, batch * width));
+        for (const auto& layer : moe->description().layers)
+            out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch * width));
     return out;
 }
 

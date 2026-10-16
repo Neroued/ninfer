@@ -1,5 +1,6 @@
 // Cold-cache benchmark for the two registered public Q8 LinearPair geometries.
 
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_pair.h"
@@ -25,12 +26,10 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kParentRows  = 6144;
-constexpr std::int32_t kFirstRow    = 4096;
-constexpr std::int32_t kSecondRow   = 5120;
-constexpr std::int32_t kRows        = 1024;
-constexpr double kRtx5090ReadGBs    = 1674.5;
-constexpr double kRtx5090Bf16Tflops = 209.5;
+constexpr std::int32_t kParentRows = 6144;
+constexpr std::int32_t kFirstRow   = 4096;
+constexpr std::int32_t kSecondRow  = 5120;
+constexpr std::int32_t kRows       = 1024;
 
 enum class Execution : std::uint8_t { Eager, Graph };
 
@@ -149,12 +148,13 @@ int main(int argc, char** argv) {
         const Weight second_weight = bench::row_view(parent.weight, kSecondRow, kRows);
 
         std::printf("# gpu=%s public=linear_pair shape=two_adjacent_Q8[1024,%d] "
-                    "execution=%s cache=cold flush_bytes=%llu read_reference=%.1f_GB/s "
-                    "bf16_tc_reference=%.1f_TFLOP/s\n",
+                    "execution=%s cache=cold flush_bytes=%llu read_reference=%s_GB/s "
+                    "bf16_tc_reference=%s_TFLOP/s\n",
                     properties.name, options.k,
                     options.execution == Execution::Graph ? "graph_replay" : "eager",
-                    static_cast<unsigned long long>(options.flush_bytes), kRtx5090ReadGBs,
-                    kRtx5090Bf16Tflops);
+                    static_cast<unsigned long long>(options.flush_bytes),
+                    bench::format_metric(bench::kRoofline.sustained_read_gbs, 1).c_str(),
+                    bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 
         double t1_median = std::numeric_limits<double>::quiet_NaN();
         for (const std::int32_t tokens : options.tokens) {
@@ -184,15 +184,15 @@ int main(int argc, char** argv) {
             const double extrapolation = std::isnan(t1_median)
                                              ? std::numeric_limits<double>::quiet_NaN()
                                              : tokens * t1_median / timing.median_us;
-            std::printf("T=%-3d median=%8.3f us min=%8.3f us p95=%8.3f us "
-                        "effective=%7.1f GB/s READ=%5.1f%% logical=%6.2f TFLOP/s ",
-                        tokens, timing.median_us, timing.min_us, timing.p95_us, gbs,
-                        100.0 * gbs / kRtx5090ReadGBs, tflops);
-            if (tokens == 1) {
-                std::printf("TC=n/a ");
-            } else {
-                std::printf("TC=%5.1f%% ", 100.0 * tflops / kRtx5090Bf16Tflops);
-            }
+            std::printf(
+                "T=%-3d median=%8.3f us min=%8.3f us p95=%8.3f us "
+                "effective=%7.1f GB/s READ=%5s%% logical=%6.2f TFLOP/s ",
+                tokens, timing.median_us, timing.min_us, timing.p95_us, gbs,
+                bench::format_metric(100.0 * gbs / bench::kRoofline.sustained_read_gbs, 1).c_str(),
+                tflops);
+            const double tc_pct = tokens > 1 ? 100.0 * tflops / bench::kRoofline.bf16_f32_tflops
+                                             : std::numeric_limits<double>::quiet_NaN();
+            std::printf("TC=%5s%% ", bench::format_metric(tc_pct, 1).c_str());
             if (std::isnan(extrapolation)) {
                 std::printf("T1_linear=n/a\n");
             } else {

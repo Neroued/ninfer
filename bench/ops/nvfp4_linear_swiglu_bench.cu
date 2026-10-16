@@ -1,3 +1,4 @@
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -44,6 +45,7 @@ struct Result {
     bench::ColdTiming timing;
     double effective_gbs;
     double useful_tflops;
+    double nvfp4_percent;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -109,13 +111,14 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
-           "useful_tflops,warmup,repeat,flush_bytes\n";
+           "useful_tflops,nvfp4_peak_percent,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
             << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
-            << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
-            << ',' << options.repeat << ',' << kFlushBytes << '\n';
+            << ',' << result.effective_gbs << ',' << result.useful_tflops << ','
+            << bench::format_metric(result.nvfp4_percent, 6, "") << ',' << options.warmup << ','
+            << options.repeat << ',' << kFlushBytes << '\n';
     }
 }
 
@@ -173,8 +176,11 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
-        std::printf("%-14s %3s %8s %8s %6s %11s %11s %11s %10s %10s\n", "op", "pol", "N", "K", "T",
-                    "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s");
+        std::printf("# reference_target=%s dense_nvfp4_fp32_accumulate_peak_tflops=%s cache=cold\n",
+                    bench::kRoofline.target,
+                    bench::format_metric(bench::kRoofline.nvfp4_f32_tflops, 1).c_str());
+        std::printf("%-14s %3s %8s %8s %6s %11s %11s %11s %10s %10s %8s\n", "op", "pol", "N", "K",
+                    "T", "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "NVFP4_%");
         for (const std::int32_t tokens : options.t_sweep) {
             const auto launch = make_launch(tokens);
             const bench::ColdTiming timing =
@@ -185,11 +191,15 @@ int main(int argc, char** argv) {
                                        2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
-            std::printf("%-14s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n",
+            const bool a4 = options.policy == ops::LinearPolicy::AllowA4 && tokens >= 5;
+            const double nvfp4_percent =
+                a4 ? 100.0 * useful_tflops / bench::kRoofline.nvfp4_f32_tflops
+                   : std::numeric_limits<double>::quiet_NaN();
+            std::printf("%-14s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8s\n",
                         "linear_swiglu", policy_name(options.policy), kGateUpRows, kHidden, tokens,
                         timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
-                        useful_tflops);
-            results.push_back({tokens, timing, effective_gbs, useful_tflops});
+                        useful_tflops, bench::format_metric(nvfp4_percent).c_str());
+            results.push_back({tokens, timing, effective_gbs, useful_tflops, nvfp4_percent});
         }
         write_csv(options, results, packed.model_weight_bytes());
         CUDA_CHECK(cudaStreamDestroy(stream));

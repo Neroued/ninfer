@@ -21,6 +21,20 @@ system. Unknown targets, conflicting CUDA architectures and target changes withi
 build directory are configuration errors. Compiler changes also require a fresh build directory.
 Libraries and executables retain their logical names across targets; their build trees are separate.
 
+The same selection generates `<build-dir>/generated/core/platform.h` from
+[`src/core/platform.h.in`](../../src/core/platform.h.in). Internal consumers explicitly include
+`core/platform.h`; `ninfer_internal_includes()` supplies its private include root. Both
+`NINFER_TARGET_RTX5090` and `NINFER_TARGET_SPARK` are defined as 0 or 1, so test them with `#if`.
+These definitions do not propagate into public headers or third-party targets.
+
+Target identity and capabilities are distinct. The platform header maps each target to
+`NINFER_SHARED_PHYSICAL_MEMORY` and `NINFER_EXPERT_OFFLOAD` independently. Memory planning uses the
+former; model offload entry points use the latter. Shared physical memory is not a Spark identity
+test, and lack of shared memory does not itself imply CPU expert support. CMake still owns
+target-private translation units and dependencies; macros handle small differences within shared
+sources, not whole implementation catalogs. Benchmark reference data belongs to
+[`bench/common/roofline.h`](../../bench/common/roofline.h), selected by target identity.
+
 Target selection owns source composition and compilation, not model mathematics or artifact
 capability admission. Ops retain the same public interfaces and report unsupported implementations
 at their own capacity/execution entries. Models do not receive a target key or reproduce Op shape

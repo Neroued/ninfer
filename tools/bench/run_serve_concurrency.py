@@ -97,7 +97,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/rtx5090-dev/apps/ninfer-serve",
+        required=True,
         help="ninfer-serve executable",
     )
     parser.add_argument(

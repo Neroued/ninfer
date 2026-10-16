@@ -5,6 +5,7 @@
 // evicting L2; both run outside the timed interval. One complete public ops::linear_add call is
 // captured per graph, and the reported node count is the captured graph's real node count.
 
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear.h"
@@ -34,7 +35,6 @@ constexpr std::int32_t kRows           = 5120;
 constexpr std::size_t kDefaultFlushMiB = 256;
 constexpr int kDefaultWarmup           = 5;
 constexpr int kDefaultRepeat           = 50;
-constexpr double kDramSpecGBs          = 1792.0;
 
 struct Options {
     std::int32_t hidden = 0;
@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
                              row.timing.median_us, row.timing.min_us, row.timing.p95_us,
                              static_cast<unsigned long long>(row.weight_bytes),
                              static_cast<unsigned long long>(row.logical_bytes),
-                             row.projection_flops, gbs, gbs / kDramSpecGBs * 100.0,
+                             row.projection_flops, gbs, gbs / bench::kRoofline.memory_gbs * 100.0,
                              row.projection_flops / seconds / 1.0e12, row.workspace_sweep_bytes,
                              row.workspace_exact_bytes, row.workspace_used_bytes);
             }

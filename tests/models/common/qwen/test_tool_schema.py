@@ -8,12 +8,7 @@ import unittest
 
 import jsonschema
 
-ROOT = Path(__file__).resolve().parents[4]
-PROBE = Path(
-    os.environ.get(
-        "NINFER_TOOL_PROBE", ROOT / "build/rtx5090-dev/tests/ninfer_qwen_tool_constraints_test"
-    )
-)
+PROBE = Path(os.environ["NINFER_TOOL_PROBE"])
 
 
 def schema(value):

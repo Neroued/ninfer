@@ -1,4 +1,5 @@
 #include "runtime/engine/model_construction.h"
+#include "core/platform.h"
 #include "runtime/engine/model_startup.h"
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"

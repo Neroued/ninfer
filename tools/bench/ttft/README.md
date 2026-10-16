@@ -95,9 +95,11 @@ run. Use the standalone ordinary case when an isolated whole-run resource compar
 The default artifact is `out/qwen3_8_27b_nvfp4.ninfer`, with FP8 KV. GPU campaigns run serially.
 
 ```bash
-python3 tools/bench/run_serve_ttft_campaign.py --campaign preemption --samples 1
+python3 tools/bench/run_serve_ttft_campaign.py \
+  --serve build/rtx5090-dev/apps/ninfer-serve --campaign preemption --samples 1
 
 python3 tools/bench/run_serve_ttft_campaign.py \
+  --serve build/rtx5090-dev/apps/ninfer-serve \
   --case session-hot-continuation \
   --case private-state-working-set-shift \
   --samples 3
@@ -116,8 +118,8 @@ Campaigns select workloads by purpose:
 | `preprocess` | Default versus single-thread heavy-media preparation. |
 | `smoke` | One short cold case. |
 
-The default is `resource` with one sample. Select
-`--serve` and `--artifact` explicitly when using another binary or artifact. Fixture token facts
+The default is `resource` with one sample. `--serve` is required; use
+`--artifact` when selecting another artifact. Fixture token facts
 still need to match the selected tokenizer/template.
 
 `--profile-config FILE` replaces the built-in profile catalog. This allows a preserved baseline

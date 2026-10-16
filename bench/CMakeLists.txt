@@ -16,3 +16,8 @@ endif()
 add_executable(ninfer_expert_cache_bench core/expert_cache.cu)
 ninfer_internal_includes(ninfer_expert_cache_bench)
 target_link_libraries(ninfer_expert_cache_bench PRIVATE ninfer_artifact ninfer_core)
+
+add_executable(ninfer_memory_bandwidth_bench ../tools/hbm_bandwidth_probe.cu)
+ninfer_internal_includes(ninfer_memory_bandwidth_bench)
+target_include_directories(ninfer_memory_bandwidth_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ninfer_memory_bandwidth_bench PRIVATE CUDA::cudart)

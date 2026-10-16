@@ -30,7 +30,6 @@ def _cuda_module():
         extra_cuda_cflags=[
             "-O3",
             "--fmad=false",
-            "-gencode=arch=compute_120,code=sm_120",
         ],
         extra_cflags=["-O3"],
         verbose=False,

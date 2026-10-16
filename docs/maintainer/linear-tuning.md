@@ -145,9 +145,9 @@ model_bytes       = weight_bytes + 2*K*T + 2*N*T
 effective_GB/s    = model_bytes / seconds / 1e9
 useful_flops      = 2*N*K*T
 useful_TFLOP/s    = useful_flops / seconds / 1e12
-DRAM_%           = effective_GB/s / 1792 * 100
-READ_%           = effective_GB/s / 1674.5 * 100
-memory_floor_us  = model_bytes / (1792 * 1e9) * 1e6
+DRAM_%           = effective_GB/s / memory_gbs * 100
+READ_%           = effective_GB/s / sustained_read_gbs * 100
+memory_floor_us  = model_bytes / (memory_gbs * 1e9) * 1e6
 memory_floor_pct = memory_floor_us / median_us * 100
 ```
 
@@ -156,14 +156,15 @@ split/reduction work and cache hits require profiler evidence. Dequantization, p
 private work do not increase useful FLOPs. The benchmark does not infer executed FLOPs or weight
 replay from a schedule.
 
-The RTX 5090 references are nominal DRAM bandwidth `1792 GB/s` and the measured sustained pure-read
-ceiling `1674.5 GB/s`, obtained by [the HBM probe](../../tools/hbm_bandwidth_probe.cu) with a 4 GiB
-`uint4` read workload. `READ_%` is useful for read-dominated points; a read/write copy ceiling does
-not replace that reference. Tensor Core percentages use the dense peak for the actual input and
-accumulator profile only where the exact geometry/policy/extent establishes that profile; otherwise
-the fields remain empty. An activation permission alone does not identify the executed arithmetic.
-The header's dense references are BF16/FP32 accumulation `209.5 TFLOP/s`, FP8/FP16 accumulation
-`838 TFLOP/s`, FP8/FP32 accumulation `419 TFLOP/s`, and MXFP8/FP32 accumulation `838 TFLOP/s`.
+The compiled target selects references from
+[`bench/common/roofline.h`](../../bench/common/roofline.h); their values and provenance are described
+in [Benchmarks](../../bench/README.md#hardware-references). `READ_%` is useful for read-dominated
+points; a read/write copy ceiling does not replace that reference. Tensor Core percentages use the
+dense peak for the actual input and accumulator profile only where the exact geometry/policy/extent
+establishes that profile. An activation permission alone does not identify the executed arithmetic.
+Unknown references or arithmetic leave the associated fields empty in CSV and `-` in console output.
+If the compute reference is absent, report the memory lower bound without claiming a complete
+roofline bound or classifying the point as memory-limited.
 
 Console and CSV identify labels, format, policy, N/K/T, median/min/p95, logical rates and applicable
 peak percentages. CSV retains byte breakdown, execution, Graph nodes/calls, warmup, repetitions

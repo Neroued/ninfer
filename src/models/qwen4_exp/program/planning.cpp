@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/planning.h"
+#include "core/platform.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>

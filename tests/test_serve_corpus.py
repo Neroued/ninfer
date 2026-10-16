@@ -192,6 +192,8 @@ def test_selected_kv_reaches_server_and_is_verified(
     artifact = tmp_path / "model.ninfer"
     artifact.touch()
     common = [
+        "--serve",
+        "serve",
         "--artifact",
         f"model={artifact}",
         "--output",

@@ -1,6 +1,7 @@
 // Public-Op benchmark for symmetric sliding-window Softmax Attention.
 // Each measured eager launch or graph-bundle entry calls public sliding_window_attention().
 
+#include "common/roofline.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "core/buffer.h"
 
@@ -34,9 +35,7 @@ constexpr std::int32_t kQueryHeads = 32;
 constexpr std::int32_t kKvHeads    = 8;
 constexpr float kScale             = 0.08838834764831844055F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -335,12 +334,14 @@ void report(const Result& result) {
                 result.graph_nodes, result.graph_calls, result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps);
     if (result.cache == CacheState::Cold && result.graph_calls == 1) {
-        std::printf("DRAM=%5.1f%% of %.0f GB/s ", gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+        std::printf("DRAM=%5.1f%% of %.0f GB/s ", gbps / bench::kRoofline.memory_gbs * 100.0,
+                    bench::kRoofline.memory_gbs);
     } else {
         std::printf("DRAM=n/a ");
     }
-    std::printf("math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n", tflops,
-                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+    std::printf("math=%7.2f TFLOP/s (%5s%% of %s)\n", tflops,
+                bench::format_metric(tflops / bench::kRoofline.bf16_f32_tflops * 100.0, 1).c_str(),
+                bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

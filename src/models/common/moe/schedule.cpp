@@ -1,4 +1,5 @@
 #include "models/common/moe/schedule.h"
+#include "core/platform.h"
 
 #if NINFER_EXPERT_OFFLOAD
 #    include "models/common/moe/offload/plan.h"

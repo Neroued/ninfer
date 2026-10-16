@@ -1,6 +1,7 @@
 // Public-Op benchmark for full and device-count-prefix KV cache append contracts.
 // Cache encoding, launch geometry, and route selection remain private to the public wrappers.
 
+#include "common/roofline.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "core/buffer.h"
 #include "ninfer/ops/kv_cache_append.h"
@@ -36,7 +37,6 @@ constexpr std::int32_t kPrefixHeadDim       = 128;
 constexpr std::int32_t kPrefixKvHeads       = 8;
 constexpr std::int32_t kPagedPrefixCapacity = 4096;
 constexpr std::size_t kFlushBytes           = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs            = 1792.0;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
@@ -607,7 +607,8 @@ void report(const Result& result) {
                 result.committed, result.max_count, result.graph_nodes, result.graph_calls,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us,
                 result.logical_cache_bytes, result.physical_cache_bytes, result.key_vector_bytes,
-                result.value_vector_bytes, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+                result.value_vector_bytes, gbps, gbps / bench::kRoofline.memory_gbs * 100.0,
+                bench::kRoofline.memory_gbs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

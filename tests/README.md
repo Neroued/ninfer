@@ -323,6 +323,9 @@ before protocol adapters serialize the schema.
 `NINFER_TEST_ARTIFACT` to check GBNF/JSON/schema/choice/regex content, sampling, thinking, continuation, prefix reuse
 and mixed batches. `ninfer_regex_choice_test` checks literal-set prefix masks and regex edge cases;
 `python3 tests/text/test_regex_choice.py` compares regex membership with independent fullmatch semantics.
+CTest supplies each Python oracle's native probe path. For direct invocation, set
+`NINFER_TOOL_PROBE`, `NINFER_REGEX_PROBE`, or `NINFER_SCHEMA_PROBE` to the corresponding test binary
+under the selected build tree; the scripts have no implicit build-directory choice.
 Set `NINFER_TEST_CONSTRAINT=grammar` or `json_schema` on the preemption test to
 check matcher continuity through Snapshot/Replay and cancellation. `ninfer_grammar_test` and
 `ninfer_json_schema_test` cover CPU language semantics. `ninfer_json_schema_oracle_test` compares
@@ -359,9 +362,11 @@ prefix reuse, speculative execution, frontier bounds and Responses inheritance:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
+  --server-bin build/rtx5090-dev/apps/ninfer-serve \
   --artifact out/qwen3_6_27b.ninfer --backend mtp
 
 python3 tools/smoke/serve_thinking_preservation.py \
+  --server-bin build/rtx5090-dev/apps/ninfer-serve \
   --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
 ```
 

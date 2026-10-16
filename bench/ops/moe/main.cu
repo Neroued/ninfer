@@ -1,3 +1,4 @@
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
@@ -221,15 +222,6 @@ double logical_flops(const Result& result) {
         result.operation == Operation::RoutedShared || result.operation == Operation::Complete;
     return result.tokens * ((router ? 2.0 * kRouterRows * kHidden : 0) + (shared ? ffn : 0)) +
            (result.operation == Operation::Route ? 0 : result.selected_assignments * ffn);
-}
-
-double theoretical_memory_gbps(int device) {
-    int memory_clock_khz = 0;
-    int memory_bus_bits  = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&memory_bus_bits, cudaDevAttrGlobalMemoryBusWidth, device));
-    return 2.0 * static_cast<double>(memory_clock_khz) * 1.0e3 *
-           (static_cast<double>(memory_bus_bits) / 8.0) / 1.0e9;
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -897,7 +889,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
+    const double peak_memory_gbps = bench::kRoofline.memory_gbs;
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "memory_lower_bound_us,logical_tflops,workspace_bytes,warmup,repeat,"
@@ -931,14 +923,15 @@ int main(int argc, char** argv) {
     try {
         const Options options         = parse_options(argc, argv);
         auto& context                 = ninfer::bench::device_context();
-        const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
+        const double peak_memory_gbps = bench::kRoofline.memory_gbs;
         std::printf("# gpu=%s compute_capability=%d execution=%s "
                     "timed_scope=public_op_device_body cold_flush_mib=%llu "
-                    "theoretical_memory=%.1f GB/s\n",
+                    "reference_target=%s theoretical_memory=%.1f GB/s\n",
                     context.properties().name, context.compute_capability(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
-                    static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);
+                    static_cast<unsigned long long>(options.flush_bytes >> 20),
+                    bench::kRoofline.target, peak_memory_gbps);
 
         std::printf(
             "# op=%s subset=%d; memory bound uses unique weights and theoretical bandwidth\n",

@@ -74,6 +74,51 @@ and `dgx-spark-ops` presets omit Engine/model benchmarks. CPU MoE/executor bench
 Examples below use `rtx5090-dev`; substitute the selected build directory. A multi-Op benchmark
 may expose entries that its target does not implement; those requests report the Op error.
 
+## Hardware references
+
+[`common/roofline.h`](common/roofline.h) owns the compile-target reference table. Benchmarks report
+the actual GPU separately; they do not choose a reference from its name or estimate nominal
+bandwidth from runtime memory-clock attributes. Logical GB/s and TFLOP/s describe useful work,
+not measured DRAM traffic or executed Tensor Core instructions.
+
+| Reference | RTX 5090 | DGX Spark |
+|---|---:|---:|
+| Nominal memory bandwidth, GB/s | 1792 | 273 |
+| Measured sustained pure-read bandwidth, GB/s | 1674.5 | 257.42 |
+| Dense BF16 / FP32 accumulation, TFLOP/s | 209.5 | 125.89 |
+| Dense FP8 E4M3 / FP16 accumulation, TFLOP/s | 838 | 250.80 |
+| Dense FP8 E4M3 / FP32 accumulation, TFLOP/s | 419 | 249.75 |
+| Dense MXFP8 E4M3 / FP32 accumulation, TFLOP/s | 838 | 249.52 |
+| Dense NVFP4 / FP32 accumulation, TFLOP/s | 1676 | 499.02 |
+
+The 5090 sustained-read reference comes from the [memory probe](../tools/hbm_bandwidth_probe.cu)
+using a 4 GiB `uint4` read workload. The plain BF16/FP8 and NVFP4 peaks follow the dense rates in
+[NVIDIA's RTX Blackwell whitepaper, Appendix A](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf).
+The MXFP8 reference describes the full-rate block-scaled FP32 accumulation path. Spark's nominal
+bandwidth follows the [NVIDIA hardware guide](https://docs.nvidia.com/dgx/dgx-spark/hardware.html).
+
+Spark's sustained-read and Tensor Core references use the same measured calibration on
+`192.168.1.51`, recorded on 2026-10-09 in `/home/neroued/SPARK.md`; its source is
+`/home/neroued/gb10_bench.cu` on that machine. The fixed launch uses 48 SMs, four 256-thread CTAs
+per SM, default GPU Boost, a two-second warmup, and the median of seven samples. Memory reads
+stream a 1 GiB nonconstant buffer for 16 passes. Tensor tests keep operands in registers and use
+eight independent accumulator chains; each warp MMA counts `2*M*N*K` FLOPs. Alternating signs
+keep FP16 accumulators finite, and the benchmark checks the computed results. These are measured
+MMA throughput references, not official nominal specifications or complete GEMM throughput.
+In this calibration, ordinary FP8 FP32 accumulation has the same throughput as FP16 accumulation;
+the RTX 5090 half-rate relationship does not apply to GB10. All Spark Tensor references, including
+NVFP4, use that measured basis. Unestablished references remain absent: derived percentages print
+`-` in console output and an empty CSV field.
+
+Use the profile matching the arithmetic actually selected by the Op, not merely its weight type or
+activation permission. Shape/T classification belongs to the affected benchmark, outside the
+hardware table, and must follow changes to production dispatch. SIMT routes do not report Tensor
+Core utilization. Hardware-reference changes do not change Op dispatch.
+
+`ninfer_memory_bandwidth_bench` measures sustained read, write and copy rates using the selected
+target's nominal bandwidth. `--peak-gbps` explicitly overrides that comparison value. Build/run
+instructions are in [Tools](../tools/README.md#memory-bandwidth-probe).
+
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
@@ -921,9 +966,10 @@ cmake --build build/rtx5090-dev --parallel --target ninfer_q5_linear_add_bench
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
 in-place BF16 residual epilogue. Each production sample measures one complete public call after
 restoring the residual outside the timed region and flushing L2.
-Effective bandwidth counts the weight once, the activation once, and
-the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
-references.
+Effective bandwidth counts the weight once, the activation once, and the residual read plus write.
+`READ_%` and `TC_%` use the selected target's sustained-read and BF16 references. T=1..4 use SIMT
+and omit the Tensor Core percentage and combined compute/memory roofline; the memory lower bound
+is still reported.
 
 ```bash
 cmake --build build/rtx5090-dev --parallel --target ninfer_bf16_linear_add_bench

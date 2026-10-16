@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BUILD_DIR = REPO_ROOT / "build/rtx5090-dev"
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -419,7 +418,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
     parser.add_argument(
-        "--build-dir", type=Path, default=DEFAULT_BUILD_DIR, help="configured CMake build directory"
+        "--build-dir", type=Path, required=True, help="configured CMake build directory"
     )
     parser.add_argument(
         "--bench", type=Path, default=None,

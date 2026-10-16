@@ -1,13 +1,13 @@
-// Standalone sustained device-memory bandwidth probe.
+// Sustained device-memory bandwidth probe.
 //
-// Build:
-//   nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
+// Built as bench/ninfer_memory_bandwidth_bench with the selected NINFER_TARGET.
 //
 // The "bus GB/s" column counts logical streaming traffic: N bytes for a
 // read or write and 2N bytes for a copy (N read + N written). This is the
 // rate to compare with the advertised bandwidth; it is not a measured DRAM counter.
 
-#include "../bench/common/fixture_data.cuh"
+#include "common/fixture_data.cuh"
+#include "common/roofline.h"
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -34,7 +34,6 @@
 namespace {
 
 constexpr int kThreads                 = 256;
-constexpr double kDefaultPeakGBps      = 1792.0;
 constexpr double kDefaultTrialSeconds  = 0.25;
 constexpr int kDefaultTrials           = 5;
 constexpr std::size_t kDefaultMaxBytes = std::size_t{4} << 30;
@@ -43,7 +42,7 @@ struct Options {
     double size_gib  = 0.0; // 0 selects min(4 GiB, 20% of currently free memory).
     double seconds   = kDefaultTrialSeconds;
     int trials       = kDefaultTrials;
-    double peak_gbps = kDefaultPeakGBps;
+    double peak_gbps = ninfer::bench::kRoofline.memory_gbs;
 };
 
 struct Result {
@@ -194,7 +193,7 @@ void print_help(const char* argv0) {
                 "  --trials N      timed trials per method (default: %d)\n"
                 "  --peak-gbps N   advertised bus bandwidth (default: %.0f)\n"
                 "  --help          show this text\n",
-                argv0, kDefaultTrialSeconds, kDefaultTrials, kDefaultPeakGBps);
+                argv0, kDefaultTrialSeconds, kDefaultTrials, ninfer::bench::kRoofline.memory_gbs);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -325,6 +324,7 @@ int main(int argc, char** argv) {
     const int copy_x4_grid         = resident_grid(copy_u128x4_kernel, prop.multiProcessorCount);
 
     std::printf("GPU:               %s\n", prop.name);
+    std::printf("Target:            %s\n", ninfer::bench::kRoofline.target);
     std::printf("SMs / L2:          %d / %.1f MiB\n", prop.multiProcessorCount,
                 static_cast<double>(prop.l2CacheSize) / (1 << 20));
     std::printf("Memory bus width:  %d bits\n", prop.memoryBusWidth);

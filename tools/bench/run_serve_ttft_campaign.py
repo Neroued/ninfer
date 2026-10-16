@@ -26,7 +26,6 @@ from tools.bench.ttft.report import ReportError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SERVE = REPO_ROOT / "build/rtx5090-dev/apps/ninfer-serve"
 WEIGHTS = REPO_ROOT / "out/qwen3_8_27b_nvfp4.ninfer"
 RAM_WEIGHTS_ROOT = Path("/dev/shm/ninfer-artifacts")
 RUNNER = REPO_ROOT / "tools/bench/run_serve_ttft.py"
@@ -475,7 +474,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="run one named case; repeat to form a focused campaign",
     )
     parser.add_argument("--samples", type=int, default=1)
-    parser.add_argument("--serve", type=Path, default=SERVE, help="Serve executable path")
+    parser.add_argument("--serve", type=Path, required=True, help="Serve executable path")
     parser.add_argument("--artifact", type=Path, default=WEIGHTS, help="source .ninfer artifact path")
     parser.add_argument(
         "--profile-config", type=Path,

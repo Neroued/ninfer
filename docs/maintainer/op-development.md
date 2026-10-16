@@ -366,6 +366,12 @@ launch policy. Creating target directories must not remove an existing supported
 layout consumes the selected implementation's scratch extents; public interfaces remain independent
 of platform selection.
 
+For small compile-time differences, explicitly include `core/platform.h` and use its target or
+capability macros according to the fact being tested. Keep substantial selectors in target-owned
+sources rather than scattering preprocessor branches across kernels. Hardware reference values
+for benchmarks live in `bench/common/roofline.h`; executed arithmetic and tuning decisions remain
+with the affected Op/benchmark. A missing hardware reference leaves the derived utilization empty.
+
 ## 5. State, workspace, naming, and dependencies
 
 ### 5.1 State and execution views

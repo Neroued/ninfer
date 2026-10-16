@@ -263,7 +263,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=Path("build/rtx5090-dev/apps/ninfer-serve"))
+    parser.add_argument("--server-bin", type=Path, required=True)
     parser.add_argument(
         "--fixture",
         type=Path,

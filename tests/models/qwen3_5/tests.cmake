@@ -22,6 +22,10 @@ ninfer_add_test(ninfer_qwen3_5_native_transactions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_native_transactions.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
 
+# CPU-only scaling probe for the recovery_loss complexity core (header template; no device).
+ninfer_add_test(ninfer_qwen3_5_reclaim_scaling_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reclaim_scaling.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
   LIBRARIES ninfer_engine)

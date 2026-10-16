@@ -1,6 +1,5 @@
 #include "core/arena.h"
 #include "core/buffer.h"
-#include "core/cpu/executor.h"
 #include "core/layout.h"
 #include "core/transfer.h"
 
@@ -38,31 +37,6 @@ int main() {
         require(strided.device == Device::cpu() && strided.nb[0] == 32, "strided CPU view");
         require(*static_cast<float*>(strided.data) == 2, "CPU slice origin");
         require(matrix.reshape({32}).device == Device::cpu(), "reshape residency");
-
-        CpuTopology topology;
-        CpuExecutor executor(topology, plan_cpu_team(topology.info(), 1));
-        {
-            auto scope     = arena.scope();
-            Tensor scratch = arena.alloc(DType::FP32, {32});
-
-            struct Work {
-                float* input;
-                float* temporary;
-            } work{data, static_cast<float*>(scratch.data)};
-
-            executor.execution_view().run(
-                [](void* pointer, const CpuWorkerContext& worker) noexcept {
-                    auto& work       = *static_cast<Work*>(pointer);
-                    const auto range = worker.range(32);
-                    for (auto i = range.begin; i < range.end; ++i)
-                        work.temporary[i] = work.input[i] * 2;
-                    worker.barrier();
-                    for (auto i = range.begin; i < range.end; ++i)
-                        work.input[i] = work.temporary[31 - i];
-                },
-                &work);
-        }
-        for (int i = 0; i < 32; ++i) require(data[i] == 2.0F * (31 - i), "CPU tensor computation");
 
         const auto used = arena.used();
         {

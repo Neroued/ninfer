@@ -1,15 +1,15 @@
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  message(FATAL_ERROR "NInfer CPU execution currently requires Linux x86-64")
-endif()
-
 add_library(ninfer_cpu STATIC
   cpu/system.cpp
   cpu/task_pool.cpp
-  cpu/executor.cpp
 )
 ninfer_internal_includes(ninfer_cpu)
 target_link_libraries(ninfer_cpu PRIVATE PkgConfig::HWLOC Threads::Threads)
+
+if(NINFER_TARGET STREQUAL "rtx5090")
+  add_library(ninfer_cpu_executor STATIC cpu/executor.cpp cpu/x86.cpp)
+  ninfer_internal_includes(ninfer_cpu_executor)
+  target_link_libraries(ninfer_cpu_executor PUBLIC ninfer_cpu)
+endif()
 
 add_library(ninfer_core STATIC
   arena.cpp

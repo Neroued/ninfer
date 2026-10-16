@@ -28,12 +28,13 @@ the weights again.
 
 ## Quick start
 
-NInfer requires x86-64 Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
+The complete Engine requires x86-64 Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
 CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), `hwloc >= 2.5`, `liburing >= 2.5`,
 and `libcurl >= 7.85`.
 CUDA 13.4 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+The `rtx5090` build targets `sm_120a`. Use `dgx-spark-ops` for native Core, Artifact and Ops
+development on AArch64/`sm_121a` DGX Spark.
 
 Build the product binaries:
 
@@ -41,13 +42,14 @@ Build the product binaries:
 git clone https://github.com/Neroued/ninfer.git
 cd ninfer
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --preset rtx5090-release
+cmake --build build/rtx5090-release -j
 ```
 
-Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
-the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
-Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
+Tests and benchmarks are excluded from the product preset. `cmake --preset rtx5090-dev`
+enables both and finds a Python 3 interpreter. The `rtx5090-ops` and `dgx-spark-ops` presets
+build Core, Artifact and Ops with their tests and benchmarks. Each preset uses its own
+`build/<preset-name>/` directory.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 
@@ -66,7 +68,7 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
 Start a long-running text/agent server with two execution lanes and prefix caching:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 240000 \
   --kv-capacity 240000 \
   --max-concurrency 2 \
@@ -98,7 +100,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 Run a one-shot CLI request with a 32,768-token allocation:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/rtx5090-release/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode, then give a concise conclusion." \
   --max-context 32768 \
   --max-new 8192 \

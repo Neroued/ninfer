@@ -1,23 +1,23 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+include(cmake/NinferPlatform.cmake)
 
 project(ninfer LANGUAGES C CXX CUDA)
+ninfer_validate_platform()
 
 # --- Global settings ---------------------------------------------------------
+option(NINFER_BUILD_ENGINE "Build models, frontend and Engine" ON)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+
+if(NINFER_BUILD_APPS AND NOT NINFER_BUILD_ENGINE)
+  message(FATAL_ERROR "NINFER_BUILD_APPS requires NINFER_BUILD_ENGINE")
+endif()
+if(NINFER_BUILD_ENGINE AND NINFER_TARGET STREQUAL "dgx_spark")
+  message(FATAL_ERROR
+    "NINFER_BUILD_ENGINE is not supported for dgx_spark; use the dgx-spark-ops preset")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,7 +35,7 @@ endif()
 
 # Tests also exercise product input, logging and protocol adapters.
 set(NINFER_BUILD_PRODUCT_SUPPORT OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
+if(NINFER_BUILD_ENGINE AND (NINFER_BUILD_APPS OR BUILD_TESTING))
   set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 

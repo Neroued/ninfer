@@ -85,9 +85,13 @@ optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 
 ```text
 artifact: out/qwen3_6_27b.ninfer
-binary:   build/bench/ninfer_bench
+build:    build/rtx5090-dev
+binary:   <build-dir>/bench/ninfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
+
+`--build-dir` selects the configured CMake tree for both building and the default benchmark path.
+`--bench` overrides the executable; pair it with `--no-build` when running an independently built binary.
 
 The matrix treats MTP `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
 `k=5` as controls, and sweeps `k=0..5` on representative context-decode cases. Decode-bearing cases
@@ -95,12 +99,12 @@ cover CUDA Graph and eager execution; prefill-only cases vary prompt length and 
 
 ```bash
 # Configure the benchmark targets once; they are off in the default public build.
-cmake -S . -B build -DNINFER_BUILD_BENCHMARKS=ON
+cmake --preset rtx5090-dev
 
 # Inspect commands without running the model.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
 
-# Main run. Builds build/bench/ninfer_bench first, then writes JSON and summary.csv.
+# Main run. Builds build/rtx5090-dev/bench/ninfer_bench first, then writes JSON and summary.csv.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 
 # Longer run that adds 32k/64k prompt and context-decode points.

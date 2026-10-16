@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
+DEFAULT_BUILD_DIR = REPO_ROOT / "build/rtx5090-dev"
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -397,6 +397,7 @@ def write_manifest(
         "primary_mtp_draft_tokens": 3,
         "primary_proposal_head": "optimized",
         "repo_root": str(REPO_ROOT),
+        "build_dir": str(args.build_dir),
         "bench": str(args.bench),
         "artifact": str(args.weights),
         "corpus": str(args.corpus),
@@ -417,7 +418,13 @@ def write_manifest(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
-    parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
+    parser.add_argument(
+        "--build-dir", type=Path, default=DEFAULT_BUILD_DIR, help="configured CMake build directory"
+    )
+    parser.add_argument(
+        "--bench", type=Path, default=None,
+        help="benchmark executable (default: <build-dir>/bench/ninfer_bench)",
+    )
     parser.add_argument(
         "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench"
     )
@@ -431,7 +438,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
     parser.add_argument(
-        "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
+        "--no-build", action="store_true", help="use the existing benchmark executable"
     )
     return parser.parse_args(argv)
 
@@ -445,7 +452,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.warmup is not None and args.warmup < 0:
         raise SystemExit("--warmup must be nonnegative")
 
-    args.bench = args.bench.expanduser().resolve()
+    args.build_dir = args.build_dir.expanduser().resolve()
+    args.bench = (args.bench or args.build_dir / "bench/ninfer_bench").expanduser().resolve()
     args.weights = args.weights.expanduser().resolve()
     args.corpus = args.corpus.expanduser().resolve()
 
@@ -516,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_stdout = log_dir / "build.stdout.txt"
         build_stderr = log_dir / "build.stderr.txt"
         rc = run_command(
-            ["cmake", "--build", "build", "-j", "--target", "ninfer_bench"],
+            ["cmake", "--build", str(args.build_dir), "-j", "--target", "ninfer_bench"],
             build_stdout,
             build_stderr,
         )

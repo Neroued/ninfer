@@ -17,7 +17,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/shapes/n5120_k6144.cu"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n5120_k17408_tma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n5120_k6144_tma.cu"
 )

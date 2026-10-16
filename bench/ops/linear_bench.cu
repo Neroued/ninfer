@@ -1,11 +1,11 @@
 // Cold-cache benchmark for the public pure Linear contract.
 //
 // Examples:
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
-//   ./build/bench/ninfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
-//   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
+//   ./build/rtx5090-dev/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
+//   ./build/rtx5090-dev/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
+//   ./build/rtx5090-dev/bench/ninfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
+//   ./build/rtx5090-dev/bench/ninfer_linear_bench --suite qwen3_6_27b
+//   ncu --profile-from-start off ./build/rtx5090-dev/bench/ninfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
 #include "core/weight.h"

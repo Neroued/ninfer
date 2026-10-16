@@ -273,7 +273,7 @@ return a small family-private Plan containing the selected stages and resource f
 choices to allocation and launch instead of repeating the same selection downstream. Capacity
 queries and execution must consume the same selection and allocation rules.
 
-Selection depends on actual operands and execution facts, never target keys, artifact names,
+Runtime selection depends on actual operands and execution facts, never target keys, artifact names,
 converter fields, model roles, Program phases or arbitrary registry strings. A launcher may
 specialize full tiles versus tails and obey CUDA grid limits; performance policy belongs in the
 selector. Device-resident per-row lengths stay Device inputs under the Op's capture contract.
@@ -347,6 +347,24 @@ numerical boundary. The consuming Op chooses its arithmetic profile and tuned im
 
 Preserve per-shape compilation units and explicit template ownership. File organization must not
 silently change RDC mode, architecture, compiler precision options or device-link ownership.
+
+### 4.4 Execution-target ownership
+
+The build selects one native execution target; see [Build system](build-system.md). Keep the
+mathematical interface and caller-owned resources independent of that selection. A small portable
+Op stays in its existing source. Split only where target-specific dispatch, instantiation or launch
+requirements need independent ownership; not every family needs platform subdirectories.
+
+Within an affected Op, `rtx5090/` and `dgx_spark/` own their private shape catalogs, schedules and
+launch bindings. CMake includes the selected source manifest. Shared kernel templates, codecs,
+operand contracts and mathematical oracles remain outside those directories when useful to both.
+Each target owns its tuning independently. The compiled Op defines its supported inputs;
+workspace queries and execution use the same admission rules and report unsupported calls there.
+
+Q8 projection demonstrates independent target catalogs under `linear/projection/q8/`. HC mix keeps
+its multi-stage Plan and launch decisions behind `gated_residual/mix/implementation.h`; workspace
+layout takes explicit scratch extents rather than a target's Plan. The public interfaces remain
+independent of platform selection.
 
 ## 5. State, workspace, naming, and dependencies
 
@@ -457,7 +475,7 @@ Enforce the boundary in code and build ownership:
 The owning family registers its implementation in `src/ops/<family>/sources.cmake`; large families
 delegate to explicit local manifests for their kernel library and semantic implementations.
 Ordinary sources contribute to `ninfer_ops`; NVFP4 sources requiring non-RDC compilation contribute
-to `ninfer_nvfp4_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
+to `ninfer_ops_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
 language and separate translation units. See [Build system](build-system.md) for the target policy.
 
 ## 6. Qualification

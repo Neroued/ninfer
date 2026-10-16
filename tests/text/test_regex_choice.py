@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 PROBE = Path(
-    os.environ.get("NINFER_REGEX_PROBE", ROOT / "build/tests/ninfer_regex_choice_test")
+    os.environ.get("NINFER_REGEX_PROBE", ROOT / "build/rtx5090-dev/tests/ninfer_regex_choice_test")
 )
 
 

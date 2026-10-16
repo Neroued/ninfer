@@ -74,3 +74,31 @@ int test_mixed(Fixture& fixture, CudaExecutionView execution) {
 }
 
 } // namespace ninfer::test::moe
+
+int main() {
+    using namespace ninfer;
+    using namespace ninfer::test;
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    try {
+        auto& context = cuda_environment().context;
+        cudaStream_t stream;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                   "create mixed MoE test stream");
+        const auto execution = context.execution_view(stream);
+        int failures         = 0;
+        for (const auto down : {QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {
+            moe::Fixture fixture(QType::Q4_G64_FP16, down);
+            failures += moe::test_mixed(fixture, execution);
+            failures += fixture.verify_preserved();
+        }
+        cuda_check(cudaStreamDestroy(stream), "destroy mixed MoE test stream");
+        std::cout << (failures ? "FAIL" : "OK") << " mixed MoE contracts\n";
+        return failures ? 1 : 0;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
+}

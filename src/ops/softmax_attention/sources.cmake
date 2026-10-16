@@ -23,7 +23,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/plan.cpp"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/tiled_launch.cu"
 )
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/gated_residual/mix/select.h"
+#include "ops/gated_residual/mix/operands.h"
 #include "ops/common/host/operands.h"
 #include "core/layout.h"
 
@@ -17,11 +17,10 @@ struct Layout {
     std::size_t bytes;
 };
 
-inline Layout layout(Kind kind, Plan plan, std::int32_t columns) {
+inline Layout layout(Kind kind, std::int32_t columns, int splits) {
     LayoutBuilder b;
     const auto u = b.add(common::operand::bytes(std::uint64_t(kRank) * columns, 2, "hc_mix"), 256,
                          "HC low-rank activation");
-    const auto splits = split_factor(plan.down);
     const auto temporary_bytes =
         splits == 1 ? 0 : std::uint64_t(down_rows(kind)) * columns * splits * 4;
     LayoutRegion temporary;

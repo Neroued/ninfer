@@ -7,7 +7,6 @@ int test_weights();
 int test_complete(Fixture&, CudaExecutionView);
 int test_route(Fixture&, CudaExecutionView);
 int test_routed(Fixture&, CudaExecutionView);
-int test_mixed(Fixture&, CudaExecutionView);
 } // namespace ninfer::test::moe
 
 int main() {
@@ -33,7 +32,6 @@ int main() {
             failures += moe::test_complete(fixture, execution);
             if (down == QType::Q5_G64_FP16) { failures += moe::test_route(fixture, execution); }
             failures += moe::test_routed(fixture, execution);
-            if (gu == QType::Q4_G64_FP16) { failures += moe::test_mixed(fixture, execution); }
             failures += fixture.verify_preserved();
         }
         cuda_check(cudaStreamDestroy(stream), "destroy MoE test stream");

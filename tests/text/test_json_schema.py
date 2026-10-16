@@ -12,7 +12,7 @@ import unittest
 import jsonschema
 
 ROOT = Path(__file__).resolve().parents[2]
-PROBE = Path(os.environ.get("NINFER_SCHEMA_PROBE", ROOT / "build/tests/ninfer_json_schema_test"))
+PROBE = Path(os.environ.get("NINFER_SCHEMA_PROBE", ROOT / "build/rtx5090-dev/tests/ninfer_json_schema_test"))
 
 
 def compact(value):

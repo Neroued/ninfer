@@ -4,12 +4,24 @@ add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
-foreach(part IN ITEMS system task_pool executor)
+foreach(part IN ITEMS system task_pool)
   ninfer_add_test(ninfer_cpu_${part}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_${part}.cpp"
     LIBRARIES ninfer_cpu)
   set_tests_properties(ninfer_cpu_${part}_test PROPERTIES TIMEOUT 30)
 endforeach()
+
+if(NINFER_TARGET STREQUAL "rtx5090")
+  foreach(part IN ITEMS x86 executor)
+    ninfer_add_test(ninfer_cpu_${part}_test
+      SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_${part}.cpp"
+      LIBRARIES ninfer_cpu_executor)
+    set_tests_properties(ninfer_cpu_${part}_test PROPERTIES TIMEOUT 30)
+  endforeach()
+  ninfer_add_test(ninfer_cpu_tensor_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_tensor.cpp"
+    LIBRARIES ninfer_core ninfer_cpu_executor)
+endif()
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
@@ -82,14 +94,6 @@ set_tests_properties(
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
   LIBRARIES ninfer_core)
-
-ninfer_add_test(ninfer_jinja_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
-  LIBRARIES ninfer_jinja ninfer::json)
-
-add_test(NAME ninfer_chat_templates_test
-  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
-          $<TARGET_FILE:ninfer_jinja_test>)
 
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)

@@ -1,6 +1,6 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
+`build/rtx5090-release/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 Qwen3.8-Flash-Next supports Text/Vision/MTP serving with segmented CUDA Graph decode.
@@ -13,7 +13,7 @@ See the [CLI example](cli.md) for commands and the
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
@@ -944,7 +944,7 @@ limit on total process RAM. `--host-context-mib 0` disables Host context backing
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
 
-Run `./build/apps/ninfer-serve --help` for the exact option contract.
+Run `./build/rtx5090-release/apps/ninfer-serve --help` for the exact option contract.
 
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,

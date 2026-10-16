@@ -6,6 +6,9 @@
 
 ## 1. 产品执行模型
 
+编译目标由 [Build system](build-system.md)定义。目标选择在编译时完成，决定源码与依赖的组合；
+模型 Config 与 Op 数学接口保持独立，模型调度调用所选目标提供的实现。
+
 Generation Engine 使用一张 GPU、一个常驻模型和启动时确定的 `max_concurrency=1..8`。
 有界等待队列按提交顺序组织；resident 请求按有限执行单元增量取得资源，资源压力下可以暂停与恢复。
 每轮将具备执行许可的 decode-ready 请求组成一个紧凑批次，prefill 与 Replay 分块穿插执行。

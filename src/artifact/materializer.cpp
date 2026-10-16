@@ -3,7 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/buffer.h"
-#include "core/cpu/executor.h"
+#include "core/cpu/system.h"
 #include "core/startup.h"
 
 #include <cuda_runtime.h>
@@ -27,24 +27,34 @@ constexpr std::size_t kMaximumSlotCount = 4;
 void populate_host_pages(MemorySpan storage) {
     if (storage.bytes < kReadBlockBytes) return;
 
-    struct Pages {
-        std::byte* data;
-        std::size_t count;
-    } pages{static_cast<std::byte*>(storage.data),
-            (storage.bytes + kPayloadAlignment - 1) / kPayloadAlignment};
-
     const CpuTopology topology;
     const auto workers = static_cast<std::uint32_t>(
         std::min<std::size_t>(16, cpu_worker_order(topology.info()).size()));
-    CpuExecutor team(topology, plan_cpu_team(topology.info(), workers));
-    team.execution_view().run(
-        [](void* argument, const CpuWorkerContext& worker) noexcept {
+    const auto plan = plan_cpu_team(topology.info(), workers);
+
+    struct Pages {
+        std::byte* data;
+        std::size_t count;
+        std::uint32_t workers;
+    } pages{static_cast<std::byte*>(storage.data),
+            (storage.bytes + kPayloadAlignment - 1) / kPayloadAlignment, workers};
+
+    auto threads = cpu_detail::start_workers(
+        workers,
+        [&](std::uint32_t rank) {
+            bind_current_thread(topology, std::span(&plan.worker_cpus[rank], 1));
+        },
+        [](void* argument, std::uint32_t rank) noexcept {
             const auto& pages = *static_cast<Pages*>(argument);
-            const auto range  = worker.range(pages.count);
-            for (auto page = range.begin; page < range.end; ++page)
+            const auto width  = pages.count / pages.workers;
+            const auto tail   = pages.count % pages.workers;
+            const auto begin  = rank * width + std::min<std::size_t>(rank, tail);
+            const auto end    = begin + width + (rank < tail);
+            for (auto page = begin; page < end; ++page)
                 pages.data[page * kPayloadAlignment] = std::byte{};
         },
         &pages);
+    cpu_detail::join_workers(threads);
 }
 
 void check_cuda(cudaError_t status, const char* operation) {

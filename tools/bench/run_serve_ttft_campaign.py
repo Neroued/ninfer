@@ -26,7 +26,7 @@ from tools.bench.ttft.report import ReportError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SERVE = REPO_ROOT / "build/apps/ninfer-serve"
+SERVE = REPO_ROOT / "build/rtx5090-dev/apps/ninfer-serve"
 WEIGHTS = REPO_ROOT / "out/qwen3_8_27b_nvfp4.ninfer"
 RAM_WEIGHTS_ROOT = Path("/dev/shm/ninfer-artifacts")
 RUNNER = REPO_ROOT / "tools/bench/run_serve_ttft.py"

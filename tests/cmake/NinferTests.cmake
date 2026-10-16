@@ -1,5 +1,5 @@
 # Test declarations are included from tests/CMakeLists.txt so executable paths and
-# CTest working directories stay under build/tests.
+# CTest working directories stay under <build-dir>/tests.
 function(ninfer_test_includes target)
   ninfer_internal_includes(${target})
   target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests)

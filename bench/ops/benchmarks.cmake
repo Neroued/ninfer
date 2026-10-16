@@ -52,7 +52,10 @@ ninfer_add_op_bench(ninfer_prepare_masked_block_bench
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/main.cu")
 ninfer_add_op_bench(ninfer_moe_block_scaled_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/block_scaled.cu")
-ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")
+if(NINFER_TARGET STREQUAL "rtx5090")
+  ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")
+  target_link_libraries(ninfer_moe_cpu_bench PRIVATE ninfer_cpu_executor)
+endif()
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

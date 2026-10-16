@@ -1,3 +1,8 @@
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/unavailable.cpp")
+  return()
+endif()
+
 # Baseline entry/grouping code never inherits worker ISA flags.
 set(ninfer_moe_cpu_sources
   "${CMAKE_CURRENT_LIST_DIR}/entry.cpp"
@@ -26,6 +31,6 @@ endforeach()
 
 add_library(ninfer_moe_cpu STATIC ${ninfer_moe_cpu_sources})
 ninfer_internal_includes(ninfer_moe_cpu)
-target_link_libraries(ninfer_moe_cpu PUBLIC ninfer_core PRIVATE
+target_link_libraries(ninfer_moe_cpu PUBLIC ninfer_core PRIVATE ninfer_cpu_executor
   ninfer_moe_cpu_avx2 ninfer_moe_cpu_avx512 ninfer_moe_cpu_avx512_bf16)
 target_link_libraries(ninfer_ops PUBLIC ninfer_moe_cpu)

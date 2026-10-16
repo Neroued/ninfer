@@ -20,7 +20,7 @@ WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B /build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=Release -DNINFER_TARGET=rtx5090 \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \

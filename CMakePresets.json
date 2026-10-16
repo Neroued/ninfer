@@ -1,38 +1,91 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
   "configurePresets": [
     {
-      "name": "release",
-      "displayName": "Release product binaries",
+      "name": "rtx5090-release",
+      "displayName": "RTX 5090 product binaries",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "NINFER_TARGET": "rtx5090",
+        "NINFER_BUILD_ENGINE": "ON",
         "NINFER_BUILD_APPS": "ON",
         "BUILD_TESTING": "OFF",
         "NINFER_BUILD_BENCHMARKS": "OFF"
       }
     },
     {
-      "name": "dev",
-      "displayName": "Release products, tests and benchmarks",
-      "inherits": "release",
+      "name": "rtx5090-dev",
+      "displayName": "RTX 5090 products, tests and benchmarks",
+      "inherits": "rtx5090-release",
       "cacheVariables": {
         "BUILD_TESTING": "ON",
         "NINFER_BUILD_BENCHMARKS": "ON"
       }
+    },
+    {
+      "name": "rtx5090-ops",
+      "displayName": "RTX 5090 Core, Artifact and Ops development",
+      "inherits": "rtx5090-dev",
+      "cacheVariables": {
+        "NINFER_BUILD_ENGINE": "OFF",
+        "NINFER_BUILD_APPS": "OFF"
+      }
+    },
+    {
+      "name": "dgx-spark-ops",
+      "displayName": "DGX Spark Core, Artifact and Ops development",
+      "inherits": "rtx5090-ops",
+      "cacheVariables": {
+        "NINFER_TARGET": "dgx_spark"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "release" },
-    { "name": "dev", "configurePreset": "dev" }
+    {
+      "name": "rtx5090-release",
+      "configurePreset": "rtx5090-release"
+    },
+    {
+      "name": "rtx5090-dev",
+      "configurePreset": "rtx5090-dev"
+    },
+    {
+      "name": "rtx5090-ops",
+      "configurePreset": "rtx5090-ops"
+    },
+    {
+      "name": "dgx-spark-ops",
+      "configurePreset": "dgx-spark-ops"
+    }
   ],
   "testPresets": [
     {
-      "name": "dev",
-      "configurePreset": "dev",
-      "output": { "outputOnFailure": true }
+      "name": "rtx5090-dev",
+      "configurePreset": "rtx5090-dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "rtx5090-ops",
+      "configurePreset": "rtx5090-ops",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "dgx-spark-ops",
+      "configurePreset": "dgx-spark-ops",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

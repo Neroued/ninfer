@@ -2,15 +2,14 @@
 add_library(ninfer_ops STATIC)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_ops_non_rdc)
 
-# Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
-# producer to consumer warpgroups. RDC makes ptxas discard that contract. These
-# self-contained kernels therefore use a non-RDC archive and host launchers.
-add_library(ninfer_nvfp4_non_rdc STATIC)
-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
-ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+# Kernels using setmaxnreg require non-RDC compilation to retain register transfer.
+# Family manifests own their translation units; host launchers connect the archives.
+add_library(ninfer_ops_non_rdc STATIC)
+ninfer_internal_includes(ninfer_ops_non_rdc)
+ninfer_cuda_non_rdc_archive(ninfer_ops_non_rdc)
+target_link_libraries(ninfer_ops_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
 target_sources(ninfer_ops PRIVATE weight_input.cpp)
 include("${CMAKE_CURRENT_LIST_DIR}/common/sources.cmake")

@@ -1,0 +1,897 @@
+{
+  "source": "https://raw.githubusercontent.com/thecodacus/decision-playground/843f72e61f5ebaa1c2225c4902849bd42af44c05/src/playground/presets.ts",
+  "revision": "843f72e61f5ebaa1c2225c4902849bd42af44c05",
+  "source_sha256": "d462a4223f9961f85590398cae7ccdfd5ed500dd71395bf0e6e2afa26d3f508e",
+  "presets": [
+    {
+      "id": "arena",
+      "request": {
+        "instructions": "Choose controls to defeat the enemy and survive.\nfire: true whenever aim_deviation_degrees is 10 or less, even while turning; otherwise false.\nturn_dir: aim_deviation_direction; hold only when aim_deviation_degrees is 0.\nturn_angle: aim_deviation_degrees, capped at 90.\nmovement: approach the enemy along a clear direction when far; stay when close.\nstance: stand unless a bullet is incoming; jump or crouch to evade it.\nGlobal pixels: right +x, left -x, up -y, down +y. Heading: 0 right, 90 down, 180 left, 270 up.\nObservation rows use these column orders:\nyou: x,y,heading,health,fire_cooldown_ms,jump_cooldown_ms\nenemy: x,y,bearing_degrees,screen_direction\nblocked: up,down,left,right (1 = blocked)\naim: aim_deviation_degrees,aim_deviation_direction",
+        "schema": {
+          "movement": {
+            "type": "enum",
+            "choices": [
+              "up",
+              "down",
+              "left",
+              "right",
+              "stay"
+            ],
+            "description": "Approach using global positions: enemy x greater than yours -> right; smaller -> left. Stay if movement is unnecessary."
+          },
+          "turn_dir": {
+            "type": "enum",
+            "choices": [
+              "left",
+              "right",
+              "hold"
+            ],
+            "description": "Use aim_deviation_direction; hold only when aim_deviation_degrees is 0."
+          },
+          "turn_angle": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 90,
+            "description": "aim_deviation_degrees, capped at 90; 0 when aligned."
+          },
+          "fire": {
+            "type": "boolean",
+            "description": "true when aim_deviation_degrees is 10 or less, even while turning; otherwise false."
+          },
+          "stance": {
+            "type": "enum",
+            "choices": [
+              "stand",
+              "jump",
+              "crouch"
+            ],
+            "description": "Stand normally; jump or crouch only to dodge an incoming bullet."
+          }
+        },
+        "contexts": [
+          "you:150,250,330,100,0,0\nenemy:610,273,3,right\nblocked:0,0,0,0\naim:33,right"
+        ]
+      }
+    },
+    {
+      "id": "routing",
+      "request": {
+        "instructions": "Answer each question about this support request from its state.",
+        "schema": {
+          "category": {
+            "type": "enum",
+            "choices": [
+              "billing",
+              "technical",
+              "cancellation",
+              "other"
+            ],
+            "description": "What type of support request is this?"
+          },
+          "urgent": {
+            "type": "boolean",
+            "description": "Does this need urgent handling?"
+          },
+          "priority": {
+            "type": "enum",
+            "choices": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ],
+            "description": "Rate support priority."
+          }
+        },
+        "contexts": [
+          "{\n  \"message\": \"I was charged twice and need this fixed today.\",\n  \"customerPlan\": \"Pro\",\n  \"accountAgeDays\": 420\n}"
+        ]
+      }
+    },
+    {
+      "id": "routing-bulk",
+      "request": {
+        "instructions": "Answer each question about this support request from its state.",
+        "schema": {
+          "category": {
+            "type": "enum",
+            "choices": [
+              "billing",
+              "technical",
+              "cancellation",
+              "other"
+            ],
+            "description": "What type of support request is this?"
+          },
+          "urgent": {
+            "type": "boolean",
+            "description": "Does this need urgent handling?"
+          },
+          "priority": {
+            "type": "enum",
+            "choices": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ],
+            "description": "Rate support priority."
+          }
+        },
+        "contexts": [
+          "{\n  \"message\": \"I was charged twice and need this fixed today.\",\n  \"customerPlan\": \"Pro\",\n  \"accountAgeDays\": 420\n}",
+          "{\n  \"message\": \"The dashboard has been down for our whole team since this morning.\",\n  \"customerPlan\": \"Enterprise\",\n  \"accountAgeDays\": 1210\n}",
+          "{\n  \"message\": \"How do I export my data to CSV?\",\n  \"customerPlan\": \"Free\",\n  \"accountAgeDays\": 12\n}",
+          "{\n  \"message\": \"Please cancel my subscription at the end of this month.\",\n  \"customerPlan\": \"Pro\",\n  \"accountAgeDays\": 95\n}",
+          "{\n  \"message\": \"Love the new charts, any plans for dark mode?\",\n  \"customerPlan\": \"Pro\",\n  \"accountAgeDays\": 300\n}",
+          "{\n  \"message\": \"API calls return 500 errors and our checkout is failing.\",\n  \"customerPlan\": \"Enterprise\",\n  \"accountAgeDays\": 640\n}",
+          "{\n  \"message\": \"My invoice shows the wrong company address.\",\n  \"customerPlan\": \"Pro\",\n  \"accountAgeDays\": 210\n}",
+          "{\n  \"message\": \"Cancel now or I will dispute the charge with my bank.\",\n  \"customerPlan\": \"Free\",\n  \"accountAgeDays\": 3\n}"
+        ]
+      }
+    },
+    {
+      "id": "ticket",
+      "request": {
+        "instructions": "You triage customer support email for a SaaS product (plans: free, pro, enterprise).\npriority: P1 = service down or data loss for a paying customer; P2 = a paying customer blocked on a feature; P3 = question or minor bug; P4 = feedback.\nescalate_to: billing for charges and refunds, engineering for bugs and outages, legal for data or contract requests, none otherwise.\nrefund_eligible: charged within the last 30 days and the charge was a mistake or the service failed.\nchurn_risk: the customer threatens to cancel or mentions a competitor.\nsla_hours: P1 = 1, P2 = 4, P3 = 24, P4 = 72.",
+        "schema": {
+          "category": {
+            "type": "enum",
+            "choices": [
+              "billing",
+              "bug",
+              "outage",
+              "how_to",
+              "feature_request",
+              "account",
+              "data_request"
+            ],
+            "description": "The main topic of the email."
+          },
+          "priority": {
+            "type": "enum",
+            "choices": [
+              "P1",
+              "P2",
+              "P3",
+              "P4"
+            ],
+            "description": "Priority per the rules."
+          },
+          "sla_hours": {
+            "type": "enum",
+            "choices": [
+              "1",
+              "4",
+              "24",
+              "72"
+            ],
+            "description": "Response deadline that matches the priority."
+          },
+          "sentiment": {
+            "type": "enum",
+            "choices": [
+              "very_negative",
+              "negative",
+              "neutral",
+              "positive"
+            ],
+            "description": "The customer's tone."
+          },
+          "plan": {
+            "type": "enum",
+            "choices": [
+              "free",
+              "pro",
+              "enterprise",
+              "unknown"
+            ],
+            "description": "The customer's plan if stated or implied."
+          },
+          "escalate_to": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "billing",
+              "engineering",
+              "legal"
+            ],
+            "description": "Team to escalate to."
+          },
+          "refund_eligible": {
+            "type": "boolean",
+            "description": "Per the refund rule."
+          },
+          "churn_risk": {
+            "type": "boolean",
+            "description": "Per the churn rule."
+          },
+          "contains_pii": {
+            "type": "boolean",
+            "description": "true if the email includes a card number, phone number or home address."
+          },
+          "language": {
+            "type": "enum",
+            "choices": [
+              "en",
+              "de",
+              "fr",
+              "es",
+              "other"
+            ],
+            "description": "The language the email is written in."
+          },
+          "reply_tone": {
+            "type": "enum",
+            "choices": [
+              "apologetic",
+              "neutral",
+              "upbeat"
+            ],
+            "description": "apologetic for negative sentiment, upbeat for positive, neutral otherwise."
+          },
+          "needs_human": {
+            "type": "boolean",
+            "description": "true for P1, P2, legal or churn risk; false when an automated answer is enough."
+          }
+        },
+        "contexts": [
+          "From: Maria Keller <m.keller@northwind-logistics.com>\nSubject: Charged twice AND the export is broken — seriously?\n\nHi, we're on the Enterprise plan. On the 3rd you charged our card twice for the annual renewal ($4,800 each).\nOn top of that, since yesterday the CSV export returns an empty file for every report, so my team can't close the month.\nIf this isn't fixed this week we're moving to Acme Analytics. Call me at +1 415 555 0142."
+        ]
+      }
+    },
+    {
+      "id": "home",
+      "request": {
+        "instructions": "You control a smart home. Apply the user's request to every device, using the sensor state.\nNight routine: lights off everywhere except the hallway at 20% until 23:30 (then off); outdoor lights on motion; bedroom blinds closed;\nliving-room blinds closed; front door locked; garage closed; alarm in night mode; TV off; music stopped;\nthermostat heat to 19 C when outdoor temperature is below 12 C, otherwise off.\nStart the dishwasher only if it is loaded and it is after 22:00. Dock the robot vacuum at night.\nNotify the user only when something could not be done or is unsafe (a window left open, a door that will not lock).",
+        "schema": {
+          "living_lights": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "dim",
+              "on"
+            ],
+            "description": "Living room lights."
+          },
+          "kitchen_lights": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "dim",
+              "on"
+            ],
+            "description": "Kitchen lights."
+          },
+          "bedroom_lights": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "dim",
+              "on"
+            ],
+            "description": "Bedroom lights."
+          },
+          "hallway_brightness": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+            "step": 10,
+            "description": "Hallway brightness in percent."
+          },
+          "outdoor_lights": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "motion",
+              "on"
+            ],
+            "description": "Outdoor lights mode."
+          },
+          "living_blinds": {
+            "type": "enum",
+            "choices": [
+              "open",
+              "half",
+              "closed"
+            ],
+            "description": "Living room blinds."
+          },
+          "bedroom_blinds": {
+            "type": "enum",
+            "choices": [
+              "open",
+              "half",
+              "closed"
+            ],
+            "description": "Bedroom blinds."
+          },
+          "thermostat_mode": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "heat",
+              "cool",
+              "auto"
+            ],
+            "description": "Thermostat mode."
+          },
+          "target_temp_c": {
+            "type": "integer",
+            "minimum": 16,
+            "maximum": 28,
+            "description": "Target temperature in Celsius."
+          },
+          "front_door": {
+            "type": "enum",
+            "choices": [
+              "locked",
+              "unlocked"
+            ],
+            "description": "Front door lock."
+          },
+          "garage_door": {
+            "type": "enum",
+            "choices": [
+              "open",
+              "closed"
+            ],
+            "description": "Garage door."
+          },
+          "alarm_mode": {
+            "type": "enum",
+            "choices": [
+              "disarmed",
+              "home",
+              "away",
+              "night"
+            ],
+            "description": "Alarm mode."
+          },
+          "tv_on": {
+            "type": "boolean",
+            "description": "Whether the TV stays on."
+          },
+          "music": {
+            "type": "enum",
+            "choices": [
+              "play",
+              "pause",
+              "stop"
+            ],
+            "description": "Whole-home audio."
+          },
+          "start_dishwasher": {
+            "type": "boolean",
+            "description": "Start the dishwasher now."
+          },
+          "robot_vacuum": {
+            "type": "enum",
+            "choices": [
+              "start",
+              "dock",
+              "idle"
+            ],
+            "description": "Robot vacuum."
+          },
+          "notify_user": {
+            "type": "boolean",
+            "description": "Send the user a notification."
+          },
+          "notify_reason": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "window_open",
+              "door_jammed",
+              "device_offline"
+            ],
+            "description": "Why the user is notified; none if not notified."
+          }
+        },
+        "contexts": [
+          "User: \"I'm heading to bed, get the house ready for the night.\"\ntime: 22:41\noutdoor_temp_c: 8\nsensors: kitchen_window=open, front_door=unlocked, garage=open\ndevices: tv=on, music=playing, dishwasher=loaded, robot_vacuum=cleaning\nlights: living=on, kitchen=on, bedroom=dim, hallway=on"
+        ]
+      }
+    },
+    {
+      "id": "rover",
+      "request": {
+        "instructions": "You drive a warehouse robot on a grid. Obstacles block a direction when their distance is under 1.0 m.\nPriorities: 1) avoid collisions, 2) dock to charge when battery < 20%, 3) finish the current task.\nspeed: 0 when stopped, 0.5 near people (under 3 m), otherwise 1.5 (m/s).\nlift: raise only at a pickup shelf, lower only at the drop zone, otherwise hold.\nbeacon: flashing whenever moving near people, solid when stopped, off otherwise.",
+        "schema": {
+          "direction": {
+            "type": "enum",
+            "choices": [
+              "north",
+              "south",
+              "east",
+              "west",
+              "stop"
+            ],
+            "description": "Move toward the goal along an unblocked direction; stop if every useful direction is blocked."
+          },
+          "speed_mps": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1.5,
+            "step": 0.5,
+            "description": "Speed per the rules."
+          },
+          "goal": {
+            "type": "enum",
+            "choices": [
+              "task",
+              "charger"
+            ],
+            "description": "What the robot is heading to."
+          },
+          "lift": {
+            "type": "enum",
+            "choices": [
+              "raise",
+              "lower",
+              "hold"
+            ],
+            "description": "Fork lift."
+          },
+          "beacon": {
+            "type": "enum",
+            "choices": [
+              "off",
+              "solid",
+              "flashing"
+            ],
+            "description": "Warning beacon."
+          },
+          "horn": {
+            "type": "boolean",
+            "description": "Sound the horn when a person is under 1.5 m in the travel direction."
+          },
+          "report_blocked": {
+            "type": "boolean",
+            "description": "true when the direct direction to the goal is blocked."
+          },
+          "reroute": {
+            "type": "boolean",
+            "description": "true when the robot takes a direction other than the direct one."
+          },
+          "battery_warning": {
+            "type": "boolean",
+            "description": "true when battery is below 20%."
+          },
+          "eta_s": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 120,
+            "description": "Estimated seconds to the goal at the chosen speed (distance / speed, rounded, capped at 120; 0 when stopped)."
+          }
+        },
+        "contexts": [
+          "position: (12, 4)\ntask: pick up from shelf S7 at (12, 14), direct direction north, distance 10 m\ncharger: (0, 4), direction west, distance 12 m\nbattery: 64%\nobstacles: north 0.6 m (pallet), west 0.8 m (rack), south 0.9 m (cart), east clear\nthe only way around the pallet is east\npeople: worker at 2.4 m east"
+        ]
+      }
+    },
+    {
+      "id": "arm",
+      "request": {
+        "instructions": "You command a 4-axis pick-and-place arm. Joint angles are in degrees; the gripper opening is in cm.\nTo pick an object: rotate the base to the object's bearing, lower the shoulder to the object's reach angle,\nopen the gripper 1 cm wider than the object's width, and keep the wrist level (0) unless the object is tilted\n(then match its tilt). Speed: slow for fragile objects, normal otherwise.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "base_deg": {
+              "type": "integer",
+              "minimum": -90,
+              "maximum": 90,
+              "description": "Base rotation: the object bearing."
+            },
+            "shoulder_deg": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 90,
+              "description": "Shoulder angle: the reach angle."
+            },
+            "wrist_deg": {
+              "type": "integer",
+              "minimum": -45,
+              "maximum": 45,
+              "description": "Wrist tilt: 0, or the object tilt."
+            },
+            "gripper_cm": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 12,
+              "multipleOf": 0.5,
+              "description": "Opening: object width + 1."
+            },
+            "speed": {
+              "enum": [
+                "slow",
+                "normal"
+              ],
+              "description": "slow when fragile."
+            },
+            "vacuum": {
+              "type": "boolean",
+              "description": "Use the suction cup instead of the gripper for flat objects under 0.5 cm thick."
+            },
+            "confirm_with_camera": {
+              "type": "boolean",
+              "description": "true when the object confidence is below 0.8."
+            },
+            "action": {
+              "enum": [
+                "pick",
+                "wait",
+                "abort"
+              ],
+              "description": "abort if the object is out of reach (bearing beyond +-90), wait if a person is in the cell."
+            }
+          }
+        },
+        "contexts": [
+          "object: glass vial, fragile\nbearing: -32 deg, reach angle: 57 deg, tilt: 12 deg\nwidth: 3.5 cm, thickness: 3.5 cm\ndetection confidence: 0.74\ncell: no people"
+        ]
+      }
+    },
+    {
+      "id": "squad",
+      "request": {
+        "instructions": "You command ten units in a real-time strategy game. Waypoints: A (our base, west), B (center), C (north ridge), D (enemy base, east).\nUnit rules, applied in order:\n1. A medic (units 3 and 8) heals when any unit at its waypoint is below 50 health; otherwise it holds.\n2. Any unit below 25 health retreats to A.\n3. A unit attacks the weakest visible enemy at its own waypoint.\n4. A unit with no enemy at its waypoint moves to the waypoint with the most enemies.\n5. Otherwise it holds.",
+        "schema": {
+          "unit_1_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 1; follow the unit rules."
+          },
+          "unit_1_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 1 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_2_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 2; follow the unit rules."
+          },
+          "unit_2_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 2 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_3_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 3; follow the unit rules."
+          },
+          "unit_3_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 3 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_4_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 4; follow the unit rules."
+          },
+          "unit_4_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 4 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_5_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 5; follow the unit rules."
+          },
+          "unit_5_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 5 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_6_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 6; follow the unit rules."
+          },
+          "unit_6_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 6 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_7_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 7; follow the unit rules."
+          },
+          "unit_7_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 7 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_8_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 8; follow the unit rules."
+          },
+          "unit_8_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 8 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_9_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 9; follow the unit rules."
+          },
+          "unit_9_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 9 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "unit_10_order": {
+            "type": "enum",
+            "choices": [
+              "attack",
+              "move",
+              "hold",
+              "retreat",
+              "heal"
+            ],
+            "description": "Order for unit 10; follow the unit rules."
+          },
+          "unit_10_target": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "E1",
+              "E2",
+              "E3",
+              "E4",
+              "E5",
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "Enemy id when unit 10 attacks, waypoint A-D when it moves or retreats, none when it holds or heals."
+          },
+          "formation": {
+            "type": "enum",
+            "choices": [
+              "line",
+              "wedge",
+              "column",
+              "scatter"
+            ],
+            "description": "wedge when attacking with most units, scatter under artillery fire, line when holding."
+          },
+          "stance": {
+            "type": "enum",
+            "choices": [
+              "aggressive",
+              "defensive",
+              "passive"
+            ],
+            "description": "aggressive when we outnumber the visible enemy, defensive otherwise."
+          },
+          "build": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "barracks",
+              "tower",
+              "refinery",
+              "hospital"
+            ],
+            "description": "refinery when gold < 200; hospital when 3+ units are below 40 health; otherwise none."
+          },
+          "train": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "soldier",
+              "archer",
+              "medic"
+            ],
+            "description": "medic when no medic is alive; otherwise soldier if gold >= 100; otherwise none."
+          },
+          "rally_point": {
+            "type": "enum",
+            "choices": [
+              "A",
+              "B",
+              "C",
+              "D"
+            ],
+            "description": "The waypoint closest to the enemy base."
+          },
+          "call_artillery": {
+            "type": "boolean",
+            "description": "true only when 3 or more enemies stand at the same waypoint."
+          },
+          "use_smoke": {
+            "type": "boolean",
+            "description": "true when any unit retreats."
+          },
+          "request_reinforcements": {
+            "type": "boolean",
+            "description": "true when fewer than 6 of our units have health above 40."
+          },
+          "scout": {
+            "type": "enum",
+            "choices": [
+              "none",
+              "north",
+              "south",
+              "east",
+              "west"
+            ],
+            "description": "The direction of the last known enemy sighting that no unit can see now; none if all are visible."
+          },
+          "alert_level": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5,
+            "description": "Number of enemies within range of our base, capped at 5."
+          }
+        },
+        "contexts": [
+          "gold: 140\nenemy base distance from our base: far\nunits (id,type,health,waypoint):\n1,soldier,90,B\n2,soldier,20,B\n3,medic,70,B\n4,archer,65,C\n5,archer,15,C\n6,soldier,100,A\n7,soldier,80,B\n8,medic,95,A\n9,archer,35,C\n10,soldier,55,B\nenemies (id,health,waypoint): E1,60,B  E2,30,B  E3,90,C  E4,100,B  E5,45,B\nenemies within range of our base: 1\nlast sighting not visible now: none"
+        ]
+      }
+    }
+  ]
+}

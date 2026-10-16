@@ -18,9 +18,12 @@ inline constexpr int kDefaultMaxTokens                    = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+// One executing and sixteen waiting decisions, independent of generation admission.
+inline constexpr std::size_t kDecisionRequestCapacity = 17;
 
 struct ServeOptions {
     bool help_requested = false;
+    bool jev            = false; // opt-in native finite-schema decision engine
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";

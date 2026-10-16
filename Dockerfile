@@ -11,6 +11,7 @@ RUN apt-get update \
         libavutil-dev \
         libcurl4-openssl-dev \
         libhwloc-dev \
+        liburing-dev \
         libswscale-dev \
         ninja-build \
         pkg-config \
@@ -37,6 +38,7 @@ RUN apt-get update \
         libavutil58 \
         libcurl4t64 \
         libhwloc15 \
+        liburing2 \
         libswscale7 \
     && rm -rf /var/lib/apt/lists/*
 

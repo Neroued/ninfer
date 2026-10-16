@@ -22,6 +22,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_accept.h"
 #include <algorithm>
+#include <array>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -245,6 +246,43 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
+BranchLayout branch_layout(const SequencePlanImpl& plan, std::int32_t batch,
+                            std::uint32_t chunk, std::size_t scratch_bytes) {
+    const auto& config = plan.profile->config.text;
+    LayoutBuilder builder;
+    BranchLayout b;
+    b.batch_capacity = batch;
+    b.prefill_chunk = chunk;
+    b.tables = plan_kv_execution_tables(builder, {
+        .logical_page_capacity = page_count(plan.capacity), .table_rows = batch});
+    // Full recurrent images already exist in StateImageStore. Only branch-specific transient
+    // buffers belong in scratch; duplicating images here can make even one branch never fit.
+    b.records = plan_gdn_replay_records(builder, {
+        .layers = dimension(config.linear_attention_layers),
+        .record_capacity = batch,
+        .width = kBranchWidth,
+        .conv_channels = config.gdn ? dimension(config.gdn->conv_channels()) : 0,
+        .qk_heads = config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0,
+        .value_heads = config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0,
+        .key_dim = config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0,
+        .value_dim = config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0,
+    });
+    b.ids = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch ids");
+    b.positions = add_tensor(builder, DType::I32, {kBranchWidth, batch}, "branch positions");
+    b.counts = add_tensor(builder, DType::I32, {batch}, "branch lengths");
+    b.rows = add_tensor(builder, DType::I32, {batch}, "branch KV rows");
+    b.slots = add_tensor(builder, DType::I32, {batch}, "branch state slots");
+    b.hidden = add_tensor(builder, DType::BF16,
+                          {dimension(config.hidden_size), kBranchWidth, batch}, "branch hidden");
+    b.tails = add_tensor(builder, DType::BF16,
+                         {dimension(config.hidden_size), 1 + 2 * batch}, "branch tail hidden");
+    b.logits = add_tensor(builder, DType::BF16,
+                          {dimension(config.vocab_size), batch}, "branch logits");
+    b.scratch = builder.add(scratch_bytes, kArenaAlign, "branch scratch");
+    b.bytes = builder.finish(kArenaAlign);
+    return b;
+}
+
 WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto& profile = *plan.profile;
     const auto& config  = profile.config.text;
@@ -287,7 +325,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+                                 ops::CausalAttentionExecutionEnvelope envelope, bool project_head = true) {
         for (const auto& block : profile.text.layers) {
             {
                 auto stage = layout.scope();
@@ -355,7 +393,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout, bytes);
             }
         }
-        if (!plan.causal_scoring) { linear_scratch(layout, profile.text.output_head, first, last); }
+        if (!plan.causal_scoring && project_head) {
+            linear_scratch(layout, profile.text.output_head, first, last);
+        }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, profile.mtp->output, first, last);
@@ -719,6 +759,39 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                            merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
+    if (plan.decision_scoring) {
+        // Fit an ephemeral decision batch into existing scratch. Never enlarge the native
+        // startup plan or use chat concurrency as the decision batch size. The general region
+        // excludes any live Vision handoff above it.
+        std::array<std::size_t, kBranchBatch> batch_scratch{};
+        std::size_t peak = 0;
+        for (std::int32_t batch = 1; batch <= kBranchBatch; ++batch) {
+            WorkspaceLayoutBuilder branch;
+            matrix(branch, DType::BF16, dimension(config.hidden_size), kBranchWidth * batch);
+            target_body(branch, kBranchWidth * batch, kBranchWidth * batch,
+                        qwen3_5::TextPhase::Verify, GdnWorkspacePath::ReplayRecord, batch,
+                        kBranchWidth, kBranchWidth, text_envelope, false);
+            WorkspaceLayoutBuilder projection;
+            matrix(projection, DType::BF16, dimension(config.hidden_size), batch);
+            linear_scratch(projection, profile.text.output_head, batch, batch);
+            peak = std::max({peak, finish(branch), finish(projection)});
+            batch_scratch[batch - 1] = peak;
+        }
+        for (std::int32_t batch = kBranchBatch; batch >= 1 && !out.branches; --batch) {
+            for (auto prefix_chunk = std::min(chunk, 512); prefix_chunk >= 1; prefix_chunk /= 2) {
+                WorkspaceLayoutBuilder prefix;
+                text_common_root(prefix, prefix_chunk);
+                target_body(prefix, 1, prefix_chunk, qwen3_5::TextPhase::Prefill,
+                            GdnWorkspacePath::Prefill, 1, 1, prefix_chunk, text_envelope);
+                auto candidate = branch_layout(plan, batch, prefix_chunk,
+                    std::max(batch_scratch[batch - 1], finish(prefix)));
+                if (candidate.bytes <= out.general_capacity) {
+                    out.branches = std::move(candidate);
+                    break;
+                }
+            }
+        }
+    }
     return out;
 }
 
@@ -823,6 +896,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
+    impl->decision_scoring     = inputs.decision_scoring;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
@@ -866,6 +940,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
+        .decision_scoring     = options.enable_decisions,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };

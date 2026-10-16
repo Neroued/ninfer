@@ -3,8 +3,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <iostream>
+#include <condition_variable>
 #include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -25,6 +28,74 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+int test_decision_transport_capacity() {
+    using namespace std::chrono_literals;
+    int failures = 0;
+    for (const bool decisions : {false, true}) {
+        ninfer::serve::ServeOptions options;
+        options.max_concurrency      = 1;
+        options.max_pending_requests = 1;
+        options.jev                  = decisions;
+        const std::size_t outstanding = 2 + (decisions ? 17 : 0);
+        std::unique_ptr<httplib::TaskQueue> queue(ninfer::serve::make_http_task_queue(options));
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::size_t started = 0;
+        std::size_t finished = 0;
+        bool release         = false;
+        const auto hold = [&] {
+            std::unique_lock lock(mutex);
+            ++started;
+            changed.notify_all();
+            changed.wait(lock, [&] { return release; });
+            ++finished;
+        };
+        bool ready = true;
+        // Occupy every generation and decision lifetime, including response delivery.
+        for (std::size_t i = 0; i < outstanding; ++i) {
+            if (!queue->enqueue(hold)) { ready = false; break; }
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 2s, [&] { return started == i + 1; })) {
+                ready = false;
+                break;
+            }
+        }
+        failures += check(ready, "transport cannot service both admission budgets concurrently");
+        std::promise<void> responsive;
+        auto response = responsive.get_future();
+        if (ready) {
+            failures += check(queue->enqueue([&] { responsive.set_value(); }) &&
+                                  response.wait_for(2s) == std::future_status::ready,
+                              "admitted inference stranded health/overload handling");
+            // Fill the spare worker, then verify that the transport queue remains bounded.
+            ready = queue->enqueue(hold);
+            if (ready) {
+                std::unique_lock lock(mutex);
+                ready = changed.wait_for(lock, 2s, [&] { return started == outstanding + 1; });
+            }
+            failures += check(ready, "transport lost its spare handler");
+            if (ready) {
+                for (std::size_t i = 0; i < outstanding; ++i) {
+                    failures += check(queue->enqueue(hold),
+                                      "transport queue omitted admission capacity");
+                }
+                failures += check(!queue->enqueue(hold), "transport queue is unbounded");
+            }
+        }
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        changed.notify_all();
+        queue->shutdown();
+        if (ready) {
+            failures += check(finished == 2 * outstanding + 1,
+                              "transport did not drain its admitted and queued work");
+        }
+    }
+    return failures;
 }
 
 int test_task_queue() {
@@ -255,7 +326,7 @@ int test_inherited_socket_liveness() {
 int main() {
     int failures = test_sse_transport() + test_sse_response_headers() +
                    test_prompt_json_member_order() + test_schema_number_precision() +
-                   test_task_queue();
+                   test_decision_transport_capacity() + test_task_queue();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

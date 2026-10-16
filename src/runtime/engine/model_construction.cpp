@@ -77,6 +77,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::Generation:
         break;
     case EnginePurpose::CausalScoring:
+        if (options.enable_decisions) {
+            throw std::invalid_argument("decisions require a Generation Engine");
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -101,6 +104,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
     }
+    if (options.enable_decisions && total_device_state_slots < 3) {
+        throw std::invalid_argument(
+            "decisions require at least three total Device state slots; increase "
+            "--device-state-slots or --max-concurrency");
+    }
     return options;
 }
 
@@ -117,6 +125,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
     case models::Architecture::Qwen4Exp: {
+        if (options.enable_decisions) {
+            throw std::invalid_argument("--jev currently supports Qwen3.5 Dense/MoE architectures");
+        }
         auto built =
             detail::build_model<models::qwen4_exp::Startup>(reader, options, device, budget, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};

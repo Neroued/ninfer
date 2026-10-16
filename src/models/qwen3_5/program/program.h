@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ninfer/branch_score.h"
 #include "models/common/context/checkpoint_store.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -475,6 +476,10 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks = nullptr);
+    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
+                                                   const PreparationControl&, bool reuse_prefix);
+    // Decision cache is optional shared-pool occupancy; release before chat admission/work.
+    bool release_branch_cache();
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

@@ -4,6 +4,7 @@
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "ninfer/engine.h"
+#include "decision/decision.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -21,6 +22,11 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+
+struct DecisionOutcome {
+    decision::Json body;
+    std::shared_ptr<RequestLifetime> lifetime;
+};
 
 struct GenerationMetrics {
     std::uint64_t engine_request_id       = 0;
@@ -90,7 +96,8 @@ enum class GenerationConsumerMode : std::uint8_t {
 ApiError
 request_error_to_api_error(const ninfer::RequestError& exception,
                            std::string_view constraint_param = "structured_outputs.grammar",
-                           std::span<const std::string> tool_schema_params = {});
+                           std::span<const std::string> tool_schema_params = {},
+                           std::string_view input_param = "messages");
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
@@ -151,6 +158,8 @@ public:
                           std::function<bool()> is_cancelled = {});
 
     void warmup();
+    [[nodiscard]] DecisionOutcome decide(const decision::Request& request,
+                                          std::function<bool()> is_cancelled = {});
 
 private:
     enum class CacheParticipation : std::uint8_t {
@@ -169,11 +178,14 @@ private:
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
-    acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    acquire_request_lifetime(DeadlinePolicy deadline_policy,
+                             const std::shared_ptr<RequestCapacity>& capacity = {}) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::unique_ptr<decision::DecisionEngine> decision_engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    std::shared_ptr<RequestCapacity> decision_capacity_;
 };
 
 } // namespace ninfer::serve

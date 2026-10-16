@@ -55,6 +55,36 @@ int main() {
                           cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
 
+    using ninfer::RequestErrorKind;
+    struct ErrorCase {
+        RequestErrorKind kind;
+        int status;
+        const char* code;
+    };
+    for (const char* input : {"contexts", "state"}) {
+        for (const auto& item : {
+                 ErrorCase{RequestErrorKind::Overloaded, 429, "server_overloaded"},
+                 ErrorCase{RequestErrorKind::QueueTimeout, 503, "request_queue_timeout"},
+                 ErrorCase{RequestErrorKind::Cancelled, 499, "client_disconnected"},
+                 ErrorCase{RequestErrorKind::Unavailable, 503, "service_unavailable"},
+                 ErrorCase{RequestErrorKind::ThinkingBudgetCapacityInsufficient, 400,
+                           "thinking_budget_capacity_insufficient"},
+                 ErrorCase{RequestErrorKind::ContextLengthExceeded, 400,
+                           "context_length_exceeded"}}) {
+            const auto translated = ninfer::serve::request_error_to_api_error(
+                ninfer::RequestError(item.kind, "decision rejected"), {}, {}, input);
+            httplib::Response response;
+            ninfer::serve::write_openai_error(response, translated);
+            const auto body = Json::parse(response.body).at("error");
+            failures += check(response.status == item.status && body.at("code") == item.code &&
+                                  body.at("message") == "decision rejected" &&
+                                  body.at("param") ==
+                                      (item.kind == RequestErrorKind::ContextLengthExceeded
+                                           ? Json(input) : Json(nullptr)),
+                              "decision error mislabeled input or changed its HTTP contract");
+        }
+    }
+
     failures +=
         check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&
                   ninfer::serve::matches_bearer_credential("bearer secret", "secret") &&
@@ -107,6 +137,24 @@ int main() {
                           openai_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty OpenAI 413 did not become a payload-limit error");
+
+    for (const auto* path : {"/decision", "/v1/decision"}) {
+        for (const int status : {200, 400, 413, 429}) {
+            httplib::Request request;
+            request.path = path;
+            httplib::Response response;
+            response.status = status;
+            (void)ninfer::serve::handle_unrendered_http_error(options, request, response);
+            const auto id = response.get_header_value("x-request-id");
+            failures += check(id.starts_with("req_") &&
+                                  response.get_header_value_count("x-request-id") == 1,
+                              "decision route omitted or duplicated its request ID");
+            (void)ninfer::serve::handle_unrendered_http_error(options, request, response);
+            failures += check(response.get_header_value("x-request-id") == id &&
+                                  response.get_header_value_count("x-request-id") == 1,
+                              "decision route replaced an existing request ID");
+        }
+    }
 
     httplib::Request missing_messages_request;
     missing_messages_request.path = "/v1/messages/missing";

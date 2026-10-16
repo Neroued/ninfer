@@ -335,6 +335,9 @@ public:
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*);
+    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
+                                                   const PreparationControl&, bool reuse_prefix);
+    bool release_branch_cache();
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
@@ -366,6 +369,7 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    const bool decision_scoring;
     const std::size_t kv_payload_bytes;
     std::optional<GraphMemorySummary> graph_memory;
     const WorkspacePlan workspace_plan;
@@ -393,6 +397,7 @@ public:
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
+    std::unique_ptr<BranchStorage> branches;
     Tensor sampling_config;
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;

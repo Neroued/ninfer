@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
+#include "runtime/engine/branch_score_queue.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
@@ -83,6 +84,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          decisions_(options.enable_decisions, options.context_cache.enabled),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -127,6 +129,9 @@ public:
 
     EngineCore(const EngineCore&)            = delete;
     EngineCore& operator=(const EngineCore&) = delete;
+
+    BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
+                                     const PreparationControl& control, bool reuse_prefix);
 
     class Submission {
     public:
@@ -2160,6 +2165,10 @@ private:
             std::lock_guard lock(queue_mutex_);
             failed_ = true;
             pending.swap(pending_);
+            for (auto& job : decisions_.pending) {
+                job->result.set_exception(error);
+            }
+            decisions_.pending.clear();
         }
         scheduler_ = Scheduling{};
         const std::shared_ptr<Request> materializing_request =
@@ -2191,9 +2200,11 @@ private:
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_operation()) {
-                    queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                if (!stopping_ && pending_.empty() && decisions_.pending.empty() && resident_empty() &&
+                    paused_.empty() && !instance_.program->has_context_operation()) {
+                    queue_cv_.wait(lock, [&] {
+                        return stopping_ || !pending_.empty() || !decisions_.pending.empty();
+                    });
                 }
                 if (stopping_) {
                     lock.unlock();
@@ -2206,10 +2217,17 @@ private:
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
             try {
+                if (decisions_.enabled) {
+                    executed = progress_branch_job();
+                    if (!release_branch_workspace_before_chat() && executed) {
+                        publish_runtime_stats();
+                        continue;
+                    }
+                }
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
-                executed = progress_context_operation(boundary);
+                executed |= progress_context_operation(boundary);
                 if (!instance_.program->has_context_operation()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
@@ -2376,6 +2394,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    BranchScoreQueue decisions_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
@@ -2383,6 +2402,9 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+
+    bool progress_branch_job();
+    bool release_branch_workspace_before_chat();
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;
@@ -2411,3 +2433,4 @@ private:
 } // namespace ninfer::runtime
 
 #include "runtime/engine/engine_metrics.inl"
+#include "runtime/engine/engine_decisions.inl"

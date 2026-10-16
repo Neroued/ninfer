@@ -126,13 +126,15 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--jev] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --jev enables native /v1/decision and /v1/systemone decisions\n"
+           "       --jev requires max-concurrency + extra device-state-slots >= 3\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -199,6 +201,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
+        } else if (arg == "--jev") {
+            options.jev = true;
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
@@ -366,6 +370,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    if (options.jev && static_cast<std::uint64_t>(options.max_concurrency) +
+                               options.context_cache.device_state_slots.value_or(
+                                   options.max_concurrency) < 3) {
+        throw std::invalid_argument(
+            "--jev requires at least three total Device state slots; set "
+            "--device-state-slots so max-concurrency + extra slots >= 3 "
+            "(for one lane, use --device-state-slots 2)");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

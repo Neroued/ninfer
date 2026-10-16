@@ -30,6 +30,35 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(!defaults.jev, "decision engine must be disabled by default");
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {}, {"--device-state-slots", "0"}, {"--device-state-slots", "1"},
+             {"--max-concurrency", "2", "--device-state-slots", "0"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--jev"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("--device-state-slots") != std::string::npos;
+        }
+        failures += check(rejected, "--jev accepted fewer than three total state slots");
+    }
+    for (const auto [lanes, extra] : {std::pair{1, 2}, {2, 1}, {3, 0}}) {
+        const auto decision = parse({"ninfer-serve", "model.ninfer", "--jev", "--max-concurrency",
+                                     std::to_string(lanes), "--device-state-slots",
+                                     std::to_string(extra), "--no-prefix-reuse"});
+        failures += check(decision.jev && decision.max_concurrency == lanes &&
+                              decision.context_cache.device_state_slots == extra,
+                          "--jev rejected or resized a valid three-slot configuration");
+    }
+    for (const auto lanes : {2, 3, 4, 8}) {
+        const auto decision = parse({"ninfer-serve", "model.ninfer", "--jev", "--max-concurrency",
+                                     std::to_string(lanes)});
+        failures += check(decision.jev && decision.max_concurrency == lanes &&
+                              !decision.context_cache.device_state_slots.has_value(),
+                          "--jev changed valid default state capacity");
+    }
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

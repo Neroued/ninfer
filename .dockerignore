@@ -1,4 +1,6 @@
 .git
+.agent-tmp
+.local
 .cache
 .claude
 .codex

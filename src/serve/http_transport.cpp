@@ -52,6 +52,13 @@ std::unique_ptr<httplib::TaskQueue> make_http_task_queue(std::size_t workers,
     return std::make_unique<HttpTaskQueue>(static_cast<std::uint32_t>(workers), queued_requests);
 }
 
+std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const ServeOptions& options) {
+    const std::size_t outstanding =
+        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests +
+        (options.jev ? kDecisionRequestCapacity : 0);
+    return make_http_task_queue(outstanding + 1, outstanding);
+}
+
 RequestJson parse_json_body(const httplib::Request& request) {
     text::ParsedJsonNumbers parsed;
     try {

@@ -70,6 +70,7 @@ void render_and_write(SseTransport& transport, Render&& render) {
 }
 
 RequestJson parse_json_body(const httplib::Request& request);
+[[nodiscard]] std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const ServeOptions& options);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);

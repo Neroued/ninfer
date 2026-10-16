@@ -447,3 +447,5 @@ void Engine::reset_memory_peaks() noexcept {
 }
 
 } // namespace ninfer
+
+#include "runtime/engine/engine_decision_api.inl"

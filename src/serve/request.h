@@ -172,7 +172,7 @@ struct GenerationRequest {
     std::string constraint_param;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
-    std::size_t tool_name_max_length = 64;
+    std::size_t tool_name_max_length = 128;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;

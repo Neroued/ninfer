@@ -34,7 +34,9 @@ and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included man
 executables and CTest working directories under `<build-dir>/tests/`.
 `ops/op_tester.h` and `ops/op_check.h` own reusable device/guard and comparison mechanics.
 `ops/linear_common.h` shares extent checks, explicit sampling recipes, payload preservation and
-0/1/77 entry handling; each projection family keeps its own fixtures and complete oracle.
+0/1/77 entry handling. `ops/linear/support.*` owns Linear case selection and the portable CPU oracle
+executor; `ops/linear/weights.*` owns its shared weight fixtures. Each semantic Op keeps its complete
+oracle and case declarations in its own directory.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
 presets.
 
@@ -144,27 +146,42 @@ PLE GPU Ops run with `ctest --test-dir build/rtx5090-dev -R '^ninfer_ple_(gate|c
 Gate uses an independent FP64 oracle for U and norm(actual BF16 U), including strided projections,
 record windows, masks, Graph replay and the Conv/StateExtract handoff. These tests perform no file I/O.
 
-Linear tests are independently runnable by weight and activation-compute profile:
+The Linear family has six executables under `ops/linear/`: `projection`, `split`, `add`, `swiglu`,
+`pair`, and `topk`. CTest partitions each executable by format without registering an additional
+aggregate run. Dynamic-grouped-convolution fusion remains a separate Op suite.
 
 ```bash
-cmake --build build/rtx5090-dev --parallel --target \
-  ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
-  ninfer_linear_q6_a16_test ninfer_linear_q8_a16_test
-ctest --test-dir build/rtx5090-dev -R '^ninfer_linear_(q4|q5|q6|q8)_a16_test$' --output-on-failure
+cmake --build build/rtx5090-dev -j
+ctest --test-dir build/rtx5090-dev -R '^ninfer_linear_.*_test$' --output-on-failure
+./build/rtx5090-dev/tests/ninfer_linear_projection_test --format q8 --shape 6144 5120
+./build/rtx5090-dev/tests/ninfer_linear_split_test --format fp8 --policy a4 --list
+./build/rtx5090-dev/tests/ninfer_linear_swiglu_test --format nvfp4 --policy a4 --execution graph
 ```
 
-For a change confined to one Q8 geometry, use the same public conformance cases with
-`./build/rtx5090-dev/tests/ninfer_linear_q8_a16_test --shape N K`. The default CTest invocation still covers
-all registered Q8 geometries.
+All six accept `--help`, `--list`, `--format FORMAT`, `--policy a16|a8|a4`, `--shape N K`,
+`--t T`, `--case ID`, and `--execution eager|graph`. Filters intersect and select declared cases;
+they do not generate new fixtures. Formats are `bf16`, `q4`, `q5`, `q6`, `q8`, `fp8`, `nvfp4`,
+and `q4_q5` for paired Split parents, where present in the suite. N is the logical weight row count
+(one projection's N for Pair). `--case` accepts an exact ID from `--list`.
 
-For a change confined to one BF16 geometry, use
-`./build/rtx5090-dev/tests/ninfer_linear_bf16_a16_test --shape N K`. The filter covers all registered BF16
-geometries, including the original projections and selector matrix. The default runs all cases.
+Listing and filtering precede CUDA initialization and fixture allocation. Unknown options and empty
+selections fail; exit 77 means no usable CUDA device. IDs distinguish geometry, represented-input
+recipe, policy, call form and execution. Metadata and workspace contract cases use T=0. A Graph
+case includes its whole declared input-update sequence; a policy filter selects a multi-policy
+sequence if any of its calls uses that policy. Each call uses its own policy's numerical criterion.
 
-Linear (including both BF16 fixture recipes), LinearAdd (including FP8/NVFP4) and LinearSwiGLU
-common implementations each compile once into a test support library. Their libraries and CXX Op test executables receive `-fno-fast-math` and `-ffp-contract=off`
-on GNU/Clang. The remaining organization, entry-point and oracle-build work is tracked in the
-[Linear test reorganization requirements](../docs/maintainer/linear-test-reorganization-plan.md).
+Input generation, seeds, packed codes/scales/divisors and sample coordinates belong to the case,
+independently of selection order and acceptance criteria. `AllowA4` always uses the Op's A4
+criterion, even if a higher-precision implementation runs; `AllowA8` similarly uses A8. Oracles
+decode represented weights independently and evaluate the complete FP64 formula without activation
+quantization or intermediate BF16 rounding. Bank row views are layout cases in the four consuming
+suites. Changed-input Graph checks include Pair's separate/shared parents and TopK scores.
+
+Large independent oracle rows reuse a bounded portable CPU task pool; small work remains serial.
+Each dot product retains its K accumulation order. Shared support and all CXX suite targets receive
+`-fno-fast-math` and `-ffp-contract=off` on GNU/Clang. Both build targets use the same mathematical
+criteria and shared case tables. Run the native Spark build with `build/dgx-spark-dev` in the commands
+above; add target-specific boundary tables only when actual dispatch needs them.
 
 Run the native Python suites with the project Python environment:
 

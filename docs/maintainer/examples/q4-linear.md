@@ -89,7 +89,7 @@ T=1 的逻辑带宽为 **1069.4 GB/s，标称带宽利用率 59.68%**；采用 b
   T=1024 为 **381.696 µs、168.78 TFLOP/s、80.57% TC 利用率**。
   本轮仅重测两个大 T 锚点，未重新测量 129～511 或其他大 T 交界。
 
-数值资格化复用本阶段已通过的 `ninfer_linear_q4_a16_test`：独立解码 packed Q4 code 与
+数值资格化使用 `ninfer_linear_projection_test --format q4`：独立解码 packed Q4 code 与
 FP16 scale，以 FP64 矩阵乘法为 oracle，按既有 A16 标准检查公开路线、代表性边界、输出 guard、
 输入保持和改变输入后的 CUDA Graph 重放。本次只刷新计时与文档，未重新运行数值测试。
 

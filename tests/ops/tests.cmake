@@ -28,7 +28,6 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
-include("${CMAKE_CURRENT_LIST_DIR}/linear_topk/tests.cmake")
 
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
@@ -94,9 +93,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_add/tests.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/tests.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/ple/tests.cmake")

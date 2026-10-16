@@ -553,16 +553,20 @@ organization are not qualification subjects.
 ### 6.3 Acceptance criteria
 
 Exact outputs and regions compare every observable bit or byte. Each approximate output or state
-uses a suite-owned named criterion for its real arithmetic or quantization profile; tests do not
-define per-case tolerance overrides.
+uses a suite-owned named criterion for its public numerical policy or representation; tests do not
+define per-case tolerance overrides. For Linear-family Ops, `A16Only`, `AllowA8`, and `AllowA4`
+select the A16, A8, and A4 criteria respectively, regardless of which arithmetic the implementation
+chooses. A permissive policy retains its criterion when a route uses higher precision. Input
+recipes and sampling are separate from that choice; tests must not inspect selectors or infer
+precision from T to select a criterion.
 
 A floating-point criterion states its non-finite policy. Elementwise work uses a pointwise bound.
 Reductions and matrix or attention computations use a normwise bound with a finite gross
 pointwise-error cap so cancellation does not require strict elementwise agreement and isolated
 corruption cannot hide in an aggregate norm.
 
-Different production routes use different criteria only when their arithmetic or quantization
-profiles differ materially. Widening a criterion requires a numerical reason and requalification
+Different public numerical policies or represented formats may require different criteria.
+Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
 ## 7. Performance evidence

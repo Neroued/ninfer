@@ -63,8 +63,3 @@ these references.
 Qwen3.8-Flash-Next is the Qwen4Exp instance; Qwen3.8-27B uses the Qwen3.5 architecture.
 The model references own mathematical and stored-representation facts, and the execution reference
 owns integrated support and its limits. Concrete Op contracts live in `include/ninfer/ops/`.
-
-## Planned work
-
-[Linear test maintenance](maintainer/linear-test-reorganization-plan.md) tracks the pending
-consolidation of test runners and explicit case contracts.

@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ninfer::serve {
@@ -48,6 +49,9 @@ struct OpenAIResponsesCreateRequest {
     // Responses beta namespace tools are flattened for the Engine and restored only at the wire
     // boundary. Never infer a namespace by splitting an Engine function name.
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
+    // Engine names declared as `type:"custom"` tools; lowered to functions for the Engine but
+    // re-emitted as `custom_tool_call` Items and SSE events at the wire boundary.
+    std::unordered_set<std::string> custom_tool_engine_names;
     std::optional<int> requested_max_output_tokens;
     std::optional<int> max_tool_calls;
     bool parallel_tool_calls = true;

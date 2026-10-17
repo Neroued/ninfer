@@ -805,6 +805,13 @@ int main(int argc, char** argv) {
         add({"raw prefill boundary", 5, 15, tokens, false}, 91000U + tokens);
     }
 
+    for (int heads : {32, 48}) {
+        for (int tokens : {127, 128, 129}) {
+            add({"prefill tiling boundary", 16, heads, tokens, tokens != 127},
+                92000U + heads * 100U + tokens);
+        }
+    }
+
     struct Stress {
         const char* name;
         InputPattern pattern;

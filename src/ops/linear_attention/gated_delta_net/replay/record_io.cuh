@@ -97,21 +97,32 @@ struct RecordAccess {
 
     __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
                                               const RawQkLane& raw) const {
+        store_key_chunk(coord, token, coord.dqk_base, raw);
+    }
+
+    __device__ __forceinline__ void store_key_chunk(const RecurrentCoordinates& coord,
+                                                    std::int32_t token, int key_column,
+                                                    const RawQkLane& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 &&
             static_cast<int>(coord.value_head) % heads.group_size() == 0) {
             __nv_bfloat16* destination =
                 key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
-            common::store_vec(destination + coord.dqk_base, raw.bits);
+            common::store_vec(destination + key_column, raw.bits);
         }
     }
 
     __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
                                                 std::int32_t token, const RawValueLane& raw) const {
         if (coord.lane < kDvPerWarp) {
-            __nv_bfloat16* destination =
-                value_record + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
-            destination[coord.dv_base + coord.lane] = raw.bits;
+            store_value_element(coord, token, coord.dv_base + coord.lane, raw.bits);
         }
+    }
+
+    __device__ __forceinline__ void store_value_element(const RecurrentCoordinates& coord,
+                                                        std::int32_t token, int row,
+                                                        __nv_bfloat16 bits) const {
+        value_record[(column(coord, token) * heads.H_v + coord.value_head) * kStateDim + row] =
+            bits;
     }
 
     __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,

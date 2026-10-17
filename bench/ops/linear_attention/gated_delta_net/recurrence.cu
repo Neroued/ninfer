@@ -205,7 +205,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                           tokens,
                                                           gated_delta_net_scale()};
     const int tile     = chunked ? ops::detail::gated_delta_net::select_value_tile(
-                                   problem.value_heads, execution.multiprocessor_count())
+                                   problem.value_heads, tokens, execution.multiprocessor_count())
                                  : 0;
     const auto prep_io = prepare_traffic(problem);
     const auto rec_io  = recurrence_traffic(problem, tile ? state_dim / tile : 0);

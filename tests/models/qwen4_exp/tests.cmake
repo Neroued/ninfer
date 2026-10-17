@@ -35,3 +35,9 @@ ninfer_add_test(ninfer_qwen4_exp_state_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_qwen4_exp_state_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+ninfer_add_test(ninfer_qwen4_exp_reclaim_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reclaim_real.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_reclaim_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")

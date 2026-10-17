@@ -424,6 +424,15 @@ StateImage/KV snapshot at frontier 7, where `tokens_per_row=4` leaves one valid 
 three-entry raw tail. Native transaction tests exercise the corresponding model-owned source,
 capture, retirement, recovery and consecutive decode/terminal paths.
 
+`ninfer_recovery_test` compares the shared branch-loss definition with an independent exhaustive
+oracle, including aliases, invalid/foreign generations, forced shortlist collisions, and unavailable
+fallbacks. It also checks physical union probes and rollback against complete holder enumeration.
+`ninfer_resource_manager_test` compares incremental Host selection with full rescoring and bounds
+deterministic score/holder work for 16–128 independent candidates. These operation counts check
+algorithmic regressions; they do not establish inference throughput or latency.
+`ninfer_kv_history_test` also exercises both actual Qwen checkpoint record types, separate backend
+frontiers, external snapshots, reader pins, excluded aliases, and Device/Host release quantities.
+
 ## DFlash2 Engine integration
 
 The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting
@@ -484,6 +493,8 @@ Qwen4Exp loading/resources can be checked independently of the public Engine rou
 ```bash
 ./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --host-experts
 ./build/rtx5090-dev/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --host-experts --materialize
+NINFER_QWEN4_EXP_TEST_ARTIFACT=out/qwen3_8_flash_next.ninfer \
+  ./build/rtx5090-dev/tests/ninfer_qwen4_exp_reclaim_real_test
 ```
 
 The first command plans component combinations, KV formats and concurrency without loading weight
@@ -494,3 +505,8 @@ loading on Spark, use its build directory and omit `--host-experts`. These are l
 Text/Vision/MTP generation, eager or CUDA Graph decode, and text causal scoring use the public Engine,
 with current support described in the [execution reference](../docs/maintainer/qwen4_exp-execution.md)
 and commands in the [CLI guide](../docs/cli.md).
+
+The reclaim test loads Main experts on Host and MTP/fixed weights on Device, then constructs
+native checkpoint contents without generating text. It checks complete holder quotes, actual-page
+batch coverage, typed shortage clipping, stale holders/readers/residency, Main/MTP/State migrations,
+and quoted Host release against final store occupancy. It requires the same Host memory headroom.

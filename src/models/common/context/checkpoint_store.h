@@ -85,6 +85,9 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return slots_.size(); }
 
+    // Semantic index lifetime; residency and leases do not change immutable checkpoint identity.
+    [[nodiscard]] const std::uint64_t& revision() const noexcept { return revision_; }
+
     [[nodiscard]] const Slot& operator[](std::size_t index) const { return slots_.at(index); }
 
     [[nodiscard]] CheckpointHandle handle(std::uint32_t index) const {
@@ -123,6 +126,7 @@ public:
             throw std::logic_error("checkpoint reservation is stale");
         slot.value.emplace(std::move(record));
         slot.reserved = false;
+        ++revision_;
     }
 
     [[nodiscard]] Record& at(CheckpointHandle h) {
@@ -150,10 +154,12 @@ public:
         auto& slot = slots_[h.index];
         slot.value.reset();
         if (++slot.generation == 0) ++slot.generation;
+        ++revision_;
         return true;
     }
 
     void clear() noexcept {
+        ++revision_;
         for (std::uint32_t i = 0; i < slots_.size(); ++i) {
             if (slots_[i].pins) std::terminate();
             slots_[i].value.reset();
@@ -163,5 +169,6 @@ public:
     }
 private:
     std::vector<Slot> slots_;
+    std::uint64_t revision_ = 1;
 };
 } // namespace ninfer::models::context

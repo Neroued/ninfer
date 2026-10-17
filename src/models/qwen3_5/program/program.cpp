@@ -1,8 +1,11 @@
 #include "models/qwen3_5/program/internal.h"
+
 #include "core/startup.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
+#include "models/common/qwen/recovery_store.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+
 #include <stdexcept>
 #include <utility>
 
@@ -165,9 +168,10 @@ std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle retained,
     return impl_->checkpoint_recovery_frontier(retained, base, target);
 }
 
-std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
-                                                std::span<const CheckpointHandle> surviving) const {
-    return impl_->checkpoint_recovery_loss(removed, surviving);
+context::RecoveryEvaluation<>
+Program::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
+    impl_->recovery_index.synchronize(qwen::RecoveryStoreView{impl_->checkpoints});
+    return impl_->recovery_index.evaluate(advertised);
 }
 
 bool Program::valid_checkpoint(CheckpointHandle h) const noexcept {
@@ -235,9 +239,10 @@ ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allow
     return impl_->plan_reclaim(allowed, excluded, shortage);
 }
 
-std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHandle> allowed,
-                                                   std::span<const CheckpointHandle> excluded,
-                                                   ContextResources shortage) const {
+context::ReleasePlan<ContextRelease, ContextResources>
+Program::plan_releases(std::span<const CheckpointHandle> allowed,
+                       std::span<const CheckpointHandle> excluded,
+                       ContextResources shortage) const {
     return impl_->plan_releases(allowed, excluded, shortage);
 }
 

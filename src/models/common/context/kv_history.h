@@ -146,6 +146,12 @@ public:
 
     [[nodiscard]] KVPrefixRef retain_prefix(KVHistoryHandle history, std::uint32_t frontier);
     [[nodiscard]] bool valid(KVHistoryHandle history) const noexcept;
+
+    [[nodiscard]] std::uint32_t descriptor_index(KVHistoryHandle history) const {
+        (void)require(history);
+        return history.index_;
+    }
+
     [[nodiscard]] std::uint32_t capacity() const noexcept;
     [[nodiscard]] std::uint32_t occupied() const noexcept;
     [[nodiscard]] bool owned(KVHistoryHandle history) const;

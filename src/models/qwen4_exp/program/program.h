@@ -1,6 +1,8 @@
 #pragma once
 
 #include "models/common/context/checkpoint_store.h"
+#include "models/common/context/recovery.h"
+#include "models/common/context/release_inventory.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/qwen4_exp/program/planning.h"
 #include "runtime/contract/execution.h"
@@ -17,6 +19,8 @@ class ProgramImpl;
 struct RequestPlan;
 struct Suspended;
 struct Demotion;
+struct DemotionBatch;
+struct Release;
 struct Reclaim;
 } // namespace detail
 
@@ -91,6 +95,7 @@ struct ContextDemotion {
 struct ContextRelease {
     std::vector<CheckpointHandle> sources;
     ContextResources released;
+    std::shared_ptr<const detail::Release> impl;
 };
 
 class ContextDemotionBatch {
@@ -99,9 +104,9 @@ public:
     [[nodiscard]] bool covers(const ContextRelease&) const;
     [[nodiscard]] std::optional<ContextDemotion> finish() const;
 private:
-    std::shared_ptr<detail::Demotion> plan_;
+    std::shared_ptr<detail::DemotionBatch> plan_;
 
-    explicit ContextDemotionBatch(std::shared_ptr<detail::Demotion> p) : plan_(std::move(p)) {}
+    explicit ContextDemotionBatch(std::shared_ptr<detail::DemotionBatch> p) : plan_(std::move(p)) {}
     friend struct ContextReclaimPlan;
 };
 
@@ -109,8 +114,6 @@ struct ContextReclaimPlan {
     std::vector<ContextDemotion> demotions;
     std::vector<ContextRelease> releases;
     [[nodiscard]] ContextDemotionBatch begin_kv_batch(ContextResources) const;
-    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle>,
-                                              std::span<const CheckpointHandle>) const;
     std::shared_ptr<const detail::Reclaim> impl;
 };
 
@@ -270,8 +273,9 @@ public:
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t
     checkpoint_recovery_frontier(CheckpointHandle, const RequestBasePlan&, std::uint32_t) const;
-    [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
-                                                         std::span<const CheckpointHandle>) const;
+    // Borrows this Program's index; checkpoint publication or retirement invalidates the view.
+    [[nodiscard]] context::RecoveryEvaluation<>
+    evaluate_recovery(std::span<const CheckpointHandle> advertised) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
@@ -294,9 +298,9 @@ public:
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   ContextResources) const;
-    [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle>,
-                                                            std::span<const CheckpointHandle>,
-                                                            ContextResources) const;
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
+        plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                      ContextResources) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
     [[nodiscard]] bool start_pause(SequenceHandle, bool save, runtime::ExecutionTiming* = nullptr);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);

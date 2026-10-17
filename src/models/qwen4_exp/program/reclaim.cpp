@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/program/internal.h"
 
+#include "models/common/context/physical_reclaim.h"
+#include "models/common/qwen/recovery_store.h"
+
 #include <algorithm>
 #include <unordered_set>
 
@@ -10,12 +13,102 @@ void append_unique(std::vector<T>& out, const T& value) {
     if (std::find(out.begin(), out.end(), value) == out.end()) out.push_back(value);
 }
 
-bool same_prefix(const Checkpoint& a, const Checkpoint& b, std::uint32_t f) {
-    const auto& x = a.snapshot.identity();
-    const auto& y = b.snapshot.identity();
-    return x.tag == y.tag && x.tokens.size() >= f && y.tokens.size() >= f &&
-           std::equal(x.tokens.begin(), x.tokens.begin() + f, y.tokens.begin()) &&
-           x.positions.prefix_equals(y.positions, f);
+context::PhysicalReclaim<ContextResources>
+physical_facts(const ProgramImpl& program, std::span<const CheckpointHandle> allowed,
+               std::span<const CheckpointHandle> excluded, ContextResources shortage) {
+    std::array<context::ReclaimPool, ContextResources::pool_capacity> pools;
+    for (std::uint16_t i = 0; i < program.resources.pool_count(); ++i) {
+        const auto& pool = program.resources.pool(i);
+        pools[i]         = {&pool.histories, &pool.pages, program.pools[i].host_page_stride};
+    }
+    return {program.checkpoints,
+            *program.resources.state_store,
+            program.resources.states->storage().image_bytes(),
+            pools,
+            allowed,
+            excluded,
+            shortage};
+}
+
+void seal(Demotion& plan) {
+    const auto& p            = *plan.owner;
+    plan.checkpoint_revision = p.checkpoints.revision();
+    for (const auto image : plan.images)
+        plan.image_epochs.push_back(p.resources.state_store->content_epoch(image));
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+        for (const auto page : plan.pages[pool]) {
+            const auto& store = p.resources.pool(pool).pages;
+            plan.page_versions[pool].push_back(
+                {store.content_epoch(page), store.committed_columns(page)});
+        }
+}
+
+ContextRelease
+quote_release(const ProgramImpl& p, const context::PhysicalReclaim<ContextResources>& facts,
+              std::span<const CheckpointHandle> sources,
+              const context::ReleaseInventory<ContextResources>::Selection& selection,
+              ContextResources shortage) {
+    auto proof   = std::make_shared<Release>();
+    proof->owner = &p;
+    for (const auto group : selection.freed())
+        for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+            if (shortage.kv_page_groups[pool])
+                for (const auto& page : facts.groups[group].pages[pool])
+                    if (page.releasable &&
+                        p.resources.pool(pool).pages.device_resident(page.handle))
+                        proof->pages[pool].push_back(page.handle);
+    return {{sources.begin(), sources.end()}, selection.released(), std::move(proof)};
+}
+
+bool valid_demotion(const ProgramImpl& p, const Demotion& plan, bool refresh_holders = true) {
+    if (!refresh_holders && plan.checkpoint_revision != p.checkpoints.revision()) return false;
+    for (const auto h : plan.records)
+        if (!p.checkpoints.erasable(h)) return false;
+    ContextResources needed{.state_slots = static_cast<std::uint32_t>(plan.images.size())};
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+        needed.kv_page_groups[pool] = plan.pages[pool].size();
+    std::vector<bool> images;
+    std::array<std::vector<bool>, 2> pages;
+    if (refresh_holders) {
+        const auto facts = physical_facts(p, plan.records, {}, needed);
+        images.resize(p.resources.state_store->capacity());
+        for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+            pages[pool].resize(p.resources.pool(pool).pages.capacity());
+        for (const auto& group : facts.groups) {
+            for (const auto image : group.states)
+                images[p.resources.state_store->descriptor_index(image)] = true;
+            for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+                for (const auto& page : group.pages[pool])
+                    pages[pool][p.resources.pool(pool).pages.descriptor_index(page.handle)] = true;
+        }
+    }
+    const auto& states = *p.resources.state_store;
+    if (plan.images.size() != plan.image_epochs.size()) return false;
+    for (std::size_t i = 0; i < plan.images.size(); ++i) {
+        const auto image = plan.images[i];
+        if (!states.valid(image) || (refresh_holders && !images[states.descriptor_index(image)]) ||
+            !states.device_resident(image) || states.content_epoch(image) != plan.image_epochs[i] ||
+            states.role(image) != context::StateImageRole::CheckpointImmutable ||
+            !states.can_release_after_checkpoint_references(image,
+                                                            states.checkpoint_references(image)))
+            return false;
+    }
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
+        const auto& store = p.resources.pool(pool).pages;
+        if (plan.pages[pool].size() != plan.page_versions[pool].size()) return false;
+        for (std::size_t i = 0; i < plan.pages[pool].size(); ++i) {
+            const auto page    = plan.pages[pool][i];
+            const auto version = plan.page_versions[pool][i];
+            if (!store.valid(page) ||
+                (refresh_holders && !pages[pool][store.descriptor_index(page)]) ||
+                !store.device_resident(page) || !store.can_pin_source(page) ||
+                store.source_pins(page) || store.active_history_references(page) ||
+                store.content_epoch(page) != version.epoch ||
+                store.committed_columns(page) != version.columns)
+                return false;
+        }
+    }
+    return true;
 }
 } // namespace
 
@@ -49,6 +142,9 @@ ProgramImpl::checkpoint_pages(std::span<const CheckpointHandle> records, std::ui
 
 ContextResources ProgramImpl::footprint(std::span<const CheckpointHandle> input,
                                         bool released) const {
+    if (released &&
+        std::any_of(input.begin(), input.end(), [&](auto h) { return !checkpoints.erasable(h); }))
+        return {};
     std::vector<CheckpointHandle> records;
     for (const auto h : input)
         if (checkpoints.valid(h)) append_unique(records, h);
@@ -58,8 +154,8 @@ ContextResources ProgramImpl::footprint(std::span<const CheckpointHandle> input,
         const auto references = std::count_if(records.begin(), records.end(), [&](auto h) {
             return checkpoints.at(h).snapshot.continuation().image == image;
         });
-        if (released &&
-            (references != states.checkpoint_references(image) || states.source_pins(image)))
+        if (released && (references != states.checkpoint_references(image) ||
+                         !states.can_release_after_checkpoint_references(image, references)))
             continue;
         out.state_slots += states.device_resident(image);
         if (states.host_resident(image))
@@ -88,39 +184,6 @@ std::size_t ProgramImpl::host_released(std::span<const CheckpointHandle> records
     return footprint(records, true).host_bytes;
 }
 
-std::uint64_t ProgramImpl::recovery_loss(std::span<const CheckpointHandle> removed,
-                                         std::span<const CheckpointHandle> kept) const {
-    std::uint64_t loss = 0;
-    std::vector<CheckpointHandle> maximal;
-    for (auto h : removed) {
-        if (!checkpoints.valid(h)) continue;
-        const auto& candidate = checkpoints.at(h);
-        if (std::any_of(maximal.begin(), maximal.end(), [&](auto other) {
-                return checkpoints.at(other).frontier() >= candidate.frontier() &&
-                       same_prefix(candidate, checkpoints.at(other), candidate.frontier());
-            }))
-            continue;
-        std::erase_if(maximal, [&](auto other) {
-            return checkpoints.at(other).frontier() <= candidate.frontier() &&
-                   same_prefix(candidate, checkpoints.at(other), checkpoints.at(other).frontier());
-        });
-        maximal.push_back(h);
-    }
-    for (auto h : maximal) {
-        const auto& candidate   = checkpoints.at(h);
-        std::uint32_t recovered = 0;
-        for (auto other : kept)
-            if (checkpoints.valid(other)) {
-                const auto& source = checkpoints.at(other);
-                if (source.frontier() <= candidate.frontier() &&
-                    same_prefix(source, candidate, source.frontier()))
-                    recovered = std::max(recovered, source.frontier());
-            }
-        loss += candidate.frontier() - recovered;
-    }
-    return loss;
-}
-
 std::shared_ptr<Demotion> ProgramImpl::demotion(std::span<const CheckpointHandle> records,
                                                 ContextResources shortage) const {
     if (!resources.host_context) return {};
@@ -141,6 +204,7 @@ std::shared_ptr<Demotion> ProgramImpl::demotion(std::span<const CheckpointHandle
                     !pages.active_history_references(page))
                     out->pages[pool].push_back(page);
         }
+    seal(*out);
     return out->empty() ? nullptr : out;
 }
 
@@ -204,161 +268,85 @@ bool ProgramImpl::prepare_demotion(context::MigrationBatch& migration, const Dem
     return true;
 }
 
-} // namespace ninfer::models::qwen4_exp::detail
+struct DemotionBatch {
+    const ProgramImpl* owner;
+    ContextResources shortage;
+    std::optional<runtime::KvPoolId> pool;
+    bool valid;
+    std::vector<std::shared_ptr<const Demotion>> components;
+    std::unordered_set<std::uint32_t> pages;
+};
 
-namespace ninfer::models::qwen4_exp {
-
-ContextResources Program::checkpoint_footprint(std::span<const CheckpointHandle> h) const {
-    return impl_->footprint(h, false);
-}
-
-std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> h) const {
-    return impl_->host_released(h);
-}
-
-std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
-                                                std::span<const CheckpointHandle> kept) const {
-    return impl_->recovery_loss(removed, kept);
-}
-
-CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
-    CheckpointSummary out;
-    static_cast<CheckpointMetadata&>(out) = checkpoint_metadata(h);
-    out.key                               = checkpoint_key(h, out.frontier);
-    out.evictable_resources               = impl_->footprint({&h, 1}, true);
-    return out;
-}
-
-std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHandle> allowed,
-                                                   std::span<const CheckpointHandle> excluded,
-                                                   ContextResources shortage) const {
-    const auto& p = *impl_;
-    std::vector<CheckpointHandle> records;
-    for (const auto h : allowed)
-        if (p.checkpoints.erasable(h) &&
-            std::find(excluded.begin(), excluded.end(), h) == excluded.end())
-            records.push_back(h);
-    std::vector<ContextRelease> out;
-    const auto add = [&](std::vector<CheckpointHandle> owners) {
-        std::sort(owners.begin(), owners.end(), [](auto a, auto b) { return a.index < b.index; });
-        if (owners.empty() ||
-            std::any_of(out.begin(), out.end(), [&](const auto& a) { return a.sources == owners; }))
-            return;
-        auto released = p.footprint(owners, true);
-        if (released.useful(shortage)) out.push_back({std::move(owners), released});
-    };
-    for (const auto h : records) add({h});
-    if (shortage.state_slots || shortage.host_bytes) {
-        for (const auto image : p.checkpoint_images(records)) {
-            std::vector<CheckpointHandle> owners;
-            for (auto h : records)
-                if (p.checkpoints.at(h).snapshot.continuation().image == image) owners.push_back(h);
-            add(std::move(owners));
-        }
+context::ReleasePlan<ContextRelease, ContextResources>
+ProgramImpl::plan_releases(std::span<const CheckpointHandle> allowed,
+                           std::span<const CheckpointHandle> excluded,
+                           ContextResources shortage) const {
+    auto facts = detail::physical_facts(*this, allowed, excluded, shortage);
+    context::ReleasePlan<ContextRelease, ContextResources> out{{}, facts.inventory};
+    if (this->operation || this->pending_transaction) return out;
+    auto selection = facts.inventory->select();
+    for (const auto& group : facts.groups) {
+        auto probe = selection.probe(group.sources);
+        if (selection.released().useful(shortage))
+            out.releases.push_back(
+                detail::quote_release(*this, facts, group.sources, selection, shortage));
     }
-    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
-        if (shortage.kv_page_groups[pool] || shortage.host_bytes) {
-            for (const auto page : p.checkpoint_pages(records, pool)) {
-                std::vector<CheckpointHandle> owners;
-                for (auto h : records) {
-                    const auto pages = p.checkpoint_pages({&h, 1}, pool);
-                    if (std::find(pages.begin(), pages.end(), page) != pages.end())
-                        owners.push_back(h);
-                }
-                add(std::move(owners));
-            }
-        }
     return out;
 }
 
-ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
-                                         std::span<const CheckpointHandle> excluded,
-                                         ContextResources shortage) const {
-    auto& p = *impl_;
+ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
+                                             std::span<const CheckpointHandle> excluded,
+                                             ContextResources shortage) const {
+    auto& p = *this;
     ContextReclaimPlan out;
-    out.impl     = std::make_shared<detail::Reclaim>(detail::Reclaim{&p});
-    out.releases = plan_releases(allowed, excluded, shortage);
-    for (const auto h : allowed) {
-        if (!p.checkpoints.erasable(h) ||
-            std::find(excluded.begin(), excluded.end(), h) != excluded.end())
-            continue;
-        auto plan = p.demotion({&h, 1}, shortage);
-        if (!plan) continue;
-        // A shared physical move names every holder; excluded holders veto the move.
-        for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i) {
-            const auto other = p.checkpoints.handle(i);
-            if (!p.checkpoints.valid(other) || other == h) continue;
-            const auto image = p.checkpoints.at(other).snapshot.continuation().image;
-            std::array<std::vector<context::LogicalKVPageHandle>, 2> pages;
-            bool shares =
-                std::find(plan->images.begin(), plan->images.end(), image) != plan->images.end();
-            for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
-                pages[pool] = p.checkpoint_pages({&other, 1}, pool);
-                shares |= std::any_of(pages[pool].begin(), pages[pool].end(), [&](auto page) {
-                    return std::find(plan->pages[pool].begin(), plan->pages[pool].end(), page) !=
-                           plan->pages[pool].end();
-                });
+    out.impl = std::make_shared<detail::Reclaim>(detail::Reclaim{&p, shortage});
+    if (p.operation || p.pending_transaction) return out;
+    auto facts     = detail::physical_facts(p, allowed, excluded, shortage);
+    auto selection = facts.inventory->select();
+    for (const auto& group : facts.groups) {
+        auto probe = selection.probe(group.sources);
+        if (selection.released().useful(shortage))
+            out.releases.push_back(
+                detail::quote_release(p, facts, group.sources, selection, shortage));
+        if (shortage.host_bytes || !p.resources.host_context) continue;
+        auto plan     = std::make_shared<detail::Demotion>();
+        plan->owner   = &p;
+        plan->records = group.sources;
+        if (shortage.state_slots) {
+            for (const auto image : group.states)
+                if (p.resources.state_store->role(image) ==
+                        context::StateImageRole::CheckpointImmutable &&
+                    p.resources.state_store->can_release_after_checkpoint_references(
+                        image, p.resources.state_store->checkpoint_references(image))) {
+                    plan->images.push_back(image);
+                    break;
+                }
+        } else if (const auto pool = shortage.first_kv_deficit()) {
+            const auto& pages = p.resources.pool(pool->index).pages;
+            for (const auto& page : group.pages[pool->index]) {
+                if (!pages.device_resident(page.handle) || pages.source_pins(page.handle) ||
+                    pages.active_history_references(page.handle) ||
+                    !pages.can_pin_source(page.handle))
+                    continue;
+                plan->pages[pool->index].push_back(page.handle);
+                if (plan->pages[pool->index].size() == shortage.kv_page_groups[pool->index]) break;
             }
-            if (!shares) continue;
-            if (std::find(allowed.begin(), allowed.end(), other) == allowed.end() ||
-                std::find(excluded.begin(), excluded.end(), other) != excluded.end() ||
-                !p.checkpoints.erasable(other)) {
-                std::erase(plan->images, image);
-                for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
-                    std::erase_if(plan->pages[pool], [&](auto page) {
-                        return std::find(pages[pool].begin(), pages[pool].end(), page) !=
-                               pages[pool].end();
-                    });
-            } else if (std::find(plan->records.begin(), plan->records.end(), other) ==
-                       plan->records.end())
-                plan->records.push_back(other);
         }
+        detail::seal(*plan);
         if (!plan->empty()) out.demotions.push_back(p.describe_demotion(std::move(plan)));
     }
     return out;
 }
 
-ContextDemotionBatch ContextReclaimPlan::begin_kv_batch(ContextResources) const {
-    auto out   = std::make_shared<detail::Demotion>();
-    out->owner = impl->owner;
-    return ContextDemotionBatch(std::move(out));
-}
-
-std::uint64_t ContextReclaimPlan::recovery_loss(std::span<const CheckpointHandle> removed,
-                                                std::span<const CheckpointHandle> kept) const {
-    return impl->owner->recovery_loss(removed, kept);
-}
-
-bool ContextDemotionBatch::append(const ContextDemotion& other) {
-    if (!other.impl || plan_->owner != other.impl->owner) return false;
-    const auto append = [](auto& values, const auto& additions) {
-        for (const auto value : additions)
-            if (std::find(values.begin(), values.end(), value) == values.end())
-                values.push_back(value);
-    };
-    append(plan_->images, other.impl->images);
-    for (std::uint16_t pool = 0; pool < plan_->owner->resources.pool_count(); ++pool)
-        append(plan_->pages[pool], other.impl->pages[pool]);
-    append(plan_->records, other.impl->records);
-    return true;
-}
-
-bool ContextDemotionBatch::covers(const ContextRelease& release) const {
-    return std::all_of(release.sources.begin(), release.sources.end(), [&](auto h) {
-        return std::find(plan_->records.begin(), plan_->records.end(), h) != plan_->records.end();
-    });
-}
-
-std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
-    if (plan_->empty()) return {};
-    return plan_->owner->describe_demotion(plan_);
-}
-
-bool Program::start_demote(const ContextDemotion& quote) {
-    auto& p = *impl_;
+bool ProgramImpl::start_demote(const ContextDemotion& quote) {
+    auto& p = *this;
     if (p.operation || p.pending_transaction || !quote.impl || quote.impl->owner != &p ||
-        !p.resources.host_context || quote.host_bytes > p.resources.host_context->free_bytes())
+        !p.resources.host_context || quote.sources != quote.impl->records ||
+        !detail::valid_demotion(p, *quote.impl) ||
+        quote.host_bytes > p.resources.host_context->free_bytes())
         return false;
+    const auto current = p.describe_demotion(quote.impl);
+    if (current.host_bytes != quote.host_bytes || current.released != quote.released) return false;
     p.operation = std::make_unique<detail::ContextOperation>(p.resources,
                                                              detail::DemoteOperation{quote.impl});
     try {
@@ -374,6 +362,128 @@ bool Program::start_demote(const ContextDemotion& quote) {
         throw;
     }
 }
+
+} // namespace ninfer::models::qwen4_exp::detail
+
+namespace ninfer::models::qwen4_exp {
+
+ContextResources Program::checkpoint_footprint(std::span<const CheckpointHandle> h) const {
+    return impl_->footprint(h, false);
+}
+
+std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> h) const {
+    return impl_->host_released(h);
+}
+
+context::RecoveryEvaluation<>
+Program::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
+    impl_->recovery_index.synchronize(qwen::RecoveryStoreView{impl_->checkpoints});
+    return impl_->recovery_index.evaluate(advertised);
+}
+
+CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
+    CheckpointSummary out;
+    static_cast<CheckpointMetadata&>(out) = checkpoint_metadata(h);
+    out.key                               = checkpoint_key(h, out.frontier);
+    out.evictable_resources               = impl_->footprint({&h, 1}, true);
+    return out;
+}
+
+context::ReleasePlan<ContextRelease, ContextResources>
+Program::plan_releases(std::span<const CheckpointHandle> allowed,
+                       std::span<const CheckpointHandle> excluded,
+                       ContextResources shortage) const {
+    return impl_->plan_releases(allowed, excluded, shortage);
+}
+
+ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
+                                         std::span<const CheckpointHandle> excluded,
+                                         ContextResources shortage) const {
+    return impl_->plan_reclaim(allowed, excluded, shortage);
+}
+
+ContextDemotionBatch ContextReclaimPlan::begin_kv_batch(ContextResources shortage) const {
+    const auto pool = shortage.first_kv_deficit();
+    auto batch      = std::make_shared<detail::DemotionBatch>();
+    batch->owner    = impl->owner;
+    batch->shortage = shortage;
+    batch->pool     = pool;
+    batch->valid    = !shortage.state_slots && !shortage.host_bytes && pool &&
+                   !impl->shortage.state_slots && !impl->shortage.host_bytes &&
+                   impl->shortage.first_kv_deficit() == pool;
+    return ContextDemotionBatch(std::move(batch));
+}
+
+bool ContextDemotionBatch::append(const ContextDemotion& quote) {
+    if (!plan_->valid) return false;
+    const auto pool = plan_->pool->index;
+    if (!quote.impl || quote.impl->owner != plan_->owner || !quote.impl->images.empty() ||
+        quote.sources != quote.impl->records || quote.impl->pages[pool].empty() ||
+        !quote.impl->pages[1 - pool].empty() ||
+        !detail::valid_demotion(*plan_->owner, *quote.impl, false)) {
+        plan_->valid = false;
+        return false;
+    }
+    const auto& store = plan_->owner->resources.pool(pool).pages;
+    for (const auto page : quote.impl->pages[pool])
+        plan_->pages.insert(store.descriptor_index(page));
+    plan_->components.push_back(quote.impl);
+    return true;
+}
+
+bool ContextDemotionBatch::covers(const ContextRelease& release) const {
+    if (!plan_->valid || !release.impl || release.impl->owner != plan_->owner) return false;
+    const auto pool = plan_->pool->index;
+    if (release.impl->pages[pool].empty() || !release.impl->pages[1 - pool].empty()) return false;
+    const auto& store = plan_->owner->resources.pool(pool).pages;
+    return std::all_of(
+        release.impl->pages[pool].begin(), release.impl->pages[pool].end(), [&](auto page) {
+            return store.valid(page) && plan_->pages.contains(store.descriptor_index(page));
+        });
+}
+
+std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
+    if (!plan_->valid || plan_->components.empty()) return {};
+    const auto& p               = *plan_->owner;
+    const auto pool             = plan_->pool->index;
+    const auto& store           = p.resources.pool(pool).pages;
+    const auto free             = p.resources.host_context->free_bytes();
+    const auto stride           = p.pools[pool].host_page_stride;
+    auto result                 = std::make_shared<detail::Demotion>();
+    result->owner               = &p;
+    result->checkpoint_revision = p.checkpoints.revision();
+    std::unordered_set<std::uint32_t> selected;
+    std::size_t bytes = 0;
+    bool complete     = false;
+    for (const auto& component : plan_->components) {
+        if (!detail::valid_demotion(p, *component, false)) return {};
+        bool used = false;
+        for (std::size_t i = 0; i < component->pages[pool].size(); ++i) {
+            const auto page = component->pages[pool][i];
+            if (!selected.insert(store.descriptor_index(page)).second) continue;
+            const auto needed = store.host_replica_current(page) ? 0 : stride;
+            if (needed > free - bytes) {
+                complete = true;
+                break;
+            }
+            bytes += needed;
+            result->pages[pool].push_back(page);
+            result->page_versions[pool].push_back(component->page_versions[pool][i]);
+            used = true;
+            if (result->pages[pool].size() == plan_->shortage.kv_page_groups[pool]) {
+                complete = true;
+                break;
+            }
+        }
+        if (used)
+            for (const auto h : component->records) detail::append_unique(result->records, h);
+        if (complete) break;
+    }
+    if (result->empty()) return {};
+    return p.describe_demotion(std::move(result));
+}
+
+bool Program::start_demote(const ContextDemotion& quote) { return impl_->start_demote(quote); }
 
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> keep) {

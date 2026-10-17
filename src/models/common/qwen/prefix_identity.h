@@ -66,6 +66,20 @@ private:
     std::vector<std::array<std::uint64_t, 2>> digests_;
 };
 
+// A borrowed view of one complete immutable recovery point. Backing identity is a fast proof
+// only after the frontier, domain and digest checks; it never equates physical State/KV owners.
+struct RecoveryIdentityView {
+    std::uint32_t frontier;
+    std::uint32_t domain;
+    std::span<const TokenId> tokens;
+    const ResidentPrefixIdentity& positions;
+    const PrefixShortlistDigests& digests;
+    const void* backing;
+};
+
+[[nodiscard]] bool recovery_prefix_matches(const RecoveryIdentityView& earlier,
+                                           const RecoveryIdentityView& later);
+
 [[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,
                                   std::span<const TokenId> resident_tokens,
                                   const ResidentPrefixIdentity& resident_identity,

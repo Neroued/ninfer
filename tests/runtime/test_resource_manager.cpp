@@ -1,10 +1,13 @@
 #include "runtime/engine/context_cache/resource_manager.h"
+#include "models/common/context/recovery.h"
+#include "models/common/context/release_inventory.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -115,9 +118,32 @@ struct Program {
     std::vector<Handle> released;
     std::vector<Handle> demoted;
     std::vector<std::vector<Handle>> demotion_submissions;
-    std::uint32_t main_capacity    = 1024;
-    bool transfer_in_progress      = false;
-    bool combined_demotion_blocked = false;
+    std::uint32_t main_capacity       = 1024;
+    bool transfer_in_progress         = false;
+    bool combined_demotion_blocked    = false;
+    std::uint64_t checkpoint_revision = 1;
+    mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index;
+    using ReleaseInventory = ninfer::models::context::ReleaseInventory<Usage, Handle>;
+    mutable std::shared_ptr<const ReleaseInventory> last_inventory;
+    mutable std::uint64_t score_queries = 0, scored_handles = 0;
+    mutable std::uint64_t host_plan_builds = 0;
+
+    struct Recovery : ninfer::models::context::RecoveryEvaluation<Handle> {
+        using Core = ninfer::models::context::RecoveryEvaluation<Handle>;
+        const Program* program;
+
+        Recovery(Core core, const Program& owner) : Core(std::move(core)), program(&owner) {}
+
+        Recovery(Recovery&& other) noexcept
+            : Core(std::move(other)), program(std::exchange(other.program, nullptr)) {}
+
+        ~Recovery() {
+            if (program) {
+                program->score_queries += work().queries;
+                program->scored_handles += work().removed_handles;
+            }
+        }
+    };
 
     std::size_t host_block(std::size_t bytes, bool external_reference = false) {
         blocks.push_back({bytes, external_reference});
@@ -128,6 +154,7 @@ struct Program {
                Role role = Role::SharedPrefix) {
         const Handle handle{static_cast<std::uint32_t>(contents.size())};
         contents.push_back({std::move(tokens), std::move(host_blocks)});
+        ++checkpoint_revision;
         contents.back().role = role;
         require(physical_usage().occupied.host_bytes <= host_capacity,
                 "fixture exceeded its physical Host capacity");
@@ -223,6 +250,7 @@ struct Program {
         auto& content = contents.at(handle.index);
         if (!content.alive || !content.evictable || content.release_blocked) { return false; }
         content.alive = false;
+        ++checkpoint_revision;
         released.push_back(handle);
         return true;
     }
@@ -302,17 +330,12 @@ struct Program {
         std::vector<Release> releases;
 
         [[nodiscard]] Batch begin_kv_batch(Usage shortage) const { return {program, shortage}; }
-
-        [[nodiscard]] std::uint64_t recovery_loss(std::span<const Handle> removed,
-                                                  std::span<const Handle> surviving) const {
-            return program->checkpoint_recovery_loss(removed, surviving);
-        }
     };
 
     [[nodiscard]] ReclaimPlan plan_reclaim(std::span<const Handle> allowed,
                                            std::span<const Handle> excluded, Usage shortage) const {
         return {this, demotion_options(allowed, excluded, shortage),
-                plan_releases(allowed, excluded, shortage)};
+                plan_releases(allowed, excluded, shortage).releases};
     }
 
     [[nodiscard]] std::vector<Demotion> demotion_options(std::span<const Handle> allowed,
@@ -405,9 +428,10 @@ struct Program {
         return releases_pages;
     }
 
-    [[nodiscard]] std::vector<Release> plan_releases(std::span<const Handle> allowed,
-                                                     std::span<const Handle> excluded,
-                                                     Usage shortage) const {
+    [[nodiscard]] ninfer::models::context::ReleasePlan<Release, Usage, Handle>
+    plan_releases(std::span<const Handle> allowed, std::span<const Handle> excluded,
+                  Usage shortage) const {
+        host_plan_builds += shortage.host_bytes != 0;
         const auto eligible = [&](Handle handle) {
             const auto& content = contents.at(handle.index);
             return content.alive && content.evictable && !content.leased &&
@@ -415,7 +439,27 @@ struct Program {
                    std::find(allowed.begin(), allowed.end(), handle) != allowed.end() &&
                    std::find(excluded.begin(), excluded.end(), handle) == excluded.end();
         };
-        std::vector<Release> result;
+        auto inventory = std::make_shared<ninfer::models::context::ReleaseInventory<Usage, Handle>>(
+            contents.size());
+        for (std::uint32_t i = 0; i < contents.size(); ++i)
+            if (contents[i].alive) inventory->include({i});
+        for (std::uint32_t i = 0; i < contents.size(); ++i) {
+            const auto& content = contents[i];
+            if (eligible({i}))
+                inventory->add({Handle{i}},
+                               {.state_slots    = content.device_state,
+                                .kv_page_groups = {content.main_pages, content.other_pool_pages[0],
+                                                   content.other_pool_pages[1]}});
+        }
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].external_reference) continue;
+            std::vector<Handle> holders;
+            for (std::uint32_t i = 0; i < contents.size(); ++i)
+                if (references(contents[i], block)) holders.push_back({i});
+            if (!holders.empty() && std::all_of(holders.begin(), holders.end(), eligible))
+                inventory->add(std::move(holders), {.host_bytes = blocks[block].bytes});
+        }
+        ninfer::models::context::ReleasePlan<Release, Usage, Handle> result{{}, inventory};
         const auto append = [&](std::vector<Handle> sources) {
             if (sources.empty() || !std::all_of(sources.begin(), sources.end(), eligible)) {
                 return;
@@ -431,9 +475,9 @@ struct Program {
             released.host_bytes = host_bytes_released(sources);
             const bool useful   = released.useful(shortage) != 0;
             if (!useful) { return; }
-            if (std::none_of(result.begin(), result.end(),
+            if (std::none_of(result.releases.begin(), result.releases.end(),
                              [&](const auto& action) { return action.sources == sources; })) {
-                result.push_back({std::move(sources), released});
+                result.releases.push_back({std::move(sources), released});
             }
         };
         for (const auto handle : allowed) { append({handle}); }
@@ -446,6 +490,7 @@ struct Program {
                 append(std::move(sources));
             }
         }
+        last_inventory = inventory;
         return result;
     }
 
@@ -455,35 +500,34 @@ struct Program {
         return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
     }
 
-    [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const Handle> removed,
-                                                         std::span<const Handle> surviving) const {
-        std::vector<Handle> deepest;
-        for (const auto handle : removed) {
-            const auto deeper = std::any_of(removed.begin(), removed.end(), [&](auto other) {
-                return other != handle && prefix(handle, other) &&
-                       (contents.at(handle.index).tokens.size() <
-                            contents.at(other.index).tokens.size() ||
-                        other.index < handle.index);
-            });
-            if (!deeper) { deepest.push_back(handle); }
-        }
-        std::uint64_t loss = 0;
-        for (const auto end : deepest) {
-            std::size_t line_loss = 0;
-            for (const auto handle : removed) {
-                if (!prefix(handle, end)) { continue; }
-                std::size_t fallback = 0;
-                for (const auto kept : surviving) {
-                    if (std::find(removed.begin(), removed.end(), kept) == removed.end() &&
-                        prefix(kept, handle)) {
-                        fallback = std::max(fallback, contents.at(kept.index).tokens.size());
-                    }
-                }
-                line_loss = std::max(line_loss, contents.at(handle.index).tokens.size() - fallback);
+    [[nodiscard]] auto evaluate_recovery(std::span<const Handle> advertised) const {
+        struct View {
+            const Program& program;
+
+            const std::uint64_t& revision() const { return program.checkpoint_revision; }
+
+            std::size_t capacity() const { return program.contents.size(); }
+
+            Handle handle(std::uint32_t index) const { return {index}; }
+
+            bool valid(Handle h) const { return program.valid_checkpoint(h); }
+
+            std::uint32_t frontier(Handle h) const {
+                return program.contents[h.index].tokens.size();
             }
-            loss += line_loss;
-        }
-        return loss;
+
+            ninfer::models::context::RecoveryKey key(Handle h, std::uint32_t f) const {
+                std::uint64_t hash = 0;
+                for (std::uint32_t i = 0; i < f; ++i)
+                    hash = hash * 131 + program.contents[h.index].tokens[i];
+                return {{hash, 0}, 0};
+            }
+
+            bool prefix(Handle a, Handle b) const { return program.prefix(a, b); }
+        };
+
+        recovery_index.synchronize(View{*this});
+        return Recovery(recovery_index.evaluate(advertised), *this);
     }
 
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(Handle retained, const Base& base,
@@ -1577,6 +1621,23 @@ void test_demotion_competes_with_its_actual_host_recovery_loss() {
             "zero-loss Device quote hid a more expensive Host history deletion");
 }
 
+void test_device_candidates_share_host_inventory() {
+    Fixture f(16);
+    for (unsigned i = 0; i < 8; ++i) {
+        const auto h = f.program.add(tokens(100 + i, 1000 + i * 1000));
+        f.program.contents[h.index].demotion_bytes = 4;
+        f.publish(h);
+    }
+    const auto host                             = f.program.add({1}, {f.program.host_block(16)});
+    f.program.contents[host.index].device_state = false;
+    f.publish(host);
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demoted.size() == 1 && f.program.host_plan_builds == 1,
+            "Device candidates rebuilt physical Host facts for each protected source or final "
+            "preflight");
+}
+
 void test_adjacent_kv_demotions_share_one_submission() {
     Fixture f(64);
     const auto first                                = f.program.add(tokens(100));
@@ -1892,11 +1953,124 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
             "an abandoned deep branch remained the proof after a consuming rewind");
 }
 
+std::uint64_t recovery_oracle(const Program& program, std::span<const Handle> removed,
+                              std::span<const Handle> advertised) {
+    std::uint64_t total = 0;
+    for (const auto branch : removed) {
+        if (std::any_of(removed.begin(), removed.end(), [&](auto other) {
+                return other != branch && program.prefix(branch, other) &&
+                       (program.contents[branch.index].tokens.size() <
+                            program.contents[other.index].tokens.size() ||
+                        other.index < branch.index);
+            }))
+            continue;
+        std::uint64_t worst = 0;
+        for (const auto h : removed) {
+            if (!program.prefix(h, branch)) continue;
+            std::uint64_t fallback = 0;
+            for (const auto kept : advertised)
+                if (std::find(removed.begin(), removed.end(), kept) == removed.end() &&
+                    program.prefix(kept, h))
+                    fallback = std::max<std::uint64_t>(fallback,
+                                                       program.contents[kept.index].tokens.size());
+            worst = std::max(worst, program.contents[h.index].tokens.size() - fallback);
+        }
+        total += worst;
+    }
+    return total;
+}
+
+void test_host_selection_against_full_rescoring() {
+    std::mt19937 random(402);
+    for (unsigned trial = 0; trial < 100; ++trial) {
+        Fixture f(4096);
+        for (unsigned block = 0; block < 10; ++block)
+            f.program.host_block(8 + random() % 40, block == 9);
+        for (unsigned i = 0; i < 12; ++i) {
+            Key key;
+            if (i && random() % 2) key = f.program.contents[random() % i].tokens;
+            for (auto n = 1 + random() % 3; n; --n) key.push_back(random() % 6);
+            std::vector<std::size_t> blocks{random() % 9};
+            if (random() % 2) blocks.push_back(random() % 10);
+            const auto h = f.program.add(std::move(key), std::move(blocks));
+            f.publish(h);
+        }
+        f.program.host_capacity = f.program.physical_usage().occupied.host_bytes;
+        auto cursor             = f.cache.begin_reclaim(f.program);
+        std::vector<Handle> advertised;
+        for (const auto& victim : cursor.victims) advertised.push_back(victim.handle);
+        const auto required = f.program.host_capacity / 2;
+        const auto plan     = f.program.plan_releases(advertised, {}, {.host_bytes = required});
+        std::vector<Handle> expected;
+        bool possible = true;
+        while (f.program.host_bytes_released(expected) < required) {
+            std::optional<std::vector<Handle>> best;
+            std::uint64_t best_loss = 0, best_bytes = 0;
+            std::size_t best_order = 0;
+            for (const auto& action : plan.releases) {
+                auto combined = expected;
+                for (const auto h : action.sources)
+                    if (std::find(combined.begin(), combined.end(), h) == combined.end())
+                        combined.push_back(h);
+                const auto bytes = f.program.host_bytes_released(combined);
+                if (bytes <= f.program.host_bytes_released(expected)) continue;
+                const auto units  = std::min(bytes, required);
+                const auto loss   = recovery_oracle(f.program, combined, advertised);
+                std::size_t order = 0;
+                for (std::size_t j = 0; j < cursor.victims.size(); ++j)
+                    if (std::find(combined.begin(), combined.end(), cursor.victims[j].handle) !=
+                        combined.end())
+                        order = j;
+                const auto left  = static_cast<unsigned __int128>(loss) * best_bytes;
+                const auto right = static_cast<unsigned __int128>(best_loss) * units;
+                if (!best || left < right || (left == right && order < best_order)) {
+                    best       = std::move(combined);
+                    best_loss  = loss;
+                    best_bytes = units;
+                    best_order = order;
+                }
+            }
+            if (!best) {
+                possible = false;
+                break;
+            }
+            expected = std::move(*best);
+        }
+        const auto actual = f.cache.host_victims(f.program, required, {}, {}, {}, {}, &cursor);
+        require(bool(actual) == possible && (!actual || *actual == expected),
+                "incremental Host selection differs from full rescoring with shared blocks and "
+                "branches");
+    }
+}
+
+void test_independent_host_candidates_reuse_scores() {
+    for (const auto n : {16U, 32U, 64U, 128U}) {
+        Fixture f(n);
+        for (unsigned i = 0; i < n; ++i)
+            f.publish(f.program.add({i + 1}, {f.program.host_block(1)}));
+        (void)f.program.evaluate_recovery({});
+        const auto comparisons = f.program.recovery_index.work().exact_comparisons;
+        for (const auto count : {1U, n / 2}) {
+            f.program.score_queries = f.program.scored_handles = 0;
+            const auto victims = f.cache.host_victims(f.program, count, {});
+            require(victims && victims->size() == count && f.program.score_queries == n &&
+                        f.program.scored_handles == n &&
+                        f.program.recovery_index.work().exact_comparisons == comparisons,
+                    "Host trials rescored unrelated selected checkpoints or repeated exact "
+                    "identity checks");
+            require(f.program.last_inventory->work().owner_visits <= 2ULL * (n * count + count),
+                    "Host trials rescanned the full physical union");
+        }
+    }
+}
 } // namespace
 
 int main() {
     try {
+        test_host_selection_against_full_rescoring();
+        test_independent_host_candidates_reuse_scores();
         test_demotion_competes_with_its_actual_host_recovery_loss();
+        test_device_candidates_share_host_inventory();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();
         test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback();

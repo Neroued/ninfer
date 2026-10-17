@@ -241,6 +241,13 @@ struct CheckpointState {
         return continuation().metadata.execution_frontier;
     }
 
+    [[nodiscard]] qwen::RecoveryIdentityView recovery_identity() const {
+        const auto& identity = snapshot.identity();
+        return {frontier(),       key.identity_tag,
+                identity.ledger,  identity.prefix_identity,
+                identity.digests, snapshot.identity_owner().get()};
+    }
+
     [[nodiscard]] std::uint32_t backend_frontier() const noexcept {
         return continuation().metadata.backend_kv_valid;
     }
@@ -291,8 +298,6 @@ public:
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
                                                              std::uint32_t target) const;
-    [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
-                                                         std::span<const CheckpointHandle>) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
     [[nodiscard]] std::optional<ContextResources>
         checkpoint_release_resources(std::span<const CheckpointHandle>, ContextResources) const;
@@ -319,9 +324,9 @@ public:
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   ContextResources) const;
-    [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle>,
-                                                            std::span<const CheckpointHandle>,
-                                                            ContextResources) const;
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
+        plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                      ContextResources) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
     [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
@@ -408,6 +413,7 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     Checkpoints checkpoints;
+    mutable context::RecoveryIndex<> recovery_index;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;

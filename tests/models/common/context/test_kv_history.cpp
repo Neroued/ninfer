@@ -4,6 +4,10 @@
 #include "models/common/context/kv_history.h"
 #include "models/common/context/migration.h"
 #include "models/common/context/snapshot.h"
+#include "models/common/context/physical_reclaim.h"
+#include "models/common/qwen/recovery_store.h"
+#include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen4_exp/program/internal.h"
 
 #include <array>
 #include <atomic>
@@ -911,6 +915,151 @@ void mixed_snapshot(DeviceContext& device) {
     expect(states.release(mutable_image), "mutable image leaked");
     f.empty();
 }
+
+template <bool four>
+void qwen_reclaim_facts(DeviceContext& device) {
+    namespace q35   = models::qwen3_5;
+    namespace q4    = models::qwen4_exp;
+    namespace qwen  = models::qwen;
+    using Store     = std::conditional_t<four, q4::detail::Checkpoints, q35::detail::Checkpoints>;
+    using Resources = runtime::ContextResources<2>;
+    Fixture main(device), backend(device);
+    auto main_owner = main.create(200), backend_owner = backend.create(64);
+    StateImageBuilder schema;
+    (void)schema.add(DType::BF16, {8}, 1, "test");
+    LayoutBuilder builder;
+    const auto layout = schema.finish(builder, 16);
+    DeviceBuffer backing(device.device(), builder.finish());
+    StateImageStorage physical(backing.span(), layout);
+    context::StateImageStore states(physical, nullptr, 32);
+    Store store(32);
+    const auto add = [&](std::vector<TokenId> tokens, std::uint32_t domain = 0,
+                         int position_offset = 0) {
+        const auto frontier = static_cast<std::uint32_t>(tokens.size());
+        const auto image    = states.reserve_destination();
+        expect(image.has_value(), "Qwen reclaim image allocation failed");
+        physical.clear(states.physical_slot(*image), device.execution_view());
+        states.complete_initialization(*image);
+        states.freeze(*image);
+        std::vector<context::KVPrefixRef> prefixes;
+        prefixes.push_back(main.histories->retain_prefix(main_owner.handle(), frontier));
+        prefixes.push_back(backend.histories->retain_prefix(backend_owner.handle(), 64));
+        qwen::PreparedPromptData prompt;
+        prompt.token_ids = tokens;
+        prompt.token_types.resize(frontier);
+        prompt.positions.resize(frontier * 3);
+        for (unsigned axis = 0; axis < 3; ++axis)
+            for (unsigned i = 0; i < frontier; ++i)
+                prompt.positions[axis * frontier + i] = i + position_offset;
+        const auto handle = *store.reserve();
+        if constexpr (four) {
+            auto identity    = std::make_shared<q4::detail::Identity>();
+            identity->tokens = std::move(tokens);
+            identity->tag    = domain;
+            identity->positions.assign(prompt);
+            identity->digests.assign(prompt);
+            store.publish(handle,
+                          {q4::detail::Snapshot(
+                               states, {*image, {.main_frontier = frontier, .mtp_frontier = 64}},
+                               std::move(prefixes), std::move(identity)),
+                           runtime::CheckpointRole::SharedPrefix});
+        } else {
+            auto identity    = std::make_shared<q35::detail::PreparedCaptureBacking>();
+            identity->ledger = std::move(tokens);
+            identity->prefix_identity.assign(prompt);
+            identity->digests.assign(prompt);
+            store.publish(handle, {q35::detail::Snapshot(states,
+                                                         {*image,
+                                                          {.execution_frontier = frontier,
+                                                           .text_kv_valid      = frontier,
+                                                           .backend_kv_valid   = 64}},
+                                                         std::move(prefixes), std::move(identity)),
+                                   runtime::CheckpointRole::SharedPrefix,
+                                   {.identity_tag = domain}});
+        }
+        return handle;
+    };
+    std::vector<TokenId> a(100, 1), b = a;
+    const auto root = add(a);
+    a.resize(200, 2);
+    b.resize(200, 3);
+    const auto left = add(a), right = add(b);
+    a.resize(150);
+    b.resize(150);
+    const auto kept_left = add(a), kept_right = add(b);
+    const auto domain   = add(std::vector<TokenId>(100, 1), 1);
+    const auto position = add(std::vector<TokenId>(100, 1), 0, 1);
+    const auto alias    = *store.reserve();
+    store.publish(alias, store.at(root));
+    device.synchronize();
+    const std::array all{root, left, right, kept_left, kept_right, domain, position, alias};
+    const std::array removed{root, left, right};
+    const std::array kept{kept_left, kept_right};
+    context::RecoveryIndex index;
+    index.synchronize(qwen::RecoveryStoreView{store});
+    auto evaluation = index.evaluate(kept);
+    expect(evaluation.loss(removed) == 200 && !evaluation.prefix(domain, left) &&
+               !evaluation.prefix(position, left),
+           "Native Qwen identity adapter changed branch, domain, or position semantics");
+    auto one = index.evaluate(std::span(&kept_left, 1));
+    expect(one.loss(removed) == 300, "Native Qwen adapter lost the uncovered branch");
+    auto aliases = index.evaluate(std::span(&alias, 1));
+    expect(aliases.loss(std::span(&root, 1)) == 0,
+           "Native alias was not an exact semantic fallback");
+
+    const std::array pools{
+        context::ReclaimPool{main.histories.get(), main.pages.get(), main.host_layout.page_stride},
+        context::ReclaimPool{backend.histories.get(), backend.pages.get(),
+                             backend.host_layout.page_stride}};
+    const Resources shortage{.state_slots = 16, .kv_page_groups = {8, 8}, .host_bytes = 1};
+    const auto facts = [&](std::span<const context::CheckpointHandle> excluded = {}) {
+        return context::PhysicalReclaim<Resources>(store, states, physical.image_bytes(), pools,
+                                                   all, excluded, shortage);
+    };
+    const auto release = [&](const auto& facts) {
+        auto selection = facts.inventory->select();
+        auto probe     = selection.probe(all);
+        return selection.released();
+    };
+    expect(release(facts()).kv_page_groups == std::array<std::uint32_t, 2>{0, 0},
+           "active Native histories were counted as released capacity");
+    auto external            = store.at(root).snapshot;
+    const auto main_pages    = main.logical(main_owner.handle());
+    const auto backend_pages = backend.logical(backend_owner.handle());
+    main_owner.reset();
+    backend_owner.reset();
+    (void)main.backup(main_pages);
+    (void)backend.backup(backend_pages);
+    auto limited = release(facts());
+    expect(limited.state_slots == 6 &&
+               limited.kv_page_groups == std::array<std::uint32_t, 2>{2, 0} &&
+               limited.host_bytes == 2 * main.host_layout.page_stride,
+           "external snapshot holders were lost or backend frontiers were replaced with Main");
+    // Release the independent snapshot without retaining a replacement copy.
+    { auto temporary = std::move(external); }
+    auto full = release(facts());
+    expect(full.state_slots == 7 && full.kv_page_groups == std::array<std::uint32_t, 2>{4, 1} &&
+               full.host_bytes ==
+                   4 * main.host_layout.page_stride + backend.host_layout.page_stride,
+           "Native holder inventory double-counted aliases or omitted a pool");
+    {
+        auto lease = store.lease(root);
+        expect(release(facts()).kv_page_groups == std::array<std::uint32_t, 2>{2, 0},
+               "checkpoint reader did not veto its physical cohorts");
+    }
+    main.pages->pin_source(main_pages.back());
+    expect(release(facts()).kv_page_groups == std::array<std::uint32_t, 2>{3, 1},
+           "in-flight KV reader was credited as freed storage");
+    main.pages->unpin_source(main_pages.back());
+    expect(release(facts(std::span(&root, 1))).state_slots == 6,
+           "excluded semantic alias lost its independent physical reference");
+    expect(evaluation.loss(removed) == 200,
+           "physical residency invalidated immutable identity facts");
+    store.clear();
+    expect(states.occupied() == 0, "Qwen checkpoint fixture leaked State ownership");
+    main.empty();
+    backend.empty();
+}
 } // namespace
 
 int main() {
@@ -934,6 +1083,8 @@ int main() {
         migration_restore_chain(device, PagedKVPlaneOrder::PageMajor);
         migration_restore_chain(device, PagedKVPlaneOrder::HeadMajor);
         mixed_snapshot(device);
+        qwen_reclaim_facts<false>(device);
+        qwen_reclaim_facts<true>(device);
         std::cout << "KV history and snapshot ownership passed\n";
         return 0;
     } catch (const std::exception& error) {

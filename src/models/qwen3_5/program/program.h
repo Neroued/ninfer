@@ -2,9 +2,12 @@
 
 #include "ninfer/types.h"
 #include "models/common/context/checkpoint_store.h"
+#include "models/common/context/recovery.h"
+#include "models/common/context/release_inventory.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
-#include "models/common/qwen/frontend/prepared_prompt.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -231,8 +234,6 @@ struct ContextReclaimPlan {
     std::vector<ContextRelease> releases;
 
     [[nodiscard]] ContextDemotionBatch begin_kv_batch(ContextResources shortage) const;
-    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle> removed,
-                                              std::span<const CheckpointHandle> surviving) const;
 
 private:
     std::shared_ptr<detail::ReclaimPlan> impl_;
@@ -430,9 +431,9 @@ public:
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained,
                                                              const RequestBasePlan& base,
                                                              std::uint32_t target) const;
-    [[nodiscard]] std::uint64_t
-    checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
-                             std::span<const CheckpointHandle> surviving) const;
+    // Borrows this Program's index; checkpoint publication or retirement invalidates the view.
+    [[nodiscard]] context::RecoveryEvaluation<>
+    evaluate_recovery(std::span<const CheckpointHandle> advertised) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState& paused) noexcept;
@@ -461,7 +462,7 @@ public:
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
                                                   std::span<const CheckpointHandle> excluded,
                                                   ContextResources shortage) const;
-    [[nodiscard]] std::vector<ContextRelease>
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
     plan_releases(std::span<const CheckpointHandle> allowed,
                   std::span<const CheckpointHandle> excluded, ContextResources shortage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion& plan);

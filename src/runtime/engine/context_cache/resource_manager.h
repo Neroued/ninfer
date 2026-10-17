@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iterator>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -484,7 +487,8 @@ public:
         cursor.admission = admission;
         cursor.rights    = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         if (admission && !admission->demand.reused) {
-            cursor.gain_limit = recovery_gain(program, *admission, surviving(program, {}));
+            Evaluation evaluation;
+            cursor.gain_limit = recovery_gain(program, *admission, {}, evaluation);
         }
         return cursor;
     }
@@ -554,7 +558,7 @@ public:
             return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
         }
         auto plans = program.plan_reclaim(allowed, excluded, shortage);
-        Evaluation evaluation{.native = &plans};
+        Evaluation evaluation;
         using Demotion = typename decltype(plans.demotions)::value_type;
         using Release  = typename decltype(plans.releases)::value_type;
 
@@ -1014,14 +1018,13 @@ private:
         return released.useful(shortage);
     }
 
-    [[nodiscard]] std::vector<Handle> surviving(Program& program,
-                                                std::span<const Handle> removed) const {
+    [[nodiscard]] std::vector<Handle> advertised(Program& program) const {
         // Only advertised entries can replace a future cache lookup. Waiting-only
         // checkpoints remain physical holders, but are not a caller's lookup fallback.
         std::vector<Handle> kept;
+        std::unordered_set<std::uint32_t> seen;
         const auto include = [&](Handle handle) {
-            if (!contains(removed, handle) && program.valid_checkpoint(handle) &&
-                !contains(kept, handle)) {
+            if (program.valid_checkpoint(handle) && seen.insert(handle.index).second) {
                 kept.push_back(handle);
             }
         };
@@ -1032,59 +1035,54 @@ private:
         return kept;
     }
 
-    using NativeReclaimPlan = decltype(std::declval<Program&>().plan_reclaim(
+    using Recovery =
+        decltype(std::declval<Program&>().evaluate_recovery(std::span<const Handle>{}));
+    using HostReleasePlan = decltype(std::declval<Program&>().plan_releases(
         std::span<const Handle>{}, std::span<const Handle>{}, ContextResources{}));
 
     // These facts live only until this synchronous evaluation mutates resources or yields.
     // The fixed victim cursor may outlive them; newly published points still count as fallback.
     struct Evaluation {
-        const NativeReclaimPlan* native = nullptr;
         std::optional<std::vector<Handle>> retained;
+        std::optional<Recovery> recovery;
+
+        struct Incoming {
+            const Base* base;
+            std::uint32_t frontier;
+            std::vector<Handle> candidates;
+        };
+
+        std::vector<Incoming> incoming;
+
+        struct Host {
+            std::vector<Handle> allowed;
+            HostReleasePlan plan;
+        };
+
+        std::optional<Host> host;
     };
 
     struct ActionFacts {
         CacheRetentionPriority priority;
         std::size_t order = 0;
-        std::optional<std::vector<Handle>> kept;
         std::optional<std::uint64_t> loss;
     };
 
     [[nodiscard]] std::span<const Handle> retained(Program& program, Evaluation& evaluation) const {
-        if (!evaluation.retained) { evaluation.retained = surviving(program, {}); }
+        if (!evaluation.retained) { evaluation.retained = advertised(program); }
         return *evaluation.retained;
     }
 
-    [[nodiscard]] std::uint64_t recovery_loss(Program& program, std::span<const Handle> removed,
-                                              std::span<const Handle> kept,
-                                              const Evaluation& evaluation) const {
-        if (removed.empty()) { return 0; }
-        return evaluation.native ? evaluation.native->recovery_loss(removed, kept)
-                                 : program.checkpoint_recovery_loss(removed, kept);
-    }
-
-    [[nodiscard]] std::span<const Handle> action_survivors(Program& program,
-                                                           std::span<const Handle> sources,
-                                                           ActionFacts& facts,
-                                                           Evaluation& evaluation) const {
-        if (!facts.kept) {
-            facts.kept.emplace();
-            const auto all = retained(program, evaluation);
-            facts.kept->reserve(all.size());
-            for (const auto handle : all) {
-                if (!contains(sources, handle)) { facts.kept->push_back(handle); }
-            }
-        }
-        return *facts.kept;
+    [[nodiscard]] Recovery& recovery(Program& program, Evaluation& evaluation) const {
+        if (!evaluation.recovery)
+            evaluation.recovery.emplace(program.evaluate_recovery(retained(program, evaluation)));
+        return *evaluation.recovery;
     }
 
     [[nodiscard]] std::uint64_t action_loss(Program& program, std::span<const Handle> sources,
                                             ActionFacts& facts, Evaluation& evaluation) const {
         if (!facts.loss) {
-            facts.loss = sources.empty()
-                             ? 0
-                             : recovery_loss(program, sources,
-                                             action_survivors(program, sources, facts, evaluation),
-                                             evaluation);
+            facts.loss = sources.empty() ? 0 : recovery(program, evaluation).loss(sources);
         }
         return *facts.loss;
     }
@@ -1092,7 +1090,7 @@ private:
     [[nodiscard]] CacheRetentionPriority action_priority(Program& program,
                                                          std::span<const Handle> sources,
                                                          const ReclaimCursor& cursor,
-                                                         const Evaluation& evaluation) const {
+                                                         Evaluation& evaluation) const {
         CacheRetentionPriority priority;
         if (sources.empty()) { return priority; }
         const auto include = [&](CacheRetentionPriority candidate) {
@@ -1127,9 +1125,7 @@ private:
                         }
                         const auto candidate = program.checkpoint_metadata(point.handle).frontier;
                         if (candidate < proof.proven_frontier || candidate > frontier) { continue; }
-                        const auto loss =
-                            recovery_loss(program, {&handle, 1}, {&point.handle, 1}, evaluation);
-                        if (loss == frontier - candidate) {
+                        if (recovery(program, evaluation).prefix(point.handle, handle)) {
                             fallback = true;
                             break;
                         }
@@ -1146,7 +1142,7 @@ private:
 
     [[nodiscard]] ActionFacts action_facts(Program& program, std::span<const Handle> sources,
                                            const ReclaimCursor& cursor,
-                                           const Evaluation& evaluation) const {
+                                           Evaluation& evaluation) const {
         ActionFacts facts{.priority = action_priority(program, sources, cursor, evaluation)};
         if (!sources.empty()) {
             for (std::size_t i = 0; i < cursor.victims.size(); ++i) {
@@ -1216,25 +1212,53 @@ private:
         return result;
     }
 
+    [[nodiscard]] const std::vector<Handle>& incoming_candidates(Program& program,
+                                                                 const Admission& admission,
+                                                                 Evaluation& evaluation) const {
+        auto found = std::find_if(
+            evaluation.incoming.begin(), evaluation.incoming.end(), [&](const auto& item) {
+                return item.base == admission.base && item.frontier == admission.frontier;
+            });
+        if (found == evaluation.incoming.end()) {
+            typename Evaluation::Incoming item{admission.base, admission.frontier, {}};
+            for (const auto handle : retained(program, evaluation))
+                if (program.checkpoint_recovery_frontier(handle, *admission.base,
+                                                         admission.frontier))
+                    item.candidates.push_back(handle);
+            auto& index = recovery(program, evaluation);
+            std::sort(item.candidates.begin(), item.candidates.end(),
+                      [&](auto a, auto b) { return index.frontier(a) > index.frontier(b); });
+            evaluation.incoming.push_back(std::move(item));
+            found = std::prev(evaluation.incoming.end());
+        }
+
+        return found->candidates;
+    }
+
     [[nodiscard]] std::uint64_t recovery_gain(Program& program, const Admission& admission,
-                                              std::span<const Handle> kept,
-                                              const Evaluation& evaluation = {}) const {
+                                              std::span<const Handle> removed,
+                                              Evaluation& evaluation) const {
         if (admission.base) {
-            std::uint32_t fallback = 0;
-            for (const auto handle : kept) {
-                fallback = std::max(fallback, program.checkpoint_recovery_frontier(
-                                                  handle, *admission.base, admission.frontier));
-            }
-            return admission.frontier - fallback;
+            const auto& candidates = incoming_candidates(program, admission, evaluation);
+            return admission.frontier -
+                   recovery(program, evaluation).best_remaining(candidates, removed);
         }
         if (admission.checkpoint && program.valid_checkpoint(*admission.checkpoint)) {
             auto sources = admission.sources;
             if (sources.empty()) { sources.push_back(*admission.checkpoint); }
-            auto other = std::vector<Handle>(kept.begin(), kept.end());
-            std::erase_if(other, [&](auto handle) { return contains(sources, handle); });
-            return recovery_loss(program, sources, other, evaluation);
+            return recovery(program, evaluation).loss(sources, removed);
         }
         return 0;
+    }
+
+    static bool admits_limits(CacheRetentionPriority victim, std::uint64_t loss,
+                              const Admission& admission, const ReclaimCursor& cursor) {
+        if (victim.reused &&
+            (!admission.priority.reused || victim.last_demand >= admission.priority.last_demand))
+            return false;
+        // The fixed outer budget also covers Host victims of a preservation transfer.
+        return !cursor.gain_limit || (cursor.sacrificed < *cursor.gain_limit &&
+                                      loss < *cursor.gain_limit - cursor.sacrificed);
     }
 
     [[nodiscard]] bool admits(Program& program, std::span<const Handle> removed, ActionFacts& facts,
@@ -1243,22 +1267,11 @@ private:
                               bool preserving = false) const {
         if (!preserving && !may_revoke(removed, cursor.rights)) { return false; }
         if (!admission) { return true; }
-        const auto victim = facts.priority;
-        if (victim.reused && (!admission->priority.reused ||
-                              victim.last_demand >= admission->priority.last_demand)) {
-            return false;
-        }
         const auto loss = preserving ? 0 : action_loss(program, removed, facts, evaluation);
-        // This outer budget also covers Host victims of a preservation transfer. A hot
-        // migration source cannot lend its permissions to the capture that requested space.
-        if (cursor.gain_limit && (cursor.sacrificed >= *cursor.gain_limit ||
-                                  loss >= *cursor.gain_limit - cursor.sacrificed)) {
-            return false;
-        }
+        if (!admits_limits(facts.priority, loss, *admission, cursor)) return false;
         if (admission->demand.reused) { return true; }
-        const auto kept = preserving ? retained(program, evaluation)
-                                     : action_survivors(program, removed, facts, evaluation);
-        return recovery_gain(program, *admission, kept, evaluation) > loss;
+        return recovery_gain(program, *admission, preserving ? std::span<const Handle>{} : removed,
+                             evaluation) > loss;
     }
 
     void commit_release(Program& program, std::span<const Handle> handles, ReclaimCursor& cursor,
@@ -1267,11 +1280,10 @@ private:
         if (!may_revoke(handles, cursor.rights)) {
             throw std::logic_error("cache release lacks waiting-source revocation rights");
         }
+        Evaluation evaluation;
         const auto loss =
             cursor.gain_limit
-                ? (quoted_loss
-                       ? *quoted_loss
-                       : program.checkpoint_recovery_loss(handles, surviving(program, handles)))
+                ? (quoted_loss ? *quoted_loss : recovery(program, evaluation).loss(handles))
                 : 0;
         for (const auto handle : handles) {
             if (!erase(program, handle, cursor.rights)) {
@@ -1300,8 +1312,7 @@ private:
         std::vector<Handle> allowed;
         for (const auto& victim : cursor.victims) {
             const auto handle = victim.handle;
-            if (incoming != handle && !contains(excluded, handle) && references(handle) &&
-                program.valid_checkpoint(handle)) {
+            if (references(handle) && program.valid_checkpoint(handle)) {
                 allowed.push_back(handle);
             }
         }
@@ -1309,61 +1320,221 @@ private:
         // Engine order; ordinary optional writes cannot acquire these rights.
         if (!admission) {
             for (const auto handle : later_snapshots) {
-                if (!contains(excluded, handle) && !contains(allowed, handle) &&
-                    program.valid_checkpoint(handle)) {
+                if (!contains(allowed, handle) && program.valid_checkpoint(handle)) {
                     allowed.push_back(handle);
                 }
             }
         }
-        auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
-        std::vector<Handle> selected;
-        std::size_t released = 0;
-        while (released < required) {
+        // Exclusions filter whole physical actions below; they do not change store facts.
+        // All Device candidates and the final Host preflight reuse this synchronous inventory.
+        if (!evaluation.host || evaluation.host->allowed != allowed)
+            evaluation.host.emplace(typename Evaluation::Host{
+                allowed, program.plan_releases(allowed, {}, {.host_bytes = 1})});
+        const auto& plan = evaluation.host->plan;
+        auto selection   = plan.inventory->select();
+        auto& index      = recovery(program, evaluation);
+
+        // Scores are additive across semantic components. An owner's protection proof may
+        // couple several components, so coarsen that partition before caching candidate facts.
+        std::vector<std::uint32_t> parents(index.component_capacity());
+        std::iota(parents.begin(), parents.end(), 0);
+        const auto root = [&](std::uint32_t node) {
+            while (parents[node] != node) {
+                parents[node] = parents[parents[node]];
+                node          = parents[node];
+            }
+            return node;
+        };
+        for (const auto& proof : cursor.owners) {
+            std::optional<std::uint32_t> first;
+            const auto join = [&](Handle handle) {
+                if (!index.contains(handle)) return;
+                const auto node = root(index.component(handle));
+                if (first)
+                    parents[node] = root(*first);
+                else
+                    first = node;
+            };
+            for (const auto h : proof.points) join(h);
+            if (const auto* owner = find_owner(proof.owner))
+                for (const auto& point : owner->points) join(point.handle);
+        }
+        const auto component = [&](Handle h) { return root(index.component(h)); };
+
+        struct Group {
+            std::vector<Handle> removed;
+            std::uint64_t loss = 0, version = 0;
+        };
+
+        struct Part {
+            std::uint32_t group;
+            std::vector<Handle> additions;
+            std::uint64_t version = UINT64_MAX;
+            ActionFacts facts;
+        };
+
+        struct Candidate {
+            std::vector<Part> parts;
+            std::uint64_t waiting      = 0;
+            std::size_t snapshot_order = 0;
+            bool revocable = false, chosen = false;
+        };
+
+        std::vector<Group> groups(parents.size());
+        std::vector<bool> committed(index.capacity());
+        std::vector<Candidate> candidates;
+        candidates.reserve(plan.releases.size());
+        for (const auto& action : plan.releases) {
+            Candidate candidate;
+            if (std::any_of(action.sources.begin(), action.sources.end(),
+                            [&](auto h) { return incoming == h || contains(excluded, h); })) {
+                candidate.chosen = true;
+                candidates.push_back(std::move(candidate));
+                continue;
+            }
+            candidate.waiting   = waiting_ticket(action.sources);
+            candidate.revocable = may_revoke(action.sources, cursor.rights);
+            auto ordered        = action.sources;
+            std::sort(ordered.begin(), ordered.end(), [&](auto a, auto b) {
+                return std::pair{component(a), a.index} < std::pair{component(b), b.index};
+            });
+            ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+            for (const auto h : ordered) {
+                const auto group = component(h);
+                if (candidate.parts.empty() || candidate.parts.back().group != group)
+                    candidate.parts.push_back({group, {}});
+                candidate.parts.back().additions.push_back(h);
+            }
+            for (std::size_t i = 0; i < later_snapshots.size(); ++i)
+                if (contains(action.sources, later_snapshots[i])) candidate.snapshot_order = i + 1;
+            candidates.push_back(std::move(candidate));
+        }
+
+        struct Gain {
+            const Admission* admission = nullptr;
+            std::vector<Handle> matching, sources;
+            std::vector<std::uint32_t> groups;
+            std::size_t first = 0;
+        };
+
+        const auto prepare_gain = [&](const std::optional<Admission>& value) {
+            Gain gain;
+            if (!value) return gain;
+            gain.admission = &*value;
+            if (value->base)
+                gain.matching = incoming_candidates(program, *value, evaluation);
+            else if (value->checkpoint && index.contains(*value->checkpoint)) {
+                gain.sources = value->sources;
+                if (gain.sources.empty()) gain.sources.push_back(*value->checkpoint);
+                for (const auto h : gain.sources)
+                    if (index.contains(h)) gain.groups.push_back(component(h));
+                std::sort(gain.groups.begin(), gain.groups.end());
+                gain.groups.erase(std::unique(gain.groups.begin(), gain.groups.end()),
+                                  gain.groups.end());
+            }
+            return gain;
+        };
+        std::array gains{prepare_gain(admission), prepare_gain(cursor.admission)};
+        const auto gain_after = [&](Gain& gain, const Candidate& candidate) {
+            if (gain.admission->base) {
+                // Advance only through committed removals; a trial never changes this cursor.
+                while (gain.first < gain.matching.size() &&
+                       committed[gain.matching[gain.first].index])
+                    ++gain.first;
+                auto i = gain.first;
+                while (i < gain.matching.size() && selection.contains(gain.matching[i])) ++i;
+                const auto fallback =
+                    i == gain.matching.size() ? 0 : index.frontier(gain.matching[i]);
+                return std::uint64_t(gain.admission->frontier - fallback);
+            }
+            std::vector<Handle> unavailable;
+            for (const auto group : gain.groups) {
+                const auto& removed = groups[group].removed;
+                unavailable.insert(unavailable.end(), removed.begin(), removed.end());
+                for (const auto& part : candidate.parts)
+                    if (part.group == group)
+                        for (const auto h : part.additions)
+                            if (!committed[h.index]) unavailable.push_back(h);
+            }
+            return index.loss(gain.sources, unavailable);
+        };
+        const auto include_priority = [](CacheRetentionPriority& current,
+                                         CacheRetentionPriority next) {
+            if (next.reused && (!current.reused || next.last_demand > current.last_demand))
+                current = next;
+        };
+        const auto include_waiting = [](std::uint64_t current, std::uint64_t next) {
+            return !current ? next : !next ? current : std::min(current, next);
+        };
+        ActionRank selected;
+        std::size_t selected_snapshot = 0;
+        while (selection.released().host_bytes < required) {
             std::optional<std::size_t> best;
-            std::vector<Handle> best_union;
-            std::size_t best_bytes = 0;
             ActionRank best_rank;
-            std::size_t best_snapshot_order = 0;
-            for (std::size_t i = 0; i < actions.size(); ++i) {
-                auto combined = selected;
-                for (const auto handle : actions[i].sources) {
-                    if (!contains(combined, handle)) { combined.push_back(handle); }
+            std::size_t best_snapshot = 0;
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                auto& candidate = candidates[i];
+                if (candidate.chosen || !candidate.revocable) continue;
+                const auto before = selection.released().host_bytes;
+                auto probe        = selection.probe(plan.releases[i].sources);
+                const auto amount = selection.released().host_bytes;
+                if (amount <= before) continue;
+                auto rank = selected;
+                for (auto& part : candidate.parts) {
+                    const auto& group = groups[part.group];
+                    if (part.version != group.version) {
+                        auto removed = group.removed;
+                        for (const auto h : part.additions)
+                            if (!committed[h.index]) removed.push_back(h);
+                        part.facts      = action_facts(program, removed, cursor, evaluation);
+                        part.facts.loss = index.loss(removed);
+                        part.version    = group.version;
+                    }
+                    rank.loss -= group.loss;
+                    rank.loss += *part.facts.loss;
+                    include_priority(rank.priority, part.facts.priority);
+                    rank.order = std::max(rank.order, part.facts.order);
                 }
-                const auto amount = program.host_bytes_released(combined);
-                if (amount <= released) { continue; }
-                auto facts = action_facts(program, combined, cursor, evaluation);
-                // A migration must satisfy both its own preservation rights and the
-                // optional capture that requested space. Source heat cannot grant the
-                // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
-                    continue;
-                }
-                const auto rank            = rank_action(program, combined, facts,
-                                                         std::min<std::size_t>(amount, required), evaluation);
-                std::size_t snapshot_order = 0;
-                for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
-                    if (contains(combined, later_snapshots[snapshot])) {
-                        snapshot_order = snapshot + 1;
+                bool accepted = true;
+                for (auto& gain : gains) {
+                    if (!gain.admission) continue;
+                    if (!admits_limits(rank.priority, rank.loss, *gain.admission, cursor) ||
+                        (!gain.admission->demand.reused &&
+                         gain_after(gain, candidate) <= rank.loss)) {
+                        accepted = false;
+                        break;
                     }
                 }
-                // Ordinary history is exhausted before Engine-owned paused snapshots.
-                // Snapshot candidates retain the Engine's explicit youngest-first order.
-                if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
-                    best                = i;
-                    best_union          = std::move(combined);
-                    best_bytes          = amount;
-                    best_rank           = rank;
-                    best_snapshot_order = snapshot_order;
+                if (!accepted) continue;
+                rank.units          = std::min<std::size_t>(amount, required);
+                rank.waiting        = include_waiting(selected.waiting, candidate.waiting);
+                const auto snapshot = std::max(selected_snapshot, candidate.snapshot_order);
+                if (!best || snapshot < best_snapshot ||
+                    (snapshot == best_snapshot && less_rank(rank, best_rank))) {
+                    best          = i;
+                    best_rank     = rank;
+                    best_snapshot = snapshot;
                 }
             }
-            if (!best) { return std::nullopt; }
-            selected = std::move(best_union);
-            released = best_bytes;
-            actions.erase(actions.begin() + *best);
+            if (!best) return std::nullopt;
+            auto& candidate = candidates[*best];
+            auto chosen     = selection.probe(plan.releases[*best].sources);
+            chosen.commit();
+            for (const auto& part : candidate.parts) {
+                auto& group = groups[part.group];
+                for (const auto h : part.additions)
+                    if (!committed[h.index]) {
+                        committed[h.index] = true;
+                        group.removed.push_back(h);
+                    }
+                group.loss = *part.facts.loss;
+                ++group.version;
+            }
+            candidate.chosen  = true;
+            selected          = best_rank;
+            selected_snapshot = best_snapshot;
         }
-        return selected;
+        return std::vector<Handle>(selection.handles().begin(), selection.handles().end());
     }
 
     void balance_reused(Program& program) {

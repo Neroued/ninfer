@@ -1366,7 +1366,8 @@ public:
                         "COW at the same position invalidated an independent original tail");
             }
             const std::array family{source, descendant};
-            const auto releases = program_.plan_releases(family, {}, {.kv_page_groups = {1}});
+            const auto releases =
+                program_.plan_releases(family, {}, {.kv_page_groups = {1}}).releases;
             const auto family_release =
                 std::find_if(releases.begin(), releases.end(), [&](const auto& quote) {
                     return quote.sources.size() == 2 &&
@@ -1515,7 +1516,8 @@ public:
                     program_.host_bytes_released(family) == main_bytes &&
                     program_.host_bytes_released(repeated) == main_bytes,
                 "fixed-set Host accounting double-counted shared or duplicate references");
-        const auto main_releases = program_.plan_releases(family, {}, {.kv_page_groups = {1}});
+        const auto main_releases =
+            program_.plan_releases(family, {}, {.kv_page_groups = {1}}).releases;
         const auto expected_main = program_.physical_usage().occupied.kv_page_groups[0] -
                                    empty_.occupied.kv_page_groups[0];
         require(std::any_of(main_releases.begin(), main_releases.end(),
@@ -1552,11 +1554,10 @@ public:
                 "demotion coverage confused shared holders with pages actually freed by deletion");
         const auto source_frontier     = program_.checkpoint_metadata(source).frontier;
         const auto descendant_frontier = program_.checkpoint_metadata(descendant).frontier;
-        require(family_plan.recovery_loss(descendant_set, source_set) ==
-                        descendant_frontier - source_frontier &&
-                    family_plan.recovery_loss(family, {}) == descendant_frontier &&
-                    family_plan.recovery_loss(descendant_set, source_set) ==
-                        descendant_frontier - source_frontier,
+        auto recovery                  = program_.evaluate_recovery(source_set);
+        require(recovery.loss(descendant_set) == descendant_frontier - source_frontier &&
+                    recovery.loss(family) == descendant_frontier &&
+                    recovery.loss(descendant_set) == descendant_frontier - source_frontier,
                 "reused prefix facts confused different surviving recovery sets");
         const auto unprotected_suffix =
             program_.plan_reclaim(family, source_set, {.kv_page_groups = {1}}).demotions;
@@ -1571,13 +1572,14 @@ public:
         candidate           = program_.inspect_source(extension, source);
         require(candidate && static_cast<bool>(program_.start_binding(extension, {0}, *candidate)),
                 "pinned replica fixture could not start binding");
-        require(program_.release_redundant_host({}) == 0 &&
-                    program_.plan_reclaim(family, {}, {.kv_page_groups = {1}}).demotions.empty() &&
-                    program_.plan_reclaim(family, {}, {.state_slots = 1}).demotions.empty() &&
-                    program_.plan_releases(family, {}, {.kv_page_groups = {1}}).empty() &&
-                    program_.plan_releases(family, {}, {.kv_page_groups = {0, 1}}).empty() &&
-                    program_.host_bytes_released(family) == 0,
-                "replica cleanup or fixed-set release ignored a pending reader's record pin");
+        require(
+            program_.release_redundant_host({}) == 0 &&
+                program_.plan_reclaim(family, {}, {.kv_page_groups = {1}}).demotions.empty() &&
+                program_.plan_reclaim(family, {}, {.state_slots = 1}).demotions.empty() &&
+                program_.plan_releases(family, {}, {.kv_page_groups = {1}}).releases.empty() &&
+                program_.plan_releases(family, {}, {.kv_page_groups = {0, 1}}).releases.empty() &&
+                program_.host_bytes_released(family) == 0,
+            "replica cleanup or fixed-set release ignored a pending reader's record pin");
         require(!settle(true).published, "pinned replica fixture did not cancel binding");
         expect_usage(baseline, "pinned replica checks changed physical ownership");
 
@@ -1618,7 +1620,7 @@ public:
         const auto release_and_check = [&](q35::CheckpointHandle handle) {
             const std::array one{handle};
             const auto quoted_pages = [&](q35::ContextResources shortage, bool main_pool) {
-                const auto quotes    = program_.plan_releases(one, {}, shortage);
+                const auto quotes    = program_.plan_releases(one, {}, shortage).releases;
                 std::uint32_t result = 0;
                 for (const auto& quote : quotes) {
                     require(quote.sources == std::vector<q35::CheckpointHandle>{handle},

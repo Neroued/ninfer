@@ -6,6 +6,19 @@
 #include <stdexcept>
 
 namespace ninfer::models::qwen {
+
+bool recovery_prefix_matches(const RecoveryIdentityView& earlier,
+                             const RecoveryIdentityView& later) {
+    const auto frontier = earlier.frontier;
+    if (frontier > later.frontier || earlier.domain != later.domain ||
+        earlier.digests.at(frontier) != later.digests.at(frontier))
+        return false;
+    if (earlier.backing && earlier.backing == later.backing) return true;
+    return std::equal(earlier.tokens.begin(), earlier.tokens.begin() + frontier,
+                      later.tokens.begin()) &&
+           earlier.positions.prefix_equals(later.positions, frontier);
+}
+
 namespace {
 
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {

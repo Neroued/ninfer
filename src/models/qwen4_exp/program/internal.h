@@ -52,6 +52,12 @@ struct Checkpoint {
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
     }
+
+    [[nodiscard]] qwen::RecoveryIdentityView recovery_identity() const {
+        const auto& identity = snapshot.identity();
+        return {frontier(),         identity.tag,     identity.tokens,
+                identity.positions, identity.digests, snapshot.identity_owner().get()};
+    }
 };
 
 using Checkpoints = context::CheckpointStore<Checkpoint>;
@@ -111,9 +117,17 @@ struct Suspended {
 };
 
 struct Demotion {
-    const ProgramImpl* owner = nullptr;
+    struct PageVersion {
+        std::uint64_t epoch;
+        std::uint32_t columns;
+    };
+
+    const ProgramImpl* owner          = nullptr;
+    std::uint64_t checkpoint_revision = 0;
     std::vector<Image> images;
+    std::vector<std::uint64_t> image_epochs;
     std::array<std::vector<context::LogicalKVPageHandle>, 2> pages;
+    std::array<std::vector<PageVersion>, 2> page_versions;
     std::vector<CheckpointHandle> records;
 
     [[nodiscard]] bool empty() const {
@@ -123,6 +137,12 @@ struct Demotion {
 
 struct Reclaim {
     const ProgramImpl* owner;
+    ContextResources shortage;
+};
+
+struct Release {
+    const ProgramImpl* owner;
+    std::array<std::vector<context::LogicalKVPageHandle>, 2> pages;
 };
 
 enum class StateBindingAction { Root, Move, Fork, Restore, Split };
@@ -230,11 +250,16 @@ public:
     [[nodiscard]] ContextResources footprint(std::span<const CheckpointHandle>,
                                              bool released) const;
     [[nodiscard]] std::size_t host_released(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle>,
-                                              std::span<const CheckpointHandle>) const;
     [[nodiscard]] std::shared_ptr<Demotion> demotion(std::span<const CheckpointHandle>,
                                                      ContextResources shortage) const;
     [[nodiscard]] ContextDemotion describe_demotion(std::shared_ptr<const Demotion>) const;
+    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
+                                                  std::span<const CheckpointHandle>,
+                                                  ContextResources) const;
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
+        plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                      ContextResources) const;
+    [[nodiscard]] bool start_demote(const ContextDemotion&);
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
     bool prepare_demotion(context::MigrationBatch&, const Demotion&);
     void cancel_operation() noexcept;
@@ -248,6 +273,7 @@ public:
     std::unique_ptr<Graphs> graphs;
     std::optional<GraphMemorySummary> graph_memory;
     Checkpoints checkpoints;
+    mutable context::RecoveryIndex<> recovery_index;
     CudaEventTimer prefill_timer;
     qwen::VisionHandoffState vision_handoff;
     std::size_t vision_handoff_peak_bytes = 0, vision_workspace_peak_bytes = 0;

@@ -21,7 +21,8 @@ void unique(std::vector<Case>& cases) {
 std::vector<Case> projection_cases(Profile p) {
     std::vector<Case> outputs{{1}, {4}, {8}, {64}, {128}};
     if (p.input_rows == 2560)
-        boundaries(outputs, {1, 4, 8, 192, 448, 896, 1280, 2688, 5120, 7168, 8192});
+        boundaries(outputs,
+                   {1, 4, 8, 192, 448, 512, 896, 1024, 1280, 2048, 2688, 5120, 7168, 8192});
     else if (p.input_rows == 5120)
         boundaries(outputs, {1, 8, 1024, 2048, 4096});
     else
@@ -41,7 +42,7 @@ std::vector<Case> projection_cases(Profile p) {
             outputs.push_back({8, pattern, Execution::Graph});
             outputs.push_back({129, pattern});
         }
-        for (int columns : {1, 9, 512})
+        for (int columns : {1, 9, 512, 2049})
             outputs.push_back({columns, Pattern::Random, Execution::Graph, true});
     }
     return outputs;

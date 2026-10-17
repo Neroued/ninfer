@@ -10,16 +10,10 @@ namespace {
 
 constexpr int kLast = std::numeric_limits<std::int32_t>::max();
 
-struct Route {
-    std::int32_t first, last;
-    Plan plan;
-};
-
 constexpr Plan mma(int tile, int split, RowMode rows = RowMode::Paired) {
     return {Kernel::Mma, tile, split, rows};
 }
 
-// RTX 5090/170-SM policy. Geometry and launch residency remain separate facts.
 constexpr std::array kN96K5120{
     Route{1, 1, {Kernel::Gemv}},    Route{2, 8, {Kernel::SmallSplit, 8, 10}},
     Route{9, 1024, mma(128, 8)},    Route{1025, 2048, mma(128, 4)},
@@ -28,19 +22,6 @@ constexpr std::array kN96K5120{
 constexpr std::array kN64K2048{
     Route{1, 127, mma(64, 16)},    Route{128, 1024, mma(64, 8)},   Route{1025, 2048, mma(64, 4)},
     Route{2049, 4096, mma(64, 2)}, Route{4097, kLast, mma(64, 1)},
-};
-constexpr std::array kN96K2560{
-    Route{1, 1, {Kernel::Gemv}},
-    Route{2, 8, {Kernel::TiledGemv, 4}},
-    Route{9, 192, mma(64, 8, RowMode::Merged)},
-    Route{193, 448, mma(64, 8)},
-    Route{449, 896, mma(128, 8)},
-    Route{897, 1280, mma(64, 8)},
-    Route{1281, 2688, mma(64, 4)},
-    Route{2689, 5120, mma(64, 2)},
-    Route{5121, 7168, mma(128, 1)},
-    Route{7169, 8192, mma(64, 1)},
-    Route{8193, kLast, mma(128, 1)},
 };
 
 // Materialized norm+control owns its tuning independently of control projection.
@@ -54,18 +35,9 @@ constexpr std::array kNormN64K2048{
     Route{2049, 4096, mma(64, 2)}, Route{4097, kLast, mma(64, 1)},
 };
 
-template <std::size_t N>
-constexpr bool closed(const std::array<Route, N>& routes) {
-    std::int64_t next = 1;
-    for (const auto& route : routes) {
-        if (route.first != next || route.last < route.first) return false;
-        next = std::int64_t(route.last) + 1;
-    }
-    return next == std::int64_t(kLast) + 1;
-}
 
-static_assert(closed(kN96K5120) && closed(kN64K2048) && closed(kN96K2560) &&
-              closed(kNormN96K5120) && closed(kNormN64K2048));
+static_assert(closed(kN96K5120) && closed(kN64K2048) && closed(kNormN96K5120) &&
+              closed(kNormN64K2048));
 
 std::span<const Route> routes(Geometry geometry, bool norm = false) {
     if (norm) {
@@ -75,7 +47,7 @@ std::span<const Route> routes(Geometry geometry, bool norm = false) {
     }
     if (geometry.heads == 48 && geometry.input_rows == 5120) return kN96K5120;
     if (geometry.heads == 32 && geometry.input_rows == 2048) return kN64K2048;
-    if (geometry.heads == 48 && geometry.input_rows == 2560) return kN96K2560;
+    if (geometry.heads == 48 && geometry.input_rows == 2560) return routes_n96_k2560();
     throw std::invalid_argument("gdn_control: unsupported geometry");
 }
 

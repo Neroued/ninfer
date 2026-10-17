@@ -19,9 +19,10 @@ inline constexpr int kBlockK     = 64;
 inline constexpr int kStages     = 2;
 inline constexpr int kMFragments = kBlockM / 16;
 
-template <int Heads, int Hidden, int BlockN, bool Paired = true>
+template <int Heads, int Hidden, int BlockN, bool Paired = true, bool HeadFast = false>
 struct MmaGeometry {
-    static constexpr bool kPaired = Paired;
+    static constexpr bool kPaired   = Paired;
+    static constexpr bool kHeadFast = HeadFast;
     static constexpr int kHeads = Heads, kHidden = Hidden, kBlockN = BlockN;
     static constexpr int shared_bytes =
         kStages * (BlockN * kBlockK + (Paired ? 2 : 1) * kBlockM * kBlockK) * sizeof(__nv_bfloat16);
@@ -64,14 +65,19 @@ __global__ __launch_bounds__(Warps * 32, 1) void mma_kernel(
     auto* aws = xs + kStages * kBlockN * kBlockK;
     auto* bws = aws + kStages * kBlockM * kBlockK;
 
-    const int tid          = static_cast<int>(threadIdx.x);
-    const int warp         = tid >> 5;
-    const int lane         = tid & 31;
-    const int gid          = lane >> 2;
-    const int lid          = lane & 3;
-    const int head0        = static_cast<int>(blockIdx.y) * kBlockM;
+    const int tid            = static_cast<int>(threadIdx.x);
+    const int warp           = tid >> 5;
+    const int lane           = tid & 31;
+    const int gid            = lane >> 2;
+    const int lid            = lane & 3;
+    constexpr int kHeadTiles = (Paired ? kHeads : 2 * kHeads) / kBlockM;
+    const int linear_tile =
+        static_cast<int>(blockIdx.y) * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x);
+    const int head_tile    = Geometry::kHeadFast ? linear_tile % kHeadTiles : blockIdx.y;
+    const int token_tile   = Geometry::kHeadFast ? linear_tile / kHeadTiles : blockIdx.x;
+    const int head0        = head_tile * kBlockM;
     const int weight_head0 = Paired ? head0 : head0 % kHeads;
-    const int token0       = static_cast<int>(blockIdx.x) * kBlockN;
+    const int token0       = token_tile * kBlockN;
     const int split        = static_cast<int>(blockIdx.z);
     const int kt_begin     = split * kTilesPerSplit;
 
@@ -85,7 +91,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void mma_kernel(
         float sums[NormTokenCapacity] = {};
         // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
         // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
-        if (blockIdx.y == 0 && warp == 0) {
+        if (head_tile == 0 && warp == 0) {
             for (int pair = lane; pair < kLocalPairs; pair += common::kWarpSize) {
 #pragma unroll
                 for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {

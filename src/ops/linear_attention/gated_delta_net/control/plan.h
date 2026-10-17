@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ops/linear_attention/gated_delta_net/control/operands.h"
+#include <limits>
+#include <span>
 
 namespace ninfer::ops::detail::gdn_control {
 
@@ -13,6 +15,22 @@ struct Plan {
     std::int32_t tile_cols = 1, split_k = 1;
     RowMode rows = RowMode::Paired;
 };
+
+struct Route {
+    std::int32_t first, last;
+    Plan plan;
+};
+
+constexpr bool closed(std::span<const Route> routes) {
+    std::int64_t next = 1;
+    for (const auto& route : routes) {
+        if (route.first != next || route.last < route.first) return false;
+        next = std::int64_t(route.last) + 1;
+    }
+    return next == std::int64_t(std::numeric_limits<std::int32_t>::max()) + 1;
+}
+
+std::span<const Route> routes_n96_k2560();
 
 struct NormPlan {
     NormKernel kernel;

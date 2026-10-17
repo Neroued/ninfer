@@ -51,9 +51,8 @@ public:
     }
 };
 
-// Reuse retired TMA staging for contiguous BF16 vectors over complete row tiles.
-// The contraction synchronizes before entry; all threads, including the producer,
-// participate in the transpose and its publication barrier.
+// Reuse the retired TMA staging area to transpose the accumulator fragments into
+// contiguous BF16 output vectors. All threads, including the producer, participate.
 struct Bf16TmaVectorEpilogue {
     static constexpr bool kTmaCollective = true;
 
@@ -61,11 +60,11 @@ struct Bf16TmaVectorEpilogue {
     static constexpr int kSharedBytes =
         ((Schedule::kBlockRows + 63) / 64 * 64) * Schedule::kBlockTokens * 2;
 
-    template <class Schedule, bool FullTokens, class Output>
+    template <class Schedule, bool FullTokens, bool PredicatedRows = false, class Output>
     __device__ __forceinline__ void
     finish_tile(const Output& output, unsigned char* scratch,
                 float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
-                int token_begin, int, int tokens) const {
+                int token_begin, int rows, int tokens) const {
         constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens;
         constexpr int PaddedRows = (BR + 63) / 64 * 64;
         static_assert(BR % 8 == 0 && Schedule::kProducerThreads == 32);
@@ -94,10 +93,38 @@ struct Bf16TmaVectorEpilogue {
         for (int vector = threadIdx.x; vector < BT * (BR / 8); vector += Schedule::kThreads) {
             const int token = vector / (BR / 8), row = (vector % (BR / 8)) * 8;
             if (FullTokens || token_begin + token < tokens) {
-                output.store_vector(row_begin + row, token_begin + token,
-                                    common::load_vec<uint4>(at(row, token)));
+                if constexpr (PredicatedRows) {
+                    // Compact output strides may be unaligned when rows is not a multiple of 8.
+                    if (rows % 8 == 0 && row_begin + row + 8 <= rows) {
+                        output.store_vector(row_begin + row, token_begin + token,
+                                            common::load_vec<uint4>(at(row, token)));
+                    } else {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                            if (row_begin + row + i < rows)
+                                output.store(row_begin + row + i, token_begin + token,
+                                             __bfloat162float(at(row, token)[i]));
+                    }
+                } else {
+                    output.store_vector(row_begin + row, token_begin + token,
+                                        common::load_vec<uint4>(at(row, token)));
+                }
             }
         }
+    }
+};
+
+// Opt in explicitly: existing full-row schedules retain the original specialization.
+struct Bf16TmaRowVectorEpilogue : Bf16TmaVectorEpilogue {
+    static constexpr bool kPredicatedRows = true;
+
+    template <class Schedule, bool FullTokens, class Output>
+    __device__ __forceinline__ void
+    finish_tile(const Output& output, unsigned char* scratch,
+                float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
+                int token_begin, int rows, int tokens) const {
+        Bf16TmaVectorEpilogue::template finish_tile<Schedule, FullTokens, true>(
+            output, scratch, accum, row_begin, token_begin, rows, tokens);
     }
 };
 

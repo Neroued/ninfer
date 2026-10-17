@@ -26,6 +26,14 @@ Published artifact downloads are listed in the [project README](../README.md).
 - [Tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
 
+## Designs
+
+- [Distributed execution](distributed-execution-design.md) — selected architecture for centralized
+  scheduling, local/distributed executors, rank ownership, parallel plans and communication;
+  implementation is pending.
+- [Qwen4Exp parallel strategy](qwen4_exp-parallel-design.md) — selected initial dual-Spark
+  TP2/EP2 strategy, state shards, computation/graph composition and implementation dependencies.
+
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,

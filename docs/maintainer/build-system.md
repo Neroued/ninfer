@@ -192,9 +192,6 @@ dispatch remain in C++; CMake only selects translation units. A family may expli
 `${NINFER_TARGET}/sources.cmake` where target-private implementations exist. Shared sources are
 registered once in the parent; a target must not include another target's private route catalog.
 No automatic directory scan, missing-file fallback or global shape registry selects implementations.
-Shared implementations remain shared while their selectors are identical;
-Q8 projection and HC mix use the same production sources on both targets. Introduce target-private
-selectors when there is an actual target-specific implementation or tuning policy.
 
 ## CUDA compilation boundaries
 

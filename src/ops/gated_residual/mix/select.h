@@ -12,13 +12,20 @@ enum class Down {
     TmaSplit4,
     Tma80,
     Tma96Split4,
-    Tma96Split8
+    Tma96Split8,
+    Simt4,
+    Direct64S6,
+    Direct64S3,
+    Direct128S4,
+    Direct128S2
 };
 enum class Up {
     Folded16x16,
     Folded32x32,
     TmaFolded16x64,
     TmaFolded32x64,
+    TmaFolded32Warp64,
+    TmaPrefetched32Warp64,
 };
 
 struct Plan {

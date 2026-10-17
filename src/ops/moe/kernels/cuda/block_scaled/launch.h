@@ -22,6 +22,7 @@ struct Plan {
 
     SharedAlgorithm shared_algorithm = SharedAlgorithm::Vector;
     // Complete may widen shared/control tiles independently of routed-shared.
+    bool network_topk      = false;
     int shared_columns     = 32;
     int queued_ctas_per_sm = 0;
 

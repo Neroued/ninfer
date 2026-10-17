@@ -518,6 +518,27 @@ int affine_cases(Fixture& f, CudaExecutionView execution) {
     return failures;
 }
 
+int zero_expert_cases(Fixture& f, CudaExecutionView execution) {
+    // Keep the shared term observable at its own scale through the complete Op.
+    // The existing A4/A8 criterion stays unchanged; no private route is forced.
+    std::cout << "shared-only oracle (zero routed GU), format=" << (f.fp8 ? "fp8" : "nvfp4")
+              << '\n';
+    for (std::size_t slot = 0; slot < f.gu.payload.size(); ++slot) {
+        auto& bytes = f.gu.payload[slot];
+        std::fill(bytes.begin() + f.gu.scale_offset,
+                  bytes.begin() + f.gu.scale_offset + f.gu.scale_bytes, 0);
+        std::fill(f.gu.decoded[slot].begin(), f.gu.decoded[slot].end(), 0);
+        f.gu.data.copy_from_host(bytes.data(), bytes.size(), slot * f.gu.stride);
+    }
+    f.cache.clear();
+    int failures = 0;
+    for (int m : {512, 513}) {
+        failures += run(f, execution, m, ops::ExpertSubsetKind::All, true, true, DType::BF16,
+                        ops::MoeEpilogue::Write, true);
+    }
+    return failures;
+}
+
 } // namespace
 } // namespace ninfer::test::moe_block_scaled
 
@@ -579,9 +600,10 @@ int main(int argc, char** argv) {
             add(2, ExpertSubsetKind::MaskZeros, true, false, DType::BF16, MoeEpilogue::AddResidual,
                 true);
         }
-        for (int m : {1, 2, 7, 8, 9, 65, 1024, 2047, 2048, 4096}) {
+        for (int m : {1, 2, 7, 8, 9, 65, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 4096, 4097}) {
             add(m, ExpertSubsetKind::All, true, true, DType::BF16, MoeEpilogue::Write, true);
         }
+        special("shared_only", zero_expert_cases, {{"execution", "graph"}});
         suite.add(std::move(catalogue), [=](auto selected) {
             DeviceContext device;
             Fixture fixture(fp8);

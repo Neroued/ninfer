@@ -44,7 +44,7 @@ __device__ __forceinline__ void merge_ranked(RankedExpert (&run)[Count]) {
     }
 }
 
-template <class Shape>
+template <class Shape, bool FixedIndices = false>
 __device__ __forceinline__ void select_experts(const float* scores, int* ids, float* coefficients,
                                                float* shared, float* logits) {
     constexpr int K = Shape::top_k, E = Shape::experts;
@@ -63,15 +63,44 @@ __device__ __forceinline__ void select_experts(const float* scores, int* ids, fl
             const int id = lane + item * 32;
             run[item]    = {id < E ? scores[id] : -INFINITY, id < E ? id : INT_MAX};
         }
+        if constexpr (FixedIndices) {
+            bool ordered = true;
 #pragma unroll
-        for (int i = 1; i < Count; ++i) {
-            const auto value = run[i];
-            int position     = i;
-            while (position > 0 && better(value, run[position - 1])) {
-                run[position] = run[position - 1];
-                --position;
+            for (int item = 1; item < Count; ++item) {
+                ordered &= !better(run[item], run[item - 1]);
             }
-            run[position] = value;
+            // Fixed indices keep the local ranked run in registers. The uniform fast
+            // path preserves already ordered inputs without a data-dependent index.
+            if (!__all_sync(0xffffffff, ordered)) {
+#pragma unroll
+                for (int width = 2; width <= Count; width *= 2) {
+#pragma unroll
+                    for (int stride = width / 2; stride; stride /= 2) {
+#pragma unroll
+                        for (int item = 0; item < Count; ++item) {
+                            if ((item & stride) == 0) {
+                                const int other = item | stride;
+                                const auto left = run[item], right = run[other];
+                                const bool exchange =
+                                    (item & width) == 0 ? better(right, left) : better(left, right);
+                                run[item]  = exchange ? right : left;
+                                run[other] = exchange ? left : right;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 1; i < Count; ++i) {
+                const auto value = run[i];
+                int position     = i;
+                while (position > 0 && better(value, run[position - 1])) {
+                    run[position] = run[position - 1];
+                    --position;
+                }
+                run[position] = value;
+            }
         }
     } else {
 #pragma unroll

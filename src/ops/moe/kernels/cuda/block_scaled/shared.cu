@@ -66,14 +66,15 @@ __global__ void shared_vector(const __nv_bfloat16* x, const __nv_bfloat16* weigh
     }
 }
 
-template <bool Gate, class Output>
+template <bool Gate, int Columns, class Output>
 __global__ __launch_bounds__(128) void shared_mma(const __nv_bfloat16* x,
                                                   const __nv_bfloat16* weights, Storage storage,
                                                   const float* coefficients, const float* beta,
                                                   Output output, int tokens,
                                                   const __nv_bfloat16* control = nullptr,
                                                   float* scores                = nullptr) {
-    constexpr int BK = 64, BN = 32, Rows = Gate ? 32 : 64, K = Gate ? kHidden : kIntermediate;
+    constexpr int BK = 64, BN = Columns, Rows = Gate ? 32 : 64, K = Gate ? kHidden : kIntermediate;
+    constexpr int WarpColumns = BN / 2, NT = WarpColumns / 8;
     constexpr int Planes = Gate ? 1 : 2;
     __shared__ __align__(16) __nv_bfloat16 ws[2][64 * BK];
     __shared__ __align__(16) __nv_bfloat16 xs[2][Planes][BN * BK];
@@ -112,7 +113,7 @@ __global__ __launch_bounds__(128) void shared_mma(const __nv_bfloat16* x,
     };
     stage(0, 0);
     stage(1, 1);
-    float acc[2][2][4] = {};
+    float acc[2][NT][4] = {};
     for (int kt = 0; kt < K / BK; ++kt) {
         const int s = kt % 2;
         cp_wait<1>();
@@ -129,8 +130,8 @@ __global__ __launch_bounds__(128) void shared_mma(const __nv_bfloat16* x,
                             smem_addr(ws[s] + row * BK + swizzle_xor_64(row, k)));
             }
 #pragma unroll
-            for (int n = 0; n < 2; ++n) {
-                const int row = wn * 16 + n * 8 + (lane & 7);
+            for (int n = 0; n < NT; ++n) {
+                const int row = wn * WarpColumns + n * 8 + (lane & 7);
                 const int k   = ki * 16 + ((lane >> 3) & 1) * 8;
 #pragma unroll
                 for (int p = 0; p < Planes; ++p) {
@@ -154,10 +155,10 @@ __global__ __launch_bounds__(128) void shared_mma(const __nv_bfloat16* x,
     }
     cp_wait<0>();
 #pragma unroll
-    for (int n = 0; n < 2; ++n) {
+    for (int n = 0; n < NT; ++n) {
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
-            const int token = token0 + wn * 16 + n * 8 + (lane & 3) * 2 + (v & 1);
+            const int token = token0 + wn * WarpColumns + n * 8 + (lane & 3) * 2 + (v & 1);
             if (token < tokens) {
                 if constexpr (Gate) {
                     if (route) {
@@ -192,7 +193,7 @@ __global__ __launch_bounds__(128) void shared_mma(const __nv_bfloat16* x,
     }
 }
 
-template <bool Count>
+template <bool Count, bool FixedIndices = false>
 __global__ void route_selection(const float* scores, int* ids, float* alpha, float* beta,
                                 int* counts, int tokens) {
     constexpr int Warps = Count ? 8 : 1;
@@ -205,9 +206,9 @@ __global__ void route_selection(const float* scores, int* ids, float* alpha, flo
         __syncthreads();
     }
     if (token < tokens) {
-        routing::select_experts<SwiGLUH2560I640E512K10>(scores + token * kScoreRows,
-                                                        ids + token * kTopK, alpha + token * kTopK,
-                                                        beta + token, logits[warp]);
+        routing::select_experts<SwiGLUH2560I640E512K10, FixedIndices>(
+            scores + token * kScoreRows, ids + token * kTopK, alpha + token * kTopK, beta + token,
+            logits[warp]);
         if constexpr (Count) {
             __syncwarp();
             if (lane < kTopK) { atomicAdd(local + ids[token * kTopK + lane], 1); }
@@ -233,6 +234,8 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
     const auto* beta         = static_cast<const float*>(shared.coefficients.data);
     const int tokens         = x.ne[1];
     with_output(destination, mode, [&](auto output) {
+        // Complete already produced the shared activation alongside control.
+        // The final shared down still combines routed and shared terms once.
         if (plan.shared_algorithm == SharedAlgorithm::Vector) {
             if (!prepared) {
                 shared_vector<true><<<dim3(kIntermediate / 4, tokens), 128, 0, stream>>>(
@@ -242,13 +245,22 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
             shared_vector<false><<<dim3(kHidden / 4, tokens), 128, 0, stream>>>(
                 input, down, storage, coefficients, beta, output);
         } else {
-            if (!prepared) {
-                shared_mma<true><<<dim3(kIntermediate / 32, (tokens + 31) / 32), 128, 0, stream>>>(
-                    input, gu, storage, coefficients, beta, output, tokens);
+            const auto launch = [&]<int Columns>() {
+                if (!prepared) {
+                    shared_mma<true, Columns>
+                        <<<dim3(kIntermediate / 32, (tokens + Columns - 1) / Columns), 128, 0,
+                           stream>>>(input, gu, storage, coefficients, beta, output, tokens);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                shared_mma<false, Columns>
+                    <<<dim3(kHidden / 64, (tokens + Columns - 1) / Columns), 128, 0, stream>>>(
+                        input, down, storage, coefficients, beta, output, tokens);
+            };
+            if (plan.shared_columns == 64) {
+                launch.template operator()<64>();
+            } else {
+                launch.template operator()<32>();
             }
-            CUDA_CHECK(cudaGetLastError());
-            shared_mma<false><<<dim3(kHidden / 64, (tokens + 31) / 32), 128, 0, stream>>>(
-                input, down, storage, coefficients, beta, output, tokens);
         }
         CUDA_CHECK(cudaGetLastError());
     });
@@ -266,22 +278,37 @@ void launch_control_shared(const Tensor& x, const MoeWeights& weights, const Exp
             <<<dim3(kIntermediate / 4 + (kExperts + 4) / 4, x.ne[1]), 128, 0, stream>>>(
                 input, gu, storage, nullptr, nullptr, FloatContribution{}, control, scores);
     } else {
-        shared_mma<true><<<dim3(kIntermediate / 32 + (kExperts + 64) / 64, (x.ne[1] + 31) / 32),
-                           128, 0, stream>>>(input, gu, storage, nullptr, nullptr,
-                                             FloatContribution{}, x.ne[1], control, scores);
+        const auto launch = [&]<int Columns>() {
+            shared_mma<true, Columns><<<dim3(kIntermediate / 32 + (kExperts + 64) / 64,
+                                             (x.ne[1] + Columns - 1) / Columns),
+                                        128, 0, stream>>>(input, gu, storage, nullptr, nullptr,
+                                                          FloatContribution{}, x.ne[1], control,
+                                                          scores);
+        };
+        if (plan.shared_columns == 64) {
+            launch.template operator()<64>();
+        } else {
+            launch.template operator()<32>();
+        }
     }
     CUDA_CHECK(cudaGetLastError());
-    if (storage.groups.counts) {
-        route_selection<true><<<(x.ne[1] + 7) / 8, 256, 0, stream>>>(
-            scores, static_cast<int*>(routes.ids.data),
-            static_cast<float*>(routes.coefficients.data), static_cast<float*>(shared.data),
-            storage.groups.counts, x.ne[1]);
-    } else {
-        route_selection<false>
-            <<<x.ne[1], 32, 0, stream>>>(scores, static_cast<int*>(routes.ids.data),
-                                         static_cast<float*>(routes.coefficients.data),
-                                         static_cast<float*>(shared.data), nullptr, x.ne[1]);
-    }
+    const auto select = [&]<bool FixedIndices>() {
+        if (storage.groups.counts) {
+            route_selection<true, FixedIndices><<<(x.ne[1] + 7) / 8, 256, 0, stream>>>(
+                scores, static_cast<int*>(routes.ids.data),
+                static_cast<float*>(routes.coefficients.data), static_cast<float*>(shared.data),
+                storage.groups.counts, x.ne[1]);
+        } else {
+            route_selection<false, FixedIndices>
+                <<<x.ne[1], 32, 0, stream>>>(scores, static_cast<int*>(routes.ids.data),
+                                             static_cast<float*>(routes.coefficients.data),
+                                             static_cast<float*>(shared.data), nullptr, x.ne[1]);
+        }
+    };
+    if (plan.network_topk)
+        select.template operator()<true>();
+    else
+        select.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled

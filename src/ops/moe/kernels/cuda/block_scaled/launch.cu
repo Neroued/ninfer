@@ -3,6 +3,7 @@
 #include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
@@ -133,7 +134,59 @@ __global__ void reduce(Storage storage, const float* coefficients, Output output
     }
 }
 
+// One 512-thread CTA emits column layer j across all experts. Its first output
+// index is sum_e min(j, jobs_e), followed by the prefix of experts with jobs_e > j.
+// Only the job metadata changes; packed assignments and GU products keep their offsets.
+__global__ void order_jobs(Groups g, int columns) {
+    __shared__ int warp_offsets[16], warp_before[16], base;
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    const int jobs  = (g.counts[e] + columns - 1) / columns;
+    const int j     = blockIdx.x;
+    const int value = int(jobs > j);
+    int prefix = value, before = min(j, jobs);
+#pragma unroll
+    for (int d = 1; d < 32; d *= 2) {
+        const int preceding = __shfl_up_sync(0xffffffff, prefix, d);
+        if (lane >= d) { prefix += preceding; }
+    }
+#pragma unroll
+    for (int d = 16; d; d /= 2) { before += __shfl_down_sync(0xffffffff, before, d); }
+    if (lane == 31) { warp_offsets[warp] = prefix; }
+    if (!lane) { warp_before[warp] = before; }
+    __syncthreads();
+    if (!warp) {
+        int total     = lane < 16 ? warp_offsets[lane] : 0;
+        const int own = total;
+#pragma unroll
+        for (int d = 1; d < 32; d *= 2) {
+            const int preceding = __shfl_up_sync(0xffffffff, total, d);
+            if (lane >= d) { total += preceding; }
+        }
+        if (lane < 16) { warp_offsets[lane] = total - own; }
+        int sum = lane < 16 ? warp_before[lane] : 0;
+#pragma unroll
+        for (int d = 16; d; d /= 2) { sum += __shfl_down_sync(0xffffffff, sum, d); }
+        if (!lane) { base = sum; }
+    }
+    __syncthreads();
+    if (value) {
+        const int index      = base + warp_offsets[warp] + prefix - 1;
+        g.job_experts[index] = e;
+        g.job_columns[index] = j * columns;
+    }
+}
+
 } // namespace
+
+void launch_column_jobs(Groups groups, int tokens, int columns, CudaExecutionView execution) {
+    // Stream ordering is the lifetime boundary: GU must finish reading the
+    // expert-major metadata before this launch overwrites it for down.
+    if (tokens <= columns) { return; }
+    if (!groups.counts) { throw std::logic_error("job ordering requires counted groups"); }
+    order_jobs<<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(groups,
+                                                                                      columns);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue mode,

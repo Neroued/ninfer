@@ -553,9 +553,9 @@ int main(int argc, char** argv) {
         };
         using ops::ExpertSubsetKind;
         using ops::MoeEpilogue;
-        for (int m : {1,   2,   3,   7,   8,   9,    15,   16,   17,   18,  31,  32,
-                      33,  34,  63,  64,  65,  66,   127,  128,  129,  130, 255, 256,
-                      257, 258, 511, 512, 513, 1024, 3583, 3584, 3585, 4097}) {
+        for (int m : {1,   2,   3,   7,   8,   9,    15,   16,   17,   18,   31,   32,
+                      33,  34,  63,  64,  65,  66,   127,  128,  129,  130,  255,  256,
+                      257, 258, 511, 512, 513, 1023, 1024, 1025, 3583, 3584, 3585, 4097}) {
             add(m, ExpertSubsetKind::All, false, false, DType::FP32, MoeEpilogue::Write, false);
         }
         for (auto subset :
@@ -569,6 +569,10 @@ int main(int argc, char** argv) {
         add(1, ExpertSubsetKind::None, true, false, DType::FP32, MoeEpilogue::Write, true);
         for (int m : {1, 65}) {
             add(m, ExpertSubsetKind::None, false, false, DType::FP32, MoeEpilogue::Write, true);
+        }
+        for (int m : {512, 1024}) {
+            add(m, ExpertSubsetKind::All, false, false, DType::BF16, MoeEpilogue::Write, true);
+            add(m, ExpertSubsetKind::MaskZeros, true, false, DType::FP32, MoeEpilogue::Write, true);
         }
         add(2048, ExpertSubsetKind::None, true, false, DType::FP32, MoeEpilogue::Write, false);
         if (fp8) {

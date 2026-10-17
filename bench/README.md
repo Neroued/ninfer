@@ -851,9 +851,12 @@ cmake --build build/rtx5090-dev --parallel --target ninfer_sliding_window_attent
   --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-`ninfer_packed_softmax_attention_bench` measures both public dense Attention overloads: a uniform
-plain-segment entry and a packed entry driven by cumulative segment lengths. Equal-length inputs
-can compare both public entries; nonuniform inputs select only `packed`.
+`ninfer_packed_softmax_attention_bench` measures the uniform-segment and cumulative-length
+`packed_softmax_attention` overloads. Uniform uses the same entry for one or multiple segments.
+Equal-length inputs can compare both entries; nonuniform inputs select only `packed`.
+The default `--layout qkv` reads Q/K/V slices of a BF16 `[3456,P]` projection; `contiguous`
+selects three contiguous planes. CSV records this layout, unique input/output byte counts,
+QK/PV useful FLOPs `4*72*16*sum(length²)`, and their bandwidth/compute reference times.
 
 ```bash
 cmake --build build/rtx5090-dev --parallel --target ninfer_packed_softmax_attention_bench

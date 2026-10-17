@@ -2,6 +2,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "core/decode_graph.h"
 
 #include "core/arena.h"
 #include "ops/op_tester.h"
@@ -104,7 +105,8 @@ const char* entry_name(PublicEntry entry) {
 }
 
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
-             PublicEntry entry, InputProfile input_profile = InputProfile::Random) {
+             PublicEntry entry, InputProfile input_profile = InputProfile::Random,
+             bool graph = false) {
     const int tokens              = cu_seqlens.back();
     const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
     const std::size_t value_count = static_cast<std::size_t>(tokens) * token_plane;
@@ -189,26 +191,37 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                                            std::max<std::size_t>(256, workspace_bytes));
     MemoryArena workspace(workspace_storage.span());
 
-    if (entry == PublicEntry::Plain) {
-        if (cu_seqlens.size() != 2) {
-            throw std::logic_error("plain case requires exactly one segment");
-        }
-        ops::softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, workspace,
-                               out_tensor, ninfer::test::cuda_environment().default_execution);
-    } else if (entry == PublicEntry::CuSeqlensArena) {
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, cu_tensor,
-                                      workspace, out_tensor,
-                                      ninfer::test::cuda_environment().default_execution);
-    } else {
-        const int segment_length = cu_seqlens[1] - cu_seqlens[0];
-        for (std::size_t segment = 1; segment + 1 < cu_seqlens.size(); ++segment) {
-            if (cu_seqlens[segment + 1] - cu_seqlens[segment] != segment_length) {
-                throw std::logic_error("uniform case requires equal segments");
+    cuda_synchronize();
+    const auto execution = cuda_environment().context.execution_view();
+    const auto launch    = [&] {
+        if (entry == PublicEntry::Plain) {
+            if (cu_seqlens.size() != 2) {
+                throw std::logic_error("plain case requires exactly one segment");
             }
+            ops::softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale, workspace,
+                                      out_tensor, execution);
+        } else if (entry == PublicEntry::CuSeqlensArena) {
+            ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale,
+                                             cu_tensor, workspace, out_tensor, execution);
+        } else {
+            const int segment_length = cu_seqlens[1] - cu_seqlens[0];
+            for (std::size_t segment = 1; segment + 1 < cu_seqlens.size(); ++segment) {
+                if (cu_seqlens[segment + 1] - cu_seqlens[segment] != segment_length) {
+                    throw std::logic_error("uniform case requires equal segments");
+                }
+            }
+            ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale,
+                                             segment_length, out_tensor, execution);
         }
-        ops::packed_softmax_attention(q_tensor, k_tensor, v_tensor, kGeometry, kScale,
-                                      segment_length, out_tensor,
-                                      ninfer::test::cuda_environment().default_execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    if (graph) {
+        definition.capture(execution.stream(), launch);
+        executable.instantiate(definition);
+        executable.launch(execution.stream());
+    } else {
+        launch();
     }
     cuda_synchronize();
 
@@ -271,12 +284,14 @@ void add_plain_attention_cases(ninfer::test::OpSuite& suite) {
         },
         {{"format", "bf16"}});
     const auto add = [&](std::vector<int> offsets, unsigned seed, StorageProfile storage,
-                         PublicEntry entry, InputProfile input = InputProfile::Random) {
+                         PublicEntry entry, InputProfile input = InputProfile::Random,
+                         bool graph = false) {
         auto id =
             std::string("packed_attention/") + entry_name(entry) + "/" + storage_name(storage);
         for (int offset : offsets) id += "_" + std::to_string(offset);
-        suite.add(id, [=] { return run_case(offsets, seed, storage, entry, input); },
-                  {{"format", "bf16"}, {"execution", "eager"}});
+        if (graph) id += "/graph";
+        suite.add(id, [=] { return run_case(offsets, seed, storage, entry, input, graph); },
+                  {{"format", "bf16"}, {"execution", graph ? "graph" : "eager"}});
     };
     add({0, 4}, 11u, StorageProfile::Contiguous, PublicEntry::Plain);
     add({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
@@ -285,4 +300,10 @@ void add_plain_attention_cases(ninfer::test::OpSuite& suite) {
     add({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
     add({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     add({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    add({0, 33, 66, 99}, 501u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
+    add({0, 512}, 503u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments,
+        InputProfile::Random, true);
+    add({0, 513}, 521u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
+    add({0, 129, 258}, 509u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments,
+        InputProfile::SegmentIsolation, true);
 }

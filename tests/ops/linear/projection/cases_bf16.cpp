@@ -150,7 +150,10 @@ const std::array kNewGeometries{
              4304,
              {16, 32, 40, 64, 80, 96, 116, 128, 160, 256, 384, 512, 640, 1024, 2048, 4096},
              ColumnDomain::RawPatch},
-    Geometry{4608, 4608, {1, 2, 3, 4, 16, 32, 64, 96, 128, 256, 512}, ColumnDomain::Merger},
+    Geometry{4608,
+             4608,
+             {1, 2, 3, 4, 8, 16, 32, 64, 96, 128, 256, 512, 2112, 4096},
+             ColumnDomain::Merger},
     Geometry{2560, 4608, {1, 2, 8, 24, 64, 96, 128, 256, 512}, ColumnDomain::Merger},
 };
 

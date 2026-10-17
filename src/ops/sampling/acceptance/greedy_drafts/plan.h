@@ -2,9 +2,15 @@
 #include "ops/sampling/kernels/workspace.h"
 #include "ninfer/ops/sampling.h"
 #include <algorithm>
+#include "core/platform.h"
 
 namespace ninfer::ops::greedy_drafts_detail {
-using Schedule = sampling_detail::TopKSchedule<256, 2, 256, 2, 25>;
+using RowSchedule = sampling_detail::TopKSchedule<256, 2, 256, 2, 25>;
+#if NINFER_TARGET_SPARK
+using ParallelSchedule = sampling_detail::TopKSchedule<128, 4, 128, 4, 25>;
+#else
+using ParallelSchedule = sampling_detail::TopKSchedule<256, 2, 256, 2, 25>;
+#endif
 
 inline constexpr int kMaxColumns = 16;
 
@@ -17,10 +23,11 @@ struct Plan {
 inline Plan select_plan(int token_domain, int columns) {
     Plan plan;
     // The final merge has finite capacity; larger domains use a single CTA.
-    plan.partial_blocks = common::div_up(token_domain, Schedule::kSamplerPartialTileItems);
-    plan.groups         = common::div_up(plan.partial_blocks, Schedule::kSamplerPartialsPerGroup);
-    if (token_domain > Schedule::kSamplerTileItems && columns <= kMaxColumns &&
-        plan.groups * sampling_detail::kSamplerCandidateCap <= Schedule::kSamplerGroupTileItems)
+    plan.partial_blocks = common::div_up(token_domain, ParallelSchedule::kSamplerPartialTileItems);
+    plan.groups = common::div_up(plan.partial_blocks, ParallelSchedule::kSamplerPartialsPerGroup);
+    if (token_domain > RowSchedule::kSamplerTileItems && columns <= kMaxColumns &&
+        plan.groups * sampling_detail::kSamplerCandidateCap <=
+            ParallelSchedule::kSamplerGroupTileItems)
         plan.workspace =
             sampling_detail::make_workspace(columns, plan.partial_blocks, plan.groups, true);
     return plan;

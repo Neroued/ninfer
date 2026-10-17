@@ -193,10 +193,7 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_sampling_partial
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties && cfg.mask.words == nullptr) ||
-        token_domain <= S::kSamplerTileItems) {
-        return;
-    }
+    if (greedy && !penalties && cfg.mask.words == nullptr) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -278,9 +275,8 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__ void speculative_sampling_gr
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    if (token_domain <= S::kSamplerTileItems) { return; }
-    const bool greedy    = !(cfg.temperature > 0.0f);
-    const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool greedy               = !(cfg.temperature > 0.0f);
+    const bool penalties            = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (greedy && !penalties && cfg.mask.words == nullptr) {
         if constexpr (SparseProposal) {

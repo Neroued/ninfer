@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include "core/device.h"
+#include "core/platform.h"
 #include "ops/common/cuda/reduce.cuh"
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -15,7 +16,7 @@ namespace {
 
 inline constexpr int kTargetLogprobsBlock = 256;
 
-template <int BlockSize>
+template <int BlockSize, bool FastExp>
 __launch_bounds__(BlockSize) __global__
     void target_logprobs_kernel(const __nv_bfloat16* logits, const std::int32_t* target_ids,
                                 float* output, std::int32_t valid_rows,
@@ -33,7 +34,8 @@ __launch_bounds__(BlockSize) __global__
     float local_sum = 0.0f;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        local_sum += expf(__bfloat162float(logits[base + row]) - maximum);
+        const float value = __bfloat162float(logits[base + row]) - maximum;
+        local_sum += FastExp ? __expf(value) : expf(value);
     }
     __shared__ float warp_sums[BlockSize / kWarpSize];
     const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
@@ -43,14 +45,26 @@ __launch_bounds__(BlockSize) __global__
     }
 }
 
+template <int Block, bool FastExp>
+void launch_columns(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
+                    Tensor& output, cudaStream_t stream) {
+    const auto columns = static_cast<unsigned int>(logits.ne[1]);
+    target_logprobs_kernel<Block, FastExp>
+        <<<columns, Block, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+                                        static_cast<const std::int32_t*>(target_ids.data),
+                                        static_cast<float*>(output.data), valid_rows, logits.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
                             Tensor& output, cudaStream_t stream) {
-    const auto columns = static_cast<unsigned int>(logits.ne[1]);
-    target_logprobs_kernel<kTargetLogprobsBlock><<<columns, kTargetLogprobsBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const std::int32_t*>(target_ids.data), static_cast<float*>(output.data),
-        valid_rows, logits.ne[0]);
-    CUDA_CHECK(cudaGetLastError());
+#if NINFER_TARGET_SPARK
+    if (logits.ne[0] == 248320 && valid_rows == 248077) {
+        launch_columns<1024, true>(logits, target_ids, valid_rows, output, stream);
+        return;
+    }
+#endif
+    launch_columns<kTargetLogprobsBlock, false>(logits, target_ids, valid_rows, output, stream);
 }
 
 } // namespace

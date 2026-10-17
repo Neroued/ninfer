@@ -1,5 +1,7 @@
 #pragma once
 
+#include <type_traits>
+
 #include "ops/sampling/kernels/distribution.cuh"
 
 namespace ninfer::ops::sampling_detail {
@@ -91,7 +93,7 @@ __launch_bounds__(S::kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
-template <class S>
+template <class S, bool WarpTiles = false>
 __launch_bounds__(S::kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
@@ -101,7 +103,9 @@ __launch_bounds__(S::kSamplerBlock) __global__
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
 
-    __shared__ typename SamplingPartialSort<S>::TempStorage sort_storage;
+    using SortStorage = std::conditional_t<WarpTiles, SamplingPartialTopKStorage<S>,
+                                           typename SamplingPartialSort<S>::TempStorage>;
+    __shared__ SortStorage sort_storage;
     __shared__ unsigned long long greedy_warp_keys[S::kSamplerBlock / 32];
     unsigned long long keys[S::kSamplerItemsPerThread];
 
@@ -110,6 +114,23 @@ __launch_bounds__(S::kSamplerBlock) __global__
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * S::kSamplerPartialTileItems;
+    if constexpr (WarpTiles) {
+        if (!greedy && !penalties) {
+            unsigned int raw_keys[S::kSamplerItemsPerThread];
+#pragma unroll
+            for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+                const int local = item * blockDim.x + threadIdx.x, v = tile_start + local;
+                raw_keys[item] = (v < token_domain &&
+                                  (!cfg.mask.words || (cfg.mask.words[v / 32] & (1u << (v % 32)))))
+                                     ? sampling_bf16_tile_sort_key<S>(logits[base + v], local)
+                                     : 0;
+            }
+            sampling_store_bf16_tile_topk<S>(raw_keys, cap, tile_start, workspace, col, partial,
+                                             sort_storage.bf16);
+            return;
+        }
+    }
+
 #pragma unroll
     for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
@@ -135,19 +156,23 @@ __launch_bounds__(S::kSamplerBlock) __global__
         }
         return;
     }
-    SamplingPartialSort<S>(sort_storage).Sort(keys, ScoreIdOrderGreater{});
+    if constexpr (WarpTiles) {
+        sampling_store_tile_topk<S>(keys, cap, workspace, col, partial, sort_storage.fp32);
+    } else {
+        SamplingPartialSort<S>(sort_storage).Sort(keys, ScoreIdOrderGreater{});
 
 #pragma unroll
-    for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
-        const int rank = threadIdx.x * S::kSamplerItemsPerThread + item;
-        if (rank < cap) {
-            const int off               = sampling_partial_offset(workspace, col, partial, rank);
-            workspace.partial_keys[off] = keys[item];
+        for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+            const int rank = threadIdx.x * S::kSamplerItemsPerThread + item;
+            if (rank < cap) {
+                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] = keys[item];
+            }
         }
     }
 }
 
-template <class S>
+template <class S, bool DirectGreedy = false>
 __launch_bounds__(S::kSamplerGroupBlock) __global__
     void sampling_group_finalize_sample_kernel(std::int32_t* out, const SamplingConfig* cfg_ptr,
                                                const std::int32_t* logical_positions,
@@ -179,6 +204,23 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
         group_partials = S::kSamplerPartialsPerGroup;
     }
 
+    if constexpr (DirectGreedy) {
+        if (greedy) {
+            if (group != 0) return;
+            unsigned long long best = 0;
+            for (int p = tid; p < partial_blocks; p += blockDim.x)
+                best = max(best,
+                           workspace.partial_keys[sampling_partial_offset(workspace, col, p, 0)]);
+            best = block_reduce_max_key(best, greedy_warp_keys);
+            if (tid == 0) {
+                if (cfg.mask.words && !isfinite(score_from_order_key(best))) asm volatile("trap;");
+                const int picked = id_from_order_key(best);
+                out[col]         = picked;
+                if (cfg.token_counts) atomicAdd(&cfg.token_counts[picked], 1);
+            }
+            return;
+        }
+    }
     if (greedy) {
         unsigned long long best = 0ull;
         for (int p = tid; p < group_partials; p += blockDim.x) {

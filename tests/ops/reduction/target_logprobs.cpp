@@ -235,6 +235,14 @@ int run_validation_cases() {
 } // namespace
 
 void add_target_logprobs_cases(ninfer::test::OpSuite& suite) {
+    suite.add("target_logprobs/full/uniform", [] {
+        return run_case("target_logprobs full uniform", 248320, 248077, 1,
+                        make_uniform_logits(248320, 248077, 1, 3.5f));
+    });
+    suite.add("target_logprobs/full/extreme", [] {
+        return run_case("target_logprobs full extreme", 248320, 248077, 2,
+                        make_extreme_logits(248320, 248077, 2));
+    });
     suite.add("target_logprobs/full/vocabulary/C/3",
               [] {
                   return run_case("target_logprobs full vocabulary C=3", 248320, 248077, 3,

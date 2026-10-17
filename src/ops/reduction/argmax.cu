@@ -6,6 +6,8 @@
 #include "ops/common/numeric/math.h"
 #include "ops/common/host/launch.h"
 #include "core/device.h"
+#include "core/platform.h"
+#include "ops/common/numeric/convert.cuh"
 #include <cuda_bf16.h>
 #include <climits>
 #include <math_constants.h>
@@ -59,24 +61,48 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { out[t] = indices[0]; }
 }
 
-__launch_bounds__(kArgmaxBlock) __global__
+template <int MaxBlock, int Items>
+__launch_bounds__(MaxBlock) __global__
     void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {
-    const std::int32_t t    = static_cast<std::int32_t>(blockIdx.y);
-    const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
-    const std::int32_t tile_start =
-        static_cast<std::int32_t>(blockIdx.x) * blockDim.x * kArgmaxItemsPerThread;
+    const std::int32_t t          = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t base       = static_cast<std::int64_t>(t) * physical_rows;
+    const std::int32_t tile_start = static_cast<std::int32_t>(blockIdx.x) * blockDim.x * Items;
 
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
-#pragma unroll
-    for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
-        const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
+    if constexpr (Items == 1) {
+        const auto v = tile_start + threadIdx.x;
         if (v < valid_rows) {
             const float value = __bfloat162float(logits[base + v]);
             if (score_id_better(value, v, best_value, best_index)) {
                 best_value = value;
                 best_index = v;
+            }
+        }
+    } else {
+        const auto start = tile_start + threadIdx.x * Items;
+        if (start + Items <= valid_rows) {
+            const auto values = Bf16Vector<Items>::load(logits + base + start);
+#pragma unroll
+            for (int item = 0; item < Items; ++item) {
+                const float value = __bfloat162float(values.word[item]);
+                if (score_id_better(value, start + item, best_value, best_index)) {
+                    best_value = value;
+                    best_index = start + item;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int item = 0; item < Items; ++item) {
+                const auto v = start + item;
+                if (v < valid_rows) {
+                    const float value = __bfloat162float(logits[base + v]);
+                    if (score_id_better(value, v, best_value, best_index)) {
+                        best_value = value;
+                        best_index = v;
+                    }
+                }
             }
         }
     }
@@ -112,6 +138,7 @@ int select_tiled_block(std::int32_t physical_rows, std::int32_t valid_rows, std:
     return kArgmaxBlock;
 }
 
+template <int MaxBlock, int Items>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream);
 
@@ -131,15 +158,23 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
         return;
     }
 
-    argmax_tiled_atomic_launch(logits, out, valid_rows,
-                               select_tiled_block(physical_rows, valid_rows, t_count), stream);
+#if NINFER_TARGET_SPARK
+    if (physical_rows == kFullPhysicalRows && valid_rows == kFullValidRows &&
+        reinterpret_cast<std::uintptr_t>(logits.data) % 16 == 0) {
+        argmax_tiled_atomic_launch<256, 8>(logits, out, valid_rows, 256, stream);
+        return;
+    }
+#endif
+    argmax_tiled_atomic_launch<kArgmaxBlock, 1>(
+        logits, out, valid_rows, select_tiled_block(physical_rows, valid_rows, t_count), stream);
 }
 
+template <int MaxBlock, int Items>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
-    const int tiled_blocks           = div_up(valid_rows, block * kArgmaxItemsPerThread);
+    const int tiled_blocks           = div_up(valid_rows, block * Items);
     for_each_token_slice(t_count, 1, [&](int token_offset, int token_count) {
         const Tensor logits_slice = logits.slice(1, token_offset, token_count);
         Tensor out_slice          = out.slice(0, token_offset, token_count);
@@ -148,7 +183,7 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
                                    stream));
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
-        argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(
+        argmax_tiled_atomic_kernel<MaxBlock, Items><<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits_slice.data),
             static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows);
         CUDA_CHECK(cudaGetLastError());

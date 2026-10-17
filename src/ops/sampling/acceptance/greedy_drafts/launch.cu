@@ -16,8 +16,8 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
     const std::int32_t batch         = drafts.ne[1];
     const auto& layout               = plan.workspace;
     if (layout.bytes == 0) {
-        speculative_accept_greedy_drafts_kernel<Schedule>
-            <<<batch, Schedule::kSamplerBlock, 0, stream>>>(
+        speculative_accept_greedy_drafts_kernel<RowSchedule>
+            <<<batch, RowSchedule::kSamplerBlock, 0, stream>>>(
                 static_cast<const std::int32_t*>(target_tokens.data),
                 static_cast<const __nv_bfloat16*>(logits.data),
                 static_cast<const std::int32_t*>(drafts.data),
@@ -35,8 +35,8 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
     const Workspace scratch           = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    speculative_sampling_partial_topk_kernel<Schedule>
-        <<<partial_grid, Schedule::kSamplerBlock, 0, stream>>>(
+    speculative_sampling_partial_topk_kernel<ParallelSchedule>
+        <<<partial_grid, ParallelSchedule::kSamplerBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data),
             static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
@@ -45,8 +45,8 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
                                   static_cast<unsigned int>(batch));
-    speculative_sampling_group_finalize_kernel<Schedule, false>
-        <<<batched_group_grid, Schedule::kSamplerGroupBlock, 0, stream>>>(
+    speculative_sampling_group_finalize_kernel<ParallelSchedule, false>
+        <<<batched_group_grid, ParallelSchedule::kSamplerGroupBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
             static_cast<const std::int32_t*>(current_extents.data),

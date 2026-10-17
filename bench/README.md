@@ -1398,43 +1398,48 @@ acceptance. Transaction correctness is covered by the state and Engine tests.
 
 ## Token-decision Op benchmarks
 
-The G1 benchmark calls public `argmax` for the Qwen3.6-35B full physical vocabulary with 248077
-valid rows through `C=128`, and for the 131072-row shortlist through `C=120`. With no arguments it
-covers every B=1 full-vocabulary width, both T1 routes, and both aggregate maxima:
+These benchmarks use the common single-Op timer: `--execution graph|eager|both`,
+`--cache cold|warm|both`, `--warmup`, `--repeat`, and `--csv-out`. Cold measurements flush 256 MiB
+before each call; state restoration and input transfers are outside the timed region.
+
+`ninfer_argmax_bench` reads BF16 logits with 248320 physical rows and 248077 valid rows, or the
+131072-row shortlist. `--cols` selects the independent column count. With no shape it covers
+full-vocabulary C=1..16/128 and shortlist C=1/120.
+
+`ninfer_sampling_select_bench` uses the same full vocabulary. `--sample` measures ordinary
+sampling; `--mtp --mtp-k 1..5` measures greedy-draft acceptance at B=1..8. With no entry, or with
+`--matrix`, it runs the B=1/2/4/8, greedy/stochastic, K=1..5 matrix. `--dflash2` separately measures
+sparse-q acceptance with K=1..15 and 16 proposal candidates; its default K is seven.
+
+Stochastic fixtures enable presence penalties and token counts unless `--no-counts` is given;
+plain greedy fixtures disable both. `--mixed` cycles raw greedy, penalty-bearing greedy, and
+stochastic rows. `--mask` supplies per-column vocabulary masks. `--extent P` or
+`--row-extents P0,P1,...` sets available draft counts; the default is K. `--reject-at J` changes
+one proposal. `--general` is specific to DFlash2 and requests its conservative execution envelope.
+Each timed call starts from the same counts, lengths and anchors, including warm-cache calls.
+
+CSV reports GPU/host time, launch count, caller workspace, and effective fixture options.
+Acceptance `tokens` is K+1; `valid` lists each row's available draft count. `logical_bytes` and
+`bandwidth_reference_us` describe the operands and outputs for the entire valid prefix, excluding
+private scratch traffic. Early rejection may consume less. Counts shared by a row's columns are
+counted once; DFlash2 counts are read-only. These are useful-work references, not measured DRAM
+traffic or complete bounds for sorting, synchronization and RNG.
+
+`ninfer_target_logprobs_bench` measures the CausalScoring log-softmax reduction for the same full
+vocabulary. `--columns C[,C...]` defaults to 1,8,32,128,512. Its logical traffic counts each logit
+once plus target IDs and outputs; repeated internal reads are not included. This scoring result
+is separate from sampling or Engine decode latency.
 
 ```bash
-cmake --build build/rtx5090-dev --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
-./build/rtx5090-dev/bench/ninfer_argmax_bench
-./build/rtx5090-dev/bench/ninfer_argmax_bench --shape full --cols 128
-./build/rtx5090-dev/bench/ninfer_argmax_bench --shape shortlist --cols 120
-```
-
-The G2/G3/G4 benchmark uses physical rows 248320 and valid token domain 248077. G2 covers optional
-occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers one-hot MTP windows `K=1..5`.
-With no arguments it runs the G2/G3 greedy/stochastic matrix. G4 covers DFlash2 sparse-q acceptance
-with `K=1..15`, 16 proposal candidates, `P=0..K`, and `B=1..8`. `--drafts` defaults to the
-checkpoint recommendation of seven; the default extent is the selected K.
-
-G4 reports the raw-greedy/general route, Graph node count, caller workspace, and whole-Op timings.
-A 256 MiB flush precedes each timed Graph; setup and input transfers are outside the measurement.
-`--graph-calls N` bundles N calls and reports time divided by N, so later calls reuse cache.
-`--mixed` cycles raw greedy, penalty-bearing greedy, and stochastic requests; `--general` selects
-the conservative general envelope even for greedy inputs. `--reject-at J` changes one proposal to
-exercise rejection; `--extent 0` checks the bonus-only case. These DFlash2 measurements do not
-measure Engine inference.
-
-```bash
-./build/rtx5090-dev/bench/ninfer_sampling_select_bench --matrix
-./build/rtx5090-dev/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
-./build/rtx5090-dev/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
+cmake --build build/rtx5090-dev -j --target \
+  ninfer_argmax_bench ninfer_sampling_select_bench ninfer_target_logprobs_bench
+./build/rtx5090-dev/bench/ninfer_argmax_bench --shape full --cols 48 --cache both
+./build/rtx5090-dev/bench/ninfer_sampling_select_bench --matrix --cache both
 ./build/rtx5090-dev/bench/ninfer_sampling_select_bench \
-  --dflash2 --drafts 15 --batch 8 --mode greedy --graph-calls 32 --warmup 8 --repeat 60
-./build/rtx5090-dev/bench/ninfer_sampling_select_bench \
-  --dflash2 --drafts 15 --batch 8 --mode stochastic --top-k 20 --warmup 8 --repeat 60
-./build/rtx5090-dev/bench/ninfer_sampling_select_bench \
-  --dflash2 --drafts 7 --batch 8 --mode stochastic --mixed --extent 3
+  --mtp --batch 8 --mtp-k 5 --mixed --mask --row-extents 0,1,2,3,4,5,3,1
 ./build/rtx5090-dev/bench/ninfer_sampling_select_bench \
   --dflash2 --drafts 15 --batch 8 --mode stochastic --no-counts --reject-at 7
+./build/rtx5090-dev/bench/ninfer_target_logprobs_bench --columns 1,8,128,512 --cache both
 ```
 
 ## 35B dFlash causal Attention qualification

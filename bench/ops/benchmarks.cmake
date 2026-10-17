@@ -25,6 +25,7 @@ ninfer_add_op_bench(ninfer_embedding_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/em
 ninfer_add_op_bench(ninfer_position_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/position_bench.cu")
 ninfer_add_op_bench(ninfer_cast_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cast_bench.cu")
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/argmax_bench.cu")
+ninfer_add_op_bench(ninfer_target_logprobs_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/target_logprobs_bench.cu")
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_conv1d_silu_bench.cu")
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")

@@ -75,16 +75,20 @@ std::vector<std::uint16_t> make_logits(std::int32_t physical_rows, std::int32_t 
     return logits;
 }
 
-int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t tokens) {
+int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t tokens,
+             std::size_t offset = 0) {
     auto logits   = make_logits(physical_rows, tokens, valid_rows);
     auto expected = argmax_oracle(logits, physical_rows, tokens, valid_rows);
 
-    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t) + offset);
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
-    device_logits.copy_from_host(logits.data(), logits.size() * sizeof(std::uint16_t));
+    auto* logits_data = static_cast<std::byte*>(device_logits.data()) + offset;
+    CUDA_CHECK(cudaMemcpy(logits_data, logits.data(), logits.size() * sizeof(std::uint16_t),
+                          cudaMemcpyHostToDevice));
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, tokens});
+    Tensor logits_tensor(device_logits.span().subspan(offset), DType::BF16,
+                         {physical_rows, tokens});
     Tensor output_tensor(device_output.span(), DType::I32, {tokens});
     ops::argmax(logits_tensor, output_tensor, valid_rows,
                 ninfer::test::cuda_environment().default_execution);
@@ -106,8 +110,9 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
         for (int t = 0; t < tokens; ++t)
             logits[static_cast<std::size_t>(t) * physical_rows + valid_rows - 1] =
                 f32_to_bf16(8192.0f);
-        CUDA_CHECK(cudaMemcpyAsync(device_logits.data(), logits.data(), device_logits.bytes(),
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(logits_data, logits.data(),
+                                   logits.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice,
+                                   stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -118,7 +123,7 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
 
     const auto actual =
         from_device<std::int32_t>(device_output.data(), static_cast<std::size_t>(tokens));
-    const auto logits_after = from_device<std::uint16_t>(device_logits.data(), logits.size());
+    const auto logits_after = from_device<std::uint16_t>(logits_data, logits.size());
     const std::string label = "argmax rows=" + std::to_string(physical_rows) +
                               " valid=" + std::to_string(valid_rows) +
                               " T=" + std::to_string(tokens);
@@ -134,6 +139,7 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
 } // namespace
 
 void add_argmax_cases(ninfer::test::OpSuite& suite) {
+    suite.add("argmax/unaligned/full", [] { return run_case(248320, 248077, 3, 2); });
     for (int tokens : {1, 2, 8, 9, 64, 15, 128})
         suite.add("argmax/padded/t" + std::to_string(tokens),
                   [=] { return run_case(248320, 248077, tokens); },

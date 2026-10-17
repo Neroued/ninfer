@@ -37,13 +37,14 @@ void add_two_output_cases(Suite& suite) {
         const std::vector<int> points =
             k == 2048
                 ? std::vector<int>{1, 2, 97}
-                : std::vector<int>{1,  2,  7,  8,   9,   15,  16,  17,  23,  24,   25,   31,
-                                   32, 33, 39, 40,  41,  47,  48,  49,  62,  63,   64,   65,
-                                   95, 96, 97, 127, 128, 129, 511, 512, 513, 1024, 2048, 4096};
+                : std::vector<int>{1,   2,   7,   8,    9,    15,   16,   17,   23,   24,   25,
+                                   31,  32,  33,  39,   40,   41,   47,   48,   49,   62,   63,
+                                   64,  65,  95,  96,   97,   127,  128,  129,  511,  512,  513,
+                                   191, 192, 193, 1023, 1024, 1025, 1151, 1152, 1153, 2048, 4096};
         std::vector<Invocation> calls;
         for (int t : points) calls.push_back({.t = t, .input_seed = 501U});
         if (k == 2560)
-            for (int t : {1, 8, 16, 24, 32, 40, 48, 63, 64, 96, 128, 512, 513})
+            for (int t : {1, 8, 16, 24, 32, 40, 48, 63, 64, 96, 128, 192, 512, 513, 1024, 1152})
                 calls.push_back({.t = t, .graph = true, .input_seed = 501U, .changed_seed = 1501U});
         calls.push_back({.t = 0, .workspace_intervals = true});
         add_profile(suite, profile, std::move(calls));

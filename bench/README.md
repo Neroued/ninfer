@@ -283,6 +283,8 @@ and is not a runtime input.
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+Select an exact extent with `--t`, a regular range with `--sweep`, or explicit extents with
+`--tokens T1,T2,...`; these options are mutually exclusive.
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
 FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,

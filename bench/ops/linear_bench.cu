@@ -95,6 +95,7 @@ struct Options {
     bool have_k         = false;
     bool have_t         = false;
     bool have_sweep     = false;
+    bool have_tokens    = false;
     bool have_suite     = false;
     bool profile        = false;
     bool graph          = false;
@@ -105,6 +106,7 @@ struct Options {
     std::int32_t k      = 0;
     std::int32_t t      = 0;
     bench::measurement::Sweep sweep;
+    std::vector<std::int32_t> tokens;
     std::string suite;
     int warmup                = kDefaultWarmup;
     int repeat                = kDefaultRepeat;
@@ -255,6 +257,8 @@ void usage(const char* argv0) {
                  "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
                  "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --tokens T1,T2,... "
+                 "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
@@ -266,7 +270,7 @@ void usage(const char* argv0) {
                  "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
                  "  --csv-out PATH     Write all ordinary measurement rows as CSV.\n"
                  "  -h, --help         Show this text.\n",
-                 argv0, argv0, argv0, kDefaultWarmup, kDefaultRepeat);
+                 argv0, argv0, argv0, argv0, kDefaultWarmup, kDefaultRepeat);
 }
 
 Options parse_args(int argc, char** argv) {
@@ -294,6 +298,9 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--sweep") {
             opt.sweep      = bench::measurement::parse_sweep(next("sweep"));
             opt.have_sweep = true;
+        } else if (arg == "--tokens") {
+            opt.tokens      = bench::measurement::integers(next("tokens"));
+            opt.have_tokens = true;
         } else if (arg == "--suite") {
             opt.suite      = lower(next("suite"));
             opt.have_suite = true;
@@ -331,14 +338,15 @@ Options parse_args(int argc, char** argv) {
             "graph-calls must be 1..64; multiple calls require graph timing without --profile");
     if (opt.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (opt.flush_bytes == 0) { throw std::invalid_argument("--flush-mib must be positive"); }
-    if (opt.have_t && opt.have_sweep) {
-        throw std::invalid_argument("--t and --sweep are mutually exclusive");
+    if (int(opt.have_t) + int(opt.have_sweep) + int(opt.have_tokens) > 1) {
+        throw std::invalid_argument("--t, --sweep and --tokens are mutually exclusive");
     }
     if (opt.have_suite) {
         if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "all") {
             throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, or all");
         }
-        if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
+        if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep ||
+            opt.have_tokens) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
         }
         if (opt.profile) { throw std::invalid_argument("--profile does not accept a suite"); }
@@ -346,8 +354,8 @@ Options parse_args(int argc, char** argv) {
         if (!opt.have_qtype || !opt.have_n || !opt.have_k) {
             throw std::invalid_argument("explicit mode requires --qtype, --n, and --k");
         }
-        if (!opt.have_t && !opt.have_sweep) {
-            throw std::invalid_argument("explicit mode requires exactly one of --t or --sweep");
+        if (!opt.have_t && !opt.have_sweep && !opt.have_tokens) {
+            throw std::invalid_argument("explicit mode requires --t, --sweep or --tokens");
         }
         if (opt.profile && !opt.have_t) {
             throw std::invalid_argument("--profile requires one exact --t");
@@ -408,6 +416,11 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
     }
     if (opt.have_t) {
         points.push_back({opt.qtype, opt.policy, opt.n, opt.k, opt.t, {"explicit"}, false});
+        return points;
+    }
+    if (opt.have_tokens) {
+        for (const auto t : opt.tokens)
+            append_point(points, {opt.qtype, opt.policy, opt.n, opt.k, t, {"explicit"}, false});
         return points;
     }
     for (std::int64_t t = opt.sweep.begin; t <= opt.sweep.end; t += opt.sweep.step) {

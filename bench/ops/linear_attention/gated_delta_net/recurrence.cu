@@ -28,21 +28,13 @@ namespace chunked_detail         = ninfer::ops::detail::gated_delta_net::chunked
 struct BenchRow {
     const char* normalization = "";
     std::string implementation;
-    std::int32_t full_chunks          = 0;
-    std::int32_t tail_tokens          = 0;
-    std::size_t workspace_bytes       = 0;
-    double logical_bytes              = 0.0;
-    double traffic_bytes              = 0.0;
-    double intermediate_traffic_bytes = 0.0;
-    double stage_share_pct            = -1.0;
-    double relative_to_e2e_pct        = -1.0;
+    std::int32_t full_chunks    = 0;
+    std::int32_t tail_tokens    = 0;
+    std::int32_t value_tile     = 0;
+    std::size_t workspace_bytes = 0;
+    gdn::Traffic traffic;
     measurement::Result measured;
     std::size_t workspace_peak = 0;
-};
-
-struct TrafficBytes {
-    double total        = 0.0;
-    double intermediate = 0.0;
 };
 
 template <class Launch>
@@ -55,67 +47,36 @@ measurement::Result measure_operation(
 
 float gated_delta_net_scale() { return 1.0F / std::sqrt(128.0F); }
 
-double running_logical_bytes(const Problem& problem) {
-    const double tokens   = static_cast<double>(problem.tokens);
-    const double batch    = static_cast<double>(problem.batch);
-    const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                            problem.qk_heads * tokens * batch * sizeof(std::uint16_t);
-    const double value_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                               problem.value_heads * tokens * batch * sizeof(std::uint16_t);
-    const double gate_bytes =
-        static_cast<double>(problem.value_heads) * tokens * batch * sizeof(float);
-    const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                               gated_delta_net_detail::kStateDim * problem.value_heads * batch *
-                               sizeof(float);
-    return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + 2.0 * state_bytes;
+std::uint64_t packet_bytes(const Problem& p) {
+    return std::uint64_t(chunked_detail::chunk_count(p.tokens)) *
+           (p.qk_heads * sizeof(chunked_detail::QkChunk) +
+            p.value_heads * sizeof(chunked_detail::ControlChunk));
 }
 
-double batch_update_logical_bytes(const Problem& problem) {
-    // The fixture passes the same selector tensor for source and destination slots.
-    return running_logical_bytes(problem) + double(problem.batch) * sizeof(std::int32_t);
+gdn::Traffic prepare_traffic(const Problem& p) {
+    gdn::Traffic result;
+    result.logical                  = {2 * p.qk_bytes() + 2 * p.gate_bytes(), packet_bytes(p)};
+    result.workspace_requests.write = packet_bytes(p);
+    result.modeled_request_bytes    = 2 * p.qk_bytes() * (p.value_heads / p.qk_heads) +
+                                   2 * p.gate_bytes() + result.workspace_requests.write;
+    result.active_rows  = p.batch;
+    result.valid_tokens = p.tokens * p.batch;
+    return result;
 }
 
-double qk_tensor_bytes(const Problem& problem) {
-    return static_cast<double>(gated_delta_net_detail::kStateDim) * problem.qk_heads *
-           problem.tokens * problem.batch * sizeof(std::uint16_t);
-}
-
-double value_tensor_bytes(const Problem& problem) {
-    return static_cast<double>(gated_delta_net_detail::kStateDim) * problem.value_heads *
-           problem.tokens * problem.batch * sizeof(std::uint16_t);
-}
-
-double gate_tensor_bytes(const Problem& problem) {
-    return static_cast<double>(problem.value_heads) * problem.tokens * problem.batch *
-           sizeof(float);
-}
-
-double state_tensor_bytes(const Problem& problem) {
-    return static_cast<double>(gated_delta_net_detail::kStateDim) *
-           gated_delta_net_detail::kStateDim * problem.value_heads * problem.batch * sizeof(float);
-}
-
-TrafficBytes prepare_traffic(const Problem& p, std::size_t workspace) {
-    return {2.0 * qk_tensor_bytes(p) * (p.value_heads / p.qk_heads) + 2.0 * gate_tensor_bytes(p) +
-                workspace,
-            double(workspace)};
-}
-
-TrafficBytes recurrence_traffic(const Problem& p, int slices) {
-    const double packets =
-        double(chunked_detail::chunk_count(p.tokens)) * p.value_heads *
-        (sizeof(chunked_detail::QkChunk) + sizeof(chunked_detail::ControlChunk)) * slices;
-    return {packets + 2.0 * value_tensor_bytes(p) + 2.0 * state_tensor_bytes(p), packets};
-}
-
-TrafficBytes batch_update_traffic(const Problem& problem, bool composed) {
-    const double logical = batch_update_logical_bytes(problem);
-    if (!composed) { return {logical, 0.0}; }
-    const double normalized_qk_round_trip = 4.0 * qk_tensor_bytes(problem);
-    return {
-        logical + normalized_qk_round_trip,
-        normalized_qk_round_trip,
-    };
+gdn::Traffic recurrence_traffic(const Problem& p, int slices) {
+    gdn::Traffic result;
+    result.state = {p.state_bytes(), p.state_bytes()};
+    result.workspace_requests.read =
+        std::uint64_t(chunked_detail::chunk_count(p.tokens)) * p.value_heads * slices *
+        (sizeof(chunked_detail::QkChunk) + sizeof(chunked_detail::ControlChunk));
+    result.logical = {p.value_bytes() + result.state.read + packet_bytes(p),
+                      p.value_bytes() + result.state.write};
+    result.modeled_request_bytes =
+        result.workspace_requests.read + 2 * p.value_bytes() + result.state.total();
+    result.active_rows  = p.batch;
+    result.valid_tokens = p.tokens * p.batch;
+    return result;
 }
 
 BenchRow run_batch_update(const Options& options, std::int32_t tokens, bench::L2FlushBuffer& flush,
@@ -178,23 +139,19 @@ BenchRow run_batch_update(const Options& options, std::int32_t tokens, bench::L2
                                                   !composed, ssm_states, selected_slots, selected_slots,
                                                   out, cuda);
     };
-    const auto measured        = measure_operation(launch, flush, cuda, options, restore);
-    const TrafficBytes traffic = batch_update_traffic(problem, composed);
-
-    return {
-        composed ? "composed" : "fused",
-        composed ? "l2norm_x2+public.batch_update.qk_pre_normalized"
-                 : "public.batch_update.qk_fused",
-        0,
-        0,
-        0,
-        batch_update_logical_bytes(problem),
-        traffic.total,
-        traffic.intermediate,
-        -1.0,
-        -1.0,
-        measured,
-    };
+    BenchRow row;
+    row.normalization  = composed ? "composed" : "fused";
+    row.implementation = composed ? "l2norm_x2+public.batch_update.qk_pre_normalized"
+                                  : "public.batch_update.qk_fused";
+    row.traffic        = gdn::running_traffic(problem);
+    // Source and destination use the same selector tensor.
+    row.traffic.logical.read += sizeof(std::int32_t) * problem.batch;
+    if (composed) {
+        row.workspace_bytes = row.workspace_peak = 2 * problem.qk_bytes();
+        row.traffic.workspace_requests           = {row.workspace_bytes, row.workspace_bytes};
+    }
+    row.measured = measure_operation(launch, flush, cuda, options, restore);
+    return row;
 }
 
 std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
@@ -247,15 +204,19 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                           problem.value_heads,
                                                           tokens,
                                                           gated_delta_net_scale()};
-    const int tile              = chunked ? ops::detail::gated_delta_net::select_value_tile(
+    const int tile     = chunked ? ops::detail::gated_delta_net::select_value_tile(
                                    problem.value_heads, execution.multiprocessor_count())
-                                          : 0;
-    const auto prep_io          = prepare_traffic(problem, bytes);
-    const auto rec_io           = recurrence_traffic(problem, tile ? state_dim / tile : 0);
-    const TrafficBytes total_io = chunked ? TrafficBytes{prep_io.total + rec_io.total,
-                                                         prep_io.intermediate + rec_io.intermediate}
-                                          : TrafficBytes{running_logical_bytes(problem), 0};
-    auto prepare                = [&](CudaExecutionView cuda) {
+                                 : 0;
+    const auto prep_io = prepare_traffic(problem);
+    const auto rec_io  = recurrence_traffic(problem, tile ? state_dim / tile : 0);
+    auto total_io      = gdn::running_traffic(problem);
+    if (chunked) {
+        total_io.workspace_requests = {rec_io.workspace_requests.read,
+                                       prep_io.workspace_requests.write};
+        total_io.modeled_request_bytes =
+            *prep_io.modeled_request_bytes + *rec_io.modeled_request_bytes;
+    }
+    auto prepare = [&](CudaExecutionView cuda) {
         const auto stream = cuda.stream();
         chunked_detail::launch_prepare(args, qk, control, normalize, stream);
     };
@@ -276,27 +237,26 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                  si, so, out, cuda);
     };
     std::vector<BenchRow> rows;
-    auto measure = [&](const char* name, TrafficBytes io, auto& body, double logical) {
-        const auto measured = measure_operation(body, flush, execution, options);
-        rows.push_back({normalize ? "fused" : "pre_normalized", name,
-                        chunked ? tokens / chunked_detail::kChunkSize : 0,
-                        chunked ? tokens % chunked_detail::kChunkSize : 0, bytes, logical, io.total,
-                        io.intermediate, -1.0, -1.0, measured,
-                        force_chunked ? bytes : workspace.peak_used()});
+    auto measure = [&](const char* name, gdn::Traffic io, auto& body) {
+        BenchRow row;
+        row.normalization   = normalize ? "fused" : "pre_normalized";
+        row.implementation  = name;
+        row.full_chunks     = chunked ? tokens / chunked_detail::kChunkSize : 0;
+        row.tail_tokens     = chunked ? tokens % chunked_detail::kChunkSize : 0;
+        row.value_tile      = tile;
+        row.workspace_bytes = bytes;
+        row.traffic         = io;
+        row.measured        = measure_operation(body, flush, execution, options);
+        row.workspace_peak  = force_chunked ? bytes : workspace.peak_used();
+        rows.push_back(row);
     };
     measure(force_chunked     ? "forced.chunked"
             : force_recurrent ? "forced.recurrent"
                               : "public.total",
-            total_io, pipeline, running_logical_bytes(problem));
+            total_io, pipeline);
     if (options.breakdown && chunked) {
-        measure("chunked.prepare", prep_io, prepare, 0);
-        measure("chunked.recurrence", rec_io, recurrence, 0);
-        const double sum = rows[1].measured.gpu.median_us + rows[2].measured.gpu.median_us;
-        for (int i = 1; i < 3; ++i) {
-            rows[i].stage_share_pct = 100.0 * rows[i].measured.gpu.median_us / sum;
-            rows[i].relative_to_e2e_pct =
-                100.0 * rows[i].measured.gpu.median_us / rows[0].measured.gpu.median_us;
-        }
+        measure("chunked.prepare", prep_io, prepare);
+        measure("chunked.recurrence", rec_io, recurrence);
     }
     return rows;
 }
@@ -312,10 +272,9 @@ int main(int argc, char** argv) {
         measurement::hardware();
         auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(requested.timing.flush_bytes);
-        measurement::Csv csv(
-            requested.timing.csv_out,
-            "normalization,full_chunks,tail_tokens,logical_bytes,tensor_io_request_bytes,workspace_"
-            "request_bytes,stage_share_pct,relative_to_total_pct");
+        measurement::Csv csv(requested.timing.csv_out,
+                             std::string("normalization,full_chunks,tail_tokens,value_tile,") +
+                                 gdn::Traffic::columns);
         for (const auto& execution :
              measurement::selections(requested.timing.execution, "graph", "eager"))
             for (const auto& cache :
@@ -340,11 +299,8 @@ int main(int argc, char** argv) {
                         const auto extra    = std::string(r.normalization) + "," +
                                            std::to_string(r.full_chunks) + "," +
                                            std::to_string(r.tail_tokens) + "," +
-                                           std::to_string(r.logical_bytes) + "," +
-                                           std::to_string(r.traffic_bytes) + "," +
-                                           std::to_string(r.intermediate_traffic_bytes) + "," +
-                                           std::to_string(r.stage_share_pct) + "," +
-                                           std::to_string(r.relative_to_e2e_pct);
+                                           std::to_string(r.value_tile) + "," +
+                                           r.traffic.csv(r.measured.gpu.median_us);
                         csv.write(row, r.measured, execution, cache, extra);
                     }
                 }

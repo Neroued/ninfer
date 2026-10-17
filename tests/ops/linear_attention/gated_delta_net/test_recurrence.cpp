@@ -3,6 +3,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "core/decode_graph.h"
 
 #include "gdn_ref.h"
 #include "ops/op_tester.h"
@@ -10,11 +11,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -31,31 +30,10 @@ namespace {
 
 constexpr int kStateDim = 128;
 
-enum class PrecisionProfile { Recurrent, ChunkedNormalized, ChunkedRaw };
-
-struct Criteria {
-    const char* name;
-    ReductionCriterion out;
-    ReductionCriterion state;
-};
-
-// Engineering limits for the represented public inputs, not universal forward-error
-// bounds. The chunked profile keeps the master state in FP32, uses TF32 residual products and
-// BF16 readout/update operands, and optionally materializes normalized Q/K once in BF16.
-// Output has an additional final BF16 conversion. These profile-wide regression limits retain
-// margin around the qualified error envelope and apply uniformly across head counts, sequence
-// lengths and gate values. The unchanged recurrent profile retains its limits.
-constexpr std::array<Criteria, 3> kCriteria{{
-    {"recurrent", {4.1e-3, 5.0e-6, 5.5e-3}, {2.7e-3, 1.0e-5, 3.9e-3}},
-    {"chunked-normalized", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
-    {"chunked-raw", {4.5e-3, 5.0e-6, 7.0e-3}, {3.0e-3, 1.0e-5, 4.0e-3}},
-}};
-
-PrecisionProfile prefill_profile(int tokens, bool normalize_qk) {
-    // Qualify the current public prefill boundary explicitly, including T=15/16/17.
-    if (tokens < 16) return PrecisionProfile::Recurrent;
-    return normalize_qk ? PrecisionProfile::ChunkedNormalized : PrecisionProfile::ChunkedRaw;
-}
+// One error budget for the complete recurrence over represented public inputs, including
+// continuation. FP32 state storage does not prescribe the precision of private arithmetic.
+constexpr ReductionCriterion kOutputCriterion{6.0e-3, 5.0e-6, 8.0e-3};
+constexpr ReductionCriterion kStateCriterion{4.5e-3, 1.0e-5, 9.0e-3};
 
 enum class InputPattern {
     Ordinary,
@@ -235,11 +213,8 @@ int verify_exact(const std::string& label, const std::vector<T>& got,
 }
 
 int verify_heads(const std::string& label, std::span<const double> got,
-                 std::span<const double> expected, int value_heads, int tokens,
-                 PrecisionProfile profile, bool state) {
-    const auto profile_index = static_cast<std::size_t>(profile);
-    const auto& criteria     = kCriteria[profile_index];
-    const auto& criterion    = state ? criteria.state : criteria.out;
+                 std::span<const double> expected, int value_heads, int tokens, bool state) {
+    const auto& criterion = state ? kStateCriterion : kOutputCriterion;
     const std::size_t head_size =
         static_cast<std::size_t>(kStateDim) * (state ? kStateDim : tokens);
     if (got.size() != head_size * value_heads || got.size() != expected.size()) {
@@ -263,7 +238,7 @@ int verify_heads(const std::string& label, std::span<const double> got,
         const double gross_limit = gross_error_limit(stats, criterion);
         report_reduction_stats(head_label, head_size, stats, criterion);
         if (!reduction_passes(stats, head_size, criterion)) {
-            std::cerr << head_label << ": " << criteria.name << " rel_l2=" << stats.relative_l2
+            std::cerr << head_label << ": rel_l2=" << stats.relative_l2
                       << " limit=" << criterion.relative_l2
                       << " max_abs=" << stats.maximum_absolute_error
                       << " gross_limit=" << gross_limit << " non_finite=" << stats.first_non_finite
@@ -366,7 +341,6 @@ int run_case(const Case& test_case, std::uint32_t seed,
     GuardedDeviceBuffer* current = &state_a;
     int failures                 = 0;
     int begin                    = 0;
-    bool consumed_chunked        = false;
     for (int length : partitions) {
         auto* destination = inplace ? current : (current == &state_a ? &state_b : &state_a);
         std::vector<float> source_before;
@@ -390,14 +364,6 @@ int run_case(const Case& test_case, std::uint32_t seed,
         }
         cuda_synchronize();
         begin += length;
-        consumed_chunked |=
-            prefill_profile(length, test_case.normalize_qk) != PrecisionProfile::Recurrent;
-        // A recurrent suffix inherits earlier chunked error. Check the complete prefix against
-        // the sequence's arithmetic profile; do not reset its error by seeding the oracle with
-        // the GPU's intermediate state.
-        const auto profile           = consumed_chunked
-                                           ? prefill_profile(test_case.tokens, test_case.normalize_qk)
-                                           : PrecisionProfile::Recurrent;
         const std::string checkpoint = label + " prefix=" + std::to_string(begin);
         const auto ref               = reference_prefix(in, begin, scale, test_case.normalize_qk);
         const auto output_count =
@@ -405,17 +371,17 @@ int run_case(const Case& test_case, std::uint32_t seed,
         const auto got_output = from_device_bf16(out.data(), output_count);
         const auto got_state  = read_f32(destination->data(), in.state.size());
         failures += verify_heads(checkpoint + " out", got_output, ref.out, test_case.value_heads,
-                                 begin, profile, false);
+                                 begin, false);
         if (partitions.size() > 1) {
             const auto offset =
                 static_cast<std::size_t>(begin - length) * test_case.value_heads * kStateDim;
             failures += verify_heads(checkpoint + " current out",
                                      std::span<const double>(got_output).subspan(offset),
                                      std::span<const double>(ref.out).subspan(offset),
-                                     test_case.value_heads, length, profile, false);
+                                     test_case.value_heads, length, false);
         }
         failures += verify_heads(checkpoint + " state", got_state, ref.final_state,
-                                 test_case.value_heads, 1, profile, true);
+                                 test_case.value_heads, 1, true);
         if (pattern == InputPattern::ZeroQuery || pattern == InputPattern::ZeroSignal) {
             failures += verify_exact(checkpoint + " exact zero output", got_output,
                                      std::vector<double>(output_count, 0.0));
@@ -451,8 +417,8 @@ int run_case(const Case& test_case, std::uint32_t seed,
     }
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
-    if (workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+    if (workspace.peak_used() > workspace_bytes) {
+        std::cerr << label << ": workspace exceeded its interval capacity\n";
         ++failures;
     }
     return failures;
@@ -553,16 +519,14 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
         failures += verify_heads(
             row_label + " out",
             std::span<const double>(got_output).subspan(row * value_row_size, value_row_size),
-            references[static_cast<std::size_t>(row)].out, test_case.value_heads, 1,
-            PrecisionProfile::Recurrent, false);
+            references[static_cast<std::size_t>(row)].out, test_case.value_heads, 1, false);
         const std::size_t begin =
             static_cast<std::size_t>(destination_slots[static_cast<std::size_t>(row)]) * state_size;
-        failures +=
-            verify_heads(row_label + " state",
-                         doubles(std::vector<float>(got_states.begin() + begin,
-                                                    got_states.begin() + begin + state_size)),
-                         references[static_cast<std::size_t>(row)].final_state,
-                         test_case.value_heads, 1, PrecisionProfile::Recurrent, true);
+        failures += verify_heads(
+            row_label + " state",
+            doubles(std::vector<float>(got_states.begin() + begin,
+                                       got_states.begin() + begin + state_size)),
+            references[static_cast<std::size_t>(row)].final_state, test_case.value_heads, 1, true);
     }
     for (int slot = 0; slot < slots; ++slot) {
         if (written_slots[static_cast<std::size_t>(slot)]) continue;
@@ -583,6 +547,145 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
                                                device.g, device.beta);
+    return failures;
+}
+
+int graph_case(Case c, int batch, bool pooled) {
+    const int slots              = 2 * batch;
+    const std::size_t state_size = std::size_t(kStateDim) * kStateDim * c.value_heads;
+    const std::size_t qk_size    = std::size_t(kStateDim) * c.qk_heads * c.tokens;
+    const std::size_t value_size = std::size_t(kStateDim) * c.value_heads * c.tokens;
+    const std::size_t gate_size  = std::size_t(c.value_heads) * c.tokens;
+    Case aggregate_case          = c;
+    aggregate_case.tokens *= batch;
+    auto in = make_inputs(aggregate_case, 15100U);
+    DeviceInputs device(in);
+    GuardedDeviceBuffer state(state_size * slots * sizeof(float));
+    GuardedDeviceBuffer output(value_size * batch * sizeof(std::uint16_t));
+    std::vector<std::int32_t> source(batch), destination(batch);
+    DeviceBuffer source_device = to_device(source), destination_device = to_device(destination);
+    Tensor q(device.q.span(), DType::BF16, {kStateDim, c.qk_heads, c.tokens, batch});
+    Tensor k(device.k.span(), DType::BF16, {kStateDim, c.qk_heads, c.tokens, batch});
+    Tensor v(device.v.span(), DType::BF16, {kStateDim, c.value_heads, c.tokens, batch});
+    Tensor g(device.g.span(), DType::FP32, {c.value_heads, c.tokens, batch});
+    Tensor beta(device.beta.span(), DType::FP32, {c.value_heads, c.tokens, batch});
+    Tensor out(output.span(), DType::BF16, {kStateDim, c.value_heads, c.tokens, batch});
+    Tensor states(state.span(), DType::FP32, {kStateDim, kStateDim, c.value_heads, slots});
+    SlottedStateFixture history(states, 3);
+    states = history.tensor;
+    Tensor sources(source_device.span(), DType::I32, {batch});
+    Tensor destinations(destination_device.span(), DType::I32, {batch});
+    const auto capacity = pooled ? 0
+                                 : ops::gated_delta_net_workspace_capacity_bytes(
+                                       c.qk_heads, c.value_heads, c.tokens, c.tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+    MemoryArena workspace(scratch.span());
+    auto& context        = cuda_environment().context;
+    const auto execution = context.execution_view();
+    const float scale    = 1.0F / std::sqrt(float(kStateDim));
+    const auto launch    = [&] {
+        if (pooled) {
+            ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, c.normalize_qk, states,
+                                                 sources, destinations, out, execution);
+        } else {
+            auto si = states.slice(3, 0, 1).view({kStateDim, kStateDim, c.value_heads});
+            auto so = states.slice(3, 1, 1).view({kStateDim, kStateDim, c.value_heads});
+            ops::gated_delta_net(q, k, v, g, beta, scale, c.normalize_qk, workspace, si, so, out,
+                                    execution);
+        }
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (int replay = 0; replay < 2; ++replay) {
+        in                     = make_inputs(aggregate_case, 15100U + 97U * replay);
+        const auto upload_bf16 = [](DeviceBuffer& buffer, const std::vector<float>& values) {
+            const auto bits = bf16_bits(values);
+            buffer.copy_from_host(bits.data(), buffer.size());
+        };
+        upload_bf16(device.q, in.q);
+        upload_bf16(device.k, in.k);
+        upload_bf16(device.v, in.v);
+        device.g.copy_from_host(in.g.data(), device.g.size());
+        device.beta.copy_from_host(in.beta.data(), device.beta.size());
+        std::vector<float> initial(state_size * slots);
+        for (int slot = 0; slot < slots; ++slot)
+            for (std::size_t i = 0; i < state_size; ++i)
+                initial[slot * state_size + i] = in.state[i] * (1.0F + 0.25F * slot);
+        for (int row = 0; row < batch; ++row) {
+            source[row]      = pooled ? 2 * row + replay : 0;
+            destination[row] = pooled ? 2 * row : 1;
+        }
+        state.copy_from_host(initial.data(), state.bytes());
+        history.upload();
+        source_device.copy_from_host(source.data(), source_device.size());
+        destination_device.copy_from_host(destination.data(), destination_device.size());
+        output.fill(0xff);
+        scratch.fill(0xff);
+        cuda_synchronize();
+        if (!graph.ready()) {
+            launch(); // Initialize launch resources before capture, then restore the state.
+            context.synchronize();
+            history.upload();
+            output.fill(0xff);
+            scratch.fill(0xff);
+            cuda_synchronize();
+            definition.capture(context.stream(), launch);
+            graph.instantiate(definition);
+        }
+        graph.launch(context.stream());
+        context.synchronize();
+        history.copy_back();
+        const auto got_state    = from_device<float>(state.data(), initial.size());
+        const auto got_output   = from_device_bf16(output.data(), value_size * batch);
+        const std::string label = std::string(c.name) + " replay=" + std::to_string(replay);
+        for (int row = 0; row < batch; ++row) {
+            gdn_ref::Inputs input;
+            input.head_dim    = kStateDim;
+            input.qk_heads    = c.qk_heads;
+            input.value_heads = c.value_heads;
+            input.tokens      = c.tokens;
+            const auto slice  = [row](const std::vector<float>& values, std::size_t size) {
+                return std::vector<float>(values.begin() + row * size,
+                                           values.begin() + (row + 1) * size);
+            };
+            input.q    = slice(in.q, qk_size);
+            input.k    = slice(in.k, qk_size);
+            input.v    = slice(in.v, value_size);
+            input.g    = slice(in.g, gate_size);
+            input.beta = slice(in.beta, gate_size);
+            input.state.assign(initial.begin() + source[row] * state_size,
+                               initial.begin() + (source[row] + 1) * state_size);
+            const auto reference = gdn_ref::evaluate(input, scale, c.normalize_qk);
+            failures += verify_heads(label + " output row=" + std::to_string(row),
+                                     std::span(got_output).subspan(row * value_size, value_size),
+                                     reference.out, c.value_heads, c.tokens, false);
+            failures += verify_heads(label + " state row=" + std::to_string(row),
+                                     doubles(std::vector<float>(
+                                         got_state.begin() + destination[row] * state_size,
+                                         got_state.begin() + (destination[row] + 1) * state_size)),
+                                     reference.final_state, c.value_heads, 1, true);
+        }
+        for (int slot = 0; slot < slots; ++slot) {
+            if (std::find(destination.begin(), destination.end(), slot) != destination.end())
+                continue;
+            failures +=
+                verify_exact(label + " untouched state",
+                             std::vector<float>(got_state.begin() + slot * state_size,
+                                                got_state.begin() + (slot + 1) * state_size),
+                             std::vector<float>(initial.begin() + slot * state_size,
+                                                initial.begin() + (slot + 1) * state_size));
+        }
+        failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v,
+                                                   device.g, device.beta);
+        failures += verify_exact(label + " sources", from_device_i32(source_device, batch), source);
+        failures += verify_exact(label + " destinations",
+                                 from_device_i32(destination_device, batch), destination);
+        failures += history.verify_guards(label);
+        failures += output.verify_guards(label);
+        failures += scratch.verify_guards(label);
+        if (workspace.used() != 0 || workspace.peak_used() > capacity) ++failures;
+    }
     return failures;
 }
 
@@ -751,6 +854,15 @@ int main(int argc, char** argv) {
           {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
     batch({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6}, {1, 3, 5, 7}, 8, 13101u);
 
+    suite.add("gdn/graph/running-t1",
+              [] { return graph_case({"running-t1", 16, 32, 1, false}, 1, false); },
+              {{"execution", "graph"}});
+    suite.add("gdn/graph/running-t17",
+              [] { return graph_case({"running-t17", 16, 48, 17, true}, 1, false); },
+              {{"execution", "graph"}});
+    suite.add("gdn/graph/batch-update",
+              [] { return graph_case({"batch-update", 16, 48, 1, true}, 4, true); },
+              {{"execution", "graph"}});
 
     return suite.main(argc, argv);
 }

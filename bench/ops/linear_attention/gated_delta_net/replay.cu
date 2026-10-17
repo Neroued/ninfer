@@ -1,4 +1,5 @@
 #include "replay_fixture.cuh"
+#include "traffic.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -9,7 +10,7 @@ int main(int argc, char** argv) {
         measurement::hardware();
         auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
-        measurement::Csv csv(options.timing.csv_out);
+        measurement::Csv csv(options.timing.csv_out, gdn::Traffic::columns);
         for (int t : options.tokens) {
             measurement::Row row;
             row.op            = options.op;
@@ -19,15 +20,15 @@ int main(int argc, char** argv) {
             row.qk_heads      = 16;
             row.value_heads   = options.profile.value_heads;
             row.layers        = options.op == "fold" ? options.profile.layers : 1;
-            const auto run    = [&](auto&& launch, auto&& restore) {
+            const auto run    = [&](auto&& launch, auto&& restore, const gdn::Traffic& traffic) {
                 for (const auto& execution :
                      measurement::selections(options.timing.execution, "graph", "eager"))
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
                         const auto r =
                             measurement::measure(launch, restore, flush, device.execution_view(),
-                                                 options.timing, execution, cache);
-                        csv.write(row, r, execution, cache);
+                                                    options.timing, execution, cache);
+                        csv.write(row, r, execution, cache, traffic.csv(r.gpu.median_us));
                     }
             };
             if (options.op == "fold") {
@@ -39,13 +40,17 @@ int main(int argc, char** argv) {
                     rows.push_back({slots[b], slots[b], counts[b]});
                 row.commits = gdn_replay::csv_extent(options.commits);
                 run([&](CudaExecutionView cuda) { f.fold_plan().execute(rows, cuda); },
-                    [&](CudaExecutionView cuda) { f.restore(cuda); });
+                    [&](CudaExecutionView cuda) { f.restore(cuda); },
+                    gdn::fold_traffic(options.profile.layers, 16, options.profile.value_heads,
+                                      options.profile.conv_channels, counts));
             } else {
-                auto valid = gdn_replay::extents(options.valid, t, options.batch, false);
+                auto valid         = gdn_replay::extents(options.valid, t, options.batch, false);
+                const auto traffic = gdn::record_traffic(16, options.profile.value_heads, t, valid,
+                                                         options.valid != "dense");
                 if (options.valid == "dense") valid.clear();
                 gdn_replay::RecordFixture f(options.profile, t, options.batch, valid);
                 row.valid = gdn_replay::csv_extent(options.valid);
-                run([&](CudaExecutionView cuda) { f.launch_record(cuda); }, [](auto) {});
+                run([&](CudaExecutionView cuda) { f.launch_record(cuda); }, [](auto) {}, traffic);
             }
         }
     } catch (const std::exception& e) {

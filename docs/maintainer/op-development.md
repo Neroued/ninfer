@@ -571,8 +571,10 @@ organization are not qualification subjects.
 
 Exact outputs and regions compare every observable bit or byte. Each approximate output or state
 uses a suite-owned named criterion for its public numerical policy or representation; tests do not
-define per-case tolerance overrides. For Linear-family Ops, `A16Only`, `AllowA8`, and `AllowA4`
-select the A16, A8, and A4 criteria respectively, regardless of which arithmetic the implementation
+define per-case tolerance overrides. Private arithmetic, algorithm selection, target, or a history
+of selected routes must not select a stricter or looser criterion. State storage dtype alone does
+not prescribe the precision of its internal updates. For Linear-family Ops, `A16Only`, `AllowA8`,
+and `AllowA4` select the A16, A8, and A4 criteria respectively, regardless of which arithmetic the implementation
 chooses. A permissive policy retains its criterion when a route uses higher precision. Input
 recipes and sampling are separate from that choice; tests must not inspect selectors or infer
 precision from T to select a criterion.

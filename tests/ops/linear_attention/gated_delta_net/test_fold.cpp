@@ -12,7 +12,6 @@
 #include "core/linear_attention_state.h"
 #include "core/weight.h"
 #include "ops/input_projection_test_common.h"
-#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -287,6 +286,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const Tensor q_tensor(q.span(), DType::BF16, {kStateDim, kQkHeads, width, 1});
     Tensor local_state_tensor(local_state.span(), DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
+    DeviceBuffer reference_slot = to_device(std::vector<std::int32_t>{0});
+    Tensor selected_reference_slot(reference_slot.span(), DType::I32, {1});
     Tensor output(out.span(), DType::BF16, {kStateDim, profile.value_heads, width, 1});
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
 
@@ -349,9 +350,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                     DType::FP32, {profile.value_heads, 1});
                 Tensor output_token =
                     output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
-                ops::detail::gated_delta_net::launch_recurrent_inout(
+                ops::gated_delta_net_batch_update(
                     query, key, value, g_tensor, beta_tensor, kScale, true, local_state_tensor,
-                    local_state_tensor, output_token, nullptr);
+                    selected_reference_slot, selected_reference_slot, output_token,
+                    ninfer::test::cuda_environment().default_execution);
                 if (token + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.data(), recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr),

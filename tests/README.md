@@ -135,6 +135,12 @@ or recurrent execution bit for bit; those computations have separate mathematica
 Linear and fused projection suites select their A4 criterion for `AllowA4` and A8 criterion for
 `AllowA8`, including when an implementation chooses higher precision for a small input.
 
+GDN recurrence uses one output criterion and one final-state criterion across running and
+state-pool updates, normalization choices, targets, token extents and continuation partitions.
+Its independent FP64 oracle starts from represented inputs and retains the complete history.
+Replay record/fold uses public one-token state-pool updates to produce its exact reference
+snapshots; their bitwise consistency remains separate from recurrence's mathematical accuracy.
+
 Large independent output rows may use fixed samples of the complete mathematical formula.
 QSA sparse GQA checks all live queries up to 64 per batch row; larger rows use fixed boundary,
 interior and tail queries. GPU extents remain unchanged. QSA checks every output cell for a write

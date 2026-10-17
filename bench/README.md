@@ -636,18 +636,18 @@ valid-prefix extents supplied by `--valid-columns`.
   --op snapshot --format nvfp4 --n 16384 --k 5120 --policy allow-a4 --sweep 1:17
 ./build/rtx5090-dev/bench/ninfer_gdn_input_proj_bench \
   --op record --format fp8 --n 16384 --k 5120 --policy allow-a8 \
-  --tokens 6 --batch 3 --valid-columns 6,3,1 --csv-out out/bench/gdn-record.csv
+  --tokens 6 --batch 3 --valid-columns 6,3,1 --csv-out .agent-tmp/gdn/record.csv
 ```
 
 `ninfer_gated_delta_net_bench` selects `--mode running|batch-update|chunked-raw|chunked-normalized|recurrent`.
 Running and batch-update call public Ops. The other modes force a production mechanism for
 crossover analysis; `chunked-raw` normalizes raw Q/K inside prepare, while `chunked-normalized`
 supplies pre-normalized BF16 inputs and skips that normalization. `--breakdown` additionally
-times the private prepare and recurrence stages. `stage_share_pct` partitions the sum of isolated
-stage medians; `relative_to_total_pct` compares each stage with the complete pipeline. Separate
-cache conditioning means isolated medians are not an additive breakdown of pipeline latency.
-`logical_bytes` counts contract tensors once; `tensor_io_request_bytes` and
-`workspace_request_bytes` estimate CTA requests, not measured DRAM traffic.
+times the private prepare and recurrence stages. Separate cache conditioning means these isolated
+medians are not an additive breakdown of pipeline latency. `value_tile` identifies the selected
+chunked stripe for interpreting packet reuse. `--qk-norm composed` measures two public L2Norm
+calls followed by a batch update at B=1; its scratch footprint includes the two materialized
+BF16 Q/K tensors.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_gated_delta_net_bench \
@@ -665,6 +665,40 @@ record measures one recurrence layer. Specify actual `--layers`, `--value-heads`
 `--commits dense|one|mixed|N[,N...]` selects fold lengths, including zero;
 `--valid dense|mixed|N[,N...]` selects positive record prefixes. Host fold rows are captured
 at graph construction; eager timing includes their submission on every call.
+
+Both recurrence and Replay CSVs report the same traffic fields:
+
+- `logical_read_bytes`, `logical_write_bytes`, and `logical_bytes` count unique boundary payloads
+  by direction. Full calls exclude internal workspace; isolated stages include their workspace
+  inputs or outputs. Reads and writes to the same address count separately.
+- `state_read_bytes` and `state_write_bytes` are the recurrent-state subset of logical traffic.
+  With `S=4*128*128*Hv` bytes per row/layer, running reads/writes S once, independent of T.
+  Batch update reads/writes B*S, record reads B*S without writing state, and fold reads/writes
+  L*A*S, where A is the number of nonzero commit rows. Neither T nor chunk count multiplies S.
+- `record_read_bytes` and `record_write_bytes` are the raw recurrence/convolution-record subset.
+  Record counts valid input/record prefixes and the full output including zeroed suffixes.
+  Fold reads only committed K/V/gates and the final required convolution-history columns;
+  zero-commit rows contribute no state or record bytes. Convolution history also contributes
+  to logical traffic, separately from the recurrent-state subset.
+- `workspace_read_request_bytes` and `workspace_write_request_bytes` count intermediate payload
+  accesses, including repeated packet reads. For C=ceil(T/16), current chunked prepare writes
+  `C*(8192*Hq+2304*Hv)` bytes; recurrence reads `C*Hv*(128/value_tile)*(8192+2304)` bytes.
+  Full packets include tail padding. Capacity/alignment alone is not an access count.
+- `modeled_request_bytes` includes repeated source Q/K reads and intermediate traffic for the
+  chunked implementation. It is absent for recurrent/Replay and composed calls, which do not
+  maintain a complete request model; unique logical bytes are never substituted for it.
+- `active_rows` counts rows with work; `valid_tokens` sums their valid/committed lengths, without
+  multiplying by layers. Physical T/B and L remain separate columns.
+
+`logical_GBps` and `modeled_request_GBps` divide their respective bytes by the complete measured
+body's median time. Neither is measured DRAM bandwidth. `memory_roofline_GBps` is the target's
+nominal memory bandwidth; `streaming_memory_reference_us` is logical bytes divided by that rate.
+It assumes streaming reads and writes and is not a lower bound for cache-resident execution.
+Cold samples evict before the timed body; they do not force its output writes back from L2 to
+DRAM before the stop event. Logical bandwidth can therefore exceed nominal DRAM bandwidth even
+in a cold row, particularly for an in-place state update that fits in L2.
+The calibrated read-only bandwidth is not used as a mixed-read/write reference. Cache reuse
+within a full chunked pipeline can also serve workspace requests without a DRAM round trip.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_gdn_replay_bench \

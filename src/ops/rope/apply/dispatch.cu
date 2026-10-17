@@ -1,6 +1,7 @@
 #include "ops/rope/apply/dispatch.h"
 #include "ops/common/host/operands.h"
 #include "ops/rope/apply/launch.cuh"
+#include "core/platform.h"
 
 #include <algorithm>
 
@@ -79,8 +80,18 @@ Selection select_rope(const RopeArguments& a, int multiprocessors) {
         }
     }
     if (axes == 2 && a.rotary_dim == 72 && a.theta == 10'000.0F && first_heads == 16) {
-        if (a.second && second_heads == 16)
+        if (a.second && second_heads == 16) {
+#if NINFER_TARGET_SPARK
+            if (tokens < 32) return {launch_rope_fixed<RopeKernelMode::AxialD72R72, 16, 16>, 512};
+            if (common::operand::aligned(a.first.data, 8) &&
+                common::operand::aligned(a.second->data, 8) && a.first.nb[2] % 8 == 0 &&
+                a.second->nb[2] % 8 == 0)
+                return {launch_rope_axial_vector<256>, 256};
+            return {launch_rope_fixed<RopeKernelMode::AxialD72R72, 16, 16>, 256};
+#else
             return select_fixed<RopeKernelMode::AxialD72R72, 16, 16>(tokens, multiprocessors);
+#endif
+        }
         if (!a.second)
             return select_fixed<RopeKernelMode::AxialD72R72, 16, 0>(tokens, multiprocessors);
     }

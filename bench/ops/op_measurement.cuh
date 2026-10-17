@@ -275,6 +275,34 @@ private:
     std::ostream* out_ = &std::cout;
 };
 
+// One complete, stateless or restored Op with a logical-byte roofline model.
+class LogicalBenchmark {
+public:
+    explicit LogicalBenchmark(const Options& options)
+        : options_(options), flush_(options.flush_bytes),
+          csv_(options.csv_out, "logical_bytes,logical_gb_s,bandwidth_reference_us") {}
+
+    template <class Launch, class Restore>
+    void run(const Row& row, std::size_t logical_bytes, Launch&& launch, Restore&& restore) {
+        for (const auto& execution : selections(options_.execution, "graph", "eager"))
+            for (const auto& cache : selections(options_.cache, "cold", "warm")) {
+                const auto result =
+                    measure(launch, restore, flush_, device_context().execution_view(), options_,
+                            execution, cache);
+                csv_.write(row, result, execution, cache,
+                           std::to_string(logical_bytes) + ',' +
+                               format_metric(logical_bytes / (result.gpu.median_us * 1000), 3, "") +
+                               ',' +
+                               format_metric(logical_bytes / (kRoofline.memory_gbs * 1000), 3, ""));
+            }
+    }
+
+private:
+    Options options_;
+    L2FlushBuffer flush_;
+    Csv csv_;
+};
+
 inline DeviceBuffer make_i32(const std::vector<int>& values) {
     DeviceBuffer result(ninfer::bench::device_context().device(), values.size() * sizeof(int));
     result.copy_from_host(values.data(), result.size());

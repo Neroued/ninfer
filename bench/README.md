@@ -1469,9 +1469,13 @@ cmake --build build/rtx5090-dev --parallel --target \
 ./build/rtx5090-dev/bench/ninfer_add_bias_bench [--d D --columns C]
 ```
 
-Aligned registered shapes use 16-byte BF16 packs in the cache-sized regime. GELU and AddBias
-select their BF16x2 streaming routes for larger Vision items; odd or unaligned repository-internal
-test shapes exercise the scalar fallbacks.
+LayerNorm, RoPE, position interpolation, AddBias, GELU and ResidualAdd use the shared Op
+measurement harness: `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup`,
+`--repeat` and `--csv-out`. Defaults are Graph, both cache states, 10 warmups and 100 samples.
+Each sample contains one complete Op; mutable inputs are restored outside the timed interval.
+CSV reports geometry, execution/cache mode, GPU/Host timings, logical bytes and their bandwidth
+reference time. The logical model counts norm/bias vectors once, RoPE positions once, and each
+distinct interpolation table row once. Repeated table gathers and cache hits are not DRAM traffic.
 
 ## Causal conv1d SiLU Op benchmark
 

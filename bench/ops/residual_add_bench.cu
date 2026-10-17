@@ -18,7 +18,7 @@ using namespace ninfer::bench;
 
 namespace {
 
-void run(int d, int tokens) {
+void run(int d, int tokens, measurement::LogicalBenchmark& benchmark) {
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(tokens);
     DeviceBuffer y      = make_bf16(n, 101U);
     DeviceBuffer x      = make_bf16(n, 103U);
@@ -27,13 +27,9 @@ void run(int d, int tokens) {
     Tensor ty(y.span(), DType::BF16, {d, tokens});
     Tensor tx(x.span(), DType::BF16, {d, tokens});
 
-    const Result result = bench_loop_prepared(
-        restore, [&](CudaExecutionView cuda) { ops::residual_add(ty, tx, cuda); },
-        static_cast<double>(n) * 6.0);
-
-    char tag[96];
-    std::snprintf(tag, sizeof(tag), "residual_add [%d,%-5d]", d, tokens);
-    print_result(tag, result);
+    benchmark.run(
+        {.op = "residual-add", .format = "bf16", .n = d, .tokens = tokens}, n * 6,
+        [&](CudaExecutionView cuda) { ops::residual_add(ty, tx, cuda); }, restore);
 }
 
 } // namespace
@@ -47,7 +43,9 @@ int main(int argc, char** argv) try {
 
     int d = 1152;
     std::vector<int> tokens;
+    measurement::Options timing;
     for (int i = 1; i < argc; ++i) {
+        const char* flag = argv[i];
         if (!std::strcmp(argv[i], "--patches") && i + 1 < argc) {
             if (!tokens.empty()) {
                 std::fprintf(stderr, "--patches and --tokens are mutually exclusive\n");
@@ -67,13 +65,20 @@ int main(int argc, char** argv) try {
                 return 2;
             }
             tokens = measurement::integers(argv[++i]);
-        } else {
+        } else if (!std::strcmp(argv[i], "--help")) {
+            std::cout << "ResidualAdd: --d 1152|2048|5120 --tokens T[,T...] or --patches P\n";
+            measurement::help();
+            return 0;
+        } else if (!measurement::parse(timing, flag, measurement::take(argc, argv, i))) {
             std::fprintf(stderr,
                          "usage: %s [--d 1152|2048|5120] [--tokens T[,T...] | --patches P]\n",
                          argv[0]);
             return 2;
         }
     }
+    measurement::hardware();
+    measurement::LogicalBenchmark benchmark(timing);
+
     for (const int tokens_value : tokens) {
         if (tokens_value <= 0) {
             std::fprintf(stderr, "tokens must be positive\n");
@@ -83,7 +88,7 @@ int main(int argc, char** argv) try {
     if (tokens.empty()) {
         tokens = {8, 256, 4096, 49152, 65536};
     }
-    for (const int tokens_value : tokens) { run(d, tokens_value); }
+    for (const int tokens_value : tokens) { run(d, tokens_value, benchmark); }
     return 0;
 } catch (const std::exception& error) {
 

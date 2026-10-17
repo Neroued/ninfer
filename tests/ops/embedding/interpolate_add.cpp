@@ -18,9 +18,8 @@ using namespace ninfer::test;
 
 namespace {
 
-// Full-matrix measurements against the direct FP64 ideal peak at 3.891e-3 relative error. One
-// strict pointwise criterion covers every output element in both registered cases; there is no
-// tail or normwise escape path.
+// BF16 RNE contributes at most 2^-8 relative error; the absolute margin covers
+// the four-term sum and residual addition near cancellation.
 constexpr PointwiseCriterion kVisionPositionEmbeddingTolerance{
     /*absolute=*/1.0e-5,
     /*relative=*/3.95e-3,

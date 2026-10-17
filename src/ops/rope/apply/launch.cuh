@@ -38,6 +38,14 @@ void launch_rope_split(const RopeArguments& a, int threads, cudaStream_t stream)
             a.first.nb[2] / 2, a.second_stride());
 }
 
+template <int Block>
+void launch_rope_axial_vector(const RopeArguments& a, int, cudaStream_t stream) {
+    rope_axial_vector_kernel<Block><<<a.positions.ne[0], Block, 0, stream>>>(
+        static_cast<const std::int32_t*>(a.positions.data),
+        static_cast<__nv_bfloat16*>(a.first.data), a.second_data(), a.positions.ne[0],
+        a.first.nb[2] / 2, a.second_stride());
+}
+
 inline void launch_rope_generic(const RopeArguments& a, int threads, cudaStream_t stream) {
     rope_generic_kernel<<<a.positions.ne[0], threads, 0, stream>>>(
         static_cast<const std::int32_t*>(a.positions.data), a.positions.ne[1],

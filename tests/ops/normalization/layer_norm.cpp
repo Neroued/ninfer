@@ -52,7 +52,7 @@ std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::ve
 }
 
 int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near_constant = false,
-             bool bf16x2_unaligned = false) {
+             bool bf16x2_unaligned = false, float constant = 0.f) {
     const std::size_t n = static_cast<std::size_t>(kVisionWidth) * rows;
     std::vector<float> x(n), weight(kVisionWidth), bias(kVisionWidth);
     fill_uniform(x, seed, -4.0F, 4.0F);
@@ -66,6 +66,7 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
             }
         }
     }
+    if (constant != 0.f) std::fill(x.begin(), x.end(), constant);
     round_to_bf16(x);
     round_to_bf16(weight);
     round_to_bf16(bias);
@@ -110,6 +111,9 @@ void add_layer_norm_cases(ninfer::test::OpSuite& suite) {
               {{"execution", "eager"}});
     suite.add("layer_norm/near-constant/1152/4",
               [] { return run_case("layer_norm near-constant [1152,4]", 4, 3201U, true); },
+              {{"execution", "eager"}});
+    suite.add("layer_norm/large-constant/1152/7",
+              [] { return run_case("layer_norm large constant", 7, 3203U, false, false, 1.e30F); },
               {{"execution", "eager"}});
     suite.add("layer_norm/unaligned/1152/7",
               [] { return run_case("layer_norm unaligned [1152,7]", 7, 3202U, false, true); },

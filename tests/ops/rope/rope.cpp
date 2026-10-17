@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "cuda_fixture.h"
 #include "ninfer/ops/rope.h"
@@ -369,13 +370,13 @@ int run_single_case(CudaExecutionView execution, const Geometry& geometry, int h
     return failures;
 }
 
-int run_vision_packed_case(CudaExecutionView execution) {
+int run_vision_packed_case(CudaExecutionView execution, int tokens = 11, bool graph = false) {
     constexpr int kHeadDim = 72;
     constexpr int kHeads   = 16;
-    constexpr int kTokens  = 11;
+    const int kTokens      = tokens;
     constexpr int kPlane   = kHeadDim * kHeads;
     constexpr int kStride  = 3 * kPlane;
-    constexpr Geometry geometry{"vision packed qkv", kHeadDim, kHeadDim, 2, kTokens, kVisionTheta};
+    const Geometry geometry{"vision packed qkv", kHeadDim, kHeadDim, 2, kTokens, kVisionTheta};
 
     const auto q      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4001U);
     const auto k      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4002U);
@@ -408,9 +409,21 @@ int run_vision_packed_case(CudaExecutionView execution) {
     Tensor q_tensor(packed_device.span(), DType::BF16, {kHeadDim, kHeads, kTokens});
     Tensor k_tensor(packed_device.span().subspan(kPlane * 2), DType::BF16,
                     {kHeadDim, kHeads, kTokens});
-    q_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
-    k_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, execution);
+    q_tensor.nb[2]    = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
+    k_tensor.nb[2]    = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
+    const auto launch = [&] {
+        ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, execution);
+    };
+    cuda_synchronize();
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    if (graph) {
+        definition.capture(execution.stream(), launch);
+        executable.instantiate(definition);
+        executable.launch(execution.stream());
+    } else {
+        launch();
+    }
     cuda_synchronize();
 
     const auto got = from_device<std::uint16_t>(packed_device.data(), packed.size());
@@ -506,6 +519,12 @@ void add_rope_cases(ninfer::test::OpSuite& suite) {
 
     suite.add("rope/vision_packed",
               [] { return run_vision_packed_case(cuda_environment().default_execution); });
+    suite.add("rope/vision_packed/t128/graph",
+              [] {
+                  return run_vision_packed_case(cuda_environment().context.execution_view(), 128,
+                                                true);
+              },
+              {{"execution", "graph"}});
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     pair({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);

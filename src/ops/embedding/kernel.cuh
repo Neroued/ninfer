@@ -63,6 +63,20 @@ __global__ void embed_gather_dense_kernel(const std::int32_t* ids, const __nv_bf
     }
 }
 
+template <int Blocks, int Threads>
+__launch_bounds__(Threads) __global__
+    void embed_gather_bf16_d2560_kernel(const std::int32_t* ids, const uint4* table,
+                                        uint4* output) {
+    constexpr int Vectors = 2560 / 8, Tile = Vectors / Blocks;
+    static_assert(Vectors % Blocks == 0);
+    const auto token = blockIdx.x / Blocks, split = blockIdx.x % Blocks;
+    const auto row = std::int64_t(ids[token]);
+    for (int i = threadIdx.x; i < Tile; i += Threads) {
+        const auto vector                              = split * Tile + i;
+        output[std::int64_t(token) * Vectors + vector] = table[row * Vectors + vector];
+    }
+}
+
 __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                        const std::uint8_t* high, const std::uint8_t* scales,
                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T,

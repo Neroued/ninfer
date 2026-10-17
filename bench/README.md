@@ -414,7 +414,7 @@ cmake --build build/rtx5090-dev -j --target ninfer_candidate_selector_bench
 
 ## Embedding Op benchmark
 
-`ninfer_embedding_bench` measures the public quantized embedding profiles: Q6 `[248320,5120]`,
+`ninfer_embedding_bench` measures BF16 `[248320,2560]`, Q6 `[248320,5120]`,
 Q8 `[248320,5120]`, Q8 `[248320,2048]`, and row-scaled FP8 `[248320,5120]`. The default sweep is
 T=1..128; `--tokens` selects other matrix extents. This is an Op column domain, independent of a
 particular speculative algorithm's draft count.
@@ -424,6 +424,9 @@ registered table shape. `--id-pattern normal` uses tokenizer-addressable IDs. `m
 an anchor followed by masks at the explicit `--block-width` period: 248070 for D=5120 and 248077
 for existing Q8/D=2048. Use T=B*W to measure complete proposal blocks. CSV reports unique IDs,
 logical per-token bytes, execution/cache mode, Graph nodes/calls, scratch, and median/min/p95.
+`--format bf16-d2560 --id-pattern repeated` selects the dense table and repeated IDs. CSV also
+reports `unique_bytes` (each selected row once, all outputs and IDs) and its bandwidth reference
+time; repeated-row request bytes are not DRAM traffic.
 
 Each default interval contains one public Op. Cold mode evicts 256 MiB of L2 before timing;
 `--graph-calls 32 --execution graph --cache warm` measures repeated public calls in one Graph and
@@ -441,7 +444,13 @@ cmake --build build/rtx5090-dev -j --target ninfer_embedding_bench
 ./build/rtx5090-dev/bench/ninfer_embedding_bench --format fp8-d5120 --tokens 128 --profile
 ```
 
-## Batched feature scatter benchmark
+## Feature scatter benchmarks
+
+`ninfer_scatter_bench --d 2560 --columns 8 --mapping slots` measures one public feature scatter.
+`--columns` is repeatable. The default `contiguous` mapping injects a consecutive feature span;
+`slots` permutes unique destinations with gaps. Both use the shared single-Op timing options and
+report source reads, destination writes and index reads. Scatter overwrites selected columns,
+so repeated calls do not accumulate changes.
 
 `ninfer_scatter_bf16_batch_bench` measures five public `scatter_bf16_batch` calls. Each copies
 one `[D,W,B]` source into a different D-row slice of the same `[5*D,W,8]` parent pool; default

@@ -1,5 +1,6 @@
 #include "ninfer/ops/indexing.h"
 #include "core/device.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include <cuda_bf16.h>
 #include <algorithm>
@@ -69,11 +70,40 @@ void launch_scatter(const Tensor& source, const Tensor& indices, Tensor& destina
         destination.nb[1] / static_cast<std::int64_t>(sizeof(Unit)));
 }
 
+#if NINFER_TARGET_SPARK
+template <int Blocks, int Threads>
+__launch_bounds__(Threads) __global__
+    void scatter_d2560_kernel(const uint4* source, const std::int32_t* indices, uint4* destination,
+                              std::int64_t source_stride, std::int64_t destination_stride) {
+    constexpr int Vectors = 2560 / 8, Tile = Vectors / Blocks;
+    static_assert(Vectors % Blocks == 0);
+    const auto column = blockIdx.x / Blocks, split = blockIdx.x % Blocks;
+    const auto source_base      = std::int64_t(column) * source_stride;
+    const auto destination_base = std::int64_t(indices[column]) * destination_stride;
+    for (int i = threadIdx.x; i < Tile; i += Threads) {
+        const auto v                      = split * Tile + i;
+        destination[destination_base + v] = source[source_base + v];
+    }
+}
+
+template <int Blocks, int Threads>
+void launch_scatter_d2560(const Tensor& source, const Tensor& indices, Tensor& destination,
+                          cudaStream_t stream) {
+    scatter_d2560_kernel<Blocks, Threads><<<source.ne[1] * Blocks, Threads, 0, stream>>>(
+        static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(indices.data),
+        static_cast<uint4*>(destination.data), source.nb[1] / 16, destination.nb[1] / 16);
+}
+#endif
+
 ScatterLaunch select_scatter(const Tensor& source, const Tensor& destination) {
     if (source.ne[0] % 8 == 0 && common::operand::aligned(source.data, 16) &&
         common::operand::aligned(destination.data, 16) && source.nb[1] % 16 == 0 &&
-        destination.nb[1] % 16 == 0)
+        destination.nb[1] % 16 == 0) {
+#if NINFER_TARGET_SPARK
+        if (source.ne[0] == 2560) return launch_scatter_d2560<5, 64>;
+#endif
         return launch_scatter<8>;
+    }
     if (source.ne[0] % 2 == 0 && common::operand::aligned(source.data, 4) &&
         common::operand::aligned(destination.data, 4) && source.nb[1] % 4 == 0 &&
         destination.nb[1] % 4 == 0)

@@ -229,6 +229,9 @@ void add_scatter_cases(ninfer::test::OpSuite& suite) {
               {{"execution", "eager"}});
     suite.add("scatter/features/5120", [] { return scatter_case(5120, {4, 0, 7, 2}, 9); },
               {{"execution", "eager"}});
+    suite.add("scatter/features/2560",
+              [] { return scatter_case(2560, {8, 0, 6, 2, 10, 4, 14, 12}, 17); },
+              {{"execution", "eager"}});
     suite.add("scatter/features/2048", [] { return scatter_case(2048, {5, 1, 3}, 7); },
               {{"execution", "eager"}});
     suite.add("scatter/features/6", [] { return scatter_case(6, {2, 0}, 4); },

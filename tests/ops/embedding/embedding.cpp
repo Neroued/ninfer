@@ -617,56 +617,72 @@ int validate_fp8(Fp8Table& table) {
     return failures;
 }
 
-int test_dense() {
-    std::vector<std::uint16_t> table(static_cast<std::size_t>(kDenseRows) * kDenseD);
+int test_dense(int dimension = kDenseD, int tokens = 7, int offset = 0, bool graph = false) {
+    std::vector<std::uint16_t> table(static_cast<std::size_t>(kDenseRows) * dimension);
     for (std::int32_t row = 0; row < kDenseRows; ++row) {
-        for (std::int32_t d = 0; d < kDenseD; ++d) {
-            const float value = std::sin(static_cast<float>(row * 17 + d) * 0.03125f) +
-                                static_cast<float>((row + d) % 13 - 6) * 0.125f;
-            table[static_cast<std::size_t>(row) * kDenseD + d] = f32_to_bf16(value);
+        for (std::int32_t d = 0; d < dimension; ++d) {
+            table[static_cast<std::size_t>(row) * dimension + d] = std::uint16_t(
+                (std::uint32_t(row) * 1664525u + std::uint32_t(d) * 1013904223u) >> 8);
         }
     }
-    const std::vector<std::int32_t> ids = {0, kDenseRows - 1, 17, 17, 1024, 1, 2299};
-    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kDenseD) * ids.size());
+    std::vector<std::int32_t> ids(tokens);
+    for (int i = 0; i < tokens; ++i)
+        ids[i] = i % 5 == 0 ? kDenseRows - 1 : (i / 2 * 17) % kDenseRows;
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(dimension) * ids.size());
     for (std::size_t t = 0; t < ids.size(); ++t) {
-        std::copy_n(table.data() + static_cast<std::size_t>(ids[t]) * kDenseD, kDenseD,
-                    expected.data() + t * kDenseD);
+        std::copy_n(table.data() + static_cast<std::size_t>(ids[t]) * dimension, dimension,
+                    expected.data() + t * dimension);
     }
 
-    GuardedDeviceBuffer device_table(table.size() * sizeof(std::uint16_t));
-    device_table.copy_from_host(table.data(), table.size() * sizeof(std::uint16_t));
+    std::vector<std::uint16_t> storage(offset, 0x7d7d);
+    storage.insert(storage.end(), table.begin(), table.end());
+    GuardedDeviceBuffer device_table(storage.size() * 2);
+    device_table.copy_from_host(storage.data(), storage.size() * 2);
+    auto* table_data = static_cast<std::uint16_t*>(device_table.data()) + offset;
     GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
-    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer output((expected.size() + offset) * sizeof(std::uint16_t));
     output.fill(0x7d);
 
     Weight weight{};
     weight.qtype           = QType::BF16;
     weight.layout          = QuantLayout::Contiguous;
     weight.device          = device_table.device();
-    weight.payload         = device_table.data();
-    weight.payload_bytes   = device_table.bytes();
-    weight.qdata           = device_table.data();
+    weight.payload         = table_data;
+    weight.payload_bytes   = table.size() * 2;
+    weight.qdata           = table_data;
     weight.ndim            = 2;
     weight.shape[0]        = kDenseRows;
-    weight.shape[1]        = kDenseD;
+    weight.shape[1]        = dimension;
     weight.padded_shape[0] = kDenseRows;
-    weight.padded_shape[1] = kDenseD;
+    weight.padded_shape[1] = dimension;
     weight.n               = kDenseRows;
-    weight.k               = kDenseD;
+    weight.k               = dimension;
 
     Tensor input(device_ids.span(), DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor result(output.span(), DType::BF16, {kDenseD, static_cast<std::int32_t>(ids.size())});
-    ops::embedding(input, weight, result, ninfer::test::cuda_environment().default_execution);
+    Tensor result(output.span().subspan(offset * 2), DType::BF16,
+                  {dimension, static_cast<std::int32_t>(ids.size())});
+    const auto execution = cuda_environment().context.execution_view();
+    cuda_synchronize();
+    const auto launch = [&] { ops::embedding(input, weight, result, execution); };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    if (graph) {
+        definition.capture(execution.stream(), launch);
+        executable.instantiate(definition);
+        executable.launch(execution.stream());
+    } else
+        launch();
     cuda_synchronize();
 
-    int failures = verify_exact("embedding BF16 [2304,1152]",
+    expected.insert(expected.begin(), offset, 0x7d7d);
+    int failures = verify_exact("embedding BF16",
                                 guarded_to_host<std::uint16_t>(output, expected.size()), expected);
     failures += output.verify_guards("embedding BF16 output");
     failures += verify_input("embedding BF16 ids", device_ids, ids);
     failures += device_table.verify_guards("embedding BF16 table");
     failures += verify_exact("embedding BF16 table",
-                             guarded_to_host<std::uint16_t>(device_table, table.size()), table);
+                             guarded_to_host<std::uint16_t>(device_table, storage.size()), storage);
     return failures;
 }
 
@@ -706,7 +722,14 @@ void add_quantized_cases(OpSuite& suite, std::string format, int width, bool rep
 } // namespace
 
 void add_embedding_cases(ninfer::test::OpSuite& suite) {
-    suite.add("embedding/bf16/rows", test_dense, {{"format", "bf16"}, {"execution", "eager"}});
+    suite.add("embedding/bf16/rows", [] { return test_dense(); },
+              {{"format", "bf16"}, {"execution", "eager"}});
+    for (int tokens : {1, 48, 257})
+        suite.add("embedding/bf16/d2560/t" + std::to_string(tokens),
+                  [=] { return test_dense(2560, tokens, 0, tokens == 48); },
+                  {{"format", "bf16"}, {"execution", tokens == 48 ? "graph" : "eager"}});
+    suite.add("embedding/bf16/d2560/unaligned", [] { return test_dense(2560, 9, 1); },
+              {{"format", "bf16"}, {"execution", "eager"}});
     add_quantized_cases<Q6Table>(suite, "q6", kQ6D, true, {{1}, {7}, {128}},
                                  [] { return Q6Table{}; });
     add_quantized_cases<Q8Table>(suite, "q8", kQ8VisionD, true, {{1}, {6}, {16}, {1024}},

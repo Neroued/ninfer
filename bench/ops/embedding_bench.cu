@@ -31,6 +31,7 @@ constexpr std::int32_t kVocab       = 248320;
 constexpr std::size_t kL2FlushBytes = 256ULL << 20;
 
 enum class Profile {
+    Bf16D2560,
     Q6D5120,
     Q8D5120,
     Q8D2048,
@@ -46,6 +47,8 @@ struct ProfileSpec {
 
 constexpr ProfileSpec profile_spec(Profile profile) {
     switch (profile) {
+    case Profile::Bf16D2560:
+        return {"bf16-d2560", QType::BF16, 2560, 0};
     case Profile::Q6D5120:
         return {"q6-d5120", QType::Q6_G64_FP16, 5120, 64};
     case Profile::Q8D5120:
@@ -59,11 +62,13 @@ constexpr ProfileSpec profile_spec(Profile profile) {
 }
 
 Profile parse_profile(const char* raw) {
+    if (!std::strcmp(raw, "bf16-d2560")) return Profile::Bf16D2560;
     if (!std::strcmp(raw, "q6-d5120")) return Profile::Q6D5120;
     if (!std::strcmp(raw, "q8-d5120")) return Profile::Q8D5120;
     if (!std::strcmp(raw, "q8-d2048")) return Profile::Q8D2048;
     if (!std::strcmp(raw, "fp8-d5120")) return Profile::Fp8D5120;
-    throw std::invalid_argument("--format must be q6-d5120, q8-d5120, q8-d2048, or fp8-d5120");
+    throw std::invalid_argument(
+        "--format must be bf16-d2560, q6-d5120, q8-d5120, q8-d2048, or fp8-d5120");
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -82,7 +87,12 @@ struct PackedLayout {
 
 PackedLayout packed_layout(const ProfileSpec& spec) {
     PackedLayout layout;
-    layout.padded_d            = static_cast<std::int32_t>(align_up(spec.d, 128));
+    layout.padded_d = static_cast<std::int32_t>(align_up(spec.d, 128));
+    if (spec.qtype == QType::BF16) {
+        layout.code_plane_bytes = std::uint64_t(kVocab) * spec.d * 2;
+        layout.payload_bytes    = layout.code_plane_bytes;
+        return layout;
+    }
     const std::uint64_t groups = static_cast<std::uint64_t>(layout.padded_d / spec.group);
     if (spec.qtype == QType::Q6_G64_FP16) {
         layout.code_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 32;
@@ -126,6 +136,10 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, ConstMem
     table.n      = kVocab;
     table.k      = spec.d;
     table.group  = spec.group;
+    if (spec.qtype == QType::BF16) {
+        table.layout = QuantLayout::Contiguous;
+        table.scales = nullptr;
+    }
     if (spec.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         table.scale_ne[0] = kVocab;
         table.scale_nb[0] = 2;
@@ -144,17 +158,19 @@ __device__ std::uint32_t fixture_hash(std::uint32_t x) {
     return x ^ (x >> 16);
 }
 
-// Mode 0/1: Q6 low/high planes; 2: Q8; 3: finite E4M3FN. All codes obey the numeric format.
+// Q6 low/high planes, Q8, finite E4M3FN, and represented BF16 values.
 __global__ void initialize_codes(std::uint32_t* words, std::size_t size, int mode) {
     const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size) return;
-    const int bits   = mode == 0 ? 4 : mode == 1 ? 2 : 8;
+    const int bits   = mode == 0 ? 4 : mode == 1 ? 2 : mode == 4 ? 16 : 8;
     const int values = 32 / bits;
     unsigned packed  = 0;
     for (int j = 0; j < values; ++j) {
         const auto h = fixture_hash(static_cast<std::uint32_t>(i * values + j));
         unsigned code;
-        if (mode < 2) {
+        if (mode == 4) {
+            code = __bfloat16_as_ushort(__float2bfloat16_rn((int(h % 2048) - 1024) / 256.f));
+        } else if (mode < 2) {
             const int q = static_cast<int>(h % 63) - 31;
             code        = mode == 0 ? (q & 15) : ((q & 63) >> 4);
         } else if (mode == 2) {
@@ -180,7 +196,8 @@ __global__ void initialize_scales(std::uint16_t* scales, std::size_t count, bool
 void initialize_payload(const ProfileSpec& spec, const PackedLayout& layout,
                         DeviceBuffer& payload) {
     auto* base      = static_cast<std::uint8_t*>(payload.data());
-    const int mode  = spec.qtype == QType::Q6_G64_FP16   ? 0
+    const int mode  = spec.qtype == QType::BF16          ? 4
+                      : spec.qtype == QType::Q6_G64_FP16 ? 0
                       : spec.qtype == QType::Q8_G32_FP16 ? 2
                                                          : 3;
     const auto fill = [&](std::size_t offset, std::size_t bytes, int selected) {
@@ -192,8 +209,9 @@ void initialize_payload(const ProfileSpec& spec, const PackedLayout& layout,
     fill(0, layout.code_plane_bytes, mode);
     if (layout.high_plane_bytes) fill(layout.high_plane_offset, layout.high_plane_bytes, 1);
     const auto scales = layout.scale_plane_bytes / 2;
-    initialize_scales<<<(scales + 255) / 256, 256>>>(
-        reinterpret_cast<std::uint16_t*>(base + layout.scale_plane_offset), scales, mode == 3);
+    if (scales)
+        initialize_scales<<<(scales + 255) / 256, 256>>>(
+            reinterpret_cast<std::uint16_t*>(base + layout.scale_plane_offset), scales, mode == 3);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -237,8 +255,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--help") {
             std::puts(
-                "usage: ninfer_embedding_bench [--format q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
-                "[--tokens T,...] [--id-pattern normal|masked] [--block-width 2..16] [--execution "
+                "usage: ninfer_embedding_bench [--format "
+                "bf16-d2560|q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
+                "[--tokens T,...] [--id-pattern normal|repeated|masked] [--block-width 2..16] "
+                "[--execution "
                 "eager|graph] [--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                 "[--csv-out PATH] [--profile]");
             std::exit(0);
@@ -269,12 +289,13 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option " + arg);
     }
     if (o.profiles.empty())
-        o.profiles = {Profile::Q6D5120, Profile::Q8D5120, Profile::Q8D2048, Profile::Fp8D5120};
+        o.profiles = {Profile::Bf16D2560, Profile::Q6D5120, Profile::Q8D5120, Profile::Q8D2048,
+                      Profile::Fp8D5120};
     if (o.tokens.empty())
         for (int t = 1; t <= 128; ++t) o.tokens.push_back(t);
     if ((o.execution != "eager" && o.execution != "graph") ||
         (o.cache != "cold" && o.cache != "warm") ||
-        (o.pattern != "normal" && o.pattern != "masked"))
+        (o.pattern != "normal" && o.pattern != "masked" && o.pattern != "repeated"))
         throw std::invalid_argument("invalid execution or ID pattern");
     if (o.graph_calls > 1 && (o.execution != "graph" || o.profile))
         throw std::invalid_argument("bundles require Graph and no profiling");
@@ -284,6 +305,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& layout) {
+    if (spec.qtype == QType::BF16) return spec.d * 4.0 + 4;
     const double encoded =
         spec.qtype == QType::Q6_G64_FP16 ? layout.padded_d * 0.75 : layout.padded_d;
     return encoded + (layout.padded_d / spec.group) * 2 + spec.d * 2 + 4;
@@ -300,7 +322,9 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     const int mask = spec.d == 2048 ? 248077 : 248070;
     for (int i = 0; i < max_t; ++i) {
         const int normal = (static_cast<std::int64_t>(i) * 9973 + 12345) % 248077;
-        host_ids[i]      = o.pattern == "masked" && i % o.block_width ? mask : normal;
+        host_ids[i]      = o.pattern == "repeated"                      ? 12345
+                           : o.pattern == "masked" && i % o.block_width ? mask
+                                                                        : normal;
     }
     DeviceBuffer ids(ninfer::bench::device_context().device(), static_cast<std::size_t>(max_t) * 4);
     DeviceBuffer output(ninfer::bench::device_context().device(),
@@ -356,6 +380,9 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
         const auto unique          = std::set<int>(host_ids.begin(), host_ids.begin() + t).size();
         const auto nodes           = o.execution == "graph" ? graph.nodes() : 0;
         const double logical_bytes = logical_bytes_per_column(spec, layout) * t;
+        const double unique_bytes =
+            (logical_bytes_per_column(spec, layout) - spec.d * 2 - 4) * unique +
+            double(t) * (spec.d * 2 + 4);
         std::printf("embedding %s T=%d ids=%s W=%d unique=%zu execution=%s cache=%s nodes=%zu "
                     "calls=%d scratch=0 median=%.3f min=%.3f p95=%.3f us\n",
                     spec.name, t, o.pattern.c_str(), o.block_width, unique, o.execution.c_str(),
@@ -365,7 +392,8 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
             csv << spec.name << ',' << t << ',' << o.pattern << ',' << o.block_width << ',' << mask
                 << ',' << unique << ',' << o.execution << ',' << o.cache << ',' << nodes << ','
                 << o.graph_calls << ",0," << logical_bytes << ',' << result.median_us << ','
-                << result.min_us << ',' << result.p95_us << '\n';
+                << result.min_us << ',' << result.p95_us << ',' << unique_bytes << ','
+                << unique_bytes / (kRoofline.memory_gbs * 1000.) << '\n';
     }
 }
 } // namespace
@@ -383,7 +411,8 @@ int main(int argc, char** argv) {
             csv.open(o.csv);
             if (!csv) throw std::runtime_error("cannot open CSV output");
             csv << "format,T,id_pattern,block_width,mask_id,unique_ids,execution,cache,graph_nodes,"
-                   "graph_calls,workspace_bytes,logical_bytes,median_us,min_us,p95_us\n";
+                   "graph_calls,workspace_bytes,logical_bytes,median_us,min_us,p95_us,unique_bytes,"
+                   "bandwidth_reference_us\n";
         }
         for (const auto profile : o.profiles) run_profile(profile, o, csv);
         return 0;

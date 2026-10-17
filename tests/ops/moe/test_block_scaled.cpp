@@ -519,7 +519,7 @@ int affine_cases(Fixture& f, CudaExecutionView execution) {
     f.weights.routed.bank.down    = copy(f.down, down_codes, down_scales);
     cuda_synchronize(execution.stream());
     int failures = 0;
-    for (int m : {1, 129}) {
+    for (int m : {1, 2, 129}) {
         failures += run(f, execution, m, ops::ExpertSubsetKind::All, false, false, DType::FP32,
                         ops::MoeEpilogue::Write, false);
     }
@@ -616,7 +616,8 @@ int main(int argc, char** argv) {
             add(2, ExpertSubsetKind::MaskZeros, true, false, DType::BF16, MoeEpilogue::AddResidual,
                 true);
         }
-        for (int m : {1, 2, 7, 8, 9, 65, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 4096, 4097}) {
+        for (int m : {1,    2,    7,    8,    9,    65,   511,  512,  513,  1023,
+                      1024, 1025, 2047, 2048, 3071, 3072, 3073, 4096, 4097, 4098}) {
             add(m, ExpertSubsetKind::All, true, true, DType::BF16, MoeEpilogue::Write, true);
         }
         special("shared_only", zero_expert_cases, {{"execution", "graph"}});

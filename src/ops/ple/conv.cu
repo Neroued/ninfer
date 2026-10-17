@@ -1,5 +1,6 @@
 #include "ninfer/ops/ple.h"
 #include "ops/ple/conv_kernel.cuh"
+#include "core/platform.h"
 
 namespace ninfer::ops::detail::ple {
 namespace {
@@ -63,8 +64,19 @@ ConvLaunch select_conv(const ConvArguments& a, bool paired, int multiprocessors)
     if (a.normalized) {
         if (!paired) return launch_conv_norm<256, 1, true>;
         if (columns * kStreams <= 2LL * multiprocessors) return launch_conv_norm<512, 2, true>;
+#if NINFER_TARGET_SPARK
+        if (columns >= 1024) {
+            bool aligned = true;
+            for (const auto* p : {a.kernel, a.history, a.records, a.norm})
+                aligned &= reinterpret_cast<std::uintptr_t>(p) % 8 == 0;
+            for (auto stride : {a.history_column, a.history_slot, a.record_column, a.record_batch})
+                aligned &= stride % 4 == 0;
+            if (aligned) return launch_conv_norm<512, 4, true>;
+        }
+#else
         // Reuse across tokens pays for a separate norm launch in this extent range.
         if (columns >= 1024 && columns <= 2304) return launch_conv_norm<256, 2, false>;
+#endif
         return launch_conv_norm<256, 2, true>;
     }
     if (paired && a.tokens >= 128) return launch_tiled_conv;

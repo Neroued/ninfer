@@ -31,6 +31,14 @@ struct GateFixture {
 
     void restore(CudaExecutionView) const {}
 
+    std::size_t logical_bytes() const {
+        const auto active = std::accumulate(counts.begin(), counts.end(), std::size_t{});
+        const auto rows = std::count_if(counts.begin(), counts.end(), [](int n) { return n > 0; });
+        const auto inactive = std::size_t(tokens) * options.batch - active;
+        return active * (8 * D + 2 * H) + inactive * 2 * D + (active ? 6 * D : 0) +
+               sizeof(int) * (counts.size() + rows);
+    }
+
     void launch(CudaExecutionView execution) {
         const int b = options.batch;
         Tensor parent(projected.span(), DType::BF16, {D + H, tokens, b});
@@ -91,6 +99,21 @@ struct ConvFixture {
         if (saved) saved->restore(cuda);
     }
 
+    std::size_t logical_bytes() const {
+        const bool norm   = options.op == "conv-add-norm";
+        std::size_t bytes = sizeof(int) * counts.size();
+        bool active       = false;
+        for (int n : counts) {
+            bytes +=
+                std::size_t(n) * D * (norm ? 10 : 8) + std::size_t(tokens - n) * D * (norm ? 4 : 2);
+            if (n) {
+                active = true;
+                bytes += std::size_t(3 * std::min(n, 3)) * D * 2 + 2 * sizeof(int);
+            }
+        }
+        return bytes + (active ? std::size_t(D) * (norm ? 10 : 8) : 0);
+    }
+
     void launch(CudaExecutionView execution) {
         const int b = options.batch;
         Tensor h(residual.span(), DType::BF16, {H, C, tokens, b}),
@@ -143,6 +166,12 @@ struct ExtractFixture {
 
     void restore(CudaExecutionView cuda) const {
         if (saved) saved->restore(cuda);
+    }
+
+    std::size_t logical_bytes() const {
+        const auto copies = std::count_if(commits.begin(), commits.end(),
+                                          [&](int n) { return n != 0 || !options.inplace; });
+        return std::size_t(copies) * D * 9 * 4 + commits.size() * 3 * sizeof(int);
     }
 
     void launch(CudaExecutionView execution) {

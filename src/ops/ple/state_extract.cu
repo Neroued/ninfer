@@ -18,8 +18,9 @@ __global__ void extract_kernel(const __grid_constant__ ExtractArguments a) {
     const int c         = (blockIdx.x * blockDim.x + threadIdx.x) * width;
     if (c >= kChannels) return;
     const int b = blockIdx.y, accepted = a.accepted[b];
-    const auto* before  = a.before + a.source[b] * a.before_slot + c;
-    auto* after         = a.after + a.destination[b] * a.after_slot + c;
+    const auto* before = a.before + a.source[b] * a.before_slot + c;
+    auto* after        = a.after + a.destination[b] * a.after_slot + c;
+    if (accepted == 0 && before == after) return;
     const auto* records = a.records + b * a.record_batch + c;
     // Load the complete result before writing: this row may update its source in place.
     Word values[kHistory];

@@ -730,6 +730,11 @@ Gate consumes slices of one packed BF16 `[12800,T,B]` K/V parent and writes U pl
 It has no in-place form. Its unique activation traffic is 85 KiB per active token, plus U zero
 writes for inactive tokens; the three norm vectors total 60 KiB and are reused across tokens.
 This logical-byte count is not a measurement of DRAM traffic or cache reuse.
+CSV reports `logical_bytes`, `logical_gb_s` and `bandwidth_reference_us`, using the target's
+memory bandwidth reference. Conv counts unique active inputs, required history columns, weights
+and both outputs; inactive columns count only zero writes. Extract counts nine columns read and
+written per row, except zero-acceptance rows whose destination already aliases their source.
+Device count/index reads are included; repeated reads and private staging traffic are excluded.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_ple_bench --op gate --tokens 1,16,256,1024,2048,4096 --cache both

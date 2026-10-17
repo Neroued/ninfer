@@ -6,6 +6,8 @@
 
 namespace ninfer::ops::detail::qsa {
 
+enum class SparseGqaWarpSplit { Sequence, Output };
+
 enum class SparseGqaLoad { Direct, Staged, InPlace };
 
 struct SparseGqaPage {
@@ -40,4 +42,18 @@ struct SparseGqaArguments {
         return ((std::int64_t(split) * batch * tokens + q) * 24 + h);
     }
 };
+
+template <int Queries>
+__device__ __forceinline__ bool sparse_gqa_all_selected(const SparseGqaArguments& a,
+                                                        std::int64_t first) {
+    const auto total = std::int64_t(a.tokens) * a.batch;
+    const auto last  = first + Queries < total ? first + Queries : total;
+    if (first / a.tokens != (last - 1) / a.tokens) return false;
+    for (auto q = first; q < last; ++q) {
+        const auto work = a.work(q);
+        if (work.count != work.complete) return false;
+    }
+    return true;
+}
+
 } // namespace ninfer::ops::detail::qsa

@@ -4,7 +4,7 @@ ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_library(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_ops_non_rdc)
 
-# Kernels using setmaxnreg require non-RDC compilation to retain register transfer.
+# Non-RDC kernels keep instruction and register-allocation choices within one translation unit.
 # This private PIC archive joins the shared library through host launchers.
 add_library(ninfer_ops_non_rdc STATIC)
 ninfer_internal_includes(ninfer_ops_non_rdc)

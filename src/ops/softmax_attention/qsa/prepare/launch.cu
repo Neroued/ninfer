@@ -2,6 +2,7 @@
 #include "ops/softmax_attention/qsa/prepare/kernel.cuh"
 
 #include "ops/common/host/operands.h"
+#include "core/platform.h"
 
 #include <array>
 #include <cmath>
@@ -75,18 +76,18 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
 }
 
 struct PreparePlan {
-    bool head_split, bounded_phase, vector_weights;
+    bool token_major, bounded_phase, vector_weights;
 };
 
 PreparePlan select_prepare_plan(const PrepareArguments& args, float theta) {
-    // Head-split distributes short calls across CTAs; larger calls group heads across tokens.
-    return {std::int64_t(args.tokens) * args.batch <= 320, theta >= 1,
+    // Spark keeps adjacent CTAs on contiguous token data, including bulk calls.
+    return {NINFER_TARGET_SPARK || std::int64_t(args.tokens) * args.batch <= 320, theta >= 1,
             common::operand::aligned(args.wq, 16) && common::operand::aligned(args.wiq, 8)};
 }
 
 template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights>
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
-    if (plan.head_split)
+    if (plan.token_major)
         prepare_kernel<Storage, BoundedPhase, VectorWeights, true>
             <<<dim3(args.tokens * 8, args.batch), 128, 0, stream>>>(args);
     else

@@ -18,11 +18,12 @@ struct SparseGqaRaw<Storage, N, true> {
     alignas(16) std::uint8_t scales[N * std::max(K::scale_bytes, V::scale_bytes)];
 };
 
-template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load = SparseGqaLoad::Direct>
+template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load = SparseGqaLoad::Direct,
+          SparseGqaWarpSplit Split = SparseGqaWarpSplit::Sequence>
 struct SparseGqaStorage : SparseGqaRaw<Storage, N, Load == SparseGqaLoad::Staged> {
     union {
         std::uint16_t kv[2 * N * 256];
-        float partial[Warps * 16 * 256];
+        float partial[(Split == SparseGqaWarpSplit::Sequence ? Warps : 1) * 16 * 256];
     };
 
     // Address staging ends before warp reduction. The four address planes fit the same
@@ -38,10 +39,11 @@ struct SparseGqaStorage : SparseGqaRaw<Storage, N, Load == SparseGqaLoad::Staged
     };
 };
 
-template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load>
-__device__ void
-sparse_gqa_addresses(const SparseGqaArguments& a, SparseGqaStorage<Storage, N, Warps, Load>& s,
-                     SparseGqaWork work, std::int64_t q, int head, int start, int end) {
+template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load, SparseGqaWarpSplit Split>
+__device__ void sparse_gqa_addresses(const SparseGqaArguments& a,
+                                     SparseGqaStorage<Storage, N, Warps, Load, Split>& s,
+                                     SparseGqaWork work, std::int64_t q, int head, int start,
+                                     int end) {
     const int i = threadIdx.x;
     if (i < N / 4 && start + i * 4 < end) {
         const int ordinal = start / 4 + i;
@@ -64,9 +66,11 @@ sparse_gqa_addresses(const SparseGqaArguments& a, SparseGqaStorage<Storage, N, W
     __syncthreads();
 }
 
-template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key, SparseGqaLoad Load>
+template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key, SparseGqaLoad Load,
+          SparseGqaWarpSplit Split>
 __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
-                                 SparseGqaStorage<Storage, N, Warps, Load>& s, int start, int end) {
+                                 SparseGqaStorage<Storage, N, Warps, Load, Split>& s, int start,
+                                 int end) {
     using Codec      = SparseGqaCodec<Storage, Key>;
     const auto plane = Key ? a.key : a.value, scale_plane = Key ? a.key_scale : a.value_scale;
     const auto* addresses       = Key ? s.addresses.key : s.addresses.value;
@@ -189,8 +193,9 @@ __device__ __forceinline__ void sparse_gqa_expand_in_place(std::uint16_t* dst,
         sparse_gqa_expand_in_place<Storage, Key, N, Warps, Begin + Rows>(dst, raw);
 }
 
-template <KvCacheStorage Storage, bool Key, int N, int Warps, SparseGqaLoad Load>
-__device__ void sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load>& s) {
+template <KvCacheStorage Storage, bool Key, int N, int Warps, SparseGqaLoad Load,
+          SparseGqaWarpSplit Split>
+__device__ void sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split>& s) {
     using Codec = SparseGqaCodec<Storage, Key>;
     auto* dst   = s.kv + (Key ? 0 : N * 256);
     if constexpr (Load == SparseGqaLoad::InPlace) {

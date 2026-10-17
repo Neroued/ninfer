@@ -199,11 +199,11 @@ No automatic directory scan, missing-file fallback or global shape registry sele
 their own shared-library builds. Keep these device-link boundaries explicit; CUDA consumers do
 not repeat the Ops device link or embed its fatbins.
 
-`ninfer_ops_non_rdc` disables separable compilation and device-symbol resolution. It contains
-the Linear, fused projection, attention and MoE sources that depend on
-`setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA targets
-retain `-lineinfo`.
+`ninfer_ops_non_rdc` disables separable compilation and device-symbol resolution. Its sources have
+no external device calls and use whole-translation-unit compilation for instruction support
+(such as `setmaxnreg`) or measured register allocation. Their owning family manifests register
+these sources into the non-RDC target; host launchers connect them to the normal Ops. All three
+CUDA targets retain `-lineinfo`.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work

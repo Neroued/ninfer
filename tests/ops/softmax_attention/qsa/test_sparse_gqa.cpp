@@ -157,8 +157,8 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                          " T=" + std::to_string(tokens) + " bound=" + std::to_string(bound));
 }
 
-int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded) {
-    Fixture f(3, 4, 2053, padded, storage);
+int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4) {
+    Fixture f(3, batch, 2053, padded, storage);
     f.reset(0, 1);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
     DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
@@ -231,7 +231,7 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded) {
     ninfer::DeviceBuffer workspace_storage(
         ninfer::test::cuda_environment().context.device(),
         ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            storage, 3, 3, 4, f.envelope, device.execution_view().multiprocessor_count()));
+            storage, 3, 3, batch, f.envelope, device.execution_view().multiprocessor_count()));
     MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
@@ -242,8 +242,8 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded) {
 }
 
 int graph_update(DeviceContext& device, int tokens, int batch,
-                 KvCacheStorage storage = KvCacheStorage::BFloat16) {
-    Fixture f(tokens, batch, 8192, true, storage);
+                 KvCacheStorage storage = KvCacheStorage::BFloat16, bool padded = true) {
+    Fixture f(tokens, batch, 8192, padded, storage);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
         storage, tokens, tokens, batch, {262144}, device.execution_view().multiprocessor_count());
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
@@ -316,14 +316,20 @@ int validation(DeviceContext& device) {
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
     f.cache.k_pages      = k;
     const auto execution = device.execution_view();
-    std::size_t maximum  = 0;
-    for (int t = 1; t <= 512; ++t)
-        maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                        KvCacheStorage::BFloat16, t, t, 1, f.envelope,
-                                        execution.multiprocessor_count()));
-    failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                               KvCacheStorage::BFloat16, 1, 512, 1, f.envelope,
-                               execution.multiprocessor_count());
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (int batch : {1, 8}) {
+            std::size_t maximum = 0;
+            for (int t = 1; t <= 512; ++t)
+                maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                storage, t, t, batch, f.envelope,
+                                                execution.multiprocessor_count()));
+            failures += maximum !=
+                        ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                            storage, 1, 512, batch, f.envelope, execution.multiprocessor_count());
+        }
+    }
     return failures;
 }
 
@@ -396,6 +402,11 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
         special(
             "update/t" + std::to_string(t) + "/b" + std::to_string(b),
             [=](auto& device) { return graph_update(device, t, b, storage); }, "graph");
+    special(
+        "update/contiguous/t4/b1",
+        [=](auto& device) { return graph_update(device, 4, 1, storage, false); }, "graph");
+    add_case(suite, 4, 1, 8195, false, 512, 1.8f, false, storage);
+    add_case(suite, 3, 2, 32771, false, 512, 1, true, storage);
     special("read_footprint/padded",
             [=](auto& device) { return read_footprint(device, storage, true); });
     if (storage == KvCacheStorage::BFloat16) {
@@ -415,7 +426,7 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
         for (float magnitude : {0.1f, 1.8f}) add_case(suite, 8, 1, 32772, false, 512, magnitude);
     } else {
         special("read_footprint/contiguous",
-                [=](auto& device) { return read_footprint(device, storage, false); });
+                [=](auto& device) { return read_footprint(device, storage, false, 1); });
         for (auto [t, l] : {std::pair{1, 2051}, {192, 8195}, {256, 65}})
             special("scale_layout/t" + std::to_string(t),
                     [=](auto& device) { return scale_layout(device, storage, t, l); });
@@ -435,6 +446,11 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
             add_case(suite, 8, 1, 32772, false, 512, magnitude, false, storage);
         add_case(suite, 3, 2, 2052, true, 0, 1, true, storage);
     }
+    for (bool padded : {false, true})
+        add_case(suite, 6, 8, 32771, padded, 512, 1.8f, true, storage);
+    // Prefix groups cross batch boundaries and coexist with sparse or inert queries.
+    add_case(suite, 33, 8, 1024, false, 512, 1, false, storage);
+    add_case(suite, 257, 1, 2052, false, 512, 1, false, storage);
     for (int multiplier : {1, 2})
         for (int delta : {-1, 0, 1})
             special("sm_boundary/" + std::to_string(multiplier) + "/delta" + std::to_string(delta),

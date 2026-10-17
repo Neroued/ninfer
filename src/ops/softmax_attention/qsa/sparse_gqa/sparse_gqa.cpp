@@ -32,7 +32,7 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std:
         WorkspaceLayoutBuilder layout;
         detail::qsa::allocate_sparse_gqa_workspace(
             layout, t, batch,
-            detail::qsa::select_sparse_gqa_plan(t, batch, envelope, multiprocessor_count));
+            detail::qsa::select_sparse_gqa_plan(storage, t, batch, envelope, multiprocessor_count));
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return maximum;
@@ -84,7 +84,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
                            &selected.block_counts};
     for (const auto* input : inputs)
         if (input->data) v.require(!v.overlap(out, *input), "output/input overlap");
-    const auto plan    = detail::qsa::select_sparse_gqa_plan(tokens, rows, envelope,
+    const auto plan    = detail::qsa::select_sparse_gqa_plan(cache.storage, tokens, rows, envelope,
                                                              execution.multiprocessor_count());
     auto scope         = workspace.scope();
     const auto scratch = detail::qsa::allocate_sparse_gqa_workspace(workspace, tokens, rows, plan);

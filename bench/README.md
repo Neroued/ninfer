@@ -479,6 +479,9 @@ Fixture preparation and cold-cache eviction precede the timed interval. CSV repo
 geometry, execution/cache mode, GPU and host median/min/p95 microseconds, `workspace_bytes`,
 `workspace_peak`, and `kernels` (actual captured kernel nodes, excluding event nodes).
 RMSNorm uses zero workspace. These measurements establish Op latency, not Engine latency.
+Its CSV includes `logical_bytes`, `logical_gb_s` and `bandwidth_reference_us`: input, optional gate
+and output traffic plus one weight-vector read. The bandwidth reference uses the target's nominal
+memory bandwidth; repeated reads and cache/writeback behavior are not DRAM traffic measurements.
 
 All three benchmarks accept `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
 `--repeat N`, `--flush-mib N` and `--csv-out PATH`. Defaults are Graph, both cache modes,

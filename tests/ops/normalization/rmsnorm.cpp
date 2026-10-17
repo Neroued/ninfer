@@ -218,6 +218,10 @@ void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
             add("rmsnorm hidden scale/unaligned", {5120, 1, 17}, offset, 2001U, scale, true, true);
             add("rmsnorm QK scale/unaligned", {256, 4, 17}, offset, 2002U, scale, true, true);
         }
+    for (int rows : {1, 8, 128, 1024}) {
+        const auto label = "rmsnorm offset2560 rows=" + std::to_string(rows);
+        add(label.c_str(), {2560, 1, rows}, true, 2300U + rows, 4.f, false, rows != 1);
+    }
     for (int rows : {1, 8, 128, 1024, 4096}) {
         const auto label  = "rmsnorm offset10240 rows=" + std::to_string(rows);
         const bool replay = rows == 8 || rows == 128 || rows == 1024;

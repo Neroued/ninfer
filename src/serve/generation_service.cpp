@@ -1,16 +1,17 @@
-#include <charconv>
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::serve {
@@ -43,8 +44,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
                                     std::string_view constraint_param,
                                     std::span<const std::string> tool_schema_params) {
     ApiError error;
-    error.param   = "messages";
-    error.message = exception.what();
+    error.param           = "messages";
+    error.message         = exception.what();
     const auto tool_param = [&] {
         const std::string_view pointer = exception.pointer();
         const auto split               = pointer.find('/', 1);
@@ -62,6 +63,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         return "tools" + exception.pointer();
     };
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidToolOutput:
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "invalid_tool_output";
+        error.param.clear();
+        break;
     case ninfer::RequestErrorKind::InvalidToolConstraint:
         error.status = 400;
         error.code   = "invalid_tool_constraint";
@@ -86,11 +93,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         error.param  = exception.source() == RequestErrorSource::Tools
                            ? tool_param()
                            : std::string(constraint_param) + exception.pointer();
-        error.code = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
-                         ? "invalid_json_schema"
-                     : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
-                         ? "unsupported_json_schema"
-                         : "unsatisfiable_json_schema";
+        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
+                           ? "invalid_json_schema"
+                       : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
+                           ? "unsupported_json_schema"
+                           : "unsatisfiable_json_schema";
         break;
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
@@ -273,14 +280,26 @@ public:
         });
     }
 
-    void publish(ninfer::OutputDelta delta) override {
-        if (delta.text.empty()) { return; }
+    void publish(ninfer::OutputEvent event) override {
         deliver([&] {
-            if (delta.channel == ninfer::OutputChannel::Reasoning) {
-                if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-            } else {
-                if (sink_->on_content) { sink_->on_content(delta.text); }
-            }
+            std::visit(
+                [&](const auto& delta) {
+                    using T = std::decay_t<decltype(delta)>;
+                    if constexpr (std::is_same_v<T, ninfer::OutputDelta>) {
+                        if (delta.text.empty()) return;
+                        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+                            if (sink_->on_reasoning) sink_->on_reasoning(delta.text);
+                        } else if (sink_->on_content)
+                            sink_->on_content(delta.text);
+                    } else if constexpr (std::is_same_v<T, ninfer::ToolCallStart>) {
+                        if (sink_->on_tool_start) sink_->on_tool_start(delta);
+                    } else if constexpr (std::is_same_v<T, ninfer::ToolArgumentsDelta>) {
+                        if (sink_->on_tool_arguments) sink_->on_tool_arguments(delta);
+                    } else {
+                        if (sink_->on_tool_end) sink_->on_tool_end(delta);
+                    }
+                },
+                event);
         });
     }
 
@@ -372,7 +391,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
-    prepared.constraint_param               = request.constraint_param;
+    prepared.constraint_param = request.constraint_param;
     for (const auto& tool : request.tools) prepared.tool_schema_params.push_back(tool.schema_param);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(

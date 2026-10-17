@@ -3,8 +3,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1056,6 +1056,15 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                         result.generation.max_tokens);
+    if (body.contains("tools") && body.at("tools").is_array()) {
+        for (const auto& tool : body.at("tools")) {
+            if (tool.contains("name") && tool.at("name").is_string() &&
+                tool.contains("eager_input_streaming") &&
+                tool.at("eager_input_streaming").is_boolean())
+                result.eager_tool_inputs[tool.at("name").get<std::string>()] =
+                    tool.at("eager_input_streaming").get<bool>();
+        }
+    }
     parse_generation_fields(body, result.generation);
     parse_structured_outputs(body, result.generation);
     return result;

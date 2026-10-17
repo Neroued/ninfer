@@ -341,8 +341,10 @@ constexpr std::array<std::uint8_t, 32> kGradientDigest{
 
 std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
     std::string result;
-    for (const ninfer::OutputDelta& delta : output) {
-        if (delta.channel == channel) { result += delta.text; }
+    for (const auto& event : output) {
+        if (const auto* delta = std::get_if<ninfer::OutputDelta>(&event);
+            delta && delta->channel == channel)
+            result += delta->text;
     }
     return result;
 }
@@ -1933,23 +1935,41 @@ int test_tools_and_json_output() {
                           "discarded output selected a constraint branch");
         const auto branch = text == json ? ninfer::ConstraintOutputBranch::Content
                                          : ninfer::ConstraintOutputBranch::Tools;
-        std::string visible;
+        std::string visible, streamed_arguments;
+        unsigned tool_starts = 0, tool_ends = 0, argument_deltas = 0;
+        const auto observe = [&](const PublishedOutput& output) {
+            visible += channel_text(output, ninfer::OutputChannel::Content);
+            for (const auto& event : output) {
+                if (std::holds_alternative<ninfer::ToolCallStart>(event)) ++tool_starts;
+                if (std::holds_alternative<ninfer::ToolCallEnd>(event)) ++tool_ends;
+                if (const auto* delta = std::get_if<ninfer::ToolArgumentsDelta>(&event)) {
+                    streamed_arguments += delta->text;
+                    if (!delta->text.empty()) ++argument_deltas;
+                }
+            }
+        };
         for (auto token : fixture_tokenizer().encode(text)) {
             (void)session.preview_model(std::span(&token, 1), 1000,
                                         ninfer::FinishReason::OutputLimit);
-            visible += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            observe(session.commit_preview());
             failures += check(session.constraint_observation()->branch == branch,
                               "committed incomplete output lost its branch");
         }
+        failures += check(text == json ? tool_starts == 0 && tool_ends == 0
+                                       : tool_starts == 1 && tool_ends == 1 && argument_deltas > 1,
+                          "tool events leaked a discarded branch or waited until EOS");
         auto complete = session.constraint_observation();
         failures += check(complete && complete->complete && !complete->terminated &&
                               complete->branch == branch,
                           "combined output lost complete-before-EOS state");
         const auto eos = frontend.default_stop_policy().token_ids.front();
         (void)session.preview_model(std::span(&eos, 1), 1, ninfer::FinishReason::OutputLimit);
-        visible += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+        observe(session.commit_preview());
         const auto observed = session.constraint_observation();
         const auto calls    = session.take_tool_calls();
+        failures += check(text == json || (tool_ends == 1 && calls.size() == 1 &&
+                                           streamed_arguments == calls[0].arguments_json),
+                          "streamed tool was duplicated or changed at terminal");
         failures +=
             check(observed->terminated &&
                       observed->branch == (text == json ? ninfer::ConstraintOutputBranch::Content
@@ -2020,7 +2040,7 @@ int test_structured_tool_output() {
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
-        "</parameter>\n<parameter=enabled>\n\n</parameter>\n<parameter=count>\nmany\n"
+        "</parameter>\n<parameter=enabled>\nfalse\n</parameter>\n<parameter=count>\n\"many\"\n"
         "</parameter>\n</function>\n</tool_call>";
     const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
@@ -2037,7 +2057,6 @@ int test_structured_tool_output() {
                           ninfer::ToolCallParseDiagnostics{
                               .marker_seen               = true,
                               .structured_call_count     = 1,
-                              .empty_arguments_omitted   = 1,
                               .schema_mismatch_arguments = 1,
                               .fallback_reason = ninfer::ToolCallParseFallbackReason::None,
                           },
@@ -2045,7 +2064,7 @@ int test_structured_tool_output() {
     if (!calls.empty()) {
         const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
         failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1" &&
-                              !arguments.contains("enabled") && arguments.at("count") == "many",
+                              arguments.at("enabled") == false && arguments.at("count") == "many",
                           "frontend did not preserve normalized tool arguments");
     }
     return failures;

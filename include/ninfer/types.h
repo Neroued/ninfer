@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer {
@@ -344,22 +345,25 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-// Model-origin structured output. Protocol adapters own any wire-level call identifier.
+enum class ToolCallStatus : std::uint8_t { InProgress, Complete, Incomplete };
+
+// Model-origin structured output. Incomplete arguments are an unmodified JSON prefix, not an
+// executable call. Protocol adapters own wire identifiers and their incomplete-result projection.
 struct GeneratedToolCall {
     std::string name;
     std::string arguments_json;
+    ToolCallStatus status = ToolCallStatus::Complete;
+
+    bool operator==(const GeneratedToolCall&) const = default;
 };
 
-// Diagnostics for model-origin tool-call markup. Free generation uses schema-guided value
-// normalization and can return malformed markup as text. Constrained calls use the model's
-// parameter encoding contract and publish only complete calls.
+// Free generation can return an unrecognized tool header as text. Once a declared function has
+// started, malformed output is a request error; previously published arguments are never retracted.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
-    DuplicateParameter,
     InvalidToolName,
     UndeclaredTool,
-    TrailingContent,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -369,14 +373,10 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "none";
     case ToolCallParseFallbackReason::MalformedStructure:
         return "malformed_structure";
-    case ToolCallParseFallbackReason::DuplicateParameter:
-        return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
     case ToolCallParseFallbackReason::UndeclaredTool:
         return "undeclared_tool";
-    case ToolCallParseFallbackReason::TrailingContent:
-        return "trailing_content";
     }
     return "malformed_structure";
 }
@@ -384,7 +384,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 struct ToolCallParseDiagnostics {
     bool marker_seen                            = false;
     std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
 
@@ -539,6 +538,7 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     InvalidToolConstraint,
+    InvalidToolOutput,
     InvalidGrammar,
     InvalidChoice,
     InvalidRegex,
@@ -631,8 +631,28 @@ struct OutputDelta {
     std::string text;
 };
 
+struct ToolCallStart {
+    std::uint32_t index = 0;
+    std::string name;
+};
+
+struct ToolArgumentsDelta {
+    std::uint32_t index = 0;
+    std::string text;
+    // A complete parameter value has been decoded. Protocols requesting buffered parameters can
+    // flush here without parsing or interpreting the model's private framing themselves.
+    bool parameter_complete = false;
+};
+
+struct ToolCallEnd {
+    std::uint32_t index   = 0;
+    ToolCallStatus status = ToolCallStatus::Complete;
+};
+
+using OutputEvent = std::variant<OutputDelta, ToolCallStart, ToolArgumentsDelta, ToolCallEnd>;
+
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
-// OutputDelta, after the prefix choice and materialization reservation are committed and before
+// OutputEvent, after the prefix choice and materialization reservation are committed and before
 // transfer/prefill execution.
 struct GenerationStart {
     PromptSummary prompt;
@@ -651,7 +671,7 @@ struct PromptProgress {
 
 // Cumulative timing snapshot at one stable output-commit boundary. Generated tokens count model
 // and Engine-injected tokens accepted into the sequence, independently of whether the Frontend has
-// enough visible bytes to publish an OutputDelta for that boundary.
+// enough visible bytes to publish an OutputEvent for that boundary.
 struct GenerationTimingObservation {
     std::uint32_t generated_tokens      = 0;
     std::uint64_t prompt_elapsed_ns     = 0;
@@ -664,7 +684,7 @@ public:
     virtual void start(GenerationStart start)               = 0;
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
-    virtual void publish(OutputDelta delta)                 = 0;
+    virtual void publish(OutputEvent event)                 = 0;
 };
 
 enum class OutputConsumerMode : std::uint8_t {
@@ -833,8 +853,8 @@ struct ContextKvPoolUsage {
     friend bool operator==(const ContextKvPoolUsage&, const ContextKvPoolUsage&) = default;
 };
 
-// Frozen immediately before the first nonempty public output delta is published. This boundary
-// differs from the first accepted model token and from the client's first HTTP output. Elapsed
+// Frozen before the first nonempty text or tool-argument delta; call metadata does not count.
+// This differs from the first accepted model token and the client's first HTTP output. Elapsed
 // starts at Engine submission, excluding Frontend preparation. Initial queue, initial binding,
 // paused time and the remaining resident interval partition this Engine wall time.
 struct GenerationFirstOutputTiming {

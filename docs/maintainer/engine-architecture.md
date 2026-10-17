@@ -400,6 +400,19 @@ Forced control 使用同一提交机制，token 由 Frontend 提供，不调用 
 初次 admission 确立后，在任何输出 delta 前发布一次 `GenerationStart`；抢占恢复不重复发布它。
 最终 response 等待 terminal 资源及缓存 owner 结算完成。
 
+公共 OutputEvent 包含正文/思考增量、工具调用开始、参数增量和调用结束。Qwen OutputSession
+在 commit 后推进请求独占的增量工具 decoder；Engine 将这些事件按顺序交给 wait() 的消费线程，
+HTTP 写入不在 GPU worker 上执行。聚合与 Streaming 使用同一参数转码结果。工具序号在请求内
+稳定，协议 call/item/block ID 由各适配器从开始事件分配。调用状态区分 InProgress、Complete
+和 Incomplete，未完成参数保留已经发布的 JSON 前缀。
+
+工具 decoder 通过结构化 output_error 区分自由生成格式错误与受约束输出合同违规；worker 在
+本批提交完成后 abort 该 sequence、释放其所有权，分别结算 InvalidToolOutput 或内部错误。
+正常可隔离的解析失败不进入 Engine 全局异常清理。工具参数名称状态与静态 matcher 一起参与
+每个 speculative 位置的 mask、preview、confirm 和 discard；它不消费 Replay 的历史 token。
+暂停保留 decoder 状态，Replay 不再次消费或发布历史参数；最终调用状态与实际结束原因分别保留。
+
+
 ## 6. 结束、取消与失败
 
 成功结束时，Program 将可保留 continuation 交给 ResourceManager，或释放 sequence；ResourceManager

@@ -178,7 +178,10 @@ public:
         last_timing_ = timing;
     }
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        const auto* text = std::get_if<ninfer::OutputDelta>(&event);
+        if (!text) return;
+        const auto& delta = *text;
         if (!timing_seen_) { valid_ = false; }
         published_output_ = published_output_ || !delta.text.empty();
     }

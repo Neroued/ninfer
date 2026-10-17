@@ -139,6 +139,27 @@ def test_fragmented_utf8_and_multiple_frames_keep_completion_timestamp():
     assert result["output_gap_ns"] == [0]
 
 
+def test_tool_identity_is_metadata_and_only_argument_bytes_are_output():
+    decoder = SseDecoder()
+    adapter = ChatStreamAdapter()
+
+    def consume(call, when):
+        payload = {"id": "chatcmpl_tool", "choices": [{"index": 0, "delta": {"tool_calls": [call]}}]}
+        wire = ("data: " + json.dumps(payload) + "\n\n").encode()
+        return [event for frame in decoder.feed(wire, when) for event in adapter.consume(frame)]
+
+    start = consume({"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "write", "arguments": ""}}, 3_000_000)
+    assert [event.kind for event in start] == ["metadata"]
+    first = consume({"index": 0, "function": {"arguments": '{"content":"'}}, 5_000_000)
+    second = consume({"index": 0, "function": {"arguments": "<html>"}}, 8_000_000)
+    assert first[0].output == '{"content":"'
+    assert second[0].output == "<html>"
+    result = record([*start, *first, *second, ProtocolEvent("terminal", "done", 15_000_000)])
+    assert result["ttft_ns"] == 4_000_000
+    assert result["output_gap_ns"] == [3_000_000]
+
+
 def campaign(tmp_path: Path, records, *, notes=None, constructed=True):
     raw = tmp_path / "run.json"
     raw.write_text("{}")
@@ -223,7 +244,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 30,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -296,7 +317,7 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=29, final=None, state_bytes=0, main_bytes=0,
+def runtime_interval(*, schema=30, final=None, state_bytes=0, main_bytes=0,
                      host_seconds=0.0, occupied=0, peak=None):
     occupancy = {"device_state_slots": 1, "host_state_slots": 1,
                  "host_kv_bytes": occupied, "host_context_occupied_bytes": occupied,
@@ -628,7 +649,7 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": 30,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -673,7 +694,7 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 30,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

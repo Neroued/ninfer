@@ -94,6 +94,7 @@ void validate(const ninfer::GenerationResult& result, std::string_view name = "r
 
 struct Sink final : ninfer::OutputSink {
     std::string content;
+    std::vector<ninfer::GeneratedToolCall> calls;
 
     void start(ninfer::GenerationStart) override {}
 
@@ -101,8 +102,26 @@ struct Sink final : ninfer::OutputSink {
 
     void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
-        if (delta.channel == ninfer::OutputChannel::Content) content += delta.text;
+    void publish(ninfer::OutputEvent event) override {
+        std::visit(
+            [&](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, ninfer::OutputDelta>) {
+                    if (value.channel == ninfer::OutputChannel::Content) content += value.text;
+                } else if constexpr (std::is_same_v<T, ninfer::ToolCallStart>) {
+                    require(value.index == calls.size(), "streamed tool index skipped or repeated");
+                    calls.push_back({value.name, {}, ninfer::ToolCallStatus::InProgress});
+                } else if constexpr (std::is_same_v<T, ninfer::ToolArgumentsDelta>) {
+                    require(calls.at(value.index).status == ninfer::ToolCallStatus::InProgress,
+                            "argument delta has no active call");
+                    calls[value.index].arguments_json += value.text;
+                } else {
+                    require(calls.at(value.index).status == ninfer::ToolCallStatus::InProgress,
+                            "tool end has no active call");
+                    calls[value.index].status = value.status;
+                }
+            },
+            event);
     }
 };
 
@@ -125,6 +144,7 @@ void exercise_basic(ninfer::Engine& engine, unsigned concurrency, bool speculati
     require(sink.content == result.content &&
                 result.content.find("<tool_call>") == std::string::npos,
             "default tool framing leaked into the text stream");
+    require(sink.calls == result.tool_calls, "streamed arguments differ from Engine result");
     for (const auto& call : result.tool_calls)
         require(call.name == "record" && Json::parse(call.arguments_json).is_object(),
                 "default tool output is not a callable argument object");

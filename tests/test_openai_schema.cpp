@@ -1,3 +1,4 @@
+#include "serve_tool_stream_fixture.h"
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
@@ -878,20 +879,22 @@ int test_stream_response() {
     GenerationOutcome tool_outcome;
     tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
-    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
-    const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
-    const Json tool_delta                      = parse_sse(tool_events[0]);
+    tool_outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const auto tool_events     = emit_tools(tool_stream, tool_outcome.tool_calls);
+    const auto tool_finish     = tool_stream.finish(tool_outcome);
+    const Json tool_delta      = parse_sse(tool_events[0]);
     failures += check(
         tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
             "call_") &&
             tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
-            parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
+            parse_sse(tool_finish[0])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
     OpenAIChatStream interrupted(identity(), false);
     (void)interrupted.start();
     tool_outcome.finish_reason = ninfer::FinishReason::OutputLimit;
-    const auto partial_events  = interrupted.finish(tool_outcome);
-    failures += check(parse_sse(partial_events[1])["choices"][0]["finish_reason"] == "length",
+    (void)emit_tools(interrupted, tool_outcome.tool_calls);
+    const auto partial_events = interrupted.finish(tool_outcome);
+    failures += check(parse_sse(partial_events[0])["choices"][0]["finish_reason"] == "length",
                       "streamed completed call hid a later truncation");
     return failures;
 }

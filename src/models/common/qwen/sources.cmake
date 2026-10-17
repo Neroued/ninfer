@@ -10,6 +10,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_call_parser.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_contract.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_grammar.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_name_constraint.cpp"
 )
 
 target_sources(ninfer_model_loading PRIVATE

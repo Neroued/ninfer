@@ -311,6 +311,16 @@ physical state/KV ownership, binding, capture, reclamation and abort; their posi
 Public-HTTP latency and output gaps are measured separately by the
 [TTFT campaign](../tools/bench/ttft/README.md).
 
+`ninfer_tool_streaming_test` checks incremental tool arguments without loading weights: long HTML
+strings and JSON containers, byte-split Unicode/framing, completion and interruption at every
+boundary, continuation initialization, request-local format errors, stable protocol IDs, and
+Chat/Responses/Anthropic argument equivalence. It also checks Anthropic eager versus parameter-buffered
+publication, terminal-reason and item-status consistency, and exclusion of incomplete calls from
+executable history. Unknown parameter types
+wait for parameter completion before inference; known JSON encodings do not repair malformed values.
+`ninfer_qwen_tool_constraints_test` additionally checks open-name uniqueness before sampling,
+whole-token boundary crossings, speculative rollback, independent requests, and continuation seeds.
+
 `ninfer_qwen3_5_tools_real_test [none|mtp|dflash|dflash2] [graph|eager|basic|snapshot|replay|cancel] [concurrency]`
 uses `NINFER_TEST_ARTIFACT` for strict tools, thinking, raw continuation, mixed batches, and
 call/result prefix reuse, and required-tool → JSON continuation with committed constraint observations.

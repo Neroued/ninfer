@@ -100,6 +100,10 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
    * is not thread-safe.*/
   Grammar Convert(const SchemaSpecPtr& spec);
 
+  // Standalone JSON values with the same string and numeric representation as nested tool
+  // arguments. Like Convert(), this initializes a fresh converter exactly once.
+  Grammar ConvertJSONValue();
+
  protected:
   // Override methods for XML format
   int32_t GenerateInteger(const IntegerSpec& spec, const std::string& rule_name) override;

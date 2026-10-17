@@ -78,6 +78,9 @@ struct StreamSink {
     std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(const ninfer::ToolCallStart&)> on_tool_start;
+    std::function<void(const ninfer::ToolArgumentsDelta&)> on_tool_arguments;
+    std::function<void(const ninfer::ToolCallEnd&)> on_tool_end;
     std::function<bool()> is_cancelled;
 };
 
@@ -102,7 +105,7 @@ struct PreparedRequest {
     ninfer::ResolvedSamplingParameters sampling;
     // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
     double service_prepare_seconds = 0.0;
-    double acquisition_seconds = 0.0;
+    double acquisition_seconds     = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;

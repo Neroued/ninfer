@@ -228,10 +228,13 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
     std::ostringstream out;
     out << "req#" << context.id << " done | " << protocol_name(context.protocol) << " | ";
-    if (outcome.tool_calls.empty()) {
+    const auto complete_calls =
+        std::count_if(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                      [](const auto& call) { return call.status == ToolCallStatus::Complete; });
+    if (complete_calls == 0) {
         out << finish_reason_name(outcome.finish_reason);
     } else {
-        out << "tool calls " << product::format_pretty_count(outcome.tool_calls.size());
+        out << "tool calls " << product::format_pretty_count(complete_calls);
     }
     out << " | prompt "
         << product::format_pretty_count(

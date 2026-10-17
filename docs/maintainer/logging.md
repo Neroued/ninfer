@@ -158,10 +158,13 @@ machine terminal: `request_done` immediately after `GenerationService::run()` re
 transport happen after that transaction; their failures are operational `response` records and do
 not create a second request JSONL terminal.
 
-Tool-call parameter normalization remains a successful request outcome. Empty-argument omissions
-and schema mismatches are machine-only counters. If a complete tool marker must be returned to text
-because its structure or declared identity cannot be represented, Serve emits one warning carrying
-only the stable fallback classification; generated markup and arguments remain excluded.
+Tool-call buffered inference remains a successful request outcome. Schema mismatches are
+machine-only counters. Request JSONL version 30 removes the obsolete empty-argument omission
+counter: parameters encoded as JSON must contain a JSON value. If an unrecognized tool header is
+returned to text before a call starts, Serve emits one warning carrying only the stable fallback
+classification. Malformed structure or parameter JSON after a recognized header is a request error
+on the free-generation route. A constrained decoder failure is reported as an internal contract
+violation. Generated markup and arguments remain excluded.
 
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.

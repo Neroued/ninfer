@@ -5,6 +5,7 @@
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
 #include "serve/translate.h"
+#include "serve_tool_stream_fixture.h"
 
 #include <nlohmann/json.hpp>
 
@@ -702,11 +703,14 @@ int test_namespace_tools() {
     stream_request.stream                       = true;
     OpenAIResponsesEventStream stream("resp_namespace_stream", 1, stream_request, {});
     (void)stream.start();
+    auto tool_events                           = emit_tools(stream, outcome.tool_calls);
     const OpenAIResponsesStreamFinish streamed = stream.finish(outcome);
-    bool saw_added                             = false;
-    bool saw_done                              = false;
-    bool saw_item_done                         = false;
-    for (const std::string& wire : streamed.events_before_terminal) {
+    tool_events.insert(tool_events.end(), streamed.events_before_terminal.begin(),
+                       streamed.events_before_terminal.end());
+    bool saw_added     = false;
+    bool saw_done      = false;
+    bool saw_item_done = false;
+    for (const std::string& wire : tool_events) {
         const Json event = parse_event(wire);
         if (event.at("type") == "response.output_item.added" &&
             event.at("item").at("type") == "function_call") {
@@ -989,6 +993,7 @@ int test_response_object() {
               "truncation lost a completed call or hid the incomplete response");
     OpenAIResponsesEventStream stream("resp_partial_stream", 123, request, runtime);
     (void)stream.start();
+    (void)emit_tools(stream, tools.tool_calls);
     const auto finish   = stream.finish(tools);
     const auto terminal = parse_event(stream.terminal(finish.response));
     failures += check(terminal.at("type") == "response.incomplete" &&

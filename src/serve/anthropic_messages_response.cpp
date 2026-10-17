@@ -38,6 +38,7 @@ std::vector<ToolCall> materialize_tool_calls(const GenerationOutcome& outcome) {
     std::vector<ToolCall> result;
     result.reserve(outcome.tool_calls.size());
     for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
+        if (call.status != ToolCallStatus::Complete) continue;
         result.push_back(ToolCall{.id             = random_identifier("toolu_"),
                                   .name           = call.name,
                                   .arguments_json = call.arguments_json});
@@ -59,8 +60,10 @@ struct StopPresentation {
 };
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
-    if (!outcome.tool_calls.empty() && (outcome.finish_reason == ninfer::FinishReason::StopToken ||
-                                        outcome.finish_reason == ninfer::FinishReason::None))
+    if (std::any_of(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                    [](const auto& call) { return call.status == ToolCallStatus::Complete; }) &&
+        (outcome.finish_reason == ninfer::FinishReason::StopToken ||
+         outcome.finish_reason == ninfer::FinishReason::None))
         return StopPresentation{.reason = "tool_use"};
     switch (outcome.finish_reason) {
     case ninfer::FinishReason::OutputLimit:
@@ -223,9 +226,11 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
     return Json{{"input_tokens", input_tokens}}.dump();
 }
 
-AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens)
-    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
+AnthropicMessagesStream::AnthropicMessagesStream(
+    AnthropicResponseIdentity identity, int input_tokens,
+    std::unordered_map<std::string, bool> eager_tool_inputs)
+    : identity_(std::move(identity)), eager_tool_inputs_(std::move(eager_tool_inputs)),
+      input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -251,7 +256,7 @@ std::string AnthropicMessagesStream::start_with_cache(std::optional<int> cache_r
 }
 
 std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::string& text) {
-    if (!started_ || finished_ || text_open_) {
+    if (!started_ || finished_ || text_open_ || !tool_indices_.empty()) {
         throw std::logic_error("invalid Anthropic reasoning delta state");
     }
     std::vector<std::string> events;
@@ -318,6 +323,57 @@ std::vector<std::string> AnthropicMessagesStream::close_text() {
         event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", text_index_}})};
 }
 
+std::vector<std::string> AnthropicMessagesStream::tool_start(const ninfer::ToolCallStart& value) {
+    if (!started_ || finished_) throw std::logic_error("invalid Anthropic tool start state");
+    tools_.start(value);
+    auto events = close_thinking();
+    append(events, close_text());
+    const int index = next_index_++;
+    tool_indices_.push_back(index);
+    const auto policy = eager_tool_inputs_.find(value.name);
+    eager_tool_       = policy != eager_tool_inputs_.end() && policy->second;
+    buffered_arguments_.clear();
+    events.push_back(event("content_block_start",
+                           Json{{"type", "content_block_start"},
+                                {"index", index},
+                                {"content_block", Json{{"type", "tool_use"},
+                                                       {"id", random_identifier("toolu_")},
+                                                       {"name", value.name},
+                                                       {"input", Json::object()}}}}));
+    return events;
+}
+
+std::vector<std::string>
+AnthropicMessagesStream::tool_arguments(const ninfer::ToolArgumentsDelta& value) {
+    if (!started_ || finished_) throw std::logic_error("invalid Anthropic tool delta state");
+    tools_.append(value);
+    buffered_arguments_ += value.text;
+    if ((!eager_tool_ && !value.parameter_complete) || buffered_arguments_.empty()) return {};
+    return {event("content_block_delta",
+                  Json{{"type", "content_block_delta"},
+                       {"index", tool_indices_.at(value.index)},
+                       {"delta", Json{{"type", "input_json_delta"},
+                                      {"partial_json", std::exchange(buffered_arguments_, {})}}}})};
+}
+
+std::vector<std::string> AnthropicMessagesStream::tool_end(const ninfer::ToolCallEnd& value) {
+    if (!started_ || finished_) throw std::logic_error("invalid Anthropic tool end state");
+    tools_.end(value);
+    std::vector<std::string> events;
+    const int index = tool_indices_.at(value.index);
+    if (!buffered_arguments_.empty() && (eager_tool_ || value.status == ToolCallStatus::Complete))
+        events.push_back(
+            event("content_block_delta",
+                  Json{{"type", "content_block_delta"},
+                       {"index", index},
+                       {"delta", Json{{"type", "input_json_delta"},
+                                      {"partial_json", std::exchange(buffered_arguments_, {})}}}}));
+    buffered_arguments_.clear();
+    events.push_back(
+        event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
+    return events;
+}
+
 std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome& outcome) {
     if (!started_ || finished_) { throw std::logic_error("invalid Anthropic stream finish state"); }
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
@@ -336,24 +392,7 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     append(events, close_thinking());
     append(events, close_text());
 
-    for (const ToolCall& call : materialize_tool_calls(outcome)) {
-        (void)parse_tool_input(call);
-        const int index = next_index_++;
-        events.push_back(
-            event("content_block_start", Json{{"type", "content_block_start"},
-                                              {"index", index},
-                                              {"content_block", Json{{"type", "tool_use"},
-                                                                     {"id", call.id},
-                                                                     {"name", call.name},
-                                                                     {"input", Json::object()}}}}));
-        events.push_back(event("content_block_delta",
-                               Json{{"type", "content_block_delta"},
-                                    {"index", index},
-                                    {"delta", Json{{"type", "input_json_delta"},
-                                                   {"partial_json", call.arguments_json}}}}));
-        events.push_back(
-            event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
-    }
+    tools_.verify(outcome.tool_calls);
 
     const StopPresentation stop = stop_presentation(outcome);
     Json terminal{{"type", "message_delta"},

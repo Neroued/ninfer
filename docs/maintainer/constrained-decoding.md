@@ -231,7 +231,9 @@ JSON 使用紧凑的 `,` / `:` 分隔符及声明字段顺序。字符串长度�
 
 默认 Basic 对有工具的请求启用结构约束，包括普通 Auto + 非 strict。模型自行选择正文或工具调用；一旦进入调用，函数名和封装受约束。显式 Automatic 只执行请求提出的 strict、allowed_names、Required、None 或 parallel=false 等要求，普通 Auto + 非 strict 可以自由生成。
 
-非 strict 的基础参数语言允许任意顺序及可表示的参数名；不根据 properties 封闭参数集合，不强制 required 或参数值断言。复杂根 schema 与开放对象不会触发 strict 编译器。参数值沿用原有归一化提示；重复参数取最后一个值并保持第一次出现的字段位置，发布对象中每个 key 仅出现一次。严格参数继续按声明顺序生成并禁止重复。
+非 strict 的基础参数语言允许任意顺序及可表示的参数名；不根据 properties 封闭参数集合，不强制 required 或参数值断言。复杂根 schema 与开放对象不会触发 strict 编译器。每次调用的顶层参数名必须唯一，按名称字节精确比较；不同调用可以复用名字。静态 grammar 约束封装和编码，请求独占的名称状态在采样前收紧位图，阻止重复参数头闭合。严格参数继续按声明顺序生成并禁止重复。
+
+参数编码在准备阶段由共享合同确定。非 strict 中明确允许 string 的类型提示沿用 raw string 表示；明确不含 string 的类型提示使用 JSON 值编码。Basic 只要求后者具有合法 JSON 语法，允许与类型提示不匹配的 JSON 值，例如 integer 提示下的 `"tomorrow"`。裸文本 `tomorrow`、空块或 `True` 不属于 JSON 编码，不进行补引号、空参数省略或布尔大小写转换。未知名称或无法确定类型的参数使用缓冲归一化：在当前参数结束后去除外围格式空白，合法 JSON 保留原文，其他文本转为 JSON 字符串。
 
 Auto 允许零到多次调用；Required 至少一次；parallel=false 将上限设为一次。OpenAI named 映射为 Required + 单名称 + parallel=false；Anthropic named 使用单名称并遵守 disable_parallel_tool_use。None 保留 prompt 声明并禁止生成 `<tool_call>`；与正文约束组合时由正文约束拥有输出语言。所有选择都保留完整声明与缓存标记位置，不通过删改 prompt 工具列表实现。
 
@@ -253,15 +255,19 @@ Qwen 工具语法采用现有 `<tool_call>`、`<function=...>`、`<parameter=...
 
 Qwen raw string 与 JSON 值的选择必须无歧义。纯字符串参数使用 raw string；不含 string 的类型联合使用 JSON 值。包含 string 与其他类型的同一 raw 参数若无法从模型格式确定分支，在准备阶段拒绝严格组合；现有“只要允许 string 就都按 string 解释”不能用于宣称其他分支也已正确执行。
 
-Raw string 的参数结束分隔符是 `\n</parameter>`，这段文本不能出现在值中。Grammar 与 parser 使用相同的分隔符规则，严格输出只生成可无损表示的值；const/enum 等要求的值无法表示时返回明确错误，不修改值。字符串的 pattern/长度与分隔符排除同时成立。外围 framing 没有可选空白，避免把值的空白划到 schema 之外。嵌套 JSON 使用模板的 `, ` / `: ` 分隔符，包括 const/enum 对象；integer 限 signed 64-bit，number 使用有限 binary64 可解析表示。
+Raw string 的参数结束分隔符是 `\n</parameter>`，这段文本不能出现在值中。Grammar 与 parser 使用相同的分隔符规则，严格输出只生成可无损表示的值；const/enum 等要求的值无法表示时返回明确错误，不修改值。字符串的 pattern/长度与分隔符排除同时成立。外围 framing 没有可选空白，避免把值的空白划到 schema 之外。strict 嵌套 JSON 使用模板的 `, ` / `: ` 分隔符，包括 const/enum 对象；integer 限 signed 64-bit，number 使用有限 binary64 可解析表示。
 
 工具参数根节点须归约为 type=object，可经本地 $ref 或受支持的 allOf 组合。严格路线采用声明的有限参数名与属性顺序：要求 additionalProperties=false；归约后仍为根 const/enum/anyOf/oneOf 时返回不支持。普通 JSON 响应支持表中定义的 additionalProperties。工具定义中的重复名称在准备阶段拒绝。
 
-受约束工具的结构化事件来自完整解析并提交的调用。工具结果在终态解析与发布；截断时保留已经完成的调用和实际中断原因，未完成调用不产生 `arguments_json`。
+工具输出由已提交的文本增量驱动：识别声明中的完整函数头后发布 ToolCallStart；参数转码过程中发布 ToolArgumentsDelta；模型调用封装闭合后发布 Complete 的 ToolCallEnd。每个调用的增量拼接与聚合 arguments_json 字节一致。截断产生 Incomplete 的调用和原始 JSON 前缀，保留实际中断原因，不补齐引号、括号或伪造可执行参数。协议 ID 归 Serve 所有。
 
-对受约束路线，grammar 已确认完整调用但 parser 无法按同一合同解释，属于实现不一致，不能回落成普通 content 掩盖。自由生成路线保留既有的畸形文本处理行为。
+RawString 参数增量 JSON 转义并保留 framing 内的值；JsonValue 参数按 JSON 词法跟踪引号和转义，保留数值字面量和成员顺序。JSON 编码复用工具值的可发布数值域和 Unicode scalar 规则，避免生成 `1e999` 或未配对 surrogate 后才在解码时失败。两者无需等待完整参数即可发布。BufferedNormalize 只缓冲当前参数，不能凭 `{`、`[`、`"` 开头提前决定输出类型；已发布的参数字节不再改写。未知类型的大参数仍可能存在参数级输出延迟。
 
-实现所有权：`tool_contract` 解析声明并选择当前合同；`tool_grammar` 将合同编译为模型语言；`tool_call_parser` 按相同参数编码规则解码已提交文本。Compiled grammar 沿用 Frontend 的共享预算与冷编译限制。非 strict grammar 的身份只使用名称和封装/调用策略；schema 归一化提示仍由每请求合同持有，不进入共享 grammar 的语义。Continuation 可以推进到第一个未完成调用；包含已完成调用的 raw assistant 前缀被拒绝，避免重新发布历史调用。
+自由生成只在有效工具头确认前保留正文回退；确认后的畸形结构、重复参数和 JsonValue 编码错误产生请求级 InvalidToolOutput。Basic 或 strict 的正常受约束输出若与 decoder 不一致，属于内部合同违规，不归类为普通模型输出错误。两者均在稳定提交边界中止该 sequence 并结算对应错误；物理资源可以正常清理时不影响同批其他请求。长度、上下文容量或取消导致的截断是 Incomplete，不是格式错误。
+
+实现所有权：`tool_contract` 解析声明并确定参数编码；`tool_grammar` 构造互斥的已知名称与开放名称分支；`tool_name_constraint` 维护可回滚的顶层名称集合；`tool_call_parser` 解码已提交文本。静态 matcher 和名称状态由 GrammarSession 协调同一组 lookahead/accept/confirm/discard 操作。每个 speculative 位置先求两者的合法集合，再推进 draft；不能事后过滤整批静态位图。候选检查消费 token 的全部 bytes，包括同一 token 内跨越参数或调用边界的情况。正文 JSON 与 thinking 中的工具标记不改变名称状态。
+
+Compiled grammar 沿用 Frontend 的共享预算与冷编译限制。Basic 缓存身份包含参数名和编码布局；其余 schema 提示保留在请求合同中。词表 bytes 和边界候选索引按 compiler 共享，已见名称不进入共享缓存。Continuation 同时初始化 matcher、名称状态与 decoder；可以推进到第一个未完成调用，包含已完成调用的 raw assistant 前缀被拒绝。已有参数在该调用初始化时只发布一次，随后追加新增字节；这些前缀字节不计入新生成 token。
 
 ## 5. Thinking、正文与 continuation
 

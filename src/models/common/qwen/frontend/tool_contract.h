@@ -32,13 +32,13 @@ struct ToolCallOutputContract {
         DeclaredTypes,
     };
 
-    enum class Encoding : std::uint8_t { NonStrict, RawString, Json };
+    enum class Encoding : std::uint8_t { BufferedNormalize, RawString, JsonValue };
 
     struct Parameter {
         std::string name;
         NormalizationPolicy policy = NormalizationPolicy::InferredTypes;
         TypeSet types;
-        Encoding encoding = Encoding::NonStrict;
+        Encoding encoding = Encoding::BufferedNormalize;
     };
 
     struct Tool {

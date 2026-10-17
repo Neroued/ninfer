@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-REQUEST_LOG_SCHEMA_VERSION = 29
+REQUEST_LOG_SCHEMA_VERSION = 30
 
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",

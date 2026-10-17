@@ -43,7 +43,10 @@ struct Sink final : ninfer::OutputSink {
 
     void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        const auto* text = std::get_if<ninfer::OutputDelta>(&event);
+        if (!text) return;
+        const auto& delta = *text;
         if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
     }
 };

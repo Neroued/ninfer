@@ -424,6 +424,18 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         render_and_write(transport,
                                          [&] { return stream->encoder->content_delta(text); });
                     };
+                    output.on_tool_start = [&](const ninfer::ToolCallStart& event) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->tool_start(event); });
+                    };
+                    output.on_tool_arguments = [&](const ninfer::ToolArgumentsDelta& event) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->tool_arguments(event); });
+                    };
+                    output.on_tool_end = [&](const ninfer::ToolCallEnd& event) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->tool_end(event); });
+                    };
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);

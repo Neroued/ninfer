@@ -19,6 +19,30 @@ namespace ninfer::text {
 
 [[nodiscard]] RequestErrorKind constraint_error_kind(OutputConstraintKind kind);
 
+// Shared raw token bytes and lazily built byte indexes. A session may outlive its compiler.
+class GrammarVocabulary {
+public:
+    explicit GrammarVocabulary(std::vector<std::string> pieces);
+    ~GrammarVocabulary();
+    [[nodiscard]] const std::vector<std::string>& pieces() const noexcept;
+    [[nodiscard]] const std::vector<std::int32_t>& containing(unsigned char byte) const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Model-owned state that can only narrow the static grammar's token set. Both states share the
+// same lookahead/accept/confirm/discard transaction; this interface is not a public Engine API.
+class GrammarStateConstraint {
+public:
+    virtual ~GrammarStateConstraint()                  = default;
+    virtual void filter(std::span<std::uint32_t> mask) = 0;
+    virtual bool accept(std::string_view bytes)        = 0;
+    virtual void confirm() noexcept                    = 0;
+    virtual void discard() noexcept                    = 0;
+};
+
 // One immutable vocabulary/compiler per model; one transactional matcher per request.
 class GrammarSession {
 public:
@@ -55,7 +79,9 @@ public:
     // Model-owned composition, built only on a miss in the same bounded compiler cache.
     [[nodiscard]] std::unique_ptr<GrammarSession>
     compile_model(std::string_view identity, const std::function<xgrammar::Grammar()>& build,
-                  std::string_view reasoning_close, std::string_view continuation);
+                  std::string_view reasoning_close, std::string_view continuation,
+                  std::unique_ptr<GrammarStateConstraint> state = {});
+    [[nodiscard]] std::shared_ptr<const GrammarVocabulary> vocabulary() const;
 
 private:
     class Impl;

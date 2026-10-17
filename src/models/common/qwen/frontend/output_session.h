@@ -1,8 +1,9 @@
 #pragma once
 
+#include "models/common/qwen/frontend/tool_output_error.h"
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
-#include <array>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -22,40 +23,7 @@ struct ToolCallOutputContract;
 } // namespace frontend
 class Frontend;
 
-class PublishedOutput {
-public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
-
-    PublishedOutput()                                  = default;
-    PublishedOutput(const PublishedOutput&)            = default;
-    PublishedOutput& operator=(const PublishedOutput&) = default;
-    PublishedOutput(PublishedOutput&& other) noexcept;
-    PublishedOutput& operator=(PublishedOutput&& other) noexcept;
-
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
-
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
-
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
-
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
-
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
-
-    void clear() noexcept;
-    void push_back(OutputDelta value);
-
-private:
-    std::array<OutputDelta, 2> values_{};
-    std::size_t size_ = 0;
-};
+using PublishedOutput = std::vector<OutputEvent>;
 
 class OutputSession {
 public:
@@ -86,6 +54,7 @@ public:
     [[nodiscard]] std::uint32_t grammar_masks(std::span<const TokenId> drafts,
                                               std::span<std::uint32_t> words);
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
+    [[nodiscard]] std::optional<frontend::ToolOutputError> output_error() const;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;

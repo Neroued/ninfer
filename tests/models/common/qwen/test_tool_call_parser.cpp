@@ -1,3 +1,4 @@
+#include "tool_decoder_test_support.h"
 #include "models/common/qwen/frontend/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
@@ -12,6 +13,9 @@
 #include <vector>
 
 namespace {
+using tool_decoder_test::feed;
+using tool_decoder_test::finish;
+using tool_decoder_test::completed;
 
 using Json   = nlohmann::json;
 namespace fi = ninfer::models::qwen::frontend;
@@ -65,13 +69,24 @@ tool_call(std::string_view tool_name,
     return text;
 }
 
-int check_rejected(const std::string& text, const fi::ToolCallOutputContract& contract,
+int check_fallback(const std::string& text, const fi::ToolCallOutputContract& contract,
                    ninfer::ToolCallParseFallbackReason reason, std::string_view message) {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
     return check(!parsed.is_tool_call_response && parsed.content == text &&
                      parsed.tool_calls.empty() && parsed.diagnostics.marker_seen &&
                      parsed.diagnostics.fallback_reason == reason,
                  std::string(message));
+}
+
+int check_invalid(const std::string& text, const fi::ToolCallOutputContract& contract,
+                  std::string_view message) {
+    try {
+        (void)fi::parse_qwen_tool_call_output(text, 64, contract);
+    } catch (const ninfer::RequestError& error) {
+        return check(error.kind() == ninfer::RequestErrorKind::InvalidToolOutput,
+                     std::string(message));
+    }
+    return check(false, std::string(message));
 }
 
 int check_parameter_schema_mismatch(const fi::ToolCallOutputContract& contract,
@@ -214,19 +229,17 @@ int test_string_values_preserve_embedded_tool_markup() {
     return failures;
 }
 
-int test_unrepresentable_parameter_delimiters_fall_back() {
+int test_unrepresentable_parameter_delimiters_fail() {
     const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
     const std::string unmatched_open =
         tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
     const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
 
     int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+    failures += check_invalid(unmatched_open, contract,
+                              "unbalanced nested parameter open was silently repaired");
+    failures += check_invalid(standalone_close, contract,
+                              "standalone parameter close was guessed to be string content");
     return failures;
 }
 
@@ -269,50 +282,20 @@ int test_declared_json_types() {
 }
 
 int test_boolean_boundary() {
-    const auto contract =
-        contract_for("configure", Json{{"lower_true", Json{{"type", "boolean"}}},
-                                       {"title_true", Json{{"type", "boolean"}}},
-                                       {"upper_true", Json{{"type", "boolean"}}},
-                                       {"mixed_false", Json{{"type", "boolean"}}},
-                                       {"spaced_true", Json{{"type", "boolean"}}},
-                                       {"windows_false", Json{{"type", "boolean"}}}});
-    const auto parsed =
-        fi::parse_qwen_tool_call_output("<tool_call>\n"
-                                        "<function=configure>\n"
-                                        "<parameter=lower_true>\ntrue\n</parameter>\n"
-                                        "<parameter=title_true>\nTrue\n</parameter>\n"
-                                        "<parameter=upper_true>\nTRUE\n</parameter>\n"
-                                        "<parameter=mixed_false>\nfAlSe\n</parameter>\n"
-                                        "<parameter=spaced_true>\n \tTrUe \n</parameter>\n"
-                                        "<parameter=windows_false>\r\nFaLsE\r\n</parameter>\n"
-                                        "</function>\n"
-                                        "</tool_call>",
-                                        64, contract);
-
-    int failures = 0;
-    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
-                      "case-insensitive booleans were rejected");
-    if (parsed.tool_calls.size() != 1) { return failures; }
-    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
-    failures += check(args.at("lower_true") == true && args.at("title_true") == true &&
-                          args.at("upper_true") == true && args.at("spaced_true") == true,
-                      "true variants were not canonicalized");
-    failures += check(args.at("mixed_false") == false && args.at("windows_false") == false,
-                      "false variants were not canonicalized");
-
-    const auto one_flag = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "1", "1",
-                                                "integer boolean mismatch was not structured");
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "0", "0",
-                                                "zero boolean mismatch was not structured");
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "\"true\"", "\"true\"",
-                                                "string boolean mismatch was not structured");
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "yes", "\"yes\"",
-                                                "plain boolean mismatch was not structured");
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "None", "\"None\"",
-                                                "Python null mismatch was not structured");
-    failures += check_parameter_schema_mismatch(one_flag, "flag", "null", "null",
-                                                "null boolean mismatch was not structured");
+    const auto bound = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    int failures     = 0;
+    for (const auto text : {"true", "false", " \ttrue ", "\r\nfalse\r\n"}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(tool_call("configure", {{"flag", text}}), 64, bound);
+        failures += check(Json::parse(parsed.tool_calls.at(0).arguments_json)["flag"].is_boolean(),
+                          "valid JSON boolean lost its type");
+    }
+    for (const auto text : {"True", "FALSE", "yes", "None", ""})
+        failures += check_invalid(tool_call("configure", {{"flag", text}}), bound,
+                                  "JSON codec accepted non-JSON boolean text");
+    for (const auto text : {"1", "0", "\"true\"", "null"})
+        failures += check_parameter_schema_mismatch(bound, "flag", text, text,
+                                                    "valid JSON mismatch was not retained");
     return failures;
 }
 
@@ -374,10 +357,10 @@ int test_composed_schema_types() {
                                           Json{{"type", "integer"}}})}}},
              {"string_or_number",
               Json{{"oneOf", Json::array({Json{{"type", "string"}}, Json{{"type", "number"}}})}}}});
-    const std::string text = tool_call("configure", {{"flag", "False"},
+    const std::string text = tool_call("configure", {{"flag", "false"},
                                                      {"unset", "null"},
                                                      {"count", "7.0"},
-                                                     {"nested", "TRUE"},
+                                                     {"nested", "true"},
                                                      {"string_or_number", "7"}});
     const auto parsed      = fi::parse_qwen_tool_call_output(text, 64, contract);
 
@@ -399,83 +382,23 @@ int test_composed_schema_types() {
     return failures;
 }
 
-int test_empty_declared_non_string_is_omitted() {
-    const Json properties = {
-        {"file_path", Json{{"type", "string"}}},
-        {"new_string", Json{{"type", "string"}}},
-        {"old_string", Json{{"type", "string"}}},
-        {"replace_all", Json{{"type", "boolean"}}},
-    };
-    const std::string text = "I need one more check.\n\n"
-                             "<tool_call>\n"
-                             "<function=Edit>\n"
-                             "<parameter=file_path>\n/tmp/probe.cpp\n</parameter>\n"
-                             "<parameter=new_string>\n"
-                             "std::map<std::uint32_t, int> counts;\n"
-                             "</parameter>\n"
-                             "<parameter=old_string>\nold line\n</parameter>\n"
-                             "<parameter=replace_all>\n</parameter>\n"
-                             "</function>\n"
-                             "</tool_call>";
-
-    const std::vector<std::string> definitions = {tool_definition(
-        "Edit", properties, Json::array({"file_path", "new_string", "old_string"}))};
-    const auto contract                        = contract_from_definitions(definitions);
-    const auto parsed = fi::parse_qwen_tool_call_output(text, 128, *contract);
-
-    int failures = 0;
-    failures +=
-        check(parsed.is_tool_call_response && parsed.content == "I need one more check." &&
-                  parsed.tool_calls.size() == 1 && parsed.diagnostics.marker_seen &&
-                  parsed.diagnostics.structured_call_count == 1 &&
-                  parsed.diagnostics.empty_arguments_omitted == 1 &&
-                  parsed.diagnostics.schema_mismatch_arguments == 0 &&
-                  parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
-              "empty optional boolean demoted a complete Edit call to text");
-    if (parsed.tool_calls.size() == 1) {
-        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
-        failures += check(args.size() == 3 && args.at("file_path") == "/tmp/probe.cpp" &&
-                              args.at("new_string") == "std::map<std::uint32_t, int> counts;" &&
-                              args.at("old_string") == "old line" && !args.contains("replace_all"),
-                          "empty optional boolean was not omitted from Edit arguments");
-    }
-
-    bool every_split_matches = true;
+int test_empty_parameter_encoding() {
+    const auto bound = output_contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    const auto text  = tool_call("configure", {{"flag", ""}});
+    int failures     = check_invalid(text, *bound, "empty JSON value was silently omitted");
     for (std::size_t split = 0; split <= text.size(); ++split) {
-        fi::ToolCallOutputDecoder decoder(contract, 128);
-        std::string visible = decoder.feed(std::string_view(text).substr(0, split));
-        visible += decoder.feed(std::string_view(text).substr(split));
-        auto terminal = decoder.finish();
-        if (visible != "I need one more check." || !terminal.content.empty() ||
-            terminal.tool_calls.size() != 1 ||
-            terminal.tool_calls.front().arguments_json !=
-                parsed.tool_calls.front().arguments_json ||
-            terminal.diagnostics != parsed.diagnostics) {
-            every_split_matches = false;
-            break;
-        }
+        fi::ToolCallOutputDecoder decoder(bound, 64);
+        (void)feed(decoder, std::string_view(text).substr(0, split));
+        (void)feed(decoder, std::string_view(text).substr(split));
+        (void)decoder.finish();
+        failures += check(decoder.error().has_value(), "chunking hid an invalid empty JSON value");
     }
-    failures += check(every_split_matches,
-                      "incremental Edit parsing depends on the transport chunk boundary");
-
-    fi::ToolCallOutputDecoder bytewise(contract, 128);
-    std::string bytewise_visible;
-    for (const char byte : text) { bytewise_visible += bytewise.feed(std::string_view(&byte, 1)); }
-    auto bytewise_terminal = bytewise.finish();
-    failures +=
-        check(bytewise_visible == "I need one more check." && bytewise_terminal.content.empty() &&
-                  bytewise_terminal.tool_calls.size() == 1 &&
-                  bytewise_terminal.diagnostics == parsed.diagnostics,
-              "bytewise Edit parsing changed the terminal tool-call semantics");
-
-    const auto string_contract =
-        contract_for("configure", Json{{"label", Json{{"type", "string"}}}});
-    const auto empty_string = fi::parse_qwen_tool_call_output(
-        tool_call("configure", {{"label", ""}}), 64, string_contract);
-    failures +=
-        check(empty_string.is_tool_call_response && empty_string.tool_calls.size() == 1 &&
-                  Json::parse(empty_string.tool_calls.front().arguments_json).at("label") == "",
-              "empty declared string was incorrectly omitted");
+    const auto strings = contract_for("configure", Json{{"label", Json{{"type", "string"}}}});
+    const auto empty   = fi::parse_qwen_tool_call_output(
+        tool_call("configure", {{"label", ""}, {"unknown", ""}}), 64, strings);
+    failures += check(Json::parse(empty.tool_calls.at(0).arguments_json) ==
+                          Json{{"label", ""}, {"unknown", ""}},
+                      "empty raw and inferred strings changed");
     return failures;
 }
 
@@ -499,12 +422,17 @@ int test_schema_mismatches_remain_structured() {
                                                 "object array mismatch was not structured");
     failures += check_parameter_schema_mismatch(contract, "null_value", "false", "false",
                                                 "boolean null mismatch was not structured");
-    failures += check_parameter_schema_mismatch(
-        contract, "object_value", "{'x': True}", "\"{'x': True}\"",
-        "Python object mismatch was not preserved for client validation");
-    failures += check_parameter_schema_mismatch(
-        contract, "array_value", "['a', None]", "\"['a', None]\"",
-        "Python array mismatch was not preserved for client validation");
+    for (const auto& [name, value] :
+         {std::pair{"object_value", "{'x': True}"}, {"array_value", "['a', None]"}}) {
+        bool rejected = false;
+        try {
+            (void)fi::parse_qwen_tool_call_output(tool_call("configure", {{name, value}}), 64,
+                                                  contract);
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::InvalidToolOutput;
+        }
+        failures += check(rejected, "started JSON was retroactively converted to a string");
+    }
     return failures;
 }
 
@@ -547,35 +475,28 @@ int test_strict_structure_and_active_tool_set() {
     int failures        = 0;
 
     const std::string malformed = "<tool_call>\n<function=configure>\n";
-    failures +=
-        check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                       "missing structural tags were accepted");
+    failures += check_invalid(malformed, contract, "missing structural tags were accepted");
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
+    failures += check_invalid(suffix, contract, "non-whitespace suffix was accepted");
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
         "</function>\n</tool_call>";
-    failures += check_rejected(missing_parameter_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "missing parameter close was repaired");
+    failures +=
+        check_invalid(missing_parameter_close, contract, "missing parameter close was repaired");
 
     const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
-    failures +=
-        check_rejected(duplicate, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
-                       "duplicate parameter was silently overwritten");
+    failures += check_invalid(duplicate, contract, "duplicate parameter was silently overwritten");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
     failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+        check_fallback(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
                        "undeclared tool name was accepted");
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
     failures +=
-        check_rejected(invalid_name, contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+        check_fallback(invalid_name, contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
                        "invalid function-name character was accepted");
     return failures;
 }
@@ -619,31 +540,31 @@ int test_duplicate_tool_contracts_rejected() {
     return check(false, "duplicate declarations were accepted");
 }
 
-int test_all_or_nothing_structural_commit() {
+int test_malformed_tail_fails_request() {
     const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
     const std::string text = tool_call("configure", {{"flag", "true"}}) +
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                          "partially valid tool-call region was partially committed");
+    return check_invalid(text, contract,
+                         "partially valid tool-call region was partially committed");
 }
 
 int test_incremental_valid_and_boolean() {
     fi::ToolCallOutputDecoder legacy(output_contract_for("get_weather", Json::object()), 64);
     std::string visible;
-    visible += legacy.feed("Calling weather.  \n<tool_");
-    visible += legacy.feed("call>\n<function=get_weather>");
-    visible += legacy.feed("\n</function>\n</tool_call>");
-    auto legacy_terminal = legacy.finish();
+    visible += feed(legacy, "Calling weather.  \n<tool_");
+    visible += feed(legacy, "call>\n<function=get_weather>");
+    visible += feed(legacy, "\n</function>\n</tool_call>");
+    auto legacy_terminal = finish(legacy);
     visible += legacy_terminal.content;
 
     auto bool_contract =
         output_contract_for("configure", Json{{"enabled", Json{{"type", "boolean"}}}});
     fi::ToolCallOutputDecoder boolean(std::move(bool_contract), 64);
     std::string boolean_visible;
-    boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT");
-    boolean_visible += boolean.feed("r");
-    boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>");
-    auto boolean_terminal = boolean.finish();
+    boolean_visible += feed(boolean, "<tool_call>\n<function=configure>\n<parameter=enabled>\nt");
+    boolean_visible += feed(boolean, "r");
+    boolean_visible += feed(boolean, "ue\n</parameter>\n</function>\n</tool_call>");
+    auto boolean_terminal = finish(boolean);
 
     int failures = 0;
     failures += check(visible == "Calling weather." && legacy_terminal.tool_calls.size() == 1,
@@ -653,37 +574,36 @@ int test_incremental_valid_and_boolean() {
                       "incremental boolean call leaked as content");
     if (boolean_terminal.tool_calls.size() == 1) {
         const Json args = Json::parse(boolean_terminal.tool_calls.front().arguments_json);
-        failures += check(args.at("enabled") == true,
-                          "split case-insensitive boolean was not canonicalized");
+        failures += check(args.at("enabled") == true, "split JSON boolean changed its value");
     }
     return failures;
 }
 
 int test_incremental_fallback_preserves_bytes() {
-    const std::string original = "prefix  \n<tool_call>\n<function=broken>";
+    const std::string original = "prefix  \n<tool_call>\n<function=missing>";
     fi::ToolCallOutputDecoder malformed(output_contract_for("broken", Json::object()), 64);
     std::string restored;
-    restored += malformed.feed(original.substr(0, 10));
-    restored += malformed.feed(original.substr(10));
-    auto malformed_terminal = malformed.finish();
+    restored += feed(malformed, original.substr(0, 10));
+    restored += feed(malformed, original.substr(10));
+    auto malformed_terminal = finish(malformed);
     restored += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
-    ordinary_text += ordinary.feed("ordinary text  ");
-    ordinary_text += ordinary.finish().content;
+    ordinary_text += feed(ordinary, "ordinary text  ");
+    ordinary_text += finish(ordinary).content;
 
     const std::string partial_original = "  <tool_x then <tool_";
     fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string partial_restored;
-    partial_restored += partial.feed("  <too");
-    partial_restored += partial.feed("l_x then <tool_");
-    partial_restored += partial.finish().content;
+    partial_restored += feed(partial, "  <too");
+    partial_restored += feed(partial, "l_x then <tool_");
+    partial_restored += finish(partial).content;
 
     int failures = 0;
     failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
                           malformed_terminal.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                              ninfer::ToolCallParseFallbackReason::UndeclaredTool,
                       "malformed incremental call lost raw bytes or fallback diagnostics");
     failures += check(ordinary_text == "ordinary text  ",
                       "ordinary incremental output lost trailing whitespace");
@@ -702,9 +622,9 @@ int test_incremental_embedded_parameter_markup() {
     std::string visible;
     constexpr std::size_t kChunk = 7;
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
-        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+        visible += feed(decoder, std::string_view(text).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = finish(decoder);
 
     int failures = 0;
     failures +=
@@ -723,21 +643,19 @@ int test_free_tool_continuation() {
     int failures        = 0;
     for (const auto& [prefix, suffix] :
          std::initializer_list<std::pair<std::string_view, std::string_view>>{
-             {"Earlier <tool_ca", "broken"},
-             {"Earlier <tool_ca", "ll>broken"},
-             {"Earlier <tool_call>\n<function=echo>", "broken"}}) {
+             {"Earlier <tool_ca", "broken"}, {"Earlier <tool_ca", "ll>broken"}}) {
         fi::ToolCallOutputDecoder decoder(contract, 64);
         decoder.initialize_continuation(prefix);
-        std::string visible = decoder.feed(suffix);
-        visible += decoder.finish(ninfer::FinishReason::OutputLimit).content;
+        std::string visible = feed(decoder, suffix);
+        visible += finish(decoder, ninfer::FinishReason::OutputLimit).content;
         failures += check(visible == suffix, "free continuation republished its prompt prefix");
     }
     const auto complete = tool_call("echo", {{"value", "hello"}});
     const auto split    = complete.find("hello") + 2;
     fi::ToolCallOutputDecoder decoder(contract, 64);
     decoder.initialize_continuation(std::string_view(complete).substr(0, split));
-    (void)decoder.feed(std::string_view(complete).substr(split));
-    const auto result = decoder.finish();
+    (void)feed(decoder, std::string_view(complete).substr(split));
+    const auto result = finish(decoder);
     failures += check(result.tool_calls.size() == 1 && result.content.empty() &&
                           result.tool_calls[0].arguments_json == R"({"value":"hello"})",
                       "free continuation lost the completed call");
@@ -759,18 +677,18 @@ int main() {
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
-    failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_unrepresentable_parameter_delimiters_fail();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
     failures += test_composed_schema_types();
-    failures += test_empty_declared_non_string_is_omitted();
+    failures += test_empty_parameter_encoding();
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_duplicate_tool_contracts_rejected();
-    failures += test_all_or_nothing_structural_commit();
+    failures += test_malformed_tail_fails_request();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();

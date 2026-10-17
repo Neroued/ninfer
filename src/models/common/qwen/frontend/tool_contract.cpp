@@ -1,4 +1,5 @@
 #include "models/common/qwen/frontend/tool_contract.h"
+#include "models/common/qwen/frontend/tool_format.h"
 #include "text/json_schema.h"
 #include "text/json_input.h"
 
@@ -28,10 +29,6 @@ constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8
 
 std::string parameter_path(const Contract::Tool& tool) {
     return "/" + std::to_string(tool.declaration_index) + "/parameters";
-}
-
-bool valid_parameter_name(std::string_view name) {
-    return !name.empty() && name.find_first_of("<>\r\n") == std::string_view::npos;
 }
 
 bool schema_type(std::string_view name, SchemaType& type) {
@@ -184,7 +181,7 @@ void prepare_strict_parameters(Contract::Tool& tool) {
             fail("strict tool '" + tool.name + "' parameter '" + name +
                      "' mixes raw string and JSON value types",
                  parameter_path(tool));
-        parameter.encoding = string ? Contract::Encoding::RawString : Contract::Encoding::Json;
+        parameter.encoding = string ? Contract::Encoding::RawString : Contract::Encoding::JsonValue;
         tool.parameters.push_back(std::move(parameter));
     }
 }
@@ -220,14 +217,19 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();
             tool.declaration_index = i;
-            // Non-strict output keeps the established best-effort normalization contract.
+            // Encoding is selected before generation, never guessed from a value prefix.
             if (schema.is_object() && schema.contains("properties") &&
                 schema["properties"].is_object()) {
                 for (const auto& [name, property] : schema["properties"].items()) {
                     Contract::Parameter parameter;
                     parameter.name = name;
-                    if (compile_schema_types(property, parameter.types))
+                    if (compile_schema_types(property, parameter.types)) {
                         parameter.policy = NormalizationPolicy::DeclaredTypes;
+                        // The established non-strict normalization of a string union is raw text.
+                        parameter.encoding = parameter.types.bits & type_bit(SchemaType::String)
+                                                 ? Contract::Encoding::RawString
+                                                 : Contract::Encoding::JsonValue;
+                    }
                     tool.parameters.push_back(std::move(parameter));
                 }
             }

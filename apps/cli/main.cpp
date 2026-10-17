@@ -10,9 +10,9 @@
 #include <cstdint>
 #include <exception>
 #include <fstream>
-#include <iterator>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -113,7 +113,28 @@ public:
 
     void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        if (const auto* call = std::get_if<ninfer::ToolCallStart>(&event)) {
+            if (content_seen_ && !content_ends_in_newline_) std::cout << '\n';
+            std::cout << "{\"name\":\"" << call->name << "\",\"arguments\":";
+            content_seen_            = true;
+            content_ends_in_newline_ = false;
+        } else if (const auto* args = std::get_if<ninfer::ToolArgumentsDelta>(&event)) {
+            std::cout << args->text;
+        } else if (const auto* end = std::get_if<ninfer::ToolCallEnd>(&event)) {
+            if (end->status == ninfer::ToolCallStatus::Complete)
+                std::cout << '}';
+            else
+                std::cerr << "\nTool call interrupted; arguments are incomplete.\n";
+            std::cout << '\n';
+            content_ends_in_newline_ = true;
+        } else {
+            publish_text(std::get<ninfer::OutputDelta>(std::move(event)));
+        }
+        std::cout.flush();
+    }
+
+    void publish_text(ninfer::OutputDelta delta) {
         std::ostream& output =
             delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;
         output << delta.text;

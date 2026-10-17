@@ -113,6 +113,9 @@ public:
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
+    std::vector<std::string> tool_start(const ninfer::ToolCallStart& event);
+    std::vector<std::string> tool_arguments(const ninfer::ToolArgumentsDelta& event);
+    std::vector<std::string> tool_end(const ninfer::ToolCallEnd& event);
     OpenAIResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltOpenAIResponse& response);
     std::string failed(const ApiError& error);

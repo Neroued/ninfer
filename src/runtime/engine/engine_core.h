@@ -487,7 +487,7 @@ private:
                         if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
                             sink->timing(std::move(*timing));
                         } else {
-                            sink->publish(std::move(std::get<OutputDelta>(event)));
+                            sink->publish(std::move(std::get<OutputEvent>(event)));
                         }
                     } catch (...) { fail_consumer(); }
                 }
@@ -596,8 +596,12 @@ private:
                        EnginePhaseScope* phase                           = nullptr) {
         if (output.empty() && !timing) { return; }
         if (!request->first_output_timing &&
-            std::any_of(output.begin(), output.end(),
-                        [](const auto& delta) { return !delta.text.empty(); })) {
+            std::any_of(output.begin(), output.end(), [](const OutputEvent& event) {
+                if (const auto* text = std::get_if<OutputDelta>(&event)) return !text->text.empty();
+                if (const auto* arguments = std::get_if<ToolArgumentsDelta>(&event))
+                    return !arguments->text.empty();
+                return false;
+            })) {
             if (phase) { phase->checkpoint(); }
             record_first_output(request);
         }
@@ -605,14 +609,31 @@ private:
         {
             std::lock_guard lock(request->mutex);
             if (streaming && timing) { request->events.emplace_back(std::move(*timing)); }
-            for (OutputDelta& delta : output) {
-                std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
-                                                                              : request->content;
-                full += delta.text;
-                if (streaming) { request->events.emplace_back(std::move(delta)); }
+            for (OutputEvent& event : output) {
+                if (const auto* delta = std::get_if<OutputDelta>(&event)) {
+                    auto& full = delta->channel == OutputChannel::Reasoning ? request->reasoning
+                                                                            : request->content;
+                    full += delta->text;
+                }
+                if (streaming) { request->events.emplace_back(std::move(event)); }
             }
         }
         if (streaming) { request->cv.notify_one(); }
+    }
+
+    // Model-format failures settle only this already-committed row. Native abort still owns the
+    // sequence cleanup; decoder errors must not escape to the Engine-wide invariant handler.
+    bool fail_output(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        const auto error = request->output.output_error();
+        if (!error) return false;
+        auto aborted = instance_.program->abort(*request->sequence);
+        if (aborted.status != ConsumeStatus::Consumed)
+            throw std::logic_error("invalid tool output sequence could not be aborted");
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        complete_error(request, error->exception());
+        remove_completed_slot(lane);
+        return true;
     }
 
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
@@ -1168,6 +1189,13 @@ private:
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing), &phase);
+                if (request->output.output_error()) {
+                    if (committed.capture_ready[row]) {
+                        instance_.program->skip_capture(*request->sequence);
+                        committed.capture_ready[row] = false;
+                    }
+                    if (fail_output(request, lane)) continue;
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -2146,6 +2174,7 @@ private:
             request->budget->commit(membership.row_stride);
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, request->output.commit_preview(), std::move(timing), &phase);
+            if (fail_output(request, lane)) continue;
             update_recovery(request);
             request->model_state = EngineRequestState::DecodeReady;
         }

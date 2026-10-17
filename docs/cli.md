@@ -65,7 +65,10 @@ scope, state handling and resource limits.
 Exactly one of `--prompt` and `--messages` is required. The CLI normally omits `--kv-capacity`, so
 the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
 
-Answer content is streamed to stdout. Human-readable startup milestones and runtime errors are
+Answer content is streamed to stdout. Tool calls supplied through `--messages` also stream to stdout
+as `{"name":"...","arguments":...}` records, with argument bytes appearing as they are generated.
+An interrupted record retains its partial JSON and reports the interruption on stderr; it is not
+repaired into a complete call. Human-readable startup milestones and runtime errors are
 written to stderr without service timestamps. Reasoning and the CLI result report (timings,
 throughput, GPU memory, token IDs when requested, and speculative-decoding statistics) also use
 stderr as unprefixed product output, so stdout can be redirected independently. On a terminal,

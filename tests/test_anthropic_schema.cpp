@@ -1,3 +1,4 @@
+#include "serve_tool_stream_fixture.h"
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
@@ -682,6 +683,8 @@ int test_tool_call_presentation() {
     std::vector<std::string> content = stream.content_delta(outcome.text);
     events.insert(events.end(), std::make_move_iterator(content.begin()),
                   std::make_move_iterator(content.end()));
+    auto tool_events = emit_tools(stream, outcome.tool_calls);
+    events.insert(events.end(), tool_events.begin(), tool_events.end());
     std::vector<std::string> terminal = stream.finish(outcome);
     events.insert(events.end(), std::make_move_iterator(terminal.begin()),
                   std::make_move_iterator(terminal.end()));

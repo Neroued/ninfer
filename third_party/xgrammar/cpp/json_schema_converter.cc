@@ -3488,6 +3488,12 @@ Grammar XMLToolCallingConverter::Convert(const SchemaSpecPtr& spec) {
   return JSONSchemaConverter::Convert(spec);
 }
 
+Grammar XMLToolCallingConverter::ConvertJSONValue() {
+  nested_object_level_ = 0;
+  AddBasicRules();
+  return GrammarNormalizer::Apply(builder_.Get(kBasicAny));
+}
+
 std::optional<std::string> XMLToolCallingConverter::GetRenderedJSONType(const SchemaSpecPtr& spec) {
   if (spec == nullptr) {
     return std::nullopt;

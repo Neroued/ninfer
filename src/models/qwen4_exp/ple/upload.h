@@ -14,6 +14,15 @@ struct UploadMemory {
     std::size_t device_bytes;
 };
 
+// Stable slot binding, independent of how the Host producer obtains E. A consumer waits
+// for ready before reading values and records consumed after its last reader. Both events
+// may be captured as external graph nodes; their owner outlives the graph.
+struct DeviceEmbedding {
+    Tensor values;
+    const CudaCompletionEvent& ready;
+    CudaCompletionEvent& consumed;
+};
+
 // Program-owned pinned/Device E slots. One producer borrows host_slots() through its shutdown;
 // it issues the tickets and cannot reuse an output until its writers and all CUDA users retire.
 // This owner handles transfers and consumption, not preparation, cancellation or model state.
@@ -29,18 +38,20 @@ public:
     // Requires sealed, ready input in this ticket's pinned slot. Enqueues H2D and its event.
     // Each generation uploads at most once. Input remains immutable until upload completes.
     void upload(const HostEmbedding&, CudaExecutionView transfer);
-    // Caller establishes that this input is still wanted. Enqueues the current generation's
-    // upload dependency, then borrows Device E; no Host wait for GPU completion occurs.
-    [[nodiscard]] Tensor embedding(Ticket, CudaExecutionView consumer);
-    // Exactly one ordered consumer stream; its last E reader precedes this call.
-    void record_consumed(Ticket, CudaExecutionView consumer);
+    // Requires the current generation's upload to be submitted. Borrows E on one consumer
+    // stream; the caller submits the ready wait, readers and consumed record before notifying us.
+    [[nodiscard]] DeviceEmbedding acquire(Ticket, CudaExecutionView consumer);
+    void consumer_submitted(Ticket, CudaExecutionView consumer);
     [[nodiscard]] bool upload_complete(Ticket) const;
     // Retires this generation's CUDA references, or returns false while they remain. Also
     // succeeds for an input never uploaded. The caller separately drains/releases its producer.
     // Cancellation does not shorten DMA/consumer lifetime or require an artificial consumer.
     [[nodiscard]] bool try_release(Ticket);
 
-    // Stable address for capture. Runtime use still needs embedding() and record_consumed().
+    // Capture does not acquire a generation. Runtime replay still requires acquire() and
+    // consumer_submitted(), including when the event nodes already belong to a graph.
+    [[nodiscard]] DeviceEmbedding binding(std::uint32_t slot, std::uint32_t tokens,
+                                          std::uint32_t batch) const;
     [[nodiscard]] Tensor device_slot(std::uint32_t slot, std::uint32_t tokens,
                                      std::uint32_t batch) const;
     [[nodiscard]] UploadMemory memory() const noexcept;

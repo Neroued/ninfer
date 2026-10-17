@@ -1961,7 +1961,7 @@ private:
     enum class ReservationScope { Round, Prefill };
 
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round) {
-        runnable_units_.fill(false);
+        reserved_units_.fill(false);
         std::optional<std::uint32_t> recovering;
         std::optional<std::uint32_t> oldest;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2023,7 +2023,7 @@ private:
             for (;;) {
                 const auto result = instance_.program->reserve_units({&unit, 1});
                 if (result) {
-                    runnable_units_[lane] = true;
+                    reserved_units_[lane] = true;
                     break;
                 }
                 if (instance_.program->has_context_operation()) { break; }
@@ -2051,18 +2051,19 @@ private:
         if (blocked && !instance_.program->has_context_operation()) {
             (void)pause_resident(*blocked);
         }
-        if (prefill && runnable_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
-            runnable_units_[*prefill] = false;
+        if (prefill && reserved_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
+            reserved_units_[*prefill] = false;
         }
-        // A pause may have selected an already licensed younger row. Its permit belongs
-        // to Native cleanup, and it must not enter this cycle's compact execution batch.
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (!slots_[lane] || slots_[lane]->model_state == EngineRequestState::Pausing ||
-                (slots_[lane]->sequence &&
-                 instance_.program->context_blocks(*slots_[lane]->sequence))) {
-                runnable_units_[lane] = false;
-            }
-        }
+    }
+
+    // Admission can pin an existing writer's tail after its reservation. Membership must
+    // observe current context dependencies, including pauses selected during reclamation.
+    [[nodiscard]] bool unit_runnable(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        return reserved_units_[lane] && request && request->sequence &&
+               request->model_state != EngineRequestState::Pausing &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               !instance_.program->context_blocks(*request->sequence);
     }
 
     void run_decode_round(const RoundMembership& membership,
@@ -2295,10 +2296,7 @@ private:
                 ControlMembership selected_control;
                 selected_control.row_stride = controls.row_stride;
                 for (std::size_t row = 0; row < controls.size; ++row) {
-                    if (!runnable_units_[controls.lanes[row]] ||
-                        slots_[controls.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
-                        continue;
-                    }
+                    if (!unit_runnable(controls.lanes[row])) { continue; }
                     selected_control.lanes[selected_control.size]       = controls.lanes[row];
                     selected_control.sequences[selected_control.size++] = controls.sequences[row];
                     const auto begin = controls.tokens.begin() + row * controls.row_stride;
@@ -2317,10 +2315,7 @@ private:
                 {
                     RoundMembership selected;
                     for (std::size_t row = 0; row < decode.size; ++row) {
-                        if (!runnable_units_[decode.lanes[row]] ||
-                            slots_[decode.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
-                            continue;
-                        }
+                        if (!unit_runnable(decode.lanes[row])) { continue; }
                         if (std::find(controls.lane_span().begin(), controls.lane_span().end(),
                                       decode.lanes[row]) != controls.lane_span().end()) {
                             continue;
@@ -2349,11 +2344,7 @@ private:
                 }
                 auto prefill_slots = slots_;
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                    if (!runnable_units_[lane] ||
-                        (prefill_slots[lane] &&
-                         prefill_slots[lane]->cancelled.load(std::memory_order_acquire))) {
-                        prefill_slots[lane].reset();
-                    }
+                    if (!unit_runnable(lane)) { prefill_slots[lane].reset(); }
                 }
                 if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
                     const auto request = slots_[*lane];
@@ -2423,7 +2414,7 @@ private:
     std::shared_ptr<Request> context_owner_;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
-    std::array<bool, kMaximumConcurrency> runnable_units_{};
+    std::array<bool, kMaximumConcurrency> reserved_units_{};
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;

@@ -198,11 +198,13 @@ void run(const Options& o) {
         const auto host_ready = Clock::now();
         uploads.upload(service.embedding(*ticket), context.transfer_view());
         if (o.work) {
-            const auto e = uploads.embedding(*ticket, context.execution_view())
-                               .reshape({2560, std::int32_t(positions)});
+            const auto binding = uploads.acquire(*ticket, context.execution_view());
+            binding.ready.wait(context.stream());
+            const auto e = binding.values.reshape({2560, std::int32_t(positions)});
             exposed_time.record_stop();
             ops::linear(e, projection, y, context.execution_view());
-            uploads.record_consumed(*ticket, context.execution_view());
+            binding.consumed.record(context.stream());
+            uploads.consumer_submitted(*ticket, context.execution_view());
         }
         until([&] { return uploads.upload_complete(*ticket); });
         const auto device_ready = Clock::now();

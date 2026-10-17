@@ -15,7 +15,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 | 并发与上下文 | 启动固定 1–8 路 resident lanes；本实例最大上下文 262144，实际容量由启动预算决定 |
 | Vision | 图像、视频、多媒体消息；共享 Vision 编码器、MRoPE 和跨 Text chunk 特征交接 |
 | 原生 MTP | draft 数 1–5，支持 Text/Vision、1–8 路、采样 penalty 和约束输出 |
-| CUDA Graph | ordinary、MTP draft/target/Finish、单列 control；Main 使用分段图 |
+| CUDA Graph | resident Main 整图、MTP draft chain、独立采样/接受图、无 head 的单列 control 图；expert offload 保留分段交接 |
 | KV 存储 | BF16、INT8-G64、FP8-row256、NVFP4-G16、K8V4；index keys 固定 BF16 |
 | 上下文复用 | 完整 StateImage 与 Main/MTP 页组、Device 前缀命中、Snapshot/Replay；5090 还提供 Host 副本 |
 | 前端与服务 | thinking、thinking budget、tool call、GBNF/JSON/schema/choice/regex；共用 Qwen Frontend 和现有 HTTP 协议 |
@@ -31,7 +31,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
   小批量缺失 expert 由 CPU 计算，没有按需换入 GPU 计算的第三条分工路径。
 - PLE 当前只有磁盘准备路径，没有整表 RAM/GPU lookup。
 - Prefill、Replay、Vision encode、MTP 历史对齐与状态采用均使用 eager。
-  Resident Graph 包含完整层的 GPU 计算；offload 保留 CPU expert 交接。两者均保留 PLE 磁盘交接。
+  Resident Main 图包含全部层和 PLE 消费；PLE Host 准备在提交图前交付输入，offload 保留 CPU expert 交接。
 
 用户命令见 [CLI](../cli.md)与[Serving](../serving.md)，产物生成见
 [转换指南](../weight-conversion.md)。这些能力描述当前实现；公开的吞吐与质量结果由
@@ -181,10 +181,13 @@ Ticket 由物理 slot 和 generation 构成。每行携带 sequence、epoch、�
 | append | 按行连续追加候选 IDs，可立即发起读取 |
 | seal | 冻结最终有效输入长度；截去尾列置零，之后不可追加 |
 | HostReady | 已 seal，全部有效 E 完成；尚不代表 Device 可消费 |
-| upload / embedding | 在独立 transfer stream 排入 H2D 和 event，consumer 等待本代次已 record 的 event |
+| upload / acquire | 在独立 transfer stream 排入 H2D 和 event，再借出本代次的 Device E、ready/consumed events |
 | consumed / release | 最后 Device 消费、H2D 和 Host writers 都退役后，才重用 slot |
 
 `UploadSlots` 独立拥有 pinned/Device E；PrepareService 借用其 Host 槽。
+Consumer 在首个 E 读者前等待 ready，在最后读者后记录 consumed，再通知 owner 已提交。
+Graph 将这两个依赖捕获为 external event nodes；本代次 H2D/event 必须先于 graph replay
+排入 producer stream。尚未提交的下一代 event 不能作为本轮就绪信号。
 Program 先创建上传槽，后创建准备服务；销毁时先结束 Host writers，再排空上传和消费。
 取消撤销该窗口的发布意图，仍有其他窗口使用的共享读继续完成。
 晚到完成可填充正确的不可变行缓存，但不能写入重用后的 ticket。
@@ -200,7 +203,7 @@ Canonical state 和 accepted IDs 不借用将要释放的 ticket。
 |---|---|
 | 首个输入窗口 | IDs 已知后提交，可与 Vision encode、embedding 和 PLE 前层重叠 |
 | Prefill / Replay | 消费当前 PLE 后准备下一个实际 Text 窗口，与后续 Main 层计算重叠 |
-| Ordinary decode | anchor 已知即准备，主要利用 PLE 前的计算窗口 |
+| Ordinary decode | anchor 已知即准备；resident Main 提交前等待 HostReady/H2D 已排入，图内在 PLE 入口等待上传完成 |
 | MTP verify | 先准备 anchor；各步 draft ID 异步 D2H 后按顺序 append，全部有效 IDs 到齐后 seal |
 | Control / scoring | 使用同一真实输入前沿和准备流水 |
 
@@ -216,8 +219,9 @@ residual + U + N + 旧 history → ple_conv_add_norm：BF16 residual、下一组
 
 PLE 卷积消费 norm(actual BF16 U) 的 N records，四个 tap 对应 -9、-6、-3、0。
 Conv/SiLU 与 residual/U 相加后写 BF16，再做下一组 HC norm。
-E 的最后读者是 KV Linear；当前 Program 在整个 PLE GPU 段后记录 consumed，
-然后开始后续层。N records 和采用所需 IDs 保留到提交，不随 E 槽释放。
+E 的最后读者是 KV Linear；Program 在整个 PLE GPU 段后记录 consumed。
+Resident 图中的 external record 允许 Host 在后续层执行期间回收该槽。
+N records 和采用所需 IDs 保留到提交，不随 E 槽释放。
 GPU 数学见 [PLE 合同](../../include/ninfer/ops/ple.h)。
 
 ## 5. MTP 的生成与采用
@@ -342,23 +346,27 @@ state slot/table row。前缀命中采用公共资源策略，不另建 QSA/PLE 
 
 ### 8.1 图的边界
 
-`program/graphs.*` 按 exact-B 准备 ordinary、逐步 draft、target verify 和采样/Finish。
-Main 由 `text_graph.*` 组织 stem、逐层 mixer/MoE/combine、PLE 消费和 final mixer。
+`program/graphs.*` 按 exact-B 准备 ordinary、control、target verify、draft chain 和决策图。
+Resident Main 一次 replay 包含 embedding、全部层、PLE、final mixer，以及生成所需的 head。
+Control 使用无 head 的图；前缀命中后的首次采样仍可单独从保存的 hidden 投影 head。
 Eager/capture 调用同一组 GPU body，CPU experts、缓存 lease 与磁盘 I/O 在图外执行。
 
-PLE 位于前序层之后的 Host 交接处：提交前序计算，等待当前 HostReady 并排入 H2D/event，
-选择对应上传槽的 PLE 消费图，再继续后续层。两个稳定 E 地址仅各自绑定 PLE 消费段。
-Resident 每层捕获 `mixer → MoE → combine`；offload 每层保留 CPU/cache 交接。
-Main 仍由 stem、逐层图、PLE 段和 finish 组成。
+`text_graph.*` 将 resident 与 expert offload 的组织分开。Resident 的 QSA mixer 以 child
+graph 持有各 context envelope；其余层计算直接捕获在外层图。PLE 消费也是 child，
+包含 ready wait、计算和 consumed record。换上传槽只更新该 child，不复制完整 Main。
+当前 Host producer 在 Main 提交前交付已排入 H2D 的 E；H2D 可以与图内前序计算重叠，
+Host 读取等待不再与 resident 前序层重叠。表驻留位置不进入 Main 的数学接口。
+Offload 仍按真实 CPU/cache 交接分段，PLE 之前的层可以在 Host 准备期间执行。
 
 同一 exact-B 内，位置、valid columns、state selectors、table rows、page IDs、route/mask
-内容是 Device 输入。上下文 envelope 由 Program 选择并更新兼容图；GDN 定义和
-MoE subset 定义跨档位共享，QSA 相关定义随 envelope 更新。启动时验证全部更新关系，
-Op 的私有分派仍由 Op 决定。
+内容是 Device 输入。Program 选择 context envelope 并更新本地 child；Op 保留自己的
+分派逻辑。启动时验证全部 envelope 更新和 PLE 槽切换；workspace 取允许 profile 的峰值。
 
-MTP 每步 draft 图后在图外提交 ID event/D2H，增量准备 PLE。
-Target 与 Finish 分开，Host 在 Finish 前生成约束 mask。最终接受长度仍由 Host
-事务决定，GDN fold、QSA/PLE tail 提取及 Backend 对齐在图外执行。
+MTP 按本轮实际深度 S=1..K 选择一条 draft chain，保留每行有效长度和 step-0 bridge。
+每步在 transfer 分支异步复制 ID 并记录 external event，Host 按顺序 append 到 PLE；
+链尾回接 compute stream。随后提交 Main verify（含 head），再提交消费 logits 的接受图。
+Ordinary 同样将 Main/head 与采样图分开，约束 mask 和采样配置在决策前上传。
+最终接受长度仍由 Host 事务决定，GDN fold、QSA/PLE tail 提取及 Backend 对齐在图外执行。
 
 ### 8.2 容量规划
 

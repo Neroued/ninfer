@@ -324,7 +324,9 @@ transport 通过队列、原子 cancellation flag 和 response event 交互。
 在 resident 间轮转，decode 批次使用实际 `B`。
 
 Program 的 `reserve_units` 原子取得一个调用集合的 typed 增量需求；Engine 逐行调用，组成可运行
-子集。一行缺资源不会阻止其他已许可行执行。普通 unit 结算释放未用 reservation 与 provisional
+子集。取得许可后，fresh admission 仍可能增加尾页复制等依赖；control、decode、prefill 成批时
+重新检查 Program 当前的 `context_blocks`，受影响的 writer 等待复制完成。一行缺资源不会阻止
+其他已许可且无依赖的行执行。普通 unit 结算释放未用 reservation 与 provisional
 suffix；恢复许可保留未来重建及首新单元尚需的 reservation。压力可以回收 optional cache、撤销
 paused Snapshot 或暂停年轻 resident，具体准入与公平性见核心缓存文档。
 
@@ -438,8 +440,9 @@ COW 和 replica publication 在 GPU 稳定边界完成。消费者只拿 non-own
 
 CUDA Graph 按合法 exact-`B` topology 建立，page ID、请求身份、state selectors 是输入而非 graph key。
 Op 拥有声明执行范围内的 Graph 更新兼容性，Program 在启动时捕获并验证同类更新。
-Speculative unit 使用 Forward、Finish 两段 Graph，CPU 在两段之间准备约束 mask，并可与 target
-forward 重叠；两段共享同一个资源预留和提交边界。
+Program 按真实数据依赖组织计算与决策 Graph；CPU 在决策前准备约束 mask，并可与 target
+forward 重叠。Qwen4Exp resident Main 包含 PLE 消费和 head；Host PLE producer 在 Main
+提交前提供本代次输入，MTP draft chain 增量回传 IDs。所有设备段共享同一个资源预留和提交边界。
 长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
 
 MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。

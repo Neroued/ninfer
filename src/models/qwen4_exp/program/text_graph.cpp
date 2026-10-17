@@ -4,40 +4,6 @@
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
-namespace {
-class ResidentDefinition;
-
-class ResidentExecutable final : public moe::LayerGraphExecutable {
-public:
-    explicit ResidentExecutable(const DecodeGraphDefinition& definition) {
-        executable_.instantiate(definition);
-    }
-
-    void update(const moe::LayerGraphDefinition&) override;
-
-    void upload(cudaStream_t stream) override { executable_.upload(stream); }
-
-    void replay(Tensor&, CudaExecutionView cuda, const std::function<void()>& submitted) override {
-        executable_.launch(cuda.stream());
-        if (submitted) submitted();
-    }
-private:
-    DecodeGraphExecutable executable_;
-};
-
-class ResidentDefinition final : public moe::LayerGraphDefinition {
-public:
-    DecodeGraphDefinition definition;
-
-    std::unique_ptr<moe::LayerGraphExecutable> instantiate() const override {
-        return std::make_unique<ResidentExecutable>(definition);
-    }
-};
-
-void ResidentExecutable::update(const moe::LayerGraphDefinition& source) {
-    executable_.update(dynamic_cast<const ResidentDefinition&>(source).definition);
-}
-} // namespace
 
 void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& body) {
     definition.capture(cuda.stream(), body);
@@ -47,95 +13,166 @@ void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& 
 
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
                         moe::Schedule* experts, std::span<const std::uint32_t> bounds,
-                        std::array<Tensor, 2> ple, execution::TextOutputs output,
-                        std::int32_t columns, MemoryArena& workspace, DeviceContext& device) {
-    const auto cuda    = device.execution_view();
-    const auto& config = parameters.model.config().text;
-    ple_layer_         = config.ple.layer;
-    block_output_      = run.block_output();
-    for (const auto& layer : parameters.text.layers) banks_.push_back(layer.moe.bank);
-    workspace.reset_peak();
-    stem_.prepare(cuda, [&] { run.stem(); });
-    for (std::size_t slot = 0; slot < ple.size(); ++slot)
-        ple_[slot].prepare(cuda, [&] { run.consume_ple(ple[slot]); });
-    finish_.prepare(cuda, [&] { run.finish(output); });
-    const auto fixed_workspace = workspace.peak_used();
-    profiles_.reserve(bounds.size());
-    for (const auto bound : bounds) {
-        run.set_visible_tokens(bound);
-        workspace.reset_peak();
-        Profile profile{bound, {}};
-        profile.layers.reserve(banks_.size());
-        for (std::size_t i = 0; i < banks_.size(); ++i) {
-            const auto* shared = profiles_.empty() ? nullptr : &profiles_.front().layers[i];
-            if (shared &&
-                std::holds_alternative<execution::GdnParameters>(parameters.text.layers[i].mixer)) {
-                profile.layers.push_back(*shared);
-                continue;
-            }
-            if (experts) {
-                profile.layers.push_back(experts->capture_layer(
-                    banks_[i], cuda, columns, [&] { run.mixer(i); },
-                    [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); },
-                    shared ? *shared : nullptr));
-            } else {
-                auto layer = std::make_shared<ResidentDefinition>();
-                layer->definition.capture(cuda.stream(), [&] {
-                    run.mixer(i);
-                    run.resident_moe(i);
-                    run.combine(i);
-                });
-                profile.layers.push_back(std::move(layer));
-            }
-        }
-        profile.workspace_bytes = std::max(fixed_workspace, workspace.peak_used());
-        if (!profiles_.empty())
-            profile.workspace_bytes =
-                std::max(profile.workspace_bytes, profiles_.front().workspace_bytes);
-        profiles_.push_back(std::move(profile));
-    }
-    layers_.reserve(banks_.size());
-    for (const auto& layer : profiles_.front().layers) layers_.push_back(layer->instantiate());
-    // Exercise every update before accepting requests, including the return to the first tier.
-    for (const auto bound : bounds) {
+                        std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
+                        Tensor logits, std::int32_t columns, MemoryArena& workspace,
+                        DeviceContext& device) {
+    bounds_.assign(bounds.begin(), bounds.end());
+    workspace_bytes_.resize(bounds.size());
+    const auto cuda = device.execution_view();
+    if (experts)
+        prepare_offloaded(run, parameters, *experts, ple, output, logits, columns, workspace, cuda);
+    else
+        prepare_resident(run, parameters, ple, output, logits, workspace, cuda);
+    // Qualify every child/layer update before accepting requests.
+    for (const auto bound : bounds_) {
         select(bound);
-        for (auto& layer : layers_) layer->upload(cuda.stream());
+        if (resident()) {
+            std::get<Resident>(implementation_).main.executable.upload(cuda.stream());
+        } else {
+            for (auto& layer : std::get<Offloaded>(implementation_).layers)
+                layer->upload(cuda.stream());
+        }
         device.synchronize();
     }
-    select(bounds.front());
+    select(bounds_.front());
 }
 
+void TextGraph::prepare_resident(execution::TextRun& run, const execution::Parameters& p,
+                                 std::array<ple::DeviceEmbedding, 2> inputs,
+                                 execution::TextOutputs output, Tensor logits,
+                                 MemoryArena& workspace, CudaExecutionView cuda) {
+    auto& graph = implementation_.emplace<Resident>();
+    for (const auto bound : bounds_) {
+        run.set_visible_tokens(bound);
+        workspace.reset_peak();
+        auto& profile = graph.profiles.emplace_back();
+        for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
+            if (!std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer)) continue;
+            profile.emplace_back().capture(cuda.stream(), [&] { run.mixer(i); });
+        }
+        workspace_bytes_[graph.profiles.size() - 1] = workspace.peak_used();
+    }
+    workspace.reset_peak();
+    for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
+        graph.ple[slot].capture(cuda.stream(), [&] {
+            inputs[slot].ready.wait_external(cuda.stream());
+            run.consume_ple(inputs[slot].values);
+            inputs[slot].consumed.record_external(cuda.stream());
+        });
+    }
+    run.set_visible_tokens(bounds_.front());
+    graph.main.prepare(cuda, [&] {
+        run.stem();
+        std::size_t mixer = 0;
+        for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
+            if (i == p.model.config().text.ple.layer)
+                graph.ple_node = graph.ple[0].append_to(cuda.stream());
+            if (std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer))
+                graph.mixers.push_back(graph.profiles.front()[mixer++].append_to(cuda.stream()));
+            else
+                run.mixer(i);
+            run.resident_moe(i);
+            run.combine(i);
+        }
+        run.finish(output, logits);
+    });
+    for (auto& bytes : workspace_bytes_) bytes = std::max(bytes, workspace.peak_used());
+}
+
+void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Parameters& p,
+                                  moe::Schedule& experts,
+                                  std::array<ple::DeviceEmbedding, 2> inputs,
+                                  execution::TextOutputs output, Tensor logits,
+                                  std::int32_t columns, MemoryArena& workspace,
+                                  CudaExecutionView cuda) {
+    auto& graph        = implementation_.emplace<Offloaded>();
+    graph.ple_layer    = p.model.config().text.ple.layer;
+    graph.block_output = run.block_output();
+    workspace.reset_peak();
+    graph.stem.prepare(cuda, [&] { run.stem(); });
+    for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
+        graph.ple[slot].prepare(cuda, [&] {
+            inputs[slot].ready.wait_external(cuda.stream());
+            run.consume_ple(inputs[slot].values);
+            inputs[slot].consumed.record_external(cuda.stream());
+        });
+    }
+    graph.finish.prepare(cuda, [&] { run.finish(output, logits); });
+    const auto fixed_workspace = workspace.peak_used();
+    for (const auto bound : bounds_) {
+        run.set_visible_tokens(bound);
+        workspace.reset_peak();
+        auto& profile = graph.profiles.emplace_back();
+        for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
+            const auto* shared = graph.profiles.size() == 1 ? nullptr : &graph.profiles.front()[i];
+            if (shared &&
+                std::holds_alternative<execution::GdnParameters>(p.text.layers[i].mixer)) {
+                profile.push_back(*shared);
+            } else {
+                profile.push_back(experts.capture_layer(
+                    p.text.layers[i].moe.bank, cuda, columns, [&] { run.mixer(i); },
+                    [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); },
+                    shared ? *shared : nullptr));
+            }
+        }
+        workspace_bytes_[graph.profiles.size() - 1] =
+            std::max({fixed_workspace, workspace.peak_used(), workspace_bytes_.front()});
+    }
+    for (const auto& layer : graph.profiles.front()) graph.layers.push_back(layer->instantiate());
+}
+
+bool TextGraph::resident() const { return std::holds_alternative<Resident>(implementation_); }
+
 void TextGraph::select(std::uint32_t visible) {
-    const auto it = std::lower_bound(profiles_.begin(), profiles_.end(), visible,
-                                     [](const auto& profile, auto n) { return profile.bound < n; });
-    if (it == profiles_.end()) throw std::logic_error("Qwen4Exp graph context exceeds capacity");
-    const auto next = static_cast<std::size_t>(it - profiles_.begin());
+    const auto it = std::lower_bound(bounds_.begin(), bounds_.end(), visible);
+    if (it == bounds_.end()) throw std::logic_error("Qwen4Exp graph context exceeds capacity");
+    const auto next = static_cast<std::size_t>(it - bounds_.begin());
     if (next == installed_) return;
-    for (std::size_t i = 0; i < layers_.size(); ++i)
-        if (it->layers[i] != profiles_[installed_].layers[i]) layers_[i]->update(*it->layers[i]);
+    if (resident()) {
+        auto& graph = std::get<Resident>(implementation_);
+        for (std::size_t i = 0; i < graph.mixers.size(); ++i)
+            graph.main.executable.update_child(graph.mixers[i], graph.profiles[next][i]);
+    } else {
+        auto& graph = std::get<Offloaded>(implementation_);
+        for (std::size_t i = 0; i < graph.layers.size(); ++i)
+            if (graph.profiles[next][i] != graph.profiles[installed_][i])
+                graph.layers[i]->update(*graph.profiles[next][i]);
+    }
     installed_ = next;
 }
 
-void TextGraph::traverse(std::uint32_t begin, std::uint32_t end, CudaExecutionView cuda) {
+void TextGraph::replay(std::uint32_t slot, CudaExecutionView cuda) {
+    auto& graph = std::get<Resident>(implementation_);
+    if (slot != graph.slot) {
+        graph.main.executable.update_child(graph.ple_node, graph.ple.at(slot));
+        graph.slot = slot;
+    }
+    graph.main.executable.launch(cuda.stream());
+}
+
+void TextGraph::Offloaded::traverse(std::uint32_t begin, std::uint32_t end,
+                                    CudaExecutionView cuda) {
     for (auto i = begin; i < end; ++i) {
         nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
-        layers_[i]->replay(block_output_, cuda);
+        layers[i]->replay(block_output, cuda);
     }
 }
 
 void TextGraph::prefix(CudaExecutionView cuda) {
-    stem_.executable.launch(cuda.stream());
-    traverse(0, ple_layer_, cuda);
+    auto& graph = std::get<Offloaded>(implementation_);
+    graph.stem.executable.launch(cuda.stream());
+    graph.traverse(0, graph.ple_layer, cuda);
 }
 
 void TextGraph::consume_ple(std::uint32_t slot, CudaExecutionView cuda) {
     if (slot >= 2) throw std::logic_error("invalid PLE graph slot");
-    ple_[slot].executable.launch(cuda.stream());
+    std::get<Offloaded>(implementation_).ple[slot].executable.launch(cuda.stream());
 }
 
 void TextGraph::suffix(CudaExecutionView cuda) {
-    traverse(ple_layer_, banks_.size(), cuda);
-    finish_.executable.launch(cuda.stream());
+    auto& graph = std::get<Offloaded>(implementation_);
+    graph.traverse(graph.ple_layer, graph.layers.size(), cuda);
+    graph.finish.executable.launch(cuda.stream());
 }
 
 } // namespace ninfer::models::qwen4_exp

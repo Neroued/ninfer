@@ -96,18 +96,42 @@ void PlePipeline::append_device(ple::Ticket ticket, const Tensor& ids,
         throw std::logic_error("invalid PLE draft handoff");
     auto& transfer = appends_.at(ticket.slot * k + step);
     if (transfer.pending) throw std::logic_error("PLE draft handoff is still live");
-    transfer.ticket = ticket;
-    transfer.batch  = extents.size();
-    for (std::size_t b = 0; b < extents.size(); ++b) transfer.active[b] = step < extents[b];
-    const auto bytes = resources_.plan.shape.max_concurrency * sizeof(std::int32_t);
-    const auto offset =
-        resources_.plan.persistent.buffers.mtp->ingress.bytes + (ticket.slot * k + step) * bytes;
     transfer.produced.record(cuda_.stream());
     const auto upload = resources_.ple_transfer();
     transfer.produced.wait(upload.stream());
-    copy_bytes_async(resources_.mtp_ingress().subspan(offset, ids.bytes()),
+    copy_bytes_async(append_destination(ticket.slot, step, extents.size()),
                      {ids.data, ids.bytes(), cuda_.device()}, upload);
     transfer.copied.record(upload.stream());
+    append_submitted(ticket, extents, step);
+}
+
+MemorySpan PlePipeline::append_destination(std::uint32_t slot, std::uint32_t step,
+                                           std::uint32_t batch) {
+    const auto index  = slot * resources_.plan.shape.draft_tokens + step;
+    const auto offset = resources_.plan.persistent.buffers.mtp->ingress.bytes +
+                        index * resources_.plan.shape.max_concurrency * sizeof(std::int32_t);
+    return resources_.mtp_ingress().subspan(offset, batch * sizeof(std::int32_t));
+}
+
+void PlePipeline::capture_append(std::uint32_t slot, const Tensor& ids, std::uint32_t step,
+                                 CudaExecutionView cuda) {
+    auto& transfer = appends_.at(slot * resources_.plan.shape.draft_tokens + step);
+    copy_bytes_async(append_destination(slot, step, ids.numel()),
+                     {ids.data, ids.bytes(), cuda.device()}, cuda);
+    transfer.copied.record_external(cuda.stream());
+}
+
+void PlePipeline::append_submitted(ple::Ticket ticket, std::span<const std::uint32_t> extents,
+                                   std::uint32_t step) {
+    auto& w      = window(ticket);
+    const auto k = resources_.plan.shape.draft_tokens;
+    if (step >= k || extents.size() != w.rows.size() || w.seal_requested)
+        throw std::logic_error("invalid PLE draft handoff");
+    auto& transfer = appends_.at(ticket.slot * k + step);
+    if (transfer.pending) throw std::logic_error("PLE draft handoff is still live");
+    transfer.ticket = ticket;
+    transfer.batch  = extents.size();
+    for (std::size_t b = 0; b < extents.size(); ++b) transfer.active[b] = step < extents[b];
     transfer.pending = true;
     ++w.append_count;
 }
@@ -192,7 +216,7 @@ void PlePipeline::progress() {
     }
 }
 
-Tensor PlePipeline::consume(ple::Ticket ticket) {
+ple::DeviceEmbedding PlePipeline::consume(ple::Ticket ticket) {
     nvtx::ScopedRange wait(nvtx::Name::PleWait, nvtx::Category::Runtime);
     for (;;) {
         progress();
@@ -200,7 +224,7 @@ Tensor PlePipeline::consume(ple::Ticket ticket) {
         if (w.error) std::rethrow_exception(w.error);
         if (w.cancelled) throw std::logic_error("consuming a cancelled PLE window");
         if (w.uploaded) {
-            auto value = resources_.ple_upload->embedding(ticket, cuda_);
+            auto value = resources_.ple_upload->acquire(ticket, cuda_);
             w.acquired = true;
             return value;
         }
@@ -210,8 +234,15 @@ Tensor PlePipeline::consume(ple::Ticket ticket) {
 
 void PlePipeline::consumed(ple::Ticket ticket) {
     auto& w = window(ticket);
-    resources_.ple_upload->record_consumed(ticket, cuda_);
+    resources_.ple_upload->consumer_submitted(ticket, cuda_);
     w.consumed = true;
+}
+
+void PlePipeline::abandon_consumer(Window& w) {
+    if (!w.acquired || w.consumed) return;
+    auto input = resources_.ple_upload->binding(w.ticket.slot, w.tokens, w.rows.size());
+    input.consumed.record(cuda_.stream());
+    consumed(w.ticket);
 }
 
 void PlePipeline::wait_compute() {
@@ -228,7 +259,7 @@ void PlePipeline::cancel(std::uint64_t sequence) {
         if (w && !w->cancelled && std::any_of(w->rows.begin(), w->rows.end(), [&](const auto& row) {
                 return row.sequence == sequence;
             })) {
-            if (w->acquired && !w->consumed) consumed(w->ticket);
+            abandon_consumer(*w);
             resources_.ple_prepare->cancel(w->ticket);
             w->cancelled = true;
         }
@@ -239,7 +270,7 @@ void PlePipeline::cancel(std::uint64_t sequence) {
 void PlePipeline::drain() {
     for (auto& w : windows_) {
         if (w && !w->cancelled) {
-            if (w->acquired && !w->consumed) consumed(w->ticket);
+            abandon_consumer(*w);
             resources_.ple_prepare->cancel(w->ticket);
             w->cancelled = true;
         }

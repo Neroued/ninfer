@@ -122,10 +122,23 @@ private:
 Graphs::Graphs(ProgramImpl& owner)
     : owner_(owner), bounds_(context_bounds(owner.shape.max_context)) {}
 
-void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
+TextGraph& Graphs::main(Batch& graph, MainGraph kind) {
+    switch (kind) {
+    case MainGraph::Control:
+        return graph.control;
+    case MainGraph::Ordinary:
+        return graph.ordinary;
+    case MainGraph::Verify:
+        return graph.verify;
+    }
+    throw std::logic_error("invalid Main graph kind");
+}
+
+void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
     auto& p             = owner_;
     auto& r             = p.resources;
     const auto& buffers = r.plan.persistent.buffers;
+    const auto verify   = kind == MainGraph::Verify;
     const auto tokens   = verify ? p.shape.draft_tokens + 1 : 1;
     const auto call     = r.main_batch(tokens, batch, bounds_.back());
     const auto& c       = p.parameters.model.config().text;
@@ -135,6 +148,9 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
     if (buffers.pending_conditioning)
         output.conditioning =
             r.packed(*buffers.pending_conditioning, {dimension(c.residual_width()), t, b});
+    const auto logits = kind != MainGraph::Control
+                            ? r.packed(*buffers.logits, {dimension(c.vocabulary), t, b})
+                            : Tensor{};
     const execution::TextExecution execution{r.workspace,
                                              *r.states,
                                              r.main->cache,
@@ -144,24 +160,29 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
                                              r.tensor(buffers.ple_records)};
     execution::StateUpdate update = execution::StepUpdate{};
     if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
-    const std::array ple{r.ple_upload->device_slot(0, tokens, batch),
-                         r.ple_upload->device_slot(1, tokens, batch)};
-    auto& selected = verify ? graph.verify : graph.ordinary;
+    const std::array ple{r.ple_upload->binding(0, tokens, batch),
+                         r.ple_upload->binding(1, tokens, batch)};
+    auto& selected = main(graph, kind);
     {
         // Warm the actual bodies before capture. No disk request is needed for these bindings.
         execution::TextRun run(p.parameters, execution, call, update, p.cuda);
         run.prefix();
-        run.consume_ple(ple[0]);
-        run.suffix(output);
+        run.consume_ple(ple[0].values);
+        run.suffix(output, logits);
         p.device.synchronize();
-        selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, tokens * batch,
-                         r.workspace, p.device);
+        selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, logits,
+                         tokens * batch, r.workspace, p.device);
     }
     selected.select(bounds_.back());
     execution::TextRun run(p.parameters, execution, call, update, p.cuda);
-    selected.prefix(p.cuda);
-    selected.consume_ple(0, p.cuda);
-    selected.suffix(p.cuda);
+    if (selected.resident()) {
+        selected.replay(1, p.cuda);
+        selected.replay(0, p.cuda);
+    } else {
+        selected.prefix(p.cuda);
+        selected.consume_ple(0, p.cuda);
+        selected.suffix(p.cuda);
+    }
     p.device.synchronize();
 }
 
@@ -179,15 +200,45 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
                                             [&] { p.draft_forward(step, batch, bound); });
             call.workspace_bytes.push_back(p.resources.workspace.peak_used());
         }
-        call.executable.instantiate(call.definitions.front());
-        for (const auto& definition : call.definitions) {
-            call.executable.update(definition);
-            call.executable.upload(p.cuda.stream());
+        const auto& frame = *p.resources.plan.persistent.buffers.mtp;
+        const auto ids    = p.device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
+        for (std::uint32_t slot = 0; slot < 2; ++slot)
+            call.handoffs[slot].capture(p.cuda.stream(),
+                                        [&] { p.ple.capture_append(slot, ids, step, p.cuda); });
+    }
+    graph.chains.resize(p.shape.draft_tokens);
+    CudaCompletionEvent fork(p.device), join(p.device);
+    const auto transfer = p.resources.ple_transfer();
+    for (std::uint32_t depth = 1; depth <= p.shape.draft_tokens; ++depth) {
+        auto& chain = graph.chains[depth - 1];
+        chain.installed.resize(depth);
+        chain.graph.prepare(p.cuda, [&] {
+            for (std::uint32_t step = 0; step < depth; ++step) {
+                const auto& call = graph.drafts[step];
+                chain.steps.push_back(call.definitions.front().append_to(p.cuda.stream()));
+                p.save_draft(step, batch);
+                fork.record(p.cuda.stream());
+                fork.wait(transfer.stream());
+                chain.handoffs.push_back(call.handoffs[0].append_to(transfer.stream()));
+            }
+            join.record(transfer.stream());
+            join.wait(p.cuda.stream());
+        });
+        for (std::size_t context = 0; context < bounds_.size(); ++context) {
+            for (std::uint32_t step = 0; step < depth; ++step)
+                chain.graph.executable.update_child(chain.steps[step],
+                                                    graph.drafts[step].definitions[context]);
+            chain.graph.executable.upload(p.cuda.stream());
             p.device.synchronize();
         }
-        call.installed = bounds_.size() - 1;
-        call.executable.launch(p.cuda.stream());
-        p.device.synchronize();
+        std::fill(chain.installed.begin(), chain.installed.end(), bounds_.size() - 1);
+        for (std::uint32_t slot : {1U, 0U}) {
+            for (std::uint32_t step = 0; step < depth; ++step)
+                chain.graph.executable.update_child(chain.handoffs[step],
+                                                    graph.drafts[step].handoffs[slot]);
+            chain.graph.executable.launch(p.cuda.stream());
+            p.device.synchronize();
+        }
     }
 }
 
@@ -202,14 +253,12 @@ void Graphs::prepare() {
     for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
         auto& graph = batches_[batch - 1];
         inputs.batch(r.main_batch(1, batch, bounds_.back()), 0, bounds_.back());
-        prepare_main(graph, batch, false);
-        const auto hidden =
-            r.packed(r.plan.persistent.buffers.pending_sample,
-                     {dimension(p.parameters.model.config().text.hidden), static_cast<int>(batch)});
-        p.sample_forward(batch, hidden, false);
+        prepare_main(graph, batch, MainGraph::Control);
+        prepare_main(graph, batch, MainGraph::Ordinary);
+        p.sample_forward(batch, false);
         p.device.synchronize();
         r.workspace.reset_peak();
-        graph.sample.prepare(p.cuda, [&] { p.sample_forward(batch, hidden, false); });
+        graph.sample.prepare(p.cuda, [&] { p.sample_forward(batch, false); });
         graph.sample_workspace = r.workspace.peak_used();
         if (p.parameters.mtp) {
             const auto& frame = *r.plan.persistent.buffers.mtp;
@@ -219,7 +268,7 @@ void Graphs::prepare() {
             prepare_drafts(graph, batch);
             inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()), 0,
                          bounds_.back());
-            prepare_main(graph, batch, true);
+            prepare_main(graph, batch, MainGraph::Verify);
             p.accept_forward(batch);
             p.device.synchronize();
             r.workspace.reset_peak();
@@ -232,25 +281,37 @@ void Graphs::prepare() {
     r.workspace.reset_peak();
 }
 
-TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible) {
+TextGraph& Graphs::main(std::uint32_t batch, MainGraph kind, std::uint32_t visible) {
     auto& group = batches_.at(batch - 1);
-    auto& graph = verify ? group.verify : group.ordinary;
+    auto& graph = main(group, kind);
     graph.select(visible);
     workspace_peak_ = std::max(workspace_peak_, graph.workspace_bytes());
     return graph;
 }
 
-void Graphs::draft(std::uint32_t batch, std::uint32_t step, std::uint32_t visible) {
-    auto& call       = batches_.at(batch - 1).drafts.at(step);
-    const auto found = std::lower_bound(bounds_.begin(), bounds_.end(), visible);
-    if (found == bounds_.end()) throw std::logic_error("MTP graph context exceeds capacity");
-    const auto selected = static_cast<std::size_t>(found - bounds_.begin());
-    workspace_peak_     = std::max(workspace_peak_, call.workspace_bytes[selected]);
-    if (call.installed != selected) {
-        call.executable.update(call.definitions[selected]);
-        call.installed = selected;
+void Graphs::draft(std::uint32_t batch, std::span<const execution::BatchView> calls,
+                   ple::Ticket ticket, std::span<const std::uint32_t> extents) {
+    auto& group = batches_.at(batch - 1);
+    auto& chain = group.chains.at(calls.size() - 1);
+    for (std::size_t step = 0; step < calls.size(); ++step) {
+        const auto& call = group.drafts[step];
+        const auto found =
+            std::lower_bound(bounds_.begin(), bounds_.end(), calls[step].max_visible_tokens);
+        if (found == bounds_.end()) throw std::logic_error("MTP graph context exceeds capacity");
+        const auto selected = static_cast<std::size_t>(found - bounds_.begin());
+        workspace_peak_     = std::max(workspace_peak_, call.workspace_bytes[selected]);
+        if (chain.installed[step] != selected) {
+            chain.graph.executable.update_child(chain.steps[step], call.definitions[selected]);
+            chain.installed[step] = selected;
+        }
+        if (chain.slot != ticket.slot)
+            chain.graph.executable.update_child(chain.handoffs[step],
+                                                call.handoffs.at(ticket.slot));
     }
-    call.executable.launch(owner_.cuda.stream());
+    chain.slot = ticket.slot;
+    chain.graph.executable.launch(owner_.cuda.stream());
+    for (std::uint32_t step = 0; step < calls.size(); ++step)
+        owner_.ple.append_submitted(ticket, extents, step);
 }
 
 void Graphs::sample(std::uint32_t batch) {

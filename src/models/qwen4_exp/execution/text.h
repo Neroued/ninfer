@@ -24,7 +24,7 @@ public:
     TextRun(const Parameters&, TextExecution, BatchView, StateUpdate, CudaExecutionView);
     void prefix(std::optional<VisualEmbeddingView> = {});
     void consume_ple(const Tensor& embedding);
-    void suffix(TextOutputs);
+    void suffix(TextOutputs, Tensor logits = {});
 
     // GPU bodies share the same activation frame in eager execution and graph capture.
     void stem(std::optional<VisualEmbeddingView> = {});
@@ -32,7 +32,7 @@ public:
     void resident_moe(std::uint32_t layer);
     void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);
-    void finish(TextOutputs);
+    void finish(TextOutputs, Tensor logits = {});
 
     [[nodiscard]] Tensor& block_output() { return roots_.output; }
 

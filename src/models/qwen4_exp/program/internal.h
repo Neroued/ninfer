@@ -207,7 +207,8 @@ public:
     void initialize_graphs();
     void release_graphs();
     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible);
-    void sample_forward(std::int32_t batch, const Tensor& hidden, bool first_token);
+    void save_draft(std::uint32_t step, std::int32_t batch);
+    void sample_forward(std::int32_t batch, bool first_token);
     void accept_forward(std::int32_t batch);
     [[nodiscard]] context::StateImageSelectors selectors(const Sequence&) const;
     void complete_write(Sequence&);
@@ -230,7 +231,8 @@ public:
                                           runtime::ExecutionTimingRecorder&);
     void commit_verify(std::span<const SequenceHandle>, std::span<const runtime::CommitDecision>,
                        runtime::ExecutionTimingRecorder&);
-    [[nodiscard]] Tensor forward(std::span<Sequence* const>, std::uint32_t tokens, bool sequence);
+    [[nodiscard]] Tensor forward(std::span<Sequence* const>, std::uint32_t tokens, bool sequence,
+                                 bool logits = false);
     void adopt_forward(std::span<Sequence* const>, std::uint32_t tokens);
     [[nodiscard]] PendingBatch sample(std::span<Sequence* const>, const Tensor&, bool first,
                                       runtime::TokenMaskProvider*,

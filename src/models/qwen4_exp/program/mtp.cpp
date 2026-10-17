@@ -82,6 +82,17 @@ void ProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uin
     ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
 }
 
+void ProgramImpl::save_draft(std::uint32_t step, std::int32_t batch) {
+    const auto& frame = *resources.plan.persistent.buffers.mtp;
+    const auto k      = shape.draft_tokens;
+    auto drafts       = packed_tensor(frame.drafts, {static_cast<int>(k), batch});
+    const auto ids    = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
+    auto* destination = static_cast<TokenId*>(drafts.data) + step;
+    copy_rows_async({destination, drafts.bytes() - step * sizeof(TokenId), cuda.device()},
+                    k * sizeof(TokenId), {ids.data, ids.bytes(), cuda.device()}, sizeof(TokenId),
+                    sizeof(TokenId), batch, cuda);
+}
+
 void ProgramImpl::align_mtp(std::span<Sequence* const> rows, std::uint32_t tokens,
                             const Tensor& previous, const Tensor& conditioning,
                             std::optional<execution::VisualEmbeddingView> visual) {
@@ -153,19 +164,14 @@ void ProgramImpl::accept_forward(std::int32_t batch) {
     const auto& buffers   = resources.plan.persistent.buffers;
     const auto& frame     = *buffers.mtp;
     const auto width      = shape.draft_tokens + 1;
-    const auto hidden     = dimension(parameters.model.config().text.hidden);
     const auto vocabulary = parameters.profile->public_tokens;
     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
-    auto sample  = packed_tensor(buffers.pending_sample, {hidden, static_cast<int>(width), batch});
-    auto drafts  = packed_tensor(frame.drafts, {static_cast<int>(shape.draft_tokens), batch});
+    auto drafts    = packed_tensor(frame.drafts, {static_cast<int>(shape.draft_tokens), batch});
     auto anchors = row(frame.anchors), extents = row(frame.extents);
     auto device_configs = device_tensor(*buffers.sampling);
     auto logits =
         packed_tensor(*buffers.logits, {dimension(parameters.model.config().text.vocabulary),
                                         static_cast<int>(width), batch});
-    auto flat_logits = logits.view({logits.ne[0], static_cast<int>(width) * batch});
-    execution::project_head(sample.view({hidden, static_cast<int>(width) * batch}),
-                            parameters.text.head, flat_logits, resources.workspace, cuda);
     auto target      = packed_tensor(frame.target_tokens, {static_cast<int>(width), batch});
     auto target_flat = target.view({static_cast<int>(width) * batch});
     ops::argmax(logits.view({logits.ne[0], static_cast<int>(width) * batch}), target_flat,
@@ -276,18 +282,16 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
     }
     {
         nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp, steps * batch);
-        for (std::uint32_t step = 0; step < steps; ++step) {
-            if (graphs)
-                graphs->draft(batch, step, calls[step].max_visible_tokens);
-            else
+        if (graphs && steps) {
+            graphs->draft(batch, calls, ticket, round.extents);
+        } else {
+            for (std::uint32_t step = 0; step < steps; ++step) {
                 draft_forward(step, batch, calls[step].max_visible_tokens);
-            auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
-            const auto destination = static_cast<TokenId*>(drafts.data) + step;
-            copy_rows_async({destination, drafts.bytes() - step * sizeof(TokenId), cuda.device()},
-                            k * sizeof(TokenId), {ids.data, ids.bytes(), cuda.device()},
-                            sizeof(TokenId), sizeof(TokenId), rows.size(), cuda);
-            ple.append_device(ticket, ids, round.extents, step);
-            ple.progress();
+                save_draft(step, batch);
+                auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
+                ple.append_device(ticket, ids, round.extents, step);
+                ple.progress();
+            }
         }
     }
     std::array<std::uint32_t, kMaximumConcurrency> valid;
@@ -310,25 +314,36 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
             buffers.ple_records.bind(resources.persistent())};
         execution::TextRun run(parameters, execution, round.batch,
                                execution::VerifyRecords{*resources.gdn_records}, cuda);
-        auto* graph = graphs ? &graphs->main(batch, true, maximum) : nullptr;
-        if (graph)
-            graph->prefix(cuda);
-        else
+        auto* graph = graphs ? &graphs->main(batch, MainGraph::Verify, maximum) : nullptr;
+        if (graph) {
+            if (!graph->resident()) graph->prefix(cuda);
+        } else {
             run.prefix();
+        }
         auto embedding = ple.consume(ticket);
         for (int b = 0; b < batch; ++b) {
             const auto input = ple.input(ticket, b);
             std::copy(input.begin(), input.end(), round.inputs.begin() + b * width);
         }
-        if (graph)
-            graph->consume_ple(ticket.slot, cuda);
-        else
-            run.consume_ple(embedding);
+        if (graph) {
+            if (graph->resident())
+                graph->replay(ticket.slot, cuda);
+            else
+                graph->consume_ple(ticket.slot, cuda);
+        } else {
+            embedding.ready.wait(cuda.stream());
+            run.consume_ple(embedding.values);
+            embedding.consumed.record(cuda.stream());
+        }
         ple.consumed(ticket);
-        if (graph)
-            graph->suffix(cuda);
-        else
-            run.suffix({sample, conditioning});
+        if (graph) {
+            if (!graph->resident()) graph->suffix(cuda);
+        } else {
+            auto logits = packed_tensor(*buffers.logits,
+                                        {dimension(parameters.model.config().text.vocabulary),
+                                         static_cast<int>(width), batch});
+            run.suffix({sample, conditioning}, logits);
+        }
     }
     const auto vocabulary = parameters.profile->public_tokens;
     const auto words      = (vocabulary + 31) / 32;

@@ -12,10 +12,14 @@ public:
     [[nodiscard]] ple::Ticket begin(std::uint32_t tokens, std::span<const ple::InputRow>);
     void append_device(ple::Ticket, const Tensor& ids, std::span<const std::uint32_t> extents,
                        std::uint32_t step);
+    // Capture only the CUDA handoff. Host bookkeeping follows the submitted chain replay.
+    void capture_append(std::uint32_t slot, const Tensor& ids, std::uint32_t step,
+                        CudaExecutionView);
+    void append_submitted(ple::Ticket, std::span<const std::uint32_t> extents, std::uint32_t step);
     void seal(ple::Ticket, std::span<const std::uint32_t> valid_columns);
     [[nodiscard]] std::span<const std::int32_t> input(ple::Ticket, std::uint32_t row);
     void prefetch(std::uint32_t tokens, std::span<const ple::InputRow>);
-    [[nodiscard]] Tensor consume(ple::Ticket);
+    [[nodiscard]] ple::DeviceEmbedding consume(ple::Ticket);
     void consumed(ple::Ticket);
     void progress();
     void wait_compute();
@@ -48,6 +52,9 @@ private:
     [[nodiscard]] std::optional<ple::Ticket> prepare(std::uint32_t, std::span<const ple::InputRow>,
                                                      bool);
     Window& window(ple::Ticket);
+    [[nodiscard]] MemorySpan append_destination(std::uint32_t slot, std::uint32_t step,
+                                                std::uint32_t batch);
+    void abandon_consumer(Window&);
     Resources& resources_;
     CudaExecutionView cuda_;
     CudaCompletionEvent completed_;

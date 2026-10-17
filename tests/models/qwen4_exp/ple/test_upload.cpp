@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/ple/upload.h"
 #include "models/qwen4_exp/ple/parameters.h"
 #include "core/buffer.h"
+#include "core/decode_graph.h"
 #include "core/transfer.h"
 
 #include <algorithm>
@@ -62,11 +63,14 @@ void run() {
     uploads.upload(second, context.transfer_view());
 
     auto consume = [&](const HostEmbedding& host) {
-        const auto e = uploads.embedding(host.ticket, context.execution_view());
+        const auto binding = uploads.acquire(host.ticket, context.execution_view());
+        binding.ready.wait(context.stream());
+        const auto& e = binding.values;
         copy_bytes_async(copied.span().subspan(0, e.bytes()), {e.data, e.bytes(), e.device},
                          context.execution_view());
         require(!uploads.try_release(host.ticket), "acquired E released before its last reader");
-        uploads.record_consumed(host.ticket, context.execution_view());
+        binding.consumed.record(context.stream());
+        uploads.consumer_submitted(host.ticket, context.execution_view());
         until([&] { return uploads.try_release(host.ticket); });
         copied.copy_to_host(actual.data(), host.values.bytes);
         const auto* expected = static_cast<const std::uint16_t*>(host.values.data);
@@ -79,7 +83,7 @@ void run() {
 
     const auto next = input({0, 2}, 1, 3);
     uploads.upload(next, context.transfer_view());
-    rejects([&] { (void)uploads.embedding(first.ticket, context.execution_view()); });
+    rejects([&] { (void)uploads.acquire(first.ticket, context.execution_view()); });
     rejects([&] { (void)uploads.try_release(first.ticket); });
     consume(next);
 
@@ -90,6 +94,39 @@ void run() {
     const auto discarded = input({1, 3}, 1, 2);
     uploads.upload(discarded, context.transfer_view());
     until([&] { return uploads.try_release(discarded.ticket); });
+
+    DecodeGraphDefinition children[2], parent;
+    for (std::uint32_t slot = 0; slot < 2; ++slot) {
+        const auto binding = uploads.binding(slot, 3, 2);
+        children[slot].capture(context.stream(), [&] {
+            binding.ready.wait_external(context.stream());
+            const auto& e = binding.values;
+            copy_bytes_async(copied.span(), {e.data, e.bytes(), e.device},
+                             context.execution_view());
+            binding.consumed.record_external(context.stream());
+        });
+    }
+    DecodeGraphChild child;
+    parent.capture(context.stream(), [&] {
+        CUDA_CHECK(cudaMemsetAsync(copied.data(), 0xff, copied.size(), context.stream()));
+        child = children[0].append_to(context.stream());
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(parent);
+    for (std::uint32_t iteration = 0; iteration < 32; ++iteration) {
+        const auto slot = iteration % 2;
+        const auto host = input({slot, iteration + 4}, 3, 2);
+        uploads.upload(host, context.transfer_view());
+        (void)uploads.acquire(host.ticket, context.execution_view());
+        graph.update_child(child, children[slot]);
+        graph.launch(context.stream());
+        uploads.consumer_submitted(host.ticket, context.execution_view());
+        until([&] { return uploads.try_release(host.ticket); });
+        copied.copy_to_host(actual.data(), host.values.bytes);
+        const auto* expected = static_cast<const std::uint16_t*>(host.values.data);
+        require(std::equal(expected, expected + host.values.bytes / 2, actual.begin()),
+                "graph child update consumed a stale PLE generation or slot");
+    }
 }
 } // namespace
 

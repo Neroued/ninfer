@@ -136,7 +136,7 @@ void UploadSlots::upload(const HostEmbedding& input, CudaExecutionView transfer)
     } catch (...) { p.submission_failed(slot); }
 }
 
-Tensor UploadSlots::embedding(Ticket ticket, CudaExecutionView consumer) {
+DeviceEmbedding UploadSlots::acquire(Ticket ticket, CudaExecutionView consumer) {
     auto& p = *impl_;
     p.validate(consumer);
     auto& slot = p.current(ticket);
@@ -144,23 +144,17 @@ Tensor UploadSlots::embedding(Ticket ticket, CudaExecutionView consumer) {
         throw std::logic_error("invalid PLE consumer ordering");
     }
     slot.consumer = consumer.stream();
-    try {
-        slot.uploaded.wait(consumer.stream());
-    } catch (...) { p.submission_failed(slot); }
-    return device_slot(ticket.slot, slot.tokens, slot.batch);
+    return binding(ticket.slot, slot.tokens, slot.batch);
 }
 
-void UploadSlots::record_consumed(Ticket ticket, CudaExecutionView consumer) {
+void UploadSlots::consumer_submitted(Ticket ticket, CudaExecutionView consumer) {
     auto& p = *impl_;
     p.validate(consumer);
     auto& slot = p.current(ticket);
     if (slot.consumer != consumer.stream() || slot.consumption_recorded) {
         throw std::logic_error("PLE consumer completion has no matching acquisition");
     }
-    try {
-        slot.consumed.record(consumer.stream());
-        slot.consumption_recorded = true;
-    } catch (...) { p.submission_failed(slot); }
+    slot.consumption_recorded = true;
 }
 
 bool UploadSlots::upload_complete(Ticket ticket) const {
@@ -193,6 +187,12 @@ Tensor UploadSlots::device_slot(std::uint32_t slot, std::uint32_t tokens,
     return Tensor(
         p.slots.at(slot).device.span().subspan(0, bytes), DType::BF16,
         {kEmbeddingElements, static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(batch)});
+}
+
+DeviceEmbedding UploadSlots::binding(std::uint32_t slot, std::uint32_t tokens,
+                                     std::uint32_t batch) const {
+    auto& storage = impl_->slots.at(slot);
+    return {device_slot(slot, tokens, batch), storage.uploaded, storage.consumed};
 }
 
 UploadMemory UploadSlots::memory() const noexcept {

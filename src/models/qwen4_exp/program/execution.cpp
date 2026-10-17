@@ -82,7 +82,7 @@ void ProgramImpl::settle(Sequence& s) {
 }
 
 Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t tokens,
-                            bool sequence_route) {
+                            bool sequence_route, bool project_logits) {
     const auto hidden_width = dimension(parameters.model.config().text.hidden);
     const auto batch        = static_cast<std::int32_t>(rows.size());
     const auto t = static_cast<std::int32_t>(tokens), m = t * batch;
@@ -189,16 +189,27 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
         execution::StateUpdate update = execution::StepUpdate{};
         if (sequence) update = *sequence;
         execution::TextRun run(parameters, execution, call, update, cuda);
-        auto* graph = graphs && !sequence_route ? &graphs->main(batch, false, maximum) : nullptr;
-        if (graph)
-            graph->prefix(cuda);
-        else
+        auto* graph =
+            graphs && !sequence_route
+                ? &graphs->main(batch, project_logits ? MainGraph::Ordinary : MainGraph::Control,
+                                maximum)
+                : nullptr;
+        if (graph) {
+            if (!graph->resident()) graph->prefix(cuda);
+        } else {
             run.prefix(visual);
+        }
         auto embedding = ple.consume(ticket);
-        if (graph)
-            graph->consume_ple(ticket.slot, cuda);
-        else
-            run.consume_ple(embedding);
+        if (graph) {
+            if (graph->resident())
+                graph->replay(ticket.slot, cuda);
+            else
+                graph->consume_ple(ticket.slot, cuda);
+        } else {
+            embedding.ready.wait(cuda.stream());
+            run.consume_ple(embedding.values);
+            embedding.consumed.record(cuda.stream());
+        }
         ple.consumed(ticket);
         if (sequence_route) {
             auto& s          = *rows[0];
@@ -217,10 +228,12 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
                 ple.prefetch(end - begin, {&next, 1});
             }
         }
-        if (graph)
-            graph->suffix(cuda);
-        else
-            run.suffix({sample, conditioning});
+        if (graph) {
+            if (!graph->resident()) graph->suffix(cuda);
+        } else {
+            auto logits = project_logits ? device_tensor(*layout.logits).slice(1, 0, m) : Tensor{};
+            run.suffix({sample, conditioning}, logits);
+        }
     }
     if (parameters.mtp) align_mtp(rows, tokens, previous_conditioning, conditioning, visual);
     auto hidden = resources.states->sample_hidden();
@@ -252,14 +265,13 @@ void ProgramImpl::adopt_forward(std::span<Sequence* const> rows, std::uint32_t t
     }
 }
 
-void ProgramImpl::sample_forward(std::int32_t b, const Tensor& hidden, bool first_token) {
+void ProgramImpl::sample_forward(std::int32_t b, bool first_token) {
     const auto& io               = resources.plan.persistent.buffers;
     const auto vocabulary        = parameters.profile->public_tokens;
     const auto device_configs    = device_tensor(*io.sampling);
     const auto logical_positions = device_tensor(io.batch.base_positions).slice(0, 0, b);
     auto logits                  = device_tensor(*io.logits).slice(1, 0, b);
-    execution::project_head(hidden, parameters.text.head, logits, resources.workspace, cuda);
-    auto sampled = first(device_tensor(*io.sampled_ids), b);
+    auto sampled                 = first(device_tensor(*io.sampled_ids), b);
     {
         auto scope = resources.workspace.scope();
         ops::sample(logits, sampled, vocabulary,
@@ -311,10 +323,14 @@ PendingBatch ProgramImpl::sample(std::span<Sequence* const> rows, const Tensor& 
     auto logical_positions = device_tensor(io.batch.base_positions).slice(0, 0, b);
     copy_bytes_async({logical_positions.data, rows.size() * 4, cuda.device()},
                      {positions, rows.size() * 4, Device::cpu(), true}, cuda);
+    if (first_token) {
+        auto logits = device_tensor(*io.logits).slice(1, 0, b);
+        execution::project_head(hidden, parameters.text.head, logits, resources.workspace, cuda);
+    }
     if (graphs && !first_token)
         graphs->sample(b);
     else
-        sample_forward(b, hidden, first_token);
+        sample_forward(b, first_token);
     const auto sampled = first(device_tensor(*io.sampled_ids), b);
     copy_bytes_async(resources.egress().subspan(0, rows.size() * 4),
                      {sampled.data, rows.size() * 4, cuda.device()}, cuda);

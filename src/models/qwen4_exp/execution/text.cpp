@@ -131,13 +131,13 @@ void TextRun::consume_ple(const Tensor& embedding) {
         roots_.residual, roots_.normalized, execution_.workspace, cuda_);
 }
 
-void TextRun::suffix(TextOutputs output) {
+void TextRun::suffix(TextOutputs output, Tensor logits) {
     const auto start = parameters_.model.config().text.ple.layer;
     for (std::uint32_t i = start; i < parameters_.text.layers.size(); ++i) layer(i);
-    finish(output);
+    finish(output, logits);
 }
 
-void TextRun::finish(TextOutputs output) {
+void TextRun::finish(TextOutputs output, Tensor logits) {
     const auto& p = parameters_.text;
     if (output.conditioning.data)
         copy_bytes_async({output.conditioning.data, output.conditioning.bytes(), cuda_.device()},
@@ -145,6 +145,10 @@ void TextRun::finish(TextOutputs output) {
     auto sample = output.sample.view(
         {dimension(parameters_.model.config().text.hidden), batch_.tokens * batch_.batch});
     ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, sample, cuda_);
+    if (logits.data) {
+        logits = logits.view({logits.ne[0], batch_.tokens * batch_.batch});
+        project_head(sample, p.head, logits, execution_.workspace, cuda_);
+    }
 }
 
 void project_head(const Tensor& sample, const LinearParameters& head, Tensor& logits,

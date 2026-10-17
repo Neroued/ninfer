@@ -5,12 +5,15 @@
 namespace ninfer::models::qwen4_exp::detail {
 class ProgramImpl;
 
+enum class MainGraph { Control, Ordinary, Verify };
+
 class Graphs {
 public:
     explicit Graphs(ProgramImpl&);
     void prepare();
-    [[nodiscard]] TextGraph& main(std::uint32_t batch, bool verify, std::uint32_t visible);
-    void draft(std::uint32_t batch, std::uint32_t step, std::uint32_t visible);
+    [[nodiscard]] TextGraph& main(std::uint32_t batch, MainGraph, std::uint32_t visible);
+    void draft(std::uint32_t batch, std::span<const execution::BatchView>, ple::Ticket,
+               std::span<const std::uint32_t> extents);
     void sample(std::uint32_t batch);
     void accept(std::uint32_t batch);
 
@@ -19,21 +22,29 @@ public:
     void reset_workspace_peak() { workspace_peak_ = 0; }
 
 private:
-    struct ContextCall {
+    struct DraftStep {
         std::vector<DecodeGraphDefinition> definitions;
         std::vector<std::size_t> workspace_bytes;
-        DecodeGraphExecutable executable;
-        std::size_t installed = 0;
+        std::array<DecodeGraphDefinition, 2> handoffs;
+    };
+
+    struct DraftChain {
+        GraphSegment graph;
+        std::vector<DecodeGraphChild> steps, handoffs;
+        std::vector<std::size_t> installed;
+        std::uint32_t slot = 0;
     };
 
     struct Batch {
-        TextGraph ordinary, verify;
+        TextGraph control, ordinary, verify;
         GraphSegment sample, accept;
-        std::vector<ContextCall> drafts;
+        std::vector<DraftStep> drafts;
+        std::vector<DraftChain> chains;
         std::size_t sample_workspace = 0, accept_workspace = 0;
     };
 
-    void prepare_main(Batch&, std::uint32_t batch, bool verify);
+    void prepare_main(Batch&, std::uint32_t batch, MainGraph);
+    [[nodiscard]] TextGraph& main(Batch&, MainGraph);
     void prepare_drafts(Batch&, std::uint32_t batch);
     ProgramImpl& owner_;
     std::vector<std::uint32_t> bounds_;

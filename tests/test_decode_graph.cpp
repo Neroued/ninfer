@@ -64,6 +64,34 @@ int check_external_event(ninfer::DeviceContext& device) {
     return failures;
 }
 
+int check_child_graph(ninfer::DeviceContext& device) {
+    ninfer::DeviceBuffer source(device.device(), sizeof(std::uint32_t));
+    ninfer::DeviceBuffer destination(device.device(), sizeof(std::uint32_t));
+    ninfer::DecodeGraphDefinition children[2], parent;
+    for (int i = 0; i < 2; ++i)
+        children[i].capture(device.stream(), [&] {
+            CUDA_CHECK(cudaMemsetAsync(source.data(), i + 1, source.size(), device.stream()));
+        });
+    ninfer::DecodeGraphChild child;
+    parent.capture(device.stream(), [&] {
+        CUDA_CHECK(cudaMemsetAsync(source.data(), 0xff, source.size(), device.stream()));
+        child = children[0].append_to(device.stream());
+        CUDA_CHECK(cudaMemcpyAsync(destination.data(), source.data(), source.size(),
+                                   cudaMemcpyDeviceToDevice, device.stream()));
+    });
+    ninfer::DecodeGraphExecutable executable;
+    executable.instantiate(parent);
+    int failures = 0;
+    for (int i = 0; i < 8; ++i) {
+        executable.update_child(child, children[i % 2]);
+        executable.launch(device.stream());
+        device.synchronize();
+        failures += expect_value(destination.data(), (i % 2 + 1) * 0x01010101U,
+                                 "child update and surrounding capture dependencies");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +161,7 @@ int main() {
         device.synchronize();
         failures += expect_value(storage.data(), 0x55555555U, "capture after failed preparation");
         failures += check_external_event(device);
+        failures += check_child_graph(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "decode graph test failed: " << error.what() << '\n';

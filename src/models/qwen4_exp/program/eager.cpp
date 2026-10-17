@@ -89,7 +89,7 @@ PendingBatch Program::decode(std::span<const SequenceHandle> members,
             pending.timing_ = timing.finish();
             return pending;
         }
-        const auto hidden = p.forward(rows, 1, false);
+        const auto hidden = p.forward(rows, 1, false, true);
         p.adopt_forward(rows, 1);
         auto pending = p.sample(rows, hidden, false, masks, timing);
         for (auto* s : rows) s->timings.decode_seconds += seconds(started);

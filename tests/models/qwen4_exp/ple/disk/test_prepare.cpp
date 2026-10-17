@@ -316,9 +316,12 @@ void gpu(const disk::Table& source, const Input& input) {
     {
         StreamGate transfer(context.transfer_stream()), consumer(context.stream());
         uploads.upload(service.embedding(ticket), context.transfer_view());
-        const auto e = uploads.embedding(ticket, context.execution_view());
+        const auto binding = uploads.acquire(ticket, context.execution_view());
+        binding.ready.wait(context.stream());
+        const auto& e = binding.values;
         copy_bytes_async(copied.span(), {e.data, e.bytes(), e.device}, context.execution_view());
-        uploads.record_consumed(ticket, context.execution_view());
+        binding.consumed.record(context.stream());
+        uploads.consumer_submitted(ticket, context.execution_view());
         service.cancel(ticket);
         until([&] {
             const auto s = service.poll(ticket);
@@ -343,13 +346,24 @@ void gpu(const disk::Table& source, const Input& input) {
         try {
             fail_event_record = !consumer_failure;
             uploads.upload(service.embedding(failed), context.transfer_view());
-            const auto e = uploads.embedding(failed, context.execution_view());
+            const auto binding = uploads.acquire(failed, context.execution_view());
+            binding.ready.wait(context.stream());
+            const auto& e = binding.values;
             copy_bytes_async(copied.span(), {e.data, e.bytes(), e.device},
                              context.execution_view());
             fail_event_record = true;
-            uploads.record_consumed(failed, context.execution_view());
+            binding.consumed.record(context.stream());
+            uploads.consumer_submitted(failed, context.execution_view());
         } catch (const std::runtime_error&) {
             rejected = true;
+            if (consumer_failure) {
+                require(!uploads.try_release(failed), "failed record released a live consumer");
+                // The submitter owns the failed consumer submission. Establish completion
+                // before returning the slot, just as Program cancellation does.
+                auto binding = uploads.binding(failed.slot, input.tokens, input.batch);
+                binding.consumed.record(context.stream());
+                uploads.consumer_submitted(failed, context.execution_view());
+            }
             service.cancel(failed);
         }
         require(rejected && !fail_event_record, "CUDA event failure was not reported");
@@ -358,20 +372,31 @@ void gpu(const disk::Table& source, const Input& input) {
 
     const auto again = prepare(service, input);
     service.seal(again, input.lengths());
-    const auto fixed = uploads.device_slot(again.slot, input.tokens, input.batch);
-    DecodeGraphDefinition definition;
-    definition.capture(context.stream(), [&] {
+    const auto captured = uploads.binding(again.slot, input.tokens, input.batch);
+    const auto& fixed   = captured.values;
+    DecodeGraphDefinition child, definition;
+    child.capture(context.stream(), [&] {
+        captured.ready.wait_external(context.stream());
         copy_bytes_async(copied.span(), {fixed.data, fixed.bytes(), fixed.device},
                          context.execution_view());
+        captured.consumed.record_external(context.stream());
     });
+    definition.capture(context.stream(), [&] { (void)child.append_to(context.stream()); });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
     ready(service, again);
     uploads.upload(service.embedding(again), context.transfer_view());
-    const auto e = uploads.embedding(again, context.execution_view());
+    const auto binding = uploads.acquire(again, context.execution_view());
+    const auto& e      = binding.values;
     require(e.data == fixed.data, "Device E changed its captured address");
-    graph.launch(context.stream());
-    uploads.record_consumed(again, context.execution_view());
+    {
+        StreamGate gate(context.stream());
+        graph.launch(context.stream());
+        uploads.consumer_submitted(again, context.execution_view());
+        until([&] { return uploads.upload_complete(again); });
+        require(!try_release(again), "child event retained the previous completed generation");
+        gate.open();
+    }
     until([&] { return try_release(again); });
     copied.copy_to_host(actual.data(), input.bytes());
     emit(actual.data(), input.bytes());

@@ -112,10 +112,13 @@ void ple_window(q4::Resources& resources, const q4::Model& model, DeviceContext&
     }
     const auto host = resources.ple_prepare->embedding(*ticket);
     resources.ple_upload->upload(host, resources.ple_transfer());
-    auto e = resources.ple_upload->embedding(*ticket, device.execution_view());
+    auto binding = resources.ple_upload->acquire(*ticket, device.execution_view());
+    binding.ready.wait(device.stream());
+    auto e = binding.values;
     DeviceBuffer copy(device.device(), e.bytes());
     copy_bytes_async(copy.span(), {e.data, e.bytes(), device.device()}, device.execution_view());
-    resources.ple_upload->record_consumed(*ticket, device.execution_view());
+    binding.consumed.record(device.stream());
+    resources.ple_upload->consumer_submitted(*ticket, device.execution_view());
     device.synchronize();
     std::vector<std::byte> bytes(e.bytes());
     copy.copy_to_host(bytes.data(), bytes.size());

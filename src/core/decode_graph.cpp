@@ -73,6 +73,25 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     *this = capture.finish();
 }
 
+DecodeGraphChild DecodeGraphDefinition::append_to(cudaStream_t stream) const {
+    cudaStreamCaptureStatus status;
+    cudaGraph_t parent                  = nullptr;
+    const cudaGraphNode_t* dependencies = nullptr;
+    std::size_t count                   = 0;
+    check_graph(
+        cudaStreamGetCaptureInfo(stream, &status, nullptr, &parent, &dependencies, nullptr, &count),
+        "cudaStreamGetCaptureInfo");
+    if (!ready() || status != cudaStreamCaptureStatusActive)
+        throw std::logic_error("appending a child requires a definition and active capture");
+    DecodeGraphChild child;
+    check_graph(cudaGraphAddChildGraphNode(&child.node, parent, dependencies, count, graph_),
+                "cudaGraphAddChildGraphNode");
+    check_graph(cudaStreamUpdateCaptureDependencies(stream, &child.node, nullptr, 1,
+                                                    cudaStreamSetCaptureDependencies),
+                "cudaStreamUpdateCaptureDependencies");
+    return child;
+}
+
 DecodeGraphCapture::DecodeGraphCapture(cudaStream_t stream) : stream_(stream) {
     check_graph(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal),
                 "cudaStreamBeginCapture");
@@ -141,6 +160,15 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
             " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
     }
+}
+
+void DecodeGraphExecutable::update_child(DecodeGraphChild child,
+                                         const DecodeGraphDefinition& definition) {
+    nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
+    if (!ready() || !child.node || !definition.ready())
+        throw std::logic_error("CUDA Graph child update requires a node and definition");
+    check_graph(cudaGraphExecChildGraphNodeSetParams(exec_, child.node, definition.graph_),
+                "cudaGraphExecChildGraphNodeSetParams");
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {

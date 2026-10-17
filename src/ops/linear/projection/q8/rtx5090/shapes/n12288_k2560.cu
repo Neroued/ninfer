@@ -4,7 +4,7 @@
 #include "ops/linear/kernels/q8/q8_mma_launch.cuh"
 #include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
 
-#include "ops/linear/projection/q8/shapes/n12288_k2560.cuh"
+#include "ops/linear/projection/q8/rtx5090/shapes/n12288_k2560.cuh"
 #include <type_traits>
 
 namespace ninfer::ops::detail {

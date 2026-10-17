@@ -5,7 +5,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n10240_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n12288_k2048.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n12288_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2048_k16384.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2048_k4096.cu"

@@ -3,7 +3,7 @@ add_library(ninfer_linear_test_support STATIC
   "${CMAKE_CURRENT_LIST_DIR}/weights.cpp")
 ninfer_test_includes(ninfer_linear_test_support)
 ninfer_op_oracle_options(ninfer_linear_test_support)
-target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops)
+target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops ninfer_op_test_support)
 
 function(ninfer_linear_suite family)
   set(target "ninfer_linear_${family}_test")
@@ -21,7 +21,7 @@ function(ninfer_linear_format_tests family)
   foreach(format IN LISTS ARGN)
     set(name "ninfer_linear_${family}_${format}_test")
     add_test(NAME ${name} COMMAND ninfer_linear_${family}_test --format ${format})
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 LABELS "ops")
   endforeach()
 endfunction()
 

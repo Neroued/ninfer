@@ -313,8 +313,10 @@ different Ops share a tuning table or include a sibling's private shape policy.
 ### 4.3 Shared computation and compilation
 
 Private launch headers, selectors and kernel templates are not included by models, contract
-headers, product code, permanent tests or public benchmarks. Every kernel assumption has a
-matching admission or launch predicate. An Op never infers it from model identity.
+headers, product code, mathematical qualification tests or public benchmarks. The owning suite
+may use the contract-specified execution as an exact-equivalence reference described in §6.1.
+Every kernel assumption has a matching admission or launch predicate. An Op never infers it from
+model identity.
 
 `src/ops/common/` owns the shared implementation foundation:
 
@@ -490,6 +492,12 @@ Semantic Op tests live under `tests/ops/` and invoke the public contract indepen
 order. They link the Op layer and required core libraries rather than a model implementation. Commands and
 common reporting behavior belong in [`tests/README.md`](../../tests/README.md).
 
+A suite is owned by a semantic Op or closely related overloads. Group executable entry points
+by useful family boundaries; split files for substantial fixtures, oracles or case catalogues,
+not for every helper. Keep one non-overlapping default CTest set. Metadata-only case declaration
+and filtering precede device initialization and fixture construction. Cases have stable IDs and
+selection-independent input recipes; a stateful or Graph sequence is one selectable case.
+
 ### 6.1 Oracle
 
 Choose the reference and comparison from the observable promise of the Op. A tensor's floating-point
@@ -510,9 +518,9 @@ state. For such mathematical contracts, another GPU route, generated model outpu
 implementation parity is supplementary evidence, not the mathematical oracle.
 
 When the contract instead requires exact equivalence to a specified execution, that execution is
-the reference. ReplaySSM record/fold must preserve the corresponding snapshot outputs and committed
-state bit for bit. Compare the same initial state, physical block, inputs, and arithmetic policy;
-for each committed prefix, select the corresponding snapshot from that same block. Re-running a
+the reference. ReplaySSM record/fold must preserve the specified snapshot or recurrent outputs and
+committed state bit for bit. Compare the same initial state, physical block, inputs, and arithmetic
+policy; for each committed prefix, select the corresponding snapshot from that same block. Re-running a
 shorter projection can choose different arithmetic and is not an equivalent reference. Check raw
 record copies, untouched state, invalid tails, and zero-commit effects according to their contracts.
 A separate FP64 recurrence does not establish this equivalence and is not required for its acceptance.
@@ -543,8 +551,17 @@ and `b+1` where valid, and a representative interior extent for each route. Othe
 declared finite domains and relevant boundaries. Do not build a redundant Cartesian product when
 one case establishes several dimensions.
 
+Prune redundant sweeps by the independent risk they cover. Keep numerical stress histories,
+state/alias/stride/page boundaries, and each compiled CPU arithmetic route. Cheap finite-domain
+metadata checks can remain exhaustive. Reuse represented fixtures and parallelize independent
+oracle outputs without changing their accumulation order. Large independent-output computations
+may sample fixed output coordinates while evaluating their complete formula and retaining full
+checks of exact effects, valid writes, untouched regions and guards. Do not truncate a recurrent
+history to reduce oracle cost.
+
 When CUDA Graph capture/replay is part of the public execution contract, qualify the captured
-public Op and its observable effects against the same oracle.
+public Op and its observable effects against the same oracle, including changed inputs or metadata
+at the captured addresses.
 
 Keep schedule composition, persistent-state lifetime, and end-to-end behavior in model or product
 integration tests. Private candidates, plan choices, launcher symbols, filenames, and source

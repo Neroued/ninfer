@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
@@ -233,26 +234,6 @@ int verify_exact(const std::string& label, const std::vector<T>& got,
     return ninfer::test::verify_exact(label.c_str(), got, expected);
 }
 
-struct WorstError {
-    double value = 0.0;
-    std::string label;
-
-    void include(double candidate, const std::string& name) {
-        if (label.empty() || candidate > value) {
-            value = candidate;
-            label = name;
-        }
-    }
-};
-
-struct ProfileSummary {
-    std::size_t heads_checked = 0;
-    WorstError relative_l2;
-    WorstError gross_ratio;
-};
-
-std::array<std::array<ProfileSummary, 2>, kCriteria.size()> summaries;
-
 int verify_heads(const std::string& label, std::span<const double> got,
                  std::span<const double> expected, int value_heads, int tokens,
                  PrecisionProfile profile, bool state) {
@@ -280,10 +261,6 @@ int verify_heads(const std::string& label, std::span<const double> got,
         const std::string head_label = label + " head=" + std::to_string(h);
         const auto stats = compute_reduction_stats(head_got.data(), head_ref.data(), head_size);
         const double gross_limit = gross_error_limit(stats, criterion);
-        auto& summary            = summaries[profile_index][state ? 1 : 0];
-        ++summary.heads_checked;
-        summary.relative_l2.include(stats.relative_l2, head_label);
-        summary.gross_ratio.include(stats.maximum_absolute_error / gross_limit, head_label);
         report_reduction_stats(head_label, head_size, stats, criterion);
         if (!reduction_passes(stats, head_size, criterion)) {
             std::cerr << head_label << ": " << criteria.name << " rel_l2=" << stats.relative_l2
@@ -295,23 +272,6 @@ int verify_heads(const std::string& label, std::span<const double> got,
         }
     }
     return failures;
-}
-
-void print_summaries() {
-    for (std::size_t p = 0; p < kCriteria.size(); ++p) {
-        for (int state = 0; state < 2; ++state) {
-            const auto& summary   = summaries[p][state];
-            const auto& criterion = state ? kCriteria[p].state : kCriteria[p].out;
-            std::cout << "GDN_PROFILE profile=" << kCriteria[p].name
-                      << " kind=" << (state ? "state" : "out")
-                      << " heads_checked=" << summary.heads_checked << std::setprecision(10)
-                      << " max_rel_l2=" << summary.relative_l2.value
-                      << " rel_l2_limit=" << criterion.relative_l2
-                      << " max_gross_ratio=" << summary.gross_ratio.value
-                      << " l2_case=" << summary.relative_l2.label
-                      << " gross_case=" << summary.gross_ratio.label << '\n';
-        }
-    }
 }
 
 std::vector<double> read_f32(const void* device, std::size_t count) {
@@ -677,35 +637,46 @@ int contract_rejection_cases() {
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    int failures = 0;
-
-    const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 15, 17);
-    const std::size_t witness  = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 17, 17);
-    if (interval != witness) {
-        std::cerr << "gated_delta_net interval capacity missed the chunk boundary\n";
-        ++failures;
-    }
-    try {
-        (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, 0, 65);
-        std::cerr << "gated_delta_net accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    try {
-        (void)ops::gated_delta_net_workspace_capacity_bytes(4, 6, 1, 65);
-        std::cerr << "gated_delta_net workspace accepted a non-divisible head map\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    failures += contract_rejection_cases();
-
-    failures += run_case({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
-    failures += run_case({"27b recurrent", 16, 48, 7, false}, 12007U);
-    failures += run_case({"35b recurrent", 16, 32, 15, true}, 12015U);
+int main(int argc, char** argv) {
+    OpSuite suite;
+    suite.add("gdn/contract", [] {
+        int failures               = 0;
+        const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 15, 17);
+        const std::size_t witness  = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 17, 17);
+        if (interval != witness) {
+            std::cerr << "gated_delta_net interval capacity missed the chunk boundary\n";
+            ++failures;
+        }
+        try {
+            (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, 0, 65);
+            std::cerr << "gated_delta_net accepted an invalid token interval\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+        try {
+            (void)ops::gated_delta_net_workspace_capacity_bytes(4, 6, 1, 65);
+            std::cerr << "gated_delta_net workspace accepted a non-divisible head map\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+        failures += contract_rejection_cases();
+        return failures;
+    });
+    const auto add = [&](Case c, unsigned seed, InputPattern pattern = InputPattern::Ordinary,
+                         bool inplace = false, std::vector<int> chunks = {}) {
+        const auto id = "gdn/" + std::string(c.name) + "/h" + std::to_string(c.qk_heads) + "/v" +
+                        std::to_string(c.value_heads) + "/t" + std::to_string(c.tokens) +
+                        (c.normalize_qk ? "/normalized" : "/raw") +
+                        (inplace ? "/alias" : "/disjoint");
+        suite.add(id, [=] { return run_case(c, seed, pattern, inplace, chunks); },
+                  {{"execution", "eager"}});
+    };
+    const auto batch = [&](Case c, std::vector<int> source, std::vector<int> destination, int slots,
+                           unsigned seed) {
+        suite.add("gdn/batch/" + std::string(c.name),
+                  [=] { return batch_update_case(c, source, destination, slots, seed); });
+    };
+    add({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
+    add({"27b recurrent", 16, 48, 7, false}, 12007U);
+    add({"35b recurrent", 16, 32, 15, true}, 12015U);
 
     struct Geometry {
         const char* name;
@@ -718,17 +689,17 @@ int main() {
           Geometry{"single-head", 1, 1, 65}, Geometry{"shared-qk", 1, 3, 65},
           Geometry{"generic-grouped-map", 5, 15, 65}}) {
         for (bool normalize : {false, true}) {
-            failures += run_case({geometry.name, geometry.qk_heads, geometry.value_heads,
-                                  geometry.tokens, normalize},
-                                 16180U + geometry.value_heads, InputPattern::Ordinary, !normalize);
+            add({geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens,
+                 normalize},
+                16180U + geometry.value_heads, InputPattern::Ordinary, !normalize);
         }
     }
     for (int tokens : {15, 16, 17, 31, 32, 33, 63, 64, 65, 1023, 1024, 1025, 4095, 4096}) {
-        failures += run_case({"prefill boundary", 1, 3, tokens, true}, 90000U + tokens,
-                             InputPattern::Ordinary, tokens % 2 != 0);
+        add({"prefill boundary", 1, 3, tokens, true}, 90000U + tokens, InputPattern::Ordinary,
+            tokens % 2 != 0);
     }
     for (int tokens : {15, 16, 17}) {
-        failures += run_case({"raw prefill boundary", 5, 15, tokens, false}, 91000U + tokens);
+        add({"raw prefill boundary", 5, 15, tokens, false}, 91000U + tokens);
     }
 
     struct Stress {
@@ -746,48 +717,40 @@ int main() {
           Stress{"small beta", InputPattern::SmallBeta, 16385, 332213U},
           Stress{"strong decay", InputPattern::StrongDecay, 16385, 332214U},
           Stress{"near collinear", InputPattern::NearCollinear, 4097, 332215U}}) {
-        failures += run_case({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern);
+        add({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern);
     }
     for (const auto stress : {Stress{"raw weak decay", InputPattern::WeakDecay, 16385, 332211U},
                               Stress{"raw zero decay", InputPattern::ZeroDecay, 16385, 332212U}}) {
-        failures +=
-            run_case({stress.name, 1, 3, stress.tokens, false}, stress.seed, stress.pattern, true);
+        add({stress.name, 1, 3, stress.tokens, false}, stress.seed, stress.pattern, true);
     }
-    failures += run_case({"35b zero decay", 16, 32, 4097, true}, 16032U, InputPattern::ZeroDecay);
-    failures +=
-        run_case({"35b weak decay", 16, 32, 4097, true}, 16032U, InputPattern::WeakDecay, true);
-    failures += run_case({"27b strong tail", 16, 48, 65, true}, 12065U, InputPattern::StrongDecay);
+    add({"35b zero decay", 16, 32, 4097, true}, 16032U, InputPattern::ZeroDecay);
+    add({"35b weak decay", 16, 32, 4097, true}, 16032U, InputPattern::WeakDecay, true);
+    add({"27b strong tail", 16, 48, 65, true}, 12065U, InputPattern::StrongDecay);
     // The first checkpoint is the aligned T=64 prefix of the identical T=65 stress input.
-    failures += run_case({"27b strong continuation", 16, 48, 65, true}, 12065U,
-                         InputPattern::StrongDecay, true, {64, 1});
+    add({"27b strong continuation", 16, 48, 65, true}, 12065U, InputPattern::StrongDecay, true,
+        {64, 1});
 
-    failures += run_case({"27b prefill continuation", 16, 48, 2049, true}, 14249U,
-                         InputPattern::ZeroState, false, {1024, 1024, 1});
-    failures += run_case({"weak prefill continuation", 1, 3, 4097, true}, 14297U,
-                         InputPattern::WeakDecay, true, {1024, 1024, 1024, 1024, 1});
-    failures += run_case({"raw uneven continuation", 5, 15, 1025, false}, 14125U,
-                         InputPattern::ZeroDecay, false, {15, 17, 992, 1});
-    failures += run_case({"near-zero normalization", 1, 3, 17, true, true}, 14017U);
+    add({"27b prefill continuation", 16, 48, 2049, true}, 14249U, InputPattern::ZeroState, false,
+        {1024, 1024, 1});
+    add({"weak prefill continuation", 1, 3, 4097, true}, 14297U, InputPattern::WeakDecay, true,
+        {1024, 1024, 1024, 1024, 1});
+    add({"raw uneven continuation", 5, 15, 1025, false}, 14125U, InputPattern::ZeroDecay, false,
+        {15, 17, 992, 1});
+    add({"near-zero normalization", 1, 3, 17, true, true}, 14017U);
     for (bool normalize : {false, true}) {
-        failures += run_case({"zero query", 1, 3, 17, normalize}, 14317U, InputPattern::ZeroQuery);
-        failures +=
-            run_case({"zero signal", 1, 3, 17, normalize}, 14417U, InputPattern::ZeroSignal, true);
-        failures += run_case({"zero beta", 1, 3, 17, normalize}, 14517U, InputPattern::ZeroBeta);
-        failures +=
-            run_case({"unit beta", 1, 3, 257, normalize}, 14657U, InputPattern::UnitBeta, true);
+        add({"zero query", 1, 3, 17, normalize}, 14317U, InputPattern::ZeroQuery);
+        add({"zero signal", 1, 3, 17, normalize}, 14417U, InputPattern::ZeroSignal, true);
+        add({"zero beta", 1, 3, 17, normalize}, 14517U, InputPattern::ZeroBeta);
+        add({"unit beta", 1, 3, 257, normalize}, 14657U, InputPattern::UnitBeta, true);
     }
 
     // The production decode path updates selected state-pool slots in place at width one.
-    failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,
-                                  12101u);
-    failures += batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6},
-                                  8, 12201u);
-    failures += batch_update_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
-                                  {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
-    failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
-                                  {1, 3, 5, 7}, 8, 13101u);
+    batch({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8, 12101u);
+    batch({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6}, 8, 12201u);
+    batch({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
+          {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
+    batch({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6}, {1, 3, 5, 7}, 8, 13101u);
 
-    print_summaries();
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
-    return failures == 0 ? 0 : 1;
+
+    return suite.main(argc, argv);
 }

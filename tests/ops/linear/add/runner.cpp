@@ -443,14 +443,14 @@ static int run_cases(std::string_view label, QType format, const InvocationCase&
 }
 
 void add_cases(Suite& suite, QType format, const InvocationCase& shape) {
-    std::vector<Invocation> calls(shape.invocations.begin(), shape.invocations.end());
+    std::vector<Invocation> calls;
     std::vector<linear_suite::Case> cases;
     const std::string fixture =
         "s" + std::to_string(shape.seed) +
         (shape.fixture == FixturePattern::TokenBlocks ? "/token-blocks" : "/hashed") + "/rows" +
         std::to_string(static_cast<int>(shape.rows)) + "/columns" +
         std::to_string(static_cast<int>(shape.columns));
-    for (auto& call : calls) {
+    for (const auto& call : shape.invocations) {
         const auto policy = call.policy.value_or(ops::LinearPolicy::A16Only);
         auto test         = linear_suite::make_case(
             linear_suite::format_name(format), shape.n, shape.k, call.tokens, policy,
@@ -466,6 +466,9 @@ void add_cases(Suite& suite, QType format, const InvocationCase& shape) {
             test.policies |= linear_suite::policy_bit(*call.followup_policy);
             test.id += "/followup-" + std::string(linear_suite::policy_name(*call.followup_policy));
         }
+        if (std::any_of(cases.begin(), cases.end(), [&](const auto& c) { return c.id == test.id; }))
+            continue;
+        calls.push_back(call);
         cases.push_back(std::move(test));
     }
     auto owned_shape        = shape;

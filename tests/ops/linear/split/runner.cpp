@@ -112,7 +112,7 @@ int verify_output(const Profile& profile, const Invocation& call,
         while (output_begin + profile.outputs[output_index] <= region.first)
             output_begin += profile.outputs[output_index++];
         std::vector<double> actual(rows.size() * columns.size()), expected(actual.size());
-        linear_suite::parallel_rows(
+        ninfer::test::parallel_rows(
             rows.size(), std::uint64_t(rows.size()) * columns.size() * profile.k,
             [&](int begin, int end) {
                 std::vector<double> weight(profile.k);

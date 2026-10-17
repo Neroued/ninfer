@@ -1,3 +1,5 @@
+#include "ops/suite.h"
+#include "kv_cache_storage.h"
 #include "prepare_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -548,36 +550,72 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage) {
 
 } // namespace
 
-int main() {
-    try {
-        if (cuda_unavailable()) return 77;
-        DeviceContext device;
-        int failures = 0;
-        for (int t : {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 33, 63, 64, 65, 128})
-            failures += run(device, t, t % 2 ? 8 : 1, t % 3 ? 3 : 1, t % 4, t % 3);
-        for (int t : {319, 320, 321}) failures += run(device, t, 1, 3, 3, 0);
-        for (int t : {39, 40, 41}) failures += run(device, t, 8, 1, 0, 2);
-        for (int alias = 0; alias < 4; ++alias)
-            failures += run(device, 9, 8, 3, alias, alias % 3, 5);
-        for (int t : {1024, 2048, 4096}) failures += run(device, t, 1, 3, 3, 0);
-        failures += epsilon_range(device) + coordinate_handoff(device) +
-                    norm_alignment_and_phase(device) + continuation(device) + chunking(device) +
-                    numerical_edges(device, true) + numerical_edges(device, false) +
-                    read_footprint(device) + validation(device);
-        for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-                             KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
-            for (int t : {1, 8, 17, 65, 319, 320, 321, 1024, 2048, 4096})
-                failures += run(device, t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, storage);
-            for (int t : {1, 8, 39, 40, 41}) failures += run(device, t, 8, 3, t % 4, 2, 0, storage);
-            failures += run(device, 9, 8, 1, 3, 1, 5, storage);
-            failures += exact_key_encoding(device, storage) + scale_edges(device, storage) +
-                        norm_alignment_and_phase(device, storage) + continuation(device, storage) +
-                        chunking(device, storage) + read_footprint(device, storage);
-        }
-        std::cout << "QSA Prepare: " << (failures ? "FAIL" : "PASS") << '\n';
-        return failures ? 1 : 0;
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
+int main(int argc, char** argv) {
+    OpSuite suite;
+    const auto add = [&](int t, int b, int axes, int alias, int layout, int capacity = 0,
+                         KvCacheStorage storage = KvCacheStorage::BFloat16) {
+        const std::string format = kv_cache_storage_name(storage);
+        suite.add("qsa_prepare/" + format + "/t" + std::to_string(t) + "/b" + std::to_string(b) +
+                      "/axes" + std::to_string(axes) + "/alias" + std::to_string(alias) +
+                      "/layout" + std::to_string(layout) + "/capacity" + std::to_string(capacity),
+                  [=] {
+                      return run(cuda_environment().context, t, b, axes, alias, layout, capacity,
+                                 storage);
+                  },
+                  {{"format", format}, {"execution", "graph"}});
+    };
+    for (int t : {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 33, 63, 64, 65, 128})
+        add(t, t % 2 ? 8 : 1, t % 3 ? 3 : 1, t % 4, t % 3);
+    for (int t : {319, 320, 321}) add(t, 1, 3, 3, 0);
+    for (int t : {39, 40, 41}) add(t, 8, 1, 0, 2);
+    for (int alias = 0; alias < 4; ++alias) add(9, 8, 3, alias, alias % 3, 5);
+    for (int t : {1024, 2048, 4096}) add(t, 1, 3, 3, 0);
+    suite.add("qsa_prepare/bf16/epsilon", [] { return epsilon_range(cuda_environment().context); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/coordinate_handoff",
+              [] { return coordinate_handoff(cuda_environment().context); }, {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/norm_alignment",
+              [] { return norm_alignment_and_phase(cuda_environment().context); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/continuation",
+              [] { return continuation(cuda_environment().context); }, {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/chunking", [] { return chunking(cuda_environment().context); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/numerical_edges/key",
+              [] { return numerical_edges(cuda_environment().context, true); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/numerical_edges/value",
+              [] { return numerical_edges(cuda_environment().context, false); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/read_footprint",
+              [] { return read_footprint(cuda_environment().context); }, {{"format", "bf16"}});
+    suite.add("qsa_prepare/bf16/contract", [] { return validation(cuda_environment().context); },
+              {{"format", "bf16"}});
+    for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                         KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        for (int t : {1, 8, 17, 65, 319, 320, 321, 1024, 2048, 4096})
+            add(t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, storage);
+        for (int t : {1, 8, 39, 40, 41}) add(t, 8, 3, t % 4, 2, 0, storage);
+        add(9, 8, 1, 3, 1, 5, storage);
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/key_encoding",
+                  [=] { return exact_key_encoding(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/scale_edges",
+                  [=] { return scale_edges(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/norm_alignment",
+                  [=] { return norm_alignment_and_phase(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/continuation",
+                  [=] { return continuation(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/chunking",
+                  [=] { return chunking(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/read_footprint",
+                  [=] { return read_footprint(cuda_environment().context, storage); },
+                  {{"format", kv_cache_storage_name(storage)}});
     }
+
+    return suite.main(argc, argv);
 }

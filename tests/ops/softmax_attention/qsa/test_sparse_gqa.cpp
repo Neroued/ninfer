@@ -1,3 +1,5 @@
+#include "ops/suite.h"
+#include "kv_cache_storage.h"
 #include "sparse_gqa_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -16,8 +18,19 @@ constexpr ReductionCriterion kSparseA16Criterion{2.8e-3, 1.0e-3, 2.7e-3};
 int verify(Fixture& f, const std::string& label, bool preserved = true) {
     const auto reference = f.reference();
     const auto got       = from_device_bf16(f.out.data(), f.qhost.size());
-    int failures         = verify_reduction(label, got, reference, kSparseA16Criterion);
-    const auto words     = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
+    std::vector<double> selected;
+    selected.reserve(reference.values.size());
+    for (int m : reference.queries)
+        selected.insert(selected.end(), got.begin() + std::size_t(m) * 6144,
+                        got.begin() + std::size_t(m + 1) * 6144);
+    int failures = selected.empty()
+                       ? 0
+                       : verify_reduction(label, selected, reference.values, kSparseA16Criterion);
+    if (!std::all_of(got.begin(), got.end(), [](double x) { return std::isfinite(x); })) {
+        std::cerr << label << ": nonfinite or unwritten output\n";
+        ++failures;
+    }
+    const auto words = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
     for (int m = 0; m < f.T * f.B; ++m)
         if (f.visible[m].empty())
             for (int i = 0; i < 6144; ++i)
@@ -144,8 +157,7 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                          " T=" + std::to_string(tokens) + " bound=" + std::to_string(bound));
 }
 
-int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                   bool padded = true) {
+int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded) {
     Fixture f(3, 4, 2053, padded, storage);
     f.reset(0, 1);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
@@ -315,31 +327,6 @@ int validation(DeviceContext& device) {
     return failures;
 }
 
-int run_bf16(DeviceContext& device) {
-    int failures = 0;
-    failures += gate_rounding(device);
-    failures += graph_update(device, 8, 3);
-    failures += graph_update(device, 33, 8);
-    failures += read_footprint(device);
-    for (int l : {1, 3, 4, 5, 63, 64, 65, 2047, 2048, 2049, 2051, 2052, 2053, 262144})
-        failures += run(device, 1, 1, l);
-    for (int cap : {0, 1, 7, 8, 9, 15, 16, 17, 511})
-        failures += run(device, 3, 1, 32772, true, cap);
-    for (int t : {2, 4, 8, 9, 16, 17, 32, 63, 64, 65, 128, 169, 170, 171})
-        failures += run(device, t, 1, 8195, t % 2, 17);
-    for (int b = 2; b <= 8; ++b) failures += run(device, 9, b, 32771, b % 2, 512, 1, true);
-    for (int t : {255, 256, 257})
-        for (int history : {1024, 8192}) failures += run(device, t, 1, history, false, 512);
-    failures += run(device, 257, 1, 2051, true, 17);
-    failures += run(device, 1024, 1, 2048, false, 512);
-    failures += run(device, 1024, 1, 8192, false, 3);
-    failures += run(device, 2048, 1, 8192, false, 1);
-    failures += run(device, 4096, 1, 8192, false, 0);
-    for (float magnitude : {0.1f, 1.8f})
-        failures += run(device, 8, 1, 32772, false, 512, magnitude);
-    return failures;
-}
-
 int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history) {
     // Scale planes have their own strides/alignment, independently of vector-aligned data.
     Fixture f(tokens, 1, history, false, storage, true);
@@ -377,66 +364,92 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     return failures;
 }
 
-int run_quantized(DeviceContext& device, KvCacheStorage storage) {
-    int failures = quantized_validation(device, storage);
-    failures += read_footprint(device, storage, false) + read_footprint(device, storage, true);
-    failures += scale_layout(device, storage, 1, 2051);
-    failures += scale_layout(device, storage, 192, 8195);
-    failures += scale_layout(device, storage, 256, 65);
-    failures += gate_rounding(device, storage);
-    failures += gate_rounding(device, storage, 256, 1);
-    failures += gate_rounding(device, storage, 256, 8192);
-    failures += graph_update(device, 8, 3, storage);
-    failures += graph_update(device, 33, 8, storage);
-    for (int l : {1, 3, 4, 64, 65, 2048, 2051, 2052, 262144})
-        failures += run(device, 1, 1, l, false, 512, 1, false, storage);
-    for (int t : {63, 64, 65, 169, 170, 171, 255, 256, 257, 339, 340, 341})
-        failures += run(device, t, 1, 8192, false, 17, 1, false, storage);
-    failures += run(device, 257, 1, 2051, true, 17, 1, false, storage);
-    failures += run(device, 9, 8, 32771, true, 512, 1, true, storage);
-    failures += run(device, 1024, 1, 2048, false, 512, 1, false, storage);
-    failures += run(device, 192, 1, 8192, false, 512, 1, false, storage);
-    failures += run(device, 1024, 1, 8192, false, 512, 1, false, storage, 8);
-    for (float magnitude : {0.1f, 1.8f})
-        failures += run(device, 8, 1, 32772, false, 512, magnitude, false, storage);
-    failures += run(device, 3, 2, 2052, true, 0, 1, true, storage);
-    return failures;
+void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, int cap = 512,
+              float magnitude = 1, bool graph = false,
+              KvCacheStorage storage = KvCacheStorage::BFloat16,
+              int live_limit         = std::numeric_limits<int>::max()) {
+    const auto format = kv_cache_storage_name(storage);
+    suite.add(std::string("sparse_gqa/") + format + "/t" + std::to_string(t) + "/b" +
+                  std::to_string(b) + "/l" + std::to_string(history) + "/cap" +
+                  std::to_string(cap) + (padded ? "/padded" : "/contiguous") + "/qk" +
+                  std::to_string(magnitude) + "/live" + std::to_string(live_limit) +
+                  (graph ? "/graph" : "/eager"),
+              [=] {
+                  return run(cuda_environment().context, t, b, history, padded, cap, magnitude,
+                             graph, storage, live_limit);
+              },
+              {{"format", format}, {"execution", graph ? "graph" : "eager"}});
+}
+
+void add_cases(OpSuite& suite, KvCacheStorage storage) {
+    const std::string prefix = std::string("sparse_gqa/") + kv_cache_storage_name(storage);
+    const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
+        suite.add(prefix + "/" + id, [=] { return run(cuda_environment().context); },
+                        {{"format", kv_cache_storage_name(storage)}, {"execution", execution}});
+    };
+    special("contract", [=](auto& device) {
+        return storage == KvCacheStorage::BFloat16 ? validation(device)
+                                                   : quantized_validation(device, storage);
+    });
+    special("gate_rounding", [=](auto& device) { return gate_rounding(device, storage); });
+    for (auto [t, b] : {std::pair{8, 3}, {33, 8}})
+        special(
+            "update/t" + std::to_string(t) + "/b" + std::to_string(b),
+            [=](auto& device) { return graph_update(device, t, b, storage); }, "graph");
+    special("read_footprint/padded",
+            [=](auto& device) { return read_footprint(device, storage, true); });
+    if (storage == KvCacheStorage::BFloat16) {
+        for (int l : {1, 3, 4, 5, 63, 64, 65, 2047, 2048, 2049, 2051, 2052, 2053, 262144})
+            add_case(suite, 1, 1, l);
+        for (int cap : {0, 1, 7, 8, 9, 15, 16, 17, 511}) add_case(suite, 3, 1, 32772, true, cap);
+        for (int t : {2, 4, 8, 9, 16, 17, 32, 63, 64, 65, 128})
+            add_case(suite, t, 1, 8195, t % 2, 17);
+        for (int b = 2; b <= 8; ++b) add_case(suite, 9, b, 32771, b % 2, 512, 1, true);
+        for (int t : {255, 256, 257})
+            for (int history : {1024, 8192}) add_case(suite, t, 1, history, false, 512);
+        add_case(suite, 257, 1, 2051, true, 17);
+        add_case(suite, 1024, 1, 2048, false, 512);
+        add_case(suite, 1024, 1, 8192, false, 3);
+        add_case(suite, 2048, 1, 8192, false, 1);
+        add_case(suite, 4096, 1, 8192, false, 0);
+        for (float magnitude : {0.1f, 1.8f}) add_case(suite, 8, 1, 32772, false, 512, magnitude);
+    } else {
+        special("read_footprint/contiguous",
+                [=](auto& device) { return read_footprint(device, storage, false); });
+        for (auto [t, l] : {std::pair{1, 2051}, {192, 8195}, {256, 65}})
+            special("scale_layout/t" + std::to_string(t),
+                    [=](auto& device) { return scale_layout(device, storage, t, l); });
+        for (int bound : {1, 8192})
+            special("gate_rounding/t256/bound" + std::to_string(bound),
+                    [=](auto& device) { return gate_rounding(device, storage, 256, bound); });
+        for (int l : {1, 3, 4, 64, 65, 2048, 2051, 2052, 262144})
+            add_case(suite, 1, 1, l, false, 512, 1, false, storage);
+        for (int t : {63, 64, 65, 255, 256, 257})
+            add_case(suite, t, 1, 8192, false, 17, 1, false, storage);
+        add_case(suite, 257, 1, 2051, true, 17, 1, false, storage);
+        add_case(suite, 9, 8, 32771, true, 512, 1, true, storage);
+        add_case(suite, 1024, 1, 2048, false, 512, 1, false, storage);
+        add_case(suite, 192, 1, 8192, false, 512, 1, false, storage);
+        add_case(suite, 1024, 1, 8192, false, 512, 1, false, storage, 8);
+        for (float magnitude : {0.1f, 1.8f})
+            add_case(suite, 8, 1, 32772, false, 512, magnitude, false, storage);
+        add_case(suite, 3, 2, 2052, true, 0, 1, true, storage);
+    }
+    for (int multiplier : {1, 2})
+        for (int delta : {-1, 0, 1})
+            special("sm_boundary/" + std::to_string(multiplier) + "/delta" + std::to_string(delta),
+                    [=](auto& device) {
+                        return run(device, device.multiprocessor_count() * multiplier + delta, 1,
+                                   8192, false, 17, 1, false, storage);
+                    });
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    if (cuda_unavailable()) return 77;
-    try {
-        std::vector<KvCacheStorage> formats{
-            KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Int8Group64,
-            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
-        if (argc != 1) {
-            if (argc != 3 || std::string_view(argv[1]) != "--kv-cache")
-                throw std::invalid_argument(
-                    "usage: ninfer_qsa_sparse_gqa_test [--kv-cache bf16|fp8|int8|nvfp4|k8v4]");
-            const std::string_view name = argv[2];
-            if (name == "bf16")
-                formats = {KvCacheStorage::BFloat16};
-            else if (name == "fp8")
-                formats = {KvCacheStorage::Fp8E4M3Row256};
-            else if (name == "int8")
-                formats = {KvCacheStorage::Int8Group64};
-            else if (name == "nvfp4")
-                formats = {KvCacheStorage::Nvfp4Group16};
-            else if (name == "k8v4")
-                formats = {KvCacheStorage::Fp8KeyNvfp4Value};
-            else
-                throw std::invalid_argument("unsupported test cache format");
-        }
-        DeviceContext device;
-        int failures = validation(device);
-        for (auto format : formats)
-            failures += format == KvCacheStorage::BFloat16 ? run_bf16(device)
-                                                           : run_quantized(device, format);
-        std::cout << "QSA Sparse GQA: " << (failures ? "FAIL" : "PASS") << '\n';
-        return failures ? 1 : 0;
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
-    }
+    OpSuite suite;
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
+        add_cases(suite, storage);
+    return suite.main(argc, argv);
 }

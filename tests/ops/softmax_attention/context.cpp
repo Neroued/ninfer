@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -582,49 +583,59 @@ int batch_table_case() {
 
 } // namespace
 
-int run_softmax_attention_context_tests() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
-    }
-
-    int failures = 0;
-    constexpr ops::ContextAttentionExecutionEnvelope capacity_envelope{0, 196609};
-    const std::size_t interval = ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, capacity_envelope, 1, 16, 1);
-    const std::size_t witness = std::max(ops::context_softmax_attention_workspace_capacity_bytes(
-                                             kGeometry, capacity_envelope, 8, 8, 1),
-                                         ops::context_softmax_attention_workspace_capacity_bytes(
-                                             kGeometry, capacity_envelope, 16, 16, 1));
-    if (interval != witness) {
-        std::cerr << "context-attention interval capacity missed a token-band endpoint\n";
-        ++failures;
-    }
-    try {
-        (void)ops::context_softmax_attention_workspace_capacity_bytes(kGeometry, capacity_envelope,
-                                                                      9, 8, 1);
-        std::cerr << "context-attention accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    failures += run_case(1, 0);
-    failures += run_case(2, 1);
-    failures += run_case(1, 63);
-    failures += run_case(2, 64, InputProfile::Random, -1, MappingPattern::Offset);
-    failures += run_case(4, 65, InputProfile::Random, -1, MappingPattern::Fragmented);
-    failures += run_case(8, 95, InputProfile::Random, 4096, MappingPattern::Fragmented);
-    failures += run_case(16, 65, InputProfile::Random, 65537, MappingPattern::Fragmented, 16, true);
-    failures += run_case(16, 257);
-    failures += run_case(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
-    failures += run_case(4, 0, InputProfile::QueryVisibility);
-    failures += run_case(8, 0, InputProfile::Random, 0, MappingPattern::Identity, 0);
-    failures += run_case(8, 65, InputProfile::Random, 65, MappingPattern::Fragmented, 0);
-    failures += graph_mapping_replay_case();
-    failures += batch_table_case();
-
-    if (failures != 0) {
-        std::cerr << "context_softmax_attention failures=" << failures << '\n';
-        return 1;
-    }
-    std::cout << "context_softmax_attention: PASS\n";
-    return 0;
+void add_context_attention_cases(ninfer::test::OpSuite& suite) {
+    suite.add(
+        "context_attention/capacity",
+        [] {
+            int failures = 0;
+            constexpr ops::ContextAttentionExecutionEnvelope capacity_envelope{0, 196609};
+            const std::size_t interval = ops::context_softmax_attention_workspace_capacity_bytes(
+                kGeometry, capacity_envelope, 1, 16, 1);
+            const std::size_t witness =
+                std::max(ops::context_softmax_attention_workspace_capacity_bytes(
+                             kGeometry, capacity_envelope, 8, 8, 1),
+                         ops::context_softmax_attention_workspace_capacity_bytes(
+                             kGeometry, capacity_envelope, 16, 16, 1));
+            if (interval != witness) {
+                std::cerr << "context-attention interval capacity missed a token-band endpoint\n";
+                ++failures;
+            }
+            try {
+                (void)ops::context_softmax_attention_workspace_capacity_bytes(
+                    kGeometry, capacity_envelope, 9, 8, 1);
+                std::cerr << "context-attention accepted an invalid token interval\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+            return failures;
+        },
+        {{"format", "bf16"}});
+    const auto add = [&](int tokens, int length, InputProfile input = InputProfile::Random,
+                         int envelope = -1, MappingPattern mapping = MappingPattern::Identity,
+                         int valid = -1, bool sparse_storage = false) {
+        const auto id = "context_attention/t" + std::to_string(tokens) + "/l" +
+                        std::to_string(length) + "/bound" + std::to_string(envelope) + "/valid" +
+                        std::to_string(valid) + "/mapping" + std::to_string(int(mapping)) +
+                        "/input" + std::to_string(int(input));
+        suite.add(id,
+                  [=] {
+                      return run_case(tokens, length, input, envelope, mapping, valid,
+                                      sparse_storage);
+                  },
+                  {{"format", "bf16"}, {"execution", "eager"}});
+    };
+    add(1, 0);
+    add(2, 1);
+    add(1, 63);
+    add(2, 64, InputProfile::Random, -1, MappingPattern::Offset);
+    add(4, 65, InputProfile::Random, -1, MappingPattern::Fragmented);
+    add(8, 95, InputProfile::Random, 4096, MappingPattern::Fragmented);
+    add(16, 65, InputProfile::Random, 65537, MappingPattern::Fragmented, 16, true);
+    add(16, 257);
+    add(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
+    add(4, 0, InputProfile::QueryVisibility);
+    add(8, 0, InputProfile::Random, 0, MappingPattern::Identity, 0);
+    add(8, 65, InputProfile::Random, 65, MappingPattern::Fragmented, 0);
+    suite.add("context_attention/graph_mapping", graph_mapping_replay_case,
+              {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("context_attention/batch_table", batch_table_case, {{"format", "bf16"}});
 }

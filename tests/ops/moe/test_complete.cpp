@@ -1,17 +1,12 @@
 #include "fixture.h"
 
 namespace ninfer::test::moe {
-
-int test_complete(Fixture& fixture, CudaExecutionView execution) {
-    const auto& profile          = fixture.profile();
-    const bool q8                = profile.routed.ffn.gate_up_type == QType::Q8_G32_FP16;
-    const bool q5                = profile.routed.ffn.down_type == QType::Q5_G64_FP16;
-    const std::vector<int> cases = q8   ? std::vector<int>{1, 2, 19, 20, 383, 384, 768}
-                                   : q5 ? std::vector<int>{1, 2, 46, 47, 768, 4097}
-                                        : std::vector<int>{1, 2, 46, 47, 768};
-    int failures                 = 0;
-    std::size_t witness          = 0;
-    for (int tokens : cases) {
+namespace {
+int complete(Fixture& fixture, CudaExecutionView execution, int tokens, bool write) {
+    const auto& profile = fixture.profile();
+    const bool q5       = profile.routed.ffn.down_type == QType::Q5_G64_FP16;
+    int failures        = 0;
+    if (!write) {
         const auto batch = fixture.batch(tokens, tokens == 1 ? 1 : 0);
         DeviceBatch input(batch);
         GuardedDeviceBuffer storage(batch.residual.size() * 2);
@@ -19,7 +14,6 @@ int test_complete(Fixture& fixture, CudaExecutionView execution) {
         Tensor output(storage.span(), DType::BF16, {kHidden, tokens});
         const auto bytes = ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
-        witness = std::max(witness, bytes);
         GuardedDeviceBuffer scratch(bytes);
         MemoryArena arena(scratch.span());
         const auto run = [&] {
@@ -76,14 +70,7 @@ int test_complete(Fixture& fixture, CudaExecutionView execution) {
                 }
             }
         }
-    }
-    if (ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-            profile, ops::MoeEpilogue::AddResidual, 1, cases.back()) != witness) {
-        std::cerr << "complete MoE interval capacity mismatch\n";
-        ++failures;
-    }
-    // Write cannot consume the old destination, including when it contains NaNs.
-    for (int tokens : {1, q8 ? 20 : 47}) {
+    } else {
         auto batch = fixture.batch(tokens);
         DeviceBatch input(batch);
         DeviceBuffer buffer(execution.device(), batch.input.size() * 2);
@@ -105,5 +92,29 @@ int test_complete(Fixture& fixture, CudaExecutionView execution) {
                              reference, kCompleteA16);
     }
     return failures;
+}
+} // namespace
+
+void add_complete_cases(std::vector<FixtureCase>& cases, QType gate_up, QType down) {
+    const bool q8 = gate_up == QType::Q8_G32_FP16, q5 = down == QType::Q5_G64_FP16;
+    const auto widths = q8   ? std::vector{1, 2, 19, 20, 383, 384, 768}
+                        : q5 ? std::vector{1, 2, 46, 47, 768, 4097}
+                             : std::vector{1, 2, 46, 47, 768};
+    for (int t : widths)
+        cases.push_back(
+            {{"complete/t" + std::to_string(t), {{"execution", q5 && t == 2 ? "graph" : "eager"}}},
+             [=](Fixture& f, auto e) { return complete(f, e, t, false); }});
+    for (int t : {1, q8 ? 20 : 47})
+        cases.push_back({{"complete/write/t" + std::to_string(t), {{"execution", "eager"}}},
+                         [=](Fixture& f, auto e) { return complete(f, e, t, true); }});
+    cases.push_back(
+        {{"complete/capacity", {}}, [=](Fixture& f, auto) {
+             std::size_t peak = 0;
+             for (int t : widths)
+                 peak = std::max(peak, ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                                           f.profile(), ops::MoeEpilogue::AddResidual, t, t));
+             return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                        f.profile(), ops::MoeEpilogue::AddResidual, 1, widths.back()) != peak;
+         }});
 }
 } // namespace ninfer::test::moe

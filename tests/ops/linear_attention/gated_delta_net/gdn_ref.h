@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/suite.h"
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -87,70 +89,73 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
     result.final_state.resize(state_size);
     if (record_snapshots) { result.snapshots.resize(state_size * static_cast<std::size_t>(T)); }
 
-    std::vector<double> state(static_cast<std::size_t>(S * S));
-    std::vector<double> delta(static_cast<std::size_t>(S));
-    for (std::int64_t h = 0; h < H_v; ++h) {
-        const std::size_t state_base = static_cast<std::size_t>(h * S * S);
-        for (std::int64_t i = 0; i < S * S; ++i) {
-            state[static_cast<std::size_t>(i)] =
-                static_cast<double>(in.state[state_base + static_cast<std::size_t>(i)]);
+    parallel_rows(static_cast<int>(H_v), std::uint64_t(H_v) * T * S * S, [&](int first, int last) {
+        std::vector<double> state(static_cast<std::size_t>(S * S));
+        std::vector<double> delta(static_cast<std::size_t>(S));
+        for (std::int64_t h = first; h < last; ++h) {
+            const std::size_t state_base = static_cast<std::size_t>(h * S * S);
+            for (std::int64_t i = 0; i < S * S; ++i) {
+                state[static_cast<std::size_t>(i)] =
+                    static_cast<double>(in.state[state_base + static_cast<std::size_t>(i)]);
+            }
+
+            const std::int64_t qh = qk_head(h, H_qk, H_v);
+            for (std::int64_t t = 0; t < T; ++t) {
+                const std::size_t qk_base = static_cast<std::size_t>((t * H_qk + qh) * S);
+                const std::size_t v_base  = static_cast<std::size_t>((t * H_v + h) * S);
+                const std::size_t gb      = static_cast<std::size_t>(t * H_v + h);
+                const double alpha        = std::exp(static_cast<double>(in.g[gb]));
+                const double beta         = static_cast<double>(in.beta[gb]);
+
+                for (std::int64_t row = 0; row < S; ++row) {
+                    double state_dot_k         = 0.0;
+                    const std::size_t row_base = static_cast<std::size_t>(row * S);
+                    for (std::int64_t col = 0; col < S; ++col) {
+                        state_dot_k += state[row_base + static_cast<std::size_t>(col)] *
+                                       k_logical[qk_base + static_cast<std::size_t>(col)];
+                    }
+                    delta[static_cast<std::size_t>(row)] =
+                        beta * (static_cast<double>(in.v[v_base + static_cast<std::size_t>(row)]) -
+                                alpha * state_dot_k);
+                }
+
+                for (std::int64_t row = 0; row < S; ++row) {
+                    const std::size_t row_base = static_cast<std::size_t>(row * S);
+                    const double row_delta     = delta[static_cast<std::size_t>(row)];
+                    for (std::int64_t col = 0; col < S; ++col) {
+                        const std::size_t index = row_base + static_cast<std::size_t>(col);
+                        state[index] =
+                            alpha * state[index] +
+                            row_delta * k_logical[qk_base + static_cast<std::size_t>(col)];
+                    }
+                }
+
+                for (std::int64_t row = 0; row < S; ++row) {
+                    double state_dot_q         = 0.0;
+                    const std::size_t row_base = static_cast<std::size_t>(row * S);
+                    for (std::int64_t col = 0; col < S; ++col) {
+                        state_dot_q += state[row_base + static_cast<std::size_t>(col)] *
+                                       q_logical[qk_base + static_cast<std::size_t>(col)];
+                    }
+                    result.out[v_base + static_cast<std::size_t>(row)] = scale * state_dot_q;
+                }
+
+                if (record_snapshots) {
+                    const std::size_t snapshot_base =
+                        static_cast<std::size_t>(t) * state_size + state_base;
+                    for (std::int64_t i = 0; i < S * S; ++i) {
+                        result.snapshots[snapshot_base + static_cast<std::size_t>(i)] =
+                            state[static_cast<std::size_t>(i)];
+                    }
+                }
+            }
+
+            for (std::int64_t i = 0; i < S * S; ++i) {
+                result.final_state[state_base + static_cast<std::size_t>(i)] =
+                    state[static_cast<std::size_t>(i)];
+            }
         }
-
-        const std::int64_t qh = qk_head(h, H_qk, H_v);
-        for (std::int64_t t = 0; t < T; ++t) {
-            const std::size_t qk_base = static_cast<std::size_t>((t * H_qk + qh) * S);
-            const std::size_t v_base  = static_cast<std::size_t>((t * H_v + h) * S);
-            const std::size_t gb      = static_cast<std::size_t>(t * H_v + h);
-            const double alpha        = std::exp(static_cast<double>(in.g[gb]));
-            const double beta         = static_cast<double>(in.beta[gb]);
-
-            for (std::int64_t row = 0; row < S; ++row) {
-                double state_dot_k         = 0.0;
-                const std::size_t row_base = static_cast<std::size_t>(row * S);
-                for (std::int64_t col = 0; col < S; ++col) {
-                    state_dot_k += state[row_base + static_cast<std::size_t>(col)] *
-                                   k_logical[qk_base + static_cast<std::size_t>(col)];
-                }
-                delta[static_cast<std::size_t>(row)] =
-                    beta * (static_cast<double>(in.v[v_base + static_cast<std::size_t>(row)]) -
-                            alpha * state_dot_k);
-            }
-
-            for (std::int64_t row = 0; row < S; ++row) {
-                const std::size_t row_base = static_cast<std::size_t>(row * S);
-                const double row_delta     = delta[static_cast<std::size_t>(row)];
-                for (std::int64_t col = 0; col < S; ++col) {
-                    const std::size_t index = row_base + static_cast<std::size_t>(col);
-                    state[index]            = alpha * state[index] +
-                                   row_delta * k_logical[qk_base + static_cast<std::size_t>(col)];
-                }
-            }
-
-            for (std::int64_t row = 0; row < S; ++row) {
-                double state_dot_q         = 0.0;
-                const std::size_t row_base = static_cast<std::size_t>(row * S);
-                for (std::int64_t col = 0; col < S; ++col) {
-                    state_dot_q += state[row_base + static_cast<std::size_t>(col)] *
-                                   q_logical[qk_base + static_cast<std::size_t>(col)];
-                }
-                result.out[v_base + static_cast<std::size_t>(row)] = scale * state_dot_q;
-            }
-
-            if (record_snapshots) {
-                const std::size_t snapshot_base =
-                    static_cast<std::size_t>(t) * state_size + state_base;
-                for (std::int64_t i = 0; i < S * S; ++i) {
-                    result.snapshots[snapshot_base + static_cast<std::size_t>(i)] =
-                        state[static_cast<std::size_t>(i)];
-                }
-            }
-        }
-
-        for (std::int64_t i = 0; i < S * S; ++i) {
-            result.final_state[state_base + static_cast<std::size_t>(i)] =
-                state[static_cast<std::size_t>(i)];
-        }
-    }
+    });
     return result;
 }
 

@@ -6,7 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
-#include <thread>
+#include "ops/suite.h"
 
 namespace ninfer::test::moe {
 namespace {
@@ -299,21 +299,10 @@ std::vector<float> make_down(std::int32_t rows, std::int32_t columns, std::uint3
 }
 
 template <class Function>
-void parallel_rows(std::int32_t rows, Function&& function) {
-    const unsigned available   = std::min(8U, std::max(1U, std::thread::hardware_concurrency()));
-    const std::int32_t threads = std::min(rows, static_cast<std::int32_t>(available));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (std::int32_t thread = 0; thread < threads; ++thread) {
-        const std::int32_t begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * thread) / threads);
-        const std::int32_t end =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * (thread + 1)) / threads);
-        workers.emplace_back([&, begin, end] {
-            for (std::int32_t row = begin; row < end; ++row) { function(row); }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
+void for_oracle_rows(std::int32_t rows, Function&& function) {
+    ninfer::test::parallel_rows(rows, std::uint64_t(rows) * kHidden, [&](int begin, int end) {
+        for (int row = begin; row < end; ++row) function(row);
+    });
 }
 
 double dot_fp64(const std::vector<float>& matrix, std::int32_t row, std::int32_t columns,
@@ -329,7 +318,8 @@ double dot_fp64(const std::vector<float>& matrix, std::int32_t row, std::int32_t
 RouteReference route_reference(const std::vector<float>& input, const std::vector<float>& weights) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> scores(kExperts + 1);
-    parallel_rows(kExperts + 1, [&](int row) { scores[row] = dot_fp64(weights, row, kHidden, x); });
+    for_oracle_rows(kExperts + 1,
+                    [&](int row) { scores[row] = dot_fp64(weights, row, kHidden, x); });
     std::vector<int> ids(kExperts);
     std::iota(ids.begin(), ids.end(), 0);
     std::sort(ids.begin(), ids.end(), [&](int a, int b) {
@@ -352,12 +342,12 @@ std::vector<double> ffn_reference(const std::vector<float>& input,
                                   const quantized_weight::PackedWeight& down) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> activation(kIntermediate), out(kHidden);
-    parallel_rows(kIntermediate, [&](int row) {
+    for_oracle_rows(kIntermediate, [&](int row) {
         const double gate = dot_fp64(gu.dequant, row, kHidden, x);
         const double up   = dot_fp64(gu.dequant, kIntermediate + row, kHidden, x);
         activation[row]   = gate / (1 + std::exp(-gate)) * up;
     });
-    parallel_rows(kHidden, [&](int row) {
+    for_oracle_rows(kHidden, [&](int row) {
         out[row] = dot_fp64(down.dequant, row, kIntermediate, activation);
     });
     return out;

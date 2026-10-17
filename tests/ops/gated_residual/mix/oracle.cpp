@@ -1,7 +1,7 @@
-#include "oracle.h"
-#include "../criteria.h"
+#include "support.h"
+#include "../support.h"
 
-#include <thread>
+#include "ops/suite.h"
 
 namespace ninfer::test::hc::mix {
 namespace {
@@ -50,15 +50,10 @@ Column reference_column(const Weights& w, std::span<const float> z) {
 std::vector<Column> reference(const Weights& weights, std::span<const float> catalog) {
     const int columns = int(catalog.size() / kTotal);
     std::vector<Column> result(columns);
-    const int threads = std::min(columns, int(std::max(1U, std::thread::hardware_concurrency())));
-    std::vector<std::thread> workers;
-    for (int worker = 0; worker < threads; ++worker)
-        workers.emplace_back([&, worker] {
-            for (int m = worker; m < columns; m += threads)
-                result[m] =
-                    reference_column(weights, catalog.subspan(std::size_t(m) * kTotal, kTotal));
-        });
-    for (auto& worker : workers) worker.join();
+    parallel_rows(columns, std::uint64_t(columns) * kTotal * kRank, [&](int first, int last) {
+        for (int m = first; m < last; ++m)
+            result[m] = reference_column(weights, catalog.subspan(std::size_t(m) * kTotal, kTotal));
+    });
     return result;
 }
 

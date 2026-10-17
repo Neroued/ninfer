@@ -189,7 +189,7 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
         throw std::invalid_argument("linear test: invalid FP64 GEMM argument");
     }
 
-    linear_suite::parallel_rows(
+    ninfer::test::parallel_rows(
         n, static_cast<std::uint64_t>(n) * k * t, [&](int row_begin, int row_end) {
             for (std::int32_t row = row_begin; row < row_end; ++row) {
                 const float* weight_row = weight + static_cast<std::size_t>(row) * k;
@@ -394,7 +394,7 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
 
 void add_shape(Suite& suite, QType format, ActivationRecipe recipe, WeightGenerator generator,
                const ShapeCase& shape) {
-    std::vector<Invocation> calls(shape.invocations.begin(), shape.invocations.end());
+    std::vector<Invocation> calls;
     std::vector<linear_suite::Case> cases;
     std::string fixture = "s" + std::to_string(shape.seed) +
                           (recipe == ActivationRecipe::TokenBlocks ? "/token-blocks" : "/hashed") +
@@ -402,11 +402,14 @@ void add_shape(Suite& suite, QType format, ActivationRecipe recipe, WeightGenera
     if (shape.activation_generator) fixture += "/projection-recipe";
     if (shape.activation_pattern == ActivationPattern::KTail) fixture += "/k-tail";
     if (shape.activation_pattern == ActivationPattern::Cancellation) fixture += "/cancellation";
-    for (auto& call : calls) {
+    for (const auto& call : shape.invocations) {
         auto test = linear_suite::make_case(
             linear_suite::format_name(format), shape.n, shape.k, call.t, call.policy,
             call.graph_replay ? linear_suite::Execution::Graph : linear_suite::Execution::Eager,
             fixture + (call.call_form == CallForm::A16Convenience ? "/convenience" : "/policy"));
+        if (std::any_of(cases.begin(), cases.end(), [&](const auto& c) { return c.id == test.id; }))
+            continue;
+        calls.push_back(call);
         cases.push_back(std::move(test));
     }
     auto owned_shape        = shape;

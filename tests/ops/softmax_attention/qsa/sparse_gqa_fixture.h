@@ -107,6 +107,7 @@ struct Fixture {
         std::fill(ids.begin(), ids.end(), -1);
         std::fill(counts.begin(), counts.end(), -1);
         for (auto& row : visible) row.clear();
+        std::vector<bool> populated(std::size_t(pages) * 64);
         for (int b = 0; b < B; ++b) {
             int end = history, live = std::min(T, end);
             if (phase == 1 || B > 1) {
@@ -152,18 +153,21 @@ struct Fixture {
                     ghost[index]     = f32_to_bf16(sample(index + 129 + phase) * 4);
                 }
                 for (int j : visible[m]) {
-                    const int page = tables[selectors[b] * table_stride + j / 64];
-                    for (int h = 0; h < 2; ++h)
-                        for (int d = 0; d < 256; ++d) {
-                            const auto seed =
-                                std::uint32_t((page * 128 + h * 64 + j % 64) * 256 + d);
-                            keys.host[keys.offset(d, h, j % 64, page)] =
-                                f32_to_bf16(sample(seed + 701) * magnitude);
-                            values.host[values.offset(d, h, j % 64, page)] =
-                                half(sample(seed + 1311));
-                        }
+                    const int page                = tables[selectors[b] * table_stride + j / 64];
+                    populated[page * 64 + j % 64] = true;
                 }
             }
+        }
+        for (int row = 0; row < pages * 64; ++row) {
+            if (!populated[row]) continue;
+            const int page = row / 64, token = row % 64;
+            for (int h = 0; h < 2; ++h)
+                for (int d = 0; d < 256; ++d) {
+                    const auto seed = std::uint32_t((page * 128 + h * 64 + token) * 256 + d);
+                    keys.host[keys.offset(d, h, token, page)] =
+                        f32_to_bf16(sample(seed + 701) * magnitude);
+                    values.host[values.offset(d, h, token, page)] = half(sample(seed + 1311));
+                }
         }
         upload();
     }
@@ -183,7 +187,7 @@ struct Fixture {
             encoded_key->encode(keys);
             encoded_value->encode(values);
         }
-        out.fill(0xa5);
+        out.fill(0xff);
         // Fixture transfers/memset use the default stream; the Op's stream is nonblocking.
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
@@ -193,58 +197,101 @@ struct Fixture {
                             execution);
     }
 
-    std::vector<double> reference() const {
-        std::vector<double> result(qhost.size());
-        const auto kv = [&](const Plane& plane, int d, int h, int ordinal, int m) {
-            const int token    = visible[m][ordinal];
-            const int physical = tables[selectors[m / T] * table_stride + token / 64];
-            if (encoded_key)
-                return (&plane == &keys ? encoded_key : encoded_value)
-                    ->decode(d, h, token % 64, physical);
-            const auto word = plane.host[plane.offset(d, h, token % 64, physical)];
-            return plane.view.dtype == DType::BF16 ? double(bf16_to_f32(word))
-                                                   : double(unhalf(word));
-        };
-        const auto run = [&](int first, int last) {
-            for (int m = first; m < last; ++m) {
-                if (visible[m].empty()) continue;
-                std::array<double, 6144> transformed_query;
-                for (int h = 0; h < 24; ++h) {
-                    std::array<double, 256> row;
-                    for (int d = 0; d < 256; ++d)
-                        row[d] = bf16_to_f32(qhost[(std::size_t(m) * 24 + h) * 256 + d]);
-                    if (encoded_key) prepare::hadamard(row);
-                    std::copy(row.begin(), row.end(), transformed_query.begin() + h * 256);
-                }
-                naive_dense_softmax_attention(
-                    {256, 24, 2}, 1, int(visible[m].size()), 1.0 / 16,
-                    [&](int d, int h, int) { return transformed_query[h * 256 + d]; },
-                    [&](int d, int h, int j) { return kv(keys, d, h, j, m); },
-                    [&](int d, int h, int j) { return kv(values, d, h, j, m); },
-                    [](int, int) { return true; },
-                    [&](int d, int h, int, double x) {
-                        const auto i = (std::size_t(m) * 24 + h) * 256 + d;
-                        result[i]    = x;
-                    },
-                    T * B == 1 ? 16 : 1);
-                for (int h = 0; h < 24; ++h) {
-                    const auto base = (std::size_t(m) * 24 + h) * 256;
-                    std::array<double, 256> row;
-                    std::copy_n(result.begin() + base, 256, row.begin());
-                    if (encoded_value && encoded_value->format.rotate) prepare::hadamard(row);
-                    for (int d = 0; d < 256; ++d)
-                        result[base + d] =
-                            row[d] / (1.0 + std::exp(-double(bf16_to_f32(ghost[base + d]))));
-                }
+    struct Reference {
+        std::vector<int> queries;
+        std::vector<double> values;
+    };
+
+    Reference reference() const {
+        Reference result;
+        for (int b = 0; b < B; ++b) {
+            const int live = valid[b];
+            if (live <= 64) {
+                for (int t = 0; t < live; ++t) result.queries.push_back(b * T + t);
+            } else {
+                // Full dot/softmax/value formula at fixed output queries. The GPU still computes
+                // every query; all output cells are checked for writes/finite values separately.
+                std::vector<int> samples{0,  1,  7,   8,   15,  16,  31,       32,
+                                         63, 64, 127, 128, 255, 256, live / 2, live - 1};
+                std::sort(samples.begin(), samples.end());
+                samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+                for (int t : samples)
+                    if (t < live) result.queries.push_back(b * T + t);
             }
-        };
-        const int workers = std::min(16, T * B);
-        {
-            std::vector<std::jthread> threads;
-            for (int i = 1; i < workers; ++i)
-                threads.emplace_back(run, T * B * i / workers, T * B * (i + 1) / workers);
-            run(0, T * B / workers);
         }
+        result.values.resize(result.queries.size() * 6144);
+        std::vector<int> row_indices(std::size_t(pages) * 64, -1);
+        std::vector<int> rows;
+        for (int m : result.queries)
+            for (int token : visible[m]) {
+                const int page = tables[selectors[m / T] * table_stride + token / 64];
+                const int row  = page * 64 + token % 64;
+                if (row_indices[row] >= 0) continue;
+                row_indices[row] = int(rows.size());
+                rows.push_back(row);
+            }
+        std::vector<double> decoded_keys(rows.size() * 512), decoded_values(decoded_keys.size());
+        parallel_rows(int(rows.size()), std::uint64_t(rows.size()) * 512, [&](int first, int last) {
+            for (int i = first; i < last; ++i)
+                for (int h = 0; h < 2; ++h)
+                    for (int d = 0; d < 256; ++d) {
+                        const int page = rows[i] / 64, token = rows[i] % 64;
+                        const auto index = std::size_t(i) * 512 + h * 256 + d;
+                        decoded_keys[index] =
+                            encoded_key
+                                ? encoded_key->decode(d, h, token, page)
+                                : double(bf16_to_f32(keys.host[keys.offset(d, h, token, page)]));
+                        decoded_values[index] =
+                            encoded_value
+                                ? encoded_value->decode(d, h, token, page)
+                                : double(unhalf(values.host[values.offset(d, h, token, page)]));
+                    }
+        });
+        parallel_rows(
+            int(result.queries.size()), std::uint64_t(result.queries.size()) * 6144 * 2048,
+            [&](int first, int last) {
+                for (int qi = first; qi < last; ++qi) {
+                    const int m = result.queries[qi];
+                    if (visible[m].empty()) continue;
+                    std::vector<int> kv_rows;
+                    for (int token : visible[m]) {
+                        const int page = tables[selectors[m / T] * table_stride + token / 64];
+                        kv_rows.push_back(row_indices[page * 64 + token % 64]);
+                    }
+                    std::array<double, 6144> transformed_query;
+                    for (int h = 0; h < 24; ++h) {
+                        std::array<double, 256> row;
+                        for (int d = 0; d < 256; ++d)
+                            row[d] = bf16_to_f32(qhost[(std::size_t(m) * 24 + h) * 256 + d]);
+                        if (encoded_key) prepare::hadamard(row);
+                        std::copy(row.begin(), row.end(), transformed_query.begin() + h * 256);
+                    }
+                    naive_dense_softmax_attention(
+                        {256, 24, 2}, 1, int(visible[m].size()), 1.0 / 16,
+                        [&](int d, int h, int) { return transformed_query[h * 256 + d]; },
+                        [&](int d, int h, int j) {
+                            return decoded_keys[std::size_t(kv_rows[j]) * 512 + h * 256 + d];
+                        },
+                        [&](int d, int h, int j) {
+                            return decoded_values[std::size_t(kv_rows[j]) * 512 + h * 256 + d];
+                        },
+                        [](int, int) { return true; },
+                        [&](int d, int h, int, double x) {
+                            result.values[(std::size_t(qi) * 24 + h) * 256 + d] = x;
+                        },
+                        result.queries.size() == 1);
+                    for (int h = 0; h < 24; ++h) {
+                        const auto base = (std::size_t(qi) * 24 + h) * 256;
+                        std::array<double, 256> row;
+                        std::copy_n(result.values.begin() + base, 256, row.begin());
+                        if (encoded_value && encoded_value->format.rotate) prepare::hadamard(row);
+                        for (int d = 0; d < 256; ++d)
+                            result.values[base + d] =
+                                row[d] / (1.0 + std::exp(-double(bf16_to_f32(
+                                                    ghost[(std::size_t(m) * 24 + h) * 256 + d]))));
+                    }
+                }
+            });
         return result;
     }
 };

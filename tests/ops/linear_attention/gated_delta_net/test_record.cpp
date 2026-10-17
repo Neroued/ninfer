@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
@@ -296,23 +297,24 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    int failures = 0;
-    failures += run_case(32, 2, 1, {}, 1701U);
-    failures += run_case(32, 16, 1, {7}, 1711U);
-    failures += run_case(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
+int main(int argc, char** argv) {
+    OpSuite suite;
+    const auto add = [&](int heads, int width, int batch, std::vector<int> valid, unsigned seed) {
+        suite.add("gdn_record/h" + std::to_string(heads) + "/w" + std::to_string(width) + "/b" +
+                      std::to_string(batch) + (valid.empty() ? "/dense" : "/ragged"),
+                  [=] { return run_case(heads, width, batch, valid, seed); },
+                  {{"execution", width == 2 || width == 9 || width == 16 ? "graph" : "eager"}});
+    };
+    add(32, 2, 1, {}, 1701U);
+    add(32, 16, 1, {7}, 1711U);
+    add(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
     for (int width = 2; width <= 16; ++width) {
-        failures += run_case(48, width, 1, {}, 1730U + width);
+        add(48, width, 1, {}, 1730U + width);
         std::vector<std::int32_t> valid(8);
         for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (3 * b) % width;
-        failures += run_case(48, width, 8, valid, 1760U + width);
+        add(48, width, 8, valid, 1760U + width);
     }
-    failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
-    return failures == 0 ? 0 : 1;
+    add(48, 5, 3, {5, 3, 1}, 1791U);
+
+    return suite.main(argc, argv);
 }

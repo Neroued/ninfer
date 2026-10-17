@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -89,22 +90,18 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = 0;
-        for (int layout : {0, 1, 2}) {
-            failures += run(device, 1, layout, false, false);
-            failures += run(device, 8, layout, false, false);
-            failures += run(device, 3, layout, true, false);
-            failures += run(device, 8, layout, true, true);
-        }
-        if (failures) return 1;
-        std::cout << "OK PLE exact state extraction for every accepted prefix, strides and Graph "
-                     "metadata\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
+void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
+    const auto add = [&](int batch, int layout, bool inplace, bool sliced) {
+        suite.add("ple_state_extract/b" + std::to_string(batch) + "/layout" +
+                      std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +
+                      (sliced ? "/sliced" : "/full"),
+                  [=] { return run(cuda_environment().context, batch, layout, inplace, sliced); },
+                  {{"execution", "graph"}});
+    };
+    for (int layout : {0, 1, 2}) {
+        add(1, layout, false, false);
+        add(8, layout, false, false);
+        add(3, layout, true, false);
+        add(8, layout, true, true);
     }
 }

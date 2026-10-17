@@ -81,20 +81,4 @@ inline int verify_preserved(const void* device, std::span<const std::byte> expec
     return 1;
 }
 
-template <class Run>
-int run_test_main(std::string_view label, Run&& run) {
-    try {
-        if (cuda_unavailable()) {
-            std::cout << "SKIP: no usable CUDA device\n";
-            return 77;
-        }
-        const int failures = std::forward<Run>(run)();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << ' ' << label << '\n';
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << label << ": " << error.what() << '\n';
-        return 1;
-    }
-}
-
 } // namespace ninfer::test::linear_common

@@ -1,4 +1,4 @@
-#include "fixtures.h"
+#include "support.h"
 #include "cuda_fixture.h"
 
 namespace ninfer::test::hc {

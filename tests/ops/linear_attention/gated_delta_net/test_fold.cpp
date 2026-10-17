@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -816,32 +817,38 @@ int run_record_fold_rounds(bool q8 = false) {
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
+int main(int argc, char** argv) {
+    OpSuite suite;
+    const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
+                         unsigned seed, bool distinct = false) {
+        std::string id = "gdn_fold/l" + std::to_string(p.layers) + "/h" +
+                         std::to_string(p.value_heads) + "/w" + std::to_string(width) + "/b" +
+                         std::to_string(batch) + (distinct ? "/disjoint" : "/alias") + "/commits";
+        for (int c : commits) id += "_" + std::to_string(c);
+        suite.add(id, [=] { return run_case(p, width, batch, commits, seed, distinct); },
+                  {{"execution", width == 16 && batch == 8 ? "graph" : "eager"}});
+    };
+    add({48, 48, 10240}, 2, 1, {2}, 1801U, true);
+    add({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
+    add({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
+    add({48, 48, 10240}, 7, 8, {7, 0, 1, 2, 3, 4, 5, 6}, 1823U, true);
+    add({48, 48, 10240}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1825U, true);
+    add({48, 48, 10240}, 16, 1, {16}, 1827U, true);
+    add({48, 48, 10240}, 16, 1, {0}, 1829U, true);
+    add({30, 32, 8192}, 2, 1, {2}, 1831U);
+    add({30, 32, 8192}, 6, 1, {6}, 1841U);
+    add({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
+    add({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    add({36, 48, 10240}, 2, 1, {2}, 1871U, true);
+    add({36, 48, 10240}, 5, 4, {0, 1, 3, 5}, 1873U);
+    add({36, 48, 10240}, 16, 8, {0, 1, 2, 3, 4, 5, 6, 7}, 1875U, true);
+    add({36, 48, 10240}, 16, 8, {8, 9, 10, 11, 12, 13, 14, 15}, 1877U);
+    add({36, 48, 10240}, 16, 1, {16}, 1879U, true);
+    add({36, 48, 10240}, 16, 1, {0}, 1881U, true);
+    suite.add("gdn_fold/record_rounds/q4_q5", [] { return run_record_fold_rounds(); },
+              {{"format", "q4_q5"}});
+    suite.add("gdn_fold/record_rounds/q8", [] { return run_record_fold_rounds(true); },
+              {{"format", "q8"}});
 
-    int failures = 0;
-    failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
-    failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
-    failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
-    failures += run_case({48, 48, 10240}, 7, 8, {7, 0, 1, 2, 3, 4, 5, 6}, 1823U, true);
-    failures += run_case({48, 48, 10240}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1825U, true);
-    failures += run_case({48, 48, 10240}, 16, 1, {16}, 1827U, true);
-    failures += run_case({48, 48, 10240}, 16, 1, {0}, 1829U, true);
-    failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
-    failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
-    failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
-    failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
-    failures += run_case({36, 48, 10240}, 2, 1, {2}, 1871U, true);
-    failures += run_case({36, 48, 10240}, 5, 4, {0, 1, 3, 5}, 1873U);
-    failures += run_case({36, 48, 10240}, 16, 8, {0, 1, 2, 3, 4, 5, 6, 7}, 1875U, true);
-    failures += run_case({36, 48, 10240}, 16, 8, {8, 9, 10, 11, 12, 13, 14, 15}, 1877U);
-    failures += run_case({36, 48, 10240}, 16, 1, {16}, 1879U, true);
-    failures += run_case({36, 48, 10240}, 16, 1, {0}, 1881U, true);
-    failures += run_record_fold_rounds();
-    failures += run_record_fold_rounds(true);
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
-    return failures == 0 ? 0 : 1;
+    return suite.main(argc, argv);
 }

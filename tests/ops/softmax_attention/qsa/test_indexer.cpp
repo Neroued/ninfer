@@ -1,3 +1,5 @@
+#include "ops/suite.h"
+#include "kv_cache_storage.h"
 #include "indexer_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -245,36 +247,40 @@ int validation(DeviceContext& device) {
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = validation(device);
-        for (int history :
-             {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
-            failures += run(device, 1, 1, history, 0, Pattern::Dyadic);
-        for (int capacity : {2051, 2052, 16388})
-            failures += run(device, 5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
-        for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
-            failures += run(device, t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
-        for (int b = 2; b <= 8; ++b)
-            failures += run(device, 64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
-        for (int t : {128, 1024, 2048, 4096})
-            failures += run(device, t, 1, 262144, 0, Pattern::Dyadic);
-        for (auto pattern :
-             {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {
-            failures += run(device, 1, 1, 262144, 0, pattern);
-            failures += run(device, 8, 4, 131072, 1, pattern);
-            if (pattern == Pattern::Dense) {
-                failures += run(device, 16, 1, 32772, 0, pattern);
-                failures += run(device, 32, 1, 32772, 1, pattern);
-            }
+int main(int argc, char** argv) {
+    OpSuite suite;
+    suite.add("qsa_indexer/contract", [] { return validation(cuda_environment().context); });
+    suite.add("qsa_indexer/read_footprint",
+              [] { return read_footprint(cuda_environment().context); });
+    const auto add = [&](int t, int b, int history, int layout, Pattern pattern, bool graph = false,
+                         std::uint32_t capacity = 262144) {
+        suite.add("qsa_indexer/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
+                      std::to_string(history) + "/layout" + std::to_string(layout) + "/pattern" +
+                      std::to_string(int(pattern)) + "/capacity" + std::to_string(capacity),
+                  [=] {
+                      return run(cuda_environment().context, t, b, history, layout, pattern, graph,
+                                 capacity);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    for (int history :
+         {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
+        add(1, 1, history, 0, Pattern::Dyadic);
+    for (int capacity : {2051, 2052, 16388})
+        add(5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
+    for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
+        add(t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
+    for (int b = 2; b <= 8; ++b) add(64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
+    for (int t : {128, 1024, 2048, 4096}) add(t, 1, 262144, 0, Pattern::Dyadic);
+    for (auto pattern :
+         {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {
+        add(1, 1, 262144, 0, pattern);
+        add(8, 4, 131072, 1, pattern);
+        if (pattern == Pattern::Dense) {
+            add(16, 1, 32772, 0, pattern);
+            add(32, 1, 32772, 1, pattern);
         }
-        failures += read_footprint(device);
-        std::cout << "QSA Indexer: " << (failures ? "FAIL" : "PASS") << '\n';
-        return failures ? 1 : 0;
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
     }
+
+    return suite.main(argc, argv);
 }

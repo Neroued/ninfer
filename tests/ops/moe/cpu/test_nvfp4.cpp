@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
 
@@ -338,32 +339,75 @@ void validation(Fixture& f, CpuExecutor& executor) {
 }
 } // namespace
 
-int main() {
-    try {
+int main(int argc, char** argv) {
+    using namespace ninfer::test;
+    OpSuite suite(false);
+
+    struct Case {
+        int tokens, active;
+        bool same;
+        ops::ExpertSubsetKind subset;
+        int workers = 8;
+    };
+
+    std::vector<Case> cases;
+    using ops::ExpertSubsetKind;
+    for (int t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 72, 255, 256, 257})
+        cases.push_back({t, K, true, ExpertSubsetKind::All});
+    for (auto subset : {ExpertSubsetKind::All, ExpertSubsetKind::None, ExpertSubsetKind::MaskOnes,
+                        ExpertSubsetKind::MaskZeros})
+        cases.push_back({9, K, false, subset});
+    cases.push_back({3, 1, false, ExpertSubsetKind::MaskOnes, 1});
+    std::vector<OpCase> catalogue;
+    for (auto c : cases)
+        catalogue.push_back({"cpu_moe/nvfp4/t" + std::to_string(c.tokens) + "/active" +
+                                 std::to_string(c.active) + "/subset" +
+                                 std::to_string(int(c.subset)) + "/workers" +
+                                 std::to_string(c.workers) + (c.same ? "/same" : "/mixed"),
+                             {{"format", "nvfp4"}}});
+    suite.add(std::move(catalogue), [=](auto selected) {
         CpuTopology topology;
         const auto count = std::min<std::size_t>(8, cpu_worker_order(topology.info()).size());
-        CpuExecutor executor(topology, plan_cpu_team(topology.info(), count));
-        Fixture f;
-        for (int t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 72, 255, 256, 257})
-            qualify(f, executor, t, K, true, ops::ExpertSubsetKind::All);
-        for (auto kind : {ops::ExpertSubsetKind::All, ops::ExpertSubsetKind::None,
-                          ops::ExpertSubsetKind::MaskOnes, ops::ExpertSubsetKind::MaskZeros})
-            qualify(f, executor, 9, K, false, kind);
+        CpuExecutor team(topology, plan_cpu_team(topology.info(), count));
         CpuExecutor single(topology, plan_cpu_team(topology.info(), 1));
-        qualify(f, single, 3, 1, false, ops::ExpertSubsetKind::MaskOnes);
-        const auto divisors = f.gu.divisors;
-        for (int e = 1; e < E; e += 2) f.gu.divisors[e] = std::numeric_limits<float>::quiet_NaN();
-        qualify(f, executor, 3, K, false, ops::ExpertSubsetKind::MaskOnes);
-        f.gu.divisors                = divisors;
-        f.profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
-        f.profile.ffn.down_policy    = ops::LinearPolicy::AllowA8;
-        qualify(f, executor, 4, K, true, ops::ExpertSubsetKind::All);
-        qualify(f, executor, 257, K, false, ops::ExpertSubsetKind::MaskOnes, 256);
-        validation(f, executor);
-        tiny_inputs(f, executor);
-        std::cout << "CPU NVFP4 independent FP64 qualification passed\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
-    }
+        Fixture fixture;
+        for (auto i : selected) {
+            auto c = cases[i];
+            qualify(fixture, c.workers == 1 ? single : team, c.tokens, c.active, c.same, c.subset);
+        }
+        return 0;
+    });
+    enum class Recipe { InactiveDivisors, Policies, InactivePrefix, Contract, Tiny };
+    for (auto [recipe, name] : {std::pair{Recipe::InactiveDivisors, "inactive_divisors"},
+                                {Recipe::Policies, "policies"},
+                                {Recipe::InactivePrefix, "inactive_prefix"},
+                                {Recipe::Contract, "contract"},
+                                {Recipe::Tiny, "tiny"}})
+        suite.add(std::string("cpu_moe/nvfp4/") + name,
+                  [=] {
+                      CpuTopology topology;
+                      CpuExecutor executor(
+                          topology,
+                          plan_cpu_team(
+                              topology.info(),
+                              std::min<std::size_t>(8, cpu_worker_order(topology.info()).size())));
+                      Fixture f;
+                      if (recipe == Recipe::InactiveDivisors) {
+                          for (int e = 1; e < E; e += 2)
+                              f.gu.divisors[e] = std::numeric_limits<float>::quiet_NaN();
+                          qualify(f, executor, 3, K, false, ExpertSubsetKind::MaskOnes);
+                      } else if (recipe == Recipe::Policies) {
+                          f.profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
+                          f.profile.ffn.down_policy    = ops::LinearPolicy::AllowA8;
+                          qualify(f, executor, 4, K, true, ExpertSubsetKind::All);
+                      } else if (recipe == Recipe::InactivePrefix)
+                          qualify(f, executor, 257, K, false, ExpertSubsetKind::MaskOnes, 256);
+                      else if (recipe == Recipe::Contract)
+                          validation(f, executor);
+                      else
+                          tiny_inputs(f, executor);
+                      return 0;
+                  },
+                  {{"format", "nvfp4"}});
+    return suite.main(argc, argv);
 }

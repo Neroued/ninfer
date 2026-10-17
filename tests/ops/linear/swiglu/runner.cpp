@@ -125,7 +125,7 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
 
-    linear_suite::parallel_rows(
+    ninfer::test::parallel_rows(
         profile.output_rows,
         static_cast<std::uint64_t>(profile.output_rows) * profile.input_rows * tokens,
         [&](int row_begin, int row_end) {

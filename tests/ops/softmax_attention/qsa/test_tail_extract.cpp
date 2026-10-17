@@ -1,3 +1,5 @@
+#include "ops/suite.h"
+#include "kv_cache_storage.h"
 #include "tail_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -259,25 +261,28 @@ int validation(DeviceContext& device) {
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = validation(device) + read_footprint(device);
-        failures += run(device, 1, 0, Binding::Separate, 9);
-        failures += run(device, 8, 0, Binding::Separate, 9);
-        failures += run(device, 8, 1, Binding::InPlace, 9);
-        failures += run(device, 3, 2, Binding::InPlace, 9);
-        failures += run(device, 8, 3, Binding::ShiftedInPlace, 9);
-        failures += run(device, 8, 2, Binding::SamePool, 9);
-        failures += run(device, 4, 1, Binding::RawInPlace, 9);
-        for (int b = 1; b <= 8; ++b) failures += run(device, b, b % 4, Binding::Separate, 1, false);
-        for (int r : {2, 3, 16, 4096})
-            failures += run(device, 8, r % 4, Binding::Separate, r, false);
-        if (failures) return 1;
-        std::cout << "OK QSA exact tail extraction, aliases, strides, metadata and Graph replay\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
-    }
+int main(int argc, char** argv) {
+    OpSuite suite;
+    suite.add("qsa_tail/contract", [] { return validation(cuda_environment().context); });
+    suite.add("qsa_tail/read_footprint", [] { return read_footprint(cuda_environment().context); });
+    const auto add = [&](int b, int layout, Binding binding, int capacity, bool exhaustive = true) {
+        suite.add(
+            "qsa_tail/b" + std::to_string(b) + "/layout" + std::to_string(layout) + "/binding" +
+                std::to_string(int(binding)) + "/capacity" + std::to_string(capacity),
+            [=] {
+                return run(cuda_environment().context, b, layout, binding, capacity, exhaustive);
+            },
+            {{"execution", "graph"}});
+    };
+    add(1, 0, Binding::Separate, 9);
+    add(8, 0, Binding::Separate, 9);
+    add(8, 1, Binding::InPlace, 9);
+    add(3, 2, Binding::InPlace, 9);
+    add(8, 3, Binding::ShiftedInPlace, 9);
+    add(8, 2, Binding::SamePool, 9);
+    add(4, 1, Binding::RawInPlace, 9);
+    for (int b = 1; b <= 8; ++b) add(b, b % 4, Binding::Separate, 1, false);
+    for (int r : {2, 3, 16, 4096}) add(8, r % 4, Binding::Separate, r, false);
+
+    return suite.main(argc, argv);
 }

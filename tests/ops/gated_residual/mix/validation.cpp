@@ -1,4 +1,4 @@
-#include "oracle.h"
+#include "support.h"
 #include <array>
 
 namespace ninfer::test::hc::mix {

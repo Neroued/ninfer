@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "gate_fixture.h"
 #include "core/decode_graph.h"
 
@@ -203,29 +204,30 @@ int chain(DeviceContext& device) {
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures =
-            validation(device) + short_records(device) + long_extent(device) + chain(device);
-        for (int b = 1; b <= 8; ++b)
-            failures +=
-                run(device, b % 2 ? 1 : 5, b, GateLayout::Packed, GateSignal::Random, b == 8);
-        failures += run(device, 1, 1, GateLayout::Packed, GateSignal::Random, true);
-        for (auto layout : {GateLayout::Separate, GateLayout::OddStride, GateLayout::Interleaved,
-                            GateLayout::PairAligned, GateLayout::PaddedColumns})
-            failures += run(device, 9, 3, layout, GateSignal::Random, true);
-        for (auto signal : {GateSignal::ZeroKey, GateSignal::Correlated, GateSignal::Opposed,
-                            GateSignal::Balanced, GateSignal::Tiny})
-            failures += run(device, 3, 2, GateLayout::Packed, signal);
-        for (int t : {2, 3, 8, 16, 33, 127, 128, 129, 256, 1024, 4097})
-            failures += run(device, t, 1);
-        if (failures) return 1;
-        std::cout
-            << "OK PLE gate, actual-U norm, records, layouts, Graph and convolution handoff\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
-    }
+void add_ple_gate_cases(ninfer::test::OpSuite& suite) {
+    for (auto [label, run] :
+         {std::pair<const char*, int (*)(DeviceContext&)>{"contract", validation},
+          {"short_records", short_records},
+          {"long_extent", long_extent},
+          {"conv_handoff", chain}})
+        suite.add(std::string("ple_gate/") + label,
+                  [=] { return run(cuda_environment().context); });
+    const auto add = [&](int t, int b, GateLayout layout = GateLayout::Packed,
+                         GateSignal signal = GateSignal::Random, bool graph = false) {
+        suite.add("ple_gate/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
+                      std::to_string(int(layout)) + "/signal" + std::to_string(int(signal)) +
+                      (graph ? "/graph" : "/eager"),
+                  [=] { return run(cuda_environment().context, t, b, layout, signal, graph); },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    for (int b = 1; b <= 8; ++b)
+        add(b % 2 ? 1 : 5, b, GateLayout::Packed, GateSignal::Random, b == 8);
+    add(1, 1, GateLayout::Packed, GateSignal::Random, true);
+    for (auto layout : {GateLayout::Separate, GateLayout::OddStride, GateLayout::Interleaved,
+                        GateLayout::PairAligned, GateLayout::PaddedColumns})
+        add(9, 3, layout, GateSignal::Random, true);
+    for (auto signal : {GateSignal::ZeroKey, GateSignal::Correlated, GateSignal::Opposed,
+                        GateSignal::Balanced, GateSignal::Tiny})
+        add(3, 2, GateLayout::Packed, signal);
+    for (int t : {2, 3, 8, 16, 33, 127, 128, 129, 256, 1024, 4097}) add(t, 1);
 }

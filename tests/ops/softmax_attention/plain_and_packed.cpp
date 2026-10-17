@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -164,11 +165,11 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                         interleaved_expected.data() + target + token_plane * 2);
         }
         interleaved_storage = to_device(interleaved_expected);
-        q_tensor = Tensor(interleaved_storage.span(), DType::BF16, {kDim, kHeads, tokens});
-        q_tensor.nb[2]      = static_cast<std::int64_t>(token_plane * 3 * sizeof(std::uint16_t));
-        k_tensor            = q_tensor;
-        v_tensor            = q_tensor;
-        k_tensor.data       = static_cast<std::uint8_t*>(interleaved_storage.data()) +
+        q_tensor       = Tensor(interleaved_storage.span(), DType::BF16, {kDim, kHeads, tokens});
+        q_tensor.nb[2] = static_cast<std::int64_t>(token_plane * 3 * sizeof(std::uint16_t));
+        k_tensor       = q_tensor;
+        v_tensor       = q_tensor;
+        k_tensor.data  = static_cast<std::uint8_t*>(interleaved_storage.data()) +
                         token_plane * sizeof(std::uint16_t);
         v_tensor.data = static_cast<std::uint8_t*>(interleaved_storage.data()) +
                         token_plane * 2 * sizeof(std::uint16_t);
@@ -246,40 +247,42 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
 
 } // namespace
 
-int run_softmax_attention_plain_and_packed_tests() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
-    }
-
-    int failures = 0;
-    if (ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 1) != 0 ||
-        ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 3) !=
-            ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 194, 194, 3, 3)) {
-        std::cerr
-            << "packed_softmax_attention rectangular capacity missed its maximal legal pair\n";
-        ++failures;
-    }
-    try {
-        (void)ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 1, 2, 3, 4);
-        std::cerr << "packed_softmax_attention accepted an envelope without a legal segment pair\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    failures += run_case({0, 4}, 11u, StorageProfile::Contiguous, PublicEntry::Plain);
-    failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
-    failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
-    failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
-                         PublicEntry::CuSeqlensArena);
-    failures +=
-        run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
-    failures +=
-        run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
-
-    if (failures != 0) {
-        std::cerr << "packed_softmax_attention failures=" << failures << '\n';
-        return 1;
-    }
-    std::cout << "packed_softmax_attention: PASS\n";
-    return 0;
+void add_plain_attention_cases(ninfer::test::OpSuite& suite) {
+    suite.add(
+        "packed_attention/capacity",
+        [] {
+            int failures = 0;
+            if (ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 1) !=
+                    0 ||
+                ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 4, 194, 1, 3) !=
+                    ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 194, 194, 3,
+                                                                           3)) {
+                std::cerr << "packed_softmax_attention rectangular capacity missed its maximal "
+                             "legal pair\n";
+                ++failures;
+            }
+            try {
+                (void)ops::packed_softmax_attention_workspace_capacity_bytes(kGeometry, 1, 2, 3, 4);
+                std::cerr << "packed_softmax_attention accepted an envelope without a legal "
+                             "segment pair\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+            return failures;
+        },
+        {{"format", "bf16"}});
+    const auto add = [&](std::vector<int> offsets, unsigned seed, StorageProfile storage,
+                         PublicEntry entry, InputProfile input = InputProfile::Random) {
+        auto id =
+            std::string("packed_attention/") + entry_name(entry) + "/" + storage_name(storage);
+        for (int offset : offsets) id += "_" + std::to_string(offset);
+        suite.add(id, [=] { return run_case(offsets, seed, storage, entry, input); },
+                  {{"format", "bf16"}, {"execution", "eager"}});
+    };
+    add({0, 4}, 11u, StorageProfile::Contiguous, PublicEntry::Plain);
+    add({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
+    add({0, 4, 11}, 7u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena,
+        InputProfile::SegmentIsolation);
+    add({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    add({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
+    add({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
 }

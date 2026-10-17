@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/linear.h"
 #include "ops/linear_common.h"
+#include "ops/suite.h"
 
 #include <functional>
 #include <span>
@@ -44,8 +45,5 @@ private:
 
     std::vector<Group> groups_;
 };
-
-// Parallelize independent output rows, retaining each dot product's K accumulation order.
-void parallel_rows(int rows, std::uint64_t work, const std::function<void(int, int)>& run);
 
 } // namespace ninfer::test::linear_suite

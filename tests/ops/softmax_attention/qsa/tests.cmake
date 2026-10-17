@@ -12,4 +12,5 @@ ninfer_add_op_test(ninfer_qsa_indexer_test
 
 ninfer_add_op_test(ninfer_qsa_sparse_gqa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_gqa.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops
+  FORMATS bf16 int8 fp8 nvfp4 k8v4)

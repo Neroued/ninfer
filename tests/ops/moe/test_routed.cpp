@@ -199,41 +199,46 @@ int run(Fixture& fixture, CudaExecutionView execution, int tokens, ExpertSubsetK
 }
 } // namespace
 
-int test_routed(Fixture& fixture, CudaExecutionView execution) {
-    int failures  = 0;
-    const bool q8 = fixture.profile().routed.ffn.gate_up_type == QType::Q8_G32_FP16;
+void add_routed_cases(std::vector<FixtureCase>& cases, QType gate_up) {
+    const bool q8  = gate_up == QType::Q8_G32_FP16;
+    const auto add = [&](int t, ExpertSubsetKind kind, DType dtype, bool shared,
+                         MoeEpilogue epilogue) {
+        cases.push_back(
+            {{"routed/t" + std::to_string(t) + "/subset" + std::to_string(int(kind)) + "/dtype" +
+                  std::to_string(int(dtype)) + (shared ? "/shared" : "/no_shared") +
+                  (epilogue == MoeEpilogue::Write ? "/write" : "/residual"),
+              {}},
+             [=](Fixture& f, auto e) { return run(f, e, t, kind, dtype, shared, epilogue); }});
+    };
     for (int tokens : {1, 2, q8 ? 19 : 46, q8 ? 20 : 47, 64, 768}) {
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::All, DType::FP32, false,
-                        MoeEpilogue::Write);
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskOnes, DType::BF16, true,
-                        MoeEpilogue::Write);
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskZeros, DType::BF16, false,
-                        MoeEpilogue::AddResidual);
+        add(tokens, ExpertSubsetKind::All, DType::FP32, false, MoeEpilogue::Write);
+        add(tokens, ExpertSubsetKind::MaskOnes, DType::BF16, true, MoeEpilogue::Write);
+        add(tokens, ExpertSubsetKind::MaskZeros, DType::BF16, false, MoeEpilogue::AddResidual);
     }
     for (int tokens : {1, 15, 16, 17, 4097}) {
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::None, DType::FP32, false,
-                        MoeEpilogue::Write);
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::None, DType::BF16, false,
-                        MoeEpilogue::AddResidual);
-        failures += run(fixture, execution, tokens, ExpertSubsetKind::None, DType::FP32, true,
-                        MoeEpilogue::Write);
+        add(tokens, ExpertSubsetKind::None, DType::FP32, false, MoeEpilogue::Write);
+        add(tokens, ExpertSubsetKind::None, DType::BF16, false, MoeEpilogue::AddResidual);
+        add(tokens, ExpertSubsetKind::None, DType::FP32, true, MoeEpilogue::Write);
     }
-    {
-        PackedBank strided(fixture, false);
-        for (int tokens : {1, 64}) {
-            failures += run(fixture, execution, tokens, ExpertSubsetKind::All, DType::FP32, true,
-                            MoeEpilogue::Write, &strided);
-        }
-    }
-    {
-        PackedBank indexed(fixture, true);
-        for (int tokens : {1, 64, 768}) {
-            failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskOnes, DType::FP32,
-                            true, MoeEpilogue::Write, &indexed, true);
-            failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskZeros, DType::FP32,
-                            false, MoeEpilogue::Write, &indexed);
-        }
-    }
-    return failures;
+    cases.push_back({{"routed/strided_bank", {}}, [](Fixture& fixture, auto execution) {
+                         int failures = 0;
+                         PackedBank strided(fixture, false);
+                         for (int tokens : {1, 64})
+                             failures += run(fixture, execution, tokens, ExpertSubsetKind::All,
+                                             DType::FP32, true, MoeEpilogue::Write, &strided);
+                         return failures;
+                     }});
+    cases.push_back(
+        {{"routed/indexed_bank", {{"execution", "graph"}}}, [](Fixture& fixture, auto execution) {
+             int failures = 0;
+             PackedBank indexed(fixture, true);
+             for (int tokens : {1, 64, 768}) {
+                 failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskOnes,
+                                 DType::FP32, true, MoeEpilogue::Write, &indexed, true);
+                 failures += run(fixture, execution, tokens, ExpertSubsetKind::MaskZeros,
+                                 DType::FP32, false, MoeEpilogue::Write, &indexed);
+             }
+             return failures;
+         }});
 }
 } // namespace ninfer::test::moe

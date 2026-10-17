@@ -3,6 +3,7 @@
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
 #include "ops/op_tester.h"
+#include "ops/suite.h"
 #include "ops/quantized_weight.h"
 
 #include <array>
@@ -88,5 +89,15 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+struct FixtureCase {
+    OpCase metadata;
+    std::function<int(Fixture&, CudaExecutionView)> run;
+};
+
+void add_complete_cases(std::vector<FixtureCase>& cases, QType gate_up, QType down);
+void add_route_cases(std::vector<FixtureCase>& cases);
+void add_routed_cases(std::vector<FixtureCase>& cases, QType gate_up);
+int test_weights();
 
 } // namespace ninfer::test::moe

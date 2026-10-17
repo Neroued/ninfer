@@ -121,7 +121,7 @@ There is no installed SDK, package export or configure-time dependency download.
 repository-pinned third-party targets and their product-support conditions. External include
 requirements follow their consuming targets.
 [`cmake/NinferTargets.cmake`](../../cmake/NinferTargets.cmake) provides private project includes
-and the two CUDA archive policies.
+and the RDC library and non-RDC archive policies.
 
 [`src/CMakeLists.txt`](../../src/CMakeLists.txt) explicitly enters the component directories.
 Each component's `CMakeLists.txt` owns its targets, dependency visibility and compile properties;
@@ -131,6 +131,39 @@ Component declaration order is not the execution dependency graph: CMake resolve
 links during generation. Model runtime can refer to the runtime support target declared later;
 support links core, while Engine links model runtime. The ownership and dependency contracts are
 defined by [Engine architecture](engine-architecture.md) and [Op development](op-development.md).
+
+### Shared-library boundary
+
+Products, tests and benchmarks link the same internal shared libraries:
+
+| Target | Contents |
+|---|---|
+| `ninfer_cpu` | Portable CPU topology and task pool |
+| `ninfer_core` | Storage, transfers, CUDA execution and resource primitives |
+| `ninfer_ops` | GPU Ops and their host dispatch |
+| `ninfer_cpu_executor` | RTX 5090 collective CPU executor |
+| `ninfer_moe_cpu` | RTX 5090 CPU MoE dispatch and ISA implementations |
+
+Shared libraries are written to `<build-dir>/lib/`. Apps, tests and benchmarks retain their own
+output directories. Build RPATH uses `$ORIGIN` for in-tree dependencies: moving a build's binaries
+requires preserving their relative layout with `lib/`. External dependencies retain their discovered
+search paths. Running from the build tree needs no `LD_LIBRARY_PATH` setup.
+
+Artifact, model, runtime and test-support targets remain static libraries. The non-RDC CUDA archive
+and CPU ISA object libraries are position-independent inputs to their owning shared libraries;
+consumers do not embed another copy of them. CPU arithmetic qualification archives remain private
+to the tests that select restricted ISA routes.
+
+Project CUDA targets use the shared CUDA host runtime. Each CUDA shared library owns its device
+link and registration; host functions connect library boundaries. Device functions and variables do
+not form a cross-library interface. Host symbols retain normal C++ linkage, including internal
+entries used by existing qualification tests. These are build-tree libraries, not an exported SDK
+or a versioned ABI.
+
+`LINK_DEPENDS_NO_SHARED` avoids relinking consumers for shared-library implementation changes.
+The build still brings their dependency targets up to date. Header dependencies and link-command
+changes rebuild affected consumers normally. Library types are explicit; `BUILD_SHARED_LIBS` does
+not select a second NInfer linkage mode. Project defaults are set after third-party declarations.
 
 ## Explicit source ownership
 
@@ -166,12 +199,13 @@ selectors when there is an actual target-specific implementation or tuning polic
 ## CUDA compilation boundaries
 
 `ninfer_core` and `ninfer_ops` enable separable compilation (RDC) and resolve device symbols in
-the static archive build. Keep this device-link boundary explicit.
+their own shared-library builds. Keep these device-link boundaries explicit; CUDA consumers do
+not repeat the Ops device link or embed its fatbins.
 
 `ninfer_ops_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the Linear, fused projection, attention and MoE sources that depend on
 `setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets
+non-RDC target; host launchers connect them to the normal Ops. All three CUDA targets
 retain `-lineinfo`.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
@@ -195,6 +229,10 @@ Independent mathematical oracles and shared fixtures do not split with target tu
 Tests can reuse compiled support libraries. Oracle options apply to the libraries containing
 oracle code as well as the test executables. Test variants, skip return codes,
 interop commands and special linker options belong with the affected registrations.
+Failure-injection executables export only their replacement symbols through
+`ninfer_test_interpose()`. Their replacements call the next shared-library definition through
+the test-only `symbol_interpose.h` helper. This exercises calls made inside shared libraries without
+adding production fault hooks; link-time `--wrap` does not intercept those calls.
 
 For build-organization changes, compare configured target/source ownership, compile flags,
 device links and CTest commands/properties; check the relevant option combinations, build the

@@ -4,6 +4,7 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
 #include "core/transfer.h"
+#include "symbol_interpose.h"
 
 #include <algorithm>
 #include <atomic>
@@ -377,14 +378,14 @@ void gpu(const disk::Table& source, const Input& input) {
 }
 } // namespace
 
-extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
-
-extern "C" cudaError_t __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+extern "C" cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+    static const auto real =
+        ninfer::test::next_symbol<cudaError_t (*)(cudaEvent_t, cudaStream_t)>("cudaEventRecord");
     if (fail_event_record) {
         fail_event_record = false;
         return cudaErrorInvalidResourceHandle;
     }
-    return __real_cudaEventRecord(event, stream);
+    return real(event, stream);
 }
 
 int main(int argc, char** argv) {

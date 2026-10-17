@@ -1,4 +1,5 @@
 #include "core/expert_cache.h"
+#include "symbol_interpose.h"
 
 #include <cuda_runtime.h>
 
@@ -19,29 +20,22 @@ Trace trace;
 } // namespace
 
 extern "C" {
-cudaError_t CUDARTAPI __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
-cudaError_t CUDARTAPI __real_cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind,
-                                             cudaStream_t);
-cudaError_t CUDARTAPI __real_cudaMemcpyBatchAsync(void* const*, const void* const*,
-                                                  const std::size_t*, std::size_t,
-                                                  cudaMemcpyAttributes*, std::size_t*, std::size_t,
-                                                  cudaStream_t);
-cudaError_t CUDARTAPI __real_cudaStreamSynchronize(cudaStream_t);
-cudaError_t CUDARTAPI __real_cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned);
-cudaError_t CUDARTAPI __real_cudaFree(void*);
-cudaError_t CUDARTAPI __real_cudaFreeHost(void*);
 
-cudaError_t CUDARTAPI __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+    static const auto real =
+        ninfer::test::next_symbol<cudaError_t (*)(cudaEvent_t, cudaStream_t)>("cudaEventRecord");
     if (trace.active && !trace.failed && trace.failure == Failure::CompletionEvent) {
         trace.failed = true;
         return cudaErrorInvalidResourceHandle;
     }
-    return __real_cudaEventRecord(event, stream);
+    return real(event, stream);
 }
 
-cudaError_t CUDARTAPI __wrap_cudaMemcpyAsync(void* to, const void* from, std::size_t bytes,
-                                             cudaMemcpyKind kind, cudaStream_t stream) {
-    const auto result = __real_cudaMemcpyAsync(to, from, bytes, kind, stream);
+cudaError_t CUDARTAPI cudaMemcpyAsync(void* to, const void* from, std::size_t bytes,
+                                      cudaMemcpyKind kind, cudaStream_t stream) {
+    static const auto real = ninfer::test::next_symbol<cudaError_t (*)(
+        void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t)>("cudaMemcpyAsync");
+    const auto result      = real(to, from, bytes, kind, stream);
     if (trace.active && result == cudaSuccess) {
         trace.pending = true;
         ++trace.copies;
@@ -49,16 +43,18 @@ cudaError_t CUDARTAPI __wrap_cudaMemcpyAsync(void* to, const void* from, std::si
     return result;
 }
 
-cudaError_t CUDARTAPI __wrap_cudaMemcpyBatchAsync(void* const* to, const void* const* from,
-                                                  const std::size_t* bytes, std::size_t count,
-                                                  cudaMemcpyAttributes* attrs, std::size_t* indices,
-                                                  std::size_t attr_count, cudaStream_t stream) {
+cudaError_t CUDARTAPI cudaMemcpyBatchAsync(void* const* to, const void* const* from,
+                                           const std::size_t* bytes, std::size_t count,
+                                           cudaMemcpyAttributes* attrs, std::size_t* indices,
+                                           std::size_t attr_count, cudaStream_t stream) {
+    static const auto real = ninfer::test::next_symbol<cudaError_t (*)(
+        void* const*, const void* const*, const std::size_t*, std::size_t, cudaMemcpyAttributes*,
+        std::size_t*, std::size_t, cudaStream_t)>("cudaMemcpyBatchAsync");
     if (trace.active && !trace.failed && trace.failure == Failure::IndexCopy && trace.copies == 1) {
         trace.failed = true;
         return cudaErrorInvalidValue;
     }
-    const auto result =
-        __real_cudaMemcpyBatchAsync(to, from, bytes, count, attrs, indices, attr_count, stream);
+    const auto result = real(to, from, bytes, count, attrs, indices, attr_count, stream);
     if (trace.active && result == cudaSuccess) {
         trace.pending = true;
         ++trace.copies;
@@ -66,29 +62,35 @@ cudaError_t CUDARTAPI __wrap_cudaMemcpyBatchAsync(void* const* to, const void* c
     return result;
 }
 
-cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
-    const auto result = __real_cudaStreamSynchronize(stream);
+cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t stream) {
+    static const auto real =
+        ninfer::test::next_symbol<cudaError_t (*)(cudaStream_t)>("cudaStreamSynchronize");
+    const auto result = real(stream);
     if (trace.active && result == cudaSuccess) { trace.pending = false; }
     return result;
 }
 
-cudaError_t CUDARTAPI __wrap_cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event,
-                                                 unsigned flags) {
+cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned flags) {
+    static const auto real =
+        ninfer::test::next_symbol<cudaError_t (*)(cudaStream_t, cudaEvent_t, unsigned)>(
+            "cudaStreamWaitEvent");
     if (trace.active && !trace.failed && trace.failure == Failure::ConsumerWait) {
         trace.failed = true;
         return cudaErrorInvalidResourceHandle;
     }
-    return __real_cudaStreamWaitEvent(stream, event, flags);
+    return real(stream, event, flags);
 }
 
-cudaError_t CUDARTAPI __wrap_cudaFree(void* p) {
+cudaError_t CUDARTAPI cudaFree(void* p) {
+    static const auto real = ninfer::test::next_symbol<cudaError_t (*)(void*)>("cudaFree");
     if (trace.active && trace.pending) { trace.premature_free = true; }
-    return __real_cudaFree(p);
+    return real(p);
 }
 
-cudaError_t CUDARTAPI __wrap_cudaFreeHost(void* p) {
+cudaError_t CUDARTAPI cudaFreeHost(void* p) {
+    static const auto real = ninfer::test::next_symbol<cudaError_t (*)(void*)>("cudaFreeHost");
     if (trace.active && trace.pending) { trace.premature_free = true; }
-    return __real_cudaFreeHost(p);
+    return real(p);
 }
 }
 

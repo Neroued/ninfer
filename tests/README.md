@@ -32,6 +32,15 @@ Tests are grouped by observable risk, not by mirroring every source file or clas
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, the model directories
 and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
 executables and CTest working directories under `<build-dir>/tests/`.
+Tests link the same Core, Ops and CPU shared libraries as products and benchmarks, stored in
+`<build-dir>/lib/`; relative RPATH supplies their build-tree lookup. Test support and restricted
+CPU ISA qualification libraries remain private static targets. See
+[Build system](../docs/maintainer/build-system.md#shared-library-boundary) for linkage ownership.
+
+CUDA and I/O failure cases interpose selected symbols only in their owning test executables.
+`ninfer_test_interpose()` exports the replacements; `symbol_interpose.h` resolves the real shared
+definitions with `RTLD_NEXT`. Keep failure state and assertions local to the relevant suite.
+
 `ops/op_tester.h` and `ops/op_check.h` own reusable device/guard and comparison mechanics.
 `ops/linear_common.h` shares extent checks, explicit sampling recipes, payload preservation and
 0/1/77 entry handling. `ops/linear/support.*` owns Linear case selection and the portable CPU oracle
@@ -45,8 +54,6 @@ Op suites. `ops/quantized_weight.h` owns packed-weight fixtures and independent 
 `ops/direct_bf16_weight.h` owns direct BF16 fixtures. GDN record/fold tests preserve their specified
 snapshot reference separately from projection and recurrence mathematical qualification.
 
-For segmented projection, run the original 2560-input suite and the migrated two/multi-output suites:
-`ctest --test-dir build/rtx5090-dev -R '^ninfer_linear_split(_two_output|_multi_output)?_test$' --output-on-failure`.
 `ninfer_qsa_sparse_gqa_test --kv-cache bf16|fp8|int8|nvfp4|k8v4` selects one cache profile;
 the default checks all five. QSA tail, prepare, indexer and sparse-GQA partial-initialization cases
 also check their permitted read footprints under Compute Sanitizer initcheck.

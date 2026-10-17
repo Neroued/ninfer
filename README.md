@@ -57,6 +57,8 @@ Machine-specific compiler and Python paths belong in the ignored `CMakeUserPrese
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 
 There is no install target or packaged binary distribution; run NInfer from its source build tree.
+Executables use shared libraries in the same build's `lib/` directory through relative RPATH;
+keep that directory alongside `apps/`, `tests/` and `bench/` when moving build outputs.
 Python tools run independently of CMake; the standalone HBM probe has its own
 [build command](tools/README.md#standalone-hbm-probe).
 

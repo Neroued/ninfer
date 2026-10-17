@@ -9,7 +9,7 @@ set_tests_properties(ninfer_ple_disk_table_test PROPERTIES TIMEOUT 30)
 add_executable(ninfer_ple_disk_prepare_test "${CMAKE_CURRENT_LIST_DIR}/ple/disk/test_prepare.cpp")
 ninfer_test_includes(ninfer_ple_disk_prepare_test)
 target_link_libraries(ninfer_ple_disk_prepare_test PRIVATE ninfer_model_runtime)
-target_link_options(ninfer_ple_disk_prepare_test PRIVATE "LINKER:--wrap=cudaEventRecord")
+ninfer_test_interpose(ninfer_ple_disk_prepare_test cudaEventRecord)
 foreach(mode IN ITEMS host gpu)
   add_test(NAME ninfer_ple_disk_prepare_${mode}_test
     COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/ple/disk/test_prepare.py"

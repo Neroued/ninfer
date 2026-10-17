@@ -1,6 +1,7 @@
 #include "core/io/file.h"
 #include "core/io/read_queue.h"
 #include "core/buffer.h"
+#include "symbol_interpose.h"
 
 #include <liburing.h>
 
@@ -175,9 +176,8 @@ void run() {
 }
 } // namespace
 
-extern "C" int __real_io_uring_submit(io_uring* ring);
-
-extern "C" int __wrap_io_uring_submit(io_uring* ring) {
+extern "C" int io_uring_submit(io_uring* ring) {
+    static const auto real = ninfer::test::next_symbol<int (*)(io_uring*)>("io_uring_submit");
     if (interrupt_submit) {
         interrupt_submit = false;
         return -EINTR;
@@ -196,11 +196,11 @@ extern "C" int __wrap_io_uring_submit(io_uring* ring) {
         short_submit      = false;
         const auto tail   = ring->sq.sqe_tail;
         ring->sq.sqe_tail = ring->sq.sqe_head + 1;
-        const auto result = __real_io_uring_submit(ring);
+        const auto result = real(ring);
         ring->sq.sqe_tail = tail;
         return result;
     }
-    return __real_io_uring_submit(ring);
+    return real(ring);
 }
 
 int main() {

@@ -18,6 +18,7 @@ foreach(isa IN ITEMS avx2 avx512 avx512_bf16)
     "${CMAKE_CURRENT_LIST_DIR}/../../kernels/cpu/groupwise_int/${isa}.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../../kernels/cpu/nvfp4/${isa}.cpp")
   ninfer_internal_includes(ninfer_moe_cpu_${isa})
+  set_target_properties(ninfer_moe_cpu_${isa} PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(ninfer_moe_cpu_${isa} PRIVATE ninfer_core)
   target_compile_options(ninfer_moe_cpu_${isa} PRIVATE -mavx2 -mfma -mf16c)
   if(NOT isa STREQUAL "avx2")
@@ -29,7 +30,7 @@ foreach(isa IN ITEMS avx2 avx512 avx512_bf16)
   endif()
 endforeach()
 
-add_library(ninfer_moe_cpu STATIC ${ninfer_moe_cpu_sources})
+add_library(ninfer_moe_cpu SHARED ${ninfer_moe_cpu_sources})
 ninfer_internal_includes(ninfer_moe_cpu)
 target_link_libraries(ninfer_moe_cpu PUBLIC ninfer_core PRIVATE ninfer_cpu_executor
   ninfer_moe_cpu_avx2 ninfer_moe_cpu_avx512 ninfer_moe_cpu_avx512_bf16)

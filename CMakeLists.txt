@@ -38,6 +38,13 @@ endif()
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 
+# Project binaries share the same libraries and CUDA runtime. These defaults are
+# set after third-party targets so their build policies remain independent.
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

@@ -1,4 +1,4 @@
-add_library(ninfer_cpu STATIC
+add_library(ninfer_cpu SHARED
   cpu/system.cpp
   cpu/task_pool.cpp
 )
@@ -6,12 +6,12 @@ ninfer_internal_includes(ninfer_cpu)
 target_link_libraries(ninfer_cpu PRIVATE PkgConfig::HWLOC Threads::Threads)
 
 if(NINFER_TARGET STREQUAL "rtx5090")
-  add_library(ninfer_cpu_executor STATIC cpu/executor.cpp cpu/x86.cpp)
+  add_library(ninfer_cpu_executor SHARED cpu/executor.cpp cpu/x86.cpp)
   ninfer_internal_includes(ninfer_cpu_executor)
   target_link_libraries(ninfer_cpu_executor PUBLIC ninfer_cpu)
 endif()
 
-add_library(ninfer_core STATIC
+add_library(ninfer_core SHARED
   arena.cpp
   buffer.cpp
   buffer.cu
@@ -39,6 +39,6 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
 )
 ninfer_internal_includes(ninfer_core)
-ninfer_cuda_archive(ninfer_core)
+ninfer_cuda_library(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
 target_link_libraries(ninfer_core PRIVATE PkgConfig::URING)

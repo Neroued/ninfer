@@ -60,7 +60,7 @@ add_test(NAME ninfer_nf4_exact_test
 
 ninfer_add_test(ninfer_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue.cpp"
   LIBRARIES ninfer_core PkgConfig::URING)
-target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
+ninfer_test_interpose(ninfer_read_queue_test io_uring_submit)
 set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
 
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
@@ -104,8 +104,6 @@ ninfer_add_test(ninfer_expert_cache_test
   LIBRARIES ninfer_core)
 set_tests_properties(ninfer_expert_cache_test PROPERTIES TIMEOUT 60)
 
-foreach(symbol IN ITEMS
-    cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
-    cudaFree cudaFreeHost)
-  target_link_options(ninfer_expert_cache_test PRIVATE "LINKER:--wrap=${symbol}")
-endforeach()
+ninfer_test_interpose(ninfer_expert_cache_test
+  cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
+  cudaFree cudaFreeHost)

@@ -5,6 +5,15 @@ function(ninfer_test_includes target)
   target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 endfunction()
 
+# Export only the replacements used by this executable's fault-injection cases.
+# Production shared libraries resolve these symbols through the normal ELF lookup.
+function(ninfer_test_interpose target)
+  target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+  foreach(symbol IN LISTS ARGN)
+    target_link_options(${target} PRIVATE "LINKER:--export-dynamic-symbol=${symbol}")
+  endforeach()
+endfunction()
+
 function(ninfer_add_test name)
   cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES")
   add_executable(${name} ${arg_SOURCES})

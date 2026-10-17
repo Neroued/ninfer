@@ -154,7 +154,10 @@ const std::array kNewGeometries{
              4608,
              {1, 2, 3, 4, 8, 16, 32, 64, 96, 128, 256, 512, 2112, 4096},
              ColumnDomain::Merger},
-    Geometry{2560, 4608, {1, 2, 8, 24, 64, 96, 128, 256, 512}, ColumnDomain::Merger},
+    Geometry{2560,
+             4608,
+             {1, 2, 8, 24, 64, 96, 128, 192, 256, 384, 512, 1984, 2048, 2111, 2112, 4096},
+             ColumnDomain::Merger},
 };
 
 ninfer::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {

@@ -66,6 +66,11 @@ void add_segmented_cases(Suite& suite) {
             }
             graph_tokens.insert(1024);
         }
+        if (fixture.profile.weights.size() == 1 &&
+            fixture.profile.weights[0].type == QType::Q8_G32_FP16) {
+            tokens.insert({191, 192, 193, 1023, 1025, 1151, 1152, 1153});
+            graph_tokens.insert({192, 1024, 1152});
+        }
         std::vector<Invocation> calls{{.t = 0, .validate_operands = true}};
         for (int t : tokens) {
             calls.push_back({.t            = t,

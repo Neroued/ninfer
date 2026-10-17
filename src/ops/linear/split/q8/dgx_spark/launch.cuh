@@ -18,4 +18,7 @@ void launch_q8_n16384_k2560_full(const Q8LinearOperands& operands,
                                  LinearBf16SegmentedOutput<10240, 6144> output,
                                  cudaStream_t stream);
 
+void launch_q8_n12288_k2560_full(const Q8LinearOperands& operands,
+                                 LinearBf16SegmentedOutput<6144, 6144> output, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail::linear_split

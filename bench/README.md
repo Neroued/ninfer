@@ -574,6 +574,13 @@ locking clocks. It also allows eager submissions to queue behind the prelude; us
 Fixtures allocate only selected operands and an in-place backup when needed. The measurements cover
 Op latency and the named compositions.
 
+Residual/norm rows also report `logical_bytes`, `logical_gb_s` and `bandwidth_reference_us`.
+The logical count includes each public input read and output write, with shared weights counted
+once per call; the named two-Op compositions include the intermediate residual reread.
+The reference uses the target's nominal memory bandwidth. Private repeated loads and internal
+staging are excluded, and cache retention/writeback can make the logical rate exceed DRAM bandwidth.
+Mix leaves these fields empty because its contractions require separate work accounting.
+
 ```bash
 cmake --build build/rtx5090-dev -j --target ninfer_gated_residual_bench
 ./build/rtx5090-dev/bench/ninfer_gated_residual_bench \

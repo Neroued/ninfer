@@ -109,6 +109,10 @@ void add_norm_cases(OpSuite& suite) {
             add(7 * 8, Pattern::Midpoint, true, true);
         }
         if (form == Form::CombineNorm || form == Form::AddNorm) {
+            for (int m : {1023, 1024, 1025}) {
+                add(m, Pattern::Random, false, false);
+                add(m, Pattern::Random, true, false);
+            }
             for (int m : {1535, 1536, 1537, 1840, 1841, 1842, 3071, 3072, 3073})
                 add(m, Pattern::Random, false, false);
             add(1664, Pattern::Midpoint, false, true);

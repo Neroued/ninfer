@@ -58,6 +58,14 @@ void add_segmented_cases(Suite& suite) {
             tokens.insert({288, 384});
             graph_tokens.insert({288, 384});
         }
+        if (fixture.profile.weights.size() == 1 && fixture.profile.weights[0].type == QType::BF16 &&
+            fixture.profile.weights[0].rows == 13952) {
+            for (int end : {256, 512, 3072, 3839, 4096}) {
+                tokens.insert({end - 1, end, end + 1});
+                graph_tokens.insert({end, end + 1});
+            }
+            graph_tokens.insert(1024);
+        }
         std::vector<Invocation> calls{{.t = 0, .validate_operands = true}};
         for (int t : tokens) {
             calls.push_back({.t            = t,

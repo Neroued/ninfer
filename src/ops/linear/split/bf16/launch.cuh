@@ -26,9 +26,9 @@ struct Bf16SplitRoutes {
         launch_bf16_a16_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
     }
 
-    template <class S>
+    template <class S, class Epilogue = LinearIdentityEpilogue>
     void tma() const {
-        launch_bf16_a16_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+        launch_bf16_a16_tma_mma<S>(operands, output, Epilogue{}, stream);
     }
 };
 

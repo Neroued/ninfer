@@ -10,6 +10,8 @@ struct RouterPlan {
     RouterAlgorithm algorithm = RouterAlgorithm::Vector;
     bool programmatic         = false;
     bool count_assignments    = false;
+    int mma_rows              = 16;
+    bool network_topk         = false;
 };
 
 struct RouteStorage {

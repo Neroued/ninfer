@@ -86,7 +86,7 @@ __global__ void router_token_tile(const __nv_bfloat16* x, const __nv_bfloat16* w
     }
 }
 
-template <class Shape, bool Partial>
+template <class Shape, bool Partial, bool FixedIndices = false>
 __global__ void select_routes(const float* scores, int* ids, float* alpha, float* beta,
                               bool programmatic) {
     __shared__ float reduced[Shape::control_rows], selected[Shape::top_k];
@@ -105,9 +105,9 @@ __global__ void select_routes(const float* scores, int* ids, float* alpha, float
         __syncthreads();
     }
     if (tid < 32) {
-        select_experts<Shape>(Partial ? reduced : scores + std::int64_t(token) * Shape::score_rows,
-                              ids + token * Shape::top_k, alpha + token * Shape::top_k,
-                              beta + token, selected);
+        select_experts<Shape, FixedIndices>(
+            Partial ? reduced : scores + std::int64_t(token) * Shape::score_rows,
+            ids + token * Shape::top_k, alpha + token * Shape::top_k, beta + token, selected);
     }
 }
 
@@ -175,9 +175,21 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
             throw std::logic_error("router token tile is unsupported for this shape");
         }
     } else {
-        router_mma_kernel<S>
-            <<<dim3((S::control_rows + 15) / 16, (tokens + 63) / 64), 256, 0, stream>>>(
-                input, weights, storage.scores, tokens);
+        if (plan.mma_rows == 64) {
+            if constexpr (S::hidden == 2560) {
+                router_mma_kernel<S, 64>
+                    <<<dim3((S::control_rows + 63) / 64, (tokens + 63) / 64), 128, 0, stream>>>(
+                        input, weights, storage.scores, tokens);
+            } else {
+                throw std::logic_error("router64 is unsupported for this geometry");
+            }
+        } else if (plan.mma_rows == 16) {
+            router_mma_kernel<S>
+                <<<dim3((S::control_rows + 15) / 16, (tokens + 63) / 64), 256, 0, stream>>>(
+                    input, weights, storage.scores, tokens);
+        } else {
+            throw std::logic_error("invalid router row tile");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     auto* ids   = static_cast<int*>(routes.ids.data);
@@ -198,8 +210,13 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
-        select_routes<S, false>
-            <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        if (plan.network_topk) {
+            select_routes<S, false, true>
+                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        } else {
+            select_routes<S, false>
+                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }

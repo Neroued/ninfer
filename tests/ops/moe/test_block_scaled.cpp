@@ -406,7 +406,7 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
 
 int route_cases(Fixture& f, CudaExecutionView execution) {
     int failures = 0;
-    for (int m : {1, 2, 33, 4097}) {
+    for (int m : {1, 2, 33, 64, 127, 128, 129, 130, 192, 512, 1024, 4097}) {
         std::vector<float> input(std::size_t(m) * H);
         for (int t = 0; t < m; ++t) {
             std::copy(f.x[t % 3].begin(), f.x[t % 3].end(), input.begin() + std::size_t(t) * H);
@@ -421,7 +421,7 @@ int route_cases(Fixture& f, CudaExecutionView execution) {
         ops::ExpertRoutes routes{Tensor(ids.span(), DType::I32, {TopK, m}),
                                  Tensor(alpha.span(), DType::FP32, {TopK, m})};
         int pattern_offset = 0;
-        if (m == 33) {
+        if (m == 33 || m == 128 || m == 129 || m == 512) {
             cudaGraph_t graph;
             cudaGraphExec_t executable;
             cuda_check(cudaStreamBeginCapture(execution.stream(), cudaStreamCaptureModeGlobal),

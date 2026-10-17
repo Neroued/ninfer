@@ -320,8 +320,17 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
             std::array<double, TopK> coefficients;
             double total = 0;
             for (int j = 0; j < TopK; ++j) {
-                const int e       = complete ? order[j] : (replay == 1 ? j : (t * 13 + j * 31) % E);
-                ids[t * TopK + j] = e;
+                int e = complete ? order[j] : (replay == 1 ? j : (t * 13 + j * 31) % E);
+                if (!complete && f.fp8 && tokens == 2) {
+                    // Cover no overlap, permuted full overlap and partial overlap
+                    // between tokens while retaining distinct IDs within each token.
+                    if (replay == 1) {
+                        e = t ? (j + 3) % TopK : j;
+                    } else if (replay == 2 || !graph) {
+                        e = t ? (j < 5 ? (j + 3) % TopK : 100 + j) : j;
+                    }
+                }
+                ids[t * TopK + j]   = e;
                 alpha[t * TopK + j] = .025F + j * .007F;
                 coefficients[j] =
                     complete ? std::exp(logits[e] - logits[order[0]]) : alpha[t * TopK + j];
@@ -574,9 +583,9 @@ int main(int argc, char** argv) {
         };
         using ops::ExpertSubsetKind;
         using ops::MoeEpilogue;
-        for (int m : {1,   2,   3,   7,   8,   9,    15,   16,   17,   18,   31,   32,
-                      33,  34,  63,  64,  65,  66,   127,  128,  129,  130,  255,  256,
-                      257, 258, 511, 512, 513, 1023, 1024, 1025, 3583, 3584, 3585, 4097}) {
+        for (int m : {1,   2,   3,   7,    8,    9,    15,   16,   17,   18,   31,   32,   33,
+                      34,  63,  64,  65,   66,   127,  128,  129,  130,  255,  256,  257,  258,
+                      511, 512, 513, 1023, 1024, 1025, 3071, 3072, 3073, 3583, 3584, 3585, 4097}) {
             add(m, ExpertSubsetKind::All, false, false, DType::FP32, MoeEpilogue::Write, false);
         }
         for (auto subset :
@@ -597,6 +606,13 @@ int main(int argc, char** argv) {
         }
         add(2048, ExpertSubsetKind::None, true, false, DType::FP32, MoeEpilogue::Write, false);
         if (fp8) {
+            add(2, ExpertSubsetKind::All, false, false, DType::FP32, MoeEpilogue::Write, true);
+            add(2, ExpertSubsetKind::MaskOnes, false, false, DType::FP32, MoeEpilogue::Write, true);
+            add(4098, ExpertSubsetKind::All, false, false, DType::FP32, MoeEpilogue::Write, true);
+            for (int m : {3071, 3072, 3073}) {
+                add(m, ExpertSubsetKind::MaskZeros, true, false, DType::FP32, MoeEpilogue::Write,
+                    true);
+            }
             add(2, ExpertSubsetKind::MaskZeros, true, false, DType::BF16, MoeEpilogue::AddResidual,
                 true);
         }

@@ -161,6 +161,9 @@ Each participating comparison emits `OP_ERROR_STATS` with the case label, actual
 and error-to-limit ratio. The switch changes reporting only. Passing tests otherwise print the
 selected-case result; detailed failure diagnostics remain owned by each oracle.
 
+QSA Indexer and sparse GQA qualify both metadata changes during Graph replay and envelope
+changes through Graph executable updates, including transitions through all-select/inert calls.
+Their numerical criteria remain independent of target, extent and private arithmetic.
 QSA tail, prepare, indexer and sparse GQA retain partial-initialization cases for Compute Sanitizer
 initcheck. Use `--list` / `--case` to select the read-footprint recipe rather than running a whole
 format sweep under instrumentation.

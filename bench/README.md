@@ -1150,10 +1150,10 @@ projection and round; fixture creation is outside timing.
 cmake --build build/rtx5090-dev -j --target ninfer_qsa_bench
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --projection all --entry both --sweep 1:128 \
   --rounds 3 --warmup 10 --repeat 100 --execution graph --cache both \
-  --csv-out out/bench/qsa_small.csv
+  --csv-out .agent-tmp/qsa/qsa_small.csv
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --tokens 256,512,1024,2048,4096 \
   --rounds 3 --warmup 10 --repeat 100 --execution both --cache both \
-  --csv-out out/bench/qsa_prefill.csv
+  --csv-out .agent-tmp/qsa/qsa_prefill.csv
 ```
 
 `--op tail-extract` measures the complete public `qsa_tail_extract()` call. `--capacity` selects
@@ -1169,7 +1169,7 @@ destinations and restores both source planes outside each timed call. Extraction
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op tail-extract --capacity 16,4096 --batch 8 \
   --base-positions 6 --accepted mixed --layout layered --inplace \
   --rounds 3 --warmup 10 --repeat 100 --execution both --cache both \
-  --csv-out out/bench/qsa_tail.csv
+  --csv-out .agent-tmp/qsa/qsa_tail.csv
 ```
 
 `--op prepare` measures the complete `qsa_prepare()` call. `--kv-cache bf16|int8|fp8|nvfp4|k8v4`
@@ -1182,27 +1182,29 @@ words outside every timed call. CSV rows include positions, axes, alias mode, la
 ```bash
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op prepare --sweep 1:16 --batch 8 --axes 3 \
   --base-positions 63 --inplace --rounds 3 --cache both \
-  --csv-out out/bench/qsa_prepare_small.csv
+  --csv-out .agent-tmp/qsa/qsa_prepare_small.csv
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op prepare --tokens 128,1024,2048,4096 \
   --kv-cache nvfp4 --axes 3 --rounds 3 --execution both --cache both \
-  --csv-out out/bench/qsa_prepare_prefill.csv
+  --csv-out .agent-tmp/qsa/qsa_prepare_prefill.csv
 ```
 
 `--op indexer` measures the complete public `qsa_indexer()` call, including paged scoring and
 Top512 selection. `--contexts L[,L...]` gives each row's visible original-token count at its last
-live query; one value broadcasts to B rows. `--valid` sets live query prefixes. The fixed
-`--context-capacity` envelope defaults to 262144 and is independent of actual context lengths.
+live query; one value broadcasts to B rows. `--valid` sets live query prefixes. The
+`--context-capacity` envelope defaults to the batch maximum L, as it does for sparse GQA. An
+explicit wider bound measures a fixed capture envelope independently of actual context lengths.
 `--layout` selects contiguous, interleaved-page, or naturally aligned BF16 keys. Page mappings are
 nonsequential. CSV includes actual contexts, envelope, layout, caller workspace capacity/peak,
 and Graph kernel count. The index plane is always BF16, independent of main KV encoding.
+`--score-pattern random|ties` supplies ordinary inputs or zero queries with equal scores.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op indexer --tokens 1,8,64,1024,2048,4096 \
   --contexts 262144 --context-capacity 262144 --rounds 3 --execution graph --cache both \
-  --csv-out out/bench/qsa_indexer.csv
+  --csv-out .agent-tmp/qsa/qsa_indexer.csv
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op indexer --tokens 8 --batch 8 \
   --contexts 262144,131072,32768,8192,2052,2051,4,0 --valid 8,8,8,8,8,8,4,0 \
-  --rounds 3 --execution graph --cache both --csv-out out/bench/qsa_indexer_mixed.csv
+  --rounds 3 --execution graph --cache both --csv-out .agent-tmp/qsa/qsa_indexer_mixed.csv
 ```
 
 `--op sparse-gqa` measures the complete public attention and sigmoid gate, including any split
@@ -1212,19 +1214,37 @@ source values, initialized through public `kv_cache_append` outside timing. `--c
 `--valid` have the same meaning as Indexer. Its
 `--context-capacity` defaults to the batch's maximum actual context; an explicit wider value
 measures that capture envelope. `--selection random|shared|contiguous` selects dispersed independent
-sets, a shared shuffled block ranking filtered by each query's causal boundary, or recent adjacent
+uniform samples without replacement, a shared shuffled block ranking filtered by each query's causal boundary, or recent adjacent
 blocks. `--selected-blocks` defaults to 512 and permits 0..512; incomplete tails are always included.
 Physical pages are shuffled, and `--layout` exercises the same three plane layouts.
 
-CSV records the envelope, workspace, node count, separate useful QK/PV FLOPs, summed per-query
-selected K/V bytes including scales, union K/V bytes across queries, and allocated physical cache
-bytes. Payload rates are not measured DRAM bandwidth; use actual DRAM/L2 traffic to interpret the
-roofline.
+Prepare, Indexer and sparse GQA share semantic work/traffic columns. Counts follow actual live
+prefixes; T/B describe physical extents. Indexer reports scoring queries and complete candidate
+blocks, excluding the C<=512 all-select case. QK FLOPs count the four 128-dimensional heads only
+for scored queries. Sparse GQA reports separate useful QK/PV FLOPs over selected blocks plus the
+incomplete tail, with 24 query heads and two KV heads (`value_heads` in the common CSV).
+
+`logical_read_bytes` and `logical_write_bytes` count unique boundary payloads by direction,
+including activations, relevant metadata and all required output writes. `kv_read_bytes` is the
+union of selected KV across queries; `per_query_cache_bytes` instead sums each query's cache
+support. KV counts include represented scales. Indexer has corresponding unique index-key reads.
+Prepare reports KV/index writes and raw-record writes; incomplete groups read only the necessary
+old tail, and inert Q/IQ columns still contribute zero-output writes. Physical cache allocation,
+workspace capacity and arena high-water remain separate from accessed payloads.
+
+`logical_GBps` and `logical_TFLOps` use complete-Op median latency. The reference times divide
+logical bytes by nominal target memory bandwidth and useful contraction FLOPs by the calibrated
+BF16/FP32 tensor rate; `roofline_reference_us` is their maximum. This is an ideal semantic-work
+reference: it excludes TopK selection, normalization, softmax, codec work, padding, repeated loads
+and internal scratch traffic. It is neither measured DRAM bandwidth nor Tensor Core utilization.
+Cold eviction occurs before the Op, so internal cache reuse and deferred output writeback remain
+possible. Use targeted profiling for workspace traffic and executed-kernel utilization; benchmarks
+do not duplicate private launch plans to infer either quantity.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op sparse-gqa --tokens 1,8,128,1024,2048,4096 \
   --contexts 262144 --kv-cache nvfp4 --execution graph --cache both \
-  --csv-out out/bench/qsa_sparse.csv
+  --csv-out .agent-tmp/qsa/qsa_sparse.csv
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op sparse-gqa --tokens 9 --batch 8 \
   --contexts 64,2048,8192,32768,131072,262144,0,65536 --valid 9,9,9,5,9,9,0,9 \
   --context-capacity 262144 --execution graph --cache both

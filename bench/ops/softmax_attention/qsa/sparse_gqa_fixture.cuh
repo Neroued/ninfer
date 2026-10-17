@@ -65,6 +65,7 @@ struct SparseGqaFixture {
     DeviceBuffer workspace_storage;
     std::optional<MemoryArena> workspace;
     std::size_t workspace_bytes, selected_tokens = 0, unique_tokens = 0, token_bytes = 0;
+    std::size_t active_queries = 0, selected_ids = 0, table_entries = 0, active_rows = 0;
 
     SparseGqaFixture(const Options& o, int tokens, CudaExecutionView execution)
         : contexts(broadcast(o.contexts, o.batch)),
@@ -165,6 +166,8 @@ struct SparseGqaFixture {
             std::vector<int> order(contexts[b] / 4);
             std::iota(order.begin(), order.end(), 0);
             std::shuffle(order.begin(), order.end(), random);
+            std::vector<int> random_order(order.size());
+            std::iota(random_order.begin(), random_order.end(), 0);
             std::vector<bool> seen(contexts[b]);
             for (int t = 0; t < lengths[b]; ++t) {
                 const int m = b * tokens + t, p = contexts[b] - lengths[b] + t, C = (p + 1) / 4,
@@ -177,23 +180,38 @@ struct SparseGqaFixture {
                         if (g < C && int(chosen.size()) < c) chosen.push_back(g);
                         if (int(chosen.size()) == c) break;
                     }
+                } else if (o.selection == "contiguous") {
+                    for (int i = 0; i < c; ++i) chosen.push_back(C - 1 - i);
                 } else {
-                    int step = C ? int(random() % C) | 1 : 1;
-                    while (C && std::gcd(step, C) != 1) step += 2;
-                    const int offset = C ? random() % C : 0;
-                    for (int i = 0; i < c; ++i)
-                        chosen.push_back(o.selection == "contiguous"
-                                             ? C - 1 - i
-                                             : int((std::int64_t(step) * i + offset) % C));
+                    // The prefix remains a permutation of [0,C) as causal C grows.
+                    // Partial Fisher-Yates gives an ordered uniform sample without replacement.
+                    for (int i = 0; i < c; ++i) {
+                        const int j = std::uniform_int_distribution<int>(i, C - 1)(random);
+                        std::swap(random_order[i], random_order[j]);
+                        chosen.push_back(random_order[i]);
+                    }
                 }
                 for (int i = 0; i < c; ++i) {
                     block_ids[std::size_t(m) * 512 + i] = chosen[i];
                     for (int j = 0; j < 4; ++j) seen[chosen[i] * 4 + j] = true;
                 }
                 for (int j = C * 4; j <= p; ++j) seen[j] = true;
-                selected_tokens += c * 4 + (p + 1) % 4;
+                const auto support = c * 4 + (p + 1) % 4;
+                selected_tokens += support;
+                active_queries += support != 0;
+                // A full selection is known from its count without inspecting ids.
+                if (c < C) selected_ids += c;
             }
             unique_tokens += std::count(seen.begin(), seen.end(), true);
+            bool active = false;
+            for (std::size_t first = 0; first < seen.size(); first += 64) {
+                const bool used = std::any_of(seen.begin() + first,
+                                              seen.begin() + std::min(first + 64, seen.size()),
+                                              [](bool v) { return v; });
+                table_entries += used;
+                active |= used;
+            }
+            active_rows += active;
         }
         CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
         positions  = measurement::make_i32(pos);

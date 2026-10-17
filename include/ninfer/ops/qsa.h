@@ -102,8 +102,9 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
  * Each row has 0<=n<=T; live positions are consecutive nonnegative original-token ordinals.
  * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
- * Envelope zero permits only inert queries. Live scoring operands and their FP32 scores are
- * finite. BF16 values enter FP32 accumulation directly; scores have no BF16 rounding boundary.
+ * Envelope zero permits only inert queries. Live scoring operands and scores are
+ * finite. Ranking approximates the formula from represented inputs; there is no semantic
+ * intermediate score-storage rounding boundary.
  * Device counts, positions, selectors and readable live pages are caller guarantees.
  *
  * Effects / output:
@@ -162,8 +163,9 @@ qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min
  * Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256), with
  * [leading_extent,64,2,G] geometry. Features are contiguous; naturally aligned positive,
  * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
- * quantized to low-bit operands: MMA uses BF16/FP16 operands with FP32 accumulation, softmax
- * and basis transforms. Decoded KV tiles stay on chip; there is no expanded global cache.
+ * quantized to low-bit operands. The A16 numerical policy applies to the complete attention
+ * and gate; intermediate arithmetic remains private. Decoded KV tiles stay on chip; there is
+ * no expanded global cache.
  * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
  * I32 [T,B]; valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T,
  * with consecutive nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144,

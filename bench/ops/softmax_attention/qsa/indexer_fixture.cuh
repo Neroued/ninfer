@@ -35,13 +35,16 @@ struct IndexerFixture {
         : contexts(broadcast(o.contexts, o.batch)),
           lengths(o.valid == "dense" ? std::vector<int>(o.batch, tokens)
                                      : broadcast(measurement::integers(o.valid, 0), o.batch)),
-          envelope{std::uint32_t(o.context_capacity)} {
-        if (o.context_capacity > 262144)
+          envelope{std::uint32_t(o.context_capacity_explicit
+                                     ? o.context_capacity
+                                     : *std::max_element(contexts.begin(), contexts.end()))} {
+        if (envelope.max_visible_tokens > 262144)
             throw std::invalid_argument("indexer context capacity exceeds 262144");
-        const int B = o.batch, logical = std::max(1, (o.context_capacity + 63) / 64);
+        const int B = o.batch, logical = std::max(1, (int(envelope.max_visible_tokens) + 63) / 64);
         int pages = 2;
         for (int b = 0; b < B; ++b) {
-            if (contexts[b] > o.context_capacity || lengths[b] > tokens || lengths[b] > contexts[b])
+            if (contexts[b] > int(envelope.max_visible_tokens) || lengths[b] > tokens ||
+                lengths[b] > contexts[b])
                 throw std::invalid_argument("invalid indexer context/valid length");
             pages += (contexts[b] + 63) / 64;
         }
@@ -49,7 +52,8 @@ struct IndexerFixture {
         const int page_stride = 16 * row_stride * (o.layout == "layered" ? 2 : 1);
         const int leading     = o.layout == "unaligned" ? 1 : 0;
         query_data            = make_bf16(std::size_t(512) * tokens * B, 101);
-        key_data              = make_bf16(std::size_t(page_stride) * pages + leading, 103);
+        if (o.score_pattern == "ties") query_data.fill(0);
+        key_data = make_bf16(std::size_t(page_stride) * pages + leading, 103);
         std::vector<int> position(tokens * B, -1), selectors(B), table(logical * B, -1),
             permutation(pages);
         std::iota(permutation.begin(), permutation.end(), 0);
@@ -71,9 +75,9 @@ struct IndexerFixture {
         counts     = make_zeros(std::size_t(tokens) * B * 4);
         query      = Tensor(query_data.span(), DType::BF16, {128, 4, tokens, B});
         Tensor keys(key_data.span().subspan(leading * 2), DType::BF16, {128, 16, 1, pages});
-        keys.nb[1] = row_stride * 2;
-        keys.nb[2] = 16 * keys.nb[1];
-        keys.nb[3] = page_stride * 2;
+        keys.nb[1]      = row_stride * 2;
+        keys.nb[2]      = 16 * keys.nb[1];
+        keys.nb[3]      = page_stride * 2;
         cache           = {keys, Tensor(tables.span(), DType::I32, {logical, B})};
         batch           = {Tensor(positions.span(), DType::I32, {tokens, B}),
                            Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};

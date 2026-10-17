@@ -58,10 +58,11 @@ struct Options {
     int rounds             = 1;
     std::vector<int> capacities{16}, bases{6};
     std::vector<int> contexts{8192};
-    int context_capacity           = 262144;
+    int context_capacity           = 0;
     bool context_capacity_explicit = false;
     int selected_blocks            = 512;
     std::string selection          = "random";
+    std::string score_pattern      = "random";
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
     int axes     = 1;
@@ -73,6 +74,7 @@ inline Options parse_options(int argc, char** argv) {
     bool token_options = false, state_options = false;
     bool projection_only = false, tail_only = false, prepare_only = false;
     bool indexer_only = false, base_options = false, sparse_only = false, cache_option = false;
+    bool score_option = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -87,7 +89,7 @@ inline Options parse_options(int argc, char** argv) {
                          "  --base-positions F[,F...] --valid dense|N[,N...] --layout "
                          "contiguous|layered|unaligned\n"
                          "Indexer: --tokens T[,T...] --batch B --contexts L[,L...]\n"
-                         "  --context-capacity N (fixed envelope, default 262144)\n"
+                         "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
                          "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
                          "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n"
                          "  --selection random|shared|contiguous --selected-blocks 0..512\n"
@@ -116,11 +118,14 @@ inline Options parse_options(int argc, char** argv) {
         indexer_only |= flag == "--contexts" || flag == "--context-capacity";
         base_options |= flag == "--base-positions";
         sparse_only |= flag == "--selection" || flag == "--selected-blocks";
+        score_option |= flag == "--score-pattern";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
         else if (flag == "--contexts")
             o.contexts = measurement::integers(value, 0);
+        else if (flag == "--score-pattern")
+            o.score_pattern = value;
         else if (flag == "--selection")
             o.selection = value;
         else if (flag == "--selected-blocks")
@@ -181,7 +186,8 @@ inline Options parse_options(int argc, char** argv) {
     if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare" && o.op != "indexer" &&
         o.op != "sparse-gqa")
         throw std::invalid_argument("op: input-proj|tail-extract|prepare|indexer|sparse-gqa");
-    if ((o.op != "prepare" && o.op != "sparse-gqa" && cache_option) ||
+    if ((o.op != "indexer" && score_option) ||
+        (o.op != "prepare" && o.op != "sparse-gqa" && cache_option) ||
         (o.op != "sparse-gqa" && sparse_only) ||
         (o.op == "sparse-gqa" &&
          (tail_only || projection_only || prepare_only || base_options || o.inplace)) ||
@@ -192,6 +198,8 @@ inline Options parse_options(int argc, char** argv) {
         (o.op == "indexer" &&
          (tail_only || projection_only || prepare_only || base_options || o.inplace)))
         throw std::invalid_argument("options must belong to the selected QSA Op");
+    if (o.score_pattern != "random" && o.score_pattern != "ties")
+        throw std::invalid_argument("score-pattern: random|ties");
     if (o.selected_blocks > 512 ||
         (o.selection != "random" && o.selection != "shared" && o.selection != "contiguous"))
         throw std::invalid_argument("invalid sparse selection/count");

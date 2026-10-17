@@ -1,4 +1,5 @@
 #include "fixture.cuh"
+#include "metrics.h"
 #include "tail_fixture.cuh"
 #include "prepare_fixture.cuh"
 #include "indexer_fixture.cuh"
@@ -39,16 +40,22 @@ void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuf
 }
 
 void measure_prepare(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
-    measurement::Csv csv(options.timing.csv_out, "base_positions,axes,inplace,layout,round");
+    measurement::Csv csv(options.timing.csv_out,
+                         std::string("base_positions,axes,inplace,layout,round,") +
+                             qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::PrepareFixture fixture(options, tokens);
         measurement::Row row;
-        row.op       = "qsa_prepare";
-        row.format   = qsa::name(options.storage);
-        row.tokens   = tokens;
-        row.batch    = options.batch;
-        row.valid    = qsa::csv_list(fixture.counts);
-        row.qk_heads = 24;
+        row.op             = "qsa_prepare";
+        row.format         = qsa::name(options.storage);
+        row.tokens         = tokens;
+        row.batch          = options.batch;
+        row.valid          = qsa::csv_list(fixture.counts);
+        row.qk_heads       = 24;
+        row.value_heads    = 2;
+        const auto metrics = qsa::prepare_metrics(
+            tokens, options.axes, fixture.bases, fixture.counts,
+            2 * paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head());
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -61,24 +68,27 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.bases) + "," + std::to_string(options.axes) +
                                   "," + std::to_string(options.inplace) + "," + options.layout +
-                                  "," + std::to_string(round));
+                                  "," + std::to_string(round) + "," +
+                                  metrics.csv(result.gpu.median_us));
                 }
     }
 }
 
 void measure_indexer(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
-    measurement::Csv csv(options.timing.csv_out, "contexts,context_capacity,layout,round");
+    measurement::Csv csv(options.timing.csv_out,
+                         std::string("contexts,context_capacity,layout,score_pattern,round,") +
+                             qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::IndexerFixture fixture(options, tokens, device.execution_view());
         measurement::Row row;
         row.op              = "qsa_indexer";
         row.format          = "bf16";
-        row.policy          = "fp32_scores";
         row.tokens          = tokens;
         row.batch           = options.batch;
         row.qk_heads        = 4;
         row.valid           = qsa::csv_list(fixture.lengths);
         row.workspace_bytes = fixture.workspace_bytes;
+        const auto metrics  = qsa::indexer_metrics(tokens, fixture.contexts, fixture.lengths);
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -90,17 +100,18 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
                     row.workspace_peak = fixture.workspace->peak_used();
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.contexts) + "," +
-                                  std::to_string(options.context_capacity) + "," + options.layout +
-                                  "," + std::to_string(round));
+                                  std::to_string(fixture.envelope.max_visible_tokens) + "," +
+                                  options.layout + "," + options.score_pattern + "," +
+                                  std::to_string(round) + "," + metrics.csv(result.gpu.median_us));
                 }
     }
 }
 
 void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
-    measurement::Csv csv(
-        options.timing.csv_out,
-        "contexts,context_capacity,layout,selection,selected_blocks,qk_flops,pv_flops,selected_kv_"
-        "bytes,unique_kv_bytes,physical_cache_bytes,round");
+    measurement::Csv csv(options.timing.csv_out,
+                         std::string("contexts,context_capacity,layout,selection,selected_blocks,"
+                                     "physical_cache_bytes,round,") +
+                             qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::SparseGqaFixture fixture(options, tokens, device.execution_view());
         measurement::Row row;
@@ -110,9 +121,21 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
         row.tokens          = tokens;
         row.batch           = options.batch;
         row.qk_heads        = 24;
-        row.value_heads     = 24;
+        row.value_heads     = 2;
         row.valid           = qsa::csv_list(fixture.lengths);
         row.workspace_bytes = fixture.workspace_bytes;
+        qsa::Metrics metrics;
+        metrics.live_queries =
+            std::accumulate(fixture.lengths.begin(), fixture.lengths.end(), 0ULL);
+        metrics.selected_tokens = fixture.selected_tokens;
+        metrics.qk_flops = metrics.pv_flops = fixture.selected_tokens * 2 * 24 * 256;
+        metrics.kv_read                     = fixture.unique_tokens * fixture.token_bytes;
+        metrics.per_query_cache_bytes       = fixture.selected_tokens * fixture.token_bytes;
+        metrics.read_bytes = metrics.kv_read + fixture.active_queries * 6144 * 2 * 2 +
+                             fixture.selected_ids * 4 + metrics.live_queries * 8 +
+                             options.batch * 4 + fixture.active_rows * 4 +
+                             fixture.table_entries * 4;
+        metrics.write_bytes = std::uint64_t(tokens) * options.batch * 6144 * 2;
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -122,20 +145,16 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                         [&](CudaExecutionView cuda) { fixture.launch(cuda); }, [](auto) {}, flush,
                         device.execution_view(), options.timing, execution, cache);
                     row.workspace_peak = fixture.workspace->peak_used();
-                    const auto flops   = fixture.selected_tokens * 2 * 24 * 256;
-                    csv.write(
-                        row, result, execution, cache,
-                        qsa::csv_list(fixture.contexts) + "," +
-                            std::to_string(fixture.envelope.max_visible_tokens) + "," +
-                            options.layout + "," + options.selection + "," +
-                            std::to_string(options.selected_blocks) + "," + std::to_string(flops) +
-                            "," + std::to_string(flops) + "," +
-                            std::to_string(fixture.selected_tokens * fixture.token_bytes) + "," +
-                            std::to_string(fixture.unique_tokens * fixture.token_bytes) + "," +
-                            std::to_string(fixture.key_data.size() + fixture.value_data.size() +
-                                           fixture.key_scales.size() +
-                                           fixture.value_scales.size()) +
-                            "," + std::to_string(round));
+                    csv.write(row, result, execution, cache,
+                              qsa::csv_list(fixture.contexts) + "," +
+                                  std::to_string(fixture.envelope.max_visible_tokens) + "," +
+                                  options.layout + "," + options.selection + "," +
+                                  std::to_string(options.selected_blocks) + "," +
+                                  std::to_string(
+                                      fixture.key_data.size() + fixture.value_data.size() +
+                                      fixture.key_scales.size() + fixture.value_scales.size()) +
+                                  "," + std::to_string(round) + "," +
+                                  metrics.csv(result.gpu.median_us));
                 }
     }
 }

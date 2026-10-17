@@ -99,6 +99,9 @@ void q8_a16_conformance(Suite& suite) {
                 calls.push_back({t, CallForm::A16Convenience});
         }
         if (shape.n == 16384 && shape.k == 2560) {
+            for (int t : {191, 192, 193, 1023, 1151, 1152, 1153, 2048, 4096}) calls.push_back({t});
+            for (int t : {192, 1152})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
             for (int t : {512, 513, 1025}) calls.push_back({t});
             for (int t : {1,  8,  9,  16, 17, 24, 25,  32,  33,  40,  41,   48,
                           49, 63, 64, 65, 96, 97, 128, 129, 512, 513, 1024, 1025})

@@ -1470,6 +1470,9 @@ test shapes exercise the scalar fallbacks.
 `ninfer_causal_conv1d_silu_bench` times one public entry per invocation. `--tokens` takes a list, so
 a route decision comes from one process rather than a series of them. `--cache` defaults to warm;
 pass `--cache cold` for the state route decisions are made in.
+`--execution graph|eager` defaults to Graph body timing; both cache and state-alias forms use the
+same measurement harness. `--warmup` and `--repeat` default to 10 and 100. `--inplace` selects the
+split entry's exact state alias, restoring its initial history outside every timed call.
 
 ```bash
 ./build/rtx5090-dev/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 8192 --tokens 1,2,7,15,16,17,24,32,33,64,65

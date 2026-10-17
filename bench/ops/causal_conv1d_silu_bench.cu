@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <optional>
 #include <vector>
 
 using namespace ninfer;
@@ -27,6 +28,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 struct Options {
+    measurement::Options timing;
     std::int32_t channels     = 8192;
     std::int32_t tokens       = 1024;
     std::int32_t slots        = 7;
@@ -40,6 +42,7 @@ struct Options {
     bool snapshot = false;
     bool split    = false;
     bool cold     = false;
+    bool in_place = false;
 };
 
 // The split-output fixture uses two key ranges followed by the remaining value rows; the
@@ -54,20 +57,17 @@ bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t&
 
 Result time_stage(const Options& options, const launch_fn& launch, double bytes_moved,
                   const launch_fn& restore = {}) {
-    if (!options.cold) {
-        return restore ? bench_loop_prepared(restore, launch, bytes_moved)
-                       : bench_loop(launch, bytes_moved);
-    }
-    constexpr int kColdWarmup = 20;
-    constexpr int kColdRepeat = 40;
     bench::L2FlushBuffer flush(kFlushBytes);
-    const auto cuda = default_execution();
-    const ColdTiming timing =
-        restore
-            ? measure_cold_launch_prepared(restore, launch, flush, cuda, kColdWarmup, kColdRepeat)
-            : measure_cold_launch(launch, flush, cuda, kColdWarmup, kColdRepeat);
+    const auto cuda     = device_context().execution_view();
+    const auto measured = measurement::measure(
+        launch,
+        [&](CudaExecutionView execution) {
+            if (restore) restore(execution);
+        },
+        flush, cuda, options.timing, options.timing.execution, options.cold ? "cold" : "warm");
+    const auto& timing = measured.gpu;
     Result result;
-    result.n_runs        = kColdRepeat;
+    result.n_runs        = options.timing.repeat;
     result.median_us     = timing.median_us;
     result.min_us        = timing.min_us;
     result.p95_us        = timing.p95_us;
@@ -77,7 +77,7 @@ Result time_stage(const Options& options, const launch_fn& launch, double bytes_
 }
 
 std::string cache_tag(const Options& options, const char* entry) {
-    return options.cold ? std::string(entry) + "-cold" : std::string(entry);
+    return std::string(entry) + (options.cold ? "-cold-" : "-warm-") + options.timing.execution;
 }
 
 DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
@@ -152,15 +152,18 @@ void run_split(const Options& options) {
     DeviceBuffer weight =
         make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
     DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
-    DeviceBuffer state_out = make_zeros(state_n * 2u);
-    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
+    DeviceBuffer state_out = options.in_place ? DeviceBuffer{} : make_zeros(state_n * 2u);
+    std::optional<SavedBuffer> initial;
+    if (options.in_place) initial.emplace(state_in);
+    DeviceBuffer q = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer k = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
+    DeviceBuffer v = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
 
     Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens});
     Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
     Tensor tin(state_in.span(), DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.span(), DType::BF16, {options.channels, 3});
+    Tensor tout_state(options.in_place ? state_in.span() : state_out.span(), DType::BF16,
+                      {options.channels, 3});
     Tensor tq(q.span(), DType::BF16, {key_dim, options.tokens});
     Tensor tk(k.span(), DType::BF16, {key_dim, options.tokens});
     Tensor tv(v.span(), DType::BF16, {value_dim, options.tokens});
@@ -168,14 +171,18 @@ void run_split(const Options& options) {
     // x in, q+k+v out, the four-tap weight and both states. NCU counters remain the performance
     // authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = time_stage(
+    const launch_fn restore =
+        options.in_place ? launch_fn([&](CudaExecutionView cuda) { initial->restore(cuda); })
+                         : launch_fn{};
+    const Result r = time_stage(
         options,
         [&](CudaExecutionView cuda) {
             ops::causal_conv1d_silu_split(tx, tw, tin, tout_state, tq, tk, tv, cuda);
         },
-        bytes);
+        bytes, restore);
     const std::string tag =
-        shape_tag(cache_tag(options, "split").c_str(), options.channels, options.tokens);
+        shape_tag(cache_tag(options, options.in_place ? "split-alias" : "split").c_str(),
+                  options.channels, options.tokens);
     print_result(tag.c_str(), r);
 }
 
@@ -273,7 +280,8 @@ void run_snapshot(const Options& options) {
 void print_usage(const char* program) {
     std::fprintf(stderr,
                  "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
-                 "[--cache warm|cold] [--channels C] [--tokens T[,T...]] "
+                 "[--inplace] [--cache warm|cold] [--execution graph|eager] "
+                 "[--warmup N] [--repeat N] [--channels C] [--tokens T[,T...]] "
                  "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
                  "[--initial-slot I]\n",
                  program);
@@ -291,6 +299,14 @@ bool parse_options(int argc, char** argv, Options& options) try {
             options.snapshot = true;
         } else if (!std::strcmp(argv[i], "--split")) {
             options.split = true;
+        } else if (!std::strcmp(argv[i], "--inplace")) {
+            options.in_place = true;
+        } else if ((!std::strcmp(argv[i], "--execution") || !std::strcmp(argv[i], "--warmup") ||
+                    !std::strcmp(argv[i], "--repeat")) &&
+                   i + 1 < argc) {
+            const std::string_view flag = argv[i++];
+            if (!measurement::parse(options.timing, flag, argv[i])) return false;
+            if (options.timing.execution == "both") return false;
         } else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) {
             const char* value = argv[++i];
             if (!std::strcmp(value, "cold")) {
@@ -325,7 +341,7 @@ bool parse_options(int argc, char** argv, Options& options) try {
         !options.split) {
         options.decode = options.prefill = true;
     }
-    if (options.batch > 8 ||
+    if (options.batch > 8 || (options.in_place && !options.split) ||
         ((!options.snapshot) && (options.batch != 1 || !options.valid_columns.empty())) ||
         (!options.valid_columns.empty() &&
          options.valid_columns.size() != static_cast<std::size_t>(options.batch))) {

@@ -2,6 +2,7 @@
 #include "ops/linear_attention/causal_conv/launch.h"
 #include "ops/linear_attention/causal_conv/kernel.cuh"
 #include "core/device.h"
+#include "core/platform.h"
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -38,11 +39,10 @@ int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
 void launch_prefill_output(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                            Tensor& conv_state_out, Tensor& out, CausalConvRoute route,
                            cudaStream_t stream) {
-    constexpr int kOutputBlock  = 256;
-    constexpr int kChannelBlock = 256;
-    constexpr int kPairBlock    = 256;
-    const std::int32_t C        = x.ne[0];
-    const std::int32_t T        = x.ne[1];
+    constexpr int kOutputBlock = 256;
+    constexpr int kPairBlock   = 256;
+    const std::int32_t C       = x.ne[0];
+    const std::int32_t T       = x.ne[1];
     if (route == CausalConvRoute::PrefillPairs) {
         const CausalConvContiguousOutput<__nv_bfloat162> out_map{
             reinterpret_cast<__nv_bfloat162*>(out.data), C / 2};
@@ -63,12 +63,7 @@ void launch_prefill_output(const Tensor& x, const Tensor& weight, const Tensor& 
         CUDA_CHECK(cudaGetLastError());
     }
 
-    causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "prefill state"), kChannelBlock,
-                                         0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), C, T);
-    CUDA_CHECK(cudaGetLastError());
+    launch_causal_conv_state(x, conv_state_in, conv_state_out, stream);
 }
 
 void launch_token_parallel(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
@@ -132,10 +127,9 @@ void launch_prefill_split_geometry(const Tensor& x, const Tensor& weight,
                                    Tensor& out0, Tensor& out1, Tensor& out2, cudaStream_t stream) {
     static_assert((Rows0 % 2) == 0 && (Rows1 % 2) == 0 && (Rows2 % 2) == 0,
                   "a pair must not straddle two destinations");
-    constexpr int kChannelBlock = 256;
-    constexpr int kPairBlock    = 256;
-    const std::int32_t C        = x.ne[0];
-    const std::int32_t T        = x.ne[1];
+    constexpr int kPairBlock = 256;
+    const std::int32_t C     = x.ne[0];
+    const std::int32_t T     = x.ne[1];
     if (Rows0 + Rows1 + Rows2 != C) {
         throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
     }
@@ -149,12 +143,7 @@ void launch_prefill_split_geometry(const Tensor& x, const Tensor& weight,
         static_cast<const __nv_bfloat16*>(conv_state_in.data), out_map, C, T);
     CUDA_CHECK(cudaGetLastError());
 
-    causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "prefill state"), kChannelBlock,
-                                         0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), C, T);
-    CUDA_CHECK(cudaGetLastError());
+    launch_causal_conv_state(x, conv_state_in, conv_state_out, stream);
 }
 
 void launch_prefill_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
@@ -317,12 +306,27 @@ void launch_causal_conv(const Tensor& x, const Tensor& weight, const Tensor& sta
 
 void launch_causal_conv_split(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                               Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              CausalConvSplitGeometry geometry, CausalConvRoute route,
-                              cudaStream_t stream) {
+                              CausalConvSplitGeometry geometry, cudaStream_t stream) {
+#if NINFER_TARGET_SPARK
+    if (geometry == CausalConvSplitGeometry::Rows2048x2048x6144 && x.ne[1] > 16)
+        return launch_causal_conv_split_10240(x, weight, state_in, state_out, out0, out1, out2,
+                                              stream);
+#endif
+    const auto route = select_causal_conv_split_plan(x.ne[1]);
     if (route == CausalConvRoute::TokenParallel)
         launch_token_parallel_split(x, weight, state_in, state_out, out0, out1, out2, geometry,
                                     stream);
     else
         launch_prefill_split(x, weight, state_in, state_out, out0, out1, out2, geometry, stream);
+}
+
+void launch_causal_conv_state(const Tensor& x, const Tensor& state_in, Tensor& state_out,
+                              cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    causal_conv1d_prefill_state_kernel<<<grid_for(x.ne[0], kBlock, "prefill state"), kBlock, 0,
+                                         stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(state_in.data),
+        static_cast<__nv_bfloat16*>(state_out.data), x.ne[0], x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail

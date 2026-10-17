@@ -241,8 +241,7 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     require_split_nonoverlap(x, weight, conv_state_in, conv_state_out, out0, out1, out2);
 
     detail::launch_causal_conv_split(x, weight, conv_state_in, conv_state_out, out0, out1, out2,
-                                     geometry, detail::select_causal_conv_split_plan(x.ne[1]),
-                                     stream);
+                                     geometry, stream);
 }
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,

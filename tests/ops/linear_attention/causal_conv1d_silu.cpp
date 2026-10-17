@@ -3,6 +3,7 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "cuda_fixture.h"
 #include "ops/op_tester.h"
+#include "core/decode_graph.h"
 
 #include <cuda_runtime.h>
 
@@ -312,35 +313,20 @@ int split_rejection_case(std::int32_t T) {
 // One registered geometry, one column count, one state form. `offset_pairs` shifts every
 // destination by one BF16 pair, which the contract admits and the arena never produces.
 int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int32_t value_dim,
-               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed) {
-    const LogicalInput input       = make_input(C, T, seed);
-    const std::vector<float> state = make_state(C, seed + 2U);
-    const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
-    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
-    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
-    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
-    const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
-
+               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed,
+               bool captured = false) {
     const std::size_t pad     = offset_pairs ? 2U * sizeof(std::uint16_t) : 0U;
     const std::size_t q_bytes = static_cast<std::size_t>(q_dim) * T * sizeof(std::uint16_t);
     const std::size_t k_bytes = static_cast<std::size_t>(k_dim) * T * sizeof(std::uint16_t);
     const std::size_t v_bytes = static_cast<std::size_t>(value_dim) * T * sizeof(std::uint16_t);
 
-    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer state_out(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer x(std::size_t(C) * T * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(std::size_t(C) * 4 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(std::size_t(C) * 3 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out(std::size_t(C) * 3 * sizeof(std::uint16_t));
     GuardedDeviceBuffer q(q_bytes + pad);
     GuardedDeviceBuffer k(k_bytes + pad);
     GuardedDeviceBuffer v(v_bytes + pad);
-
-    x.copy_from_host(x_bits.data(), x.bytes());
-    weight.copy_from_host(weight_bits.data(), weight.bytes());
-    state_in.copy_from_host(state_bits.data(), state_in.bytes());
-    state_out.fill(0x5a);
-    q.fill(kOutputPoison);
-    k.fill(kOutputPoison);
-    v.fill(kOutputPoison);
 
     auto at               = [&](GuardedDeviceBuffer& buffer) { return buffer.span().subspan(pad); };
     auto pad_is_untouched = [&](GuardedDeviceBuffer& buffer, const char* label) {
@@ -364,41 +350,74 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     Tensor tk(at(k), DType::BF16, {k_dim, T});
     Tensor tv(at(v), DType::BF16, {value_dim, T});
 
-    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv,
-                                  ninfer::test::cuda_environment().default_execution);
-    cuda_synchronize();
-
-    const std::string tag = "causal_conv1d_silu_split C=" + std::to_string(C) +
-                            " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
-                            (offset_pairs ? " offset" : "");
-    const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
-    const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
-    const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
-
+    const auto execution = ninfer::test::cuda_environment().context.execution_view();
+    const auto launch    = [&] {
+        ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
     int failures = 0;
-    failures += pad_is_untouched(q, "out0");
-    failures += pad_is_untouched(k, "out1");
-    failures += pad_is_untouched(v, "out2");
-    failures += verify_output(tag + " q", from_device_bf16(at(q).data, q_count),
-                              oracle_slice(oracle.output, C, T, 0, q_dim));
-    failures += verify_output(tag + " k", from_device_bf16(at(k).data, k_count),
-                              oracle_slice(oracle.output, C, T, q_dim, k_dim));
-    failures += verify_output(tag + " v", from_device_bf16(at(v).data, v_count),
-                              oracle_slice(oracle.output, C, T, q_dim + k_dim, value_dim));
-    failures +=
-        verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(), final_bits);
-    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
-    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
-    if (!alias_state) {
-        failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
+    for (int phase = 0; phase < (captured ? 2 : 1); ++phase) {
+        const LogicalInput input       = make_input(C, T, seed + phase * 13U);
+        const std::vector<float> state = make_state(C, seed + 2U + phase * 13U);
+        const OracleResult oracle = causal_conv_oracle(input.x, input.weight, state, C, T, false);
+        const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+        const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+        const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+        const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
+
+        x.copy_from_host(x_bits.data(), x.bytes());
+        weight.copy_from_host(weight_bits.data(), weight.bytes());
+        state_in.copy_from_host(state_bits.data(), state_in.bytes());
+        state_out.fill(0x5a);
+        q.fill(kOutputPoison);
+        k.fill(kOutputPoison);
+        v.fill(kOutputPoison);
+
+        cuda_synchronize();
+        if (captured) {
+            if (phase == 0) {
+                definition.capture(execution.stream(), launch);
+                graph.instantiate(definition);
+            }
+            graph.launch(execution.stream());
+        } else {
+            launch();
+        }
+        cuda_synchronize(execution.stream());
+
+        const std::string tag = "causal_conv1d_silu_split C=" + std::to_string(C) +
+                                " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
+                                (offset_pairs ? " offset" : "");
+        const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
+        const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
+        const std::size_t v_count =
+            static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
+
+        failures += pad_is_untouched(q, "out0");
+        failures += pad_is_untouched(k, "out1");
+        failures += pad_is_untouched(v, "out2");
+        failures += verify_output(tag + " q", from_device_bf16(at(q).data, q_count),
+                                  oracle_slice(oracle.output, C, T, 0, q_dim));
+        failures += verify_output(tag + " k", from_device_bf16(at(k).data, k_count),
+                                  oracle_slice(oracle.output, C, T, q_dim, k_dim));
+        failures += verify_output(tag + " v", from_device_bf16(at(v).data, v_count),
+                                  oracle_slice(oracle.output, C, T, q_dim + k_dim, value_dim));
+        failures += verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(),
+                                final_bits);
+        failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+        failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+        if (!alias_state) {
+            failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
+        }
+        failures += verify_buffer_guards(tag + " x", x);
+        failures += verify_buffer_guards(tag + " weight", weight);
+        failures += verify_buffer_guards(tag + " state input", state_in);
+        failures += verify_buffer_guards(tag + " state output", state_out);
+        failures += verify_buffer_guards(tag + " q", q);
+        failures += verify_buffer_guards(tag + " k", k);
+        failures += verify_buffer_guards(tag + " v", v);
     }
-    failures += verify_buffer_guards(tag + " x", x);
-    failures += verify_buffer_guards(tag + " weight", weight);
-    failures += verify_buffer_guards(tag + " state input", state_in);
-    failures += verify_buffer_guards(tag + " state output", state_out);
-    failures += verify_buffer_guards(tag + " q", q);
-    failures += verify_buffer_guards(tag + " k", k);
-    failures += verify_buffer_guards(tag + " v", v);
     return failures;
 }
 
@@ -750,10 +769,12 @@ int main(int argc, char** argv) {
                   });
     };
     const auto split = [&](int channels, int q, int k, int v, int t, bool alias, bool offset,
-                           unsigned seed) {
+                           unsigned seed, bool captured = false) {
         suite.add("causal_conv/split/c" + std::to_string(channels) + "/t" + std::to_string(t) +
-                      (alias ? "/alias" : "/disjoint") + (offset ? "/offset" : "/aligned"),
-                  [=] { return split_case(channels, q, k, v, t, alias, offset, seed); });
+                      (alias ? "/alias" : "/disjoint") + (offset ? "/offset" : "/aligned") +
+                      (captured ? "/graph" : ""),
+                  [=] { return split_case(channels, q, k, v, t, alias, offset, seed, captured); },
+                  {{"execution", captured ? "graph" : "eager"}});
     };
     const auto split_rejection = [&](int t) {
         suite.add("causal_conv/split_contract/t" + std::to_string(t),
@@ -826,6 +847,9 @@ int main(int argc, char** argv) {
         split(kQwen35Channels, 2048, 2048, 4096, T, false, true,
               7200U + static_cast<std::uint32_t>(T));
     }
+
+    split(kQwen27Channels, 2048, 2048, 6144, 17, true, false, 8017U, true);
+    split(kQwen27Channels, 2048, 2048, 6144, 257, true, true, 8257U, true);
 
     // Argument rejection, on both sides of the route bound.
     split_rejection(16);

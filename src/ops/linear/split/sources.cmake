@@ -1,7 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/shapes/n13952_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/shapes/n14336_k5120.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/bf16/shapes/n1664_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n14336_k5120/a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n14336_k5120/a8.cu"
@@ -35,3 +34,5 @@ target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n14336_k5120/a4_tma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n16384_k5120/a4_tma.cu"
 )
+
+include("${CMAKE_CURRENT_LIST_DIR}/bf16/${NINFER_TARGET}/sources.cmake")

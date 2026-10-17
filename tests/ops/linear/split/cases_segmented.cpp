@@ -1,5 +1,7 @@
 #include "ops/linear/split/runner.h"
 
+#include <set>
+
 namespace ninfer::test::linear_split {
 
 void add_segmented_cases(Suite& suite) {
@@ -43,16 +45,28 @@ void add_segmented_cases(Suite& suite) {
           64, 65, 95, 96, 97, 127, 128, 129, 511, 512, 513, 1024, 2048, 4096, 4097}},
     };
     for (const auto& fixture : fixtures) {
+        std::set<int> tokens(fixture.tokens.begin(), fixture.tokens.end());
+        std::set<int> graph_tokens{1, 8, 32, 64, 128, 129};
+        if (fixture.profile.weights.size() == 1 && fixture.profile.weights[0].type == QType::BF16 &&
+            fixture.profile.weights[0].rows == 1664) {
+            for (int end : {32,  64,   96,   128,  160,  256,  336,  448,  560,  640,
+                            896, 1024, 1152, 1280, 1408, 1440, 1664, 1856, 2048, 4096}) {
+                tokens.insert({end - 1, end, end + 1});
+                graph_tokens.insert({end, end + 1});
+            }
+            // Full and partial token tiles for each new warp-store shape.
+            tokens.insert({288, 384});
+            graph_tokens.insert({288, 384});
+        }
         std::vector<Invocation> calls{{.t = 0, .validate_operands = true}};
-        for (int t : fixture.tokens) {
-            calls.push_back(
-                {.t            = t,
-                 .graph        = t == 1 || t == 8 || t == 32 || t == 64 || t == 128 || t == 129,
-                 .input_seed   = 317U,
-                 .changed_seed = 348U,
-                 .columns      = Columns::HeadBoundaries,
-                 .full_rows    = t <= 8,
-                 .convenience  = true});
+        for (int t : tokens) {
+            calls.push_back({.t            = t,
+                             .graph        = graph_tokens.contains(t),
+                             .input_seed   = 317U,
+                             .changed_seed = 348U,
+                             .columns      = Columns::HeadBoundaries,
+                             .full_rows    = t <= 8,
+                             .convenience  = true});
         }
         calls.push_back({.t             = 17,
                          .graph         = true,

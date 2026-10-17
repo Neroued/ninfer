@@ -5,14 +5,12 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n256_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n48_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n96_k2560.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n1664_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n324_k10240.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n320_k10240.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n10240_k320.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n12800_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n248320_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n13952_k2560.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k6144.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1152_k1536.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n3456_k1152.cu"
@@ -22,3 +20,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4608_k4608.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k4608.cu"
 )
+
+include("${CMAKE_CURRENT_LIST_DIR}/${NINFER_TARGET}/sources.cmake")

@@ -15,8 +15,9 @@ enum class ConvKernel {
     Fp8Fused,
     Nvfp4Decode,
     Nvfp4Window,
+    Q8TmaBatch,
 };
-enum class ProjectedConvKernel { Sequential, TokenParallel };
+enum class ProjectedConvKernel { Sequential, TokenParallel, TokenParallel8 };
 
 struct ProjectionPlan {
     Compute compute = Compute::A16;
@@ -32,6 +33,7 @@ struct ConvPlan {
 
 ProjectionPlan select_projection_plan(const WeightProfile& weights, std::int32_t columns);
 // Publication does not select arithmetic. Snapshot and record consume the same physical block.
+ConvPlan select_q8_conv_plan(const WeightProfile& weights, Batch batch);
 ConvPlan select_conv_plan(const WeightProfile& weights, Batch batch);
 std::size_t convolution_capacity(const WeightProfile& weights, Publication publication,
                                  std::int32_t batch, std::int32_t first, std::int32_t last);

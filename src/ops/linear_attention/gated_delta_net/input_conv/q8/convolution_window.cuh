@@ -1,3 +1,5 @@
+#pragma once
+
 #include "ops/linear_attention/gated_delta_net/input_conv/q8/launch.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/kernels/output.cuh"
 #include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
@@ -9,7 +11,7 @@
 namespace ninfer::ops::detail {
 using ConvGeometry = GdnConvGeometry<6144>;
 
-namespace {
+namespace gdn_q8_window {
 
 using Output = LinearBf16SegmentedOutput<10240, 6144>;
 
@@ -106,31 +108,6 @@ void dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                           publish, aggregate, stream);
 }
 
-} // namespace
-
-void launch_q8_gdn_conv_n16384_k2560_snapshot(const Tensor& x, const Weight& weight,
-                                              const Tensor& conv_weight, Tensor& states,
-                                              const Tensor& valid, const Tensor& initial,
-                                              const Tensor& bases, Tensor& query, Tensor& key,
-                                              Tensor& value, Tensor& z, bool aggregate,
-                                              cudaStream_t stream) {
-    dispatch(x, weight, conv_weight, states, valid, initial, query, key, value, z,
-             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(states.data), states.nb[2] / 2,
-                                    static_cast<const std::int32_t*>(bases.data),
-                                    ConvGeometry::channels},
-             aggregate, stream);
-}
-
-void launch_q8_gdn_conv_n16384_k2560_record(const Tensor& x, const Weight& weight,
-                                            const Tensor& conv_weight, const Tensor& states,
-                                            const Tensor& valid, const Tensor& initial,
-                                            Tensor& records, Tensor& query, Tensor& key,
-                                            Tensor& value, Tensor& z, bool aggregate,
-                                            cudaStream_t stream) {
-    dispatch(x, weight, conv_weight, states, valid, initial, query, key, value, z,
-             RecordColumnPublish{static_cast<__nv_bfloat16*>(records.data), ConvGeometry::channels,
-                                 x.ne[1]},
-             aggregate, stream);
-}
+} // namespace gdn_q8_window
 
 } // namespace ninfer::ops::detail

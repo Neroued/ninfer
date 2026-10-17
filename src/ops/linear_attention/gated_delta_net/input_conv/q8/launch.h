@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/linear_attention/gated_delta_net/input_conv/plan.h"
+
 #include "core/weight.h"
 #include "core/tensor.h"
 #include <cuda_runtime.h>
@@ -14,13 +16,13 @@ void launch_q8_gdn_conv_n16384_k2560_snapshot(const Tensor& x, const Weight& wei
                                               const Tensor& conv_weight, Tensor& states,
                                               const Tensor& valid, const Tensor& initial,
                                               const Tensor& bases, Tensor& query, Tensor& key,
-                                              Tensor& value, Tensor& z, bool aggregate,
-                                              cudaStream_t stream);
+                                              Tensor& value, Tensor& z,
+                                              gdn_input::ConvKernel kernel, cudaStream_t stream);
 void launch_q8_gdn_conv_n16384_k2560_record(const Tensor& x, const Weight& weight,
                                             const Tensor& conv_weight, const Tensor& states,
                                             const Tensor& valid, const Tensor& initial,
                                             Tensor& records, Tensor& query, Tensor& key,
-                                            Tensor& value, Tensor& z, bool aggregate,
+                                            Tensor& value, Tensor& z, gdn_input::ConvKernel kernel,
                                             cudaStream_t stream);
 
 void launch_q8_gdn_input_decode(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

@@ -19,19 +19,7 @@ ConvPlan select_conv_plan(const WeightProfile& weights, Batch batch) {
             plan.kernel = ConvKernel::Q4Q5Fused;
         break;
     case Format::Q8:
-        if (weights.geometry.input_rows == 2560) {
-            if (batch.rows == 1 && batch.tokens <= 16)
-                plan.kernel = ConvKernel::Q8Window;
-            else if (batch.columns() <= 16 && !(batch.tokens == 1 && batch.rows >= 6) &&
-                     !(batch.tokens == 2 && batch.rows == 4))
-                plan.kernel = ConvKernel::Q8Aggregate;
-        } else if (batch.rows == 1) {
-            if (batch.tokens == 1)
-                plan.kernel = ConvKernel::Q8Decode;
-            else if (batch.tokens <= 16)
-                plan.kernel = ConvKernel::Q8SlicedK;
-        }
-        break;
+        return select_q8_conv_plan(weights, batch);
     case Format::Fp8:
         if (batch.rows == 1 && batch.tokens <= 3) plan.kernel = ConvKernel::Fp8Fused;
         break;

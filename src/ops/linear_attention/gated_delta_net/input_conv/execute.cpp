@@ -58,9 +58,10 @@ void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tenso
         return;
     case ConvKernel::Q8Window:
     case ConvKernel::Q8Aggregate:
+    case ConvKernel::Q8TmaBatch:
         launch_q8_gdn_conv_n16384_k2560_snapshot(
             x, w, conv, state.history, valid, state.source_slots, state.snapshot_bases, out.query,
-            out.key, out.value, out.z, plan.kernel == ConvKernel::Q8Aggregate, stream);
+            out.key, out.value, out.z, plan.kernel, stream);
         return;
     case ConvKernel::Fp8Fused:
         launch_fp8_gdn_snapshot_fused(x, w, conv, state.history, valid, state.source_slots,
@@ -86,10 +87,10 @@ void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tenso
                       stream);
     const Tensor projected =
         scratch.projected.view({weights.geometry.channels(), batch.tokens, batch.rows});
-    if (plan.post == ProjectedConvKernel::TokenParallel)
-        launch_gdn_projected_conv_parallel_snapshot(projected, conv, state.history, valid,
-                                                    state.source_slots, state.snapshot_bases,
-                                                    out.query, out.key, out.value, stream);
+    if (plan.post != ProjectedConvKernel::Sequential)
+        launch_gdn_projected_conv_parallel_snapshot(
+            projected, conv, state.history, valid, state.source_slots, state.snapshot_bases,
+            out.query, out.key, out.value, plan.post, stream);
     else
         launch_gdn_projected_conv_snapshot(projected, conv, state.history, valid,
                                            state.source_slots, state.snapshot_bases, out.query,
@@ -114,9 +115,10 @@ void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor&
         return;
     case ConvKernel::Q8Window:
     case ConvKernel::Q8Aggregate:
+    case ConvKernel::Q8TmaBatch:
         launch_q8_gdn_conv_n16384_k2560_record(x, w, conv, state.history, valid, state.source_slots,
                                                record, out.query, out.key, out.value, out.z,
-                                               plan.kernel == ConvKernel::Q8Aggregate, stream);
+                                               plan.kernel, stream);
         return;
     case ConvKernel::Fp8Fused:
         launch_fp8_gdn_record_fused(x, w, conv, state.history, valid, state.source_slots, record,
@@ -136,10 +138,10 @@ void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor&
     const ProjectedOutputs projected{record.view({weights.geometry.channels(), batch.columns()}),
                                      out.z.view({weights.geometry.value_rows, batch.columns()})};
     launch_projection(flat_x, weights, projected, plan.projection, scratch, stream);
-    if (plan.post == ProjectedConvKernel::TokenParallel)
+    if (plan.post != ProjectedConvKernel::Sequential)
         launch_gdn_projected_conv_parallel_record(record, conv, state.history, valid,
                                                   state.source_slots, out.query, out.key, out.value,
-                                                  stream);
+                                                  plan.post, stream);
     else
         launch_gdn_projected_conv_record(record, conv, state.history, valid, state.source_slots,
                                          out.query, out.key, out.value, stream);

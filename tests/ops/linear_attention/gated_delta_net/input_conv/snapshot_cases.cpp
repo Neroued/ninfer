@@ -39,7 +39,11 @@ std::vector<SnapshotCase> cases(Profile p) {
                                                            11, 12, 13, 14, 15, 16, 17, 33, 129};
         for (int t : widths) result.push_back({.width = t, .initial = t == 2 ? 0 : t + 1});
         if (p.hidden == 2560)
-            for (int t : {1, 8, 16, 17, 65}) result.push_back({.width = t, .graph = true});
+            for (int t : {1, 8, 16, 17, 65, 192, 1024, 1025, 1152})
+                result.push_back({.width = t, .graph = true});
+        if (p.hidden == 2560)
+            for (int t : {95, 96, 97, 127, 128, 191, 193, 1023, 1151, 1153, 4096})
+                result.push_back({.width = t});
         for (int b : p.hidden == 2048 ? std::vector{2} : std::vector{2, 3, 4, 5, 6, 7, 8})
             for (int t : p.hidden == 2048
                              ? std::vector{16}

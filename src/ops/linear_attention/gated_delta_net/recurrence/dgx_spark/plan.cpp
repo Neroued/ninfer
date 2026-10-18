@@ -2,7 +2,8 @@
 #include <climits>
 
 namespace ninfer::ops::detail::gated_delta_net {
-int select_value_tile(int value_heads, int tokens, int multiprocessor_count) {
+int select_value_tile(int qk_heads, int value_heads, int tokens, int multiprocessor_count) {
+    if (qk_heads == 8 && value_heads == 24) return tokens <= 128 ? 32 : 64;
     if (value_heads == 32 || value_heads == 48) {
         if (tokens <= 128) return 16;
         return value_heads == 48 ? 64 : 32;

@@ -9,6 +9,7 @@ struct Options {
     measurement::Options timing;
     Mode mode    = Mode::Running;
     int qk_heads = 16, value_heads = 48, batch = 1;
+    std::string state_form = "distinct";
     std::vector<int> tokens{1024};
     bool breakdown      = false;
     std::string qk_norm = "fused";
@@ -16,20 +17,22 @@ struct Options {
 
 inline Options parse_options(int argc, char** argv) {
     Options o;
-    bool explicit_tokens = false;
+    bool explicit_tokens = false, explicit_state = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
-            std::cout << "Gated DeltaNet recurrence benchmark\n"
-                         "  --mode running|batch-update|chunked-raw|chunked-normalized|recurrent\n"
-                         "  --tokens T[,T...] or --sweep START:END[:STEP] --qk-heads H "
-                         "--value-heads H --batch B\n"
-                         "  --qk-norm fused|composed (composed requires B=1)\n"
-                         "  --breakdown (chunked stages)\n"
-                         "Running and batch-update call public Ops; other modes and breakdown are "
-                         "private stage analysis.\n"
-                         "chunked-raw normalizes raw Q/K; chunked-normalized consumes "
-                         "pre-normalized BF16 Q/K.\n";
+            std::cout
+                << "Gated DeltaNet recurrence benchmark\n"
+                   "  --mode running|batch-update|chunked-raw|chunked-normalized|recurrent\n"
+                   "  --tokens T[,T...] or --sweep START:END[:STEP] --qk-heads H "
+                   "--value-heads H --batch B\n"
+                   "  --qk-norm fused|composed (composed requires B=1)\n"
+                   "  --breakdown (chunked stages)\n"
+                   "  --state-form distinct|alias (batch default alias, prefill default distinct)\n"
+                   "Running and batch-update call public Ops; other modes and breakdown are "
+                   "private stage analysis.\n"
+                   "chunked-raw normalizes raw Q/K; chunked-normalized consumes "
+                   "pre-normalized BF16 Q/K.\n";
             measurement::help();
             std::exit(0);
         }
@@ -65,11 +68,17 @@ inline Options parse_options(int argc, char** argv) {
             o.value_heads = measurement::integer(value);
         else if (flag == "--batch")
             o.batch = measurement::integer(value);
-        else if (flag == "--qk-norm")
+        else if (flag == "--state-form") {
+            o.state_form   = value;
+            explicit_state = true;
+        } else if (flag == "--qk-norm")
             o.qk_norm = value;
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
+    if (o.state_form != "distinct" && o.state_form != "alias")
+        throw std::invalid_argument("unknown state form");
+    if (!explicit_state && o.mode == Mode::BatchUpdate) o.state_form = "alias";
     if (o.mode == Mode::BatchUpdate && !explicit_tokens) o.tokens = {1};
     if (o.value_heads < o.qk_heads || o.value_heads % o.qk_heads || o.batch > 8 ||
         (o.mode != Mode::BatchUpdate && o.batch != 1))

@@ -470,6 +470,12 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
         rows.push_back(std::move(input));
     }
 
+    // Repeated source selectors share the final represented pool contents, independent of row
+    // inputs.
+    for (int row = 0; row < batch; ++row) {
+        const auto begin = initial_states.begin() + std::size_t(source_slots[row]) * state_size;
+        rows[row].state.assign(begin, begin + state_size);
+    }
     std::vector<gdn_ref::Result> references;
     references.reserve(static_cast<std::size_t>(batch));
     std::vector<bool> written_slots(static_cast<std::size_t>(slots), false);
@@ -765,7 +771,8 @@ int main(int argc, char** argv) {
     });
     const auto add = [&](Case c, unsigned seed, InputPattern pattern = InputPattern::Ordinary,
                          bool inplace = false, std::vector<int> chunks = {}) {
-        const auto id = "gdn/" + std::string(c.name) + "/h" + std::to_string(c.qk_heads) + "/v" +
+        const auto id = (std::string(c.name).starts_with("local") ? "gdn_local/" : "gdn/") +
+                        std::string(c.name) + "/h" + std::to_string(c.qk_heads) + "/v" +
                         std::to_string(c.value_heads) + "/t" + std::to_string(c.tokens) +
                         (c.normalize_qk ? "/normalized" : "/raw") +
                         (inplace ? "/alias" : "/disjoint");
@@ -774,9 +781,42 @@ int main(int argc, char** argv) {
     };
     const auto batch = [&](Case c, std::vector<int> source, std::vector<int> destination, int slots,
                            unsigned seed) {
-        suite.add("gdn/batch/" + std::string(c.name),
-                  [=] { return batch_update_case(c, source, destination, slots, seed); });
+        std::string id =
+            (std::string(c.name).starts_with("local") ? "gdn_batch_local/" : "gdn/batch/") +
+            std::string(c.name) + "/b" + std::to_string(source.size()) +
+            (c.normalize_qk ? "/normalized" : "/raw");
+        for (int x : source) id += "/s" + std::to_string(x);
+        for (int x : destination) id += "/d" + std::to_string(x);
+        suite.add(id, [=] { return batch_update_case(c, source, destination, slots, seed); });
     };
+    for (bool normalize : {false, true}) {
+        for (int t : {1,   2,   3,   4,   5,   6,   7,    8,    9,    10,   11,  12,  13,
+                      14,  15,  16,  17,  31,  32,  33,   63,   64,   65,   127, 128, 129,
+                      255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2048, 4096})
+            for (bool alias : {false, true})
+                add({"local", 8, 24, t, normalize}, 21000U + t, InputPattern::Ordinary, alias);
+        for (int t : {1, 16, 17, 129, 1024})
+            suite.add("gdn_local/graph/t" + std::to_string(t) +
+                          (normalize ? "/normalized" : "/raw"),
+                      [=] { return graph_case({"local-graph", 8, 24, t, normalize}, 1, false); },
+                      {{"execution", "graph"}});
+    }
+    for (auto pattern : {InputPattern::WeakDecay, InputPattern::ZeroDecay, InputPattern::SmallBeta,
+                         InputPattern::NearCollinear, InputPattern::ZeroQuery,
+                         InputPattern::ZeroSignal, InputPattern::ZeroBeta, InputPattern::UnitBeta})
+        for (bool alias : {false, true}) {
+            const char* name = pattern == InputPattern::WeakDecay       ? "local-weak"
+                               : pattern == InputPattern::ZeroDecay     ? "local-zero-decay"
+                               : pattern == InputPattern::SmallBeta     ? "local-small-beta"
+                               : pattern == InputPattern::NearCollinear ? "local-collinear"
+                               : pattern == InputPattern::ZeroQuery     ? "local-zero-query"
+                               : pattern == InputPattern::ZeroSignal    ? "local-zero-signal"
+                               : pattern == InputPattern::ZeroBeta      ? "local-zero-beta"
+                                                                        : "local-unit-beta";
+            add({name, 8, 24, 257, true}, 23001U + static_cast<unsigned>(pattern), pattern, alias);
+        }
+    add({"local-continuation", 8, 24, 1025, true}, 24001U, InputPattern::WeakDecay, true,
+        {15, 17, 992, 1});
     add({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
     add({"27b recurrent", 16, 48, 7, false}, 12007U);
     add({"35b recurrent", 16, 32, 15, true}, 12015U);
@@ -854,6 +894,27 @@ int main(int argc, char** argv) {
         add({"unit beta", 1, 3, 257, normalize}, 14657U, InputPattern::UnitBeta, true);
     }
 
+    for (int b = 1; b <= 8; ++b) {
+        std::vector<int> source(b), alias(b), distinct(b), shared(b, 0), fork(b);
+        for (int row = 0; row < b; ++row) {
+            source[row]   = 2 * row + 2;
+            alias[row]    = source[row];
+            distinct[row] = source[row] + 1;
+            fork[row]     = 2 * row + 1;
+        }
+        for (bool normalize : {false, true}) {
+            batch({"local-ordinary", 8, 24, 1, normalize}, source, alias, 2 * b + 4, 25000U + b);
+            batch({"local-ordinary", 8, 24, 1, normalize}, source, distinct, 2 * b + 4, 25000U + b);
+            batch({"local-fork", 8, 24, 1, normalize}, shared, fork, 2 * b + 4, 26000U + b);
+            batch({"local-near-zero", 8, 24, 1, normalize, true}, source, distinct, 2 * b + 4,
+                  27000U + b);
+            suite.add(
+                "gdn_batch_local/graph/b" + std::to_string(b) +
+                    (normalize ? "/normalized" : "/raw"),
+                [=] { return graph_case({"local-batch-graph", 8, 24, 1, normalize}, b, true); },
+                {{"execution", "graph"}});
+        }
+    }
     // The production decode path updates selected state-pool slots in place at width one.
     batch({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8, 12101u);
     batch({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6}, 8, 12201u);

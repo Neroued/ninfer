@@ -1,4 +1,5 @@
 #include "ops/linear/split/dispatch.h"
+#include "core/platform.h"
 
 #include <stdexcept>
 
@@ -27,13 +28,20 @@ const SplitShape& select_split_shape(ProjectionProfile weights) {
     }
     switch (weights.first.qtype) {
     case QType::BF16: {
-        const std::array shapes{&kBf16SplitN1664K2560, &kBf16SplitN13952K2560,
-                                &kBf16SplitN14336K5120};
+        const std::array shapes{
+#if NINFER_TARGET_SPARK
+            &kBf16SplitN288K4096,  &kBf16SplitN1152K2560,  &kBf16SplitN7296K2560,
+#endif
+            &kBf16SplitN1664K2560, &kBf16SplitN13952K2560, &kBf16SplitN14336K5120};
         return match(shapes, weights);
     }
     case QType::Q8_G32_FP16: {
-        const std::array shapes{&kQ8SplitN12288K2560, &kQ8SplitN16384K2560, &kQ8SplitN9216K2048,
-                                &kQ8SplitN6144K2048,  &kQ8SplitN6144K5120,  &kQ8SplitN12288K2048};
+        const std::array shapes{
+#if NINFER_TARGET_SPARK
+            &kQ8SplitN8192K2560,  &kQ8SplitN6144K2560,  &kQ8SplitN12288K4096,
+#endif
+            &kQ8SplitN12288K2560, &kQ8SplitN16384K2560, &kQ8SplitN9216K2048,
+            &kQ8SplitN6144K2048,  &kQ8SplitN6144K5120,  &kQ8SplitN12288K2048};
         return match(shapes, weights);
     }
     case QType::FP8_E4M3FN_ROW_BF16: {

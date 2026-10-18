@@ -48,8 +48,10 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("unknown activation policy");
     if (o.format == "q4q5" && o.policy != "a16")
         throw std::invalid_argument("paired Q4/Q5 weights use A16");
+    const bool q8_geometry = (o.n == 12288 && o.k == 2048) || (o.n == 16384 && o.k == 2560) ||
+                             (o.n == 8192 && o.k == 2560) || (o.n == 6144 && o.k == 2560);
     const bool supported = o.format == "q8"
-                               ? ((o.n == 12288 && o.k == 2048) || (o.n == 16384 && o.k == 2560))
+                               ? q8_geometry
                                : (o.format == "q4q5" || o.format == "fp8" || o.format == "nvfp4") &&
                                      o.n == 16384 && o.k == 5120;
     if (!supported) throw std::invalid_argument("unsupported format/N/K");
@@ -81,8 +83,10 @@ int main(int argc, char** argv) {
                 first = make_nvfp4_weight(options.n, options.k, 501U);
             weights = ops::SingleProjectionWeight{first.weight, policy};
         }
-        const int tail = (options.n - 4096) / 2;
-        const std::array rows{4096 + tail, tail};
+        const int tail  = (options.n - 4096) / 2;
+        const auto rows = options.n == 6144   ? std::array{3072, 3072}
+                          : options.n == 8192 ? std::array{5120, 3072}
+                                              : std::array{4096 + tail, tail};
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out);
         for (int t : options.tokens) {

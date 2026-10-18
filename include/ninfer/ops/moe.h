@@ -162,7 +162,9 @@ void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile&, const Weigh
                         const Tensor& correction_bias, ExpertRoutes& routes, MemoryArena&,
                         CudaExecutionView);
 
-// F_e(x)=down_e*(SiLU(gate_e*x)*(up_e*x)). Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset.
+// F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with the explicit profile clamp when present.
+// Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
+// geometries support Write to BF16 or FP32, without a scaled shared term.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
 // x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both,
 // routes and encoded planes are 16-byte aligned; mask/shared coefficients are 4-byte aligned.

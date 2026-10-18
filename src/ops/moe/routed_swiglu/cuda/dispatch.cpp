@@ -1,10 +1,16 @@
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/operands.h"
+#include "core/platform.h"
 
 namespace ninfer::ops::detail::moe_routed {
 
 const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     validate_expert_profile(profile);
+#if NINFER_TARGET_SPARK
+    if (profile.ffn.hidden == 4096)
+        return profile.ffn.down_type == QType::NVFP4 ? nvfp4_h4096_i2048_e288_k8()
+                                                     : fp8_h4096_i2048_e288_k8();
+#endif
     switch (profile.ffn.down_type) {
     case QType::FP8_E4M3FN_BLOCK128X128_BF16:
         return fp8_h2560_i640_e512_k10();

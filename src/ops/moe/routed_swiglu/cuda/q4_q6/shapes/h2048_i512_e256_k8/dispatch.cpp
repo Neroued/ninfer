@@ -7,7 +7,7 @@ namespace {
 constexpr int kGroupedFirst = 47;
 constexpr std::array kAllocationBoundaries{kGroupedFirst, 768};
 
-Plan select_plan(int tokens, int shared_intermediate) {
+Plan select_plan(const SwiGLUProfile&, int tokens, int shared_intermediate) {
     const bool shared = shared_intermediate != 0;
     Plan plan;
     plan.integer.grouped = tokens >= kGroupedFirst;

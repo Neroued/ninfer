@@ -8,7 +8,7 @@ constexpr int kGroupedFirst = 20;
 constexpr int kWideFirst    = 384;
 constexpr std::array kAllocationBoundaries{kGroupedFirst, kWideFirst};
 
-Plan select_plan(int tokens, int shared_intermediate) {
+Plan select_plan(const SwiGLUProfile&, int tokens, int shared_intermediate) {
     const bool shared = shared_intermediate != 0;
     Plan plan;
     plan.integer.grouped = tokens >= kGroupedFirst;

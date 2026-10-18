@@ -4,9 +4,9 @@ namespace ninfer::ops::detail::moe_routed {
 namespace {
 using SharedAlgorithm = kernel::block_scaled::SharedAlgorithm;
 
-Plan select_plan(int tokens, int shared_intermediate) {
+Plan select_plan(const SwiGLUProfile&, int tokens, int shared_intermediate) {
     Plan plan;
-    plan.implementation = kernel::ExpertImplementation::BlockScaled;
+    plan.implementation = Implementation::BlockScaled;
     const int columns   = tokens <= 16 ? 8 : tokens <= 128 ? 32 : tokens < 512 ? 64 : 128;
     plan.block_scaled   = {.format                 = QType::NVFP4,
                            .gate_columns           = columns,

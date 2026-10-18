@@ -2,9 +2,9 @@
 
 namespace ninfer::ops::detail::moe_routed {
 namespace {
-Plan select_plan(int tokens, int) {
+Plan select_plan(const SwiGLUProfile&, int tokens, int) {
     Plan plan;
-    plan.implementation = kernel::ExpertImplementation::BlockScaled;
+    plan.implementation = Implementation::BlockScaled;
     const int columns   = tokens <= 16 ? 8 : tokens <= 32 ? 16 : tokens <= 64 ? 32 : 64;
     plan.block_scaled   = {.format                = QType::FP8_E4M3FN_BLOCK128X128_BF16,
                            .gate_columns          = tokens >= 257 ? 128 : columns,

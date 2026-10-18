@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 
-
 namespace ninfer::ops {
 
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
@@ -21,8 +20,9 @@ enum SamplePurpose : std::int32_t {
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
-// Each consumed position must have at least one legal token. The caller carries dead-end status
-// separately and supplies a safe filler for dead/unreachable speculative positions.
+// Empty support is permitted only where the consuming Op defines it. sample() and
+// speculative_accept_* require a legal token at each consumed position; their caller carries
+// dead-end status separately and supplies safe filler for dead/unreachable positions.
 struct SamplingMask {
     const std::uint32_t* words = nullptr;
     std::int32_t stride        = 0;
@@ -92,5 +92,17 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,
                             CudaExecutionView execution);
+
+// Adds the first valid_columns[b] IDs from I32 token_ids [T,B] to count slot slots[b] in
+// I32 token_counts [V,S]. T,V,S>0, B=1..8; valid_columns/slots are contiguous I32 [B].
+// 0<=valid_columns[b]<=T; live rows have slots[b] in [0,S). IDs are in [0,V), and counts
+// remain representable in I32. A zero-length row reads neither IDs
+// nor its slot. Repeated IDs or slots add all occurrences atomically. Inputs are contiguous;
+// counts has contiguous vocabulary entries and a non-overlapping, naturally aligned slot
+// stride. All storage belongs to execution.device(); counts overlaps no input. Only the
+// addressed counts change. Device metadata is replayable; no workspace or allocation.
+void increment_token_counts_batch(const Tensor& token_ids, const Tensor& valid_columns,
+                                  const Tensor& slots, Tensor& token_counts,
+                                  CudaExecutionView execution);
 
 } // namespace ninfer::ops

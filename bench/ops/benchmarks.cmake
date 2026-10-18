@@ -50,6 +50,7 @@ ninfer_add_op_bench(ninfer_sliding_window_attention_bench
 ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/kv_cache_append_bench.cu")
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
+ninfer_add_op_bench(ninfer_vocabulary_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/vocabulary_bench.cu")
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/main.cu")
 ninfer_add_op_bench(ninfer_moe_block_scaled_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/block_scaled.cu")

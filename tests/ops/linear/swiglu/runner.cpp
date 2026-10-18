@@ -7,6 +7,7 @@
 #include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/linear_common.h"
+#include "ops/linear/weights.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -17,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -29,7 +31,14 @@ namespace {
 using linear_common::checked_elements;
 
 // The public policy determines the criterion, independently of the selected arithmetic.
-constexpr ReductionCriterion tolerance_for(ops::LinearPolicy policy) {
+constexpr ReductionCriterion tolerance_for(ops::LinearPolicy policy, bool clamped = false) {
+    if (clamped) {
+        // The tiny absolute allowance also detects an erroneous lower gate clamp at -10.
+        // Policy, rather than the private arithmetic or token count, fixes the criterion.
+        if (policy == ops::LinearPolicy::AllowA4) return {1.6e-1, 1.0e-7, 1.6e-1};
+        if (policy == ops::LinearPolicy::AllowA8) return {8.0e-2, 1.0e-7, 1.2e-1};
+        return {1.0 / 256, 1.0e-7, 2.0 / 256};
+    }
     switch (policy) {
     case ops::LinearPolicy::A16Only:
         return {3.3e-3, 5.0e-3, 6.3e-3};
@@ -61,7 +70,10 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     const bool native_float_weight =
         profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16;
     const float dense_scale =
-        profile.qtype == QType::Q4_G64_FP16 ? 1.25e-4F : (native_float_weight ? 1.0e-3F : 1.0e-5F);
+        profile.qtype == QType::BF16
+            ? 2.0e-2F
+            : (profile.qtype == QType::Q4_G64_FP16 ? 1.25e-4F
+                                                   : (native_float_weight ? 1.0e-3F : 1.0e-5F));
     for (std::int32_t column = 0; column < profile.input_rows; ++column) {
         const std::uint64_t mixed = mix64((static_cast<std::uint64_t>(profile.seed) << 32) |
                                           static_cast<std::uint32_t>(column));
@@ -73,7 +85,10 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
 
     constexpr std::int32_t kNonzerosPerSparseToken = 4;
     const float sparse_scale =
-        profile.qtype == QType::Q4_G64_FP16 ? 1.5e-2F : (native_float_weight ? 2.0e-2F : 1.5e-3F);
+        profile.qtype == QType::BF16
+            ? 5.0e-1F
+            : (profile.qtype == QType::Q4_G64_FP16 ? 1.5e-2F
+                                                   : (native_float_weight ? 2.0e-2F : 1.5e-3F));
     for (std::int32_t token = 1; token < tokens; ++token) {
         for (std::int32_t lane = 0; lane < kNonzerosPerSparseToken; ++lane) {
             const std::uint64_t mixed =
@@ -147,8 +162,12 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                     }
                 }
                 for (std::int32_t token = 0; token < tokens; ++token) {
-                    const double fused = silu_fp64(gate[static_cast<std::size_t>(token)]) *
-                                         up[static_cast<std::size_t>(token)];
+                    const double g     = gate[static_cast<std::size_t>(token)];
+                    const double u     = up[static_cast<std::size_t>(token)];
+                    const double limit = profile.clamp_limit;
+                    const double fused =
+                        limit > 0 ? silu_fp64(std::min(g, limit)) * std::clamp(u, -limit, limit)
+                                  : silu_fp64(g) * u;
                     output[static_cast<std::size_t>(token) * profile.output_rows + row] = fused;
                 }
             }
@@ -170,14 +189,14 @@ std::vector<double> read_bf16_output(const test::GuardedDeviceBuffer& output,
 }
 
 int compare_output(std::string_view label, const std::vector<double>& actual,
-                   const double* reference, ops::LinearPolicy policy) {
+                   const double* reference, ops::LinearPolicy policy, bool clamped = false) {
     if (actual.empty() || reference == nullptr) {
         std::cerr << label << ": invalid numerical comparison\n";
         return 1;
     }
 
     return verify_reduction(label, actual, std::span<const double>(reference, actual.size()),
-                            tolerance_for(policy));
+                            tolerance_for(policy, clamped));
 }
 
 int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& device,
@@ -224,8 +243,13 @@ static int run_profile(std::string_view label, const Profile& profile,
         weight_options.weight_scale_divisor = 0.125F;
         weight_options.input_scale_divisor  = 3.5F;
     }
-    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    quantized_weight::PackedWeight host_weight =
+        profile.qtype == QType::BF16
+            ? linear_weights::make_bf16_weight(profile.gate_up_rows, profile.input_rows,
+                                               profile.seed)
+            : quantized_weight::make_patterned_weight(profile.qtype, profile.gate_up_rows,
+                                                      profile.input_rows, profile.seed,
+                                                      weight_options);
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =
         linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
@@ -290,13 +314,30 @@ static int run_profile(std::string_view label, const Profile& profile,
             }
             return;
         }
+        if (profile.clamp_limit > 0 && tokens == 1 && !replay) {
+            output.fill(0x5a);
+            for (float invalid : {0.0f, -1.0f, std::numeric_limits<float>::infinity(),
+                                  std::numeric_limits<float>::quiet_NaN()}) {
+                try {
+                    ops::linear_swiglu(x, weight, destination, invalid, policy, workspace,
+                                                cuda_environment().default_execution);
+                    ++failures;
+                } catch (const std::invalid_argument&) {}
+            }
+            std::vector<std::uint8_t> preserved(output.bytes(), 0x5a);
+            failures += verify_unchanged("invalid clamp preserves output", output, preserved.data(),
+                                                  preserved.size());
+        }
         workspace.reset();
         workspace.reset_peak();
         const auto cuda =
             replay ? graph_context->execution_view() : cuda_environment().default_execution;
         const auto stream = cuda.stream();
         const auto launch = [&] {
-            if (call.form == CallForm::Convenience)
+            if (profile.clamp_limit > 0)
+                ops::linear_swiglu(x, weight, destination, profile.clamp_limit, policy, workspace,
+                                            cuda);
+            else if (call.form == CallForm::Convenience)
                 ops::linear_swiglu(x, weight, destination, workspace, cuda);
             else
                 ops::linear_swiglu(x, weight, destination, policy, workspace, cuda);
@@ -333,7 +374,8 @@ static int run_profile(std::string_view label, const Profile& profile,
                 failures += output.verify_guards(label_case);
                 failures += scratch.verify_guards(label_case + " workspace");
                 const auto actual = read_bf16_output(output, elements);
-                failures += compare_output(label_case, actual, expected.data(), profile.policy);
+                failures += compare_output(label_case, actual, expected.data(), profile.policy,
+                                                    profile.clamp_limit > 0);
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                           input_bits.data(),
@@ -363,7 +405,7 @@ static int run_profile(std::string_view label, const Profile& profile,
 
 int run_negative_gate(std::string_view label, const quantized_weight::PackedWeight& packed,
                       ops::LinearPolicy policy, std::span<const std::int32_t> token_cases,
-                      std::span<const std::int32_t> active_columns) {
+                      std::span<const std::int32_t> active_columns, float clamp_limit = 0.0f) {
     validate_tokens(token_cases);
     const std::int32_t rows           = packed.weight.n;
     const std::int32_t k              = packed.weight.k;
@@ -385,7 +427,10 @@ int run_negative_gate(std::string_view label, const quantized_weight::PackedWeig
         gate += quantized_weight::logical_weight_fp64(packed, 0, column);
         up += quantized_weight::logical_weight_fp64(packed, half, column);
     }
-    const double ideal = gate / (1.0 + std::exp(-gate)) * up;
+    const double limit = clamp_limit;
+    const double ideal = limit > 0
+                             ? silu_fp64(std::min(gate, limit)) * std::clamp(up, -limit, limit)
+                             : silu_fp64(gate) * up;
 
     test::GuardedDeviceBuffer weights(packed.payload.size());
     test::GuardedDeviceBuffer input_storage(activation.size() * sizeof(std::uint16_t));
@@ -404,15 +449,19 @@ int run_negative_gate(std::string_view label, const quantized_weight::PackedWeig
 
         Tensor input(input_storage.span(), DType::BF16, {k, tokens});
         Tensor output(output_storage.span(), DType::BF16, {half, tokens});
-        ops::linear_swiglu(input, weight, output, policy, workspace,
-                           ninfer::test::cuda_environment().default_execution);
+        if (clamp_limit > 0)
+            ops::linear_swiglu(input, weight, output, clamp_limit, policy, workspace,
+                               ninfer::test::cuda_environment().default_execution);
+        else
+            ops::linear_swiglu(input, weight, output, policy, workspace,
+                               ninfer::test::cuda_environment().default_execution);
         test::cuda_synchronize();
         const auto elements = checked_elements(half, tokens, "output size");
         const auto actual   = read_bf16_output(output_storage, elements);
         const std::vector<double> reference(elements, ideal);
         failures +=
             verify_reduction(std::string(label) + " negative gate T=" + std::to_string(tokens),
-                             actual, reference, tolerance_for(policy));
+                             actual, reference, tolerance_for(policy, clamp_limit > 0));
         failures += output_storage.verify_guards(label);
         failures += scratch.verify_guards(label);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) ++failures;
@@ -426,13 +475,15 @@ void add_profile(Suite& suite, const Profile& profile, std::span<const std::int3
     for (int t : tokens) calls.push_back({t});
     for (int t : graphs) calls.push_back({t, true});
     if (profile.policy == ops::LinearPolicy::A16Only) {
-        calls.push_back(
-            {profile.qtype == QType::NVFP4 ? 16 : tokens.front(), false, CallForm::Convenience});
+        if (profile.clamp_limit == 0)
+            calls.push_back({profile.qtype == QType::NVFP4 ? 16 : tokens.front(), false,
+                             CallForm::Convenience});
         if (profile.qtype == QType::NVFP4) calls.push_back({17, false, CallForm::RejectA16Extent});
     }
     std::vector<linear_suite::Case> cases;
     for (auto& call : calls) {
-        const std::string recipe = "s" + std::to_string(profile.seed) + "/dense-sparse/" +
+        const std::string recipe = "s" + std::to_string(profile.seed) +
+                                   (profile.clamp_limit > 0 ? "/clamped/" : "/dense-sparse/") +
                                    (call.form == CallForm::Convenience       ? "convenience"
                                     : call.form == CallForm::RejectA16Extent ? "reject-extent"
                                                                              : "policy");
@@ -468,7 +519,7 @@ void add_negative_gate(Suite& suite, const Profile& profile, std::span<const std
                   std::vector<int> chosen;
                   for (auto index : selected) chosen.push_back(owned_tokens[index]);
                   return run_negative_gate("negative-gate", make_weight(), profile.policy, chosen,
-                                           owned_columns);
+                                           owned_columns, profile.clamp_limit);
               });
 }
 

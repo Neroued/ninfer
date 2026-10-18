@@ -3,6 +3,21 @@
 #include "ops/linear/swiglu/token_major_mma_epilogue.cuh"
 
 namespace ninfer::ops::detail {
+struct SwiGluProduct {
+    __device__ __forceinline__ float operator()(float gate, float up) const {
+        return common::silu(gate) * up;
+    }
+};
+
+struct ClampedSwiGluProduct {
+    float limit;
+
+    __device__ __forceinline__ float operator()(float gate, float up) const {
+        return common::silu(fminf(gate, limit)) * fmaxf(-limit, fminf(up, limit));
+    }
+};
+
+
 template <int RowsPerBranch, int IntermediateRows = 0>
 struct SwiGluBranchRows {
     static_assert(RowsPerBranch > 0 && (RowsPerBranch & (RowsPerBranch - 1)) == 0);

@@ -83,3 +83,5 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 endif()
+
+ninfer_add_op_bench(ninfer_linear_swiglu_clamped_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_swiglu_clamped.cu")

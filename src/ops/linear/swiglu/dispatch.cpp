@@ -1,8 +1,13 @@
+#include "core/platform.h"
 #include "ops/linear/swiglu/dispatch.h"
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 void validate_swiglu_geometry(QType type, int rows, int k) {
+#if NINFER_TARGET_SPARK
+    if (type == QType::NVFP4 && rows == 12288 && k == 4096) return;
+    if (type == QType::BF16 && rows == 2048 && k == 4096) return;
+#endif
     if (type == QType::Q8_G32_FP16 && rows == 12288 && k == 2048) return;
     if (rows == 34816 && k == 5120 &&
         (type == QType::Q4_G64_FP16 || type == QType::Q8_G32_FP16 ||

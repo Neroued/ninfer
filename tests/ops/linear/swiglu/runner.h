@@ -32,6 +32,7 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ops::LinearPolicy policy;
+    float clamp_limit = 0.0f;
 };
 
 void add_profile(Suite& suite, const Profile& profile, std::span<const std::int32_t> token_cases,
@@ -41,6 +42,7 @@ void add_negative_gate(Suite& suite, const Profile& profile, std::span<const std
                        std::span<const std::int32_t> active_columns,
                        std::function<quantized_weight::PackedWeight()> make_weight);
 
+void add_bf16_cases(Suite& suite);
 void add_q4_cases(Suite& suite);
 void add_q8_cases(Suite& suite);
 void add_nvfp4_cases(Suite& suite);

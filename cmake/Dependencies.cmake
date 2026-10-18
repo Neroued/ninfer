@@ -17,6 +17,11 @@ if(NINFER_BUILD_ENGINE)
 endif()
 
 if(NINFER_BUILD_PRODUCT_SUPPORT)
+  add_library(ninfer::toml INTERFACE IMPORTED GLOBAL)
+  target_include_directories(ninfer::toml INTERFACE
+    ${PROJECT_SOURCE_DIR}/third_party/tomlplusplus)
+  target_compile_features(ninfer::toml INTERFACE cxx_std_17)
+
   # Media acquisition uses CURLOPT_PROTOCOLS_STR and CURLOPT_REDIR_PROTOCOLS_STR,
   # introduced in libcurl 7.85 (not merely the version of the maintainer environment).
   pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)

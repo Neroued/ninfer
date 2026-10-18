@@ -346,15 +346,21 @@ int test_prompt_cache_policy_after_history_resolution() {
         resolve_openai_responses_prompt(followup.prompt, store, "resp_second", true);
     const auto second_prompt = to_prompt_input(second.generation, ResolvedPromptSemantics{}, {});
     failures += check(
-        second_prompt.context_cache.markers.size() == 2 &&
-            second_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
-            second_prompt.context_cache.markers[0].after_message_count == 2 &&
-            second_prompt.context_cache.markers[0].evidence == Evidence::ExplicitBoundary &&
+        second_prompt.context_cache.markers.size() == 3 &&
+            // #142: the leading instruction turn is a Developer turn; the
+            // automatic system/developer-frontier candidate now marks it.
+            second_prompt.context_cache.markers[0].location == Location::MessageBoundary &&
+            second_prompt.context_cache.markers[0].after_message_count == 1 &&
+            second_prompt.context_cache.markers[0].evidence == Evidence::DefaultAutomatic &&
             second_prompt.context_cache.markers[1].location == Location::MessagePartBoundary &&
-            second_prompt.context_cache.markers[1].after_message_part_count == 1 &&
-            second_prompt.context_cache.markers[1].after_message_count == 4 &&
-            second_prompt.context_cache.markers[1].evidence == Evidence::DefaultAutomatic,
-        "previous_response_id preserves explicit history and caches only the new implicit tail");
+            second_prompt.context_cache.markers[1].after_message_count == 2 &&
+            second_prompt.context_cache.markers[1].evidence == Evidence::ExplicitBoundary &&
+            second_prompt.context_cache.markers[2].location == Location::MessagePartBoundary &&
+            second_prompt.context_cache.markers[2].after_message_part_count == 1 &&
+            second_prompt.context_cache.markers[2].after_message_count == 4 &&
+            second_prompt.context_cache.markers[2].evidence == Evidence::DefaultAutomatic,
+        "previous_response_id preserves explicit history, marks the instruction "
+        "head, and caches only the new implicit tail");
     const auto parent       = store.get("resp_parent");
     const auto parent_turns = flatten_openai_response_context(parent->context);
     failures +=

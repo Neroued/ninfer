@@ -29,15 +29,16 @@ struct Weights {
 
 struct Fixture {
     Fixture(const Options& o, const ops::ProjectionWeights& weights, int t)
-        : options(o), weights(weights), tokens(t), value_rows((o.n - 4096) / 2),
-          channels(4096 + value_rows), columns(t * o.batch), slots(columns + o.batch),
+        : options(o), weights(weights), tokens(t), query_rows(o.query_rows),
+          value_rows((o.n - 2 * query_rows) / 2), channels(2 * query_rows + value_rows),
+          columns(t * o.batch), slots(columns + o.batch),
           x(make_bf16(std::size_t(o.k) * columns, 101U)),
           z(make_zeros(std::size_t(value_rows) * columns * 2)),
           conv(make_bf16(std::size_t(channels) * 4, 103U)),
           history(make_bf16(std::size_t(channels) * 3 * slots, 107U)),
           saved(o.op == "snapshot" ? std::make_unique<SavedBuffer>(history) : nullptr),
-          q(make_zeros(std::size_t(2048) * columns * 2)),
-          k(make_zeros(std::size_t(2048) * columns * 2)),
+          q(make_zeros(std::size_t(query_rows) * columns * 2)),
+          k(make_zeros(std::size_t(query_rows) * columns * 2)),
           v(make_zeros(std::size_t(value_rows) * columns * 2)),
           records(o.op == "record" ? make_zeros(std::size_t(channels) * columns * 2)
                                    : DeviceBuffer{}),
@@ -74,8 +75,8 @@ struct Fixture {
             src(source.span(), DType::I32, {b}), dst(base.span(), DType::I32, {b});
         Tensor mask;
         if (valid.data()) mask = Tensor(valid.span(), DType::I32, {b});
-        ops::GdnConvOutputs out{Tensor(q.span(), DType::BF16, {2048, tokens, b}),
-                                Tensor(k.span(), DType::BF16, {2048, tokens, b}),
+        ops::GdnConvOutputs out{Tensor(q.span(), DType::BF16, {query_rows, tokens, b}),
+                                Tensor(k.span(), DType::BF16, {query_rows, tokens, b}),
                                 Tensor(v.span(), DType::BF16, {value_rows, tokens, b}),
                                 Tensor(z.span(), DType::BF16, {value_rows, tokens, b})};
         if (options.op == "snapshot")
@@ -90,7 +91,7 @@ struct Fixture {
 
     const Options& options;
     const ops::ProjectionWeights& weights;
-    int tokens, value_rows, channels, columns, slots;
+    int tokens, query_rows, value_rows, channels, columns, slots;
     DeviceBuffer x;
     DeviceBuffer z;
     DeviceBuffer conv;

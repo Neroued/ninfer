@@ -85,15 +85,15 @@ struct SnapshotOracle {
 };
 
 template <class Projection>
-SnapshotOracle snapshot_oracle(std::int32_t value_rows, std::int32_t tokens,
-                               const std::vector<float>& conv_weight,
-                               std::span<const std::uint16_t> initial_state,
-                               Projection&& projection, bool full_reference = false) {
-    const std::int32_t channels = kQueryRows + kKeyRows + value_rows;
+SnapshotOracle
+snapshot_oracle(std::int32_t value_rows, std::int32_t tokens, const std::vector<float>& conv_weight,
+                std::span<const std::uint16_t> initial_state, Projection&& projection,
+                bool full_reference = false, int qk_rows = kQueryRows) {
+    const std::int32_t channels = qk_rows + qk_rows + value_rows;
     SnapshotOracle oracle;
     const std::int32_t sample_count                = snapshot_sample_count(tokens, full_reference);
-    const std::vector<std::int32_t> query_rows     = sampled_rows(kQueryRows, sample_count);
-    const std::vector<std::int32_t> key_rows       = sampled_rows(kKeyRows, sample_count);
+    const std::vector<std::int32_t> query_rows     = sampled_rows(qk_rows, sample_count);
+    const std::vector<std::int32_t> key_rows       = sampled_rows(qk_rows, sample_count);
     const std::vector<std::int32_t> value_selected = sampled_rows(value_rows, sample_count);
     const std::size_t sampled_channel_count =
         query_rows.size() + key_rows.size() + value_selected.size();
@@ -125,16 +125,17 @@ SnapshotOracle snapshot_oracle(std::int32_t value_rows, std::int32_t tokens,
     };
 
     for (const std::int32_t row : query_rows) { evaluate(row, oracle.query); }
-    for (const std::int32_t row : key_rows) { evaluate(kQueryRows + row, oracle.key); }
+    for (const std::int32_t row : key_rows) { evaluate(qk_rows + row, oracle.key); }
     for (const std::int32_t row : value_selected) {
-        evaluate(kQueryRows + kKeyRows + row, oracle.value);
+        evaluate(qk_rows + qk_rows + row, oracle.value);
     }
     return oracle;
 }
 
 std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::int32_t channels,
                                  std::int32_t value_rows, std::int32_t tokens,
-                                 std::int32_t snapshot_base_slot, bool full_reference = false) {
+                                 std::int32_t snapshot_base_slot, bool full_reference = false,
+                                 int qk_rows = kQueryRows) {
     std::vector<double> gathered;
     const auto append = [&](std::int32_t global_row) {
         for (std::int32_t token = 0; token < tokens; ++token) {
@@ -147,12 +148,10 @@ std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::in
         }
     };
     const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
-    for (const std::int32_t row : sampled_rows(kQueryRows, sample_count)) { append(row); }
-    for (const std::int32_t row : sampled_rows(kKeyRows, sample_count)) {
-        append(kQueryRows + row);
-    }
+    for (const std::int32_t row : sampled_rows(qk_rows, sample_count)) { append(row); }
+    for (const std::int32_t row : sampled_rows(qk_rows, sample_count)) { append(qk_rows + row); }
     for (const std::int32_t row : sampled_rows(value_rows, sample_count)) {
-        append(kQueryRows + kKeyRows + row);
+        append(qk_rows + qk_rows + row);
     }
     return gathered;
 }
@@ -288,14 +287,15 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
                      std::int32_t z_rows, std::int32_t width, std::int32_t batch,
                      std::vector<std::int32_t> valid_columns, const std::vector<float>& conv_weight,
                      std::size_t workspace_bytes, const ReductionCriterion& criterion,
-                     ProjectQkv&& project_qkv, ProjectZ&& project_z, Launch&& launch) {
-    const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
+                     ProjectQkv&& project_qkv, ProjectZ&& project_z, Launch&& launch,
+                     int qk_rows = kQueryRows, bool graph = false, bool full_reference = false) {
+    const std::int32_t channels          = qk_rows + qk_rows + value_rows;
     const std::int32_t aggregate_columns = width * batch;
     const std::int32_t slots             = aggregate_columns + batch;
     const std::size_t slot_stride        = static_cast<std::size_t>(channels) * 3;
-    const std::vector<float> activation =
+    std::vector<float> activation =
         make_bf16_activation(hidden, aggregate_columns, 1103U + width + batch);
-    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    std::vector<std::uint16_t> activation_bits        = bf16_bits(activation);
     const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
 
     std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
@@ -324,8 +324,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     if (!valid_columns.empty()) { device_valid = to_device(valid_columns); }
     GuardedBf16Tensor state(channels * 3, slots);
     state.copy_from_bits(state_before);
-    GuardedBf16Tensor query(kQueryRows, aggregate_columns);
-    GuardedBf16Tensor key(kKeyRows, aggregate_columns);
+    GuardedBf16Tensor query(qk_rows, aggregate_columns);
+    GuardedBf16Tensor key(qk_rows, aggregate_columns);
     GuardedBf16Tensor value(value_rows, aggregate_columns);
     GuardedBf16Tensor z(z_rows, aggregate_columns);
 
@@ -338,16 +338,49 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     if (!valid_columns.empty()) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     Tensor initial(device_initial.span(), DType::I32, {batch});
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {batch});
-    Tensor q(query.span(), DType::BF16, {kQueryRows, width, batch});
-    Tensor k(key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor q(query.span(), DType::BF16, {qk_rows, width, batch});
+    Tensor k(key.span(), DType::BF16, {qk_rows, width, batch});
     Tensor v(value.span(), DType::BF16, {value_rows, width, batch});
     Tensor z_output(z.span(), DType::BF16, {z_rows, width, batch});
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(1, workspace_bytes));
     MemoryArena workspace(workspace_storage.span());
 
-    launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace);
-    cuda_synchronize();
+    const auto invoke = [&](CudaExecutionView execution) {
+        launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace,
+               execution);
+    };
+    if (graph) {
+        cudaStream_t stream;
+        cudaGraph_t captured;
+        cudaGraphExec_t executable;
+        cuda_synchronize();
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        invoke(cuda_environment().context.execution_view(stream));
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        history.upload();
+        if (!valid_columns.empty()) {
+            valid_columns[0] = width > 1 ? width - 1 : 1;
+            CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
+                                       device_valid.size(), cudaMemcpyHostToDevice, stream));
+        }
+        activation      = make_bf16_activation(hidden, aggregate_columns, 1783U + width + batch);
+        activation_bits = bf16_bits(activation);
+        CUDA_CHECK(cudaMemcpyAsync(device_activation.data(), activation_bits.data(),
+                                   device_activation.size(), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(captured));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    } else {
+        invoke(cuda_environment().default_execution);
+        cuda_synchronize();
+    }
 
     int failures                           = 0;
     const std::vector<double> query_values = query.values();
@@ -377,23 +410,25 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
             slot_stride;
         const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
                                                            slot_stride);
-        const SnapshotOracle oracle =
-            snapshot_oracle(value_rows, valid_extent, conv_weight, initial_state,
-                            [&](std::int32_t row, std::int32_t column) {
-                                return project_qkv(row, batch_row * width + column, activation);
-                            });
-        const std::int32_t sample_count = snapshot_sample_count(valid_extent);
-        append(query_actual, gather_batch_rows(query_values, kQueryRows, kQueryRows, width,
-                                               batch_row, valid_extent, sample_count));
+        const SnapshotOracle oracle = snapshot_oracle(
+            value_rows, valid_extent, conv_weight, initial_state,
+            [&](std::int32_t row, std::int32_t column) {
+                return project_qkv(row, batch_row * width + column, activation);
+            },
+            full_reference, qk_rows);
+        const std::int32_t sample_count = snapshot_sample_count(valid_extent, full_reference);
+        append(query_actual, gather_batch_rows(query_values, qk_rows, qk_rows, width, batch_row,
+                                               valid_extent, sample_count));
         append(query_expected, oracle.query);
-        append(key_actual, gather_batch_rows(key_values, kKeyRows, kKeyRows, width, batch_row,
+        append(key_actual, gather_batch_rows(key_values, qk_rows, qk_rows, width, batch_row,
                                              valid_extent, sample_count));
         append(key_expected, oracle.key);
         append(value_actual, gather_batch_rows(value_values, value_rows, value_rows, width,
                                                batch_row, valid_extent, sample_count));
         append(value_expected, oracle.value);
         append(state_actual, gather_state(state_after, channels, value_rows, valid_extent,
-                                          snapshot_bases[static_cast<std::size_t>(batch_row)]));
+                                          snapshot_bases[static_cast<std::size_t>(batch_row)],
+                                          full_reference, qk_rows));
         append(state_expected, oracle.state);
 
         std::vector<double> row_z_expected;
@@ -426,10 +461,10 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     failures += key.verify_fully_written(std::string(label) + " key");
     failures += value.verify_fully_written(std::string(label) + " value");
     failures += z.verify_fully_written(std::string(label) + " z");
-    failures += verify_zero_tail(std::string(label) + " query", query, kQueryRows, width, batch,
+    failures += verify_zero_tail(std::string(label) + " query", query, qk_rows, width, batch,
                                  valid_columns);
     failures +=
-        verify_zero_tail(std::string(label) + " key", key, kKeyRows, width, batch, valid_columns);
+        verify_zero_tail(std::string(label) + " key", key, qk_rows, width, batch, valid_columns);
     failures += verify_zero_tail(std::string(label) + " value", value, value_rows, width, batch,
                                  valid_columns);
     failures += verify_batched_state_effects(label, state_before, state_after, channels, slots,
@@ -905,7 +940,7 @@ namespace ninfer::test::gdn_input_conv {
 int run_snapshot(Weights& weights, const SnapshotCase& c) {
     const auto p      = weights.profile;
     const int initial = c.initial < 0 ? c.width + 1 : c.initial;
-    if (!c.batch) {
+    if (!c.batch && p.qk_rows == 2048) {
         switch (p.format) {
         case QType::Q4_G64_FP16:
             return run_q4_q5_case(weights.first, *weights.second, c.width, initial,
@@ -921,11 +956,11 @@ int run_snapshot(Weights& weights, const SnapshotCase& c) {
             throw std::logic_error("unknown snapshot test format");
         }
     }
-    const int channels    = 4096 + p.value_rows();
+    const int channels    = 2 * p.qk_rows + p.value_rows();
     const auto conv       = make_conv_weight(channels, c.conv_seed);
     const auto projection = weights.projection(c.policy);
     const auto capacity   = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        projection, c.batch, c.width, c.width);
+        projection, c.batch ? c.batch : 1, c.width, c.width);
     const auto criterion =
         p.format == QType::Q8_G32_FP16 ? kQ8GdnInputProjConvSnapshotA16Tolerance
         : p.format == QType::FP8_E4M3FN_ROW_BF16
@@ -935,8 +970,8 @@ int run_snapshot(Weights& weights, const SnapshotCase& c) {
                                                  : kGdnInputProjConvSnapshotA16Tolerance;
     return run_batched_case(
         std::string(p.name) + "/w" + std::to_string(c.width) + "/b" + std::to_string(c.batch),
-        p.hidden, p.value_rows(), p.value_rows(), c.width, c.batch, c.valid, conv, capacity,
-        criterion,
+        p.hidden, p.value_rows(), p.value_rows(), c.width, c.batch ? c.batch : 1, c.valid, conv,
+        capacity, criterion,
         [&](int row, int column, const std::vector<float>& x) {
             return weights.project(row, x.data() + std::size_t(column) * p.hidden);
         },
@@ -945,10 +980,10 @@ int run_snapshot(Weights& weights, const SnapshotCase& c) {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& bases, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
-            MemoryArena& arena) {
+            MemoryArena& arena, CudaExecutionView execution) {
             ops::gdn_input_proj_conv_snapshot(x, projection, conv, {state, initial, bases}, valid,
-                                              {q, k, v, z}, arena,
-                                              cuda_environment().default_execution);
-        });
+                                              {q, k, v, z}, arena, execution);
+        },
+        p.qk_rows, c.graph, c.full_reference);
 }
 } // namespace ninfer::test::gdn_input_conv

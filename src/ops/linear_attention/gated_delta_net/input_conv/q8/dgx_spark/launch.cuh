@@ -19,6 +19,10 @@ void launch_q8_gdn_tma_n16384_k2560_record(const Tensor& x, const Weight& weight
                                            Tensor& record, Tensor& query, Tensor& key,
                                            Tensor& value, Tensor& z, cudaStream_t stream);
 
+void launch_q8_gdn_n8192_k2560_full(const Q8LinearOperands& operands,
+                                    LinearBf16SegmentedOutput<5120, 3072> output,
+                                    cudaStream_t stream);
+
 void launch_q8_gdn_n16384_k2560_full(const Q8LinearOperands& operands,
                                      LinearBf16SegmentedOutput<10240, 6144> output,
                                      cudaStream_t stream);

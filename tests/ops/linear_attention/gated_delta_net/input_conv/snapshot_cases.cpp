@@ -25,6 +25,24 @@ std::vector<SnapshotCase> cases(Profile p) {
                           .valid     = std::move(valid),
                           .conv_seed = seed});
     };
+    if (p.qk_rows == 1024) {
+        for (int t = 1; t <= 16; ++t)
+            result.push_back({.width          = t,
+                              .graph          = t == 1 || t == 6 || t == 16,
+                              .full_reference = t == 1 || t == 6,
+                              .batch          = 1});
+        for (int t : {17,  31,  32,  33,  63,  64,  65,  95,   96,   97,   127,  128, 129,
+                      191, 192, 193, 256, 511, 512, 513, 1023, 1024, 1025, 2048, 4096})
+            result.push_back({.width = t, .graph = t == 33 || t == 512 || t == 4096, .batch = 1});
+        for (int b = 2; b <= 8; ++b)
+            for (int t = 1; t <= 16; ++t) {
+                std::vector<int> valid(b);
+                for (int i = 0; i < b; ++i) valid[i] = t - i % t;
+                batch(t, b, std::move(valid), 739);
+                result.back().graph = (b == 2 && t == 6) || (b == 8 && t == 16);
+            }
+        return result;
+    }
     if (p.format == QType::Q4_G64_FP16) {
         for (int t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 32, 33, 64})
             result.push_back(
@@ -127,6 +145,22 @@ int snapshot_capacity_contract() {
             }
         }
     }
+#if NINFER_TARGET_SPARK
+    for (int b = 1; b <= 8; ++b)
+        for (int first = 1; first <= 16; ++first) {
+            std::size_t peak = 0;
+            for (int last = first; last <= 16; ++last) {
+                const auto capacity = [&](int lo, int hi) {
+                    return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                        ops::SingleProjectionWeight{
+                            capacity_weight(QType::Q8_G32_FP16, 8192, 2560)},
+                        b, lo, hi);
+                };
+                peak = std::max(peak, capacity(last, last));
+                if (peak != capacity(first, last)) ++failures;
+            }
+        }
+#endif
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{capacity_weight(QType::NVFP4, 16384, 5120),
                                     ops::LinearPolicy::AllowA4},
@@ -174,7 +208,11 @@ int snapshot_capacity_contract() {
 int main(int argc, char** argv) {
     OpSuite suite;
     suite.add("gdn_input_snapshot/capacity", snapshot_capacity_contract);
-    for (auto profile : profiles) {
+    std::vector<Profile> selected_profiles(std::begin(profiles), std::end(profiles));
+#if NINFER_TARGET_SPARK
+    selected_profiles.push_back(local_profile);
+#endif
+    for (auto profile : selected_profiles) {
         const auto tests = cases(profile);
         std::vector<OpCase> catalogue;
         for (auto c : tests) {

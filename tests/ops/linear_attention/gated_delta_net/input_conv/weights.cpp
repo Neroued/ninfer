@@ -25,7 +25,7 @@ quantized_weight::PackedWeight make_first(Profile p, bool record) {
         options.weight_scale_divisor = 0.125F;
         options.input_scale_divisor  = 3.5F;
     }
-    const int rows = p.format == QType::Q4_G64_FP16 ? 4096 : 4096 + 2 * p.value_rows();
+    const int rows = p.format == QType::Q4_G64_FP16 ? 4096 : 2 * p.qk_rows + 2 * p.value_rows();
     return quantized_weight::make_patterned_weight(p.format, rows, p.hidden, seed, options);
 }
 } // namespace

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/platform.h"
+
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/suite.h"
@@ -13,7 +15,9 @@ struct Profile {
     int hidden;
     const char* name;
 
-    int value_rows() const { return hidden == 2048 ? 4096 : 6144; }
+    int qk_rows = 2048;
+
+    int value_rows() const { return qk_rows == 1024 ? 3072 : (hidden == 2048 ? 4096 : 6144); }
 };
 
 inline constexpr Profile profiles[]{{QType::Q4_G64_FP16, 5120, "q4_q5"},
@@ -21,6 +25,8 @@ inline constexpr Profile profiles[]{{QType::Q4_G64_FP16, 5120, "q4_q5"},
                                     {QType::Q8_G32_FP16, 2560, "q8"},
                                     {QType::NVFP4, 5120, "nvfp4"},
                                     {QType::FP8_E4M3FN_ROW_BF16, 5120, "fp8"}};
+
+inline constexpr Profile local_profile{QType::Q8_G32_FP16, 2560, "q8_local", 1024};
 
 const char* policy_name(ops::LinearPolicy policy);
 

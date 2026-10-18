@@ -10,8 +10,8 @@ enum class Format { Q4Q5, Q8, Fp8, Nvfp4 };
 struct Geometry {
     std::int32_t input_rows;
     std::int32_t value_rows;
-    static constexpr std::int32_t query_rows = 2048;
-    static constexpr std::int32_t key_rows   = 2048;
+    std::int32_t query_rows = 2048;
+    std::int32_t key_rows   = 2048;
 
     [[nodiscard]] std::int32_t channels() const { return query_rows + key_rows + value_rows; }
 };

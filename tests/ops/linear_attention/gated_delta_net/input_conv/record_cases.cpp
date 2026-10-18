@@ -14,6 +14,16 @@ std::vector<int> ragged(int width, int batch) {
 std::vector<RecordCase> cases(Profile p) {
     using Policy = ops::LinearPolicy;
     std::vector<RecordCase> result;
+    if (p.qk_rows == 1024) {
+        for (int b = 1; b <= 8; ++b)
+            for (int t = 2; t <= 16; ++t) {
+                result.push_back({t, b, {}, 1801U + t + b});
+                auto valid = ragged(t, b);
+                if (b == 1) valid[0] = t - 1;
+                result.push_back({t, b, std::move(valid), 1901U + t + b});
+            }
+        return result;
+    }
     if (p.format == QType::Q4_G64_FP16) {
         for (int t = 2; t <= 16; ++t) {
             result.push_back({t, 1, {}, 1400U + t});
@@ -49,7 +59,33 @@ std::vector<RecordCase> cases(Profile p) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    for (auto profile : profiles) {
+#if NINFER_TARGET_SPARK
+    suite.add("gdn_input_record/local_capacity", [] {
+        Weight metadata;
+        metadata.qtype = QType::Q8_G32_FP16;
+        metadata.n     = 8192;
+        metadata.k     = 2560;
+        const ops::SingleProjectionWeight weights{metadata};
+        int failures = 0;
+        for (int b = 1; b <= 8; ++b) {
+            for (int first = 2; first <= 16; ++first)
+                for (int last = first; last <= 16; ++last)
+                    if (ops::gdn_input_proj_conv_record_workspace_capacity_bytes(weights, b, first,
+                                                                                 last) != 0)
+                        ++failures;
+            try {
+                (void)ops::gdn_input_proj_conv_record_workspace_capacity_bytes(weights, b, 1, 16);
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+        }
+        return failures;
+    });
+#endif
+    std::vector<Profile> selected_profiles(std::begin(profiles), std::end(profiles));
+#if NINFER_TARGET_SPARK
+    selected_profiles.push_back(local_profile);
+#endif
+    for (auto profile : selected_profiles) {
         const auto tests = cases(profile);
         std::vector<OpCase> catalogue;
         for (auto c : tests) {

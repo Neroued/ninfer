@@ -94,8 +94,8 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
              std::int32_t z_rows, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::size_t snapshot_workspace_bytes,
              std::size_t record_workspace_bytes, SnapshotLaunch&& snapshot_launch,
-             RecordLaunch&& record_launch, std::uint32_t seed) {
-    const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
+             RecordLaunch&& record_launch, std::uint32_t seed, int qk_rows = kQueryRows) {
+    const std::int32_t channels          = qk_rows + qk_rows + value_rows;
     const std::int32_t aggregate_columns = width * batch;
     const std::int32_t source_slots      = 8;
     const std::int32_t slots             = aggregate_columns + source_slots;
@@ -133,12 +133,12 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     DeviceBuffer device_snapshot_initial = to_device(snapshot_initial_slots);
     DeviceBuffer device_snapshot         = to_device(snapshot_bases);
 
-    GuardedBf16Tensor snapshot_query(kQueryRows, aggregate_columns);
-    GuardedBf16Tensor snapshot_key(kKeyRows, aggregate_columns);
+    GuardedBf16Tensor snapshot_query(qk_rows, aggregate_columns);
+    GuardedBf16Tensor snapshot_key(qk_rows, aggregate_columns);
     GuardedBf16Tensor snapshot_value(value_rows, aggregate_columns);
     GuardedBf16Tensor snapshot_z(z_rows, aggregate_columns);
-    GuardedBf16Tensor record_query(kQueryRows, aggregate_columns);
-    GuardedBf16Tensor record_key(kKeyRows, aggregate_columns);
+    GuardedBf16Tensor record_query(qk_rows, aggregate_columns);
+    GuardedBf16Tensor record_key(qk_rows, aggregate_columns);
     GuardedBf16Tensor record_value(value_rows, aggregate_columns);
     GuardedBf16Tensor record_z(z_rows, aggregate_columns);
     GuardedBf16Tensor conv_record(channels, aggregate_columns);
@@ -156,12 +156,12 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     Tensor initial(device_initial.span(), DType::I32, {batch});
     Tensor snapshot_initial(device_snapshot_initial.span(), DType::I32, {batch});
     Tensor snapshot_base(device_snapshot.span(), DType::I32, {batch});
-    Tensor snapshot_q(snapshot_query.span(), DType::BF16, {kQueryRows, width, batch});
-    Tensor snapshot_k(snapshot_key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor snapshot_q(snapshot_query.span(), DType::BF16, {qk_rows, width, batch});
+    Tensor snapshot_k(snapshot_key.span(), DType::BF16, {qk_rows, width, batch});
     Tensor snapshot_v(snapshot_value.span(), DType::BF16, {value_rows, width, batch});
     Tensor snapshot_z_view(snapshot_z.span(), DType::BF16, {z_rows, width, batch});
-    Tensor record_q(record_query.span(), DType::BF16, {kQueryRows, width, batch});
-    Tensor record_k(record_key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor record_q(record_query.span(), DType::BF16, {qk_rows, width, batch});
+    Tensor record_k(record_key.span(), DType::BF16, {qk_rows, width, batch});
     Tensor record_v(record_value.span(), DType::BF16, {value_rows, width, batch});
     Tensor record_z_view(record_z.span(), DType::BF16, {z_rows, width, batch});
     Tensor conv_record_view(conv_record.span(), DType::BF16, {channels, width, batch});
@@ -205,6 +205,19 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         CUDA_CHECK(cudaMemcpyAsync(device_x.data(), activation_bits.data(),
                                    activation_bits.size() * sizeof(std::uint16_t),
                                    cudaMemcpyHostToDevice, stream));
+        if (!dense) {
+            valid_columns[0] = 1;
+            CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
+                                       device_valid.size(), cudaMemcpyHostToDevice, stream));
+        }
+        for (int row = 0; row < batch; ++row) {
+            initial_slots[row]          = (initial_slots[row] + 1) % source_slots;
+            snapshot_initial_slots[row] = aggregate_columns + initial_slots[row];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_slots.data(),
+                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_snapshot_initial.data(), snapshot_initial_slots.data(),
+                                   device_snapshot_initial.size(), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -219,9 +232,9 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     failures +=
         verify_equal(std::string(label) + " value", snapshot_value.bits(), record_value.bits());
     failures += verify_equal(std::string(label) + " z", snapshot_z.bits(), record_z.bits());
-    failures += verify_zero_tail(std::string(label) + " query", record_query.bits(), kQueryRows,
-                                 width, batch, valid_columns);
-    failures += verify_zero_tail(std::string(label) + " key", record_key.bits(), kKeyRows, width,
+    failures += verify_zero_tail(std::string(label) + " query", record_query.bits(), qk_rows, width,
+                                 batch, valid_columns);
+    failures += verify_zero_tail(std::string(label) + " key", record_key.bits(), qk_rows, width,
                                  batch, valid_columns);
     failures += verify_zero_tail(std::string(label) + " value", record_value.bits(), value_rows,
                                  width, batch, valid_columns);
@@ -292,6 +305,6 @@ int run_record(Weights& weights, const RecordCase& c) {
             ops::gdn_input_proj_conv_record(x, projection, conv, {state, initial}, valid,
                                             {q, k, v, z}, record, arena, execution);
         },
-        c.seed);
+        c.seed, p.qk_rows);
 }
 } // namespace ninfer::test::gdn_input_conv

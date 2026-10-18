@@ -7,10 +7,10 @@
 
 namespace ninfer::ops::detail {
 
-template <int ValueRows>
+template <int ValueRows, int QueryRows = 2048, int KeyRows = QueryRows>
 struct GdnConvGeometry {
-    static constexpr int query_rows = 2048;
-    static constexpr int key_rows   = 2048;
+    static constexpr int query_rows = QueryRows;
+    static constexpr int key_rows   = KeyRows;
     static constexpr int value_rows = ValueRows;
     static constexpr int z_rows     = ValueRows;
     static constexpr int channels   = query_rows + key_rows + value_rows;

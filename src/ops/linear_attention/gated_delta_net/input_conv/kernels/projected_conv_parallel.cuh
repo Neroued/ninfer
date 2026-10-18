@@ -12,7 +12,7 @@ using ConvGeometry = GdnConvGeometry<6144>;
 
 namespace gdn_projected_parallel {
 
-template <int WarpsPerCta, int TokenTile, class Publish>
+template <class ConvGeometry, int WarpsPerCta, int TokenTile, class Publish>
 __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     const __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
@@ -106,14 +106,14 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
     }
 }
 
-template <int WarpsPerCta, class Publish>
+template <int WarpsPerCta, class ConvGeometry = GdnConvGeometry<6144>, class Publish>
 void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& conv_states,
             const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query, Tensor& key,
             Tensor& value, Publish publish, cudaStream_t stream) {
     constexpr int kWarpsPerCta = WarpsPerCta;
     constexpr int kBlockTokens = 8;
     constexpr int kBlocks      = ConvGeometry::channels / 32;
-    gdn_projected_conv_parallel_kernel<kWarpsPerCta, kBlockTokens>
+    gdn_projected_conv_parallel_kernel<ConvGeometry, kWarpsPerCta, kBlockTokens>
         <<<kBlocks, kWarpsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projected.data),
             static_cast<const __nv_bfloat16*>(conv_weight.data),

@@ -5,7 +5,7 @@
 
 namespace ninfer::bench::gdn_replay {
 struct Profile {
-    int layers = 36, value_heads = 48, conv_channels = 10240;
+    int layers = 36, qk_heads = 16, value_heads = 48, conv_channels = 10240;
 };
 
 struct Options {
@@ -22,12 +22,13 @@ inline Options parse_options(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
-            std::cout << "GDN Replay benchmark\n"
-                         "  --op fold|record --layers L --value-heads H --conv-channels C\n"
-                         "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
-                         "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
-                         "Q/K heads=16, head dimension=128, T=2..16, B=1..8.\n"
-                         "Fold times all specified layers; record times one recurrence layer.\n";
+            std::cout
+                << "GDN Replay benchmark\n"
+                   "  --op fold|record --layers L --qk-heads Q --value-heads H --conv-channels C\n"
+                   "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
+                   "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
+                   "Head dimension=128, T=2..16, B=1..8.\n"
+                   "Fold times all specified layers; record times one recurrence layer.\n";
             measurement::help();
             std::exit(0);
         }
@@ -36,6 +37,8 @@ inline Options parse_options(int argc, char** argv) {
             o.op = value;
         else if (flag == "--layers")
             o.profile.layers = measurement::integer(value);
+        else if (flag == "--qk-heads")
+            o.profile.qk_heads = measurement::integer(value);
         else if (flag == "--value-heads")
             o.profile.value_heads = measurement::integer(value);
         else if (flag == "--conv-channels")

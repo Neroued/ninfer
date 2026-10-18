@@ -47,7 +47,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+    const std::int32_t kQkHeads     = value_heads == 24 ? 8 : 16;
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -205,6 +205,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         for (auto& bits : q_bits) bits ^= 0x8000U;
         CUDA_CHECK(cudaMemcpyAsync(device_q.data(), q_bits.data(), device_q.size(),
                                    cudaMemcpyHostToDevice, stream));
+        for (auto& slot : initial_slots) slot = (slot + 3) % slots;
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_slots.data(),
+                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;
             CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
@@ -311,7 +314,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
 int main(int argc, char** argv) {
     OpSuite suite;
     const auto add = [&](int heads, int width, int batch, std::vector<int> valid, unsigned seed) {
-        suite.add("gdn_record/h" + std::to_string(heads) + "/w" + std::to_string(width) + "/b" +
+        suite.add(std::string(heads == 24 ? "gdn_record_local/h" : "gdn_record/h") +
+                      std::to_string(heads) + "/w" + std::to_string(width) + "/b" +
                       std::to_string(batch) + (valid.empty() ? "/dense" : "/ragged"),
                   [=] { return run_case(heads, width, batch, valid, seed); },
                   {{"execution", width == 2 || width == 9 || width == 16 ? "graph" : "eager"}});
@@ -327,5 +331,12 @@ int main(int argc, char** argv) {
     }
     add(48, 5, 3, {5, 3, 1}, 1791U);
 
+    for (int b = 1; b <= 8; ++b)
+        for (int t = 2; t <= 16; ++t) {
+            add(24, t, b, {}, 2000U + 100 * b + t);
+            std::vector<int> valid(b);
+            for (int row = 0; row < b; ++row) valid[row] = 1 + (3 * row + t - 1) % t;
+            add(24, t, b, valid, 3000U + 100 * b + t);
+        }
     return suite.main(argc, argv);
 }

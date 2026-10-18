@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
             row.tokens        = t;
             row.batch         = options.batch;
             row.conv_channels = options.op == "fold" ? options.profile.conv_channels : 0;
-            row.qk_heads      = 16;
+            row.qk_heads      = options.profile.qk_heads;
             row.value_heads   = options.profile.value_heads;
             row.layers        = options.op == "fold" ? options.profile.layers : 1;
             const auto run    = [&](auto&& launch, auto&& restore, const gdn::Traffic& traffic) {
@@ -41,11 +41,11 @@ int main(int argc, char** argv) {
                 row.commits = gdn_replay::csv_extent(options.commits);
                 run([&](CudaExecutionView cuda) { f.fold_plan().execute(rows, cuda); },
                     [&](CudaExecutionView cuda) { f.restore(cuda); },
-                    gdn::fold_traffic(options.profile.layers, 16, options.profile.value_heads,
+                    gdn::fold_traffic(options.profile.layers, options.profile.qk_heads, options.profile.value_heads,
                                       options.profile.conv_channels, counts));
             } else {
                 auto valid         = gdn_replay::extents(options.valid, t, options.batch, false);
-                const auto traffic = gdn::record_traffic(16, options.profile.value_heads, t, valid,
+                const auto traffic = gdn::record_traffic(options.profile.qk_heads, options.profile.value_heads, t, valid,
                                                          options.valid != "dense");
                 if (options.valid == "dense") valid.clear();
                 gdn_replay::RecordFixture f(options.profile, t, options.batch, valid);

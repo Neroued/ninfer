@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace ninfer::bench::gdn_replay {
-constexpr int kQkHeads = 16, kStateDim = 128, kRecordCapacity = 8, kStateSlots = 11;
+constexpr int kStateDim = 128, kRecordCapacity = 8, kStateSlots = 11;
 
 __global__ void initialize_record_gates(float* gates, std::size_t pairs) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -96,7 +96,7 @@ private:
                                                  .record_capacity = kRecordCapacity,
                                                  .width           = width,
                                                  .conv_channels   = profile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
+                                                 .qk_heads        = profile.qk_heads,
                                                  .value_heads     = profile.value_heads,
                                                  .key_dim         = kStateDim,
                                                  .value_dim       = kStateDim});
@@ -169,8 +169,8 @@ public:
     }
 
     void launch_record(CudaExecutionView cuda) {
-        Tensor q(q_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
-        Tensor k(k_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor q(q_.span(), DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
+        Tensor k(k_.span(), DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
         Tensor v(v_.span(), DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         Tensor g(g_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
         Tensor beta(beta_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
@@ -178,7 +178,7 @@ public:
                       {kStateDim, kStateDim, profile_.value_heads, batch_});
         Tensor valid = valid_tensor();
         Tensor initial(record_initial_.span(), DType::I32, {batch_});
-        Tensor key_record(key_record_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor key_record(key_record_.span(), DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
         Tensor value_record(value_record_.span(), DType::BF16,
                             {kStateDim, profile_.value_heads, width_, batch_});
         Tensor gate_record(gate_record_.span(), DType::FP32,
@@ -193,7 +193,7 @@ private:
     [[nodiscard]] static float scale() { return 1.0F / std::sqrt(128.0F); }
 
     [[nodiscard]] std::size_t qk_elements() const {
-        return static_cast<std::size_t>(kStateDim) * kQkHeads * width_ * batch_;
+        return static_cast<std::size_t>(kStateDim) * profile_.qk_heads * width_ * batch_;
     }
 
     [[nodiscard]] std::size_t value_elements() const {

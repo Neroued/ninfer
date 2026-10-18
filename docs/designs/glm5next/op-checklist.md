@@ -1,17 +1,27 @@
 # GLM5Next：Spark TP2 / EP2 基础 Op 清单
 
+性质：既有基础执行任务。P/F/M/R/E 编号、勾选状态和实施范围在整理中保持不变；
+相关设计状态与阅读入口见[设计索引](README.md)。
+
 目标：为两台 DGX Spark 上的 GLM-5.3-Flash 准备本地 GPU 算子，完成本清单已确定的
 Linear、无状态投影融合、dense/shared MLP 与 Main/MTP MoE 支持和调优。
-架构、数学和量化决策见[模型与权重](glm5next-model.md)。部署只考虑 TP2/EP2；
-不为 GLM 另做单 rank 完整几何或 RTX 5090 的新 profile。
+架构与数学见[模型语义](../../maintainer/glm5next-model.md)，量化与精度见
+[数值政策](../../maintainer/glm5next-quantization.md)，[并行设计](parallel.md)固定分工：
+同一组两个 Spark ranks 上，MLA/Indexer DP2，KDA/dense/shared/head TP2，routed experts EP2。
+本轮仅准备下列 TP2/EP2 局部几何，不增加这些算子的完整单 rank 或 RTX 5090 profile；
+MLA/Indexer 的完整 heads DP 合同见 [Kpool Sparse MLA](kpool-sparse-mla.md)，
+其 profiles 与实现另行下发，不由本清单自动追加。
 
 本清单沿用 `.50` 的 `docs/qwen4-exp-spark-tp2-ep2-op-checklist.md` 形式。
 执行基线是 `.50` `/home/neroued/ninfer` 已完成的 Qwen TP2/EP2 本地算子成果，
 尤其复用其 indexed expert bank 和本地子集计算。未勾选表示本轮任务未完成，
 不等于现有实现不支持；已有适用实现先确认、测量，再决定是否需要改动。
 
-**KDA 计算链暂缓，等待 ReplaySSM 定案。** 本轮只准备其权重布局已确定的纯投影和
-无状态 split。MLA、Indexer、mHC 等尚未收敛接口的计算不进入本轮实施。
+**本基础清单只准备 KDA 的纯投影和无状态 split。** [KDA ReplaySSM](replayssm-kda.md)
+已固定内部 gate、每轮 record/fold 和 accepted-prefix 状态合同，其实现另行列任务。
+[Kpool Sparse MLA](kpool-sparse-mla.md) 和 [mHC](mhc.md) 的完整
+合同也已确定，其实现均不进入本轮。mHC 权重与四流 residual 复制，先取得完整
+分支输出再更新 residual；这不改变本清单的局部几何或执行条目。
 不开展 converter、权重全量转换、模型接入、通信或引擎重构。
 
 ## 1. 局部分工、合并与实施顺序
@@ -20,13 +30,16 @@ Linear、无状态投影融合、dense/shared MLP 与 Main/MTP MoE 支持和调�
 
 | 部分 | TP2/EP2 分工 | 每 rank 计算 |
 |---|---|---|
-| Block hidden | 复制 4096 维输入 | 同一组 tokens，T/B 不减半 |
+| 本清单内 TP/EP block hidden | 复制 4096 维输入 | 同一组 tokens，T/B 不减半 |
 | KDA 投影 | 按完整 heads 切为 32＋32 | Q/K/V 各 4096 维；beta 32；f_a/g_a 各完整 128 维；f_b/g_b 各 4096 维 |
 | Main 前三层 dense MLP | intermediate 12288→6144＋6144 | 本地 clamped SwiGLU，down 输出 4096 维局部贡献 |
 | Main/MTP shared expert | intermediate 2048→1024＋1024 | 本地 clamped SwiGLU，输出直接加入本 rank 的 MoE 贡献 |
 | Main/MTP routed experts | EP2，expert 内部不做 TP | 全局 288 个 experts，每 rank 实存 144 个完整 experts，global top-8 |
 | Router | 复制 | 完整 288 维 logits、correction bias 和同一 global Top8 |
 | Main/MTP LM head | vocabulary/N 轴 TP2 | 每 rank `[77440,4096]`，Main 与 MTP 共享权重 |
+
+MLA/Indexer 只计算 owner 所属请求，其输入范围不套用上表的复制约定；与本表 TP/EP
+部分的结果交接由后续模型执行设计确定。本次 DP 决策不改变 P1–P9 的局部权重形状。
 
 Dense/shared 的 gate/up 分别沿 intermediate 行切片，down 沿相同 intermediate 的 K
 范围切片。它们逐通道的 clamp/SiLU/product 不跨分片，因此两个局部输出之和对应完整
@@ -124,7 +137,7 @@ logits 输入。R1 要求完整 FP32 logits；可以共享 contraction 基础，
   `beta_raw[32,M]`、`f_a[128,M]`、`g_a[128,M]`。Beta 尚未 sigmoid，f_a/g_a
   后仍各自有第二次投影；本项不融合任何 KDA gate/recurrence 语义。
 
-沿用 [LinearSplit](../include/ninfer/ops/linear_split.h) 的分段数学与完整 capacity/launch
+沿用 [LinearSplit](../../../include/ninfer/ops/linear_split.h) 的分段数学与完整 capacity/launch
 约定。调优目标是 contraction 直接写连续分段，最终实现不额外物化完整输出后再复制。
 无状态 split 的确定不承诺未来 KDA 状态融合必须消费这组中间 buffers。
 
@@ -149,7 +162,7 @@ Clamp 在 SiLU/product 之前。此参数同步进入相应 SwiGLU/MLP/MoE profi
 - [ ] **F4 — BF16 GU＋clamped SwiGLU，依赖 P7。** 输入 BF16 `[4096,M]`、GU
   BF16 `[2048,4096]`、A16Only，输出连续 BF16 `[1024,M]`。
 
-现有 [Linear SwiGLU](../include/ninfer/ops/linear_swiglu.h) 只有无 clamp 公式，且其
+现有 [Linear SwiGLU](../../../include/ninfer/ops/linear_swiglu.h) 只有无 clamp 公式，且其
 当前格式入口未包含 BF16，F3/F4 要同步补齐公共合同、格式支持、capacity、分派与测量。
 融合计算不要求先把 gate/up 舍入为 BF16，再执行非线性。
 
@@ -263,8 +276,8 @@ Shared 只计一次，既不乘 routed scaling factor，也不乘额外 sigmoid�
 
 ## 7. 调优范围与完成方式
 
-沿用[Op 开发规范](maintainer/op-development.md)、[Linear 调优方法](maintainer/linear-tuning.md)
-及现有 [tests](../tests/README.md) / [bench](../bench/README.md)。先检查本项的
+沿用[Op 开发规范](../../maintainer/op-development.md)、[Linear 调优方法](../../maintainer/linear-tuning.md)
+及现有 [tests](../../../tests/README.md) / [bench](../../../bench/README.md)。先检查本项的
 fixture、独立数学参考、precision policy 与流量模型，再实现和调优。验收以公共 Op
 完整调用为单位，容量查询、分派、测试和 bench 同步覆盖新增几何。
 
@@ -325,12 +338,15 @@ reduction 与 workspace 流量。Graph 的冷/热缓存结果分列，保留代�
 
 - **KDA 全部计算链与状态接口**：卷积、Q/K normalization、bounded gate、递推、
   batch update、output gated norm，以及 projection＋conv/gate 等 KDA 融合；
-  snapshot、record、fold、ReplaySSM 与 accepted-prefix 恢复须先整体定案。
-  现有 `kimi_delta_attention` 可参考，但不因此提前开展 KDA 优化。
-- **MLA 与 Indexer**：latent attention、准备/cache/codec、Kpool4、评分/TopK/tail；
-  其外围投影的最终合并、吸收与本地布局也先不固定。MLA FP8 cache 暂不讨论。
-- **mHC**：pre/post、Sinkhorn、norm/residual 组合、final stream collapse 及与相邻
-  block 的融合；这些接口需单独收敛。
+  ReplaySSM 与 accepted-prefix 状态管理按[已定设计](replayssm-kda.md)执行，
+  实现和调优另行列任务，不由本文自动扩展。实验通用入口的分派不作为生产 decode 约束。
+- **MLA 与 Indexer**：[Kpool Sparse MLA](kpool-sparse-mla.md) 已固定
+  Main/MTP 完整 heads 的接口、精度、codec/page layout、投影合并、prepare 两种出口、
+  评分/TopK、冻结 selection 与 tail 提交。Indexer 固定 BF16 cache/计算；MLA 可选
+  BF16/FP8 cache，计算保持 BF16/F32。实现和调优另行下发，不因合同确定自动扩展本轮。
+- **mHC**：[已定合同](mhc.md)覆盖完整数学、五个入口、BF16 residual
+  与 FP32 系数、collapse/norm 和相邻 post/pre 融合、末尾 mean/norm、双机复制放置。
+  实现和调优另行下发，不因接口确定而自动加入本轮。
 - **MTP stem、embedding、Vision**：本地放置和算子组合不在本轮固定，暂不增加其
   Linear/fusion profiles。MTP MoE 与共享 LM head 的准备已包含在前文。
 - 分片 logits 的候选合并、sampling、MTP acceptance、scoring；本轮 P9 只产生本地
@@ -338,5 +354,11 @@ reduction 与 workspace 流量。Graph 的冷/热缓存结果分列，保留代�
 - 全量量化/converter、模型绑定与加载、通信/通算融合、Engine/Program 接入、跨 rank
   状态与资源规划，以及完整模型性能测量。
 
-这些部分的方案确定后再追加需求。执行过程中若某项依赖上述未定接口，应停止该依赖
-上的扩展并反馈具体边界，继续其余独立条目。
+这些部分只有在用户明确下发执行任务后才追加实施需求。执行过程中若某项依赖上述
+范围之外的工作，应停止该依赖上的扩展并反馈具体边界，继续其余独立条目。
+
+## 9. 清单完成后的去向
+
+条目完成时保留对应实现、测试和性能证据的入口。全部条目完成且证据已归属正式
+合同／测试／benchmark 后删除本清单，历史由 Git 保存；不因某条设计确定而新增
+执行项，也不由文档整理触发远端任务下发。

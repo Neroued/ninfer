@@ -33,10 +33,9 @@ Published artifact downloads are listed in the [project README](../README.md).
   implementation is pending.
 - [Qwen4Exp parallel strategy](qwen4_exp-parallel-design.md) — selected initial dual-Spark
   TP2/EP2 strategy, state shards, computation/graph composition and implementation dependencies.
-- [GLM5Next model and weights](glm5next-model.md) — GLM-5.3-Flash computation, source weights,
-  selected quantization scope and context-state capacity; converter and model integration are pending.
-- [GLM5Next Spark Op checklist](glm5next-spark-tp2-ep2-op-checklist.md) — initial TP2/EP2
-  projections and local MoE preparation; stateful KDA, MLA, Indexer and mHC are deferred.
+- [GLM5Next design and implementation](designs/glm5next/README.md) — selected dual-Spark
+  placement, KDA ReplaySSM, Kpool Sparse MLA, mHC and the existing Op checklist; separates
+  decisions, implementation status and retirement of designs after code takes ownership.
 
 ## Maintainer references
 
@@ -57,6 +56,8 @@ other references own narrower contracts:
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | Flash Next architecture, quantization recipe, merged projections, expert banks and PLE representation |
 | [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | current support, layer flow, PLE pipeline, MTP/Vision, continuation, resource planning and CUDA Graph |
+| [GLM5Next model semantics](maintainer/glm5next-model.md) | architecture, complete mathematics, logical weights, Main/MTP/Vision and history dependencies |
+| [GLM5Next quantization and numerics](maintainer/glm5next-quantization.md) | selected source/weight/cache representations, exact codecs, activation policy and rounding boundaries; implementation status belongs to the design index |
 | [Expert weight cache](maintainer/expert-weight-cache.md) | Host/GPU bank sources, replica cache, mixed CPU/GPU execution, streaming and graph handoffs |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |

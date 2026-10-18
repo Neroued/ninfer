@@ -21,6 +21,7 @@ public:
     int input(const Tensor& x, int hidden);
     void output(const Tensor& y, int hidden, int tokens, MoeEpilogue epilogue);
     void control(const Weight& control, const RouteProfile& profile);
+    void sigmoid_control(const Weight& control, const RouteProfile& profile);
     void routes(const ExpertRoutes& routes, int top_k, int tokens, bool writing);
     void coefficient(const Tensor& value, int tokens, bool writing);
     void subset(ExpertSubset subset, int experts);

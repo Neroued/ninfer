@@ -140,6 +140,28 @@ void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weig
                         ExpertRoutes& routes, Tensor& shared_coefficients, MemoryArena& workspace,
                         CudaExecutionView execution);
 
+// Corrected sigmoid routing over all global experts; no shared logit.
+struct SigmoidRouteProfile {
+    RouteProfile route;
+    float scaling_factor;
+    float normalization_epsilon;
+};
+
+// Native BF16 control [E,H] produces logits=control*x without an intermediate BF16 cast.
+// Choice is
+// sigmoid(logit)+correction_bias[e]; TopK is descending, ties by lower global ID.
+// Coefficients are scaling_factor*sigmoid(selected_logit)/(sum_selected_sigmoid+epsilon):
+// correction bias affects selection only. Both normalization parameters are positive finite.
+// Supports registered H/E/K geometries. Bias is contiguous FP32[E], routes I32/FP32[K,T].
+// x/output/weights follow the alignment, immutability, disjoint caller-scratch and Graph
+// contract above; there is no BF16 logit boundary, hidden allocation or host readback.
+[[nodiscard]] std::size_t topk_sigmoid_route_workspace_capacity_bytes(const SigmoidRouteProfile&,
+                                                                      std::int32_t min_tokens,
+                                                                      std::int32_t max_tokens);
+void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile&, const Weight& control,
+                        const Tensor& correction_bias, ExpertRoutes& routes, MemoryArena&,
+                        CudaExecutionView);
+
 // F_e(x)=down_e*(SiLU(gate_e*x)*(up_e*x)). Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
 // x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both,

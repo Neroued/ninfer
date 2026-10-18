@@ -87,3 +87,5 @@ endif()
 ninfer_add_op_bench(ninfer_linear_swiglu_clamped_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_swiglu_clamped.cu")
 
 ninfer_add_op_bench(ninfer_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/swiglu_bench.cu")
+ninfer_add_op_bench(ninfer_sigmoid_route_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/sigmoid_route_bench.cu")

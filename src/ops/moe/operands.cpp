@@ -150,6 +150,12 @@ void MoeOperands::control(const Weight& w, const RouteProfile& p) {
     read(w.qdata, bytes);
 }
 
+void MoeOperands::sigmoid_control(const Weight& w, const RouteProfile& p) {
+    require(w.group == 0 && w.group_size == 0 && w.high_plane_bytes == 0,
+            "MoE: invalid sigmoid control metadata");
+    matrix(w, p.experts, p.hidden, QType::BF16);
+}
+
 void MoeOperands::routes(const ExpertRoutes& r, int top_k, int tokens, bool writing) {
     operand::tensor(r.ids, DType::I32, {top_k, tokens}, 16, op_, "route IDs", device_);
     operand::tensor(r.coefficients, DType::FP32, {top_k, tokens}, 16, op_, "route coefficients",

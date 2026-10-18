@@ -56,11 +56,15 @@ class LayerGraphDefinition;
 
 class LayerGraphExecutable {
 public:
-    virtual ~LayerGraphExecutable()                                         = default;
-    virtual void update(const LayerGraphDefinition&)                        = 0;
-    virtual void upload(cudaStream_t)                                       = 0;
-    virtual void replay(Tensor&, CudaExecutionView,
-                        const std::function<void()>& after_gpu_submit = {}) = 0;
+    virtual ~LayerGraphExecutable()                  = default;
+    virtual void update(const LayerGraphDefinition&) = 0;
+    virtual void upload(cudaStream_t)                = 0;
+    // start accepts one invocation. True means its complete output chain was submitted;
+    // false retains it until poll succeeds. Tensor backing and callback captures stay live.
+    [[nodiscard]] virtual bool start(Tensor&, CudaExecutionView,
+                                     std::function<void()> after_gpu_submit = {}) = 0;
+    [[nodiscard]] virtual bool poll()                                             = 0;
+    virtual void cancel()                                                         = 0;
 };
 
 class LayerGraphDefinition {
@@ -133,9 +137,14 @@ public:
         return Activity(*this);
     }
 
-    virtual void before_layer(ExpertBankId)             = 0;
-    virtual void execute(ExpertBankId, const Tensor&, Tensor&, MemoryArena&,
-                         const ops::MoeExecutionHints&) = 0;
+    [[nodiscard]] virtual bool try_before_layer(ExpertBankId) = 0;
+    // start accepts one layer, borrowing its operands and arena through poll/cancel.
+    // Completion means submission, not Device retirement. Keep Activity across yields.
+    [[nodiscard]] virtual bool start(ExpertBankId, const Tensor&, Tensor&, MemoryArena&,
+                                     const ops::MoeExecutionHints&) = 0;
+    [[nodiscard]] virtual bool poll()                               = 0;
+    // Discard work not yet submitted; already queued consumers retain their backing.
+    virtual void cancel() = 0;
     [[nodiscard]] virtual std::shared_ptr<const LayerGraphDefinition>
     capture_layer(ExpertBankId, CudaExecutionView, std::int32_t tokens,
                   const std::function<void()>& mixer, const GpuBody&,

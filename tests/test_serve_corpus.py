@@ -165,6 +165,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
             concurrency=[1],
             sampling="greedy",
             kv_dtype="fp8",
+            proposal_head="optimized",
         ),
     )
     assert [(point.target, point.speculative_backend) for point in points] == [
@@ -185,9 +186,18 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
 @pytest.mark.parametrize(
     "kv_dtype,cache_name", [("int8", "int8-group64"), ("fp8", "fp8-e4m3-row256")]
 )
-@pytest.mark.parametrize("concurrent", [False, True])
+@pytest.mark.parametrize(
+    "concurrent,mode,head",
+    [
+        (False, "mtp0", "full"),
+        (True, "mtp0", "full"),
+        (False, "mtp5", "optimized"),
+        (True, "mtp5", "optimized"),
+        (True, "mtp5", "full"),
+    ],
+)
 def test_selected_kv_reaches_server_and_is_verified(
-    tmp_path, kv_dtype, cache_name, concurrent
+    tmp_path, kv_dtype, cache_name, concurrent, mode, head
 ):
     artifact = tmp_path / "model.ninfer"
     artifact.touch()
@@ -199,10 +209,11 @@ def test_selected_kv_reaches_server_and_is_verified(
         "--output",
         str(tmp_path),
         "--mode",
-        "mtp0",
+        mode,
         "--kv-dtype",
         kv_dtype,
     ]
+    backend, draft_tokens = corpus.SPECULATIVE_MODES[mode]
     engine = {
         "device": 0,
         "max_context": 262144,
@@ -211,9 +222,9 @@ def test_selected_kv_reaches_server_and_is_verified(
         "kv_cache": cache_name,
         "cuda_graph": True,
         "prefix_reuse": False,
-        "speculative_backend": "none",
-        "speculative_draft_window": 0,
-        "proposal_head": "full",
+        "speculative_backend": backend,
+        "speculative_draft_window": draft_tokens,
+        "proposal_head": head,
         "context_cache": {"device_state_slots": 0, "host_capacity_bytes": 0},
     }
     event = {
@@ -228,7 +239,8 @@ def test_selected_kv_reaches_server_and_is_verified(
     }
     if concurrent:
         args = concurrency.parse_args(
-            common + ["--suite", "decode-saturation", "--concurrency", "1"]
+            common + ["--suite", "decode-saturation", "--concurrency", "1",
+                      "--proposal-head", head]
         )
         point = build_points([("model", artifact)], args)[0]
         command = concurrency.server_command(
@@ -248,9 +260,9 @@ def test_selected_kv_reaches_server_and_is_verified(
             "model",
             "model",
             artifact,
-            "mtp0",
-            "none",
-            0,
+            mode,
+            backend,
+            draft_tokens,
             "stochastic",
             args.kv_dtype,
             Fixture("fixture", [], False, 8, "test"),
@@ -263,6 +275,7 @@ def test_selected_kv_reaches_server_and_is_verified(
     assert command[command.index("--kv-dtype") + 1] == kv_dtype
     assert command[command.index("--device-state-slots") + 1] == "0"
     assert command[command.index("--host-context-mib") + 1] == "0"
+    assert ("--lm-head-draft" in command) == (head == "optimized")
     assert validate() == ("instance", "bindings")
     for field in ("device_state_slots", "host_capacity_bytes"):
         engine["context_cache"][field] = 1

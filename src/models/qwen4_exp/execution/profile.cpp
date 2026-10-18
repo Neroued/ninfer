@@ -1,5 +1,5 @@
 #include "models/qwen4_exp/execution/profile.h"
-#include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/definition.h"
 #include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/linear_split.h"
 
@@ -7,10 +7,9 @@
 
 namespace ninfer::models::qwen4_exp::execution {
 namespace {
-template <class Source>
 class Describe {
 public:
-    explicit Describe(const Source& source) : source_(source) {}
+    explicit Describe(const ModelDefinition& source) : source_(source) {}
 
     ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
         std::vector<ops::WeightInput> inputs;
@@ -80,11 +79,10 @@ public:
         return out;
     }
 private:
-    const Source& source_;
+    const ModelDefinition& source_;
 };
 
-template <class Source>
-std::shared_ptr<const ModelProfile> describe(const Source& source) {
+std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source) {
     auto out           = std::make_shared<ModelProfile>();
     out->config        = source.config();
     out->options       = source.options();
@@ -110,11 +108,9 @@ std::shared_ptr<const ModelProfile> describe(const Source& source) {
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const LoadPlan& source) {
+std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
     return describe(source);
 }
-
-std::shared_ptr<const ModelProfile> describe_model(const Model& source) { return describe(source); }
 
 std::size_t qsa_projection_workspace_bytes(const QsaProfile& p, std::int32_t first,
                                            std::int32_t last) {

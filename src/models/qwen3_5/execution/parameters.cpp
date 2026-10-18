@@ -22,7 +22,8 @@ auto with_context(const std::string& context, Function&& function) {
 
 class Prepare {
 public:
-    explicit Prepare(const Model& model) : model_(model) {}
+    Prepare(const ModelShard& model, const ModelProfile& profile)
+        : model_(model), profile_(profile) {}
 
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
@@ -71,7 +72,7 @@ public:
             out.profile = {
                 ops::routed_swiglu_profile(
                     source.gate_up, source.down,
-                    dimension(std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok),
+                    dimension(std::get<MoeConfig>(profile_.config.text.ffn).num_experts_per_tok),
                     gate_up.policy(), down.policy()),
                 ops::swiglu_profile(out.shared)};
             out.bank                = w.bank;
@@ -153,7 +154,7 @@ public:
         out.projection.output_rows = {
             dimension(inputs[0].weight.shape[0]), dimension(inputs[1].weight.shape[0]),
             dimension(inputs[2].weight.shape[0]), dimension(inputs[3].weight.shape[0])};
-        if (model_.config().text.architecture == Architecture::Qwen3_5) {
+        if (profile_.config.text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         } else {
             (void)ops::linear_split_workspace_capacity_bytes(out.projection.packed,
@@ -184,7 +185,7 @@ public:
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(
-                with_context(std::string(model_.options().speculative_component()) + "/layers/" +
+                with_context(std::string(profile_.options.speculative_component()) + "/layers/" +
                                  std::to_string(i),
                              [&] {
                                  const auto& layer = w.layers[i];
@@ -224,15 +225,17 @@ public:
     }
 
 private:
-    const Model& model_;
+    const ModelShard& model_;
+    const ModelProfile& profile_;
 };
 
 } // namespace
 
-Parameters::Parameters(const Model& source, std::shared_ptr<const ModelProfile> profile)
-    : model(source), profile(profile ? std::move(profile) : describe_model(source)) {
-    const Prepare prepare(model);
-    const auto& w        = model.weights();
+Parameters::Parameters(const ModelShard& source, std::shared_ptr<const ModelProfile> profile)
+    : model(source), profile(std::move(profile)) {
+    if (!this->profile) throw std::invalid_argument("Parameters require an execution profile");
+    const Prepare prepare(model, *this->profile);
+    const auto& w        = model.definition().weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);
@@ -248,7 +251,7 @@ Parameters::Parameters(const Model& source, std::shared_ptr<const ModelProfile> 
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }
     if (w.draft) {
-        draft = with_context(std::string(model.options().speculative_component()),
+        draft = with_context(std::string(this->profile->options.speculative_component()),
                              [&] { return prepare.draft(*w.draft); });
     }
     if (w.proposal) {

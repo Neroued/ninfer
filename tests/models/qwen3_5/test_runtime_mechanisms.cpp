@@ -1,8 +1,6 @@
 #include "models/common/qwen/vision/prefill.h"
 #include "core/layout.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "models/qwen3_5/program/speculative/mtp_alignment.h"
-#include "models/qwen3_5/program/round_buffers.h"
 #include "models/common/qwen/vision/control.h"
 
 #include "models/common/qwen/prefix_identity.h"
@@ -18,7 +16,7 @@
 
 namespace {
 
-namespace q36 = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 
 int failures = 0;
 
@@ -44,8 +42,8 @@ void test_execution_timing_domains() {
            "reading a completed execution timing must not accumulate its work again");
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
-    return q36::DecoderStateSpec{
+q35::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
+    return q35::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
         .capacity                  = 129,
@@ -60,7 +58,7 @@ q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
 
 void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
-    const q36::DecoderStateLayout bf16 = q36::plan_decoder_state(
+    const q35::DecoderStateLayout bf16 = q35::plan_decoder_state(
         bf16_builder, decoder_spec(ninfer::KvCacheStorage::BFloat16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pages.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
@@ -80,7 +78,7 @@ void test_decoder_layout() {
     probe_spec.text_physical_page_groups = 1;
     probe_spec.mtp_physical_page_groups  = 1;
     ninfer::LayoutBuilder probe_builder;
-    const auto probe = q36::plan_decoder_state(probe_builder, probe_spec);
+    const auto probe = q35::plan_decoder_state(probe_builder, probe_spec);
     expect(probe.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
                probe.text_kv.pages.spec.page_group_count == 1 &&
                probe.mtp_kv->execution_tables.spec.logical_page_capacity == 3 &&
@@ -88,7 +86,7 @@ void test_decoder_layout() {
            "Graph calibration keeps logical context while reducing physical KV storage");
 
     ninfer::LayoutBuilder int8_builder;
-    const q36::DecoderStateLayout int8 = q36::plan_decoder_state(
+    const q35::DecoderStateLayout int8 = q35::plan_decoder_state(
         int8_builder, decoder_spec(ninfer::KvCacheStorage::Int8Group64, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.pages.planes.size() == 8 &&
@@ -106,9 +104,9 @@ void test_decoder_layout() {
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 
-    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
+    q35::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
     ninfer::LayoutBuilder fp8_builder;
-    const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
+    const q35::DecoderStateLayout fp8 = q35::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
     expect(fp8.text_kv.pages.planes.size() == 8 &&
                fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
@@ -123,7 +121,7 @@ void test_decoder_layout() {
            "FP8 Text/MTP KV payload accounting");
 
     ninfer::LayoutBuilder nvfp4_builder;
-    const q36::DecoderStateLayout nvfp4 = q36::plan_decoder_state(
+    const q35::DecoderStateLayout nvfp4 = q35::plan_decoder_state(
         nvfp4_builder, decoder_spec(ninfer::KvCacheStorage::Nvfp4Group16, true));
     (void)nvfp4_builder.finish(256);
     expect(nvfp4.text_kv.pages.planes.size() == 8 &&
@@ -141,7 +139,7 @@ void test_decoder_layout() {
            "NVFP4 Text/MTP physical payload bytes");
 
     ninfer::LayoutBuilder k8v4_builder;
-    const q36::DecoderStateLayout k8v4 = q36::plan_decoder_state(
+    const q35::DecoderStateLayout k8v4 = q35::plan_decoder_state(
         k8v4_builder, decoder_spec(ninfer::KvCacheStorage::Fp8KeyNvfp4Value, true));
     (void)k8v4_builder.finish(256);
     expect(k8v4.text_kv.pages.planes.size() == 8 &&
@@ -162,77 +160,21 @@ void test_decoder_layout() {
            "K8V4 Text/MTP asymmetric physical payload bytes");
 }
 
-void test_round_layout() {
-    ninfer::LayoutBuilder builder;
-    q36::RoundStateLayout round = q36::begin_round_state_layout(
-        builder, q36::RoundStateSpec{.hidden       = 32,
-                                     .output_rows  = 128,
-                                     .draft_window = 5,
-                                     .backend      = ninfer::SpeculativeBackend::Mtp});
-    (void)builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
-    q36::complete_round_state_layout(builder, round);
-    (void)builder.finish(256);
-    expect(round.complete, "round layout completes");
-    expect(round.logits.shape[0] == 128 && round.logits.shape[1] == 1, "round logits shape");
-    expect(round.mtp.has_value() && round.mtp->draft_tokens.shape[0] == 5 &&
-               round.mtp->target_input_ids.shape[0] == 6,
-           "MTP prefill scratch shapes");
-    expect(round.mtp.has_value() && round.mtp->position.shape[0] == 1,
-           "MTP prefill scratch is explicit");
-    expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
-               round.mtp_decode->alignment_ids.shape[1] == 1,
-           "MTP decode frame is explicit");
-
-    ninfer::LayoutBuilder speculative_builder;
-    q36::RoundStateLayout dflash = q36::begin_round_state_layout(
-        speculative_builder, q36::RoundStateSpec{.hidden       = 32,
-                                                 .output_rows  = 128,
-                                                 .draft_window = 15,
-                                                 .backend = ninfer::SpeculativeBackend::DFlash});
-    q36::complete_round_state_layout(speculative_builder, dflash);
-    (void)speculative_builder.finish(256);
-    expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
-               dflash.dflash_prefill->local_append_count.shape[0] == 1 &&
-               dflash.dflash_decode.has_value() &&
-               dflash.dflash_decode->draft_tokens.shape[0] == 15,
-           "K=15 DFlash storage is backend-owned");
-    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
-           "DFlash layout does not allocate MTP storage");
-
-    ninfer::LayoutBuilder scoring_builder;
-    auto scoring = q36::begin_round_state_layout(
-        scoring_builder, {.hidden = 32, .output_rows = 128, .causal_scoring = true});
-    q36::complete_round_state_layout(scoring_builder, scoring);
-    expect(scoring.rope_delta.region.bytes != 0 && scoring.text_kv_table_row.region.bytes != 0,
-           "scoring keeps its Text prefill controls");
-    expect(!scoring.ordinary && !scoring.mtp_decode && !scoring.dflash_decode &&
-               scoring.token.region.bytes == 0 && scoring.logits.region.bytes == 0,
-           "scoring does not reserve generation frames or sampled output");
-}
-
-void test_mtp_alignment() {
+void test_visual_embedding_windows() {
     const std::vector<std::int32_t> scatter{2, 4, 7};
-    const q36::MtpAlignmentWindow first = q36::plan_mtp_alignment_window(8, 0, 4);
-    expect(first.hidden_begin == 0 && first.position_begin == 0 &&
-               first.shifted_embedding_begin == 1 && first.columns == 4 &&
-               !first.final_column_uses_generated_token,
-           "non-final MTP alignment window");
-    const ninfer::models::qwen::VisualEmbeddingSlice first_visual =
-        ninfer::models::qwen::visual_embedding_slice(scatter, 8, first.shifted_embedding_begin,
-                                                     first.columns);
-    expect(first_visual.source_begin == 0 &&
-               first_visual.destination_columns == std::vector<std::int32_t>({1, 3}),
-           "non-final shifted visual overlap");
-
-    const q36::MtpAlignmentWindow final = q36::plan_mtp_alignment_window(8, 4, 4);
-    expect(final.shifted_embedding_begin == 5 && final.final_column_uses_generated_token,
-           "final MTP alignment window");
-    const ninfer::models::qwen::VisualEmbeddingSlice final_visual =
-        ninfer::models::qwen::visual_embedding_slice(scatter, 8, final.shifted_embedding_begin,
-                                                     final.columns);
-    expect(final_visual.source_begin == 2 &&
-               final_visual.destination_columns == std::vector<std::int32_t>({2}),
-           "final shifted visual overlap excludes generated-token column");
+    const auto first = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 0, 4);
+    expect(first.source_begin == 0 && first.destination_columns == std::vector<std::int32_t>({2}),
+           "first input window selects only its visual columns");
+    const auto final = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 4, 4);
+    expect(final.source_begin == 1 &&
+               final.destination_columns == std::vector<std::int32_t>({0, 3}),
+           "last input window retains visual columns at both boundaries");
+    const auto shifted = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 1, 3);
+    expect(shifted.source_begin == 0 &&
+               shifted.destination_columns == std::vector<std::int32_t>({1}),
+           "root MTP history uses token positions after its skipped first input");
+    expect(ninfer::models::qwen::visual_embedding_slice(scatter, 8, 8, 1).empty(),
+           "generated input beyond the prompt has no visual embedding");
 }
 
 void test_vision_control() {
@@ -511,15 +453,14 @@ void test_regular_prefix_identity() {
 int main() {
     test_execution_timing_domains();
     test_decoder_layout();
-    test_round_layout();
-    test_mtp_alignment();
+    test_visual_embedding_windows();
     test_vision_control();
     test_prefix_identity();
     test_regular_prefix_identity();
     if (failures != 0) {
-        std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
+        std::cerr << failures << " Qwen3.5 runtime mechanism checks failed\n";
         return 1;
     }
-    std::cout << "Qwen3.6 runtime mechanism checks passed\n";
+    std::cout << "Qwen3.5 runtime mechanism checks passed\n";
     return 0;
 }

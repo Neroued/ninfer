@@ -58,13 +58,14 @@ HC 的四条 streams 是特征轴，GDN/QSA/MoE 的 token 数不乘四。
 
 | 所有者 | 内容 |
 |---|---|
-| Model | Config、Binding/Use、不可变 Host/GPU 权重、PLE 文件 backing、hash controls 和 LUT |
-| Program | StateImage、Main/MTP KV pools、records、workspace、PLE 服务与上传槽、Graphs；offload 另持有 expert cache/CPU bridge |
-| 请求 continuation | 完整 state identity、Main/MTP frontiers、RoPE delta、PLE raw-ID tail |
+| ModelDefinition | Config、Binding/Use、表示几何、Frontend 资源和 PLE hash controls |
+| ModelShard / Parameters | 本地不可变 Host/GPU 权重、PLE 文件 backing 和实际 Op 参数视图 |
+| Session / ContextDirectory | 请求 continuation、checkpoint、Main/MTP frontiers、RoPE delta、PLE raw-ID tail、state/page/table/Host 范围分配与引用 |
+| RankProgram | StateImage 和 Main/MTP KV 的固定 backing、records、workspace、PLE 服务与上传槽、Graphs；offload 另持有 expert cache/CPU bridge |
 | Ops | 借用的输入输出和 scratch；计算或状态提取，不发布请求状态 |
 | Runtime / Frontend | 请求调度、保留策略、输出 preview/commit 和协议语义 |
 
-HC/Linear 可计算 padding 物理列；Program 提供有限安全输入。
+HC/Linear 可计算 padding 物理列；RankProgram 提供有限安全输入。
 QSA/PLE 允许零有效列，GDN 的 active batch 不包含空行。Main 在完整 forward 前确定
 紧凑成员，保持各层、records 和 commit selectors 的行对应关系。
 
@@ -139,7 +140,7 @@ Router/shared parent 的持久合并不强制一次计算；shared 始终在 GPU
 GPU 的完整融合与 routed subset 入口均已实现，CPU subset 产生 FP32 contribution，
 由公共 mixed execution 汇合并最终舍入。
 
-Resident 路径直接调用完整 GPU 融合 MoE，bank 地址由 Model backing 保持稳定。
+Resident 路径直接调用完整 GPU 融合 MoE，bank 地址由 ModelShard backing 保持稳定。
 Offload 路径由公共 `models/common/moe` 按实际 M 选择策略：
 
 - 小 M：GPU 计算 ready experts，CPU 计算补集；稳定时不搬运权重。
@@ -161,7 +162,7 @@ Offload 路径由公共 `models/common/moe` 按实际 M 选择策略：
 direct-I/O 对齐范围；跨续卷或非对齐边界可以产生多段读。短读只有覆盖全部必需字节
 才可接受，不能用补零替代丢失数据。
 
-Program 的 `PrepareService` 使用一个 I/O worker，执行
+RankProgram 的 `PrepareService` 使用一个 I/O worker，执行
 `hash → 行去重/cache → 物理读合并 → O_DIRECT/io_uring → 收集 → LUT 解码`。
 当前配置为 64 MiB 四路原始行缓存、128 个在途读、两个窗口槽。
 行缓存和在途读可跨窗口复用；必需窗口优先，预取保留必需窗口的容量。
@@ -188,7 +189,7 @@ Ticket 由物理 slot 和 generation 构成。每行携带 sequence、epoch、�
 Consumer 在首个 E 读者前等待 ready，在最后读者后记录 consumed，再通知 owner 已提交。
 Graph 将这两个依赖捕获为 external event nodes；本代次 H2D/event 必须先于 graph replay
 排入 producer stream。尚未提交的下一代 event 不能作为本轮就绪信号。
-Program 先创建上传槽，后创建准备服务；销毁时先结束 Host writers，再排空上传和消费。
+RankProgram 先创建上传槽，后创建准备服务；销毁时先结束 Host writers，再排空上传和消费。
 取消撤销该窗口的发布意图，仍有其他窗口使用的共享读继续完成。
 晚到完成可填充正确的不可变行缓存，但不能写入重用后的 ticket。
 读取失败通过当前 unit 的错误路径传播，不发布部分 E。
@@ -219,7 +220,7 @@ residual + U + N + 旧 history → ple_conv_add_norm：BF16 residual、下一组
 
 PLE 卷积消费 norm(actual BF16 U) 的 N records，四个 tap 对应 -9、-6、-3、0。
 Conv/SiLU 与 residual/U 相加后写 BF16，再做下一组 HC norm。
-E 的最后读者是 KV Linear；Program 在整个 PLE GPU 段后记录 consumed。
+E 的最后读者是 KV Linear；RankProgram 在整个 PLE GPU 段后记录 consumed。
 Resident 图中的 external record 允许 Host 在后续层执行期间回收该槽。
 N records 和采用所需 IDs 保留到提交，不随 E 槽释放。
 GPU 数学见 [PLE 合同](../../include/ninfer/ops/ple.h)。
@@ -253,12 +254,12 @@ Draft 使用完整共享 head 的 argmax；target 验收支持请求的 greedy �
 ## 6. Vision 与前端
 
 共享 Qwen Frontend 提供原 IDs、媒体 patches、视觉 spans 和三轴 MRoPE。
-Program 在 embedding 后、HC 展开前替换视觉列；MTP 历史建立也使用对应视觉 embedding。
+RankProgram 在 embedding 后、HC 展开前替换视觉列；MTP 历史建立也使用对应视觉 embedding。
 QSA 因果顺序仍使用 token ordinal，RoPE 独立消费坐标，生成文本使用保存的 rope_delta。
 
 一个 Text 窗口至多消费一个视觉条目，条目可以跨多个 chunk。
-Program 持有一份 workspace 和独立于通用计算区的视觉 handoff；各请求 session
-按 owner/generation 借用该 handoff。编码 scratch 可以复用通用区域；
+RankProgram 持有一份 workspace 和独立于通用计算区的视觉 handoff；各 residency 的视觉执行
+按 owner/generation 借用该 handoff。Session 只保留 owning Host 输入和消费计划。编码 scratch 可以复用通用区域；
 Text/decode 不覆盖有效 handoff，另一个 Vision 编码可覆盖它，后续需要时由保留 patches 重编码。
 Main 与 MTP 完成对应消费后退役条目绑定，暂停/取消也退役。
 
@@ -315,26 +316,26 @@ Device/Host 迁移保留其原 words；恢复还必须具有同前沿的 StateIm
 ### 7.3 提交与恢复边界
 
 ```text
-预留 state / records / pages，完成 COW 与输入准备
-  → 候选 forward
-  → 后端验收 + Frontend preview 得到接受前缀 a
-  → GDN exact fold、QSA/PLE extract、末端 hidden 选择、MTP 历史对齐
-  → 采用完整 StateImage、各 pool coverage 与输入身份
-  → 发布输出，释放候选资源
+Session 取得执行许可，预留 state / pages，形成 COW 与输入描述
+  → RankProgram 执行输入准备、候选 forward 和后端验收
+  → ResultReady，Frontend preview 得到接受前缀 a
+  → Session 提交 Commit，取得 CommitReceipt 后发布输出
+  → RankProgram 执行 GDN exact fold、QSA/PLE extract、hidden 选择、MTP 历史对齐
+  → DeviceRetired，Session 结算 StateImage、各 pool coverage、输入身份和资源引用
 ```
 
 `qsa_tail_extract` 从实际 raw-key/坐标 records 取得 tail；
 `ple_state_extract` 从 N records 取得九列历史；raw-ID tail 按同一个 a 更新。
 QSA/PLE 在 a=0 时可以向独立 destination 复制旧状态；GDN fold 的 a=0 是严格 no-op。
-是否采用 destination 由 Program 决定。
+是否采用 destination 由 Session 的 Commit 决定，RankProgram 执行对应物理写入。
 
 Sample 和 conditioning 必须来自同一次执行的同一接受列，按原 words 复制；
 不能对更短窗口重算 final mixer。接受前沿可不对齐四-token 块或 64-token 页。
 例如 F0=6、a=1 时，新的 QSA tail 是 raw 4/5/6，候选阶段写出的块 4..7 仍不可见。
 
 长窗口只产生末端 GDN recurrent state，因此完整模型 checkpoint 对齐实际执行边界。
-Program 在选定 capture 点拆分窗口；QSA/PLE 能提取中间前缀，并不单独赋予该点完整
-模型恢复能力。保存 checkpoint 保留精确 KVPrefixRef，不因非页对齐而立即复制尾页；
+Session 在选定 capture 点拆分窗口；QSA/PLE 能提取中间前缀，并不单独赋予该点完整
+模型恢复能力。保存 checkpoint 保留精确 HistoryPrefix，不因非页对齐而立即复制尾页；
 真正写冲突时才执行 COW。
 
 Snapshot 复制/恢复完整 image、各 pool 前缀和 metadata；Replay 重新执行已接受输入，
@@ -359,7 +360,7 @@ Host 读取等待不再与 resident 前序层重叠。表驻留位置不进入 M
 Offload 仍按真实 CPU/cache 交接分段，PLE 之前的层可以在 Host 准备期间执行。
 
 同一 exact-B 内，位置、valid columns、state selectors、table rows、page IDs、route/mask
-内容是 Device 输入。Program 选择 context envelope 并更新本地 child；Op 保留自己的
+内容是 Device 输入。RankProgram 选择 context envelope 并更新本地 child；Op 保留自己的
 分派逻辑。启动时验证全部 envelope 更新和 PLE 槽切换；workspace 取允许 profile 的峰值。
 
 MTP 按本轮实际深度 S=1..K 选择一条 draft chain，保留每行有效长度和 step-0 bridge。
@@ -389,7 +390,7 @@ handoff 单独计入。PLE 容量为
 `Mmax=max(prefill_chunk,max_concurrency*(draft_tokens+1))`，
 两份 pinned E 和两份 Device E 各自共占 `2*Mmax*2560*2` B，
 另计 64 MiB row cache、I/O buffers 和有界 Host metadata。PLE 容量查询使用独立的
-TableGeometry；启动重试不借用已销毁 Model 的 table。Spark 将这些 Host 分配与 GPU
+TableGeometry；启动重试不借用已销毁 ModelShard 的 table。Spark 将这些 Host 分配与 GPU
 分配计入同一物理预算，Host State/KV cache 为零；Vision 的 live media 额度另在启动预算中预留。
 
 以下是本实例的逻辑 state payload，尚未计入 field/slot 对齐：
@@ -421,12 +422,13 @@ PLE cache 和进程内存分别计费；registered 范围不是另一份专家�
 
 | 责任 | 实现 |
 |---|---|
-| 配置、绑定、放置和只读 Model | [config](../../src/models/qwen4_exp/config.cpp)、[load](../../src/models/qwen4_exp/load.cpp)、[bindings](../../src/models/qwen4_exp/load/weights.cpp) |
+| 配置、只读定义与本地权重加载 | [config](../../src/models/qwen4_exp/config.cpp)、[definition](../../src/models/qwen4_exp/definition.cpp)、[load](../../src/models/qwen4_exp/load.cpp) |
 | 无地址 profile、Parameters 与层计算 | [execution](../../src/models/qwen4_exp/execution/) |
 | 启动预算、资源和图 | [planning](../../src/models/qwen4_exp/program/planning.cpp)、[resources](../../src/models/qwen4_exp/program/resources.cpp)、[graphs](../../src/models/qwen4_exp/program/graphs.cpp) |
 | PLE hash、读取服务和上传槽 | [ple](../../src/models/qwen4_exp/ple/)、[PlePipeline](../../src/models/qwen4_exp/program/ple_pipeline.cpp) |
-| Main/MTP unit 与采用 | [eager](../../src/models/qwen4_exp/program/eager.cpp)、[mtp](../../src/models/qwen4_exp/program/mtp.cpp)、[commit](../../src/models/qwen4_exp/program/commit.cpp) |
-| StateImage、页组和 checkpoint | [state](../../src/models/qwen4_exp/state/)、[context](../../src/models/qwen4_exp/program/context.cpp)、[checkpoints](../../src/models/qwen4_exp/program/checkpoints.cpp) |
+| Main/MTP 物理执行与采用 | [execution](../../src/models/qwen4_exp/program/execution.cpp)、[mtp](../../src/models/qwen4_exp/program/mtp.cpp)、[commit](../../src/models/qwen4_exp/program/commit.cpp) |
+| 请求事务、页组与 checkpoint | [session](../../src/models/qwen4_exp/session/)、[directory](../../src/models/common/context/directory.h) |
+| StateImage 与本地上下文执行 | [state](../../src/models/qwen4_exp/state/)、[context](../../src/models/qwen4_exp/program/context.cpp) |
 | 静态 expert 排序 | [expert_priority](../../src/models/qwen4_exp/program/expert_priority.cpp) |
 
 [Tests](../../tests/README.md)维护 Op 数学、状态语义、PLE 和模型加载测试入口；

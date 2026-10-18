@@ -1,5 +1,6 @@
 #include "core/device.h"
-#include "models/common/context/migration.h"
+#include "models/common/context/directory.h"
+#include "models/common/context/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -14,6 +15,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -45,8 +47,13 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto layout = schema.finish(builder, 4);
     ninfer::DeviceBuffer backing(device.device(), builder.finish());
     ninfer::StateImageStorage physical(backing.span(), layout);
-    ninfer::HostContextArena host_backing(layout.image_stride * 2, layout.image_stride);
-    store::StateImageStore images(physical, &host_backing, 6);
+    store::HostAllocator host_backing(0, layout.image_stride * 2, layout.image_stride);
+    ninfer::PinnedHostBuffer host_payload(layout.image_stride * 2);
+    store::StateDirectory images({6, 4, physical.image_bytes()}, &host_backing);
+    store::ContextStorage storage(physical, {}, 0, host_payload.span());
+    const auto enqueue = [&](const store::StateDirectory::Transfer& transfer) {
+        storage.execute(store::ContextAction{transfer.description()}, {}, device.transfer_view());
+    };
     const auto hidden_slot = [&](std::int32_t slot) {
         return physical.field(hidden_field).slice(1, slot, 1).view({8});
     };
@@ -67,16 +74,16 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(images.content_epoch(*source) == source_epoch, "freezing retains content identity");
     images.make_mutable(*source);
     expect(images.physical_slot(*source) == original_slot &&
-               images.role(*source) == store::StateImageRole::ActiveMutable,
+               images.role(*source) == store::StateRole::ActiveMutable,
            "private Move preserves the logical image and physical slot");
     images.freeze(*source);
     const auto destination = images.reserve_destination();
     expect(destination.has_value(), "state destination reservation");
-    const store::StateImageSelectors selectors = images.begin_write(*source, *destination);
+    const store::StateSelectors selectors = images.begin_write(*source, *destination);
     expect(selectors.source >= 0 && selectors.destination >= 0 &&
                selectors.source != selectors.destination,
            "fork resolves distinct physical selectors");
-    expect(images.role(*destination) == store::StateImageRole::Writing,
+    expect(images.role(*destination) == store::StateRole::Writing,
            "pending write is not readable active content");
     expect(!images.release(*source) && !images.release(*destination),
            "fork pins both logical images");
@@ -91,8 +98,8 @@ void test_state_store(ninfer::DeviceContext& device) {
                !images.release(*destination),
            "aborting one reader preserves the remaining fork's pins");
     images.complete_write(*source, *destination);
-    expect(images.role(*source) == store::StateImageRole::CheckpointImmutable &&
-               images.role(*destination) == store::StateImageRole::ActiveMutable &&
+    expect(images.role(*source) == store::StateRole::CheckpointImmutable &&
+               images.role(*destination) == store::StateRole::ActiveMutable &&
                images.content_epoch(*destination) != source_epoch,
            "fork commit preserves source and activates destination");
     images.retain_checkpoint_reference(*source);
@@ -180,8 +187,9 @@ void test_state_store(ninfer::DeviceContext& device) {
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared);
         auto transfer = images.reserve_device_to_host(*shared);
-        if (transfer) transfer->enqueue(device.transfer_view());
-        expect(transfer && images.release_checkpoint_owner(*shared) && images.valid(*shared),
+        if (transfer) enqueue(*transfer);
+        expect(transfer && images.host_occupied() == 1 &&
+                   images.release_checkpoint_owner(*shared) && images.valid(*shared),
                "submitted State transfer retains a retired checkpoint source");
         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
         if (cancel_transfer) {
@@ -189,7 +197,7 @@ void test_state_store(ninfer::DeviceContext& device) {
         } else {
             transfer->publish(true);
         }
-        expect(!images.valid(*shared) && images.occupied() == 0 &&
+        expect(!images.valid(*shared) && images.occupied() == 0 && images.host_occupied() == 0 &&
                    host_backing.occupied_bytes() == 0,
                "last transfer lease retirement frees both State replicas and reservations");
     }
@@ -226,34 +234,37 @@ void test_state_store(ninfer::DeviceContext& device) {
         auto cancelled      = images.reserve_device_to_host(*host_source, std::move(*allocation));
         expect(host_backing.occupied_bytes() == occupied && host_backing.allocation_count() == 1,
                "transfer consumes the existing Host reservation without reallocating");
-        expect(cancelled && host_backing.reserved_bytes() == layout.image_stride &&
+        expect(cancelled && images.host_occupied() == 1 &&
+                   host_backing.reserved_bytes() == layout.image_stride &&
                    host_backing.live_bytes() == 0 && images.source_pins(*host_source) == 1 &&
                    !images.release(*host_source),
                "State transfer reservation charges destination while its source is pinned");
     }
-    expect(host_backing.occupied_bytes() == 0 && images.source_pins(*host_source) == 0 &&
-               images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
+    expect(host_backing.occupied_bytes() == 0 && images.host_occupied() == 0 &&
+               images.source_pins(*host_source) == 0 &&
+               images.residency(*host_source) == store::StateResidency::DeviceOnly,
            "cancelled State transfer releases its actual Host extent and retains source state");
     auto d2h = images.reserve_device_to_host(*host_source);
-    if (d2h) d2h->enqueue(device.transfer_view());
-    expect(d2h.has_value() &&
-               images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
+    if (d2h) enqueue(*d2h);
+    expect(d2h.has_value() && images.host_occupied() == 1 &&
+               images.residency(*host_source) == store::StateResidency::DeviceOnly,
            "incomplete State D2H does not publish a Host replica");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     d2h->publish(true);
-    expect(images.residency(*host_source) == store::StateReplicaResidency::Both &&
-               host_backing.live_bytes() == layout.image_stride &&
+    expect(images.residency(*host_source) == store::StateResidency::Both &&
+               images.host_occupied() == 1 && host_backing.live_bytes() == layout.image_stride &&
                host_backing.reserved_bytes() == 0,
            "State D2H backup publishes stable Both residency");
 
     const auto moved_device = images.reserve_logical_destination();
     expect(moved_device.has_value(), "State replica split destination allocation");
     images.split_device_replica_identity(*host_source, *moved_device);
-    expect(images.role(*moved_device) == store::StateImageRole::ReservedDestination,
+    expect(images.role(*moved_device) == store::StateRole::ReservedDestination,
            "replica handover does not publish a writer");
     images.complete_initialization(*moved_device);
-    expect(images.residency(*host_source) == store::StateReplicaResidency::HostOnly &&
-               images.residency(*moved_device) == store::StateReplicaResidency::DeviceOnly &&
+    expect(images.residency(*host_source) == store::StateResidency::HostOnly &&
+               images.host_occupied() == 1 &&
+               images.residency(*moved_device) == store::StateResidency::DeviceOnly &&
                images.content_epoch(*moved_device) == images.content_epoch(*host_source),
            "State replica identity split keeps old Host content and moves Device ownership");
 
@@ -261,13 +272,14 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto fork_two = images.reserve_logical_destination();
     expect(fork_one && fork_two, "concurrent Host State forks reserve logical destinations");
     auto h2d_one = images.reserve_host_to_device(*host_source, *fork_one);
-    if (h2d_one) h2d_one->enqueue(device.transfer_view());
+    if (h2d_one) enqueue(*h2d_one);
     auto h2d_two = images.reserve_host_to_device(*host_source, *fork_two);
-    if (h2d_two) h2d_two->enqueue(device.transfer_view());
-    expect(h2d_one && h2d_two && images.source_pins(*host_source) == 2,
+    if (h2d_two) enqueue(*h2d_two);
+    expect(h2d_one && h2d_two && images.host_occupied() == 1 &&
+               images.source_pins(*host_source) == 2,
            "immutable Host State source supports multiple fork pins");
     auto h2d_source = images.reserve_host_to_device(*host_source);
-    if (h2d_source) h2d_source->enqueue(device.transfer_view());
+    if (h2d_source) enqueue(*h2d_source);
     expect(h2d_source && images.source_pins(*host_source) == 3,
            "Host replica remains shared while restoring its own Device replica");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
@@ -276,18 +288,21 @@ void test_state_store(ninfer::DeviceContext& device) {
         h2d_source->publish(false);
     } catch (const std::logic_error&) { rejected = true; }
     expect(rejected && h2d_source->valid() && images.host_resident(*host_source) &&
-               !images.device_resident(*host_source) && images.source_pins(*host_source) == 3,
+               images.host_occupied() == 1 && !images.device_resident(*host_source) &&
+               images.source_pins(*host_source) == 3,
            "restoration cannot retire Host storage retained by other transfers");
     h2d_one->publish(true);
     h2d_two->publish(true);
+    expect(images.host_occupied() == 1, "independent Device forks retain one Host source");
     h2d_source->publish(false);
-    expect(images.role(*fork_one) == store::StateImageRole::ReservedDestination,
+    expect(images.role(*fork_one) == store::StateRole::ReservedDestination &&
+               images.host_occupied() == 0,
            "Host materialization is separate from native adoption");
     images.complete_initialization(*fork_one);
     images.complete_initialization(*fork_two);
     expect(images.source_pins(*host_source) == 0 &&
-               images.residency(*fork_one) == store::StateReplicaResidency::DeviceOnly &&
-               images.residency(*fork_two) == store::StateReplicaResidency::DeviceOnly &&
+               images.residency(*fork_one) == store::StateResidency::DeviceOnly &&
+               images.residency(*fork_two) == store::StateResidency::DeviceOnly &&
                images.content_epoch(*fork_one) == images.content_epoch(*host_source) &&
                images.content_epoch(*fork_two) == images.content_epoch(*host_source),
            "Host State forks publish independent Device destinations");
@@ -308,8 +323,10 @@ void test_migration_state_fields(ninfer::DeviceContext& device) {
     const auto layout = schema.finish(backing_layout, 2);
     DeviceBuffer backing(device.device(), backing_layout.finish());
     StateImageStorage storage(backing.span(), layout);
-    store::StateImageStore states(storage, nullptr, 2);
-    store::MigrationContext executor(device, 0);
+    store::ContextDirectory directory({.state = {2, 2, storage.image_bytes()}});
+    auto& states = directory.states();
+    store::ContextStorage physical(storage, {}, 0, {});
+    store::ContextMigration executor(device, physical);
     const auto source = states.reserve_destination().value();
     std::vector<std::byte> words(storage.image_bytes());
     for (std::size_t i = 0; i < words.size(); ++i) words[i] = std::byte((i * 29 + 13) & 0xff);
@@ -323,18 +340,22 @@ void test_migration_state_fields(ninfer::DeviceContext& device) {
         const auto image = storage.image(states.physical_slot(destination));
         CUDA_CHECK(
             cudaMemcpy(image.data, expected.data(), expected.size(), cudaMemcpyHostToDevice));
-        store::MigrationBatch migration(executor, nullptr);
-        migration.own_state(states, destination);
+        store::ContextTransaction migration(directory);
+        migration.own_state(destination);
         if (clear) {
-            migration.clear_state(storage, states);
+            migration.clear_state();
             std::fill(expected.begin(), expected.end(), std::byte{0});
         } else {
-            migration.add_state_group(states, storage, source, group);
+            migration.add_state_group(source, group.offset, group.bytes);
             std::copy_n(words.begin() + group.offset, group.bytes, expected.begin() + group.offset);
         }
-        migration.submit();
-        migration.drain();
+        migration.prepare_actions();
+        executor.submit(migration.actions());
+        migration.mark_submitted();
+        while (!executor.ready()) std::this_thread::yield();
+        migration.mark_completed();
         migration.publish();
+        executor.finish();
         std::vector<std::byte> observed(words.size());
         CUDA_CHECK(
             cudaMemcpy(observed.data(), image.data, observed.size(), cudaMemcpyDeviceToHost));

@@ -19,6 +19,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(ResidentPrefixIdentity& other) noexcept;
+    void prepare_generated(std::size_t count, std::int32_t rope_delta,
+                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void append_generated(std::size_t count, std::int32_t rope_delta,
                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
@@ -52,6 +54,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(PrefixShortlistDigests& other) noexcept;
+    void prepare_generated(std::size_t count, std::int32_t rope_delta,
+                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta,
                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);

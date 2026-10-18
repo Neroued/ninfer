@@ -83,7 +83,25 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
         memory.workspace_logical_peak_bytes != 0 ||
         (memory.cuda_graph.has_value()) != engine.options().use_cuda_graph) {
-        std::cerr << "35B Engine construction has an invalid memory summary\n";
+        std::cerr << "35B Engine construction has an invalid memory summary: weights="
+                  << memory.weights.used_bytes << '/' << memory.weights.capacity_bytes
+                  << " sequence=" << memory.sequence.used_bytes << '/'
+                  << memory.sequence.capacity_bytes
+                  << " workspace=" << memory.workspace.capacity_bytes
+                  << " logical_peak=" << memory.workspace_logical_peak_bytes
+                  << " graph=" << memory.cuda_graph.has_value()
+                  << " expected_graph=" << engine.options().use_cuda_graph << '\n';
+        if (vision)
+            std::cerr << "vision: prompt=" << vision->aggregate_prompt_tokens
+                      << " item=" << vision->max_item_tokens
+                      << " general=" << vision->general_capacity_bytes
+                      << " encode_peak=" << vision->encode_peak_bytes
+                      << " handoff=" << vision->handoff_offset_bytes << '+'
+                      << vision->handoff_capacity_bytes
+                      << " active=" << vision->handoff_active_bytes
+                      << " peak=" << vision->handoff_peak_bytes << '\n';
+        else
+            std::cerr << "vision workspace is absent\n";
         return 1;
     }
     return 0;

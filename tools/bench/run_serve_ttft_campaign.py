@@ -7,7 +7,6 @@ import argparse
 import datetime as dt
 import http.client
 import json
-import os
 import socket
 import subprocess
 import sys
@@ -27,9 +26,8 @@ from tools.bench.ttft.report import ReportError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEIGHTS = REPO_ROOT / "out/qwen3_8_27b_nvfp4.ninfer"
-RAM_WEIGHTS_ROOT = Path("/dev/shm/ninfer-artifacts")
 RUNNER = REPO_ROOT / "tools/bench/run_serve_ttft.py"
-OUTPUT_ROOT = REPO_ROOT / "profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8"
+OUTPUT_ROOT = REPO_ROOT / ".agent-tmp/serve-ttft"
 HOST = "127.0.0.1"
 PORT = 18080
 
@@ -122,101 +120,6 @@ def _ensure_port_free() -> None:
             )
     finally:
         connection.close()
-
-
-def _stage_weights(source: Path) -> tuple[Path, dict[str, Any]]:
-    """Materialize the immutable artifact once in tmpfs for all fresh Serve processes."""
-
-    source = source.resolve()
-    status = source.stat()
-    # The container aligns its payload start, not its total file size.
-    if status.st_size <= 0:
-        raise CampaignError(f"the artifact is empty: {source}")
-
-    fingerprint = (
-        f"{status.st_dev:x}-{status.st_ino:x}-{status.st_size:x}-{status.st_mtime_ns:x}"
-    )
-    cache_prefix = f"{source.stem}-"
-    cached = RAM_WEIGHTS_ROOT / f"{cache_prefix}{fingerprint}.ninfer"
-    record: dict[str, Any] = {
-        "kind": "tmpfs",
-        "source": str(source),
-        "path": str(cached),
-        "source_device": status.st_dev,
-        "source_inode": status.st_ino,
-        "source_bytes": status.st_size,
-        "source_mtime_ns": status.st_mtime_ns,
-    }
-
-    RAM_WEIGHTS_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    RAM_WEIGHTS_ROOT.chmod(0o700)
-    cache_valid = cached.is_file() and cached.stat().st_size == status.st_size
-
-    # Every file under this private directory is a derived copy owned by this controller. Remove
-    # interrupted staging files, obsolete source identities, and incomplete copies.
-    for candidate in RAM_WEIGHTS_ROOT.iterdir():
-        manager_owned = (
-            candidate.name.startswith(cache_prefix)
-            or candidate.name.startswith(f".{cache_prefix}")
-        )
-        if manager_owned and (candidate != cached or not cache_valid):
-            candidate.unlink(missing_ok=True)
-
-    if cache_valid:
-        record["reused"] = True
-        record["stage_seconds"] = 0.0
-        print(
-            f"artifact cache ready: reuse {cached} ({status.st_size / 1024**3:.2f} GiB)",
-            flush=True,
-        )
-        return cached, record
-
-    staging = RAM_WEIGHTS_ROOT / f".{cached.name}.staging-{os.getpid()}"
-
-    filesystem = os.statvfs(RAM_WEIGHTS_ROOT)
-    available = filesystem.f_bavail * filesystem.f_frsize
-    if available < status.st_size:
-        raise CampaignError(
-            "insufficient /dev/shm capacity for the selected artifact: "
-            f"need {status.st_size / 1024**3:.2f} GiB, "
-            f"available {available / 1024**3:.2f} GiB"
-        )
-
-    started = time.monotonic()
-    print(
-        f"artifact cache stage: {source} -> {cached} "
-        f"({status.st_size / 1024**3:.2f} GiB, one SSD read)",
-        flush=True,
-    )
-    command = [
-        "dd",
-        f"if={source}",
-        f"of={staging}",
-        "bs=16M",
-        "iflag=direct",
-        "conv=fsync",
-        "status=progress",
-    ]
-    try:
-        completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
-        if completed.returncode != 0:
-            raise CampaignError(f"artifact tmpfs staging failed with status {completed.returncode}")
-        staged_size = staging.stat().st_size
-        if staged_size != status.st_size:
-            raise CampaignError(
-                f"artifact tmpfs staging produced {staged_size} bytes, expected {status.st_size}"
-            )
-        staging.chmod(0o600)
-        os.replace(staging, cached)
-    except BaseException:
-        staging.unlink(missing_ok=True)
-        raise
-
-    elapsed = time.monotonic() - started
-    record["reused"] = False
-    record["stage_seconds"] = elapsed
-    print(f"artifact cache ready in {elapsed:.2f}s: {cached}", flush=True)
-    return cached, record
 
 
 class RunningServe:
@@ -502,6 +405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for required in (args.serve, args.artifact, RUNNER):
         if not required.is_file():
             raise SystemExit(f"required campaign input is missing: {required}")
+    if args.artifact.stat().st_size == 0:
+        raise SystemExit(f"the artifact is empty: {args.artifact}")
 
     campaign_name = args.campaign or ("focused" if args.selected_cases else "resource")
     case_names = (
@@ -526,11 +431,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if output_dir.exists() and any(output_dir.iterdir()):
         raise SystemExit(f"campaign output directory is not empty: {output_dir}")
-
-    try:
-        runtime_weights, artifact_cache = _stage_weights(args.artifact)
-    except (OSError, CampaignError) as error:
-        raise SystemExit(f"cannot prepare RAM artifact cache: {error}") from error
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -563,7 +463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "serve_log": str(serve_log),
                     "request_log_jsonl": str(request_log_jsonl),
                     "server_command": _server_command(
-                        args.serve, runtime_weights, request_log_jsonl,
+                        args.serve, args.artifact, request_log_jsonl,
                         common_args, profiles[definition.profile],
                     ),
                     "runner_command": _runner_command(
@@ -596,13 +496,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "profile_kv_dtypes": profile_kv_dtypes,
         "serve": str(args.serve),
         "weights_source": str(args.artifact),
-        "weights_runtime": str(runtime_weights),
         "profile_config": str(args.profile_config) if args.profile_config is not None else None,
         "common_args": list(common_args),
         "profile_args": {name: list(profiles[name]) for name in selected_profiles},
         "stats_interval_ms": 1000,
         "stats_interval_source": "campaign_override",
-        "artifact_cache": artifact_cache,
         "output_dir": str(output_dir),
         "plans": plans,
     }

@@ -30,7 +30,6 @@ struct KvPoolDescriptor {
     std::string_view label;
     const KVPageGeometry* geometry   = nullptr;
     std::uint32_t device_page_groups = 0;
-    std::size_t device_page_bytes    = 0;
     std::size_t host_page_stride     = 0;
 };
 

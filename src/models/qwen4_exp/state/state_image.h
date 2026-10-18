@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/linear_attention_state.h"
-#include "models/common/context/state_store.h"
+#include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/config.h"
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/ple.h"
@@ -22,19 +22,6 @@ struct StateLayout {
 
 [[nodiscard]] StateLayout plan_state_image(LayoutBuilder&, const Config&, std::int32_t slots);
 
-struct ContinuationMetadata {
-    std::uint32_t main_frontier = 0;
-    std::int32_t rope_delta     = 0;
-    std::array<std::int32_t, 2> ple_raw_tail{};
-    std::optional<std::uint32_t> mtp_frontier;
-};
-
-[[nodiscard]] inline std::uint32_t mtp_history_frontier(std::uint32_t main_frontier) {
-    return main_frontier ? main_frontier - 1 : 0;
-}
-
-using Continuation = context::Continuation<ContinuationMetadata>;
-
 class StateViews {
 public:
     StateViews(MemorySpan, const StateLayout&);
@@ -51,8 +38,7 @@ public:
     [[nodiscard]] Tensor sample_hidden() const;
     [[nodiscard]] Tensor conditioning() const;
     // Initializes a reserved physical image; logical publication belongs to the caller.
-    [[nodiscard]] ContinuationMetadata initialize(std::int32_t slot, std::int32_t eos,
-                                                  CudaExecutionView) const;
+
 private:
     StateLayout layout_;
     StateImageStorage storage_;

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/graph_preparation.h"
 
-#include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "core/startup.h"
 
@@ -12,13 +13,16 @@ GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
                                                 const moe::Plan* moe) {
     GraphPreparationPlan out;
     if (!options.use_cuda_graph || !moe) return out;
-    out.segmented    = true;
-    const auto width = options.speculative.backend == SpeculativeBackend::None
-                           ? 1U
-                           : options.speculative.draft_tokens + 1;
-    for (std::uint32_t batch = 1; batch <= options.max_concurrency; ++batch)
-        for (const auto& layer : moe->description().layers)
-            out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch * width));
+    out.segmented = true;
+    for (std::uint32_t batch = 1; batch <= options.max_concurrency; ++batch) {
+        for (const auto& layer : moe->description().layers) {
+            out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch));
+            if (options.speculative.backend != SpeculativeBackend::None) {
+                const auto width = options.speculative.draft_tokens + 1;
+                out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch * width));
+            }
+        }
+    }
     return out;
 }
 
@@ -31,7 +35,7 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
     auto plan = detail::make_graph_probe_plan(parameters.profile, device, options, std::move(moe));
     auto probe =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan, device, StartupObserver{});
+        std::make_unique<detail::RankProgramImpl>(parameters, *plan, device, StartupObserver{});
     const auto before = device_memory_snapshot(device.device());
     probe->initialize_graphs();
     const auto ready = device_memory_snapshot(device.device());

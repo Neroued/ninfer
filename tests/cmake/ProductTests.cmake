@@ -62,4 +62,4 @@ ninfer_add_test(ninfer_http_transport_test
 
 ninfer_add_test(ninfer_tool_streaming_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_streaming.cpp"
-  LIBRARIES ninfer_serve ninfer_model_runtime ninfer::json)
+  LIBRARIES ninfer_serve ninfer_model_execution ninfer::json)

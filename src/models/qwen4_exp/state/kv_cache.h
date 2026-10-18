@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/paged_kv_cache.h"
+#include "models/common/context/storage.h"
 #include "ninfer/ops/qsa.h"
 #include "models/qwen4_exp/config.h"
 
@@ -22,14 +22,16 @@ public:
     QsaCache(MemorySpan, const QsaCacheLayout&);
     [[nodiscard]] ops::QsaCacheView layer(std::uint32_t) const;
 
-    [[nodiscard]] DeviceKVPagePool& pages() { return pages_; }
+    [[nodiscard]] context::DevicePageStorage& pages() { return pages_; }
 
-    [[nodiscard]] const DeviceKVPagePool& pages() const { return pages_; }
+    [[nodiscard]] const context::DevicePageStorage& pages() const { return pages_; }
 
-    [[nodiscard]] KVExecutionTablePool& tables() { return tables_; }
+    [[nodiscard]] context::ExecutionTableStorage& tables() { return tables_; }
+
+    [[nodiscard]] const context::ExecutionTableStorage& tables() const { return tables_; }
 private:
     QsaCacheLayout layout_;
-    DeviceKVPagePool pages_;
-    KVExecutionTablePool tables_;
+    context::DevicePageStorage pages_;
+    context::ExecutionTableStorage tables_;
 };
 } // namespace ninfer::models::qwen4_exp

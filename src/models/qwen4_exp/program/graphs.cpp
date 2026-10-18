@@ -5,6 +5,7 @@
 #include "core/nvtx.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace ninfer::models::qwen4_exp::detail {
 namespace {
@@ -24,37 +25,37 @@ void write_i32(const Tensor& target, std::span<const std::int32_t> values, CudaE
                {values.data(), values.size_bytes(), Device::cpu()}, cuda);
 }
 
-// Private histories keep warmup reads valid through every context envelope. Only their own
-// pages are repeated; no live request can observe these temporary tables or state images.
+// Preparation precedes Session binding. One physical page per row is repeated across the
+// context envelope; mappings and images are private to this preparation lifetime.
 class CaptureInputs {
 public:
-    explicit CaptureInputs(ProgramImpl& owner) : p_(owner) {}
+    explicit CaptureInputs(RankProgramImpl& owner) : p_(owner) {}
 
     void prepare() {
         auto& r = p_.resources;
+        if (r.states->storage().slot_count() < static_cast<std::int32_t>(p_.shape.max_concurrency))
+            throw std::logic_error("Graph preparation requires one StateImage per row");
         for (std::uint32_t b = 0; b < p_.shape.max_concurrency; ++b) {
-            const auto state = r.state_store->reserve_destination();
-            if (!state) throw std::bad_alloc();
-            states_.push_back(*state);
-            slots_.push_back(r.state_store->physical_slot(*state));
+            slots_.push_back(static_cast<std::int32_t>(b));
             r.states->storage().clear(slots_.back(), p_.cuda);
-            r.state_store->complete_initialization(*state);
         }
         for (std::uint32_t pool = 0; pool < r.pool_count(); ++pool) {
-            auto& storage = r.pool(pool);
+            auto& cache  = r.pool(pool);
+            auto& pages  = cache.pages();
+            auto& tables = cache.tables();
+            if (pages.capacity_pages() < p_.shape.max_concurrency ||
+                tables.row_count() < static_cast<std::int32_t>(p_.shape.max_concurrency))
+                throw std::logic_error("Graph preparation requires one KV page and table per row");
+            const auto capacity  = tables.logical_page_capacity();
+            const auto row_bytes = static_cast<std::size_t>(capacity) * sizeof(std::int32_t);
+            mappings_[pool]      = PinnedHostBuffer(row_bytes * p_.shape.max_concurrency);
             for (std::uint32_t b = 0; b < p_.shape.max_concurrency; ++b) {
-                auto binding = storage.histories.prepare_binding(nullptr, 0, 1, b);
-                binding.publish_restores();
-                binding.prepare_tail_copy();
-                binding.enqueue_mapping(p_.cuda.stream());
-                histories_[pool].push_back(binding.commit());
-                auto& history = histories_[pool].back();
-                storage.histories.prepare_write(history, 0, 1, p_.cuda.stream());
-                const auto page = storage.histories.physical_page(history.handle(), 0);
-                storage.cache.pages().zero_pages({&page, 1}, p_.cuda.stream());
-                storage.cache.tables().publish_repeated(
-                    storage.histories.execution_row(history.handle()).handle(), page,
-                    storage.cache.tables().logical_page_capacity(), p_.cuda.stream());
+                const auto page = static_cast<std::int32_t>(b);
+                pages.zero_pages({&page, 1}, p_.cuda);
+                const auto staging = mappings_[pool].span().subspan(b * row_bytes, row_bytes);
+                auto* indices      = static_cast<std::int32_t*>(staging.data);
+                std::fill_n(indices, capacity, page);
+                tables.publish(page, 0, {indices, capacity}, staging, p_.cuda);
             }
         }
         for (std::uint32_t slot = 0; slot < 2; ++slot) {
@@ -79,20 +80,18 @@ public:
     }
 
     ~CaptureInputs() {
-        p_.device.synchronize();
-        for (auto& histories : histories_) histories.clear();
-        for (const auto state : states_)
-            if (!p_.resources.state_store->release(state)) std::terminate();
+        // prepare() reports execution failures; unwinding still drains the staging readers.
+        (void)cudaStreamSynchronize(p_.cuda.stream());
     }
 
-    void batch(execution::BatchView call, std::uint32_t pool, std::uint32_t visible) {
+    void batch(execution::BatchView call, std::uint32_t visible) {
         const auto t = call.tokens, b = call.batch;
         const auto valid = std::min<std::uint32_t>(t, visible);
         const auto base  = visible - valid;
-        std::vector<std::int32_t> ids(t * b, p_.parameters.model.config().text.ple.eos);
+        std::vector<std::int32_t> ids(t * b, p_.parameters.profile->config.text.ple.eos);
         std::vector<std::int32_t> positions(t * b), rope(t * b * 3), rows(b), bases(b, base);
         for (int row = 0; row < b; ++row) {
-            rows[row] = p_.resources.pool(pool).histories.bound_row(histories_[pool][row].handle());
+            rows[row] = row;
             for (int j = 0; j < t; ++j) {
                 const auto position    = base + std::min<std::uint32_t>(j, valid - 1);
                 positions[j + t * row] = position;
@@ -112,14 +111,13 @@ public:
     }
 
 private:
-    ProgramImpl& p_;
-    std::vector<Image> states_;
+    RankProgramImpl& p_;
     std::vector<std::int32_t> slots_;
-    std::array<std::vector<context::KVHistory>, 2> histories_;
+    std::array<PinnedHostBuffer, 2> mappings_;
 };
 } // namespace
 
-Graphs::Graphs(ProgramImpl& owner)
+Graphs::Graphs(RankProgramImpl& owner)
     : owner_(owner), bounds_(context_bounds(owner.shape.max_context)) {}
 
 TextGraph& Graphs::main(Batch& graph, MainGraph kind) {
@@ -141,7 +139,7 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
     const auto verify   = kind == MainGraph::Verify;
     const auto tokens   = verify ? p.shape.draft_tokens + 1 : 1;
     const auto call     = r.main_batch(tokens, batch, bounds_.back());
-    const auto& c       = p.parameters.model.config().text;
+    const auto& c       = p.parameters.profile->config.text;
     const auto t = static_cast<std::int32_t>(tokens), b = static_cast<std::int32_t>(batch);
     execution::TextOutputs output{r.packed(buffers.pending_sample, {dimension(c.hidden), t, b}),
                                   {}};
@@ -153,7 +151,7 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
                             : Tensor{};
     const execution::TextExecution execution{r.workspace,
                                              *r.states,
-                                             r.main->cache,
+                                             *r.main,
                                              r.experts.get(),
                                              r.tensor(buffers.main_qsa.keys),
                                              r.tensor(buffers.main_qsa.coordinates),
@@ -166,9 +164,13 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
     {
         // Warm the actual bodies before capture. No disk request is needed for these bindings.
         execution::TextRun run(p.parameters, execution, call, update, p.cuda);
-        run.prefix();
+        run.stem();
+        for (std::uint32_t layer = 0; layer < c.ple.layer; ++layer)
+            while (!run.advance_layer(layer)) std::this_thread::yield();
         run.consume_ple(ple[0].values);
-        run.suffix(output, logits);
+        for (std::uint32_t layer = c.ple.layer; layer < p.parameters.text.layers.size(); ++layer)
+            while (!run.advance_layer(layer)) std::this_thread::yield();
+        run.finish(output, logits);
         p.device.synchronize();
         selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, logits,
                          tokens * batch, r.workspace, p.device);
@@ -179,9 +181,10 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
         selected.replay(1, p.cuda);
         selected.replay(0, p.cuda);
     } else {
-        selected.prefix(p.cuda);
+        selected.begin_prefix(p.cuda);
+        while (!selected.advance_prefix(p.cuda)) std::this_thread::yield();
         selected.consume_ple(0, p.cuda);
-        selected.suffix(p.cuda);
+        while (!selected.advance_suffix(p.cuda)) std::this_thread::yield();
     }
     p.device.synchronize();
 }
@@ -252,7 +255,7 @@ void Graphs::prepare() {
     batches_.resize(p.shape.max_concurrency);
     for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
         auto& graph = batches_[batch - 1];
-        inputs.batch(r.main_batch(1, batch, bounds_.back()), 0, bounds_.back());
+        inputs.batch(r.main_batch(1, batch, bounds_.back()), bounds_.back());
         prepare_main(graph, batch, MainGraph::Control);
         prepare_main(graph, batch, MainGraph::Ordinary);
         p.sample_forward(batch, false);
@@ -263,10 +266,10 @@ void Graphs::prepare() {
         if (p.parameters.mtp) {
             const auto& frame = *r.plan.persistent.buffers.mtp;
             for (std::uint32_t step = 0; step < p.shape.draft_tokens; ++step)
-                inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, bounds_.back()), 1,
+                inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, bounds_.back()),
                              bounds_.back());
             prepare_drafts(graph, batch);
-            inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()), 0,
+            inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()),
                          bounds_.back());
             prepare_main(graph, batch, MainGraph::Verify);
             p.accept_forward(batch);
@@ -324,7 +327,7 @@ void Graphs::accept(std::uint32_t batch) {
     batches_.at(batch - 1).accept.executable.launch(owner_.cuda.stream());
 }
 
-void ProgramImpl::initialize_graphs() {
+void RankProgramImpl::initialize_graphs() {
     if (!shape.cuda_graph) return;
     nvtx::ScopedRange range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
     const auto before = device_memory_snapshot(cuda.device());
@@ -337,7 +340,7 @@ void ProgramImpl::initialize_graphs() {
     device.synchronize();
 }
 
-void ProgramImpl::release_graphs() {
+void RankProgramImpl::release_graphs() {
     resources.synchronize();
     graphs.reset();
 }

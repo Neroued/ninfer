@@ -2,7 +2,7 @@
 
 #include "models/common/startup.h"
 #include "models/qwen3_5/load.h"
-#include "models/qwen3_5/program/runtime_types.h"
+#include "models/qwen3_5/runtime_types.h"
 #include "models/qwen3_5/program/graph_preparation.h"
 
 namespace ninfer::models::qwen3_5 {
@@ -14,8 +14,7 @@ struct ExecutionPreparation {
 // Native loading and execution planning. Runtime owns the budget, calibration loop and retries.
 class Startup {
 public:
-    static constexpr bool supports_graph = true;
-    using Types                          = RuntimeTypes;
+    using Types         = RuntimeTypes;
     using ExecutionPlan = models::ExecutionPlan<SequencePlan, ExecutionPreparation>;
     using Calibration   = GraphCalibration;
 
@@ -25,9 +24,9 @@ public:
 
     [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
                                                     WeightPlacement, std::size_t available) const;
-    [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, WeightPlacement,
-                                                     const StartupObserver&);
-    [[nodiscard]] qwen::Frontend frontend(const Model&, const EngineOptions&) const;
+    [[nodiscard]] std::unique_ptr<ModelShard> materialize(DeviceContext&, WeightPlacement,
+                                                          const StartupObserver&);
+    [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;
     [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&,
                                                   const ExecutionPreparation&) const;
     [[nodiscard]] Calibration calibrate(const execution::Parameters&, DeviceContext&,
@@ -35,16 +34,20 @@ public:
 
     [[nodiscard]] std::span<const WeightCandidate> placements() const { return placements_; }
 
-    [[nodiscard]] std::string prefill_signature(const Model&, const ExecutionPreparation&,
+    [[nodiscard]] std::string prefill_signature(const ExecutionPreparation&,
                                                 std::uint32_t chunk) const;
+
+    [[nodiscard]] const std::shared_ptr<const ModelDefinition>& definition() const {
+        return definition_;
+    }
+
     std::shared_ptr<const execution::ModelProfile> profile;
 
 private:
     std::vector<WeightCandidate> placements_;
     std::shared_ptr<const moe::Plan> offload_;
     const artifact::Reader& reader_;
-    LoadOptions selection_;
-    std::optional<LoadPlan> source_;
+    std::shared_ptr<const ModelDefinition> definition_;
     Architecture architecture_;
 };
 

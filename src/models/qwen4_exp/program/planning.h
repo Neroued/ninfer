@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen4_exp/execution_shape.h"
 #include "models/qwen4_exp/execution/workspace.h"
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
@@ -16,14 +17,6 @@ struct PersistentLayout {
     std::optional<QsaCacheLayout> mtp;
     BufferLayout buffers;
     std::size_t bytes;
-};
-
-struct ExecutionShape {
-    std::uint32_t max_context, max_concurrency, prefill_chunk, draft_tokens;
-    KvCacheStorage kv_storage;
-    EnginePurpose purpose;
-    bool context_cache = false;
-    bool cuda_graph    = false;
 };
 
 struct ExecutionPlan {
@@ -46,6 +39,12 @@ struct ExecutionPlan {
     [[nodiscard]] std::size_t device_bytes() const;
 
     [[nodiscard]] std::size_t device_reservation_bytes() const;
+
+    [[nodiscard]] std::size_t pinned_context_bytes() const;
+
+    [[nodiscard]] std::size_t pinned_aux_bytes() const;
+
+    [[nodiscard]] std::size_t pinned_context_counts_bytes() const;
 
     [[nodiscard]] std::size_t host_capacity_bytes() const { return host_context_bytes; }
 

@@ -1,264 +1,121 @@
 #pragma once
 
-#include "models/common/qwen/vision/prefill.h"
-#include "models/qwen3_5/program/internal.h"
-
-#include "core/arena.h"
-#include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
-#include "core/tensor.h"
-#include "core/weight.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/moe.h"
+#include "models/common/moe/schedule.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "models/common/qwen/frontend/prepared_prompt.h"
-#include "models/qwen3_5/program/round_buffers.h"
+#include "ninfer/ops/softmax_attention.h"
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
-#include <functional>
+#include <optional>
 #include <span>
-#include <vector>
-
-namespace ninfer::models::moe {
-class Schedule;
-}
+#include <variant>
 
 namespace ninfer::models::qwen3_5::execution {
 
-class TextGraphRun;
-
-using Phase = qwen3_5::TextPhase;
-
-enum class GdnStateAction : std::uint8_t {
-    UpdateInPlace,
-    RecordForReplay,
+struct TextExecutionView {
+    const Parameters& parameters;
+    MemoryArena& workspace;
+    CudaExecutionView execution;
+    const PagedKVCache& cache;
+    LinearAttentionStateView& states;
+    moe::Schedule* moe = nullptr;
 };
 
-struct NullTap {
-    static constexpr bool enabled = false;
+// Contiguous ids/cache_positions I32 [W,B], RoPE positions I32 [W*B] or [W*B,3],
+// and valid_columns/kv_table_rows/state selectors I32 [B]. SequenceUpdate uses its Host
+// state slots; ReplayRecords only reads state_source_slots. Embeddings, when supplied,
+// are immutable BF16 [H,W,B] with visual replacements already applied.
+struct TextInputs {
+    Tensor ids;
+    Tensor cache_positions;
+    Tensor rope_positions;
+    Tensor valid_columns;
+    Tensor kv_table_rows;
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
+    std::optional<Tensor> input_embeddings;
 };
 
-struct PrefillChunkResult {
-    std::uint32_t processed_tokens = 0;
-    bool finalized                 = false;
-    runtime::ExecutionTiming timing;
+// SequenceUpdate publishes a complete B=1 sequence with the chunked recurrence; its sole
+// valid extent is W. StepUpdate publishes one transition per row, all with valid extent one.
+// ReplayRecords leaves master state unchanged and records every valid transition for the
+// caller's later accepted-prefix fold. Missing valid_columns means every column is valid.
+struct SequenceUpdate {
+    std::int32_t source_slot;
+    std::int32_t destination_slot;
 };
 
+struct StepUpdate {};
+
+struct ReplayRecords {
+    const GdnReplayRecords& records;
+};
+
+using TextStateUpdate = std::variant<SequenceUpdate, StepUpdate, ReplayRecords>;
+
+// Selected post-layer residuals concatenate along the feature axis. With residency_slots,
+// features is BF16 [H*layers,W,Slots], and valid row prefixes scatter to absolute residency
+// slots. Otherwise features is BF16 [H*layers,W*B] and optional positions is I32 [W*B].
+// The caller owns storage, the stable layer selection and any later draft context append or
+// normalization. Layer IDs are distinct and refer to the model's selected draft configuration.
 struct DFlashFeatureSink {
-    static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
-
-    Tensor* features                  = nullptr;
-    Tensor* positions                 = nullptr;
-    Tensor* batch_features            = nullptr;
-    const Tensor* batch_lanes         = nullptr;
-    const Tensor* batch_valid_columns = nullptr;
-    std::int32_t batch_width          = 0;
-    std::int32_t batch_size           = 0;
+    Tensor features;
+    Tensor positions;
+    Tensor residency_slots;
     std::span<const std::uint32_t> layers;
-    PrefillConsumer consume_prefill;
-    std::uint32_t captured_mask = 0;
-    std::int32_t active_tokens  = 0;
-
-    void begin(const Tensor& value);
-    void capture_layer(int layer, const Tensor& value, CudaExecutionView execution);
-    void capture_positions(const Tensor& source, CudaExecutionView execution);
-    void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
 
-class TextContext {
+// One mathematical Main traversal. All borrowed storage stays live through completion or
+// cancellation. The arena's residual and pending post-mixer scope remain reserved across
+// readiness yields; destroy the traversal before reusing that arena for subsequent work.
+class TextRun {
 public:
-    TextContext(DeviceContext& ctx, const execution::Parameters& weights, MemoryArena& work,
-                const qwen3_5::PagedKVCache& batch_text_kv, LinearAttentionStateView& state,
-                qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
-                std::uint32_t text_kv_base,
-                qwen3_5::PagedKVCacheView mtp_kv          = qwen3_5::PagedKVCacheView(),
-                const qwen3_5::PagedKVCache* batch_mtp_kv = nullptr, moe::Schedule* moe = nullptr);
-    ~TextContext();
+    TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
+            ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
+            const DFlashFeatureSink* features = nullptr);
+    ~TextRun();
+    TextRun(const TextRun&)            = delete;
+    TextRun& operator=(const TextRun&) = delete;
 
-    void set_graph_run(TextGraphRun* graphs) noexcept { graphs_ = graphs; }
+    // True means the complete output chain was submitted, not that the GPU has retired.
+    [[nodiscard]] bool start();
+    [[nodiscard]] bool poll();
+    void cancel();
 
-    TextContext(const TextContext&)            = delete;
-    TextContext& operator=(const TextContext&) = delete;
+    // Explicit mathematical segments for rank-owned capture. These do not start an MoE
+    // activity or acquire offloaded weights. A supplied GPU call binds the captured MoE body.
+    void prefix();
+    void mixer(std::uint32_t layer);
+    void post_mixer(std::uint32_t layer, const moe::GpuCall* call = nullptr);
+    void capture_features(std::uint32_t layer);
+    void finish();
+    void set_attention_envelope(ops::CausalAttentionExecutionEnvelope envelope) noexcept;
 
-    void set_proposal_head(const LinearParameters* weight, const std::int32_t* ids,
-                           int count) noexcept {
-        proposal_head_     = weight;
-        proposal_head_ids_ = ids;
-        proposal_head_n_   = count;
-    }
+    [[nodiscard]] Tensor& residual() noexcept { return residual_; }
 
-    void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
-
-    void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
-
-    void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
-
-    void set_prefill_split_frontier(std::int64_t position) noexcept {
-        prefill_split_frontier_ = position;
-    }
-
-    void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
-        rewrite_checkpoint_hidden_output_ = output;
-    }
-
-    void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
-
-    void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
-    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
-
-    [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
-
-    [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
-
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end, DFlashFeatureSink& sink);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen::PreparedPromptData& input,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   qwen::VisionPrefillSession& vision,
-                                                   bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen::PreparedPromptData& input,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   qwen::VisionPrefillSession& vision,
-                                                   bool finalize_at_end, DFlashFeatureSink& sink);
-    void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
-                               const Tensor& rope_positions, const Tensor& kv_table_rows,
-                               const Tensor& linear_state_source_slots,
-                               const Tensor& linear_state_destination_slots,
-                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                               Tensor& logits);
-    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                             const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
-                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
-    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                             const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
-                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
-    void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
-                                  const Tensor& cache_positions, const Tensor& rope_positions,
-                                  const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                  ops::CausalAttentionExecutionEnvelope envelope,
-                                  Tensor& mtp_hidden);
-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
-    void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
-                           int logits_column, Tensor* logits, Tensor* draft_token,
-                           const Tensor* explicit_rope_positions = nullptr,
-                           const Tensor* input_embeddings        = nullptr);
-    void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
-                             const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
-                             Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
-    [[nodiscard]] bool mtp_enabled() const noexcept {
-        return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
-    }
+    enum class Stage : std::uint8_t { Idle, Layer, PostMixer, Done, Cancelled };
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void post_mixer(const BlockParameters& weights, Tensor& x, int layer);
-    [[nodiscard]] ops::MoeExecutionHints next_projection_hints(int layer) const;
-    void run_layers(Tensor& x, Phase phase);
-    template <class Tap>
-    void run_layers(Tensor& x, Phase phase, Tap& tap);
-    template <class Tap>
-    void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
-                                  const Tensor& rope_positions, const Tensor& valid_columns,
-                                  const Tensor& kv_table_rows,
-                                  const Tensor& linear_state_source_slots,
-                                  ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+    void attention(const BlockParameters&, std::uint32_t compact_layer);
+    void gdn(const BlockParameters&, std::uint32_t compact_layer);
+    [[nodiscard]] ops::MoeExecutionHints next_projection_hints(std::uint32_t layer) const;
+    void complete_layer();
 
-    void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                          Tensor& x, Tensor& ah);
-    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
-                          const Tensor& rope_positions,
-                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
-    void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                          const Tensor& rope_positions,
-                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
-                          const Tensor* input_embeddings);
-    void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                           const Tensor& positions, const Tensor& rope_positions,
-                           ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
-                           Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
-    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
-
-    struct MultimodalPrefill {
-        std::span<const int> token_ids;
-        std::span<const std::int32_t> positions;
-        qwen::VisionPrefillSession* vision = nullptr;
-        std::uint32_t begin                = 0;
-        std::int32_t rope_delta            = 0;
-    };
-
-    struct TextPrefill {
-        std::span<const int> token_ids;
-        std::uint32_t begin = 0;
-    };
-
-    template <class Tap>
-    [[nodiscard]] PrefillChunkResult
-    prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
-    moe::Schedule* moe_;
-    TextGraphRun* graphs_ = nullptr;
-    DeviceContext& ctx_;
-    CudaExecutionView execution_;
-    const Parameters& parameters_;
-    const TextConfig& config_;
-    MemoryArena& work_;
-    qwen3_5::PagedKVCacheView mtp_kv_;
-    const qwen3_5::PagedKVCache& batch_text_kv_;
-    const qwen3_5::PagedKVCache* batch_mtp_kv_ = nullptr;
-    LinearAttentionStateView& state_;
-    qwen3_5::RoundState& io_;
-    Tensor& prefill_hidden_;
-    // Borrowed from Program; every measured chunk retires before this pair is reused.
-    CudaEventTimer* prefill_gpu_timer_ = nullptr;
-    std::uint32_t prefill_chunk_;
-    std::uint32_t text_kv_base_;
-    const Tensor* active_cache_positions_                                          = nullptr;
-    const Tensor* active_rope_positions_                                           = nullptr;
-    const Tensor* active_kv_table_rows_                                            = nullptr;
-    const Tensor* active_linear_state_source_slots_                                = nullptr;
-    const Tensor* active_linear_state_destination_slots_                           = nullptr;
-    const Tensor* active_valid_columns_                                            = nullptr;
-    const Tensor* active_backend_kv_table_rows_                                    = nullptr;
-    const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
-    std::int32_t active_sequence_batch_                                            = 0;
-    std::int32_t active_sequence_width_                                            = 0;
-    std::int32_t rope_delta_                                                       = 0;
-    std::int32_t linear_state_source_slot_                                         = 0;
-    std::int32_t linear_state_destination_slot_                                    = 0;
-    GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
-    const GdnReplayRecords* replay_records_   = nullptr;
-    std::int64_t prefill_split_frontier_      = -1;
-    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
-    std::uint32_t mtp_proposal_extent_        = 0;
-
-    const Weight* embed_                        = nullptr;
-    const Tensor* final_norm_                   = nullptr;
-    const LinearParameters* lm_head_            = nullptr;
-    const LinearParameters* proposal_head_      = nullptr;
-    const std::int32_t* proposal_head_ids_      = nullptr;
-    int proposal_head_n_                        = 0;
-    const ops::SamplingConfig* sampling_config_ = nullptr;
-    const MtpParameters* mtp_                   = nullptr;
+    TextExecutionView view_;
+    TextInputs inputs_;
+    TextStateUpdate update_;
+    ops::CausalAttentionExecutionEnvelope envelope_;
+    Tensor hidden_;
+    std::optional<DFlashFeatureSink> features_;
+    MemoryArena::Scope traversal_scope_;
+    Tensor residual_;
+    std::optional<moe::Schedule::Activity> activity_;
+    std::optional<MemoryArena::Scope> post_mixer_scope_;
+    Tensor post_mixer_hidden_;
+    std::uint32_t layer_ = 0;
+    Stage stage_         = Stage::Idle;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

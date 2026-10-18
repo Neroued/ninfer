@@ -7,6 +7,10 @@ Device/Host replicas、address spaces、reservations、block tables 和 GPU cons
 回收策略见 [资源调度与上下文缓存](resource-scheduling-and-context-cache.md)。KV Store 兑现选定操作的
 物理需求，并向模型 execution unit 提供稳定的直接访问视图。
 
+集中 `ContextDirectory` 由 ModelSession 持有，负责 State、页、history、execution row、Host 范围、
+引用和预留。RankProgram 持有固定 backing 与 `ContextStorage`，按值身份执行复制和 mapping 更新，
+不维护第二套空闲页分配器。单 rank 使用同一合同，由 LocalExecutor 在进程内驱动。
+
 ---
 
 ## 1. 物理模型
@@ -171,24 +175,26 @@ backend off:
 
 MTP with D draft tokens (verification width D+1):
     Main physical pages = M
-    MTP physical pages  = M + C * ceil(D / P)
+    MTP physical pages  = M
 
 DFlash / DFlash2 with full-attention layers:
     Main physical pages        = M
     Draft Full physical pages = M
 ```
 
-MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中相对 Main 的 provisional lead，
-不扩大任一 address space 的 logical capacity。Draft Full 没有这种 provisional lead；没有 full layer
-的 draft 配置不分配此 pool。
+MTP 在当前轮生成 drafts。Main 的本轮峰值为 `F+D+1`，MTP 峰值为 `F+D`；两者各自的
+reservation 覆盖其实际写入范围，不为跨轮预生成 drafts 额外分配 backend pages。Draft Full
+按自己的 context frontier 保留；没有 full layer 的 draft 配置不分配此 pool。
 
-各 pools 物理分离。一个 pool 的 free page 不能变成另一 pool 的 payload。Program 在启动时一次性建立
-完整 typed capacity vector，运行期不扩容或重分 pool geometry。
+各 pools 物理分离。一个 pool 的 free page 不能变成另一 pool 的 payload。启动规划一次性建立
+完整 typed capacity vector，目录采用这些容量，rank 绑定对应存储；运行期不扩容或重分 pool geometry。
 
 ### 3.5 Host capacity
 
-StateImage、Main KV 和 selected backend KV 共用 startup-fixed pinned `HostContextArena`。
-`HostKVArena` 在同一 backing 上提供 typed KV allocations；每个 allocation 携带自己的 page layout。
+StateImage、Main KV 和 selected backend KV 共用 rank Resources 的启动固定 pinned backing。
+目录中的 `HostAllocator` 集中分配其 offset/length，`HostDirectory` 管理各 KV layout 的 extent
+成员；StateDirectory 直接持有同一 allocator 的 State allocation。物理视图由 ContextStorage 解析。
+Host pool ID 指定所属 backing，各 pool 的空闲字节不能互相抵扣。Spark 的 Host context 容量为零。
 Host capacity 按实际 packed bytes 和 extent geometry 计费，不扩大 Device capacity 或单 sequence context
 ceiling。输入、请求 ledger 与其他 CPU 数据有各自的生命周期，不计入这个物理 context backing。
 
@@ -355,8 +361,9 @@ metadata 和 bounded tail slack。Prefix hit granularity不参与 page-size 选�
 
 ### 5.1 Logical page identity
 
-Device page ID 只是当前 Device replica 的物理位置，不是 prefix identity。Program 为每个 pool 维护
-generation-checked logical pages：
+Device page ID 只是当前 Device replica 的物理位置，不是 prefix identity。集中 PageDirectory 为每个
+pool 维护 generation-checked logical pages。`PageId` 包含 pool、descriptor index 和 generation，
+实例身份由执行 session 确定；跨执行边界不传目录 owner 指针：
 
 ```text
 LogicalKVPage
@@ -389,8 +396,8 @@ replica.coverage\ge n
 
 ### 5.2 Device replica
 
-Device replica 使用 `4` 的 consumer-native plane layout。`DeviceKVPageLease` 独占一个 pool-local
-physical page group；generation 防止 release/reuse 后的 stale handle。
+Device replica 使用 `4` 的 consumer-native plane layout。目录 `PageLease` 独占一个 pool-local physical page group；值型 `PageSlot` 包含 pool、index 和
+generation。PageAllocator 校验分配身份，rank 按已接受的有序命令使用对应物理位置。
 
 Pool 对同一容量单位区分：
 
@@ -404,7 +411,8 @@ globally available page
 allocated+reserved+available=capacity
 \]
 
-Materialize 把 reservation 转成 lease；dematerialize 把 lease 还回同一 reservation。普通 unit 结算
+PageAllocator 优先延续前驱页后的完整连续范围，其次选择完整 free run，最后使用离散 runs。
+Materialize 把 reservation 转成 lease，不进行第二次容量准入；dematerialize 把 lease 还回同一 reservation。普通 unit 结算
 释放余额；受保护恢复则保留未来覆盖所需余额，直到真实新进展后归还。Checkpoint 别名和 history
 共享引用不重复占物理页。
 
@@ -417,7 +425,7 @@ Host replica 使用 logical-order packed `HostKVPageLayout`：
 - variable-size extent只为实际 page count 付费；
 - Main/backend layouts可以在同一 arena 中分配不同 stride 的 extents。
 
-Host arena 是有界 variable-size allocator。State 与不同 KV layouts 竞争同一 backing，彼此没有固定
+HostAllocator 在启动固定 backing 上管理有界 variable-size ranges。State 与不同 KV layouts 竞争同一容量，彼此没有固定
 配额。申请必须满足 alignment 和连续 extent geometry；`free_bytes` 只是占用摘要，不是可分配性的
 充分证明。共享 Host extent 按实际 allocation 计一次，pending destination 在 publication 前已经占用容量。
 
@@ -431,10 +439,11 @@ claim，发布前不能取得指向旧副本的新 Host 读者。
 Device COW 与 D2H/H2D transfer 复制页组的全部 plane payload，按各 plane 的实际行数、bytes 和
 offset 搬运原 words。不同密度的 plane 不单独分配、保留或回收。传输可以把相邻 physical IDs
 合并成更少的 transfer runs。
-Core 按已绑定的 plane geometry 选择 2D copy：短 PageMajor run 可以合并等宽、等间距的 planes，
+DevicePageStorage 按已绑定的 plane geometry 选择 2D copy：短 PageMajor run 可以合并等宽、等间距的 planes，
 HeadMajor 可以选择 page 或 head 作为提交外层。只在减少调用数且 pitch 合法时使用合并路径；
-Host layout 与 payload 不变。迁移批次在目的位置确定后形成真实 Host/Device runs，Core 的同一
-几何规则给出计划与实际提交工作量；迁移观测记录实际字节和 copy operations。来源选择时尚无
+Host layout 与 payload 不变。rank 准备完成后导出无地址 `KVTransferProfile`，包含 payload、
+Device copy 次数和按 run 长度选择的 Host copy 次数；目录使用该实际计划报价。迁移在目的位置
+确定后形成真实 Host/Device runs，物理执行核对计划与实际工作量；观测记录实际字节和 copy operations。来源选择时尚无
 目的物理 ID，只按已知 Host runs 给出名义连续传输估计，不能将它当作实际提交次数。
 一个 replacement replica 的 publication 顺序为：
 
@@ -446,8 +455,9 @@ reserve destination
   -> release source when no longer required
 ```
 
-Copy 进行时 source 与 destination 都被 pin。Copy 完成前，目的副本不进入已发布的 execution
-table；唯一有效 source 也不能先释放。
+Copy 进行时 source 与 destination 都被 pin。复制、mapping upload 和 consumer 使用有序依赖；
+consumer 不能在所需 copy 与 table upload 完成前读取目的页。目录在迁移完成后发布 replica，
+唯一有效 source 在最后消费者退役前保持可用。
 
 ### 5.5 Descriptor lifetime
 
@@ -458,12 +468,12 @@ Logical descriptor 不构成第三份 payload。它可以在 Device-only、Host-
 
 ## 6. KV history 与前缀引用
 
-`KVHistory` 是一个 pool 的唯一可写 owner，`KVPrefixRef` 持有同一实际历史的 `[0, F)`。
+`HistoryOwner` 是一个 pool 的唯一可写 owner，`HistoryPrefix` 持有同一实际历史的 `[0, F)`。
 引用只拥有逻辑内容，不固定 Device residency。Main 与 backend 使用各自的 owner；它们的前沿
 关系由模型决定。完整快照将各 pool 前缀与同次执行的 StateImage、metadata 和输入身份一起保存。
 
 ```text
-KVHistoryStore
+HistoryDirectory
 ├── generation-checked history descriptors
 ├── shared prefix directory / private append path
 ├── committed frontier and provisional memberships
@@ -473,7 +483,7 @@ KVHistoryStore
 ```
 
 每个 history 对其页面贡献一次 required coverage，并按最深存活前缀贡献 protection。
-引用增减只更新改变的范围，不扫描 Program 的 checkpoint 表。释放可写 owner 后，目录缩到最深
+引用增减只更新改变的范围，不扫描 Session 的 checkpoint 表。释放可写 owner 后，目录缩到最深
 存活前缀；最后一个引用消失后释放其页引用。目录节点的结构共享不决定内容保护或资源归属。
 
 保存非对齐前缀不复制尾页。同一个 writer 可以继续追加，读取者只读自己保留的前沿。
@@ -496,7 +506,8 @@ logical pages 或 frontier；暂停后恢复可以租用另一行。
 
 `binding_demand` 根据来源前缀、目标位置与峰值位置计算缺失副本、COW 和增长页。
 它接受本次授权退休的前缀列表，计算退休后的实际保护；查询本身不消费来源。
-`KVBinding` 随后持有来源引用、目的 history、Device reservation、待恢复副本和 execution row：
+`HistoryBinding` 随后持有来源引用、目的 history、Device reservation、待恢复副本和 execution row；
+ContextTransaction 持有绑定、State 目的、Host 预留及纯值动作：
 
 ```text
 reserve complete binding
@@ -510,29 +521,38 @@ reserve complete binding
 尾页的 writer 身份，防止多个待运行请求同时把它报价为零 COW。MTP 等需要从较早位置开始的
 情况由原生模型提供目标位置；消费来源前，原前沿与内容继续有效。
 
-Program 统一检查 State 与所有 enabled pools。暂停恢复取得“重建至旧 frontier + 首个真实新单元”
+Session 使用目录统一检查 State 与所有 enabled pools。暂停恢复取得“重建至旧 frontier + 首个真实新单元”
 的完整覆盖。任一 pool 不足则不执行授权退役。已经接纳的退役按请求合同生效；未采用目的的
 取消必须结束实际 DMA 后再释放 reservation 与来源引用。
 复制期间按 logical page 的实际 writer 阻塞冲突执行；来源前缀所在的 history 不能替代写入者身份。
 
 ### 7.2 显式写入区间
 
-`write_pages(history, begin, end)` 计算增长与 COW 需求。`prepare_write(owner, begin, end, stream)`
+`write_pages(history, begin, end)` 计算增长与 COW 需求。`prepare_write(owner, begin, end, transaction)`
 从实际写入起点处理保护、分支和映射，在已取得的 reservation 内物化页面；它不推进 committed
 frontier。已准备的更长 speculative mapping 可以保留到结算，较短的写入请求不隐式裁剪它。
 
-Program 先取得调用集合的完整 typed 许可，再执行。普通 unit 只预留当前峰值；恢复 reservation
+Session 先取得调用集合的完整执行和 typed 资源许可，再进入不可撤销的目录准备。prepare_write/trim
+产生 COW 与 mapping 动作；此后取消改变输出采用意图，已经接受的动作仍执行至退役，准备失败
+使执行实例失败并排空。绑定的独立目的预留在尚未提交时可以撤销。普通 unit 只预留当前峰值；恢复 reservation
 跨 chunk 保留到完整恢复覆盖，其他请求不能使用其余额。算子与 Graph 继续只消费 typed views、
 selectors 和固定地址的 block tables。
 
 ### 7.3 提交与回退
 
-模型采用实际接受前缀的 State 与 metadata，再提交各 pool 的 KV frontier。Rejected suffix 的
-bytes 可以残留，但不扩大有效范围。不同密度的 plane 仍使用 `floor(coverage/tokens_per_row)`。
+`prepare_commit` 校验实际接受前缀并整理未采用的 provisional memberships，保留退役租约；
+此时 committed frontier 和 coverage 不变。Executor 接收物理提交后，事务 `adopt` 才推进各 pool 的
+KV frontier，模型同步采用 State 与 metadata。Rejected suffix 的 bytes 可以残留，但不扩大有效范围。
+不同密度的 plane 仍使用 `floor(coverage/tokens_per_row)`。
 
 `trim` 删除超出采用前沿的 provisional memberships；若旧前缀仍需更长内容，则为 writer 分支，
 保留旧目录。真正覆盖 partial tail 前由 `prepare_write` 执行必要 COW。普通结算归还未用页，
 恢复结算保留到目标覆盖所需的余额；到达旧 frontier 本身不结束恢复保护。
+
+逻辑 trim 与物理回收分别发生。被旧执行引用的页和 row 租约保留在 ContextTransaction，直到设备
+消费者完成。提交准备记录恢复覆盖需求，退役归还旧页后再补足 reservation；已稳定状态的独立
+结算使用 `settle_growth`。
+这不会为旧页和下一轮预留暂时占用两份容量。当前执行槽在结算完成前不可复用。
 
 ### 7.4 释放与共享计费
 
@@ -541,7 +561,9 @@ bytes 可以残留，但不扩大有效范围。不同密度的 plane 仍使用 
 物理持有者，公共别名与共享完整页不重复计费；StateImage 也按实际内容引用数结算。
 
 从 mapping publication 到 GPU unit 完成，selected rows、页成员和实际消费的 payload 保持稳定。
-前缀引用更新、COW、提交和 row 回收在 worker 的 GPU 稳定边界完成。
+前缀引用和已选定 mapping 由协调侧集中更新；COW source leases、页表上传源和 row 的实际复用
+遵守该 execution 的完成依赖。取消提交中的传输不提前归还空间；未录入完成 fence 的部分提交
+失败时，由 rank 排空实际 stream 后再允许目录退役。
 
 ## 8. 部分页与副本 coverage
 
@@ -562,7 +584,7 @@ bytes 可以残留，但不扩大有效范围。不同密度的 plane 仍使用 
 
 ### 9.1 Independent pool frontiers
 
-MTP 和带 full layer 的 DFlash backend 使用 Program KV Store 的 backend pool，不建立独立 allocator。
+MTP 和带 full layer 的 DFlash backend 使用 ContextDirectory 的 backend pool，不建立私有分配器。
 
 一次 speculative unit 中，Main 与 backend：
 
@@ -583,7 +605,7 @@ canonical write 覆盖。
 |---|---|
 | DFlash/DFlash2 local sliding-window K/V | fixed per-sequence StateImage |
 | DFlash/DFlash2 boundary-local snapshot | fixed checkpoint StateImage |
-| Vision/query temporary K/V | Program workspace |
+| Vision/query temporary K/V | RankProgram workspace |
 
 DFlash/DFlash2 cyclic K/V 使用自己的 `CyclicKVCacheLayerView` 与 modulo/window 语义；它不持有 page ID、
 block table 或 growing reservation。模型配置决定其 layer count、heads 和 window。
@@ -671,17 +693,20 @@ Plane bases与 block-table matrix base在 Engine lifetime内稳定。跨 replay�
 
 Page IDs、request identity和physical contiguity不进入 graph key。
 
-在需要新 mappings 的 execution unit 前，Program：
+在需要新 mappings 的 execution unit 前：
 
 ```text
-materialize all required pages
-  -> update host-side membership
-  -> publish one contiguous table slice
-  -> launch/replay consumer on the ordered stream
+Session materializes pages and prepares mapping actions
+  -> Executor transfers owning value descriptors
+  -> rank copies mapping IDs into its pinned execution-slot staging
+  -> uploads the changed table slices
+  -> launches/replays consumers on the ordered stream
 ```
 
 同一 boundary新增多个 pages或重新激活完整 membership时使用批量 publication。Mapping update必须先于
-consumer，且 replay in-flight期间不得改写同一 row。
+consumer，且 replay in-flight期间不得改写同一 row。每次 H2D 的 Host 源也必须保持到传输完成，
+不能靠 stream 顺序允许 CPU 提前覆写 pinned mapping 数据。Compute preparation 与独立上下文
+迁移各有执行槽、mapping staging 和完成事件，其地址在启动后稳定。
 
 ---
 
@@ -711,19 +736,21 @@ consumer，且 replay in-flight期间不得改写同一 row。
 
 | 职责 | 主要位置 |
 |---|---|
-| Device page pools、reservations与execution tables | `src/core/paged_kv_cache.*` |
+| 纯页几何、Host packed layout | `src/core/paged_kv_geometry.*` |
+| Device layout 规划与 public paged views | `src/core/paged_kv_cache.*` |
 | closed K/V data/scale plane schema | `src/core/paged_kv_storage.h` |
-| 统一 Host backing、typed KV layout 与 allocation | `src/core/host_context_arena.*`, `src/core/host_kv_arena.*` |
-| logical pages、replicas 与 references | `src/models/common/context/logical_kv_store.*` |
-| history、前缀引用、写入与绑定 | `src/models/common/context/kv_history.*` |
-| State/KV 异步迁移与完成依赖 | `src/models/common/context/migration.*` |
-| StateImage 布局、逻辑身份与副本事务 | `src/core/state_image.*`, `src/models/common/context/state_store.*`；架构声明字段与类型化视图 |
+| 集中目录、事务及值动作 | `src/models/common/context/directory.*`, `contract.h` |
+| 连续页、Host 范围分配 | `src/models/common/context/directory/allocation.*` |
+| logical pages、replicas、coverage 与 references | `src/models/common/context/directory/pages.*` |
+| history、前缀引用、写入与绑定 | `src/models/common/context/directory/history.*` |
+| Host extent membership 与部分回收 | `src/models/common/context/directory/host.*` |
+| rank 本地页、State、页表视图与 DMA | `src/models/common/context/storage.*` |
+| 异步动作槽、staging、完成依赖与观测 | `src/models/common/context/transfer.*` |
+| StateImage 几何与字段视图 | `src/core/state_image.*`；架构声明字段与类型化视图 |
+| State 逻辑身份、slot 与副本预留 | `src/models/common/context/directory/state.*` |
 | 完整快照与记录 lease | `src/models/common/context/snapshot.h`, `checkpoint_store.h` |
-| 原生 checkpoint 生命周期 | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |
-| Host extent membership | `src/models/common/context/host_kv_store.*` |
-| unit 许可与上下文事务 | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
-| model pool layout与capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
-| public paged consumer views | `src/core/paged_kv_cache.h` |
+| 原生上下文、checkpoint 和恢复数学 | `src/models/qwen3_5/session/`, `src/models/qwen4_exp/session/` |
+| model pool layout 与 capacity curve | 各架构 `program/planning/` 或 `program/planning.*` |
 | growing-cache Ops | `include/ninfer/ops/`, `src/ops/` |
 
 Exact model state 和 backend mathematics 见

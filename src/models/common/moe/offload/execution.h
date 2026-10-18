@@ -76,20 +76,10 @@ void enqueue_gpu(const Tensor& hidden, const PreparedExecution&, Tensor& output,
 // Host input must be ready. Returns false without a collective when all routes hit the GPU.
 [[nodiscard]] bool compute_cpu(const PreparedExecution&);
 void enqueue_finish(const PreparedExecution&, Tensor& output, bool cpu_work);
-// Wait for the input event, compute the complement, then enqueue output completion.
-// All-GPU calls have already produced output and return false without a Host wait.
-[[nodiscard]] bool complete(const PreparedExecution&, Tensor& output);
-
-// BF16 hidden and output are disjoint contiguous [H,T]. Write does not read old output;
-// AddResidual adds it before final rounding. Required GPU keys have
-// already been published and are retained by the caller through the last GPU consumer.
-// A single caller reuses the frame on its fixed compute/bridge streams, outside capture.
-// CPU work finishes before return; output and GPU workspace follow compute-stream ordering.
-// Sources, partition and execution resources remain live through their asynchronous consumers.
-// Returns whether a CPU contribution was evaluated, for the caller's waiting policy.
-bool execute(const Tensor& hidden, const Parameters& parameters, const PartitionView& partition,
-             const ExpertBankSource& source, const ExpertBankDeviceView& bank,
-             ops::MoeEpilogue epilogue, Tensor& output, MemoryArena& workspace,
-             ExecutionView execution, const ops::MoeExecutionHints& hints = {});
+// Join the already submitted input transfer into compute retirement without running CPU work.
+void enqueue_discard(const PreparedExecution&);
+// Empty while the D2H input is pending. An engaged result submits the output chain and
+// reports whether CPU work was needed. Consume that result once; all-GPU needs no event query.
+[[nodiscard]] std::optional<bool> try_complete(const PreparedExecution&, Tensor& output);
 
 } // namespace ninfer::models::moe::offload

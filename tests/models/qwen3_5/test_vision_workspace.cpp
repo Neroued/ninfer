@@ -2,9 +2,10 @@
 #include "core/device.h"
 #include "core/buffer.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/execution/profile.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/common/qwen/vision/vision.h"
-#include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/planning.h"
 #include <cstdlib>
 
 #include "models/common/qwen/frontend/prepared_prompt.h"
@@ -27,7 +28,7 @@ void require(bool condition, const char* message) {
 
 void test_handoff_lifetime(ninfer::DeviceContext& device,
                            const q35::execution::Parameters& parameters) {
-    const auto& config     = parameters.model.config().vision.value();
+    const auto& config     = parameters.profile->config.vision.value();
     const auto merge       = static_cast<std::int32_t>(config.spatial_merge_size);
     const auto patches     = static_cast<std::size_t>(merge) * merge;
     const auto make_prompt = [&](std::uint32_t seed) {
@@ -66,18 +67,23 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
         ninfer::models::qwen::plan_vision_control(prompt_a, config));
     plan.control = std::make_shared<ninfer::models::qwen::VisionControl>(
         ninfer::models::qwen::build_vision_control(prompt_a, *plan.control_plan, 0));
-    plan.uses             = {{.begin = 0, .end = 2, .prepared_item_index = 0, .control_index = 0},
-                             {.begin = 2, .end = 4, .prepared_item_index = 1, .control_index = 1}};
+    plan.uses             = {{.begin = 1, .end = 2, .prepared_item_index = 0, .control_index = 0},
+                             {.begin = 3, .end = 4, .prepared_item_index = 1, .control_index = 1}};
     plan.max_merged_count = 1;
     const auto workspace_plan =
         ninfer::models::qwen::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
     ninfer::DeviceBuffer workspace(device.device(), workspace_plan.capacity_bytes);
     const auto backing = workspace.span();
     ninfer::models::qwen::VisionHandoffState handoff;
-    std::size_t peak_bytes  = 0;
-    const auto make_session = [&](const ninfer::models::qwen::PreparedPromptData& prompt) {
-        return std::make_unique<ninfer::models::qwen::VisionPrefillSession>(
-            device, config, *parameters.vision, backing, workspace_plan, prompt, plan, handoff,
+    std::size_t peak_bytes    = 0;
+    const auto make_execution = [&](const ninfer::models::qwen::PreparedPromptData& prompt) {
+        auto input            = std::make_shared<ninfer::models::qwen::VisionExecutionInput>();
+        input->prompt_tokens  = static_cast<std::uint32_t>(prompt.token_ids.size());
+        input->vision_items   = prompt.vision_items;
+        input->media_payloads = prompt.media_payloads;
+        input->plan           = plan;
+        return std::make_unique<ninfer::models::qwen::VisionPrefillExecution>(
+            device, config, *parameters.vision, backing, workspace_plan, std::move(input), handoff,
             peak_bytes);
     };
     const auto read = [&](const ninfer::models::qwen::VisionChunk& chunk) {
@@ -88,40 +94,40 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
         device.synchronize();
         return output;
     };
-    auto session_a      = make_session(prompt_a);
-    auto session_b      = make_session(prompt_b);
-    const auto original = read(session_a->prepare_chunk(0, 2));
-    require(read(session_a->prepare_chunk(2, 2)) != original,
+    auto execution_a    = make_execution(prompt_a);
+    auto execution_b    = make_execution(prompt_b);
+    const auto original = read(execution_a->prepare_chunk(0, 2));
+    require(read(execution_a->prepare_chunk(2, 2)) != original,
             "Vision handoff fixture needs distinguishable items");
-    require(read(session_a->prepare_chunk(0, 2)) == original,
+    require(read(execution_a->prepare_chunk(0, 2)) == original,
             "Vision replay failed to revisit an earlier item");
-    require(session_a->prepare_chunk(4, 1).control == nullptr,
+    require(execution_a->prepare_chunk(4, 1).control == nullptr,
             "text after the last Vision item retained a scatter binding");
-    require(read(session_a->prepare_chunk(0, 2)) == original,
+    require(read(execution_a->prepare_chunk(0, 2)) == original,
             "Vision replay failed after all item spans were consumed");
-    const auto other = read(session_b->prepare_chunk(0, 2));
+    const auto other = read(execution_b->prepare_chunk(0, 2));
     require(other != original, "Vision handoff fixture needs distinguishable requests");
-    require(session_a->active_handoff_bytes() == 0 && session_b->active_handoff_bytes() != 0,
-            "Vision handoff remained owned by an overwritten session");
-    require(read(session_a->prepare_chunk(1, 1)) == original,
+    require(execution_a->active_handoff_bytes() == 0 && execution_b->active_handoff_bytes() != 0,
+            "Vision handoff remained owned by an overwritten execution");
+    require(read(execution_a->prepare_chunk(1, 1)) == original,
             "Vision request failed to reconstruct an overwritten handoff");
-    session_b->retire_handoff();
-    require(session_a->active_handoff_bytes() != 0,
-            "retiring an overwritten session released the current Vision handoff");
+    execution_b->retire_handoff();
+    require(execution_a->active_handoff_bytes() != 0,
+            "retiring an overwritten execution released the current Vision handoff");
 
     // Text/decode may replace all general scratch while a Vision item remains live.
     CUDA_CHECK(cudaMemsetAsync(workspace.data(), 0xa5, workspace_plan.general_capacity_bytes,
                                device.stream()));
-    require(read(session_a->prepare_chunk(1, 1)) == original,
+    require(read(execution_a->prepare_chunk(1, 1)) == original,
             "general workspace use changed the live Vision handoff");
-    { auto unused_session = make_session(prompt_b); }
-    require(session_a->active_handoff_bytes() != 0,
-            "destroying an unused session released another Vision handoff");
-    require(read(session_b->prepare_chunk(0, 2)) == other,
+    { auto unused_execution = make_execution(prompt_b); }
+    require(execution_a->active_handoff_bytes() != 0,
+            "destroying an unused execution released another Vision handoff");
+    require(read(execution_b->prepare_chunk(0, 2)) == other,
             "retired Vision request could not reconstruct its handoff");
-    session_a.reset();
-    require(session_b->active_handoff_bytes() != 0,
-            "destroying an overwritten session released the current Vision handoff");
+    execution_a.reset();
+    require(execution_b->active_handoff_bytes() != 0,
+            "destroying an overwritten execution released the current Vision handoff");
     require(prompt_a.media_payloads[0] && prompt_a.media_payloads[1] &&
                 prompt_b.media_payloads[0] && prompt_b.media_payloads[1],
             "Vision execution released durable prepared media");
@@ -133,10 +139,6 @@ int main() {
     namespace q35        = ninfer::models::qwen3_5;
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) { return 77; }
-    static_assert(ninfer::models::qwen::kMaximumVisionItemTokens == 16384);
-    // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
-    // backing. The context growth check below protects the single-item lifetime bound.
-    constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
     try {
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
@@ -150,8 +152,12 @@ int main() {
         selected.vision        = true;
         selected.speculative   = ninfer::SpeculativeBackend::Mtp;
         selected.proposal_head = ninfer::ProposalHead::Optimized;
-        auto model             = q35::load_model(artifact, selected, device);
-        const q35::execution::Parameters parameters(*model);
+        ninfer::artifact::Reader reader(artifact);
+        auto definition = q35::read_definition(reader, selected);
+        auto profile    = q35::execution::describe_model(*definition);
+        auto model =
+            q35::materialize_model(q35::resolve_load(reader, definition, device.device()), device);
+        const q35::execution::Parameters parameters(*model, profile);
         const auto capacity = [&](std::uint32_t max_context) {
             ninfer::EngineOptions options;
             options.max_context         = max_context;
@@ -164,21 +170,30 @@ int main() {
             options.enable_vision                    = true;
             options.use_cuda_graph                   = false;
             options.context_cache.device_state_slots = 1;
-            auto planner     = q35::make_sequence_planner(parameters, device, options);
-            const auto pages = planner.capacity_curve().minimum_primary_page_groups;
-            return std::move(planner).finalize(pages).workspace_capacity_bytes();
+            auto planner       = q35::make_sequence_planner(parameters, device, options);
+            const auto pages   = planner.capacity_curve().minimum_primary_page_groups;
+            auto plan          = std::move(planner).finalize(pages);
+            const auto session = q35::plan_session(plan);
+            require(session.vision_workspace.has_value(), "Vision session lost its workspace plan");
+            const auto vision = *session.vision_workspace;
+            require(plan.workspace_capacity_bytes() >= vision.capacity_bytes &&
+                        vision.capacity_bytes >= vision.encode_peak_bytes &&
+                        vision.handoff_offset_bytes >= vision.general_capacity_bytes &&
+                        vision.handoff_offset_bytes + vision.handoff_capacity_bytes <=
+                            vision.capacity_bytes,
+                    "Vision workspace does not cover encoding and the retained handoff");
+            return vision;
         };
-        // Increasing total context cannot exceed the single Vision item's 16K workspace.
-        const auto at_item_limit    = capacity(16384);
+        // A longer text context does not enlarge the one-item Vision handoff.
+        const auto item_tokens      = ninfer::models::qwen::kMaximumVisionItemTokens;
+        const auto at_item_limit    = capacity(item_tokens);
         const auto above_item_limit = capacity(131072);
-        if (at_item_limit == 0 || at_item_limit > kWorkspaceCeiling ||
-            above_item_limit != at_item_limit) {
-            throw std::runtime_error("Vision workspace exceeded the single-item bound: at=" +
-                                     std::to_string(at_item_limit) +
-                                     " above=" + std::to_string(above_item_limit));
-        }
+        require(at_item_limit.max_merged_tokens == item_tokens &&
+                    above_item_limit.max_merged_tokens == item_tokens &&
+                    at_item_limit.handoff_capacity_bytes == above_item_limit.handoff_capacity_bytes,
+                "Long text context increased the retained Vision item capacity");
         test_handoff_lifetime(device, parameters);
-        std::cout << "Vision workspace remains bounded for long text context\n";
+        std::cout << "Vision handoff capacity remains one item for long text context\n";
         std::cout << "Vision handoff survives request rotation and replay\n";
         return 0;
     } catch (const std::exception& error) {

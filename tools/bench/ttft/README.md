@@ -141,13 +141,11 @@ records these effective arguments in its manifest. Host capacity is a unified by
 and state; when comparing a baseline with separate pools, match its actual aggregate backing.
 `--device-state-slots` remains extra state capacity beyond active lanes.
 
-Before loading servers, the controller stages the selected immutable artifact once under
-`/dev/shm/ninfer-artifacts/`. It reuses that copy while the source identity is unchanged; insufficient
-tmpfs space is an explicit error. Server warmup completes before measurement and does not populate
-the logical prefix cache.
+Servers read the selected artifact directly. Server warmup completes before measurement and does
+not populate the logical prefix cache.
 
 Each sample gets a fresh process. Results are written under the selected `--output-dir`, or the
-normal `profiles/bench/ttft/` campaign directory:
+default `.agent-tmp/serve-ttft/` campaign directory:
 
 ```text
 manifest.json

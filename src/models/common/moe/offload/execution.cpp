@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -108,16 +107,6 @@ void outside_capture(CudaExecutionView execution) {
     }
 }
 
-void drain_after_failure(ExecutionView execution) noexcept {
-    const auto drain = [](cudaStream_t stream) {
-        const auto error = cudaStreamSynchronize(stream);
-        if (error != cudaSuccess) {
-            std::fprintf(stderr, "MoE failed execution cleanup: %s\n", cudaGetErrorString(error));
-        }
-    };
-    if (execution.host) { drain(execution.host->transfer.stream()); }
-    drain(execution.cuda.stream());
-}
 
 } // namespace
 
@@ -195,6 +184,10 @@ void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& ou
                  const ops::MoeExecutionHints& hints) {
     const auto& p        = call.parameters;
     const auto execution = call.execution.cuda;
+    if (submission == GpuSubmission::Eager) {
+        outside_capture(execution);
+        if (call.execution.host) outside_capture(call.execution.host->transfer);
+    }
     validate_inputs(hidden, output, p.profile, execution.device());
     if (hidden.ne[1] != call.tokens)
         throw std::invalid_argument("MoE prepared token count differs from input");
@@ -275,32 +268,17 @@ void enqueue_finish(const PreparedExecution& call, Tensor& output, bool cpu_work
     }
 }
 
-bool complete(const PreparedExecution& call, Tensor& output) {
+void enqueue_discard(const PreparedExecution& call) {
+    if (call.partition.gpu_kind != Subset::All)
+        call.execution.host->host_ready.wait(call.execution.cuda.stream());
+}
+
+std::optional<bool> try_complete(const PreparedExecution& call, Tensor& output) {
     if (call.partition.gpu_kind == Subset::All) return false;
-    {
-        nvtx::ScopedRange wait(nvtx::Name::MoeInputWait, nvtx::Category::Moe);
-        call.execution.host->host_ready.synchronize();
-    }
+    if (!call.execution.host->host_ready.ready()) return std::nullopt;
     const bool cpu_work = compute_cpu(call);
     enqueue_finish(call, output, cpu_work);
     return cpu_work;
-}
-
-bool execute(const Tensor& hidden, const Parameters& parameters, const PartitionView& partition,
-             const ExpertBankSource& source, const ExpertBankDeviceView& bank,
-             ops::MoeEpilogue epilogue, Tensor& output, MemoryArena& workspace,
-             ExecutionView execution, const ops::MoeExecutionHints& hints) {
-    outside_capture(execution.cuda);
-    if (execution.host) outside_capture(execution.host->transfer);
-    const auto call =
-        prepare_execution(parameters, partition, source, bank, epilogue, hidden.ne[1], execution);
-    try {
-        enqueue_gpu(hidden, call, output, workspace, GpuSubmission::Eager, hints);
-        return complete(call, output);
-    } catch (...) {
-        drain_after_failure(execution);
-        throw;
-    }
 }
 
 } // namespace ninfer::models::moe::offload

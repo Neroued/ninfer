@@ -607,6 +607,223 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
     return failures;
 }
 
+struct EncodedVector {
+    std::array<std::uint8_t, 512> data{};
+    std::array<std::uint8_t, 32> scales{};
+};
+
+EncodedVector encode_prefix_vector(std::span<const std::uint16_t, kFullHeadDim> input,
+                                   KvCacheStorage storage, bool key) {
+    EncodedVector encoded;
+    const auto store_u16 = [](auto& bytes, int offset, std::uint16_t bits) {
+        std::memcpy(bytes.data() + offset, &bits, sizeof(bits));
+    };
+    if (storage == KvCacheStorage::BFloat16) {
+        for (int d = 0; d < kFullHeadDim; ++d)
+            store_u16(encoded.data, 2 * d, key ? input[d] : bf16_bits_to_f16_bits(input[d]));
+        return encoded;
+    }
+    std::array<float, kFullHeadDim> values;
+    for (int d = 0; d < kFullHeadDim; ++d) values[d] = bf16_to_f32(input[d]);
+    if (key || storage == KvCacheStorage::Nvfp4Group16 ||
+        storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        normalized_hadamard_d256_host(values);
+    if (storage == KvCacheStorage::Int8Group64) {
+        for (int group = 0; group < kFullGroups; ++group) {
+            float maximum = 0;
+            for (int d = 0; d < kFullGroup; ++d)
+                maximum = std::max(maximum, std::abs(values[group * kFullGroup + d]));
+            const auto bits    = f32_to_f16_bits(maximum / 127.0f);
+            const auto scale   = f16_bits_to_f32(bits);
+            const auto inverse = scale == 0 ? 0.0f : 1.0f / scale;
+            store_u16(encoded.scales, 2 * group, bits);
+            for (int d = 0; d < kFullGroup; ++d) {
+                const int component = group * kFullGroup + d;
+                const int code =
+                    std::clamp(round_even_to_i32(values[component] * inverse), -127, 127);
+                encoded.data[component] = static_cast<std::uint8_t>(code);
+            }
+        }
+    } else if (storage == KvCacheStorage::Fp8E4M3Row256 ||
+               (key && storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        float maximum = 0;
+        for (const auto value : values) maximum = std::max(maximum, std::abs(value));
+        const auto bits    = maximum == 0
+                                 ? std::uint16_t{0}
+                                 : f32_to_f16_bits(std::clamp(maximum / 448.0f, 0x1p-24f, 65504.0f));
+        const auto scale   = f16_bits_to_f32(bits);
+        const auto inverse = scale == 0 ? 0.0f : 1.0f / scale;
+        store_u16(encoded.scales, 0, bits);
+        for (int d = 0; d < kFullHeadDim; ++d)
+            encoded.data[d] = scale == 0 ? 0 : encode_e4m3fn_rne_satfinite(values[d] * inverse);
+    } else {
+        for (int group = 0; group < kFullNvfp4Groups; ++group) {
+            float maximum = 0;
+            for (int d = 0; d < kFullNvfp4Group; ++d)
+                maximum = std::max(maximum, std::abs(values[group * kFullNvfp4Group + d]));
+            const auto bits =
+                maximum == 0
+                    ? std::uint8_t{0}
+                    : encode_e4m3fn_rne_satfinite(std::clamp(maximum / 6.0f, 0x1p-9f, 448.0f));
+            const auto scale      = decode_e4m3fn_positive(bits);
+            encoded.scales[group] = bits;
+            for (int pair = 0; pair < kFullNvfp4Group / 2; ++pair) {
+                const auto index = group * kFullNvfp4Group + 2 * pair;
+                const auto low = scale == 0 ? 0 : encode_e2m1_rne_satfinite(values[index] / scale);
+                const auto high =
+                    scale == 0 ? 0 : encode_e2m1_rne_satfinite(values[index + 1] / scale);
+                encoded.data[index / 2] = static_cast<std::uint8_t>(low | (high << 4));
+            }
+        }
+    }
+    return encoded;
+}
+
+int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch, bool captured) {
+    const auto layout        = test_cache_layout(storage);
+    const int logical_pages  = (width + 70 + kPage - 1) / kPage;
+    const int table_rows     = batch + 1;
+    const int physical_pages = 2 * logical_pages * table_rows + 1;
+    const auto input_count   = static_cast<std::size_t>(kFullHeadDim) * kv_heads * width * batch;
+    std::vector<std::uint16_t> input_k(input_count), input_v(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input_k[i] =
+            f32_to_bf16(static_cast<float>(static_cast<int>((i * 37 + 19) % 257) - 128) / 64);
+        input_v[i] =
+            f32_to_bf16(static_cast<float>(static_cast<int>((i * 13 + 5) % 251) - 125) / 32);
+    }
+    std::fill_n(input_k.begin(), kFullHeadDim, std::uint16_t{0});
+    std::vector<std::int32_t> counts(batch), rows(batch), positions(width * batch);
+    std::vector<std::int32_t> mapping(logical_pages * table_rows);
+    for (std::size_t i = 0; i < mapping.size(); ++i) mapping[i] = static_cast<int>(2 * i + 1);
+
+    DeviceBuffer d_k = to_device(input_k), d_v = to_device(input_v);
+    DeviceBuffer d_counts = to_device(counts), d_rows = to_device(rows);
+    DeviceBuffer d_positions = to_device(positions), d_mapping = to_device(mapping);
+    const auto plane_bytes = [&](const TestVectorLayout& vector, bool scales) {
+        return static_cast<std::size_t>(scales ? vector.scale_extent : vector.code_extent) * kPage *
+               kv_heads * physical_pages *
+               dtype_size(scales ? vector.scale_dtype : vector.code_dtype);
+    };
+    const std::array<std::size_t, 4> sizes{
+        plane_bytes(layout.key, false), plane_bytes(layout.value, false),
+        plane_bytes(layout.key, true), plane_bytes(layout.value, true)};
+    std::array<GuardedDeviceBuffer, 4> storage_buffers{
+        GuardedDeviceBuffer(sizes[0]), GuardedDeviceBuffer(sizes[1]),
+        GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[2])),
+        GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[3]))};
+    PagedKVBatchLayerView cache{
+        .k_pages      = Tensor(storage_buffers[0].span(), layout.key.code_dtype,
+                               {layout.key.code_extent, kPage, kv_heads, physical_pages}),
+        .v_pages      = Tensor(storage_buffers[1].span(), layout.value.code_dtype,
+                               {layout.value.code_extent, kPage, kv_heads, physical_pages}),
+        .block_tables = Tensor(d_mapping.span(), DType::I32, {logical_pages, table_rows}),
+        .head_dim     = kFullHeadDim,
+        .num_kv_heads = kv_heads,
+        .storage      = storage,
+    };
+    if (layout.key.scale_extent)
+        cache.k_scale_pages = Tensor(storage_buffers[2].span(), layout.key.scale_dtype,
+                                     {layout.key.scale_extent, kPage, kv_heads, physical_pages});
+    if (layout.value.scale_extent)
+        cache.v_scale_pages = Tensor(storage_buffers[3].span(), layout.value.scale_dtype,
+                                     {layout.value.scale_extent, kPage, kv_heads, physical_pages});
+    Tensor k(d_k.span(), DType::BF16, {kFullHeadDim, kv_heads, width, batch});
+    Tensor v(d_v.span(), DType::BF16, {kFullHeadDim, kv_heads, width, batch});
+    Tensor p(d_positions.span(), DType::I32, {width, batch});
+    Tensor c(d_counts.span(), DType::I32, {batch});
+    Tensor r(d_rows.span(), DType::I32, {batch});
+    auto& device      = cuda_environment().context;
+    const auto launch = [&] {
+        ops::kv_cache_append_prefix(k, v, p, c, r, {0, static_cast<std::uint32_t>(width)}, cache,
+                                    device.execution_view());
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    if (captured) {
+        definition.capture(device.stream(), launch);
+        graph.instantiate(definition);
+    }
+    int failures = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+        std::array<std::vector<std::uint8_t>, 4> expected;
+        for (int plane = 0; plane < 4; ++plane) {
+            expected[plane].assign(sizes[plane], static_cast<std::uint8_t>(0xa5 + plane));
+            if (sizes[plane])
+                storage_buffers[plane].copy_from_host(expected[plane].data(), sizes[plane]);
+        }
+        for (int row = 0; row < batch; ++row) {
+            const int kind = (row + pass) % 4;
+            counts[row]    = kind == 0 ? 0 : kind == 1 ? 1 : kind == 2 ? width - 2 : width;
+            rows[row]      = counts[row] == 0 ? -1 : (batch - row + pass) % table_rows;
+            for (int token = 0; token < width; ++token)
+                positions[row * width + token] = counts[row] == 0 ? -1 : 61 + pass + token;
+            for (int token = 0; token < counts[row]; ++token) {
+                const int position = positions[row * width + token];
+                const int page     = mapping[rows[row] * logical_pages + position / kPage];
+                for (int head = 0; head < kv_heads; ++head) {
+                    const auto source = full_input_index(0, head, row * width + token, kv_heads);
+                    for (int side = 0; side < 2; ++side) {
+                        const auto& vector = side == 0 ? layout.key : layout.value;
+                        const auto& input  = side == 0 ? input_k : input_v;
+                        const auto encoded =
+                            encode_prefix_vector(std::span<const std::uint16_t, kFullHeadDim>(
+                                                     input.data() + source, kFullHeadDim),
+                                                 storage, side == 0);
+                        const auto code_offset = full_cache_index(vector.code_extent, 0, head,
+                                                                  position, page, kv_heads) *
+                                                 dtype_size(vector.code_dtype);
+                        const auto code_bytes = vector.code_extent * dtype_size(vector.code_dtype);
+                        std::copy_n(encoded.data.begin(), code_bytes,
+                                    expected[side].begin() + code_offset);
+                        if (vector.scale_extent) {
+                            const auto scale_offset = full_cache_index(vector.scale_extent, 0, head,
+                                                                       position, page, kv_heads) *
+                                                      dtype_size(vector.scale_dtype);
+                            const auto scale_bytes =
+                                vector.scale_extent * dtype_size(vector.scale_dtype);
+                            std::copy_n(encoded.scales.begin(), scale_bytes,
+                                        expected[side + 2].begin() + scale_offset);
+                        }
+                    }
+                }
+            }
+        }
+        d_counts.copy_from_host(counts.data(), counts.size() * sizeof(std::int32_t));
+        d_rows.copy_from_host(rows.data(), rows.size() * sizeof(std::int32_t));
+        d_positions.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        if (captured)
+            graph.launch(device.stream());
+        else
+            launch();
+        device.synchronize();
+        for (int plane = 0; plane < 4; ++plane) {
+            if (!sizes[plane]) continue;
+            const auto label = "D256 prefix " + std::string(kv_cache_storage_name(storage)) +
+                               " Hkv=" + std::to_string(kv_heads) +
+                               " pass=" + std::to_string(pass) + " plane=" + std::to_string(plane);
+            failures +=
+                verify_exact(label.c_str(),
+                             from_device<std::uint8_t>(storage_buffers[plane].data(), sizes[plane]),
+                             expected[plane]);
+            failures += storage_buffers[plane].verify_guards(label.c_str());
+        }
+    }
+    failures += verify_exact("prefix input K unchanged",
+                             from_device<std::uint16_t>(d_k, input_count), input_k);
+    failures += verify_exact("prefix input V unchanged",
+                             from_device<std::uint16_t>(d_v, input_count), input_v);
+    failures += verify_exact("prefix mapping unchanged",
+                             from_device<std::int32_t>(d_mapping, mapping.size()), mapping);
+    failures += verify_exact("prefix counts unchanged",
+                             from_device<std::int32_t>(d_counts, counts.size()), counts);
+    failures +=
+        verify_exact("prefix rows unchanged", from_device<std::int32_t>(d_rows, rows.size()), rows);
+    failures += verify_exact("prefix positions unchanged",
+                             from_device<std::int32_t>(d_positions, positions.size()), positions);
+    return failures;
+}
+
 } // namespace
 
 void add_full_append_cases(ninfer::test::OpSuite& suite) {
@@ -620,5 +837,14 @@ void add_full_append_cases(ninfer::test::OpSuite& suite) {
         if (storage != KvCacheStorage::BFloat16)
             suite.add("append/full/" + format + "/h2/t129",
                       [=] { return full_append_case(2, storage, 129); }, {{"format", format}});
+        for (int heads : {2, 4}) {
+            const auto base = "append/prefix/d256/" + format + "/h" + std::to_string(heads);
+            suite.add(base + "/ragged-b8-graph",
+                      [=] { return full_prefix_case(heads, storage, 16, 8, true); },
+                      {{"format", format}, {"execution", "graph"}});
+            suite.add(base + "/w129",
+                      [=] { return full_prefix_case(heads, storage, 129, 1, false); },
+                      {{"format", format}, {"execution", "eager"}});
+        }
     }
 }

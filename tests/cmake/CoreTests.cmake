@@ -66,14 +66,6 @@ set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_kv_cache_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
-  LIBRARIES ninfer_core)
-
-ninfer_add_test(ninfer_host_context_arena_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
-  LIBRARIES ninfer_core)
-
 ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)
@@ -86,8 +78,6 @@ set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test
   ninfer_arena_test
-  ninfer_kv_cache_test
-  ninfer_host_context_arena_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 

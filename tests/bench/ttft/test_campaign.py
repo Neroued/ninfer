@@ -27,9 +27,8 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
     monkeypatch.chdir(tmp_path)
     serve = tmp_path / "baseline-serve"
     artifact = tmp_path / "custom.ninfer"
-    runtime_artifact = tmp_path / "ram" / "custom.ninfer"
     serve.touch()
-    artifact.touch()
+    artifact.write_bytes(b"artifact")
     config = tmp_path / "baseline.json"
     profile = campaign.CASES["cold-short"].profile
     common_args = ["--kv-dtype", "bf16", "--log-stats-interval-ms", "0"]
@@ -41,12 +40,7 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
         "common_args": common_args,
         "profiles": {profile: profile_args},
     }))
-    staged: list[Path] = []
     started: list[list[str]] = []
-
-    def stage(source: Path) -> tuple[Path, dict[str, str]]:
-        staged.append(source)
-        return runtime_artifact, {"source": str(source), "path": str(runtime_artifact)}
 
     def running(command: list[str], *_args: object) -> object:
         started.append(command)
@@ -63,7 +57,6 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
         }))
         return 0
 
-    monkeypatch.setattr(campaign, "_stage_weights", stage)
     monkeypatch.setattr(campaign, "RunningServe", running)
     monkeypatch.setattr(campaign, "_run_client", run_client)
     monkeypatch.setattr(
@@ -78,10 +71,9 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
     ]) == 0
 
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
-    assert staged == [artifact]
     assert started == [manifest["plans"][0]["server_command"]]
     assert started[0] == [
-        str(serve), str(runtime_artifact), "--host", campaign.HOST,
+        str(serve), str(artifact), "--host", campaign.HOST,
         "--port", str(campaign.PORT), "--request-log-jsonl",
         manifest["plans"][0]["request_log_jsonl"],
         "--kv-dtype", "bf16", "--max-context", "8192", "--old-capacity", "7",
@@ -99,20 +91,20 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
     assert manifest["profile_kv_dtypes"] == {profile: "bf16"}
 
 
-def test_missing_baseline_profile_fails_before_staging(
+def test_missing_baseline_profile_fails_before_starting_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     serve = tmp_path / "serve"
     artifact = tmp_path / "custom.ninfer"
     config = tmp_path / "baseline.json"
     serve.touch()
-    artifact.touch()
+    artifact.write_bytes(b"artifact")
     config.write_text(json.dumps({"profiles": {"other-profile": []}}))
 
-    def stage(_source: Path) -> None:
-        pytest.fail("incomplete baseline config must fail before staging the artifact")
+    def running(*_args: object) -> None:
+        pytest.fail("incomplete baseline config must fail before starting a server")
 
-    monkeypatch.setattr(campaign, "_stage_weights", stage)
+    monkeypatch.setattr(campaign, "RunningServe", running)
     with pytest.raises(SystemExit, match="no executable Serve profile"):
         campaign.main([
             "--case", "cold-short", "--serve", str(serve),

@@ -2,259 +2,220 @@
 
 本文定义模型实例、执行所有权、请求生命周期及跨模块提交关系。
 [资源调度与上下文缓存](resource-scheduling-and-context-cache.md)定义缓存与抢占策略；
-[Paged KV Context Store](paged-kv-cache.md)定义物理页、replica、地址空间与 consumer 合同。
+[Paged KV Context Store](paged-kv-cache.md)定义目录、物理页、副本和消费者合同。
 
 ## 1. 产品执行模型
 
-编译目标由 [Build system](build-system.md)定义。目标选择在编译时完成，决定源码与依赖的组合；
-模型 Config 与 Op 数学接口保持独立，模型调度调用所选目标提供的实现。
+编译目标由 [Build system](build-system.md)定义：`rtx5090` 与 `dgx_spark` 各自选择本地源码和
+优化实现，模型 Config 与 Op 数学接口保持独立。当前产品使用一个 rank、一张 GPU、一个常驻模型，
+启动时固定 `max_concurrency=1..8`。LocalExecutor 在进程内驱动 RankWorker，不创建网络连接或
+collective communicator。
 
-Generation Engine 使用一张 GPU、一个常驻模型和启动时确定的 `max_concurrency=1..8`。
-有界等待队列按提交顺序组织；resident 请求按有限执行单元增量取得资源，资源压力下可以暂停与恢复。
-每轮将具备执行许可的 decode-ready 请求组成一个紧凑批次，prefill 与 Replay 分块穿插执行。
+Generation 使用有界等待队列，resident 请求按有限执行单元取得资源；压力下可以暂停与恢复。
+紧凑 decode/control 批次与分块 prefill、Replay 共用调度、提交和结果发布机制。
+Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 均通过公共 `ninfer::Engine`。
+Artifact 必须提供 Text；启动独立选择 Vision，以及 none 或一个 speculative backend，只准备所选功能。
 
-Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine`。
-Speculative backend 属于 Program 内部执行路径，与 ordinary 共用请求调度、提交及结果发布机制。
-Artifact 必须提供 Text；启动独立选择 Vision，以及 none 或一个 spec 后端，只绑定和准备所选功能
-及其共享依赖。
+Engine purpose 在启动时固定。CausalScoring 也通过原生 Session 和 Executor 执行，串行处理评分 job，
+使用临时 State 与 Main KV；不进入 Generation Scheduler 或上下文缓存，评分 staging 只在该 purpose 下分配。
 
-Engine 的 purpose 在启动时固定。CausalScoring 用于离线文本评分，`CausalScoreCore` 串行调用
-Program，窗口使用临时 State 与 Main KV，不进入 Generation Scheduler 或上下文缓存。
-评分专用 staging 只在 CausalScoring 启动时分配。
+### 1.1 架构、定义与权重
 
-### 1.1 架构、实例与权重
-
-模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
-分布和 expert 几何等实例参数。架构入口为 `Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM`
-与 `Qwen4ExpForCausalLM`；后者当前支持 Text/Vision/MTP。
-训练实例和物理权重分配作为数据进入对应实现。
+原生模型代码拥有数学公式、层连接、Op 调用顺序和状态转移。Config 提供层数、维度、
+Attention/GDN 分布及 expert 几何。架构入口为 `Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM`
+与 `Qwen4ExpForCausalLM`；后者当前支持 Text/Vision/MTP。Checkpoint 与可处理的表示组合使用同一架构入口。
 
 V3 artifact 保存配置、物理对象、逻辑参数 Binding、使用位置的 Use 和 Frontend 资源。
-Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
-验证、读取并上传原字节。相同架构和可处理的配置更换训练权重或组合已有表示，沿用同一模型代码。
+Converter 负责源映射、量化或保值导入、合并投影、packing 与 layout；loader 验证并按存储表示物化权重。
+全局 ModelDefinition 拥有配置、模型身份、绑定描述和 Frontend 资源，独立于设备权重实例存活。
+ModelShard 拥有本 rank 的不可变权重与 backing；const Parameters 借用这些权重和执行 profile。
 
 ```mermaid
 flowchart LR
-    S["来源与 recipe"] --> C["Converter / Writer"]
-    C --> A["v3 artifact"]
-    A --> L["Reader / 语义绑定 / Materialization"]
-    L --> M["只读 Model / Parameters / Frontend"]
-    M --> P["容量规划 / Program"]
-    P --> E["Engine"]
-    O["启动功能与设备预算"] --> L
-    O --> P
+    A["v3 artifact"] --> D["ModelDefinition / Frontend"]
+    A --> L["绑定与 placement / Materialization"]
+    L --> M["ModelShard / Parameters"]
+    D --> S["原生 Session / ContextDirectory"]
+    M --> P["RankProgram / 固定执行资源"]
+    S --> X["LocalExecutor / RankWorker"]
+    X --> P
 ```
 
-`metadata.name` 提供公开实例名称，缺省使用架构名称；服务可以用 `--model-id` 覆盖公开别名。
-执行选择依据架构、配置和实际绑定。文件合同见[容器规范](artifact-container.md)，权重的数值解释
-与 planes 见[数值格式](tensor-formats.md)和[存储布局](storage-layouts.md)。
+`metadata.name` 提供公开实例名称，缺省使用架构名称；服务可用 `--model-id` 覆盖公开别名。
+执行支持由实际 Parameters、规划和 Ops 决定。文件合同见[容器规范](artifact-container.md)，
+数值解释与 planes 见[数值格式](tensor-formats.md)和[存储布局](storage-layouts.md)。
 
 ## 2. 所有权与调用边界
 
 ```mermaid
 flowchart TD
-    G["Gateway：协议、连接、输入获取"] --> F["Frontend：PreparedPrompt / OutputSession"]
-    F --> E["EngineCore：请求、生命周期、提交与发布"]
-    E --> S["Scheduler：执行成员、顺序、公平性"]
-    E --> R["ResourceManager：缓存候选与保留策略"]
-    E --> P["Program：物理资源、状态、执行"]
-    R --> P
-    P --> O["Ops / Core：计算、存储与传输原语"]
+    G["Gateway：协议与输入获取"] --> F["Frontend：PreparedPrompt / OutputSession"]
+    F --> E["EngineCore：生命周期、调度、发布"]
+    E --> R["ResourceManager：来源与保留策略"]
+    E --> S["原生 Session：账本、前沿、事务"]
+    R --> S
+    S --> D["ContextDirectory：身份、引用、空间分配"]
+    S --> X["Executor：额度、ticket、命令、完成事件"]
+    X --> W["RankWorker：DeviceContext / ModelShard / Parameters"]
+    W --> P["RankProgram：物理存储、frame、Graph、原生计算"]
+    P --> O["Ops / Core"]
 ```
 
 ### 2.1 Gateway 与 Frontend
 
-Gateway 拥有协议解析、transport、media acquisition、response schema 和连接生命周期。
-它将 product/protocol input 转为公共 owning input，调用 Engine，读取输出与统计。
+Gateway 拥有协议解析、transport、media acquisition、response schema 和连接生命周期，
+将协议输入转成公共 owning input，调用 Engine 并消费输出。
 
 Frontend 拥有 tokenizer、chat template、Vision preprocessing、MRoPE prompt construction 和
-owning `PreparedPrompt`；每个请求独占一个 `OutputSession`，解释 stop、thinking/content channel、
-detokenization 及模型私有结构化输出。它还提供能够由模板历史精确重建的输出边界语义。
+owning PreparedPrompt。每个请求独占 OutputSession，解释 stop、thinking/content channel、
+detokenization、工具输出及模板边界。它可以 preview 本轮输出的语义效果，只有模型提交被接受后才 commit。
+Frontend 不持有模型 State、页池或 CUDA stream。
 
-现有 Qwen 架构共用 `models/common/qwen/frontend`，直接执行产物或启动覆盖指定的模板。
-模型侧明确提供采样默认值、embedding 词表范围和启用的媒体几何；Frontend 不根据架构名称
-推断这些参数。媒体预处理与 Program 消费同一组 `VisionItem`、grid、token span 描述。
+现有 Qwen 架构共用 `models/common/qwen/frontend`。模型明确提供采样默认值、词表范围和启用的
+媒体几何；Frontend 不按架构名称猜测参数。媒体预处理、Session 的输入窗口和 rank 的视觉计算消费
+同一组 VisionItem、grid、token span 和位置身份。
 
-Frontend 可以预览一次模型输出的语义效果，Engine 提交后才发布。等待顺序和物理缓存均由下层拥有。
-
-GBNF、JSON、JSON Schema、choice、regex 和工具约束的 compiled grammar 在 Frontend 内按词表共享，matcher 由每请求的 OutputSession 持有。
-Engine 在 submit 调用线程完成编译，再入队；Program 借用当轮的 mask provider，将 mask 送给
-GPU 采样及 spec 验收。Matcher 与输出一起 preview/commit，抢占和 Replay 保留其已提交状态。
-执行时序及语义见[约束解码设计](constrained-decoding.md)。
+GBNF、JSON、JSON Schema、choice、regex 和工具约束的 compiled grammar 按词表共享，matcher 由
+每请求 OutputSession 持有。Engine 在 submit 调用线程完成编译再入队。执行侧通过 DecisionNeeded
+交回实际 draft prefix；协调侧生成 owning DecisionInput，包括 mask words 与逐位置 dead-end bits。
+DecisionConsumed 在实际提交上传后记录字节；输入存储仍保持到传输结束。Matcher 与输出一起 preview/commit，
+Replay 保留其已提交状态。数学和协议细节见[约束解码](constrained-decoding.md)。
 
 ### 2.2 EngineCore 与 Scheduler
 
-EngineCore 拥有 request record、等待队列、resident slots、paused queue、cancellation、deadline、
-response event 和 Engine availability。它编排 admission、资源事务、有限执行单元和终态结算，
-保证模型提交、输出提交及用户可见事件的顺序。
+EngineCore 拥有 request record、等待和 paused 队列、resident lanes、cancellation、deadline、
+response events 和 availability。Scheduler 决定执行成员、fresh admission 的有限绕过、
+prefill 轮转、紧凑批次及抢占/恢复机会。两者不持有设备 Program 或物理页分配器。
 
-Scheduler 拥有执行成员与公平性规则：fresh admission 的有限绕过、prefill 轮转、紧凑 decode/control
-批次、抢占受害请求及恢复机会。它使用请求状态和提交顺序做决定，暂停请求局部等待容量事件。
+SequenceId 标识一条逻辑序列，跨暂停恢复保持；ResidencyId 标识当前 lane 绑定，重新绑定时换代。
+State slot、KV execution row、compact batch row 和 Engine lane 是不同身份。
+每个在途执行冻结 request、sequence、residency、row order 与取消快照，结果不能通过当前 lane 反查旧成员。
 
-Lane 是 resident 请求位置；StateImage slot、KV execution row 和 compact batch row 是独立身份。
-暂停释放 lane 后，请求仍由 EngineCore 拥有；恢复可以取得另一 lane。
+请求的输出预算和外部生命周期归 Engine；真实模型账本、Main/backend 前沿、Replay 目标及未决生成事务归
+原生 Session。调度状态可以记录阶段，但不成为另一份模型前沿。
 
-### 2.3 ResourceManager
+### 2.3 ResourceManager 与 ContextDirectory
 
-ResourceManager 拥有私有 continuation owner、其恢复点、共享前缀索引、session 提示、保留优先级
-与可选保存准入。它向 Program 查询实际 checkpoint 内容、传输需求和有限物理动作，选择 source，
-按恢复损失、当前缺口和真实需求证据选择回收动作，再采用 Program 返回的结果。
+ResourceManager 拥有私有 continuation owner、共享前缀索引、session 提示、需求证据、保留等级及回收权限。
+它向原生 Session 查询 checkpoint、恢复成本和有限动作，选择 source 与受害者，再采用 Session 的完成结果。
 
-State slots、Device pages、Host bytes、共享引用和 pin 的实际占用只存在于 Program stores。
-ResourceManager 的索引和保留记录不构成第二份物理账本。
+ContextDirectory 是唯一的逻辑空间和引用账本：State 身份与 slot、各 pool 的物理页编号、history、row、
+Host offset/length、coverage、writer、read leases 和 reservations 都由它管理。Host/Device backing 在 rank，
+rank 不重新选择页号或缓存命中。ResourceManager 的索引不重复拥有物理空间。
 
-### 2.4 Model 与 Program
+StateDirectory 区分预留、初始化、数学写入、冻结和 replica materialization。复制沿用 content epoch，
+数学提交产生新 epoch。不可变来源与活动写入者分开；Both replica 可以把 Device slot 交给新 identity，
+旧 identity 保留 Host 内容。完整 StateImage 连续存放，DFlash local 字段组可以独立复制。
 
-Model 拥有 config、绑定、Use、权重 backing 和只读资源。ModelInstance 的 const Parameters 借用
-这些资源，规划和执行消费同一份参数。`ModelInstance<RuntimeTypes>` 使用原生 Model、Parameters
-和 Program 类型；Engine 在构建入口按架构作有限分派，执行循环继续静态调用原生 Program。
-公共 PreparedPrompt 承载共享 Qwen 输入合同，不引用具体 Text 架构。
+HistoryOwner 是一个 pool 的唯一可写 owner，HistoryPrefix 持有其精确前缀。HistoryDirectory 随引用变化
+维护 required/protected coverage，保存前缀不复制尾页；发生写入冲突时才分支并 COW。
+Host 和 Device 可以覆盖不同长度，恢复以实际所需 coverage 为准。
 
-`models/common` 只提供明确的可复用能力：权重 ID/Use 与绑定、Qwen Frontend/Vision、逻辑上下文
-存储和 MoE 执行。Vision 编码器接收自己的 config、参数、workspace 和 CUDA 执行视图；特征交接
-按请求建立，资源由 Program 持有。架构声明 StateImage 的字段、dtype、形状与层数；Core
-`StateImageStorage` 将每个 slot 的完整 image 连续存放，Host 使用相同内部布局。类型化的
-GDN、循环 KV 等视图只表达计算几何，Op 从 Tensor 的实际 slot stride 寻址。
+Continuation 将 StateId 与原生 metadata 组合。ContextSnapshot 同时保留 State、各 pool 前缀与输入身份，
+CheckpointStore 管理发布、generation 和读者 lease。Main/MTP/DFlash 的前沿关系由模型决定，公共目录不推导。
 
-公共 `StateImageStore` 管理逻辑身份、写入预留及 Device/Host 副本，Host 副本直接持有共享
-arena 的 allocation。预留、原生初始化、写入完成与副本物化是不同动作；分支目的在完成写入前
-不成为活动内容。唯一写入者原位推进，共享来源通过独立目的或保留 Host 副本后的 Device 交接
-继续执行。完整复制为一次连续 image 复制，DFlash local 字段组可独立复制。
+### 2.4 Session、Executor 与 RankProgram
 
-`Continuation<Metadata>` 将 image 身份与原生续算 metadata 放在一起，供活动执行、候选提交和
-checkpoint 使用；lane 不持有可能随换槽失效的状态 Tensor。Replay 中的 Continuation 记录
-实际已重建的输入位置，恢复目标单独保存在请求控制中；已提交的账本与采样计数保持不变。
-各历史前沿的数学关系仍由模型决定。
-`KVHistory` 是单个 pool 的唯一可写历史，`KVPrefixRef` 持有该历史的精确只读前缀。
-`KVHistoryStore` 随引用增减局部维护保护和有效 coverage，保存前缀不复制尾页；独立写入发生
-冲突时才分支目录并 COW。Device 与 Host 可以覆盖不同长度，迁移按实际所需前缀检查副本。
-`ContextSnapshot<Metadata, Identity>` 一起持有 Continuation、各 pool 的前缀与输入身份，
-`CheckpointStore` 管理用途记录的发布、generation 与读者 lease。原生模型决定各 pool 的位置关系、
-保存机会和采用规则；公共层不推导 Main/MTP/DFlash 的数学前沿。
-具体层连接、状态推进及 speculative 提交保留原生实现。
+InferenceInstance 持有 ModelDefinition、Frontend、Executor 与原生 Session。
+LocalExecutor 持有一个 RankWorker；RankWorker 持有 DeviceContext、ModelShard、const Parameters 和 RankProgram。
+DeviceContext 地址从启动到销毁保持稳定，所有借用其 stream 的 owner 先于它销毁。
 
-每个 Program 独占：
+| 所有者 | 内容 |
+|---|---|
+| 原生 Session | 请求规划、token/位置账本、恢复目标、checkpoint 数学、接受前缀、ContextDirectory |
+| Executor | compute/context 执行额度、ticket、CommandSequence、decision 交接、提交与完成顺序 |
+| RankProgram | 原生 forward/draft/verify/commit、State/KV backing、input/output staging、frame、workspace、Graph |
+| ModelShard | 不可变权重、Host/Device backing、长期 registration 与所需文件 backing |
+| Parameters / Profile | 实际表示与计算几何、已绑定视图、Op activation policy |
 
-- active sequence、committed prefix identity、执行 ledger 和 backend 状态；
-- StateImage、KV history、Device/Host replicas、leases 和 reservations；
-- prefill、ordinary/speculative decode、forced control 与 Replay；
-- provisional model state、accepted-prefix commit/rollback；
-- workspace、CUDA Graph 和固定模型调用。
+两个模型保持原生 Session、Work、Result、Commit 与 RankProgram 类型；入口按架构作有限分派。
+Executor 抽象位于执行单元和生命周期边界，原生层遍历及 Op 分派仍由模型直接编排。
+Work 拥有输入和纯值存储动作，不借用 Engine 调用栈中的 matcher、请求对象或 CUDA 地址。
 
-Program 将具体状态和物理可行性通过原生合同提供给 runtime。请求顺序、缓存价值和输出发布由 runtime
-与 Frontend 决定。
+执行许可先保留 frame 和该 ticket 后续的 supply/commit/discard 容量。
+Session 建立 pending 事务后进入不可撤销的目录准备；此后即使取消，也必须执行已接受的 COW/mapping 动作至退役。
+准备失败使执行实例失败并排空，不能把已改变的活动目录当成一次可回滚的准入失败。
+尚未提交的独立 context binding reservation 可以正常撤销。
 
 ### 2.5 实例生命周期与固定执行
 
-Binder 按架构/config 解析所选功能的逻辑需求，`LoadPlan` 不决定位置。
-`resolve_load` 建立显式放置与 Host/Device 容量，Materializer 按原编码建立稳定 backing。
-同一物理 parent 在各位置分别去重；CPU/GPU 双端需求可由同一次有界 I/O 分发。
-Engine 在大权重读取前消费无地址的 `ModelProfile`，规划固定权重与必要的 KV/State、workspace、
-MoE backing。权重加载后以少量物理 KV 页校准完整的 Graph 集合，保留实际 context、batch、
-speculative 配置与拓扑共享关系；临时 Host context cache 为零。校准资源销毁后重新取得可用显存，
-扣除 Graph 重建估计，再确定正式 KV 与 expert cache 容量。静态容量曲线只计算显式 backing。
-Qwen3.5 MoE 与 Qwen4Exp 均优先尝试全量 GPU 放置；5090 的候选还包括 Host Main experts
-及 Program 所有的 GPU 副本。Spark 提供全量 GPU 放置。候选由原生 Startup 提供，
-ModelProfile 只记录表示与几何；Runtime 不解释 MoE cache/team 计划。候选不同时持有模型，
-见[Expert 权重缓存](expert-weight-cache.md)。
-`NINFER_VRAM_BUDGET_MIB` 限定引擎 Device 预算，实际可用显存构成另一上限。
-Spark 的 GPU 与 Host 分配共享物理内存，预算快照采用 Linux `MemAvailable`，并以 CUDA
-总容量为上限；CUDA 可以在分配时回收其空闲查询没有计入的文件缓存。容量规划还计入 PLE
-准备区及 pinned ingress/egress 等已知 Host 分配。启用 Vision 时，另为 Frontend 的
-`media_live_bytes` 留出容量；该上限已包含 retained cache，不重复加 `media_cache_bytes`。
-这部分预留在正式 Program 建立后仍须保留，计入报告的总 headroom。5090 继续使用 CUDA 空闲容量。
-Spark 不建立 Host State/KV cache，保留 Device 前缀复用和 Replay；PLE 磁盘准备缓冲独立计费。
-Runtime 的 `model_startup.h` 统一预算、候选选择、校准收敛和有界重建；模型侧 `Startup` 提供
-权重放置、容量计划、Frontend 构造和 Graph 校准合同。公共启动流程不解释具体层布局，
-只传递模型拥有的准备描述；实体执行布局移交 Program 后，
-校准与重试所需的描述仍然有效。PLE 规划使用独立几何，不借用可能被销毁的候选 Model。
-ModelInstance 持有 Model、const Parameters、Frontend 与 Program；Parameters 持有与最终
-容量计划相同的不可变执行 profile。纯逻辑加载不要求建立执行 profile。
+Binder 根据架构/config 建立 ModelDefinition 中的逻辑需求；resolve_load 建立 placement，
+Materializer 按原编码建立稳定 backing。同一物理 parent 在各位置分别去重，CPU/GPU 双端来源可由一次有界 I/O 分发。
+Frontend 的资源由 Definition 拥有，不借用稍后可能被销毁的权重候选。
 
-权重、State/KV backing、block-table matrices、workspace 和 CUDA Graph resources 在接受请求前建立。
-运行期改变 ownership、mapping、frontier 与 replica placement。每个 Program 独占可变状态和 Device
-allocation；销毁时先结束 Engine worker 与未决设备工作，再销毁 Program、Frontend、Parameters 和 Model。
+启动在大权重读取前消费无地址 ModelProfile，规划权重、State/KV、workspace 与 MoE backing。
+权重加载后，用少量物理 KV 页准备完整 Graph 集合，保留真实 context、batch、speculative 配置与拓扑共享关系；
+临时 Host context 容量为零。销毁校准资源并重取可用内存后，扣除 Graph 重建估计，确定正式容量。
 
-模型代码维护有限调用写法、跨 Op 融合和阶段关系。纯分段投影统一调用 LinearSplit；Parameters 保存
-逻辑输出行顺序及单/双 parent 参数。例如 Q4 的 Q/K 与 Q5 的 gate/V 按逻辑行拼接，完整
-FP8 parent 和 NVFP4 矩阵视图直接提供同一行序。通用权重准备解析存储视图，实际 Op 检查可执行的格式与分段。
-View 保留 parent 几何、planes 和元素范围，共享对象在同一 Device 只驻留一次，各使用位置保留独立 Use。
-激活许可为 `A16Only={A16}`、`AllowA8={A16,A8}`、`AllowA4={A16,A8,A4}`；融合调用取相关许可交集。
+正式准备依次建立 RankProgram 和 PreparedSession。RankProgram 导出实际 KVTransferProfile，填入纯控制计划；
+PreparedSession 预建目录、checkpoint catalog 和控制元数据，再检查整个实例是否满足预算。
+成功后把这批 owner 移入 Session，不重复分配。容量纠偏先销毁 PreparedSession，再销毁 rank 资源；
+控制侧回收量与 Graph/rank 回收量分别计算，避免漏计或重复扣除统一内存。
 
-Reader、binder、原生参数准备、容量查询、warmup 和执行各自检查所消费的合同。可执行范围由实际
-消费者决定。数学公式、权重表示值和实现精度分别解释；不同量化、batch、prefill 或 speculative 路径的
-数值与状态正确性按 [Op 合同](op-development.md)及独立 oracle 验证。
+Qwen3.5 MoE 与 Qwen4Exp 优先尝试全量 GPU 放置；RTX 5090 还可选择 Host Main experts 与 rank 管理的 GPU 副本。
+Spark 使用全量 GPU 路径。候选由原生 Startup 提供且不同时持有多个模型；通用启动代码不解释 MoE cache/team 规则。
+详见[Expert 权重缓存](expert-weight-cache.md)。
+
+`NINFER_VRAM_BUDGET_MIB` 限定 Device 预算。RTX 5090 以 CUDA 可用显存作另一上限；Spark 以 Linux
+MemAvailable 计入可回收文件缓存，并以 CUDA 总容量为上限。统一内存预算包含准备区、pinned staging 和控制元数据。
+Vision 的 media_live_bytes 另行保留，已包含 retained media cache，不重复计算 media_cache_bytes。
+Spark 不建立 Host State/KV cache，PLE 准备缓冲独立计费。
+
+权重、State/KV backing、block-table matrices、workspace、frame 和 Graph 在接受请求前准备。
+退出先停止提交、解析或丢弃未决事务、drain 所有设备和 Host producer，再释放 Session owners，
+随后销毁 rank Graph、frame、存储、参数、权重和 DeviceContext。
+
+表示支持仍由实际消费者检查。纯分段投影调用 LinearSplit；Parameters 保存逻辑行序及 parent 视图。
+共享权重不在执行时重新 packing。激活许可为 `A16Only={A16}`、`AllowA8={A16,A8}`、
+`AllowA4={A16,A8,A4}`，融合调用取交集。数学与精度验证遵循[Op 合同](op-development.md)。
 
 ### 2.6 内存位置与执行环境
 
-`Device` 描述 CPU 或具体 CUDA ordinal；`None` 只用于未绑定的描述符和容量规划。
-`Tensor`、权重 parent 及其派生视图记录实际位置，reshape、slice、permute 和 layout binding
-保留该位置。数值格式、逻辑形状与内存位置独立，运行时位置不写入 artifact。
+Device 描述 CPU 或具体 CUDA ordinal；None 用于未绑定描述和容量规划。
+Tensor 与权重视图记录实际位置，reshape/slice/permute 保留该位置；运行时位置不写入 artifact。
 
-`HostBuffer` 拥有对齐的普通 CPU 内存，`PinnedHostBuffer` 拥有可用于 CUDA 异步传输的锁页内存，
-`DeviceBuffer` 拥有指定 GPU 的分配。`MemorySpan` / `ConstMemorySpan` 借用 backing，记录容量、
-位置及 host pinned 属性。`MemoryArena` 只管理 span 上的分配游标；Program 分别持有 backing
-和 workspace arena，scope 退出只回退游标，不等待设备工作。容量规划使用无 backing 的描述符。
+HostBuffer 拥有对齐普通内存，PinnedHostBuffer 拥有异步 CUDA 传输用锁页内存，DeviceBuffer 拥有指定 GPU 分配。
+MemorySpan/ConstMemorySpan 借用 backing 并记录位置和 pinned 属性。MemoryArena 只管理分配游标，
+scope 退出不等待设备。rank Resources 持有 backing 与 workspace arena，规划使用无 backing 描述。
 
-`CudaHostRegistration` 拥有已有 Host 范围的 CUDA 注册，借用其 allocation。
-`CudaHostView` 分别记录 CPU 范围、CUDA 映射地址和目标 GPU；注册不改变 CPU residency。
-模型的长期传输来源由 Model 同时持有 backing 和 registration；Program 完成使用后先注销，
-再释放 backing。有界批量 H2D 描述符及 pitched 字节复制属于 Core transfer 基础。
+CudaHostRegistration 拥有注册而不拥有 allocation；CudaHostView 记录 CPU 范围、映射地址和目标 GPU。
+注册不改变 CPU residency，必须先结束借用、注销，再释放 backing。
+CudaExecutionView 由 owning DeviceContext 产生，沿 RankProgram、数学实现和 Op 调用传递。
+Op 核对操作数/workspace 所属 GPU；不能从 Tensor 位置和裸 stream 在调用点临时拼装执行环境。
+额外 stream 由 CudaStream 持有，所有者负责消费者完成后的复用。
 
-`DeviceContext` 拥有 CUDA streams 和设备属性，并创建只读的 `CudaExecutionView`。Program、
-模型上下文及组合 Op 沿调用链传递该视图；Op 入口检查实际操作数和 workspace 属于执行 GPU，
-私有 launcher 再取出 stream。借用外部 stream 时在其所有者边界核对设备，调用点不得从 Tensor
-位置和裸 stream 拼装执行环境。额外 stream 使用 `CudaStream` 持有，资源 owner 负责
-完成所有借用 buffer 的异步消费后再释放。Engine worker 在执行前绑定设备。
+copy_bytes/copy_bytes_async 表达通用字节传输；CUDA async 的 CPU 端须为 pinned memory。
+KV 保留自己的布局传输接口。Tensor 和 span 不携带就绪状态，顺序由执行事件和 owner 管理。
 
-通用字节传输通过 `copy_bytes` / `copy_bytes_async` 表达。CPU copy 同步完成；CUDA async copy
-要求 CPU 端为 pinned memory，CUDA 端属于执行 GPU。调用者持有 backing，负责 stream/event
-排序及完成后的复用；Tensor 和 span 不携带“已就绪”状态。KV 等有专用布局的传输保留其专用接口。
-MoE 混合执行借用 CPU/CUDA 两端视图。共享专家及其余固定权重留在 GPU，Main routed
-experts 可以使用注册的 CPU 来源；其副本、预取、bridge 与完成依赖由 Program 管理。
-
-`models/common/moe` 提供跨模型的 bank 绑定、缓存规划、混合执行和资源组件。每个 Program
-独占其资源实例；组件消费有序 MoE 调用、计算 profile 和明确策略。模型负责权重角色、
-Main/MTP 放置、整机预算及层连接。`Write` 产出独立 block 输出，`AddResidual` 加回已有
-输出；HC 等模型连接留在对应架构。计算格式、shape 分派和 activation Use 准备归 Ops。
+models/common/moe 提供 bank、cache、混合执行和资源组件，实例归 RankProgram。
+共享专家及其余固定权重驻留 GPU；Main routed experts 可使用注册的 CPU 来源。缓存、预取和 bridge
+不属于请求 StateImage，不随请求回滚或暂停。模型负责 Main/MTP 放置和层连接，Ops 负责格式、shape 分派和数学。
+`Write` 输出独立 block，`AddResidual` 加回已有输出，HC 等连接保留在模型中。
 
 ### 2.7 CPU 执行基础
 
-`CpuTopology` 记录发现线程允许使用的 OS CPU、物理核和可见缓存关系，不改变线程绑定。
-线程数量与 affinity 在创建资源前解析；Core 消费明确配置，不自行选择模型计算分工。
-媒体的自动线程数使用允许的 CPU 数量，保持最多 16 个 worker。
+CpuTopology 发现允许的 CPU、物理核和缓存关系，启动解析线程数与 affinity；媒体自动线程数至多 16。
+TaskPool 为独立任务提供固定线程和有界 FIFO，Frontend 媒体与 HTTP 使用独立实例，避免相互等待同一队列。
+立即提交被拒绝不消费任务；阻塞提交可以检查取消。任务拥有结果和异常通道，关闭停止新提交后排空并 join。
 
-`TaskPool` 为独立任务提供固定线程和有界 FIFO。Frontend 媒体准备与 HTTP 使用同一实现的
-独立实例；HTTP 可以等待媒体，二者不共享队列。立即提交被拒绝时不消费任务；阻塞提交在
-等待容量时允许调用方检查取消。任务拥有结果和异常通道，池不额外创建 future。关闭先停止
-新提交，再排空已接受任务并 join；拥有者在销毁前结束所有外部调用。
+CpuExecutor 拥有固定绑核团队并产生 CpuExecutionView，团队 ISA 为各 worker 的交集。
+同步 collective 向全队发布工作，返回时写入对调用方可见；提交线程不参与，团队不接受嵌套或并发 collective。
+worker 使用 nearest-even、屏蔽异常和 gradual underflow。团队只提供 rank、连续范围分工与 barrier，
+scratch 由调用方分配。keep_active() 在相邻 collective 间维持轮询，退出后恢复有限自旋与休眠，空闲请求期间不持有。
 
-`CpuExecutor` 拥有固定绑核计算团队，由它产生借用的 `CpuExecutionView`。团队实际 ISA 是
-各 worker 绑核后检测结果的交集。同步 collective 向全队发布同一次工作，返回时全部写入
-对调用者可见；提交线程不参与计算。同一团队不接受嵌套或并发 collective。worker 使用
-nearest-even、屏蔽异常和 gradual underflow，计算保留控制模式，算法的指令数值特性由 Op
-负责。团队只提供 rank、连续范围分工与全队 barrier；scratch 由调用者用现有 HostBuffer、
-MemoryArena 和布局类型管理，进入团队前完成划分。
-
-`CpuExecutionView::keep_active()` 返回借用团队的独占作用域，在相邻 collective 之间保持
-worker 轮询；退出后恢复有限自旋与休眠。它不提交工作，也不改变 collective 的完成语义。
-是否启用由调用方依据实际计算频率决定，空闲请求期间不持有该作用域。
-
-两种执行器共享启动确认、初始化失败清理和线程回收机制。CPU 团队不调用 CUDA，也不持有
-传输槽、模型状态或权重副本。Engine/Scoring 的控制线程继续拥有各自的工作循环。
-CPU 团队用于 MoE 混合执行；每个 Program 持有固定团队和交接缓冲。
-MoE 按实际 token 列数选择混合计算或整层流式 GPU 计算，prefill、Replay、decode、
-control 与 verification 共用这个选择。权重副本不属于请求 StateImage，不随回滚或暂停恢复。
+CPU 团队不调用 CUDA，也不拥有传输槽、模型状态或权重副本。RTX 5090 的 MoE offload 由 RankProgram
+取得 GPU 输入就绪事实后调用现有团队，再提交 GPU 汇合。MoE 策略由实际 token 列数决定，
+prefill、Replay、decode、control 和 verify 共用该选择。
 
 ## 3. 请求生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Waiting
-    Waiting --> Materializing: 初次绑定
+    Waiting --> Materializing
     Materializing --> Prefill
-    Materializing --> Replay: 重新执行已接受历史
-    Materializing --> DecodeReady: Snapshot 恢复
+    Materializing --> Replay
+    Materializing --> DecodeReady
     Materializing --> ControlReady
     Prefill --> DecodeReady
     DecodeReady --> ControlReady
@@ -267,241 +228,228 @@ stateDiagram-v2
     ControlReady --> Pausing
     Replay --> Pausing
     Pausing --> Paused
-    Paused --> Materializing: 恢复绑定
+    Paused --> Materializing
     Prefill --> ModelFinished
     DecodeReady --> ModelFinished
     ControlReady --> ModelFinished
-    ModelFinished --> [*]: 资源与输出结算
+    ModelFinished --> [*]
 ```
 
-`Materializing` 包含 source lease、必要传输和 destination 安装；完整绑定采用后才暴露 SequenceHandle。
-Capture 是 resident 请求上的暂时执行门，capture 未完成的请求不进入模型 unit。
-`ModelFinished` 表示模型已经结束，Engine 仍持有 lane，直到 finish/release 和缓存索引更新完成。
-取消与失败可以从相应稳定边界进入终态。
+Materializing 包含来源 lease、传输和目的安装；完整采用后才使序列可执行。
+Capture 是 resident 请求的暂时执行门，未完成时不进入该请求的模型 unit。
+ModelFinished 后 Engine 仍持有 lane，直到设备退役、finish/release 和缓存结算完成。
 
 ### 3.1 暂停与恢复
 
-暂停由 Program 在已提交 GPU 边界完成，返回 owning `ResumeState`：
+Session 在已提交执行边界完成暂停，返回 owning ResumeState。Snapshot 保留完整 State/KV；
+Replay 保留输入、accepted ledger、RNG 与 backend metadata，恢复时重建缺失历史。
+Engine 保留同一个请求、OutputSession、生成预算和已发布结果；恢复可使用另一 lane。
 
-- Snapshot 保存可直接恢复的完整 State/KV coverage；
-- Replay 保存继续请求所需的输入、accepted ledger、RNG 和 backend 控制状态，恢复时重新执行缺失历史。
-
-Engine 保留同一个 request record、OutputSession、generation budget 和已发布结果。Replay 重建物理状态时
-不重复发布历史输出，也不重新消费用户生成预算。Snapshot 是可回收的加速资源；撤销后该请求仍能 Replay。
-恢复绑定取得“重建至旧 frontier + 首个真实新单元”的完整许可，Native 跨 chunk 保持实际预留。
-同时最多一个请求处于这段受保护恢复中；真实新进展或终态结束许可，随后再尝试其他恢复。
-这期间跳过可选 capture，其他已获许可的请求仍可执行。
+Replay 不重复发布历史、不重复计数或采样。Snapshot 是可回收加速资源，撤销后仍可 Replay。
+恢复取得“旧 frontier + 首个真实新单元”的完整许可，跨 chunk 保留；同时最多一条受保护恢复。
+到达旧 frontier 本身不结束保护，真实新进展或终态才结束；期间跳过可选 capture。
 
 ### 3.2 Outstanding capacity
 
-非零输出请求成功 submit 后占一个 outstanding 名额，暂停不归还该名额。释放同时要求：
+非零输出请求成功 submit 后占一个 outstanding 名额，暂停不归还。释放同时要求 response_done
+与 consumer_released；两者任意先后，容量只释放一次。放弃 GenerationHandle 只设置取消与 consumer_released，
+consumer 线程不调用 Session 或 RankProgram。
 
-```text
-response_done       worker 已形成最终 result 或 error
-consumer_released   wait 已结束，或 GenerationHandle 被放弃
-```
+### 3.3 Continuation 与命名 session
 
-两者可以任意先后，capacity 只释放一次。放弃句柄只设置 cancellation 和 `consumer_released`，
-consumer thread 不调用 Program。
-
-### 3.3 Continuation 与 session
-
-Active continuation 是可写模型状态；checkpoint 为不可变的恢复点。完整 checkpoint 对齐 State、
-Main KV、selected backend KV 及继续执行所需 metadata。一个私有 owner 可持有多个恢复点并共享 KV history。
-
-Session key 提供 continuation 查找提示。每个请求拥有单调 `publication_order`；较早提交的请求晚结束时，
-不会覆盖较新结果的 session binding。具体恢复点与共享发布规则由
-[上下文缓存](resource-scheduling-and-context-cache.md)定义。
+活动 continuation 可写，checkpoint 是不可变的完整恢复点。一个私有 owner 可以持有多个恢复点并共享 KV history。
+产品 session key 是查找提示，与原生 ModelSession 对象不同。单调 publication_order 防止较早请求晚结束时
+覆盖较新 session binding。具体来源和共享发布规则见[上下文缓存](resource-scheduling-and-context-cache.md)。
 
 ## 4. Worker、资源与执行
 
-只有 Engine worker 修改请求运行状态、Scheduler、ResourceManager 和 Program。Ingress、consumer 与
-transport 通过队列、原子 cancellation flag 和 response event 交互。
+Engine worker 是控制状态、Scheduler、ResourceManager、Session 和本地执行推进的唯一修改者。
+Ingress、consumer、transport 通过队列、原子取消标志和响应事件交互。LocalExecutor 直接调用本进程
+RankProgram，不增加消息编码、远程队列或额外执行线程。
 
-一个 worker cycle 先推进资源事务、capture 与终态并处理取消，在容量事件上尝试最老 paused 请求
-的完整恢复。随后按恢复优先、原票号优先为 resident 逐行取得 unit 许可，用余量尝试 fresh admission，
-再执行可运行的 control、decode 和一个 prefill/Replay chunk。受保护恢复优先取得 chunk；其余 prefill
-在 resident 间轮转，decode 批次使用实际 `B`。
+每个 worker cycle 先消费执行与上下文完成、处理取消和终态，再按恢复优先及原票号为 resident 取得 unit 许可，
+用余量尝试 fresh admission，然后安排 Control、一个 compact Decode batch 和一个 Prefill/Replay turn。
+同周期已执行 Control 的行不得再次 Decode；异步事件到达不重新获得整轮调度机会。
 
-Program 的 `reserve_units` 原子取得一个调用集合的 typed 增量需求；Engine 逐行调用，组成可运行
-子集。取得许可后，fresh admission 仍可能增加尾页复制等依赖；control、decode、prefill 成批时
-重新检查 Program 当前的 `context_blocks`，受影响的 writer 等待复制完成。一行缺资源不会阻止
-其他已许可且无依赖的行执行。普通 unit 结算释放未用 reservation 与 provisional
-suffix；恢复许可保留未来重建及首新单元尚需的 reservation。压力可以回收 optional cache、撤销
-paused Snapshot 或暂停年轻 resident，具体准入与公平性见核心缓存文档。
+Session 原子取得一个调用集合的 typed 需求，Engine 逐行形成可运行子集。Fresh admission 可能新增
+共享尾页依赖，因此最终提交仍核对 context_blocks。一行不足或等待复制不阻止其他已许可且无依赖的行。
+普通 unit 增量预留，恢复许可保留尚需覆盖；回收策略由 ResourceManager 决定。
 
-一次资源事务可以与不受影响的 resident 执行交错，但同一 sequence、source/destination lease、
-block table 和 transfer buffer 的依赖由 Program 冻结。任意时刻只有一个上下文资源事务，任意 GPU unit
-访问的 mapping 在完成前保持稳定。
+当前 rank 有一套 Compute frame 和独立 Context frame。Compute 等待决策或提交时不覆写其 records；
+Context 事务可以与无冲突工作交错。每条 sequence 的源、目的、mapping、传输窗口和执行输入被冻结到相应完成边界。
+PLE 的 producer/upload/consumer、MoE 的输入就绪/CPU contribution/汇合由 rank 内部推进，控制侧不调度逐层算子。
+执行预留只取得 frame 及其后续控制命令额度；原生 Work 描述形状和数学变体，由 rank 校验。
+所有 Compute 结果需要 commit/discard，Context 完成后直接退役。
 
-Admission 检查由等待队列、容量释放、资源事务完成等事件启动有界扫描。普通 decode 前进本身不重启
-失败的 admission 扫描。恢复失败不关闭 fresh admission；更老 resident 仍在时，paused 请求不会
-为试探恢复而盲目暂停年轻 borrower。普通 active 请求不预留整个剩余生成长度。
+Admission 由队列变化、容量释放、事务完成等事件启动有界扫描，普通 decode 前进不反复重启失败扫描。
+未完成工作由 Executor poll 推进；空闲等待不能给每个 decode 完成固定增加一次定时器延迟。
+只有 Context 在途且没有进展时不重跑空调度周期；完成事件、队列通知及到期请求触发下一次边界处理。
 
-## 5. 提交与发布
+## 5. 提交、完成与发布
 
-### 5.1 上下文事务
+### 5.1 四个执行事实
 
-Bind、Capture、Demote、Pause 是独立的原生操作，由一个固定操作槽驱动：
+| 事实 | 含义 |
+|---|---|
+| Submitted | ticket 已建立，执行侧接管 owning Work 与 frame |
+| ResultReady | provisional token、每行 extent 或原生结果可被控制侧读取 |
+| CommitReceipt | 最终提交命令已被有序接受，Session 可以采用已准备的逻辑前沿 |
+| DeviceRetired | 最后设备消费者结束，目录可以归还延迟租约，frame 才可复用 |
 
-```text
-选择操作与 source
-  -> Program 取得 destination reservation 和 source lease
-  -> 分步传输与完成检查
-  -> 发布完整物理结果
-  -> Engine / ResourceManager 采用结果
-```
+SessionEpoch、ticket、FrameId generation、SequenceId/ResidencyId 和 CommandSequence 共同界定事件归属。
+ResultReady 不归还 frame。supply/commit/discard 使用原 ticket 的许可，不因其他普通工作占满额度而无法完成。
+结果和 decision handoff 拥有自己的数据，不能在下一次 D2H 后失效。
 
-公共 `MigrationBatch` 持有 State/KV 来源读者、目的 reservation、复制计划、execution row 与完成
-依赖。`MigrationContext` 在启动时准备可复用的事件与计时存储。恢复、尾页 COW 和 mapping 上传
-在同一 stream 顺序提交；未发布的恢复页可以被本批次的 COW 使用，外部消费者只取得已完成结果。
+### 5.2 上下文事务
 
-Program 返回新 sequence、恢复点、已退役 checkpoint、暂停状态和实际传输观测。取消先撤销发布
-意图，worker 继续轮询本批次的事件；事件完成后才释放空间和 lane、通知容量变化。取消中的
-批次继续占用唯一操作槽，不阻塞无依赖的 resident。普通取消与资源析构不做 stream 同步；
-部分提交异常和销毁路径显式结束实际设备访问，再退役所持资源。
-
-State 采用方式用 Root、Move、Fork、Restore、Split、BackupSplit 表达。目的 image 由 owning reservation
-管理，采用后才转交 continuation。Pause 在释放活动状态前结束可能尚未完成的 hidden-tail
-publication；DFlash normalization 也保留独立的数学完成边界，其共享 Host ingress 与执行行在
-producer 完成前不能复用。迁移完成不代替 MTP bridge 或模型接续。
-已安全完成的回收或降级可以保留，结果必须与最终实际占用一致。
-
-### 5.2 模型 unit 事务
-
-Prefill finalization、decode 和 control 可以产生 move-only `PendingBatch`，包含冻结的 sequence
-membership、provisional token、每行 produced extent 和 accepted-prefix 执行 metadata。
-Engine 使用 Frontend preview 形成每行 decision，再一次性 `Program::commit` 或 `abort_pending`。
-Program 提交或回滚对应 Main/backend KV、recurrent state、RNG 和 speculative state。
-
-非取消行满足：
+Bind、Capture、Demote、Pause 使用独立 Context slot：
 
 ```text
-1 <= accepted_tokens <= produced_tokens
-nonterminal -> accepted_tokens == produced_tokens
-terminal    -> accepted_tokens 可以是 produced prefix
+Session 选择来源与取得目的/读者
+  → ContextTransaction 准备 owning 值动作
+  → rank ContextMigration 执行复制、COW、mapping
+  → DeviceRetired
+  → Session 发布 replicas、采用绑定及 checkpoint
+  → Engine / ResourceManager 更新目录入口
 ```
 
-取消行使用零 accepted token。整个 PendingBatch 必须被消费，不能逐行遗弃未决状态。
+ContextTransaction 拥有控制侧 leases、pending replicas 和 row；ContextMigration 只持 rank 的 events、
+固定 pinned staging 与实际传输观测。已恢复但未对外发布的尾页可以在同一有序批次中继续用于 COW。
+相同 row 的重叠 mapping 更新合并成最终片段，在复制后上传；H2D 源保持到传输完成。
 
-### 5.3 输出顺序
+State 采用方式为 Root、Move、Fork、Restore、Split、BackupSplit。暂停先结束 hidden publication 和必要
+DFlash normalization，再备份或释放活动状态。取消只撤销未完成结果的发布意图，事务继续占用原 slot，
+实际消费者结束后才释放来源、目的和 row。部分提交异常及退出路径显式 drain，不能析构在途 backing。
+
+### 5.3 模型 unit 与输出
+
+产生 token 的执行返回 PendingBatch，冻结成员、provisional tokens、每行 produced extent 和数学提交 metadata。
+Engine preview 后一次性调用 Session commit 或 discard，不能逐行遗弃未决状态。
+
+非取消行满足 `1 <= accepted <= produced`；非终态采用全部 produced，终态可以采用其前缀。取消行为零 accepted。
+接受长度决定 Main/backend KV、GDN/QSA/PLE state、tail conditioning、计数和 RNG 的实际采用范围。
 
 ```text
-Frontend preview
-  -> Program 提交 accepted model state 与 prefix execution provenance
-  -> generation budget 与调度记账
-  -> OutputSession 提交 preview
-  -> 发布输出事件
+Frontend preview、必要 Host 容量检查
+  → Session 准备 accepted-prefix 逻辑与物理提交
+  → Executor 接受提交，返回 receipt
+  → Session 采用账本与前沿
+  → Engine 生成预算记账
+  → OutputSession commit 并发布输出
+  → DeviceRetired 后完成资源结算
 ```
 
-Frontend 的 boundary metadata 只描述 accepted span 内的相对位置；Engine 验证范围并随 row 搬运。
-Program 根据 base frontier 转为绝对位置，与 accepted token、State/KV 和 prefix digest 原子提交。
-Program commit 失败时，OutputSession preview 也不提交。
+提交前检查生成缓存容量、相对 boundary metadata 和成员身份。模型提交被拒绝或失败时，OutputSession preview 不提交。
+KV 的提交准备只整理 provisional 页与退役租约，不推进 committed frontier；接收后才采用前沿、State epoch、
+token identity 与恢复保护状态。采用所需的 Host 容量在接收前准备，后续设备完成再归还旧页及补足增长预留。
+后续工作继承执行顺序，terminal response 仍等待资源与缓存 owner 结算。
+Forced control 使用相同事务，token 由 Frontend 给出，不调用 sampler 或推进采样 RNG。
+初次 admission 后、任何输出 delta 前发布一次 GenerationStart，恢复不重复发布。
 
-Forced control 使用同一提交机制，token 由 Frontend 提供，不调用 sampler 或推进 sampling RNG。
-初次 admission 确立后，在任何输出 delta 前发布一次 `GenerationStart`；抢占恢复不重复发布它。
-最终 response 等待 terminal 资源及缓存 owner 结算完成。
+工具输出包含正文/思考增量、调用开始、参数增量和调用结束。请求独占 decoder 在 commit 后推进，
+HTTP 写入由消费线程完成。聚合与 streaming 共用参数转码，工具序号在请求内稳定，协议 ID 由适配器产生。
+InProgress、Complete、Incomplete 分开表示，未完成参数保留已发布 JSON 前缀。
 
-公共 OutputEvent 包含正文/思考增量、工具调用开始、参数增量和调用结束。Qwen OutputSession
-在 commit 后推进请求独占的增量工具 decoder；Engine 将这些事件按顺序交给 wait() 的消费线程，
-HTTP 写入不在 GPU worker 上执行。聚合与 Streaming 使用同一参数转码结果。工具序号在请求内
-稳定，协议 call/item/block ID 由各适配器从开始事件分配。调用状态区分 InProgress、Complete
-和 Incomplete，未完成参数保留已经发布的 JSON 前缀。
+output_error 区分自由生成格式错误与受约束合同违规。已完成该批提交后结束相关 sequence，分别结算
+InvalidToolOutput 或内部错误；可隔离的解析失败不使整个 Engine 失效。工具参数状态与 matcher 一同参与
+mask、preview、commit/discard，暂停保留，Replay 不再次消费历史参数。
 
-工具 decoder 通过结构化 output_error 区分自由生成格式错误与受约束输出合同违规；worker 在
-本批提交完成后 abort 该 sequence、释放其所有权，分别结算 InvalidToolOutput 或内部错误。
-正常可隔离的解析失败不进入 Engine 全局异常清理。工具参数名称状态与静态 matcher 一起参与
-每个 speculative 位置的 mask、preview、confirm 和 discard；它不消费 Replay 的历史 token。
-暂停保留 decoder 状态，Replay 不再次消费或发布历史参数；最终调用状态与实际结束原因分别保留。
+### 5.4 MTP 的统一轮间状态
 
+设 Main 已计算 `[0,F)`，账本有待输入的已确认 anchor `x[F]`。稳定边界为：
+
+```text
+Main frontier = F
+MTP history frontier = max(F-1, 0)
+saved conditioning = H[F-1]
+```
+
+MTP 在位置 p 消费 `H[p] + embedding(x[p+1])`。Qwen3.5 conditioning 为 target hidden，
+Qwen4Exp 为 HC conditioning，具体数值运算由各自数学实现定义。
+
+本轮先 Draft，再以 `[anchor, drafts...]` 执行 Main Verify，然后 Decision/Commit。
+最终采用 A 个输出时，Main 前沿为 `F+A`，MTP history 为 `F+A-1`，保存 target 第 A−1 列 conditioning。
+Draft 第一步写出的真实 history 可以保留；后续使用 draft conditioning 的 provisional history
+按真实 target conditioning 重建，不直接作为 committed history。
+
+Prefill、Replay、Control 采用相同的 backward alignment：根块跳过首 token；后续块先使用保存的
+上一位置 conditioning，再使用本块 target conditioning。它们只建立 history，不生成跨轮携带的 drafts。
+精确前缀命中先从 tail hidden 采样 anchor，下轮正常进入 Draft。K=0、ragged draft extent、部分终态采用
+都遵守相同前沿；Vision embedding 的 token 位置与 conditioning/RoPE 位置分别解释。
 
 ## 6. 结束、取消与失败
 
-成功结束时，Program 将可保留 continuation 交给 ResourceManager，或释放 sequence；ResourceManager
-更新私有 owner、共享索引和 session，然后 Engine 释放 lane、完成 response。
+正常结束由 Session 将可保留 continuation 交给 ResourceManager，或释放序列；缓存索引、命名 session
+与终态资源结算完成后，Engine 归还 lane 并形成最终 response。
 
-取消在 worker 边界生效：Waiting 直接结束；绑定或传输中的请求先结算/中止事务；resident 请求在
-GPU unit 稳定后 abort；paused 请求释放 ResumeState 及相关 owner。取消不改写 in-flight mapping，
-已提交输出不回退。
+Waiting 请求可直接取消；绑定和传输中的请求先完成或撤销对应事务；resident 在 accepted 工作退役后结束；
+paused 释放 ResumeState 和相关 owner。取消不改写 in-flight mapping，已发布输出不回退。
 
-Queue timeout、overload、输入超限和 request 无法表示属于请求级拒绝。Handle generation/owner
-错误、PendingBatch membership 错误、物理 mutation 无法稳定 commit/abort，以及完整性或 adoption
-不变量损坏会使 Engine 失败。Cleanup 先结束未决上下文和模型事务，再释放 resident/paused 资源与
-缓存，最后完成全部 response。内部状态损坏不能解释成 cache miss。
+Queue timeout、overload、输入超限和不可表示请求属于请求级拒绝。身份/generation 不一致、错误成员、
+不可稳定提交的物理 mutation、目录完整性损坏或执行错误使整个实例失败，不能解释为 cache miss。
+Cleanup 停止提交，保留最初错误，尝试排空各执行和 producer，再释放 resident/paused/cache owners 并完成响应。
+实际资源不足返回策略层；不可撤销准备之后的内部失败不作为普通准入不足重试。
 
 ## 7. 物理执行与 CUDA Graph
 
-Startup planner 根据与执行同源的逐层 Parameters、Use 和设备容量建立 State/KV、workspace 与
-Graph 资源。顺序互斥 scratch 取峰值，跨阶段存活的数据保留到最后消费者：Vision handoff 保留至
-Text/所选 MTP 消费结束，speculative features 和 verify records 保留至提交边界。
+RankProgram 按同源 Parameters、Use 与容量计划准备资源。互斥 scratch 取峰值；跨阶段存活的
+hidden、conditioning、verify records 和 Vision handoff 保留到最后消费者。Host ingress、decision mask、
+accepted lengths 和 mapping staging 在 H2D 完成前不覆写；egress 在 D2H 与控制侧消费都结束后复用。
 
-Growing KV 使用共享 typed paged pools，物理页与逻辑 token frontier 分离。所有预留、mapping 更新、
-COW 和 replica publication 在 GPU 稳定边界完成。消费者只拿 non-owning typed views。
+Graph 绑定固定 frame 和 backing。合法 exact-B topology 在启动准备，page IDs、sequence、State selectors
+作为输入变化；长度档位描述资源范围，不复制 Attention Op 私有分派边界。同类 Graph 更新合同由 Op 提供。
+Qwen4Exp resident Main 包含 PLE 消费和 head，Host PLE producer 在提交前准备本代次输入；
+MTP draft chain 可以增量交回 IDs。需要约束或 Host producer 的边界通过显式交接推进。
 
-CUDA Graph 按合法 exact-`B` topology 建立，page ID、请求身份、state selectors 是输入而非 graph key。
-Op 拥有声明执行范围内的 Graph 更新兼容性，Program 在启动时捕获并验证同类更新。
-Program 按真实数据依赖组织计算与决策 Graph；CPU 在决策前准备约束 mask，并可与 target
-forward 重叠。Qwen4Exp resident Main 包含 PLE 消费和 head；Host PLE producer 在 Main
-提交前提供本代次输入，MTP draft chain 增量回传 IDs。所有设备段共享同一个资源预留和提交边界。
-长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
+MoE offload 保留分段 GPU Graph 和已优化的融合路径。mixer、GPU experts、CPU contribution、cache snapshot
+及上传根据实际依赖组织；权重稳定时合并 GPU 提交，流式或恢复时保留上传重叠机会。
+层遍历、speculative prefix/suffix 与拓扑共享关系仍由原生 RankProgram 定义。
 
-MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。
-稳定缓存合并 mixer 与 MoE GPU 提交；恢复和流式加载时分开，保留 mixer 与上传重叠。
-`models/common/moe/schedule` 向模型提供图交接接口，`offload/graph` 实现 GPU subset 图及
-CPU/cache 交接；调用方提供 mixer、MoE 和
-可选 feature 的 GPU body。Text 与 speculative 的 prefix/suffix、层遍历及跨拓扑共享关系仍由原生
-Program 定义。
-Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照。释放后仍保留的驱动开销
-已进入新的可用显存基准，不能与重建估计重复扣费。差值使用有符号数；允许重建增量为零。
-`MemorySummary.cuda_graph` 分别报告校准增长、校准释放后的保留量、重建估计和正式准备增长；
-`startup_retained_bytes` 记录正式 Program 分配前、扣除已拥有权重后的总增长。
-这些差值包含 CUDA 延迟加载和驱动缓存，不作为纯 Graph allocation 的精确归因。
-`runtime_reservation_bytes` 仅包含显式 Program backing。
-正式准备的增长单独报告，以实际总占用是否满足 Device 预算判断启动，不要求它小于估计值。
-显式与自动 KV 容量统一使用至少 1 GiB 基础 headroom，自动容量显式要求更大余量时取其值。
-基础 headroom 用于容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑类重复预留。
-Spark Vision 的 live media 预留另行计入总 headroom，正式 Program 建立后仍保留这部分容量。
-正式分配不足时最多进行一次容量纠偏重建；只调整自动 KV 或可选 expert cache，保持显式容量与执行功能。
-Device 分配不足可以回收，
-执行错误与 Host 内存分配失败不作为缩减 GPU 容量的理由。
-Graph 只记录 GPU 工作，warmup 不绑定运行期控制线程；结束异步工作后先销毁 Graph，
-再释放其引用的 bridge 和 events。具体依赖见 [Expert 权重缓存](expert-weight-cache.md)。
+Graph 校准记录准备前、准备完成和仅销毁 Graph 后的显存快照。销毁后保留的驱动开销已进入可用内存基准，
+不与重建估计重复扣费；差值使用有符号数，重建增量可以为零。
+MemorySummary.cuda_graph 分别报告校准增长、保留量、重建估计和正式准备增长；这些包含 CUDA 延迟加载与
+驱动缓存，不能当作纯 Graph allocation 精确归因。runtime_reservation_bytes 表示 rank 的显式资源预留；
+共享物理内存目标还计入 pinned staging、PLE Host 准备区等共享容量，独显目标仅计入 Device backing。
 
-Source 排序使用硬件与实际绑定对应的传输成本、prefill 成本；缺省值用于没有匹配测量的配置。
-实际 reservation 和 stores 决定物理可行性。
+显式与自动 KV 容量都至少保留 1 GiB 基础 headroom；自动策略要求更大值时取其值。
+基础 headroom 容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑重复预留。
+Spark Vision live media 另行保留。正式准备以整个实例的实际占用判断预算，不要求正式增长小于估计。
+最多一次容量纠偏重建，只缩减自动 KV 或可选 expert cache；显式容量与功能不变，Host 分配失败和执行错误
+不作为缩减 GPU 容量的理由。
 
-Serve warmup 使用公共 Engine，但关闭请求级 context cache；结束后不留下可供外部请求命中的
-continuation 或 checkpoint。
+Graph warmup 使用 rank 的临时 slot/page 绑定，不建立正式 Session checkpoint 或 prefix entries。
+结束异步工作后先销毁 Graph，再释放它引用的 bridge/events。Serve warmup 使用公共 Engine，关闭请求级
+context cache，结束后不留下外部请求可命中的 continuation。
 
 ## 8. 核心不变量与实现位置
 
-1. Engine worker 是请求运行状态和物理 mutation 的唯一执行者。
-2. Scheduler 决定顺序，ResourceManager 决定逻辑保留，Program 决定物理可行性与状态操作。
-3. Unit 执行前取得完整许可；恢复许可跨 chunk 保留至真实新进展，执行中的资源和 mappings 稳定。
-4. Checkpoint 必须对应同一次实际执行的完整 State/KV coverage。
-5. 暂停保留请求语义和已发布输出，恢复不重复输出与生成记账。
-6. PendingBatch 完整消费后才能发布对应输出；终态结算前请求保有资源所有权。
-7. 每个请求、资源事务和模型事务均有唯一终态。
+1. Session 解释模型前沿，ContextDirectory 是唯一空间与引用账本，rank 执行已确定的动作。
+2. Scheduler 决定顺序，ResourceManager 决定保留，实际分配与 Op 决定物理可行性。
+3. 完整执行许可先于不可撤销准备；恢复许可跨 chunk 保留至真实新进展或终态。
+4. ResultReady、逻辑提交和 DeviceRetired 不混用；最后消费者结束前不复用 backing。
+5. Checkpoint 对应同一次实际执行的完整 State/KV coverage，暂停恢复不重复输出或生成记账。
+6. PendingBatch 被完整消费后才能发布输出；终态结算前保留资源所有权。
+7. 单 rank 的 LocalExecutor 使用正式执行合同，逐层计算继续使用原生实现与现有 Op 分派。
 
 | 职责 | 主要位置 |
 |---|---|
-| 公共 Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
-| 请求生命周期、调度与观测 | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
-| 实例构造与启动策略 | `src/runtime/engine/model_construction.*`, `model_instance.h`, `model_startup.h` |
-| 缓存 owner、索引与成本 | `src/runtime/engine/context_cache/` |
-| 公共请求、执行与资源合同 | `src/runtime/contract/` |
-| 模型 config、绑定与只读数据 | `src/models/{qwen3_5,qwen4_exp}/config.*`, `load/`, `model.*` |
-| 原生参数与固定模型调用 | `src/models/{qwen3_5,qwen4_exp}/execution/` |
-| Program 规划、存储、上下文及模型事务 | `src/models/{qwen3_5,qwen4_exp}/program/` |
-| Qwen Frontend、Vision 与输入身份 | `src/models/common/qwen/` |
-| 逻辑上下文存储 | `src/models/common/context/` |
-| 原生启动与状态布局 | `src/models/{qwen3_5,qwen4_exp}/startup.*`, `state/` |
-| 共享权重绑定与 MoE | `src/models/common/bindings.*`, `weights.*`, `moe/` |
-| Tensor、arenas、graphs、物理 KV 与 raw transfers | `src/core/` |
-| 通用 artifact framing 与 materialization | `src/artifact/` |
-| 闭合计算与状态转移 Ops | `src/ops/`, `include/ninfer/ops/` |
-| 输入转换、media acquisition 与 HTTP Gateway | `src/product/`, `src/media/decode/`, `src/serve/` |
-| Converter 与 Python 容器工具 | `tools/convert/`, `tools/artifact/` |
+| 公共 facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
+| 生命周期、周期与发布 | `src/runtime/engine/engine_core.h`, `engine_{requests,schedule,execution,metrics}.inl` |
+| 实例与启动 | `src/runtime/engine/instance.h`, `startup.*`, `startup_memory.*` |
+| 执行合同、frame 额度、本地 worker | `src/runtime/executor/` |
+| 缓存策略、索引、成本 | `src/runtime/engine/context_cache/` |
+| 模型定义、绑定、只读 shard | 各架构 `definition.*`, `load/`, `model.*` |
+| 原生控制与 checkpoint | 各架构 `session/` |
+| rank 资源、执行推进与 Graph | 各架构 `program/` |
+| 数学实现和参数 | 各架构 `execution/`、`state/` |
+| 集中目录与值动作 | `src/models/common/context/directory/`, `directory.*`, `contract.h` |
+| 本地存储、动作槽与传输 | `src/models/common/context/storage.*`, `transfer.*` |
+| Qwen Frontend、Vision、输入身份 | `src/models/common/qwen/` |
+| 共享权重与 MoE | `src/models/common/bindings.*`, `weights.*`, `moe/` |
+| Tensor、buffer、arena、Graph、物理布局 | `src/core/` |
+| Artifact 与 Converter | `src/artifact/`, `tools/convert/`, `tools/artifact/` |
+| Ops | `src/ops/`, `include/ninfer/ops/` |
+| 协议、输入获取与 HTTP | `src/product/`, `src/media/decode/`, `src/serve/` |
 
-公共 C++ 接口服务仓库内应用；NInfer 不安装或导出 C++ SDK。V3 `.ninfer` 是唯一 C++ 产品 artifact，
-CLI、server 和 inference benchmark 均通过公共 Engine，converter 不提供 Python model-inference 路径。
+公共 C++ 接口服务仓库内应用，不安装或导出 SDK。V3 `.ninfer` 是唯一 C++ 产品 artifact；
+CLI、server 和 inference benchmark 均通过 Engine，converter 不提供 Python model-inference 路径。

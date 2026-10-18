@@ -114,7 +114,7 @@ JSONL may retain an exact error string when their independent contracts require 
 
 A producer owns the event semantics and supplies already-validated values; it does not own logger
 configuration. Cross-layer state is reported at its existing ownership boundary. In particular,
-startup pinning is reported by Program around the shared Host context backing construction, not by the
+startup pinning is reported by RankProgram around the shared Host context backing construction, not by the
 generic pinned-buffer primitive. Serve owns HTTP and request lifecycle severity. CLI owns its result
 streams and must never prefix generated answer or reasoning data with operational-log metadata.
 
@@ -140,7 +140,8 @@ pretty throughput record.
 
 Engine startup is an inclusive typed hierarchy. `engine-startup` contains CUDA initialization,
 artifact inspection, semantic binding, weight materialization, model/frontend construction,
-runtime resource planning, Program construction and Engine finalization. `weights-staging-pin`
+runtime resource planning, RankProgram and PreparedSession construction, and Engine finalization.
+`weights-staging-pin`
 is nested in `weights-materialize`; shared Host context pinning and CUDA Graph preparation are nested in
 `program-initialize`. Nested durations explain
 their parent and must not be added to it. Disabled zero-capacity phases are omitted. Byte progress is
@@ -148,7 +149,7 @@ reported as submitted work, while only a synchronized terminal event reports com
 Weight materialization counts payload bytes placed on both Host and Device; a parent placed at both
 locations contributes both copies. H2D statistics count only the Device copy.
 The normal pretty view retains weight materialization, enabled Host pinning, CUDA Graph preparation,
-and the merged Engine-ready summary. Internal staging, planning, frontend, Program aggregate, and
+and the merged Engine-ready summary. Internal staging, planning, frontend, RankProgram aggregate, and
 finalization phases remain `debug`; elapsed time alone does not make an internal milestone useful to
 an operator. Every failed phase remains an error regardless of its ordinary visibility.
 

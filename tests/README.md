@@ -192,7 +192,7 @@ The real loading test accepts an explicit artifact path and optional component s
 ```
 
 Add `--host-only` to check semantic binding without uploading weights. This does not construct a
-Program or establish native Op support.
+RankProgram or establish native Op support.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
@@ -203,11 +203,23 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
 ```
 
 The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
-score tile, overlapping target suffixes, and repeated-window State/KV isolation:
+score tile, overlapping target suffixes, and finite, nonpositive results across repeated windows.
+Floating-point execution does not promise bitwise-identical scores across calls:
 
 ```bash
 NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build/rtx5090-dev -R ninfer_qwen3_5_score_real_test --output-on-failure
+```
+
+Qwen4Exp's native scoring test checks fresh-root state independently of the resulting logprobs.
+It runs two short scoring jobs in one Session, verifies that the first job writes nonzero state,
+then checks zero StateImage contents and initial PLE raw history before the second job computes.
+The executed device batch must start at position zero with no preceding KV history visible.
+It loads all weights on Device:
+
+```bash
+NINFER_QWEN4_EXP_TEST_ARTIFACT=out/qwen3_8_flash_next.ninfer \
+  ./build/dgx-spark-dev/tests/ninfer_qwen4_exp_score_state_real_test
 ```
 
 `ninfer_moe_test` qualifies the integer routing, complete MoE and routed SwiGLU profiles.
@@ -237,7 +249,7 @@ column and chunk tails, full-precision products and tiny inputs. These CPU tests
 model files or use GPU memory.
 `ninfer_moe_mixed_test` qualifies complementary CPU/GPU subsets plus GPU shared/residual composition.
 
-`ninfer_moe_execution_test` qualifies the shared single-layer execution and the Program-owned
+`ninfer_moe_execution_test` qualifies the shared single-layer execution and the RankProgram-owned
 multi-layer fixed-cache and streaming-window schedule against the same independent complete-MoE oracle. It uses registered native Host banks and the real ExpertCache,
 covering Write/AddResidual outputs, absent CPU-only replicas, explicit region replacement,
 All/None/partial partitions, bank IDs independent of traversal order, variable frame reuse through
@@ -299,6 +311,13 @@ NINFER_TEST_BACKEND=dflash2 \
 
 NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ./build/rtx5090-dev/tests/ninfer_qwen3_5_native_transactions_test dflash2
+```
+
+The MTP history test compares committed KV with an independent Main-conditioning oracle:
+
+```bash
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer ./build/rtx5090-dev/tests/ninfer_qwen3_5_mtp_history_real_test
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer NINFER_TEST_GRAPH=1 ./build/rtx5090-dev/tests/ninfer_qwen3_5_mtp_history_real_test
 ```
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
@@ -396,7 +415,7 @@ A permanent test should protect one current risk, such as:
 
 - exact artifact bytes, geometry, object binding, or conversion transform;
 - a numerical operator contract with an independent oracle;
-- model Frontend or Program frontier, prefix, MTP, or multimodal behavior;
+- model Frontend, Session frontier/prefix policy, or RankProgram MTP/multimodal execution;
 - generated-token commit/stop/cancel consistency;
 - public benchmark or OpenAI/Anthropic observable behavior;
 - a reproduced supported bug.
@@ -437,7 +456,7 @@ frontiers, external snapshots, reader pins, excluded aliases, and Device/Host re
 
 The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting
 decode binding, including shortened chunks and oversized local/full KV appends. It uses native
-Program storage and the production prefill route; select the draft component stored in the artifact:
+RankProgram storage and the production prefill route; select the draft component stored in the artifact:
 
 ```bash
 cmake --build build/rtx5090-dev -j --target ninfer_qwen3_5_dflash_prefill_real_test

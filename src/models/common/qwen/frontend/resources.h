@@ -8,8 +8,8 @@
 
 namespace ninfer::models::qwen {
 
-// Byte views borrow the model's Host backing. Tokenizer owns its decoded vocabulary and tables;
-// loading and request preparation share this one immutable interpretation.
+// Byte views borrow the immutable ModelDefinition's resource storage. Tokenizer owns its
+// decoded vocabulary and tables; loading and request preparation share one interpretation.
 struct FrontendResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;

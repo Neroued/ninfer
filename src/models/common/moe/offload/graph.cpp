@@ -64,6 +64,7 @@ LayerGraphExecutable::LayerGraphExecutable(const LayerGraphDefinition& source)
 }
 
 void LayerGraphExecutable::update(const LayerGraphDefinition& source) {
+    if (pending_) throw std::logic_error("cannot update an active MoE layer graph");
     if (plan_ != source.plan) throw std::logic_error("MoE graph plan changed");
     offload::update(mixer_, source.mixer);
     offload::update(steady_, source.steady);
@@ -71,6 +72,7 @@ void LayerGraphExecutable::update(const LayerGraphDefinition& source) {
 }
 
 void LayerGraphExecutable::upload(cudaStream_t stream) {
+    if (pending_) throw std::logic_error("cannot upload an active MoE layer graph");
     offload::upload(mixer_, stream);
     offload::upload(steady_, stream);
     offload::upload(feature_, stream);
@@ -101,48 +103,90 @@ void capture_layer(LayerGraphDefinition& definition, Resources& resources, Exper
     if (feature) definition.feature.capture(cuda.stream(), feature);
 }
 
-void LayerGraphExecutable::replay(Resources& resources, ExpertBankId bank, Tensor& output,
-                                  CudaExecutionView cuda,
-                                  const std::function<void()>& after_gpu_submit) {
-    resources.before_layer(bank);
-    if (resources.calibrating()) {
-        mixer_.launch(cuda.stream());
-        const auto run = [&](ops::ExpertSubsetKind kind, DecodeGraphExecutable& graph) {
-            const auto call = resources.prepare_calibration_layer(bank, kind);
-            try {
-                graph.launch(cuda.stream());
-                resources.gpu_submitted(bank);
-                resources.finish_layer(complete(call, output));
-            } catch (...) {
-                resources.abort_layer(bank);
-                throw;
-            }
-        };
-        for (auto kind : {ops::ExpertSubsetKind::All, ops::ExpertSubsetKind::None,
-                          ops::ExpertSubsetKind::MaskOnes}) {
-            const auto index = moe_graph_index(kind);
-            if (plan_.subsets[index]) run(kind, subsets_[index]);
-        }
-        if (plan_.steady) run(*plan_.steady, steady_);
-        if (feature_.ready()) feature_.launch(cuda.stream());
-        return;
-    }
-    const bool combined = resources.settled() && steady_.ready();
-    if (!combined) mixer_.launch(cuda.stream());
-    const auto call = resources.prepare_layer(bank);
+bool LayerGraphExecutable::start(Resources& resources, ExpertBankId bank, Tensor& output,
+                                 CudaExecutionView cuda, std::function<void()> after_gpu_submit) {
+    if (pending_) throw std::logic_error("MoE layer graph is already active");
+    resources.begin_call();
+    pending_.emplace(Invocation{resources, bank, output, cuda, std::move(after_gpu_submit)});
+    return poll();
+}
+
+bool LayerGraphExecutable::poll() {
+    if (!pending_) return true;
     try {
-        if (combined)
-            steady_.launch(cuda.stream());
-        else
-            subsets_[moe_graph_index(call.partition.gpu_kind)].launch(cuda.stream());
-        resources.gpu_submitted(bank);
-        if (after_gpu_submit) after_gpu_submit();
-        resources.finish_layer(complete(call, output));
+        if (!advance()) return false;
+        pending_->resources.end_call();
+        pending_.reset();
+        return true;
     } catch (...) {
-        resources.abort_layer(bank);
+        pending_->resources.fail_call();
+        pending_.reset();
         throw;
     }
+}
+
+void LayerGraphExecutable::cancel() {
+    if (!pending_) return;
+    auto& resources = pending_->resources;
+    if (pending_->call) enqueue_discard(*pending_->call);
+    pending_.reset();
+    resources.cancel();
+}
+
+bool LayerGraphExecutable::advance() {
+    auto& invocation = *pending_;
+    auto& resources  = invocation.resources;
+    const auto bank  = invocation.bank;
+    const auto cuda  = invocation.cuda;
+    using Stage      = Invocation::Stage;
+    resources.progress();
+    if (invocation.stage == Stage::BeforeLayer) {
+        if (!resources.try_before_layer(bank)) return false;
+        invocation.combined = !resources.calibrating() && resources.settled() && steady_.ready();
+        if (!invocation.combined) mixer_.launch(cuda.stream());
+        invocation.stage = Stage::Prepare;
+    }
+    if (resources.calibrating()) {
+        using Kind = ops::ExpertSubsetKind;
+        constexpr std::array kinds{Kind::All, Kind::None, Kind::MaskOnes};
+        // Calibration executes each finite variant; only its preparation may drain/repack.
+        for (; invocation.calibration_variant < 4; ++invocation.calibration_variant) {
+            const auto variant = invocation.calibration_variant;
+            if (invocation.stage == Stage::Prepare) {
+                if (variant < 3 ? !plan_.subsets[variant] : !plan_.steady) continue;
+                const auto kind = variant < 3 ? kinds[variant] : *plan_.steady;
+                invocation.call.emplace(resources.prepare_calibration_layer(bank, kind));
+                auto& graph = variant < 3 ? subsets_[variant] : steady_;
+                graph.launch(cuda.stream());
+                resources.gpu_submitted(bank);
+                invocation.stage = Stage::Complete;
+            }
+            const auto complete = try_complete(*invocation.call, invocation.output);
+            if (!complete) return false;
+            resources.finish_layer(*complete);
+            invocation.call.reset();
+            invocation.stage = Stage::Prepare;
+        }
+    } else {
+        if (invocation.stage == Stage::Prepare) {
+            auto call = resources.try_prepare_layer(bank);
+            if (!call) return false;
+            invocation.call.emplace(std::move(*call));
+            if (invocation.combined)
+                steady_.launch(cuda.stream());
+            else
+                subsets_[moe_graph_index(invocation.call->partition.gpu_kind)].launch(
+                    cuda.stream());
+            resources.gpu_submitted(bank);
+            invocation.stage = Stage::Complete;
+            if (invocation.after_gpu_submit) invocation.after_gpu_submit();
+        }
+        const auto complete = try_complete(*invocation.call, invocation.output);
+        if (!complete) return false;
+        resources.finish_layer(*complete);
+    }
     if (feature_.ready()) feature_.launch(cuda.stream());
+    return true;
 }
 
 } // namespace ninfer::models::moe::offload

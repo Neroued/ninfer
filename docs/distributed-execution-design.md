@@ -1,8 +1,8 @@
 # NInfer 分布式执行设计
 
-状态：目标架构已选定，待实施。本文定义集中调度下的单机/多机执行合同、所有权及实现边界。
-当前已实现的执行行为仍由[引擎架构](maintainer/engine-architecture.md)维护；对应能力完成后，
-将稳定合同收敛到维护文档。
+状态：D1 单 rank 的执行所有权拆分已实现；D2–D6 尚未实现。
+本文定义集中调度下的多机目标合同、所有权及实施边界。已实现的 LocalExecutor、Session、
+RankProgram 与上下文管理由[引擎架构](maintainer/engine-architecture.md)维护。
 
 首个分布式部署为同构 DGX Spark 上的 Qwen4Exp，两 rank、attention/GDN TP2、routed
 experts EP2。架构使用任意长度的 rank/group 描述，后续四机及其他并行组合沿用这些合同。
@@ -172,10 +172,10 @@ kernel 选择；TP 改变几何后，仍由所属 Op 的 Spark/5090 shape policy
 `runtime::Executor<Types>` 是粗粒度执行接口，Local/Distributed 两个实现共享：
 
 ```cpp
-std::optional<ExecutionReservation> try_reserve(const ExecutionRequirements& requirements);
-ExecutionTicket submit(ExecutionReservation reservation, ExecutionRequest<Types> request);
-void supply(ExecutionTicket ticket, DecisionInput<Types> input);
-CommitReceipt commit(ExecutionTicket ticket, CommitBatch<Types> decisions);
+std::optional<ExecutionReservation> try_reserve(FrameKind kind);
+ExecutionTicket submit(ExecutionReservation reservation, Types::Work work);
+void supply(ExecutionTicket ticket, DecisionInput input);
+CommitReceipt commit(ExecutionTicket ticket, Types::Commit decisions);
 void discard(ExecutionTicket ticket);
 std::optional<ExecutionEvent<Types>> poll();
 void flush();
@@ -183,15 +183,17 @@ void drain();
 ```
 
 `try_reserve` 根据已准备的执行 profile 取得参与 ranks 的 frame 与提交额度，使用控制侧
-容量记录，不向 worker 发起即时容量查询。Requirements 描述 variant、T/B、参与者和
-阶段需求；workspace 的实际尺寸及地址由 RankExecutionPlan 解析。
+容量记录，不向 worker 发起即时容量查询。预留区分 Compute 与 Context frame；每个 frame 已覆盖
+原生执行计划的形状范围。variant、T/B 和数学操作由 owning Work 描述，在 rank 的原生入口校验，
+不在预留接口重复描述。Compute 的结果需要 commit/discard；Context 在完成后直接退役。
 ExecutionReservation 是未提交执行的独占预留，放弃时归还额度。
 
 `submit` 在本地完成验证与载荷准备后，原子接收完整命令及预留，返回 ticket，不等待
 GPU。接收前失败不下发执行；接收后的传输或执行错误进入执行组失败流程。
 `supply` 补充同一事务需要的约束等决策输入。
 `commit/discard` 解析未决事务并排入有序执行；`poll` 消费完成与需求事件。
-`flush` 发送已接受的命令，`drain` 等待所有相关工作实际完成。
+`flush` 发送已接受的命令；`drain` 关闭执行入口并等待所有相关工作实际完成，不能用作
+普通轮次的等待接口。正常执行通过完成事件推进。
 初始化、容量协商与 shutdown 使用独立的生命周期入口，不经过模型步进接口。
 
 Executor 使用虚接口选择 Local/Distributed 实现；原生模型和 Op 保持直接的类型化调用。
@@ -218,9 +220,10 @@ LocalExecutor 直接移动/借用对象，DistributedExecutor 才进行编码。
   execution envelope；
 - 决策输入：已知的 sampling/grammar 内容，或本次执行声明的后续输入阶段。
 
-原生输入支持已知 token 和 `DeviceResultRef`。后者标识 producer ticket、成员、结果
+后续跨 rank、跨 ticket 的输入增加 `DeviceResultRef`，与已知 token 并列。它标识 producer ticket、成员、结果
 字段及其版本，不携带地址；rank 解析成本地结果视图或计划规定的通信交接。结果引用
-保持相应存储存活，并建立读依赖。首版用于设备内阶段交接，跨轮提前执行按第 6.3 节启用。
+保持相应存储存活，并建立读依赖。当前单 rank 的同 ticket 阶段交接由 RankProgram 持有
+结果和 frame，跨 ticket 结果引用与提前执行按第 6.3 节扩展。
 
 Bind、Capture、Restore、Pause、Reclaim 等独立上下文操作使用相同 envelope，work
 携带类型化的 `ContextWork`。它们可以只执行存储动作，不要求附带一次模型 forward。
@@ -365,15 +368,16 @@ provisional 窗口。三者的对应关系由模型定义；尚未得到设备�
 首版调度仅允许每个 sequence 一轮生成事务在途。后续有限提前执行由原生执行策略
 声明可续接条件及深度，再按 frame、状态目的和记录容量启用；grammar 或控制决策
 尚不允许续接时等待对应输入。PLE 本地准备、传输及结果消费沿同一依赖推进，
-不会因设备结果引用而省略。此前沿和依赖合同在 D1 建立，启用策略留在 D6。
+不会因设备结果引用而省略。D1 已分开稳定 continuation、未决执行和 frame 寿命；
+跨 ticket 的 provisional 窗口及其结果引用在 D6 按本节合同实现。
 
 ## 7. 集中上下文目录与本地存储
 
 ### 7.1 拆分现有存储职责
 
-现有 `StateImageStore`、`LogicalKVPageStore`、`KVHistoryStore` 同时包含逻辑身份与
-设备执行操作。本轮将它们分为控制侧目录与 worker 侧存储动作，沿用已经确定的
-StateImage 连续布局、typed KV planes、COW 和 record/fold 数学。
+ContextDirectory 管理逻辑身份与分配，ContextStorage、ContextMigration 执行本地
+存储动作。StateImage 连续布局、typed KV planes、COW 和 record/fold 数学保持各自
+的原生合同。多 rank 扩展为这些动作增加 owner 集合与完成汇总。
 
 | 控制侧 ContextDirectory | Worker 侧 ContextStorage |
 |---|---|
@@ -406,10 +410,9 @@ Session 的事务中持有，worker 接收其动作描述；提交后执行预�
 及前置依赖；rank storage 在最后消费者之后安装新内容。真正释放 Host allocation、
 device allocation 或注册窗口时等待 DeviceRetired。
 
-单机的 Host 副本同样通过明确的物理分配/传输结果进入目录。普通 Host/Device buffers
-和 arena 继续由本地资源 owner 持有；迁移中的 reservation、pin 与完成后采用规则保留。
-可变长 Host 分配由本地存储返回 allocation 身份和实际占用，目录中的预算预留不代替
-分配完成；相关 ContextReady 形成后才发布已物化副本。
+单机的 Host 副本使用固定 backing，由 ContextDirectory 分配 extent，ContextMigration
+按动作执行传输；reservation 和 pin 保持到物理退役。Host/Device buffers 与 arena
+由本地资源 owner 持有。多 rank 下，各 owner 完成对应物化后，协调侧才发布完整副本。
 
 ### 7.3 前缀与 checkpoint
 
@@ -530,19 +533,23 @@ Prefill、Replay、ordinary decode、forced control 共享命令与资源机制�
 结果回传用于输出与控制决策，不承担所有设备中间结果的转发。
 
 协调侧 OutputSession 拥有 grammar matcher。普通 mask 可以与 forward 并行准备，
-通过 `supply(ticket, input)` 送入决策阶段。实现使用 owned mask 数据与字段描述，
-替换当前只能同步借用的 `TokenMaskProvider` 跨层回调。
+通过 `supply(ticket, input)` 送入决策阶段。输入持有自己的 mask 数据和字段描述；
+DecisionNeeded 请求输入，DecisionConsumed 确认实际传输已提交，Frame 保持数据至消费结束。
 
 ### 9.3 MTP / DFlash 类事务
 
 一个 ticket 覆盖 proposal、verification、输出决策及 accepted-prefix 解析。
 GPU 内部中间 token、hidden 和通信由 RankProgram 的原生流程衔接。
-若 grammar 输入依赖 drafts，output owner 发布 `DecisionInputNeeded`，协调侧准备
+若 grammar 输入依赖 drafts，output owner 发布 `DecisionNeeded`，协调侧准备
 mask；独立的 target forward 可以继续执行，决策阶段等待 mask。
 
 最终 `CommitBatch` 携带每行接受长度、终态与 prefix provenance。各 rank 对本地
 GDN/卷积 records、QSA tail、KV 及 backend 状态执行同一逻辑前缀的提交。不同接受
 长度通过原有 valid/accepted metadata 表达，不产生各 rank 独立的控制选择。
+
+MTP 在本轮执行 Draft → Verify → Commit。稳定边界的 Main/backend 前沿为
+`F/max(F−1,0)`，提交后按实际接受长度建立下一稳定边界；不在前一轮预先生成并保存
+下一轮 drafts。DFlash 的 conditioning 和 context 提交继续遵循自己的数学定义。
 
 Vision 的获取/预处理仍在 Frontend，GPU 编码及特征分发进入原生 work；PLE 的
 准备资源和结果消费也进入对应 rank 的资源计划。具体 owner 放置由模型并行策略

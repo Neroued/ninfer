@@ -67,12 +67,14 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 /**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.
  *
- * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and
+ * k/v are contiguous BF16 [D,Hkv,T,B], positions is contiguous device I32 [T,B], and counts and
  * table_rows are contiguous device I32 [B]. For row b and i in [0,counts[b]), k/v[:, :, i, b]
- * store K bit-for-bit and V as FP16_RNE(BF16 input) at logical position positions[i,b] through
- * table row table_rows[b]. The paged planes use head-major order [128,64,Nphysical,8]. No byte
- * belonging only to the rejected physical tail [counts[b],T) is written. Inputs are unchanged,
- * and the Op neither decides nor publishes a committed frontier.
+ * are encoded at logical position positions[i,b] through table row table_rows[b]. D128/Hkv8
+ * uses head-major BF16 K and FP16 V planes [128,64,Nphysical,8]. D256/Hkv2|4 uses page-major
+ * planes and any storage format defined by kv_cache_append, with the same exact codec.
+ * No byte belonging only to the rejected physical tail [counts[b],T) is written. A zero count
+ * reads no positions or K/V for that batch row. Inputs are unchanged, and the Op
+ * neither decides nor publishes a committed frontier.
  *
  * The caller guarantees T>0, B=1..8, envelope.min_count <= counts[b] <= envelope.max_count <= T,
  * sequential nonnegative live positions, materialized table entries for every position allowed by

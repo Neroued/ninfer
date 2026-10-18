@@ -51,10 +51,4 @@ Tensor StateViews::sample_hidden() const { return storage_.field(layout_.sample_
 
 Tensor StateViews::conditioning() const { return storage_.field(layout_.conditioning.value()); }
 
-ContinuationMetadata StateViews::initialize(std::int32_t slot, std::int32_t eos,
-                                            CudaExecutionView execution) const {
-    if (eos < 0) throw std::invalid_argument("PLE EOS must be nonnegative");
-    storage_.clear(slot, execution);
-    return {0, 0, {eos, eos}, layout_.mtp_qsa ? std::optional<std::uint32_t>{0} : std::nullopt};
-}
 } // namespace ninfer::models::qwen4_exp

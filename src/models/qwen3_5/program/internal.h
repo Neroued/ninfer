@@ -1,75 +1,178 @@
 #pragma once
 
-#include "models/qwen3_5/execution/parameters.h"
+#include "ninfer/ops/kv_cache_append.h"
+
+#include "models/common/context/transfer.h"
+#include "models/common/qwen/vision/prefill.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/program/resources.h"
+#include "models/qwen3_5/program/graphs.h"
+#include "models/qwen3_5/program/planning/startup.h"
 
-#include <cstdint>
+#include <array>
+#include <chrono>
+#include <deque>
+#include <memory>
+#include <optional>
 
-namespace ninfer::models::qwen3_5 {
-
-inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
-
-} // namespace ninfer::models::qwen3_5
+namespace ninfer::models::qwen3_5::execution {
+class TextRun;
+}
 
 namespace ninfer::models::qwen3_5::detail {
-struct ContractAccess {
-    static void constraint_failed(PendingBatch& pending, std::size_t row, bool failed) {
-        pending.constraint_failed_.at(row) = failed;
-    }
 
-    static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,
-                                        std::uint64_t epoch) noexcept {
-        SequenceHandle out;
-        out.owner_ = owner;
-        out.lane_  = lane;
-        out.epoch_ = epoch;
-        return out;
-    }
+struct Residency {
+    runtime::ResidencyId id;
+    runtime::SequenceId sequence;
+    bool installed = false;
+    bool penalties = false;
+    std::shared_ptr<const qwen::VisionExecutionInput> vision_input;
+    std::unique_ptr<qwen::VisionPrefillExecution> vision;
+};
 
-    static const void* owner(const SequenceHandle& h) noexcept { return h.owner_; }
+enum class ComputeStage : std::uint8_t {
+    Inputs,
+    Forward,
+    History,
+    AwaitDecision,
+    Readback,
+    AwaitCommit,
+    Commit,
+    Retiring,
+};
 
-    static runtime::LaneId lane(const SequenceHandle& h) noexcept { return h.lane_; }
+struct ComputeOperation {
+    runtime::ExecutionRequest<ExecutionTypes> request;
+    runtime::CommandSequence last_command;
+    std::vector<ExecutionRow> rows;
+    std::vector<SamplingInput> sampling;
+    std::uint32_t width          = 0;
+    std::uint32_t batch          = 0;
+    std::uint32_t drafts         = 0;
+    std::uint32_t forward_row    = 0;
+    std::uint32_t forward_offset = 0;
+    std::uint32_t score_cursor   = 0;
+    std::uint32_t score_count    = 0;
+    double vision_before         = 0.0;
+    ComputeStage stage           = ComputeStage::Inputs;
+    std::uint32_t decision_stage = 0;
+    bool decision_requested      = false;
+    bool decision_supplied       = false;
+    bool result_published        = false;
+    bool cancelled               = false;
+    bool speculative             = false;
+    bool row_finished            = false;
+    bool graph_started           = false;
+    bool fused_decision          = false;
+    bool projected               = false;
+    std::array<std::uint32_t, kMaximumConcurrency> dead_positions{};
+    std::optional<runtime::DecisionInput> decision;
+    std::optional<Commit> commit;
+    std::optional<Result> result;
+    std::vector<float> scores;
+    runtime::ExecutionTiming timing;
+    std::optional<Tensor> input_embeddings;
+    std::unique_ptr<execution::TextRun> text;
 
-    static std::uint64_t epoch(const SequenceHandle& h) noexcept { return h.epoch_; }
+    ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&&);
+    ~ComputeOperation();
+};
 
-    [[nodiscard]] static PendingBatch
-    make_pending(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
-                 std::span<const TokenId> tokens, std::span<const std::int32_t> row_counts,
-                 std::uint32_t row_stride, runtime::ExecutionTiming timing) {
-        PendingBatch out;
-        out.owner_       = owner;
-        out.transaction_ = transaction;
-        out.row_count_   = rows.size();
-        for (std::size_t i = 0; i < rows.size(); ++i) { out.rows_[i] = rows[i]; }
-        out.tokens_     = tokens;
-        out.row_counts_ = row_counts;
-        out.row_stride_ = row_stride;
-        out.timing_     = timing;
-        return out;
-    }
+struct ContextOperation {
+    runtime::ExecutionRequest<ExecutionTypes> request;
+    runtime::CommandSequence last_command;
+};
 
-    [[nodiscard]] static const void* owner(const PendingBatch& pending) noexcept {
-        return pending.owner_;
-    }
+class RankProgramImpl {
+public:
+    RankProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
+                    const StartupObserver&);
+    ~RankProgramImpl();
 
-    [[nodiscard]] static std::uint64_t transaction(const PendingBatch& pending) noexcept {
-        return pending.transaction_;
-    }
+    void validate_work(const Work&, runtime::FrameKind) const;
+    void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;
+    void prepare_commit(runtime::ExecutionTicket, Commit&) const;
+    void start(runtime::ExecutionRequest<ExecutionTypes>&&);
+    void supply(runtime::ExecutionTicket, runtime::CommandSequence, runtime::DecisionInput&&);
+    void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
+    void discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
+    void drain();
+    [[nodiscard]] MemorySummary memory_summary() const;
+    void reset_memory_peaks() noexcept;
 
-    [[nodiscard]] static std::span<const SequenceHandle>
-    rows(const PendingBatch& pending) noexcept {
-        return {pending.rows_.data(), pending.row_count_};
-    }
+    void validate_row(const ExecutionRow&) const;
+    void install_residencies(const ContextWork&);
+    void initialize_inputs(ComputeOperation&);
+    void initialize_decode(ComputeOperation&, const DecodeWork&);
+    void initialize_forward(ComputeOperation&, const ForwardWork&);
+    void initialize_score(ComputeOperation&, const ScoreWork&);
+    void upload_input(std::uint32_t width, std::uint32_t batch);
+    void upload_positions(std::uint32_t width, std::uint32_t batch);
+    void upload_ingress();
+    void begin_target(ComputeOperation&);
+    bool advance_target(ComputeOperation&);
+    void begin_draft(ComputeOperation&);
+    void begin_mtp_draft(ComputeOperation&);
+    void prepare_mtp_draft(ComputeOperation&);
+    void run_mtp_draft(std::uint32_t batch, std::uint32_t steps, std::uint32_t frontier);
+    void run_dflash_draft(std::uint32_t batch, std::uint32_t minimum, std::uint32_t maximum);
+    void project_decode(std::uint32_t batch, std::uint32_t width);
+    void decide_decode(std::uint32_t batch, std::uint32_t width);
+    void readback_decode();
+    void initialize_graphs();
+    void release_graphs();
+    void append_draft_history(ComputeOperation&);
+    void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);
+    void commit_draft_history(ComputeOperation&);
+    void align_mtp_history(ComputeOperation&);
+    void rebuild_mtp_history(std::uint32_t batch, std::uint32_t columns);
+    void request_decision(ComputeOperation&);
+    void launch_decision(ComputeOperation&);
+    void launch_commit(ComputeOperation&);
+    void launch_score(ComputeOperation&);
+    void publish_result(ComputeOperation&);
+    void retire_compute();
+    void progress();
+    void advance();
+    [[nodiscard]] ComputeOperation& require_compute(runtime::ExecutionTicket);
+    [[nodiscard]] const ComputeOperation& require_compute(runtime::ExecutionTicket) const;
+    [[nodiscard]] ops::SamplingConfig sampling_config(const ExecutionRow&, const SamplingInput&,
+                                                      std::size_t compact_row) const;
 
-    static void consume(PendingBatch& pending) noexcept {
-        pending.owner_       = nullptr;
-        pending.transaction_ = 0;
-        pending.row_count_   = 0;
-        pending.tokens_      = {};
-        pending.row_counts_  = {};
-        pending.row_stride_  = 0;
-        pending.timing_      = {};
-    }
+    const execution::Parameters& parameters;
+    DeviceContext& device;
+    const std::uint32_t capacity;
+    const std::uint32_t kv_capacity;
+    const std::uint32_t max_concurrency;
+    const std::uint32_t prefill_chunk;
+    const std::uint32_t draft_window;
+    const SpeculativeBackend backend;
+    const ProposalHead proposal_head;
+    const bool use_cuda_graph;
+    const KvCacheStorage kv_storage;
+    const std::size_t kv_payload_bytes;
+    const WorkspaceSpec workspace_plan;
+    Resources resources;
+    std::unique_ptr<context::ContextStorage> storage;
+    std::unique_ptr<context::ContextMigration> compute_actions;
+    std::unique_ptr<context::ContextMigration> context_actions;
+    std::unique_ptr<ContextOperation> context_operation;
+    PinnedHostBuffer context_counts;
+    std::array<Residency, kMaximumConcurrency> residencies;
+    qwen::VisionHandoffState vision_handoff;
+    std::size_t workspace_peak = 0;
+    std::size_t vision_peak    = 0;
+    std::unique_ptr<ComputeOperation> compute;
+    CudaCompletionEvent result_ready;
+    CudaCompletionEvent drafts_ready;
+    CudaCompletionEvent compute_retired;
+    CudaCompletionEvent context_ready;
+    CudaEventTimer prefill_timer;
+    std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
+    std::optional<Graphs> graphs;
+    std::optional<GraphMemorySummary> graph_memory;
 };
 
 } // namespace ninfer::models::qwen3_5::detail

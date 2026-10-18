@@ -45,6 +45,11 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream) {
     if (envelope.max_count == 0) return;
+    if (cache.head_dim == 256) {
+        kv::launch_paged_write(kv::PagedWriteInstance::BatchRows256, k, v, positions, counts,
+                               table_rows, cache, stream);
+        return;
+    }
     const dim3 grid(1 + (envelope.max_count - 1) / 4, k.ne[3]);
     prefix_paged_kernel<<<grid, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),

@@ -25,6 +25,7 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
     "mtp3": ("mtp", 3),
+    "mtp5": ("mtp", 5),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
 }
@@ -86,7 +87,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 8
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 27
+SERVER_LOG_SCHEMA_VERSION = 30
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0

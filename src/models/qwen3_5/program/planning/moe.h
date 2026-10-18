@@ -4,7 +4,7 @@
 #include "ninfer/types.h"
 
 namespace ninfer::models::qwen3_5 {
-class LoadPlan;
+class ModelDefinition;
 struct TextConfig;
 
 namespace execution {
@@ -17,7 +17,7 @@ namespace detail {
 [[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
                                                                      std::size_t layer);
 [[nodiscard]] std::shared_ptr<const moe::Plan>
-describe_moe_plan(const LoadPlan&, const execution::ModelProfile&, const MoeOptions& = {});
+describe_moe_plan(const ModelDefinition&, const execution::ModelProfile&, const MoeOptions& = {});
 
 } // namespace detail
 } // namespace ninfer::models::qwen3_5

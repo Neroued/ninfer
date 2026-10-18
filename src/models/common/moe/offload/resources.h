@@ -21,7 +21,7 @@ public:
     Partition(const Partition&)            = delete;
     Partition& operator=(const Partition&) = delete;
 
-    void update(std::span<const ExpertKey> ready, CudaExecutionView execution);
+    [[nodiscard]] bool try_update(std::span<const ExpertKey> ready, CudaExecutionView execution);
     [[nodiscard]] PartitionView view() const;
 
     [[nodiscard]] std::span<const ExpertKey> gpu_keys() const noexcept { return keys_; }
@@ -83,28 +83,34 @@ public:
 
     // Retain the activity through the traversal; GPU-only streaming does not wake the team.
     [[nodiscard]] std::optional<CpuExecutionView::ActiveScope> begin(std::int32_t tokens);
-    void before_layer(ExpertBankId bank);
+    [[nodiscard]] bool try_before_layer(ExpertBankId bank);
     [[nodiscard]] bool settled() const noexcept;
     // Immutable bindings for capture. No cache acquisition or submission is performed.
     [[nodiscard]] PreparedExecution describe_layer(ExpertBankId bank, std::int32_t tokens,
                                                    ops::ExpertSubsetKind kind);
-    [[nodiscard]] PreparedExecution prepare_layer(ExpertBankId bank);
+    [[nodiscard]] std::optional<PreparedExecution> try_prepare_layer(ExpertBankId bank);
     [[nodiscard]] bool calibrating() const noexcept;
     // Calibration retains the candidate's execution variants but streams one full bank.
     [[nodiscard]] PreparedExecution prepare_calibration_layer(ExpertBankId, ops::ExpertSubsetKind);
     void gpu_submitted(ExpertBankId bank);
+    void progress();
     void finish_layer(bool cpu_work) noexcept;
-    void abort_layer(ExpertBankId bank);
+    void cancel();
     void restore_cache_after_preparation();
     // The plan fixes each layer's Write/AddResidual semantics.
-    void execute(ExpertBankId bank, const Tensor& hidden, Tensor& output, MemoryArena& workspace,
-                 const ops::MoeExecutionHints& hints);
+    [[nodiscard]] bool start(ExpertBankId bank, const Tensor& hidden, Tensor& output,
+                             MemoryArena& workspace, const ops::MoeExecutionHints& hints);
+    [[nodiscard]] bool poll();
     void synchronize() const;
     [[nodiscard]] std::uint64_t uploaded_bytes() const noexcept;
     [[nodiscard]] ExpertCacheUsage cache_usage() const;
     [[nodiscard]] const Plan& plan() const;
 
 private:
+    friend class LayerGraphExecutable;
+    void begin_call();
+    void end_call() noexcept;
+    void fail_call() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

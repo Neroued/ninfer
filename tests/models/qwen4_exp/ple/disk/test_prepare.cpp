@@ -431,7 +431,8 @@ int main(int argc, char** argv) {
             return disk::Table(
                 reader, load_lookup_parameters(
                             reader, reader.directory().bindings.at("text/layers/1/ple/table"),
-                            reader.directory().component("text").resources.at("ple_hash_controls"),
+                            reader.read_object(reader.directory().component("text").resources.at(
+                                "ple_hash_controls")),
                             {3, 8}));
         }();
         if (mode == "--failure")

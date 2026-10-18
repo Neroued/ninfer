@@ -118,17 +118,17 @@ struct Layer {
 
     Layer(const Options& options, DeviceContext& device) {
         artifact::Reader reader(options.artifact);
-        auto plan = model::plan_load(reader);
+        auto definition = model::read_definition(reader);
         const auto& layer =
-            std::get<model::MoeWeights>(plan.weights().text.layers.at(options.layer).ffn);
-        const auto& bank = plan.expert_banks()[layer.bank.index];
+            std::get<model::MoeWeights>(definition->weights().text.layers.at(options.layer).ffn);
+        const auto& bank = definition->expert_banks()[layer.bank.index];
         const std::array fixed{layer.router, layer.shared_score, layer.shared.gate, layer.shared.up,
                                layer.shared.down};
         std::vector<artifact::PlacementRequest> requests{
             {bank.gate_up.object, Device::cpu(), artifact::HostAccess::CudaTransfer},
             {bank.down.object, Device::cpu(), artifact::HostAccess::CudaTransfer}};
         for (const auto id : fixed) {
-            for (const auto& part : plan.parameter(id).binding.parts) {
+            for (const auto& part : definition->parameter(id).binding.parts) {
                 requests.push_back({part.object, device.device()});
             }
         }
@@ -140,10 +140,11 @@ struct Layer {
                    backing.host_transfer_view(bank.down.object)};
         std::array<WeightView, 5> views;
         for (std::size_t i = 0; i < fixed.size(); ++i) {
-            views[i] = artifact::bind_view(plan.parameter(fixed[i]), backing, device.device());
+            views[i] =
+                artifact::bind_view(definition->parameter(fixed[i]), backing, device.device());
         }
         const auto input = [&](std::size_t i) {
-            const auto uses = plan.uses(fixed[i]);
+            const auto uses = definition->uses(fixed[i]);
             if (uses.size() != 1) {
                 throw std::invalid_argument("benchmark requires one fixed weight Use");
             }
@@ -155,7 +156,7 @@ struct Layer {
                               ops::prepare_linear_weight(input(4))};
         auto gu_policy = ops::LinearPolicy::AllowA4, down_policy = gu_policy;
         const auto include = [&](ops::LinearPolicy& policy, ninfer::models::WeightId id) {
-            for (const auto& use : plan.uses(id)) {
+            for (const auto& use : definition->uses(id)) {
                 if (!ops::valid_linear_policy(use.policy)) {
                     throw std::invalid_argument("invalid expert Use");
                 }
@@ -174,8 +175,8 @@ struct Layer {
         parameters.profile = {
             ops::routed_swiglu_profile(
                 source.gate_up, source.down,
-                std::get<model::MoeConfig>(plan.config().text.ffn).num_experts_per_tok, gu_policy,
-                down_policy),
+                std::get<model::MoeConfig>(definition->config().text.ffn).num_experts_per_tok,
+                gu_policy, down_policy),
             ops::swiglu_profile(parameters.shared)};
         parameters.bank = {0};
     }
@@ -415,15 +416,17 @@ void run(const Options& options) {
     }
     const auto call = [&](int sample, bool serialized) {
         Tensor x(inputs[sample % inputs.size()].span(), DType::BF16, {h, options.tokens});
-        if (serialized)
+        if (serialized) {
             serial(x, p, partition.view(), residual, work, execution, frame, layer.source,
                    cache.view({0}));
-        else if (!graphs.empty()) {
-            graphs[sample % graphs.size()].launch(execution.cuda.stream());
-            (void)offload::complete(prepared, residual);
-        } else
-            offload::execute(x, p, partition.view(), layer.source, cache.view({0}),
-                             ops::MoeEpilogue::AddResidual, residual, work, execution);
+        } else {
+            if (!graphs.empty()) {
+                graphs[sample % graphs.size()].launch(execution.cuda.stream());
+            } else {
+                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Eager);
+            }
+            while (!offload::try_complete(prepared, residual)) std::this_thread::yield();
+        }
         device.synchronize();
     };
     // Both schedules use the same team, input corpus, partition, transfers, kernels and output.

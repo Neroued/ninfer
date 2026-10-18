@@ -1,7 +1,9 @@
 #include "core/device.h"
 #include "models/qwen3_5/load.h"
-#include "models/qwen3_5/program/execution_context.h"
-#include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/profile.h"
+#include "models/qwen3_5/execution/draft.h"
+#include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/program/resources.h"
 #include "models/qwen3_5/program/planning/startup.h"
 
 #include <algorithm>
@@ -11,7 +13,6 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -34,9 +35,9 @@ void append_bytes(std::vector<std::byte>& bytes, const Tensor& tensor) {
         cudaMemcpy(bytes.data() + offset, tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
 }
 
-std::vector<std::byte> local_bytes(qwen::detail::ProgramImpl& program, std::int32_t slot) {
+std::vector<std::byte> local_bytes(qwen::Resources& resources, std::int32_t slot) {
     std::vector<std::byte> bytes;
-    auto& cache = program.dflash->local;
+    auto& cache = resources.dflash->local;
     for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
         const auto view = cache.layer_view(layer);
         append_bytes(bytes, view.k.slice(3, slot, 1));
@@ -45,16 +46,16 @@ std::vector<std::byte> local_bytes(qwen::detail::ProgramImpl& program, std::int3
     return bytes;
 }
 
-std::vector<std::byte> full_bytes(qwen::detail::ProgramImpl& program, std::int32_t row,
+std::vector<std::byte> full_bytes(qwen::Resources& resources, std::int32_t row,
                                   std::uint32_t pages) {
     std::vector<std::byte> bytes;
-    if (!program.dflash->full) { return bytes; }
-    auto& cache      = *program.dflash->full;
-    const auto table = cache.execution_tables().matrix().slice(1, row, 1);
+    if (!resources.dflash->full) { return bytes; }
+    auto& cache      = *resources.dflash->full;
+    const auto table = cache.tables().matrix().slice(1, row, 1);
     std::vector<std::int32_t> physical(pages);
     CUDA_CHECK(cudaMemcpy(physical.data(), table.data, physical.size() * sizeof(std::int32_t),
                           cudaMemcpyDeviceToHost));
-    const auto& pool = cache.page_pool();
+    const auto& pool = cache.pages();
     require(pool.geometry().device_plane_order == PagedKVPlaneOrder::HeadMajor,
             "fixture requires the draft model's head-major KV storage");
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
@@ -75,11 +76,11 @@ bool any_nonzero(const std::vector<std::byte>& bytes) {
 
 // Check each absolute position, including both ends of an oversized chunk. This detects a
 // truncated full append as well as a write to the wrong execution row.
-void require_full_positions(qwen::detail::ProgramImpl& program, std::int32_t row,
-                            std::uint32_t begin, std::uint32_t end) {
-    if (!program.dflash->full) { return; }
-    auto& cache      = *program.dflash->full;
-    const auto table = cache.execution_tables().matrix().slice(1, row, 1);
+void require_full_positions(qwen::Resources& resources, std::int32_t row, std::uint32_t begin,
+                            std::uint32_t end) {
+    if (!resources.dflash->full) { return; }
+    auto& cache      = *resources.dflash->full;
+    const auto table = cache.tables().matrix().slice(1, row, 1);
     std::vector<std::int32_t> physical((end + 63) / 64);
     CUDA_CHECK(cudaMemcpy(physical.data(), table.data, physical.size() * sizeof(std::int32_t),
                           cudaMemcpyDeviceToHost));
@@ -104,9 +105,13 @@ void run(const char* artifact, SpeculativeBackend backend) {
     models::LoadOptions selected;
     selected.speculative   = backend;
     selected.proposal_head = ProposalHead::Full;
-    auto model             = qwen::load_model(artifact, selected, device);
-    const execution::Parameters parameters(*model);
-    const auto window   = *model->config().draft->sliding_window;
+    artifact::Reader reader(artifact);
+    auto definition = qwen::read_definition(reader, selected);
+    auto profile    = execution::describe_model(*definition);
+    auto model =
+        qwen::materialize_model(qwen::resolve_load(reader, definition, device.device()), device);
+    const execution::Parameters parameters(*model, profile);
+    const auto window   = *profile->config.draft->sliding_window;
     const auto capacity = ((window + 255) / 128) * 128;
     const auto pages    = capacity / kPagedKVPageSize;
     EngineOptions options;
@@ -122,119 +127,144 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.speculative.proposal_head         = ProposalHead::Full;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters.profile, device, options);
     auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2 * pages);
-    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    qwen::Resources resources(device, plan->persistent, plan->workspace);
 
-    auto& states      = *program.state_store;
-    const auto source = states.reserve_destination();
-    const auto other  = states.reserve_destination();
-    require(source && other, "fixture state allocation failed");
-    const auto source_slot = states.physical_slot(*source);
-    const auto other_slot  = states.physical_slot(*other);
-    for (const auto handle : {*source, *other}) {
-        program.state_images->storage().clear(states.physical_slot(handle),
-                                              device.execution_view());
-        states.complete_initialization(handle);
-    }
-    const auto bind = [&](models::context::KVHistoryStore& histories, int row) {
-        auto binding = histories.prepare_binding(nullptr, 0, capacity, row);
-        binding.publish_restores();
-        binding.prepare_tail_copy();
-        binding.enqueue_mapping(device.stream());
-        auto history = binding.commit();
-        histories.prepare_write(history, 0, capacity, device.stream());
-        return history;
-    };
-    auto text_owner = bind(*program.text_kv_histories, 1);
-    std::array<models::context::KVHistory, 2> full_owners;
-    if (program.backend_kv_histories) {
-        for (const auto row : {0, 1}) full_owners[row] = bind(*program.backend_kv_histories, row);
-        auto& pool = program.dflash->full->page_pool();
-        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
-            CUDA_CHECK(cudaMemsetAsync(pool.plane(plane).data, 0, pool.plane(plane).bytes(),
-                                       device.stream()));
+    constexpr std::int32_t source_slot = 0, other_slot = 1, destination_slot = 2;
+    auto& states = resources.state_images;
+    require(states.storage().slot_count() > destination_slot,
+            "fixture requires three independent state slots");
+    for (const auto slot : {source_slot, other_slot, destination_slot})
+        states.storage().clear(slot, device.execution_view());
+
+    const auto map_rows = [&](qwen::PagedKVCache& cache) {
+        require(cache.pages().capacity_pages() >= 2 * pages,
+                "fixture KV capacity does not hold two complete histories");
+        std::vector<std::int32_t> mapping(pages);
+        for (const auto row : {0, 1}) {
+            for (std::uint32_t i = 0; i < pages; ++i) mapping[i] = row * pages + i;
+            const auto table = cache.tables().row(row);
+            CUDA_CHECK(cudaMemcpy(table.data, mapping.data(), mapping.size() * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice));
         }
-    }
-    execution::PrefillContext context{
-        {device, parameters, program.work, program.state_images->linear(), &*program.replay_records,
-         program.io, program.prefill_hidden, program.prefill_chunk, program.proposal_head},
-        {},
-        program.decoder->text_kv,
-        nullptr,
-        &*program.dflash,
-        0,
-        nullptr,
-        nullptr,
-        source_slot,
-        source_slot,
-        0,
-        1,
-        program.dflash_prefill_host_ingress};
+        for (std::size_t plane = 0; plane < cache.pages().plane_count(); ++plane) {
+            const auto& value = cache.pages().plane(plane);
+            CUDA_CHECK(cudaMemsetAsync(value.data, 0, value.bytes(), device.stream()));
+        }
+    };
+    map_rows(resources.decoder.text_kv);
+    if (resources.dflash->full) map_rows(*resources.dflash->full);
+
+    // The prefill selectors have their own storage. An unrelated decode frame can change
+    // its bindings without changing the prefill's StateImage slot or full-attention row.
+    DeviceBuffer selector_storage(device.device(), 3 * sizeof(std::int32_t));
+    const Tensor append_slot(selector_storage.span(), DType::I32, {1});
+    const Tensor table_row(selector_storage.span().subspan(sizeof(std::int32_t)), DType::I32, {1});
+    const Tensor append_count(selector_storage.span().subspan(2 * sizeof(std::int32_t)), DType::I32,
+                              {1});
     std::vector<TokenId> tokens(capacity);
-    for (std::size_t i = 0; i < tokens.size(); ++i) { tokens[i] = 1000 + (i * 17) % 100; }
+    for (std::size_t i = 0; i < tokens.size(); ++i) tokens[i] = 1000 + (i * 17) % 100;
+    std::uint32_t frontier = 0;
+    auto state_source = source_slot, state_destination = source_slot;
 
     const auto decode_binding = [&](std::int32_t slot, std::int32_t row) {
-        *program.dflash_host_ingress                            = {};
-        program.dflash_host_ingress->state_destination_slots[0] = slot;
-        program.dflash_host_ingress->dflash_kv_table_rows[0]    = row;
-        CUDA_CHECK(cudaMemcpyAsync(program.io.dflash_decode->ingress.data,
-                                   program.dflash_host_ingress, sizeof(qwen::DFlashDecodeIngress),
-                                   cudaMemcpyHostToDevice, device.stream()));
+        auto& frame                                    = resources.frame;
+        *frame.host_ingress                            = {};
+        frame.host_ingress->state_destination_slots[0] = slot;
+        frame.host_ingress->backend_table_rows[0]      = row;
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, frame.host_ingress,
+                                   sizeof(qwen::FrameIngress), cudaMemcpyHostToDevice,
+                                   device.stream()));
     };
-    const auto prefill = [&](std::uint32_t nominal, std::optional<std::uint32_t> split = {}) {
-        const auto result   = execution::prefill_text_chunk(context, tokens, nominal, split, false);
-        const auto expected = split ? std::min(nominal, *split - context.text_kv_base) : nominal;
-        require(result.processed_tokens == expected && !result.finalized,
-                "prefill did not honor its actual chunk boundary");
-        context.text_kv_base += result.processed_tokens;
+    const auto prefill = [&](std::uint32_t count) {
+        require(count && frontier + count <= tokens.size(), "fixture prefill exceeds its prompt");
+        const auto width = static_cast<std::int32_t>(count);
+        const std::array selectors{state_destination, std::int32_t{1}, width};
+        CUDA_CHECK(cudaMemcpy(selector_storage.data(), selectors.data(), sizeof(selectors),
+                              cudaMemcpyHostToDevice));
+        auto& frame = resources.frame;
+        auto host   = frame.host_input_view(width, 1);
+        auto input  = frame.input_view(width, 1);
+        std::copy_n(tokens.begin() + frontier, count, static_cast<TokenId*>(host.ids.data));
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto position = static_cast<std::int32_t>(frontier + i);
+            static_cast<std::int32_t*>(host.cache_positions.data)[i] = position;
+            for (int axis = 0; axis < 3; ++axis)
+                static_cast<std::int32_t*>(host.rope_positions.data)[axis * count + i] = position;
+        }
+        for (const auto& pair : {std::pair{host.ids, input.ids},
+                                 std::pair{host.cache_positions, input.cache_positions},
+                                 std::pair{host.rope_positions, input.rope_positions}})
+            CUDA_CHECK(cudaMemcpyAsync(pair.second.data, pair.first.data, pair.second.bytes(),
+                                       cudaMemcpyHostToDevice, device.stream()));
+        auto features  = resources.dflash->prefill_features.slice(1, 0, width);
+        auto positions = resources.dflash->prefill_positions.slice(0, 0, width);
+        const execution::DFlashFeatureSink sink{
+            features, positions, {}, profile->config.draft->target_layer_ids};
+        {
+            execution::TextRun run({parameters, resources.work, device.execution_view(),
+                                    resources.decoder.text_kv, states.linear()},
+                                   {input.ids,
+                                    input.cache_positions,
+                                    input.rope_positions,
+                                    append_count,
+                                    table_row,
+                                    {},
+                                    {},
+                                    {}},
+                                   execution::SequenceUpdate{state_source, state_destination},
+                                   {frontier + count, frontier + count}, input.hidden, &sink);
+            require(run.start(), "resident Main unexpectedly yielded for offloaded weights");
+        }
+        const execution::DraftExecutionView draft{
+            parameters, resources.work, device.execution_view(), resources.dflash->local,
+            resources.dflash->full ? &*resources.dflash->full : nullptr};
+        execution::draft_append_context(draft, features, positions, append_count, append_slot,
+                                        table_row, {count, count});
+        device.synchronize();
+        frontier += count;
     };
 
     decode_binding(source_slot, 1);
     prefill(16);
-    const auto frozen = local_bytes(program, source_slot);
+    const auto frozen = local_bytes(resources, source_slot);
     require(any_nonzero(frozen), "first prefill did not populate draft local KV");
-    const auto untouched_other = local_bytes(program, other_slot);
-    const auto untouched_full  = full_bytes(program, 0, pages);
-    require_full_positions(program, 1, 0, 16);
+    const auto untouched_other = local_bytes(resources, other_slot);
+    const auto untouched_full  = full_bytes(resources, 0, pages);
+    require_full_positions(resources, 1, 0, 16);
 
     // A checkpoint freezes the source and forks subsequent execution into another physical slot.
     // Leave decode ingress pointing to the old slot, exactly as it did at request admission.
-    states.freeze(*source);
-    const auto destination = states.reserve_destination();
-    require(destination.has_value(), "fixture fork destination allocation failed");
-    const auto binding = states.begin_write(*source, *destination);
-    program.state_images->storage().copy_group(program.state_images->dflash_local_group(),
-                                               binding.source, binding.destination,
-                                               device.execution_view());
-    context.state_source_slot      = binding.source;
-    context.state_destination_slot = binding.destination;
-    prefill(23, 23); // Actual chunk is seven tokens, shortened at the capture frontier.
-    states.complete_write(*source, *destination);
-    require(local_bytes(program, source_slot) == frozen,
+    states.storage().copy_group(states.dflash_local_group(), source_slot, destination_slot,
+                                device.execution_view());
+    state_source      = source_slot;
+    state_destination = destination_slot;
+    prefill(7); // A chunk shortened at the capture frontier 23.
+    require(local_bytes(resources, source_slot) == frozen,
             "prefill mutated the frozen checkpoint after a StateImage fork");
-    const auto active = local_bytes(program, binding.destination);
+    const auto active = local_bytes(resources, destination_slot);
     require(active != frozen, "prefill did not append to the fork destination");
-    require_full_positions(program, 1, 16, 23);
+    require_full_positions(resources, 1, 16, 23);
 
     // Another compact decode batch overwrites row zero while this prefill is suspended.
     // Supply the exact conflicting binding deterministically; the assertion is on KV contents.
     decode_binding(other_slot, 0);
-    context.state_source_slot = binding.destination;
+    state_source = destination_slot;
     prefill(5);
-    require(local_bytes(program, binding.destination) != active,
+    require(local_bytes(resources, destination_slot) != active,
             "resumed prefill did not update its active slot");
-    require(local_bytes(program, source_slot) == frozen &&
-                local_bytes(program, other_slot) == untouched_other &&
-                full_bytes(program, 0, pages) == untouched_full,
+    require(local_bytes(resources, source_slot) == frozen &&
+                local_bytes(resources, other_slot) == untouched_other &&
+                full_bytes(resources, 0, pages) == untouched_full,
             "resumed prefill used another request's decode binding");
-    require_full_positions(program, 1, 23, 28);
+    require_full_positions(resources, 1, 23, 28);
 
     // Local storage takes only the tail; full KV must receive every position of the same chunk.
     prefill(window + 17);
-    require(local_bytes(program, source_slot) == frozen &&
-                local_bytes(program, other_slot) == untouched_other &&
-                full_bytes(program, 0, pages) == untouched_full,
+    require(local_bytes(resources, source_slot) == frozen &&
+                local_bytes(resources, other_slot) == untouched_other &&
+                full_bytes(resources, 0, pages) == untouched_full,
             "oversized prefill wrote outside its owned state or KV row");
-    require_full_positions(program, 1, 28, context.text_kv_base);
+    require_full_positions(resources, 1, 28, frontier);
     std::cout << "prefill fork, conflicting decode binding, split and oversized append passed ("
               << (backend == SpeculativeBackend::DFlash2 ? "dflash2" : "dflash") << ")\n";
 }

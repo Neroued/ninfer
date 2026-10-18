@@ -4,7 +4,8 @@ namespace ninfer::models::qwen4_exp::execution {
 namespace {
 class Prepare {
 public:
-    explicit Prepare(const Model& model) : model_(model) {}
+    Prepare(const ModelShard& model, const ModelProfile& profile)
+        : model_(model), profile_(profile) {}
 
     LinearParameters linear(std::initializer_list<WeightId> ids) const {
         std::vector<ops::WeightInput> inputs;
@@ -15,7 +16,7 @@ public:
     Tensor tensor(WeightId id) const { return parameter_tensor(model_.weight(id)); }
 
     Tensor hc_norm(WeightId id) const {
-        const auto& c = model_.config().text;
+        const auto& c = profile_.config.text;
         return tensor(id).view({dimension(c.hidden), dimension(c.hc.streams)});
     }
 
@@ -59,11 +60,11 @@ public:
                          tensor(q.key_norm),
                          tensor(q.index_query_norm),
                          tensor(q.index_key_norm),
-                         model_.config().text.norm_epsilon,
-                         model_.config().text.qsa.rope_theta,
-                         model_.config().text.qsa.rotary_dim,
-                         model_.config().text.qsa.rope_sections,
-                         model_.config().text.qsa.rope_interleaved};
+                         profile_.config.text.norm_epsilon,
+                         profile_.config.text.qsa.rope_theta,
+                         profile_.config.text.qsa.rotary_dim,
+                         profile_.config.text.qsa.rope_sections,
+                         profile_.config.text.qsa.rope_interleaved};
             p.output  = linear({q.output});
             out.mixer = std::move(p);
         }
@@ -79,14 +80,16 @@ public:
         return out;
     }
 private:
-    const Model& model_;
+    const ModelShard& model_;
+    const ModelProfile& profile_;
 };
 } // namespace
 
-Parameters::Parameters(const Model& model, std::shared_ptr<const ModelProfile> profile)
-    : model(model), profile(profile ? std::move(profile) : describe_model(model)) {
-    const Prepare p(model);
-    const auto& w  = model.weights();
+Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfile> profile)
+    : model(model), profile(std::move(profile)) {
+    if (!this->profile) throw std::invalid_argument("Parameters require an execution profile");
+    const Prepare p(model, *this->profile);
+    const auto& w  = model.definition().weights();
     text.embedding = native_weight(model.weight(w.text.embedding).view);
     text.head      = p.linear({w.text.head});
     text.final_hc  = p.final_hc(w.text.final_hc);
@@ -95,7 +98,7 @@ Parameters::Parameters(const Model& model, std::shared_ptr<const ModelProfile> p
     const auto& ple = w.text.ple;
     text.ple        = {p.linear({ple.key, ple.value}),
                        {p.hc_norm(ple.norm_key), p.hc_norm(ple.norm_query), p.hc_norm(ple.norm_conv),
-                        model.config().text.norm_epsilon},
+                        this->profile->config.text.norm_epsilon},
                        p.tensor(ple.convolution)};
     if (w.mtp) {
         const auto& m = *w.mtp;

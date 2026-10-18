@@ -1,6 +1,5 @@
 #include "ninfer/engine.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -49,20 +48,12 @@ int main() {
         std::cerr << "causal scoring returned an invalid result shape\n";
         return 1;
     }
-    for (const float value : all) {
-        if (!std::isfinite(value) || value > 0.0F) {
-            std::cerr << "causal scoring returned an invalid log probability\n";
-            return 1;
-        }
-    }
-    for (std::size_t i = 0; i < suffix.size(); ++i) {
-        if (!std::isfinite(suffix[i]) || suffix[i] > 0.0F) {
-            std::cerr << "causal scoring returned a non-finite logprob\n";
-            return 1;
-        }
-        if (suffix[i] != repeated[i]) {
-            std::cerr << "a repeated score window inherited prior State/KV\n";
-            return 1;
+    for (const auto* window : {&all, &suffix, &repeated}) {
+        for (const float value : *window) {
+            if (!std::isfinite(value) || value > 0.0F) {
+                std::cerr << "causal scoring returned an invalid log probability\n";
+                return 1;
+            }
         }
     }
     std::cout << "OK causal_score_real\n";

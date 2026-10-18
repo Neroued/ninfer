@@ -40,9 +40,9 @@ Partition::Partition(ExpertBankId bank, std::int32_t experts,
     }
 }
 
-void Partition::update(std::span<const ExpertKey> ready, CudaExecutionView execution) {
-    if (std::equal(keys_.begin(), keys_.end(), ready.begin(), ready.end())) return;
-    if (upload_pending_) mask_uploaded_.synchronize();
+bool Partition::try_update(std::span<const ExpertKey> ready, CudaExecutionView execution) {
+    if (std::equal(keys_.begin(), keys_.end(), ready.begin(), ready.end())) return true;
+    if (upload_pending_ && !mask_uploaded_.ready()) return false;
     auto* mask = static_cast<std::int32_t*>(mask_.data());
     std::fill_n(mask, experts_, 0);
     for (const auto key : ready) {
@@ -61,6 +61,7 @@ void Partition::update(std::span<const ExpertKey> ready, CudaExecutionView execu
         mask_uploaded_.record(execution.stream());
         upload_pending_ = true;
     }
+    return true;
 }
 
 PartitionView Partition::view() const {
@@ -159,7 +160,16 @@ struct Resources::Impl {
         std::optional<ExpertCacheUse> use;
     };
 
+    struct Pending {
+        ExpertBankId bank;
+        Tensor hidden, output;
+        MemoryArena& workspace;
+        ops::MoeExecutionHints hints;
+        std::optional<PreparedExecution> call;
+    };
+
     std::shared_ptr<const Plan> plan;
+    std::optional<Pending> pending;
     std::vector<const Parameters*> parameters;
     std::span<const ExpertBankSource> sources;
     const DeviceContext& device;
@@ -181,10 +191,13 @@ struct Resources::Impl {
     std::size_t observed_layers = 0;
     std::size_t cpu_layers      = 0;
     std::size_t active_step     = SIZE_MAX;
+    std::size_t pending_step    = SIZE_MAX;
+    std::size_t pending_window  = SIZE_MAX;
     bool cache_settled          = true;
     bool streaming              = false;
     bool preparing              = false;
     bool keep_cpu_active        = false;
+    bool call_active            = false;
 
     Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
          std::span<const ExpertBankSource> sources, const DeviceContext& device,
@@ -277,43 +290,45 @@ struct Resources::Impl {
         CUDA_CHECK(status);
     }
 
-    void snapshot(std::size_t index) {
+    bool snapshot(std::size_t index) {
         auto& layer = layers[index];
-        if (layer.use) return;
+        if (layer.use) return true;
         cache.ready_keys(plan->layers[index].spec.bank, layer.ready);
-        for (;;) {
-            layer.use = cache.acquire(layer.ready, cuda);
-            if (layer.use) break;
-            cache.wait_for_progress();
-        }
-        layer.partition->update(layer.ready, cuda);
+        if (!layer.partition->try_update(layer.ready, cuda)) return false;
+        layer.use = cache.acquire(layer.ready, cuda);
+        return layer.use.has_value();
     }
 
-    void prepare_step(std::size_t first) {
+    bool prepare_step(std::size_t first) {
         const auto it = std::lower_bound(needed.begin(), needed.end(), first);
-        if (it == needed.end()) return;
+        if (it == needed.end()) return true;
         const auto n = static_cast<std::size_t>(it - needed.begin());
         if (active_step != n) {
             const auto current = *it;
             const auto next =
                 plan->window_count == 2 && n + 1 < needed.size() ? needed[n + 1] : SIZE_MAX;
-            auto window = window_for(current);
-            if (window == SIZE_MAX) {
-                window = next != SIZE_MAX && window_for(next) == 0 ? 1 : 0;
-                load_window(window, current);
+            if (pending_step != n) {
+                auto window = window_for(current);
+                if (window == SIZE_MAX) {
+                    window = next != SIZE_MAX && window_for(next) == 0 ? 1 : 0;
+                    load_window(window, current);
+                }
+                cache.prepare({layers[current].keys});
+                pending_step   = n;
+                pending_window = window;
             }
-            cache.prepare({layers[current].keys});
-            // Queue the current publication before reusing the other window. Its reader wait
-            // must not get ahead of an unfinished current upload on the shared transfer stream.
-            while (!cache.progress({SIZE_MAX, SIZE_MAX}).required_published)
-                cache.wait_for_progress();
-            if (next != SIZE_MAX) load_window(1 - window, next);
+            // Publish current uploads before queuing the other window's reader dependency;
+            // otherwise that wait could precede an upload needed by the current consumer.
+            if (!cache.progress({SIZE_MAX, SIZE_MAX}).required_published) return false;
+            if (next != SIZE_MAX) load_window(1 - pending_window, next);
             cache.prepare({layers[current].keys, next != SIZE_MAX
                                                      ? std::span<const ExpertKey>(layers[next].keys)
                                                      : std::span<const ExpertKey>{}});
-            active_step = n;
+            active_step  = n;
+            pending_step = pending_window = SIZE_MAX;
         }
         cache.progress();
+        return true;
     }
 
     void progress_cache() {
@@ -331,7 +346,8 @@ Resources::Resources(std::shared_ptr<const Plan> plan,
 Resources::~Resources() = default;
 
 std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t tokens) {
-    auto& state       = *impl_;
+    auto& state = *impl_;
+    if (state.call_active) throw std::logic_error("previous MoE layer is still active");
     const auto thread = std::this_thread::get_id();
     if (!state.preparing) {
         if (!state.caller) {
@@ -367,7 +383,7 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
             state.needed.push_back(i);
     }
     const bool streaming = !state.needed.empty();
-    state.active_step    = SIZE_MAX;
+    state.active_step = state.pending_step = state.pending_window = SIZE_MAX;
     if (streaming != state.streaming) {
         state.release_snapshots();
         state.cache.replace(state.extra_region(),
@@ -385,10 +401,14 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
     return std::nullopt;
 }
 
-void Resources::before_layer(ExpertBankId bank) {
-    if (calibrating()) return;
-    impl_->prepare_step(impl_->plan->layer_index(bank));
+bool Resources::try_before_layer(ExpertBankId bank) {
+    if (calibrating()) return true;
+    const auto index     = impl_->plan->layer_index(bank);
+    const bool published = impl_->prepare_step(index);
     impl_->progress_cache();
+    // Uploading a later full bank does not delay a current hybrid layer.
+    return published || !impl_->plan->layers[index].requires_full_bank(impl_->tokens) ||
+           impl_->plan->layers[index].stream_layout.empty();
 }
 
 Resources::Preparation::Preparation(Resources& owner) : owner_(owner) {
@@ -417,7 +437,7 @@ PreparedExecution Resources::describe_layer(ExpertBankId bank, std::int32_t toke
                              tokens, state.bridge.execution_view());
 }
 
-PreparedExecution Resources::prepare_layer(ExpertBankId bank) {
+std::optional<PreparedExecution> Resources::try_prepare_layer(ExpertBankId bank) {
     auto& state      = *impl_;
     const auto index = state.plan->layer_index(bank);
     auto& layer      = state.layers[index];
@@ -434,15 +454,13 @@ PreparedExecution Resources::prepare_layer(ExpertBankId bank) {
     }
     auto kind = ops::ExpertSubsetKind::All;
     if (state.plan->layers[index].requires_full_bank(state.tokens)) {
-        while (!layer.use) {
-            layer.use = state.cache.acquire(layer.keys, state.cuda);
-            if (layer.use) break;
-            const auto progress = state.cache.progress();
-            if (!progress.required_published && progress.submitted_batches) continue;
-            state.cache.wait_for_progress();
+        if (!layer.use) layer.use = state.cache.acquire(layer.keys, state.cuda);
+        if (!layer.use) {
+            state.cache.progress();
+            return std::nullopt;
         }
     } else {
-        state.snapshot(index);
+        if (!state.snapshot(index)) return std::nullopt;
         kind = layer.partition->gpu_kind();
     }
     return describe_layer(bank, state.tokens, kind);
@@ -480,7 +498,8 @@ PreparedExecution Resources::prepare_calibration_layer(ExpertBankId bank,
             : std::clamp<std::size_t>(state.plan->layers[index].cache_experts, 1,
                                       std::max<std::size_t>(1, layer.keys.size() - 1));
     const auto keys = std::span(layer.keys).first(count);
-    layer.partition->update(keys, state.cuda);
+    if (!layer.partition->try_update(keys, state.cuda))
+        throw std::logic_error("calibration mask still has an active upload");
     if (count) {
         layer.use = state.cache.acquire(keys, state.cuda);
         if (!layer.use) throw std::logic_error("calibration bank is not ready");
@@ -496,7 +515,14 @@ void Resources::gpu_submitted(ExpertBankId bank) {
         return;
     }
     if (!state.cache_settled) state.release(state.layers[index]);
-    state.prepare_step(index + 1);
+    (void)state.prepare_step(index + 1);
+    state.progress_cache();
+}
+
+void Resources::progress() {
+    if (calibrating()) return;
+    auto& state = *impl_;
+    if (state.pending_step != SIZE_MAX) (void)state.prepare_step(state.needed[state.pending_step]);
     state.progress_cache();
 }
 
@@ -505,9 +531,11 @@ void Resources::finish_layer(bool cpu_work) noexcept {
     impl_->cpu_layers += cpu_work;
 }
 
-void Resources::abort_layer(ExpertBankId bank) {
-    impl_->release(impl_->layers[impl_->plan->layer_index(bank)]);
-    synchronize();
+void Resources::cancel() {
+    if (impl_->pending && impl_->pending->call) enqueue_discard(*impl_->pending->call);
+    impl_->pending.reset();
+    impl_->call_active = false;
+    impl_->release_snapshots();
 }
 
 void Resources::restore_cache_after_preparation() {
@@ -524,16 +552,59 @@ void Resources::restore_cache_after_preparation() {
     synchronize();
 }
 
-void Resources::execute(ExpertBankId bank, const Tensor& hidden, Tensor& output,
-                        MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+bool Resources::start(ExpertBankId bank, const Tensor& hidden, Tensor& output,
+                      MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+    if (impl_->pending) throw std::logic_error("MoE layer is already active");
     if (hidden.ne[1] != impl_->tokens) throw std::logic_error("MoE traversal token count changed");
-    const auto call = prepare_layer(bank);
+    begin_call();
+    impl_->pending.emplace(Impl::Pending{bank, hidden, output, workspace, hints, {}});
+    return poll();
+}
+
+void Resources::begin_call() {
+    if (impl_->call_active) throw std::logic_error("MoE bridge is already in use");
+    impl_->call_active = true;
+}
+
+void Resources::end_call() noexcept { impl_->call_active = false; }
+
+void Resources::fail_call() noexcept {
+    // A partial CUDA submission may fail before recording the current input event.
+    // Drain its actual streams before releasing any borrowed frame or cache lease.
     try {
-        enqueue_gpu(hidden, call, output, workspace, GpuSubmission::Eager, hints);
-        gpu_submitted(bank);
-        finish_layer(complete(call, output));
+        synchronize();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "MoE failed execution drain: %s\n", error.what());
+    }
+    try {
+        cancel();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "MoE failed execution release: %s\n", error.what());
+    }
+}
+
+bool Resources::poll() {
+    if (!impl_->pending) return true;
+    try {
+        progress();
+        auto& pending = *impl_->pending;
+        if (!pending.call) {
+            if (!try_before_layer(pending.bank)) return false;
+            auto call = try_prepare_layer(pending.bank);
+            if (!call) return false;
+            pending.call.emplace(std::move(*call));
+            enqueue_gpu(pending.hidden, *pending.call, pending.output, pending.workspace,
+                        GpuSubmission::Eager, pending.hints);
+            gpu_submitted(pending.bank);
+        }
+        const auto complete = try_complete(*pending.call, pending.output);
+        if (!complete) return false;
+        finish_layer(*complete);
+        impl_->pending.reset();
+        end_call();
+        return true;
     } catch (...) {
-        abort_layer(bank);
+        fail_call();
         throw;
     }
 }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::models::qwen {
 
@@ -49,48 +50,40 @@ void scatter_visual_embeddings(Tensor& input_embeddings, const Tensor& visual_em
     ops::scatter(embeddings, destination_indices, input_embeddings, execution);
 }
 
-std::uint32_t VisionPrefillPlan::window_end(std::uint32_t begin, std::uint32_t end) const {
-    const auto next = std::lower_bound(
-        uses.begin(), uses.end(), begin,
-        [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
-    if (next != uses.end() && next->begin < end && next + 1 != uses.end())
-        end = std::min(end, (next + 1)->begin);
-    return end;
-}
-
-VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionConfig& config,
-                                           const VisionParameters& parameters, MemorySpan workspace,
-                                           const VisionWorkspacePlan& workspace_plan,
-                                           const PreparedPromptData& prompt,
-                                           const VisionPrefillPlan& plan,
-                                           VisionHandoffState& handoff,
-                                           std::size_t& handoff_peak_bytes)
-    : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
-      plan_(plan), handoff_(handoff), handoff_peak_bytes_(handoff_peak_bytes),
+VisionPrefillExecution::VisionPrefillExecution(DeviceContext& device, const VisionConfig& config,
+                                               const VisionParameters& parameters,
+                                               MemorySpan workspace,
+                                               const VisionWorkspacePlan& workspace_plan,
+                                               std::shared_ptr<const VisionExecutionInput> input,
+                                               VisionHandoffState& handoff,
+                                               std::size_t& handoff_peak_bytes)
+    : device_(device), workspace_(workspace), workspace_plan_(workspace_plan),
+      input_(std::move(input)), handoff_(handoff), handoff_peak_bytes_(handoff_peak_bytes),
       context_(device.execution_view(), config, parameters) {
-    if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
+    if (!input_) throw std::invalid_argument("Vision execution has no input");
+    const auto& plan = input_->plan;
+    if (!plan.control || plan.control->items.empty() || plan.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
     if (workspace_.data == nullptr || workspace_.bytes < workspace_plan_.capacity_bytes ||
-        plan_.max_merged_count == 0 || plan_.max_merged_count > workspace_plan_.max_merged_tokens) {
+        plan.max_merged_count == 0 || plan.max_merged_count > workspace_plan_.max_merged_tokens) {
         throw std::invalid_argument("Vision prefill workspace plan is invalid");
     }
     std::uint32_t previous_end = 0;
     std::optional<std::uint32_t> previous_item;
-    for (const VisionUseSpan& use : plan_.uses) {
-        if (use.begin >= use.end || use.begin < previous_end ||
-            use.end > prompt_.token_ids.size()) {
+    for (const VisionUseSpan& use : plan.uses) {
+        if (use.begin >= use.end || use.begin < previous_end || use.end > input_->prompt_tokens) {
             throw std::invalid_argument("Vision suffix item spans are invalid or unordered");
         }
-        if (use.control_index >= plan_.control->items.size() ||
-            use.prepared_item_index >= prompt_.vision_items.size() ||
-            use.prepared_item_index >= prompt_.media_payloads.size() ||
-            plan_.control->prepared_item_begin + use.control_index != use.prepared_item_index ||
+        if (use.control_index >= plan.control->items.size() ||
+            use.prepared_item_index >= input_->vision_items.size() ||
+            use.prepared_item_index >= input_->media_payloads.size() ||
+            plan.control->prepared_item_begin + use.control_index != use.prepared_item_index ||
             (previous_item && use.prepared_item_index <= *previous_item)) {
             throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
         }
-        const VisionItemControl& control = plan_.control->items[use.control_index];
-        const VisionItem& source         = prompt_.vision_items[use.prepared_item_index];
+        const VisionItemControl& control = plan.control->items[use.control_index];
+        const VisionItem& source         = input_->vision_items[use.prepared_item_index];
         if (control.scatter_indices.empty() ||
             use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
             (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&
@@ -101,7 +94,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionCo
             source.patch_count != control.patch_count) {
             throw std::invalid_argument("Vision suffix plan does not describe the prepared item");
         }
-        if (control.merged_count > plan_.max_merged_count) {
+        if (control.merged_count > plan.max_merged_count) {
             throw std::invalid_argument("Vision suffix item exceeds its request workspace extent");
         }
         const Tensor output =
@@ -112,7 +105,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionCo
             throw std::overflow_error("Vision item patch elements overflows size_t");
         }
         const std::size_t patch_elements = control.patch_count * patch_width;
-        const auto& payload              = prompt_.media_payloads[use.prepared_item_index];
+        const auto& payload              = input_->media_payloads[use.prepared_item_index];
         if (output.bytes() > workspace_plan_.handoff_capacity_bytes || !payload ||
             payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision suffix item storage has an invalid shape");
@@ -120,43 +113,45 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionCo
         previous_end  = use.end;
         previous_item = use.prepared_item_index;
     }
-    if (plan_.max_merged_count != 0 &&
-        std::none_of(plan_.control->items.begin(), plan_.control->items.end(),
+    if (plan.max_merged_count != 0 &&
+        std::none_of(plan.control->items.begin(), plan.control->items.end(),
                      [&](const VisionItemControl& item) {
-                         return item.merged_count == plan_.max_merged_count;
+                         return item.merged_count == plan.max_merged_count;
                      })) {
         throw std::invalid_argument("Vision request workspace extent has no matching suffix item");
     }
-    timers_.reserve(plan_.uses.size());
+    timers_.reserve(plan.uses.size());
 }
 
-VisionPrefillSession::~VisionPrefillSession() { retire_handoff(); }
+VisionPrefillExecution::~VisionPrefillExecution() { retire_handoff(); }
 
-VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
-    if (nominal_length == 0 || begin >= prompt_.token_ids.size()) {
+VisionChunk VisionPrefillExecution::prepare_chunk(std::uint32_t begin,
+                                                  std::uint32_t nominal_length) {
+    if (nominal_length == 0 || begin >= input_->prompt_tokens) {
         throw std::invalid_argument("Vision chunk range is empty or outside the prompt");
     }
+    const auto& plan = input_->plan;
     const std::uint64_t nominal_end64 =
         static_cast<std::uint64_t>(begin) + static_cast<std::uint64_t>(nominal_length);
-    const auto end = plan_.window_end(begin, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                                 nominal_end64, prompt_.token_ids.size())));
+    const auto end = plan.window_end(begin, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                nominal_end64, input_->prompt_tokens)));
 
     // Replay can revisit an earlier item, including after the last item was consumed.
     const auto next_use = std::lower_bound(
-        plan_.uses.begin(), plan_.uses.end(), begin,
+        plan.uses.begin(), plan.uses.end(), begin,
         [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
     const VisionUseSpan* active = nullptr;
-    if (next_use != plan_.uses.end() && next_use->begin < end) { active = &*next_use; }
+    if (next_use != plan.uses.end() && next_use->begin < end) { active = &*next_use; }
     if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    const VisionItemControl& control = plan_.control->items[active->control_index];
+    const VisionItemControl& control = plan.control->items[active->control_index];
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
     std::size_t encode_bytes = 0;
 
     if (!owns_handoff() || !active_item_ || *active_item_ != active->prepared_item_index) {
-        const auto& payload = prompt_.media_payloads[active->prepared_item_index];
+        const auto& payload = input_->media_payloads[active->prepared_item_index];
         if (!payload) { throw std::logic_error("Vision replay lost its prepared media payload"); }
         if (handoff_.generation_ == std::numeric_limits<std::uint64_t>::max()) {
             throw std::overflow_error("Vision handoff generation exhausted");
@@ -179,14 +174,14 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output, encode_bytes};
 }
 
-void VisionPrefillSession::retire_handoff() noexcept {
+void VisionPrefillExecution::retire_handoff() noexcept {
     if (owns_handoff()) { handoff_.owner_ = nullptr; }
     active_item_.reset();
     active_generation_    = 0;
     active_handoff_bytes_ = 0;
 }
 
-double VisionPrefillSession::elapsed_seconds() const {
+double VisionPrefillExecution::elapsed_seconds() const {
     double milliseconds = 0.0;
     for (const CudaEventTimer& timer : timers_) { milliseconds += timer.elapsed_ms(); }
     return milliseconds / 1000.0;

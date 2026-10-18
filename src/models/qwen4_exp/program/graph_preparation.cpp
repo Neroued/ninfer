@@ -38,7 +38,7 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
     auto plan  = plan_graph_probe(parameters.profile, parameters.model.ple_table().geometry(),
                                   options, device, std::move(moe));
-    auto probe = std::make_unique<detail::ProgramImpl>(parameters, std::move(plan), device);
+    auto probe = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
     const auto before = device_memory_snapshot(device.device());
     probe->initialize_graphs();
     const auto ready = device_memory_snapshot(device.device());

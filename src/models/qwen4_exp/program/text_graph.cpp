@@ -65,7 +65,7 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
         run.stem();
         std::size_t mixer = 0;
         for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
-            if (i == p.model.config().text.ple.layer)
+            if (i == p.profile->config.text.ple.layer)
                 graph.ple_node = graph.ple[0].append_to(cuda.stream());
             if (std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer))
                 graph.mixers.push_back(graph.profiles.front()[mixer++].append_to(cuda.stream()));
@@ -86,7 +86,7 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
                                   std::int32_t columns, MemoryArena& workspace,
                                   CudaExecutionView cuda) {
     auto& graph        = implementation_.emplace<Offloaded>();
-    graph.ple_layer    = p.model.config().text.ple.layer;
+    graph.ple_layer    = p.profile->config.text.ple.layer;
     graph.block_output = run.block_output();
     workspace.reset_peak();
     graph.stem.prepare(cuda, [&] { run.stem(); });
@@ -150,18 +150,31 @@ void TextGraph::replay(std::uint32_t slot, CudaExecutionView cuda) {
     graph.main.executable.launch(cuda.stream());
 }
 
-void TextGraph::Offloaded::traverse(std::uint32_t begin, std::uint32_t end,
-                                    CudaExecutionView cuda) {
-    for (auto i = begin; i < end; ++i) {
-        nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
-        layers[i]->replay(block_output, cuda);
+bool TextGraph::Offloaded::advance(std::uint32_t end, CudaExecutionView cuda) {
+    while (next_layer < end) {
+        const nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, next_layer);
+        auto& layer         = *layers[next_layer];
+        const bool complete = waiting_layer ? layer.poll() : layer.start(block_output, cuda);
+        if (!complete) {
+            waiting_layer = true;
+            return false;
+        }
+        waiting_layer = false;
+        ++next_layer;
     }
+    return true;
 }
 
-void TextGraph::prefix(CudaExecutionView cuda) {
-    auto& graph = std::get<Offloaded>(implementation_);
+void TextGraph::begin_prefix(CudaExecutionView cuda) {
+    auto& graph         = std::get<Offloaded>(implementation_);
+    graph.next_layer    = 0;
+    graph.waiting_layer = false;
     graph.stem.executable.launch(cuda.stream());
-    graph.traverse(0, graph.ple_layer, cuda);
+}
+
+bool TextGraph::advance_prefix(CudaExecutionView cuda) {
+    auto& graph = std::get<Offloaded>(implementation_);
+    return graph.advance(graph.ple_layer, cuda);
 }
 
 void TextGraph::consume_ple(std::uint32_t slot, CudaExecutionView cuda) {
@@ -169,10 +182,19 @@ void TextGraph::consume_ple(std::uint32_t slot, CudaExecutionView cuda) {
     std::get<Offloaded>(implementation_).ple[slot].executable.launch(cuda.stream());
 }
 
-void TextGraph::suffix(CudaExecutionView cuda) {
+bool TextGraph::advance_suffix(CudaExecutionView cuda) {
     auto& graph = std::get<Offloaded>(implementation_);
-    graph.traverse(graph.ple_layer, graph.layers.size(), cuda);
+    if (!graph.advance(graph.layers.size(), cuda)) return false;
     graph.finish.executable.launch(cuda.stream());
+    return true;
+}
+
+void TextGraph::cancel() {
+    if (auto* graph = std::get_if<Offloaded>(&implementation_)) {
+        if (graph->waiting_layer) graph->layers.at(graph->next_layer)->cancel();
+        graph->waiting_layer = false;
+        graph->next_layer    = 0;
+    }
 }
 
 } // namespace ninfer::models::qwen4_exp

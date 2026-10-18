@@ -310,6 +310,10 @@ flowchart TD
 
 The finite model implementation is in
 [`execution/draft.cpp`](../../src/models/qwen3_5/execution/draft.cpp); storage is in
-[`program/storage/draft_context.cpp`](../../src/models/qwen3_5/program/storage/draft_context.cpp).
+[`program/resources.cpp`](../../src/models/qwen3_5/program/resources.cpp).
+The draft Graph includes the previous round's accepted-context append before proposing new tokens.
+Its prefix-count envelope covers empty and ragged rows; terminal completion still appends any
+remaining accepted context before retirement.
+
 Workspace planners and CUDA Graph profiles use the selected parameters and startup widths. Native
 Ops retain their own format, shape, numerical and state-transition contracts.

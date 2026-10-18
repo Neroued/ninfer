@@ -2,6 +2,8 @@
 
 #include "models/qwen4_exp/ple/hash.h"
 
+#include "ninfer/types.h"
+
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -240,7 +242,7 @@ std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::span<co
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     if (p.fatal) std::rethrow_exception(p.fatal);
-    if (!tokens || rows.empty() || rows.size() > 8 ||
+    if (!tokens || rows.empty() || rows.size() > kMaximumConcurrency ||
         std::uint64_t(tokens) * rows.size() > p.options.max_positions)
         throw std::invalid_argument("invalid PLE window shape");
     for (const auto& row : rows) {

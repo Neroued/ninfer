@@ -103,7 +103,7 @@ Classify a proposed model-callable computation in this order:
 2. If its complete transformation cannot be defined from explicit arguments and metadata, it
    belongs to model or product schedule.
 3. If it decides call order, lifecycle, frontier, commit, rollback, or request policy, it belongs
-   to Program, schedule, or runtime.
+   to Session, RankProgram, model schedule, or runtime according to ownership.
 4. If it is only a partial step beneath a complete transformation, it is a private implementation
    detail of the enclosing Op.
 5. Otherwise, admit it as an Op.
@@ -118,10 +118,9 @@ boundary is not semantically closed.
 
 ### 2.1 Boundaries outside the Op layer
 
-Program, model schedule, and runtime policy own model topology, call order, weight-role and state
-instance selection, prompt chunking, multimodal spans, generated-token transactions,
-prefix/frontier/commit/rollback policy, persistent state lifetime, CUDA Graph variants, and
-publication of product statistics.
+Session owns logical state selection, prompt windows, multimodal spans, generated-token transactions,
+and prefix/frontier policy. RankProgram and model execution compose topology, call order, physical
+state reads/writes and CUDA Graph variants. Runtime owns scheduling and publication policy.
 
 Core owns model-independent storage and execution mechanisms: tensor and weight views, checked
 layouts, arenas, physical cache containers, CUDA Graph lifetime, and raw host/device or
@@ -274,7 +273,7 @@ choices to allocation and launch instead of repeating the same selection downstr
 queries and execution must consume the same selection and allocation rules.
 
 Runtime selection depends on actual operands and execution facts, never target keys, artifact names,
-converter fields, model roles, Program phases or arbitrary registry strings. A launcher may
+converter fields, model roles, model execution phases or arbitrary registry strings. A launcher may
 specialize full tiles versus tails and obey CUDA grid limits; performance policy belongs in the
 selector. Device-resident per-row lengths stay Device inputs under the Op's capture contract.
 
@@ -391,9 +390,9 @@ supported native overload, checking its parent geometry, format, layout and shap
 [`weight_input.h`](../../include/ninfer/ops/weight_input.h). Model execution composes the prepared
 Ops; resource queries and execution check their applicable contracts.
 
-Program owns persistent state instances and lifetime; core owns model-independent physical
-containers; an Op owns only the documented reads, writes, outputs, and state transition of one
-call.
+Session's context directory owns logical state identities, allocations and retention. RankProgram
+owns the fixed physical backing and its execution lifetime; Core owns model-independent storage
+mechanisms. An Op owns only the documented reads, writes, outputs, and state transition of one call.
 
 CUDA entries receive the `CudaExecutionView` propagated from the owning `DeviceContext`.
 Validate operand residency with the family's existing shape/layout checks, including active
@@ -407,7 +406,8 @@ CPU entries receive `CpuExecutionView` from the owning fixed `CpuExecutor` and b
 native weight banks and caller scratch until synchronous return. Select ISA implementations using
 the bound workers' common features. Keep advanced ISA flags local to kernel compilation units;
 the caller-side entry and selection remain baseline C++. Workers neither allocate storage nor
-call CUDA. Program owns CPU/GPU handoff and overlap, not the Op or executor.
+call CUDA. RankProgram and its MoE schedule own CPU/GPU handoff and overlap; an Op or CPU executor
+does not own this model schedule.
 
 ### 5.2 Workspace
 
@@ -473,7 +473,7 @@ depend on artifact provenance or model binding concepts.
 Enforce the boundary in code and build ownership:
 
 - contract headers include only required core, CUDA host, and peer semantic contract types;
-- `src/ops/**` does not include model, Program, schedule, product, or artifact-provenance headers;
+- `src/ops/**` does not include model, Session, RankProgram, schedule, product, or artifact-provenance headers;
 - model execution includes contract headers, never private launcher, kernel, common, codec, or plan
   headers;
 - `ninfer_ops` does not link a model implementation;
@@ -688,7 +688,7 @@ temporary sweep and its private entry points are then removed as described above
 
 An Op-scoped performance claim ends at the public Op boundary. Exact formats, layouts, shapes, and
 extents can be constructed directly by the Op benchmark; they do not authorize loading a model
-artifact or invoking a model, Program, Engine, or whole-round benchmark. Product-route evidence is
+artifact or invoking a model, Engine, or whole-round benchmark. Product-route evidence is
 required only when the requested deliverable explicitly makes an end-to-end claim and includes
 that product route in scope.
 

@@ -129,10 +129,30 @@ std::size_t ExecutionPlan::device_bytes() const {
            (moe ? moe->description().device_bytes : 0);
 }
 
+std::size_t ExecutionPlan::pinned_context_bytes() const {
+    const auto mapping_elements = [](const QsaCacheLayout& pool) {
+        return std::size_t(pool.tables.spec.logical_page_capacity) * pool.tables.spec.table_rows;
+    };
+    const auto elements = mapping_elements(persistent.main) +
+                          (persistent.mtp ? mapping_elements(*persistent.mtp) : 0);
+    return 2 * elements * sizeof(std::int32_t);
+}
+
+std::size_t ExecutionPlan::pinned_aux_bytes() const {
+    return std::size_t(std::max(1024U, persistent.buffers.batch.max_positions)) * sizeof(TokenId);
+}
+
+std::size_t ExecutionPlan::pinned_context_counts_bytes() const {
+    return persistent.buffers.token_counts
+               ? std::size_t(profile->public_tokens) * shape.max_concurrency * sizeof(std::int32_t)
+               : 0;
+}
+
 std::size_t ExecutionPlan::device_reservation_bytes() const {
     const auto host = ple_prepare_bytes + ple_upload.ordinary_host_bytes +
                       ple_upload.pinned_host_bytes + pinned_io_bytes + pinned_output_bytes +
-                      pinned_sampling_bytes + pinned_mtp_bytes;
+                      pinned_sampling_bytes + pinned_mtp_bytes + pinned_context_bytes() +
+                      pinned_aux_bytes() + pinned_context_counts_bytes();
     return device_bytes() + ((NINFER_SHARED_PHYSICAL_MEMORY != 0) ? host : 0);
 }
 

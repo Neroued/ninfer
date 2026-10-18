@@ -4,8 +4,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
-#include "core/host_context_arena.h"
-#include "core/host_kv_arena.h"
+#include "models/common/context/storage.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/engine.h"
@@ -154,14 +153,13 @@ std::vector<TransferCase> transfer_cases(std::size_t payload_bytes) {
     return out;
 }
 
-std::vector<DeviceKVPageHandle> select_runs(const std::vector<DeviceKVPageHandle>& physical,
-                                            std::size_t base, std::uint32_t pages,
-                                            std::uint32_t runs) {
+std::vector<std::int32_t> select_runs(const std::vector<std::int32_t>& physical, std::size_t base,
+                                      std::uint32_t pages, std::uint32_t runs) {
     if (pages == 0 || runs == 0 || runs > pages ||
         base + static_cast<std::size_t>(pages) + runs - 1U > physical.size()) {
         throw std::invalid_argument("invalid fragmented transfer selection");
     }
-    std::vector<DeviceKVPageHandle> selected;
+    std::vector<std::int32_t> selected;
     selected.reserve(pages);
     std::size_t cursor           = base;
     std::uint32_t remaining      = pages;
@@ -231,32 +229,21 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
         plan_device_kv_page_pool(builder, DeviceKVPagePoolSpec{.page_group_count = physical_pages,
                                                                .geometry = fixture.geometry});
     DeviceBuffer backing(device.device(), builder.finish(256, "context-cost transfer fixture"));
-    DeviceKVPagePool pool(backing.span(), layout);
-    auto reservation = pool.reserve(physical_pages);
-    if (!reservation) { throw std::runtime_error("failed to reserve transfer fixture pages"); }
-    std::vector<DeviceKVPageLease> leases;
-    leases.reserve(physical_pages);
-    pool.materialize(*reservation, physical_pages, leases);
-    std::vector<DeviceKVPageHandle> handles;
-    handles.reserve(leases.size());
-    for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
-    pool.zero_pages(handles, device.transfer_stream());
+    models::context::DevicePageStorage pool(backing.span(), layout);
+    std::vector<std::int32_t> handles(physical_pages);
+    for (std::uint32_t i = 0; i < physical_pages; ++i) handles[i] = static_cast<std::int32_t>(i);
+    pool.zero_pages(handles, device.transfer_view());
 
     const std::size_t host_bytes =
         checked_size_mul(host_layout.page_stride, region_pages, "transfer fixture Host bytes");
-    const std::array<HostKVPageLayout, 1> layouts{host_layout};
-    HostContextArena host_context(host_bytes, host_layout.page_stride);
-    HostKVArena host(host_context, layouts);
-    auto allocation = host.allocate(host_layout, region_pages);
-    if (!allocation) { throw std::runtime_error("failed to allocate transfer fixture Host pages"); }
-    HostKVAllocationView host_view = host.writable_view(*allocation);
-    fill_transfer_payload(host_view.data(), host_bytes, 0x7ac5d3e91b2468f0ULL);
-    pool.copy_from_host(HostKVAllocationConstView(host_view),
-                        std::span<const DeviceKVPageHandle>(handles).first(region_pages),
-                        device.transfer_stream());
-    pool.copy_from_host(HostKVAllocationConstView(host_view),
-                        std::span<const DeviceKVPageHandle>(handles).subspan(region_pages),
-                        device.transfer_stream());
+    PinnedHostBuffer host(host_bytes);
+    fill_transfer_payload(host.data(), host_bytes, 0x7ac5d3e91b2468f0ULL);
+    pool.copy_from_host(host.span(), host_layout,
+                        std::span<const std::int32_t>(handles).first(region_pages),
+                        device.transfer_view());
+    pool.copy_from_host(host.span(), host_layout,
+                        std::span<const std::int32_t>(handles).subspan(region_pages),
+                        device.transfer_view());
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
 
     CudaEventTimer timer(device, device.transfer_stream());
@@ -265,16 +252,17 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
         timer.start();
         if (test.direction == TransferDirection::DeviceToHost) {
             const auto source = select_runs(handles, 0, test.pages, test.runs);
-            work              = pool.copy_to_host(source, host_view.subview(0, test.pages),
-                                                  device.transfer_stream());
+            work              = pool.copy_to_host(source,
+                                                  host.span().subspan(0, test.pages * host_layout.page_stride),
+                                                  host_layout, device.transfer_view());
         } else if (test.direction == TransferDirection::HostToDevice) {
             const auto destination = select_runs(handles, region_pages, test.pages, test.runs);
-            work = pool.copy_from_host(HostKVAllocationConstView(host_view.subview(0, test.pages)),
-                                       destination, device.transfer_stream());
+            work = pool.copy_from_host(host.span().subspan(0, test.pages * host_layout.page_stride),
+                                       host_layout, destination, device.transfer_view());
         } else {
             for (std::uint32_t page = 0; page < test.pages; ++page) {
                 const auto part = pool.copy_page(handles[page], handles[region_pages + page],
-                                                 device.transfer_stream());
+                                                 device.transfer_view());
                 work.payload_bytes += part.payload_bytes;
                 work.copy_operations += part.copy_operations;
             }

@@ -568,7 +568,7 @@ struct Program {
 };
 
 struct Model {
-    using Program          = ::Program;
+    using Session          = ::Program;
     using RequestBasePlan  = Base;
     using CheckpointHandle = Handle;
     using SourceCandidate  = Source;

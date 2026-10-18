@@ -11,7 +11,8 @@
 
 namespace ninfer::models::qwen3_5 {
 
-std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uint32_t chunk) {
+std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe,
+                              std::uint32_t chunk) {
     using Json         = nlohmann::json;
     const auto& config = model.config();
     const auto& t      = config.text;

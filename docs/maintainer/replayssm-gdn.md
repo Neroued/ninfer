@@ -18,7 +18,7 @@ bitwise clone 的条件、causal-conv history，以及当前 Qwen3.5 模型实�
 Record/Fold 的实现与合同见 [`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) 和
 [`record.cpp`](../../src/ops/linear_attention/gated_delta_net/replay/record.cpp)、
 [`fold.cpp`](../../src/ops/linear_attention/gated_delta_net/replay/fold.cpp)。模型配置决定 layer/head
-数量，Program 按启用的 MTP、DFlash 或 DFlash2 窗口预留 record capacity。
+数量，RankProgram 按启用的 MTP、DFlash 或 DFlash2 窗口预留 record capacity。
 
 ---
 

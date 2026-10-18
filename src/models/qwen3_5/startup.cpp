@@ -7,17 +7,19 @@
 
 namespace ninfer::models::qwen3_5 {
 Startup::Startup(const artifact::Reader& reader, const EngineOptions& options, Device device)
-    : reader_(reader), selection_(load_options(options)), source_(plan_load(reader, selection_)),
-      architecture_(source_->config().text.architecture) {
-    profile = execution::describe_model(*source_);
+    : reader_(reader), definition_(read_definition(reader, load_options(options))),
+      architecture_(definition_->config().text.architecture) {
+    profile       = execution::describe_model(*definition_);
+    auto resident = resolve_load(reader_, definition_, device);
     placements_.push_back(
-        {WeightPlacement::Resident, source_->placement(device, device).device_capacity_bytes});
+        {WeightPlacement::Resident, resident.materialization().device_capacity_bytes});
     if (architecture_ == Architecture::Qwen3_5Moe) {
-        offload_ = detail::describe_moe_plan(*source_, *profile, options.moe);
-        if (offload_)
+        offload_ = detail::describe_moe_plan(*definition_, *profile, options.moe);
+        if (offload_) {
+            const auto host = resolve_load(reader_, definition_, device, Device::cpu());
             placements_.push_back(
-                {WeightPlacement::HostExperts,
-                 source_->placement(device, Device::cpu()).device_capacity_bytes});
+                {WeightPlacement::HostExperts, host.materialization().device_capacity_bytes});
+        }
     }
 }
 
@@ -29,7 +31,9 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     const bool host_experts = placement == WeightPlacement::HostExperts;
     if (host_experts && !offload_) return {};
     auto trial       = options;
-    const auto chunk = options.prefill_chunk ? options.prefill_chunk : host_experts ? 4096U : 1024U;
+    const auto chunk = std::min(options.max_context, options.prefill_chunk ? options.prefill_chunk
+                                                     : host_experts        ? 4096U
+                                                                           : 1024U);
     trial.prefill_chunk             = chunk;
     auto policy                     = options.kv_capacity;
     policy.automatic_headroom_bytes = 0;
@@ -70,18 +74,16 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
                          {std::move(moe)}};
 }
 
-std::unique_ptr<Model> Startup::materialize(DeviceContext& device, WeightPlacement placement,
-                                            const StartupObserver& observer) {
-    if (!source_) source_.emplace(plan_load(reader_, selection_));
+std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPlacement placement,
+                                                 const StartupObserver& observer) {
     auto resolved =
-        resolve_load(std::move(*source_), device.device(),
+        resolve_load(reader_, definition_, device.device(),
                      placement == WeightPlacement::HostExperts ? Device::cpu() : device.device());
-    source_.reset();
     return materialize_model(std::move(resolved), device, &observer);
 }
 
-qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& options) const {
-    return qwen::make_frontend(model.resources(),
+qwen::Frontend Startup::frontend(const EngineOptions& options) const {
+    return qwen::make_frontend(definition_->resources(),
                                {.chat_template_path       = options.chat_template_path,
                                 .grammar_cache_bytes      = options.grammar_cache_bytes,
                                 .vision_enabled           = options.enable_vision,
@@ -103,9 +105,9 @@ Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
     return calibrate_graphs(parameters, device, options, preparation.experts);
 }
 
-std::string Startup::prefill_signature(const Model& model, const ExecutionPreparation& preparation,
+std::string Startup::prefill_signature(const ExecutionPreparation& preparation,
                                        std::uint32_t chunk) const {
-    return qwen3_5::prefill_signature(model, preparation.experts.get(), chunk);
+    return qwen3_5::prefill_signature(*definition_, preparation.experts.get(), chunk);
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "models/common/context/kv_history.h"
+#include "models/common/context/directory/history.h"
 #include "models/common/context/release_inventory.h"
-#include "models/common/context/state_store.h"
+#include "models/common/context/directory/state.h"
 #include "models/common/context/work.h"
 
 #include <algorithm>
@@ -21,9 +21,9 @@
 namespace ninfer::models::context {
 
 struct ReclaimPool {
-    const KVHistoryStore* histories = nullptr;
-    const LogicalKVPageStore* pages = nullptr;
-    std::size_t host_page_bytes     = 0;
+    const HistoryDirectory* histories = nullptr;
+    const PageDirectory* pages        = nullptr;
+    std::size_t host_page_bytes       = 0;
 };
 
 // Shared store facts for both Native implementations. Model code supplies actual snapshot
@@ -31,14 +31,14 @@ struct ReclaimPool {
 template <class Resources>
 struct PhysicalReclaim {
     struct Page {
-        LogicalKVPageHandle handle;
+        PageId handle;
         std::uint32_t position = 0;
         bool releasable        = false;
     };
 
     struct Group {
         std::vector<CheckpointHandle> sources;
-        std::vector<StateImageStore::Handle> states;
+        std::vector<StateId> states;
         std::array<std::vector<Page>, Resources::pool_capacity> pages;
         Resources released;
     };
@@ -47,9 +47,8 @@ struct PhysicalReclaim {
     std::shared_ptr<ReleaseInventory<Resources>> inventory;
 
     template <class Store>
-    PhysicalReclaim(const Store& checkpoints, const StateImageStore& states,
-                    std::size_t state_bytes, std::span<const ReclaimPool> pools,
-                    std::span<const CheckpointHandle> allowed,
+    PhysicalReclaim(const Store& checkpoints, const StateDirectory& states, std::size_t state_bytes,
+                    std::span<const ReclaimPool> pools, std::span<const CheckpointHandle> allowed,
                     std::span<const CheckpointHandle> excluded, Resources shortage)
         : inventory(std::make_shared<ReleaseInventory<Resources>>(checkpoints.size())) {
         std::vector<bool> eligible(checkpoints.size());
@@ -69,7 +68,7 @@ struct PhysicalReclaim {
 
         if (shortage.state_slots || shortage.host_bytes) {
             struct Image {
-                StateImageStore::Handle handle;
+                StateId handle;
                 std::vector<std::uint32_t> holders;
             };
 
@@ -106,12 +105,12 @@ struct PhysicalReclaim {
             const auto& pages     = *storage.pages;
 
             struct History {
-                KVHistoryHandle handle;
+                HistoryId handle;
                 std::vector<std::uint32_t> holders;
             };
 
             std::vector<History> histories_by_id(histories.capacity());
-            std::vector<const KVPrefixRef*> prefixes;
+            std::vector<const HistoryPrefix*> prefixes;
             for (std::uint32_t i = 0; i < checkpoints.size(); ++i) {
                 const auto& slot = checkpoints[i];
                 if (!slot.value || pool >= slot.value->snapshot.prefixes().size()) continue;
@@ -128,7 +127,7 @@ struct PhysicalReclaim {
                 releasable[pages.descriptor_index(page)] = true;
 
             struct PageOwners {
-                LogicalKVPageHandle handle;
+                PageId handle;
                 std::uint32_t holders = none, position = 0, last_owner = 0;
             };
 

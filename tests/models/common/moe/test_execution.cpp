@@ -1,4 +1,5 @@
 #include "models/common/moe/offload/resources.h"
+#include "models/common/moe/offload/graph.h"
 #include "core/decode_graph.h"
 #include "models/common/moe/offload/plan.h"
 #include "ops/moe/fixture.h"
@@ -21,6 +22,74 @@ using Epilogue = ops::MoeEpilogue;
 
 void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
+}
+
+class StreamGate {
+public:
+    explicit StreamGate(cudaStream_t stream) : stream_(stream) {
+        cuda_check(cudaLaunchHostFunc(
+                       stream_,
+                       [](void* pointer) {
+                           auto& open = *static_cast<std::atomic<bool>*>(pointer);
+                           while (!open.load(std::memory_order_acquire)) std::this_thread::yield();
+                       },
+                       &open_),
+                   "delay stream");
+        fallback_ = std::jthread([this](std::stop_token stop) {
+            const auto deadline = Clock::now() + std::chrono::milliseconds(20);
+            while (!stop.stop_requested() && Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            release();
+        });
+    }
+
+    ~StreamGate() {
+        release();
+        fallback_.request_stop();
+        fallback_.join();
+        (void)cudaStreamSynchronize(stream_);
+    }
+
+    void release() { open_.store(true, std::memory_order_release); }
+
+private:
+    cudaStream_t stream_;
+    std::atomic<bool> open_ = false;
+    std::jthread fallback_;
+};
+
+bool finish(const offload::PreparedExecution& prepared, Tensor& output) {
+    while (true) {
+        if (auto completed = offload::try_complete(prepared, output)) return *completed;
+        std::this_thread::yield();
+    }
+}
+
+void qualify_partition(const DeviceContext& device) {
+    const std::array<std::int32_t, 2> initial{0, 2};
+    const std::array<ExpertKey, 2> next{{{{0}, 1}, {{0}, 3}}};
+    const std::array<ExpertKey, 2> last{{{{0}, 0}, {{0}, 1}}};
+    Partition partition({0}, 4, initial, device);
+    device.synchronize();
+    {
+        StreamGate gate(device.stream());
+        const bool accepted  = partition.try_update(next, device.execution_view());
+        const bool pending   = !partition.try_update(last, device.execution_view());
+        const auto view      = partition.view();
+        const auto* host     = static_cast<const std::int32_t*>(view.host_mask.data);
+        const bool unchanged = std::equal(partition.gpu_keys().begin(), partition.gpu_keys().end(),
+                                          next.begin(), next.end()) &&
+                               host[0] == 0 && host[1] == 1 && host[2] == 0 && host[3] == 1;
+        gate.release();
+        require(accepted && pending && unchanged,
+                "pending mask upload allowed its Host source to be overwritten");
+    }
+    require(partition.try_update(last, device.execution_view()),
+            "retired mask upload did not permit a new partition");
+    device.synchronize();
+    const auto mask = from_device<std::int32_t>(partition.view().device_mask.data, 4);
+    require(mask == std::vector<std::int32_t>({1, 1, 0, 0}),
+            "partition retry uploaded the wrong mask");
 }
 
 void publish(ExpertCache& cache, const ExpertCacheRequirements& req,
@@ -51,6 +120,7 @@ struct Call {
     Tensor destination;
     std::vector<double> expected;
     DecodeGraphExecutable graph;
+    std::unique_ptr<offload::LayerGraphExecutable> scheduled_graph;
 
     Call(moe::Fixture& fixture, int tokens, int pattern, Epilogue epilogue = Epilogue::AddResidual)
         : batch(fixture.batch(tokens, pattern)), device(batch), output(batch.residual.size() * 2),
@@ -109,39 +179,49 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     MemoryArena workspace(workspace_storage.span());
     int failures       = 0;
     const auto execute = [&](Call& call, const Partition& partition,
-                             offload::ExecutionView execution) {
+                             offload::ExecutionView execution, bool delayed = false) {
         std::optional<ExpertCacheUse> use;
         if (partition.gpu_kind() != Kind::None) {
             use = cache.acquire(partition.gpu_keys(), execution.cuda);
             if (!use) throw std::logic_error("GPU assignment was not published");
         }
         try {
-            if (graph) {
-                const auto prepared = offload::prepare_execution(
-                    parameters, partition.view(), sources[0], cache.view({0}), epilogue,
-                    call.device.x.ne[1], execution);
-                if (!call.graph.ready()) {
-                    DecodeGraphDefinition definition;
-                    definition.capture(execution.cuda.stream(), [&] {
-                        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
-                                             offload::GpuSubmission::Capture);
-                    });
-                    call.graph.instantiate(definition);
-                }
-                call.graph.launch(execution.cuda.stream());
-                (void)offload::complete(prepared, call.destination);
-            } else {
-                offload::execute(call.device.x, parameters, partition.view(), sources[0],
-                                 cache.view({0}), epilogue, call.destination, workspace, execution);
+            const auto prepared = offload::prepare_execution(parameters, partition.view(),
+                                                             sources[0], cache.view({0}), epilogue,
+                                                             call.device.x.ne[1], execution);
+            if (graph && !call.graph.ready()) {
+                DecodeGraphDefinition definition;
+                definition.capture(execution.cuda.stream(), [&] {
+                    offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                         offload::GpuSubmission::Capture);
+                });
+                call.graph.instantiate(definition);
             }
+            std::optional<StreamGate> gate;
+            if (delayed)
+                gate.emplace(graph ? execution.cuda.stream() : execution.host->transfer.stream());
+            if (graph) {
+                call.graph.launch(execution.cuda.stream());
+            } else {
+                offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                     offload::GpuSubmission::Eager);
+            }
+            if (gate) {
+                const auto ready = offload::try_complete(prepared, call.destination);
+                gate->release();
+                require(!ready,
+                        "MoE completion waited for delayed D2H instead of returning pending");
+                gate.reset();
+            }
+            (void)finish(prepared, call.destination);
         } catch (...) {
             if (use) cache.release(*use, execution.cuda);
             throw;
         }
         if (use) cache.release(*use, execution.cuda);
     };
-    const auto run = [&](Call& call, const Partition& partition) {
-        execute(call, partition, execution);
+    const auto run = [&](Call& call, const Partition& partition, bool delayed = false) {
+        execute(call, partition, execution, delayed);
         require(workspace.used() == 0 && execution.host->workspace.used() == 0,
                 "MoE leaked an arena scope");
     };
@@ -227,20 +307,38 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     publish(cache, description, mixed.gpu_keys());
     std::array<std::unique_ptr<Call>, 2> delayed{std::make_unique<Call>(fixture, 128, 1, epilogue),
                                                  std::make_unique<Call>(fixture, 1, 2, epilogue)};
-    std::atomic<bool> open = false;
-    cuda_check(cudaLaunchHostFunc(
-                   execution.host->transfer.stream(),
-                   [](void* pointer) {
-                       auto& gate = *static_cast<std::atomic<bool>*>(pointer);
-                       while (!gate.load(std::memory_order_acquire)) { std::this_thread::yield(); }
-                   },
-                   &open),
-               "delay bridge");
-    std::jthread opener([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        open.store(true, std::memory_order_release);
-    });
-    for (auto& call : delayed) { run(*call, mixed); }
+    if (!graph) {
+        auto& call = *delayed[0];
+        auto use   = cache.acquire(mixed.gpu_keys(), execution.cuda);
+        require(use.has_value(), "discard fixture assignment was not published");
+        const auto prepared =
+            offload::prepare_execution(parameters, mixed.view(), sources[0], cache.view({0}),
+                                       epilogue, call.device.x.ne[1], execution);
+        CudaCompletionEvent compute_done(device);
+        StreamGate gate(execution.host->transfer.stream());
+        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                             offload::GpuSubmission::Eager);
+        cache.release(*use, execution.cuda);
+        // Retire GPU arithmetic first so it cannot hide a missing transfer dependency.
+        compute_done.record(execution.cuda.stream());
+        compute_done.synchronize();
+        const auto completed = offload::try_complete(prepared, call.destination);
+        offload::enqueue_discard(prepared);
+        compute_done.record(execution.cuda.stream());
+        const auto deadline = Clock::now() + std::chrono::milliseconds(2);
+        bool retired        = false;
+        do {
+            retired = compute_done.ready();
+            if (!retired) std::this_thread::yield();
+        } while (!retired && Clock::now() < deadline);
+        gate.release();
+        compute_done.synchronize();
+        require(!completed && !retired,
+                "discard retired the compute frame before its delayed input transfer");
+        call.output.copy_from_host(call.batch.residual.data(), call.output.bytes());
+    }
+    run(*delayed[0], mixed, true);
+    run(*delayed[1], mixed);
     resources.synchronize();
     for (auto& call : delayed) { failures += call->verify("delayed bridge/reused frame"); }
 
@@ -409,25 +507,63 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
             "startup returned before the initial expert cache became ready");
     GuardedDeviceBuffer storage(plan->bridge.gpu_workspace_bytes);
     MemoryArena workspace(storage.span());
-    int failures = 0;
+    int failures      = 0;
+    bool check_cancel = !graph && bank_capacity == 1 && !one_large_layer;
     for (const int tokens : {1, 1, 8, 8, 9, 48, 1024, 1, 1, 8, 9, 1}) {
         std::array<std::unique_ptr<Call>, 4> calls;
         for (std::size_t i = 0; i < calls.size(); ++i) {
             calls[i] =
                 std::make_unique<Call>(*fixtures[i], tokens, i % 3, plan->layers[i].spec.epilogue);
         }
+        if (check_cancel) {
+            const auto cpu_activity = resources.begin(tokens);
+            auto& call              = *calls[0];
+            {
+                StreamGate gate(device.stream());
+                const bool completed =
+                    resources.start(order[0], call.device.x, call.destination, workspace, {});
+                resources.cancel();
+                const bool idle = resources.poll();
+                gate.release();
+                require(!completed && idle, "cancel did not discard pending MoE completion");
+            }
+            resources.synchronize();
+            call.output.copy_from_host(call.batch.residual.data(), call.output.bytes());
+            check_cancel = false;
+        }
         {
             const auto cpu_activity = resources.begin(tokens);
             for (std::size_t i = 0; i < calls.size(); ++i) {
-                resources.before_layer(order[i]);
-                if (graph) {
+                if (graph && !calibration) {
+                    auto& call = *calls[i];
+                    offload::LayerGraphDefinition definition;
+                    definition.moe = std::make_shared<offload::SubsetGraphDefinitions>();
+                    offload::capture_layer(
+                        definition, resources, order[i], device.execution_view(), tokens, [] {},
+                        [&](const offload::PreparedExecution& prepared) {
+                            offload::enqueue_gpu(call.device.x, prepared, call.destination,
+                                                 workspace, offload::GpuSubmission::Capture);
+                        });
+                    call.scheduled_graph =
+                        std::make_unique<offload::LayerGraphExecutable>(definition);
+                    if (!call.scheduled_graph->start(resources, order[i], call.destination,
+                                                     device.execution_view()))
+                        while (!call.scheduled_graph->poll()) std::this_thread::yield();
+                } else if (graph) {
+                    while (!resources.try_before_layer(order[i])) std::this_thread::yield();
                     auto& call          = *calls[i];
-                    const auto prepared = calibration && tokens <= 8
-                                              ? resources.prepare_calibration_layer(
-                                                    order[i], i % 3 == 0   ? Kind::All
-                                                              : i % 3 == 1 ? Kind::None
-                                                                           : Kind::MaskOnes)
-                                              : resources.prepare_layer(order[i]);
+                    const auto prepared = [&] {
+                        if (calibration && tokens <= 8)
+                            return resources.prepare_calibration_layer(
+                                order[i], i % 3 == 0   ? Kind::All
+                                          : i % 3 == 1 ? Kind::None
+                                                       : Kind::MaskOnes);
+                        while (true) {
+                            if (auto ready = resources.try_prepare_layer(order[i]))
+                                return std::move(*ready);
+                            std::this_thread::yield();
+                        }
+                    }();
                     DecodeGraphDefinition definition;
                     definition.capture(device.stream(), [&] {
                         offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
@@ -436,10 +572,11 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                     call.graph.instantiate(definition);
                     call.graph.launch(device.stream());
                     resources.gpu_submitted(order[i]);
-                    resources.finish_layer(offload::complete(prepared, call.destination));
+                    resources.finish_layer(finish(prepared, call.destination));
                 } else {
-                    resources.execute(order[i], calls[i]->device.x, calls[i]->destination,
-                                      workspace, {});
+                    if (!resources.start(order[i], calls[i]->device.x, calls[i]->destination,
+                                         workspace, {}))
+                        while (!resources.poll()) std::this_thread::yield();
                 }
             }
         }
@@ -520,6 +657,7 @@ int main() {
         qualify_allocation();
         CpuTopology topology;
         auto& device = cuda_environment().context;
+        qualify_partition(device);
         qualify_top10_bridge_routes(device, topology);
         int failures = 0;
         for (const auto down : {QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {

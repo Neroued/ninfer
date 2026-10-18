@@ -24,9 +24,11 @@ public:
     void select(std::uint32_t visible_tokens);
     [[nodiscard]] bool resident() const;
     void replay(std::uint32_t ple_slot, CudaExecutionView);
-    void prefix(CudaExecutionView);
+    void begin_prefix(CudaExecutionView);
+    [[nodiscard]] bool advance_prefix(CudaExecutionView);
     void consume_ple(std::uint32_t slot, CudaExecutionView);
-    void suffix(CudaExecutionView);
+    [[nodiscard]] bool advance_suffix(CudaExecutionView);
+    void cancel();
 
     [[nodiscard]] std::size_t workspace_bytes() const { return workspace_bytes_[installed_]; }
 
@@ -47,7 +49,9 @@ private:
         Tensor block_output;
         std::uint32_t ple_layer = 0;
 
-        void traverse(std::uint32_t begin, std::uint32_t end, CudaExecutionView);
+        std::uint32_t next_layer = 0;
+        bool waiting_layer       = false;
+        [[nodiscard]] bool advance(std::uint32_t end, CudaExecutionView);
     };
 
     void prepare_resident(execution::TextRun&, const execution::Parameters&,

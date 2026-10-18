@@ -21,6 +21,22 @@ bool recovery_prefix_matches(const RecoveryIdentityView& earlier,
 
 namespace {
 
+void validate_generated(std::size_t begin, std::size_t count, std::int32_t rope_delta,
+                        std::optional<std::uint32_t> split) {
+    constexpr auto maximum = std::size_t(std::numeric_limits<std::int32_t>::max());
+    if (begin > maximum || count > maximum + 1 - begin)
+        throw std::overflow_error("generated prefix exceeds int32 positions");
+    if (count) {
+        const auto first = static_cast<std::int64_t>(begin) + rope_delta;
+        const auto last  = first + static_cast<std::int64_t>(count) - 1;
+        if (first < std::numeric_limits<std::int32_t>::min() ||
+            last > std::numeric_limits<std::int32_t>::max())
+            throw std::overflow_error("generated MRoPE position exceeds int32");
+    }
+    if (split && (!*split || *split > count))
+        throw std::invalid_argument("generated execution split is outside the appended span");
+}
+
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {
     return left.temporal == right.temporal && left.height == right.height &&
            left.width == right.width;
@@ -148,6 +164,7 @@ std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens
 void ResidentPrefixIdentity::reserve(std::size_t tokens) {
     token_types_.reserve(tokens);
     for (auto& axis : positions_) { axis.reserve(tokens); }
+    rewrite_execution_frontiers_.reserve(tokens);
 }
 
 void ResidentPrefixIdentity::clear() noexcept {
@@ -195,6 +212,15 @@ void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
     std::swap(regular_prefix_, other.regular_prefix_);
     position_origins_.swap(other.position_origins_);
+}
+
+void ResidentPrefixIdentity::prepare_generated(std::size_t count, std::int32_t rope_delta,
+                                               std::optional<std::uint32_t> split) {
+    validate_generated(size(), count, rope_delta, split);
+    if (split && !rewrite_execution_frontiers_.empty() &&
+        rewrite_execution_frontiers_.back() >= size() + *split)
+        throw std::logic_error("generated execution split is not a new ordered frontier");
+    reserve(size() + count);
 }
 
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta,
@@ -398,6 +424,14 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
 
 void PrefixShortlistDigests::swap(PrefixShortlistDigests& other) noexcept {
     digests_.swap(other.digests_);
+}
+
+void PrefixShortlistDigests::prepare_generated(std::size_t count, std::int32_t rope_delta,
+                                               std::optional<std::uint32_t> split) {
+    if (digests_.empty())
+        throw std::logic_error("generated shortlist append has no resident prefix");
+    validate_generated(size(), count, rope_delta, split);
+    reserve(size() + count);
 }
 
 void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,

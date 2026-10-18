@@ -9,8 +9,7 @@
 #include <variant>
 
 namespace ninfer::models::qwen4_exp {
-class LoadPlan;
-class Model;
+class ModelDefinition;
 
 namespace execution {
 struct GdnProfile {
@@ -70,8 +69,7 @@ struct ModelProfile {
     std::vector<BankLayout> banks;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const LoadPlan&);
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const Model&);
+[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
 [[nodiscard]] std::size_t qsa_projection_workspace_bytes(const QsaProfile&, std::int32_t first,
                                                          std::int32_t last);
 } // namespace execution

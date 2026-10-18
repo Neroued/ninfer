@@ -21,9 +21,13 @@ installed/exported C++ SDK.
 This is a local, single-owner project with trusted local models, artifacts, and workflows.
 Do not derive requirements from another deployment or trust model.
 
-Model data is immutable; every Program owns its mutable state and device allocations. The loader
-validates, uploads, and binds the stored representation; actual Parameters and Ops determine
-execution support, without a whole-artifact capability registry.
+ModelDefinition owns immutable model metadata and Frontend resources. Each rank owns its
+ModelShard, Parameters and RankProgram. ModelSession owns logical continuations, checkpoints and
+the ContextDirectory; RankProgram owns physical storage, execution frames and CUDA Graphs.
+Executor transfers owning work and completion events between them. Single-device execution uses
+LocalExecutor on the Engine worker thread. The loader validates, uploads and binds the stored
+representation; actual Parameters and Ops determine execution support, without a whole-artifact
+capability registry.
 Runtime owns execution and publication policy; product/serving own input acquisition and protocol
 translation. Model code does not acquire media or own transport.
 

@@ -209,4 +209,13 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
     return out;
 }
 
+std::uint32_t VisionPrefillPlan::window_end(std::uint32_t begin, std::uint32_t end) const {
+    const auto next = std::lower_bound(
+        uses.begin(), uses.end(), begin,
+        [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
+    if (next != uses.end() && next->begin < end && next + 1 != uses.end())
+        end = std::min(end, (next + 1)->begin);
+    return end;
+}
+
 } // namespace ninfer::models::qwen

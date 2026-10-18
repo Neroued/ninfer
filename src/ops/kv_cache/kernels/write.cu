@@ -86,6 +86,18 @@ template <KvCacheStorage Storage, class G, class Metadata>
 void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metadata metadata,
                      cudaStream_t stream) {
     if constexpr (Storage == KvCacheStorage::BFloat16) {
+        if constexpr (requires { Metadata::masked; }) {
+            if (instance == PagedWriteInstance::BatchRows256) {
+                constexpr int Threads = 128;
+                const auto units      = static_cast<std::int64_t>(a.width) * G::KVHeads * (256 / 8);
+                const dim3 grid(common::div_up(units, static_cast<std::int64_t>(Threads)), 1,
+                                a.batch);
+                write_bf16_kernel<G, Metadata, true><<<grid, Threads, 0, stream>>>(
+                    a.k, a.v, a.positions, metadata, static_cast<__nv_bfloat16*>(a.keys),
+                    static_cast<__half*>(a.values), a.width);
+                return;
+            }
+        }
         if (a.batch != 1 ||
             (instance != PagedWriteInstance::Copy96 && instance != PagedWriteInstance::Copy128))
             throw std::logic_error("KV write: invalid BF16 instance");

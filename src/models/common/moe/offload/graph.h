@@ -34,10 +34,27 @@ public:
     explicit LayerGraphExecutable(const LayerGraphDefinition&);
     void update(const LayerGraphDefinition&);
     void upload(cudaStream_t);
-    void replay(Resources&, ExpertBankId, Tensor& output, CudaExecutionView,
-                const std::function<void()>& after_gpu_submit = {});
+    [[nodiscard]] bool start(Resources&, ExpertBankId, Tensor& output, CudaExecutionView,
+                             std::function<void()> after_gpu_submit = {});
+    [[nodiscard]] bool poll();
+    void cancel();
 
 private:
+    struct Invocation {
+        enum class Stage { BeforeLayer, Prepare, Complete };
+        Resources& resources;
+        ExpertBankId bank;
+        Tensor output;
+        CudaExecutionView cuda;
+        std::function<void()> after_gpu_submit;
+        Stage stage                     = Stage::BeforeLayer;
+        bool combined                   = false;
+        std::size_t calibration_variant = 0;
+        std::optional<PreparedExecution> call;
+    };
+
+    [[nodiscard]] bool advance();
+    std::optional<Invocation> pending_;
     GraphPlan plan_;
     DecodeGraphExecutable mixer_, steady_, feature_;
     std::array<DecodeGraphExecutable, 3> subsets_;

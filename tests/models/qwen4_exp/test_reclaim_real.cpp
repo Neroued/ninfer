@@ -1,47 +1,105 @@
 #include "models/qwen4_exp/load.h"
-#include "models/qwen4_exp/program/internal.h"
+#include "models/qwen4_exp/runtime_types.h"
+#include "models/qwen4_exp/session/internal.h"
+#include "runtime/executor/local_executor.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
 
 namespace {
 using namespace ninfer;
 namespace q4      = models::qwen4_exp;
 namespace context = models::context;
+using Executor    = runtime::LocalExecutor<q4::RuntimeTypes>;
 
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-void reclaim(q4::detail::ProgramImpl& p, DeviceContext& device) {
+q4::ContextResult retire_context(Executor& executor, runtime::ExecutionTicket ticket) {
+    std::optional<q4::ContextResult> result;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto event = executor.poll();
+        if (!event) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (const auto* failure = std::get_if<runtime::ExecutionFailed>(&*event))
+            throw std::runtime_error(failure->message);
+        require(std::visit([&](const auto& value) { return value.ticket == ticket; }, *event),
+                "context fixture received another execution's event");
+        if (auto* ready = std::get_if<runtime::ResultReady<q4::ExecutionTypes>>(&*event)) {
+            require(!result, "context fixture received a repeated result");
+            result.emplace(std::get<q4::ContextResult>(std::move(ready->result)));
+        } else if (std::holds_alternative<runtime::DeviceRetired>(*event)) {
+            require(result.has_value(), "context fixture retired before its result");
+            return std::move(*result);
+        } else {
+            throw std::runtime_error("context fixture requested a sampling decision");
+        }
+    }
+    throw std::runtime_error("context fixture did not retire before its deadline");
+}
+
+void execute(Executor& executor, context::ContextTransaction& transaction) {
+    transaction.prepare_actions();
+    auto reservation = executor.try_reserve(runtime::FrameKind::Context);
+    require(reservation.has_value(), "context fixture execution slot is occupied");
+    const auto ticket =
+        executor.submit(std::move(*reservation), {transaction.actions(), q4::ContextWork{}});
+    transaction.mark_submitted();
+    try {
+        (void)retire_context(executor, ticket);
+        transaction.mark_completed();
+        transaction.publish();
+    } catch (...) {
+        try {
+            executor.drain();
+        } catch (...) {}
+        if (transaction.in_flight()) transaction.mark_completed();
+        transaction.discard();
+        throw;
+    }
+}
+
+void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     const auto empty = p.usage().occupied;
-    std::array<context::KVHistory, 2> owners;
-    for (std::uint16_t pool = 0; pool < 2; ++pool) {
-        auto& histories     = p.resources.pool(pool).histories;
-        const auto frontier = pool == 0 ? 256U : 255U;
-        auto binding        = histories.prepare_binding(nullptr, 0, frontier, 0);
-        binding.enqueue_mapping(device.stream());
-        device.synchronize();
-        binding.publish_restores();
-        owners[pool] = binding.commit();
-        histories.prepare_write(owners[pool], 0, frontier, device.stream());
-        histories.commit_frontier(owners[pool].handle(), frontier);
-        const auto& physical = p.resources.pool(pool).cache.pages();
-        for (std::size_t plane = 0; plane < physical.plane_count(); ++plane)
-            CUDA_CHECK(cudaMemsetAsync(physical.plane(plane).data, 0, physical.plane(plane).bytes(),
-                                       device.stream()));
+    std::array<context::HistoryOwner, 2> owners;
+    {
+        auto bindings = p.directory.begin_transaction();
+        for (std::uint16_t pool = 0; pool < 2; ++pool)
+            bindings.add_binding(pool, p.directory.pool(pool).histories().prepare_binding(
+                                           nullptr, 0, 256U - pool, 0));
+        execute(executor, bindings);
+        for (std::uint16_t pool = 0; pool < 2; ++pool)
+            owners[pool] = bindings.binding(pool)->commit();
+    }
+    {
+        auto writes = p.directory.begin_transaction();
+        for (std::uint16_t pool = 0; pool < 2; ++pool)
+            p.directory.pool(pool).histories().prepare_write(owners[pool], 0, 256U - pool, writes);
+        execute(executor, writes);
+        for (std::uint16_t pool = 0; pool < 2; ++pool)
+            p.directory.pool(pool).histories().commit_frontier(owners[pool].handle(), 256U - pool);
     }
     const auto add = [&](std::uint32_t frontier) {
-        auto& states     = *p.resources.state_store;
+        auto& states     = p.directory.states();
         const auto image = states.reserve_destination();
         require(image.has_value(), "state reservation failed");
-        p.resources.states->storage().clear(states.physical_slot(*image), device.execution_view());
+        auto initialization = p.directory.begin_transaction();
+        initialization.own_state(*image);
+        initialization.clear_state();
+        execute(executor, initialization);
         states.complete_initialization(*image);
+        (void)initialization.state_destination().release();
         states.freeze(*image);
-        std::vector<context::KVPrefixRef> prefixes;
+        std::vector<context::HistoryPrefix> prefixes;
         for (std::uint16_t pool = 0; pool < 2; ++pool)
-            prefixes.push_back(p.resources.pool(pool).histories.retain_prefix(owners[pool].handle(),
-                                                                              frontier - pool));
+            prefixes.push_back(p.directory.pool(pool).histories().retain_prefix(
+                owners[pool].handle(), frontier - pool));
         auto identity = std::make_shared<q4::detail::Identity>();
         models::qwen::PreparedPromptData prompt;
         prompt.token_ids.resize(frontier, 1);
@@ -65,7 +123,6 @@ void reclaim(q4::detail::ProgramImpl& p, DeviceContext& device) {
     const auto alias = *p.checkpoints.reserve();
     p.checkpoints.publish(alias, p.checkpoints.at(shallow));
     const std::array all{shallow, deep, alias};
-    device.synchronize();
     for (auto& owner : owners) owner.reset();
     const auto plan = p.plan_reclaim(all, {}, {.kv_page_groups = {4}});
     const auto tail =
@@ -108,27 +165,21 @@ void reclaim(q4::detail::ProgramImpl& p, DeviceContext& device) {
             "stale quote ignored a newly published physical holder");
     require(p.checkpoints.erase(extra), "extra holder retirement failed");
     const auto pinned = one_tail->impl->pages[0].front();
-    p.resources.pool(0).pages.pin_source(pinned);
+    p.directory.pool(0).pages().pin_source(pinned);
     require(!p.start_demote(*one_tail), "demotion ignored a new KV reader");
-    p.resources.pool(0).pages.unpin_source(pinned);
+    p.directory.pool(0).pages().unpin_source(pinned);
     auto altered = *one_tail;
     ++altered.host_bytes;
     require(!p.start_demote(altered), "demotion accepted a changed physical quote");
 
     const auto settle = [&] {
-        for (unsigned attempt = 0; attempt < 8; ++attempt) {
-            device.synchronize();
-            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
-            require(p.operation &&
-                        std::holds_alternative<q4::detail::DemoteOperation>(p.operation->action),
-                    "unexpected native transaction in demotion fixture");
-            if (p.operation->migration.ready()) {
-                p.operation->migration.publish();
-                p.operation.reset();
-                return;
-            }
-        }
-        throw std::runtime_error("demotion did not complete");
+        require(p.operation && p.operation->ticket &&
+                    std::holds_alternative<q4::detail::DemoteOperation>(p.operation->action),
+                "unexpected native transaction in demotion fixture");
+        p.operation->result.emplace(retire_context(executor, *p.operation->ticket));
+        const auto completed = p.complete_context();
+        require(completed.complete && completed.published && !p.operation,
+                "demotion did not publish after physical retirement");
     };
     auto current = p.plan_reclaim(all, {}, {.kv_page_groups = {1}});
     require(!current.demotions.empty(), "Main demotion quote missing");
@@ -177,7 +228,7 @@ int main() {
         if (error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver || !devices)
             return 77;
         CUDA_CHECK(error);
-        DeviceContext device(0);
+        auto device = std::make_unique<DeviceContext>(0);
         EngineOptions options;
         options.use_cuda_graph                    = false;
         options.enable_vision                     = false;
@@ -190,17 +241,26 @@ int main() {
         options.context_cache.device_state_slots  = 4;
         options.context_cache.host_capacity_bytes = 256ULL * 1024 * 1024;
         artifact::Reader reader(path);
-        auto load      = q4::plan_load(reader, models::load_options(options));
-        auto profile   = q4::execution::describe_model(load);
-        auto execution = q4::plan_execution(profile, load.ple_table().geometry(), options, device,
-                                            8ULL * 1024 * 1024 * 1024,
-                                            q4::describe_moe_plan(*profile, options.moe));
+        auto definition = q4::read_definition(reader, models::load_options(options));
+        auto profile    = q4::execution::describe_model(*definition);
+        auto load       = q4::resolve_load(reader, definition, device->device(), Device::cpu());
+        auto execution  = q4::plan_execution(profile, load.ple_table().geometry(), options, *device,
+                                             8ULL * 1024 * 1024 * 1024,
+                                             q4::describe_moe_plan(*profile, options.moe));
         require(execution.has_value(), "reclaim test execution plan does not fit");
-        auto model = q4::materialize_model(
-            q4::resolve_load(std::move(load), device.device(), Device::cpu()), device);
-        q4::execution::Parameters parameters(*model, profile);
-        q4::detail::ProgramImpl program(parameters, std::move(*execution), device);
-        reclaim(program, device);
+        auto session_plan = q4::plan_session(*execution);
+        auto model        = q4::materialize_model(std::move(load), *device);
+        auto instance     = std::make_unique<runtime::RankModelInstance<q4::RuntimeTypes>>(
+            std::move(model), profile);
+        instance->program =
+            std::make_unique<q4::RankProgram>(instance->parameters, std::move(*execution), *device);
+        auto worker = std::make_unique<runtime::RankWorker<q4::RuntimeTypes>>(std::move(device),
+                                                                              std::move(instance));
+        Executor executor(std::move(worker), {1});
+        q4::detail::SessionImpl session(definition, std::move(session_plan));
+        session.executor            = &executor;
+        session.identity_generation = executor.epoch().value;
+        reclaim(session, executor);
         std::cout << "OK Qwen4Exp recovery quotes, physical coverage and migrations\n";
         return 0;
     } catch (const std::exception& error) {

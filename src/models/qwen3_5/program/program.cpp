@@ -1,342 +1,294 @@
 #include "models/qwen3_5/program/internal.h"
-
+#include "models/qwen3_5/execution/text.h"
 #include "core/startup.h"
-#include "models/common/qwen/frontend/prepared_prompt.h"
-#include "models/common/qwen/recovery_store.h"
-#include "models/qwen3_5/program/planning/startup.h"
-#include "models/qwen3_5/program/program_impl.h"
 
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
-#include <utility>
+#include <type_traits>
 
 namespace ninfer::models::qwen3_5 {
 
-SequencePlan::SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept
-    : impl_(std::move(impl)) {}
+RankProgram::RankProgram(std::unique_ptr<detail::RankProgramImpl> impl) : impl_(std::move(impl)) {}
 
-SequencePlan::SequencePlan(SequencePlan&&) noexcept = default;
+RankProgram::~RankProgram() = default;
 
-SequencePlan& SequencePlan::operator=(SequencePlan&&) noexcept = default;
+runtime::ExecutionCapacity RankProgram::capacity() const noexcept { return {1, 1}; }
 
-SequencePlan::~SequencePlan() = default;
-
-std::uint32_t SequencePlan::capacity() const noexcept {
-    return impl_ != nullptr ? impl_->capacity : 0;
+void RankProgram::validate_work(const Work& work, runtime::FrameKind required) const {
+    impl_->validate_work(work, required);
 }
 
-std::uint32_t SequencePlan::kv_capacity() const noexcept {
-    return impl_ != nullptr ? impl_->kv_capacity : 0;
+void RankProgram::validate_decision(runtime::ExecutionTicket ticket,
+                                    const runtime::DecisionInput& input) const {
+    impl_->validate_decision(ticket, input);
 }
 
-std::uint32_t SequencePlan::max_concurrency() const noexcept {
-    return impl_ != nullptr ? impl_->max_concurrency : 0;
+void RankProgram::prepare_commit(runtime::ExecutionTicket ticket, Commit& commit) const {
+    impl_->prepare_commit(ticket, commit);
 }
 
-std::size_t SequencePlan::device_reservation_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
+void RankProgram::start(runtime::ExecutionRequest<ExecutionTypes>&& request) {
+    impl_->start(std::move(request));
 }
 
-std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->workspace.capacity : 0;
+void RankProgram::supply(runtime::ExecutionTicket ticket, runtime::CommandSequence command,
+                         runtime::DecisionInput&& input) {
+    impl_->supply(ticket, command, std::move(input));
 }
 
-std::size_t SequencePlan::host_capacity_bytes() const noexcept {
-    return impl_ ? impl_->context_cache.host_capacity_bytes.value_or(0) : 0;
+void RankProgram::commit(runtime::ExecutionTicket ticket, runtime::CommandSequence command,
+                         Commit&& commit) {
+    impl_->commit(ticket, command, std::move(commit));
 }
 
-SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-SequencePlanner::SequencePlanner(SequencePlanner&&) noexcept = default;
-
-SequencePlanner& SequencePlanner::operator=(SequencePlanner&&) noexcept = default;
-
-SequencePlanner::~SequencePlanner() = default;
-
-const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
-    static const runtime::SequenceCapacityCurve empty;
-    return impl_ != nullptr ? impl_->curve : empty;
+void RankProgram::discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
+    impl_->discard(ticket, command);
 }
 
-SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
-    if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));
+std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgram::poll() { return impl_->poll(); }
+
+void RankProgram::drain() { impl_->drain(); }
+
+MemorySummary RankProgram::memory_summary() const { return impl_->memory_summary(); }
+
+void RankProgram::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+
+std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles() const {
+    std::vector<context::KVTransferProfile> profiles{
+        impl_->resources.decoder.text_kv.pages().transfer_profile()};
+    if (const auto* backend = impl_->resources.backend_kv())
+        profiles.push_back(backend->pages().transfer_profile());
+    return profiles;
 }
 
-RequestBasePlan::RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept = default;
-
-RequestBasePlan& RequestBasePlan::operator=(RequestBasePlan&&) noexcept = default;
-
-RequestBasePlan::~RequestBasePlan() = default;
-
-const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
-    static const runtime::RequestPlanSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
-}
-
-const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    static const qwen::PreparedContextCache empty;
-    return impl_ != nullptr ? impl_->context_cache : empty;
-}
-
-std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
-    std::vector<std::uint32_t> frontiers;
-    if (impl_) {
-        frontiers.reserve(impl_->capture_groups.size());
-        for (const auto& group : impl_->capture_groups) { frontiers.push_back(group.frontier); }
-    }
-    return frontiers;
-}
-
-std::optional<PrefixShortlistKey>
-RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
-    if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
-        return std::nullopt;
-    }
-    return PrefixShortlistKey{
-        .digests      = impl_->prefix_digests.at(frontier),
-        .frontier     = frontier,
-        .identity_tag = impl_->prefix_identity_tag,
-    };
-}
-
-ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-ResumeState::ResumeState(ResumeState&&) noexcept            = default;
-ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
-ResumeState::~ResumeState()                                 = default;
-
-bool ResumeState::has_snapshot() const noexcept { return impl_ && impl_->snapshot.has_value(); }
-
-std::optional<CheckpointHandle> ResumeState::snapshot_handle() const noexcept {
-    return impl_ ? impl_->snapshot : std::nullopt;
-}
-
-std::uint32_t ResumeState::frontier() const noexcept { return impl_ ? impl_->frontier : 0; }
-
-Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
-
-Program::~Program() noexcept = default;
-
-RequestBasePlan Program::plan_request(qwen::PreparedPrompt&& prompt,
-                                      const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(qwen::PreparedPromptAccess::take(std::move(prompt)), options);
-}
-
-std::vector<float> Program::causal_score(qwen::PreparedPrompt&& prompt, std::uint32_t target) {
-    return impl_->causal_score(qwen::PreparedPromptAccess::take(std::move(prompt)), target);
-}
-
-std::optional<SourceCandidate>
-Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                        bool consume_source, std::span<const CheckpointHandle> private_points,
-                        std::span<const CheckpointHandle> retired_points) const {
-    return impl_->inspect_source(base, checkpoint, consume_source, private_points, retired_points);
-}
-
-PrefixShortlistKey Program::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
-    return impl_->checkpoint_key(h, f);
-}
-
-std::span<const runtime::KvPoolDescriptor> Program::kv_pools() const noexcept {
-    return impl_->kv_pools;
-}
-
-ContextResources Program::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
-    return impl_->checkpoint_footprint(handles);
-}
-
-CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
-    return impl_->checkpoint_summary(h);
-}
-
-CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle h) const {
-    return impl_->checkpoint_metadata(h);
-}
-
-bool Program::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& b) const {
-    return impl_->checkpoint_matches(h, b);
-}
-
-std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle retained,
-                                                    const RequestBasePlan& base,
-                                                    std::uint32_t target) const {
-    return impl_->checkpoint_recovery_frontier(retained, base, target);
-}
-
-context::RecoveryEvaluation<>
-Program::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
-    impl_->recovery_index.synchronize(qwen::RecoveryStoreView{impl_->checkpoints});
-    return impl_->recovery_index.evaluate(advertised);
-}
-
-bool Program::valid_checkpoint(CheckpointHandle h) const noexcept {
-    return impl_->valid_checkpoint(h);
-}
-
-bool Program::release_checkpoint(CheckpointHandle h) noexcept {
-    return impl_->release_checkpoint(h);
-}
-
-bool Program::revoke_snapshot(ResumeState& paused) noexcept {
-    return impl_->revoke_snapshot(paused);
-}
-
-ContextResources Program::snapshot_resources(const ResumeState& paused) const {
-    return impl_->snapshot_resources(paused);
-}
-
-std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
-    return impl_->host_bytes_released(checkpoints);
-}
-
-std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
-}
-
-std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
-                                            std::optional<SequenceHandle> pending_backup) {
-    return impl_->release_redundant_host(excluded, pending_backup);
-}
-
-ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
-    return impl_->reserve_units(units);
-}
-
-bool Program::reclaim_capture_reservation(ContextResources shortage) {
-    return impl_->reclaim_capture_reservation(shortage);
-}
-
-void Program::release_units(std::span<const SequenceHandle> units) noexcept {
-    impl_->release_units(units);
-}
-
-BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
-                                          const SourceCandidate& source, ResumeState* resume,
-                                          ExecutionUnitKind kind, std::uint32_t tokens) {
-    return impl_->start_binding(base, lane, source, resume, kind, tokens);
-}
-
-bool Program::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
-
-bool Program::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
-
-std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
-    return impl_->prepare_capture(h);
-}
-
-void Program::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
-
-bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
-
-ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
-                                         std::span<const CheckpointHandle> excluded,
-                                         ContextResources shortage) const {
-    return impl_->plan_reclaim(allowed, excluded, shortage);
-}
-
-context::ReleasePlan<ContextRelease, ContextResources>
-Program::plan_releases(std::span<const CheckpointHandle> allowed,
-                       std::span<const CheckpointHandle> excluded,
-                       ContextResources shortage) const {
-    return impl_->plan_releases(allowed, excluded, shortage);
-}
-
-bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing) {
-    return impl_->start_pause(h, save, timing);
-}
-
-ContextProgress Program::poll_context(runtime::CancellationFlagView c) {
-    return impl_->poll_context(c);
-}
-
-bool Program::context_blocks(SequenceHandle sequence) const noexcept {
-    return impl_->context_blocks(sequence);
-}
-
-bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
-    return impl_->recovery_pending(sequence);
-}
-
-bool Program::has_context_operation() const noexcept { return impl_->has_context_operation(); }
-
-PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
-                                         runtime::TokenMaskProvider* m) {
-    return impl_->advance_prefill(h, t, m);
-}
-
-ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTiming* t) {
-    return impl_->advance_replay(h, t);
-}
-
-PendingBatch Program::decode(std::span<const SequenceHandle> s,
-                             std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t,
-                             runtime::TokenMaskProvider* m) {
-    return impl_->decode(s, b, t, m);
-}
-
-runtime::ExecutionTiming Program::append_forced_tokens(
-    std::span<const SequenceHandle> s, std::span<const TokenId> ids, std::uint32_t stride,
-    std::span<const std::optional<std::uint32_t>> splits, runtime::ExecutionTiming* t) {
-    return impl_->append_forced_tokens(s, ids, stride, splits, t);
-}
-
-CommitResult Program::commit(PendingBatch&& p, std::span<const runtime::CommitDecision> d,
-                             runtime::CommitObservation o, runtime::ExecutionTiming* t) {
-    return impl_->commit(std::move(p), d, o, t);
-}
-
-DiscardResult Program::abort_pending(PendingBatch&& p) noexcept {
-    return impl_->abort_pending(std::move(p));
-}
-
-FinishResult Program::finish(SequenceHandle s) noexcept { return impl_->finish(s); }
-
-AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); }
-
-void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
-
-PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
-
-MemorySummary Program::memory_summary() const { return impl_->memory_summary(); }
-
-void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
-
-SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
-                                      DeviceContext& device, const EngineOptions& options) {
-    return make_sequence_planner(parameters.profile, device, options);
-}
-
-SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
-                                      DeviceContext& device, const EngineOptions& options,
-                                      std::shared_ptr<const moe::Plan> moe) {
-    return SequencePlanner(
-        detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe)));
-}
-
-std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
-                                        SequencePlan&& plan, DeviceContext& device,
-                                        const StartupObserver& startup_observer) {
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->profile != parameters.profile) {
-        throw std::invalid_argument("sequence plan belongs to another model instance");
-    }
-    if (plan.impl_->multiprocessor_count != device.multiprocessor_count()) {
-        throw std::invalid_argument("sequence plan device capacity does not match execution");
-    }
+std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& parameters,
+                                                 SequencePlan&& plan, DeviceContext& device,
+                                                 const StartupObserver& observer) {
+    if (!plan.impl_) throw std::invalid_argument("Qwen3.5 rank requires a sequence plan");
     auto impl =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+        std::make_unique<detail::RankProgramImpl>(parameters, *plan.impl_, device, observer);
     if (plan.impl_->use_cuda_graph) {
-        StartupPhaseScope phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        StartupPhaseScope phase(observer, StartupPhase::CudaGraphPrepare);
         impl->initialize_graphs();
         phase.complete();
     }
     plan.impl_.reset();
-    return std::unique_ptr<Program>(new Program(std::move(impl)));
+    return std::unique_ptr<RankProgram>(new RankProgram(std::move(impl)));
 }
 
 } // namespace ninfer::models::qwen3_5
+
+namespace ninfer::models::qwen3_5::detail {
+
+ComputeOperation::ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&& value)
+    : request(std::move(value)), last_command(request.command) {}
+
+ComputeOperation::~ComputeOperation() = default;
+
+void RankProgramImpl::validate_row(const ExecutionRow& row) const {
+    const auto lane = row.member.residency.lane.value;
+    if (lane >= max_concurrency || !row.member.sequence.generation ||
+        !row.member.residency.generation || !row.source_state.valid() ||
+        !row.destination_state.valid() || row.state_slots.source < 0 ||
+        row.state_slots.destination < 0 ||
+        row.state_slots.source >= resources.state_images.storage().slot_count() ||
+        row.state_slots.destination >= resources.state_images.storage().slot_count() ||
+        !row.main_table.valid() || row.main_table.pool_id != 0 ||
+        row.main_table.index >=
+            static_cast<std::uint32_t>(resources.decoder.text_kv.tables().row_count()) ||
+        row.main_frontier > capacity || row.backend_frontier > row.main_frontier) {
+        throw std::invalid_argument("Qwen3.5 work has an invalid row binding");
+    }
+    const auto* cache = resources.backend_kv();
+    if (bool(cache) != row.backend_table.has_value() ||
+        (cache &&
+         (!row.backend_table->valid() || row.backend_table->pool_id != 1 ||
+          row.backend_table->index >= static_cast<std::uint32_t>(cache->tables().row_count())))) {
+        throw std::invalid_argument("Qwen3.5 work has an invalid backend row binding");
+    }
+    if (backend == SpeculativeBackend::Mtp &&
+        row.backend_frontier != (row.main_frontier ? row.main_frontier - 1 : 0)) {
+        throw std::invalid_argument("MTP history must end immediately before the Main frontier");
+    }
+    const auto& installed = residencies[lane];
+    if (!installed.installed || installed.id != row.member.residency ||
+        installed.sequence != row.member.sequence) {
+        throw std::logic_error("Qwen3.5 work references a retired residency");
+    }
+}
+
+void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
+    const bool context = std::holds_alternative<ContextWork>(work.operation);
+    if (kind != (context ? runtime::FrameKind::Context : runtime::FrameKind::Compute)) {
+        throw std::invalid_argument("Qwen3.5 work is reserved in the wrong execution frame");
+    }
+    (context ? context_actions : compute_actions)->validate(work.context);
+    auto validate_input = [&](const InputWindow& input) {
+        if (input.tokens.size() > prefill_chunk ||
+            input.rope_positions.size() != input.tokens.size() * 3) {
+            throw std::invalid_argument("Qwen3.5 input window has invalid positions or extent");
+        }
+        std::uint32_t previous = 0;
+        for (const auto split : input.execution_splits) {
+            if (split <= previous || split >= input.tokens.size())
+                throw std::invalid_argument(
+                    "Qwen3.5 input segments are not strictly inside its window");
+            previous = split;
+        }
+        for (TokenId id : input.tokens) {
+            if (id < 0 || static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
+                throw std::invalid_argument("Qwen3.5 input token is outside the public domain");
+        }
+    };
+    auto validate_members = [&](const auto& rows, auto binding) {
+        if (rows.empty() || rows.size() > max_concurrency)
+            throw std::invalid_argument("Qwen3.5 work has invalid batch membership");
+        std::array<bool, kMaximumConcurrency> seen{};
+        for (const auto& value : rows) {
+            const auto& row = binding(value);
+            validate_row(row);
+            auto& present = seen[row.member.residency.lane.value];
+            if (present) throw std::invalid_argument("Qwen3.5 work repeats a residency");
+            present = true;
+        }
+    };
+    std::visit(
+        [&](const auto& op) {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, ContextWork>) {
+                for (const auto& binding : op.bindings) {
+                    if (binding.member.residency.lane.value >= max_concurrency ||
+                        !binding.member.residency.generation || !binding.member.sequence.generation)
+                        throw std::invalid_argument("Qwen3.5 residency installation is invalid");
+                    for (auto id : binding.committed_generated_tokens) {
+                        if (id < 0 ||
+                            static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
+                            throw std::invalid_argument("Qwen3.5 restored count token is invalid");
+                    }
+                }
+                for (auto id : op.releases) {
+                    if (id.lane.value >= max_concurrency || !residencies[id.lane.value].installed ||
+                        residencies[id.lane.value].id != id)
+                        throw std::logic_error("Qwen3.5 release references a retired residency");
+                }
+            } else if constexpr (std::is_same_v<T, ForwardWork>) {
+                validate_members(op.rows,
+                                 [](const auto& row) -> const ExecutionRow& { return row; });
+                if (op.inputs.size() != op.rows.size() ||
+                    (op.sample != SamplePurpose::None && op.sampling.size() != op.rows.size()))
+                    throw std::invalid_argument("Qwen3.5 forward inputs do not match membership");
+                if (op.purpose == ForwardPurpose::Control) {
+                    if (op.committed_tokens.size() != op.rows.size())
+                        throw std::invalid_argument(
+                            "Qwen3.5 control tokens do not match membership");
+                    for (const auto& tokens : op.committed_tokens) {
+                        if (tokens.size() > prefill_chunk)
+                            throw std::invalid_argument("Qwen3.5 control exceeds staging capacity");
+                        for (TokenId id : tokens)
+                            if (id < 0 ||
+                                static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
+                                throw std::invalid_argument(
+                                    "Qwen3.5 control token is outside its vocabulary");
+                    }
+                }
+                for (std::size_t i = 0; i < op.rows.size(); ++i) {
+                    validate_input(op.inputs[i]);
+                    if (op.rows[i].main_frontier + op.inputs[i].tokens.size() > capacity ||
+                        (op.inputs[i].tokens.empty() && op.sample == SamplePurpose::None &&
+                         op.purpose != ForwardPurpose::Replay))
+                        throw std::invalid_argument("Qwen3.5 forward exceeds its context");
+                }
+            } else if constexpr (std::is_same_v<T, DecodeWork>) {
+                validate_members(
+                    op.rows, [](const auto& row) -> const ExecutionRow& { return row.binding; });
+                for (const auto& row : op.rows) {
+                    if (!row.binding.main_frontier || row.draft_extent > draft_window ||
+                        row.binding.main_frontier + row.draft_extent + 1 > capacity ||
+                        row.anchor < 0 ||
+                        static_cast<std::uint32_t>(row.anchor) >=
+                            parameters.profile->public_tokens ||
+                        !row.output_tokens_remaining ||
+                        row.draft_extent >= row.output_tokens_remaining)
+                        throw std::invalid_argument(
+                            "Qwen3.5 decode extent exceeds its execution permit");
+                }
+            } else if constexpr (std::is_same_v<T, NormalizeWork>) {
+                validate_members(op.rows,
+                                 [](const auto& row) -> const ExecutionRow& { return row; });
+                if (!resources.dflash)
+                    throw std::logic_error("normalization requires draft feature state");
+            } else if constexpr (std::is_same_v<T, ScoreWork>) {
+                validate_row(op.row);
+                validate_input(op.input);
+                if (!resources.frame.spec.causal_scoring || op.input.tokens.empty() ||
+                    op.first_column > op.input.tokens.size() ||
+                    op.targets.size() > op.input.tokens.size() - op.first_column)
+                    throw std::invalid_argument("Qwen3.5 scoring span is invalid");
+            }
+        },
+        work.operation);
+}
+
+ComputeOperation& RankProgramImpl::require_compute(runtime::ExecutionTicket ticket) {
+    if (!compute || compute->request.ticket != ticket)
+        throw std::logic_error("Qwen3.5 execution ticket is no longer active");
+    return *compute;
+}
+
+const ComputeOperation& RankProgramImpl::require_compute(runtime::ExecutionTicket ticket) const {
+    if (!compute || compute->request.ticket != ticket)
+        throw std::logic_error("Qwen3.5 execution ticket is no longer active");
+    return *compute;
+}
+
+void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
+                                        const runtime::DecisionInput& input) const {
+    const auto& op = require_compute(ticket);
+    if (!op.decision_requested || op.decision_supplied || input.stage != op.decision_stage)
+        throw std::logic_error("Qwen3.5 decision input does not match the pending stage");
+    std::array<bool, kMaximumConcurrency> seen{};
+    const auto words = (parameters.profile->public_tokens + 31) / 32;
+    for (const auto& row : input.rows) {
+        if (row.member >= op.batch || seen[row.member] || !op.sampling[row.member].constrained ||
+            row.positions !=
+                static_cast<std::uint32_t>(resources.frame.host_ingress->extents[row.member] + 1) ||
+            row.words.size() != words * row.positions || (row.dead_positions >> row.positions) != 0)
+            throw std::invalid_argument("Qwen3.5 decision mask has invalid shape or membership");
+        seen[row.member] = true;
+    }
+    for (std::uint32_t row = 0; row < op.batch; ++row) {
+        if (seen[row] != op.sampling[row].constrained)
+            throw std::invalid_argument("Qwen3.5 decision omitted a constrained row");
+    }
+}
+
+void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, Commit& value) const {
+    const auto& op = require_compute(ticket);
+    if (op.stage != ComputeStage::AwaitCommit || !op.result_published)
+        throw std::logic_error("Qwen3.5 commit does not match the pending result");
+    const auto* forward  = std::get_if<ForwardWork>(&op.request.work.operation);
+    const bool generated = std::holds_alternative<DecodeWork>(op.request.work.operation) ||
+                           (forward && forward->sample != SamplePurpose::None);
+    if (!generated) {
+        if (!value.rows.empty() && value.rows.size() != op.batch)
+            throw std::invalid_argument("Qwen3.5 non-generating commit has invalid membership");
+        compute_actions->validate(value.context);
+        return;
+    }
+    const auto& output = *resources.frame.host_egress;
+    if (value.rows.size() != op.batch)
+        throw std::invalid_argument("Qwen3.5 generating commit has invalid membership");
+    compute_actions->validate(value.context);
+    for (std::uint32_t i = 0; i < op.batch; ++i) {
+        const auto& row = value.rows[i];
+        if (row.accepted_tokens > static_cast<std::uint32_t>(output.counts[i]) ||
+            (row.discarded && row.accepted_tokens != 0) ||
+            (!row.discarded && !row.accepted_tokens) ||
+            (!row.terminal && !row.discarded &&
+             row.accepted_tokens != static_cast<std::uint32_t>(output.counts[i])))
+            throw std::invalid_argument("Qwen3.5 commit contains an invalid accepted prefix");
+    }
+}
+
+} // namespace ninfer::models::qwen3_5::detail

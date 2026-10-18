@@ -5,54 +5,29 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-qwen::VisionPrefillPlan ProgramImpl::plan_vision(const qwen::PreparedPromptData& prompt) const {
-    if (!parameters.vision) throw std::invalid_argument("Vision is disabled for this Engine");
-    const auto& config    = *parameters.model.config().vision;
-    const auto& workspace = *resources.plan.workspace.vision;
-    qwen::VisionPrefillPlan out;
-    out.control_plan =
-        std::make_shared<qwen::VisionControlPlan>(qwen::plan_vision_control(prompt, config));
-    out.control = std::make_shared<qwen::VisionControl>(
-        qwen::build_vision_control(prompt, *out.control_plan, 0));
-    for (std::uint32_t i = 0; i < out.control_plan->items.size(); ++i) {
-        const auto& item    = out.control_plan->items[i];
-        const auto patches  = prompt.vision_items[i].patch_count;
-        const auto& payload = prompt.media_payloads[i];
-        if (!payload || payload->patch_elements != patches * config.patch_width())
-            throw std::invalid_argument("Vision item has an invalid patch payload");
-        if (item.merged_count > workspace.max_merged_tokens ||
-            qwen::VisionContext::workspace_bytes(config, *parameters.vision, patches,
-                                                 item.merged_count,
-                                                 workspace) > workspace.encode_peak_bytes)
-            throw std::invalid_argument("Vision item exceeds the Program workspace envelope");
-        out.uses.push_back({item.token_begin, item.token_end, i, i});
-        out.max_merged_count = std::max(out.max_merged_count, item.merged_count);
-    }
-    return out;
-}
-
-std::optional<execution::VisualEmbeddingView> ProgramImpl::prepare_vision(Sequence& s,
-                                                                          std::uint32_t tokens) {
-    const auto& request = *s.request;
-    const auto begin    = s.continuation.metadata.main_frontier;
-    if (!request.vision || begin >= request.summary.prompt_tokens) return {};
-    const auto& plan = *request.vision;
+std::optional<execution::VisualEmbeddingView>
+RankProgramImpl::prepare_vision(ResidentBinding& binding, std::uint32_t begin,
+                                std::uint32_t tokens) {
+    const auto& input = binding.vision_input;
+    if (!input || begin >= input->prompt_tokens) return {};
+    const auto& plan = input->plan;
     const auto item  = std::lower_bound(
         plan.uses.begin(), plan.uses.end(), begin,
         [](const auto& use, std::uint32_t position) { return use.end <= position; });
-    if (item == plan.uses.end() || item->begin >= begin + tokens) return {};
-    if (!s.vision)
-        s.vision = std::make_unique<qwen::VisionPrefillSession>(
-            device, *parameters.model.config().vision, *parameters.vision,
-            resources.workspace_storage(), *resources.plan.workspace.vision, request.prompt, plan,
-            vision_handoff, vision_handoff_peak_bytes);
-    const auto chunk = s.vision->prepare_chunk(begin, tokens);
-    if (chunk.length != tokens || !chunk.control)
+    if (item == plan.uses.end() || item->begin >= std::uint64_t(begin) + tokens) return {};
+    if (!binding.vision) {
+        binding.vision = std::make_unique<qwen::VisionPrefillExecution>(
+            device, *parameters.profile->config.vision, *parameters.vision,
+            resources.workspace_storage(), *resources.plan.workspace.vision, input, vision_handoff,
+            vision_handoff_peak_bytes);
+    }
+    const auto chunk = binding.vision->prepare_chunk(begin, tokens);
+    if (chunk.length != static_cast<std::int32_t>(tokens) || !chunk.control)
         throw std::logic_error("Vision execution differs from the reserved input window");
     vision_workspace_peak_bytes =
         std::max(vision_workspace_peak_bytes, chunk.encode_workspace_bytes);
     const auto slice = qwen::visual_embedding_slice(chunk.control->scatter_indices,
-                                                    request.summary.prompt_tokens, begin, tokens);
+                                                    input->prompt_tokens, begin, tokens);
     if (slice.empty()) return {};
     const auto count   = static_cast<std::int32_t>(slice.size());
     const auto& region = *resources.plan.persistent.buffers.batch.visual_indices;
@@ -66,26 +41,26 @@ std::optional<execution::VisualEmbeddingView> ProgramImpl::prepare_vision(Sequen
         chunk.embeddings.slice(1, static_cast<std::int32_t>(slice.source_begin), count), indices};
 }
 
-double ProgramImpl::collect_vision_timing(Sequence& s) {
-    if (!s.vision) return 0;
-    const auto elapsed        = s.vision->elapsed_seconds();
-    const auto increment      = elapsed - s.observed_vision_seconds;
-    s.observed_vision_seconds = elapsed;
-    s.timings.vision_seconds += increment;
-    if (s.continuation.metadata.main_frontier >= s.request->vision->uses.back().end)
-        retire_vision(s);
+double RankProgramImpl::collect_vision_timing(ResidentBinding& binding,
+                                              std::uint32_t committed_frontier) {
+    if (!binding.vision) return 0;
+    const auto elapsed              = binding.vision->elapsed_seconds();
+    const auto increment            = elapsed - binding.observed_vision_seconds;
+    binding.observed_vision_seconds = elapsed;
+    if (committed_frontier >= binding.vision_input->plan.uses.back().end) retire_vision(binding);
     return increment;
 }
 
-void ProgramImpl::retire_vision(Sequence& s) noexcept {
-    s.vision.reset();
-    s.observed_vision_seconds = 0;
+void RankProgramImpl::retire_vision(ResidentBinding& binding) noexcept {
+    binding.vision.reset();
+    binding.observed_vision_seconds = 0;
 }
 
-std::size_t ProgramImpl::active_vision_bytes() const noexcept {
+std::size_t RankProgramImpl::active_vision_bytes() const noexcept {
     std::size_t bytes = 0;
-    for (const auto& s : sequences)
-        if (s && s->vision) bytes = std::max(bytes, s->vision->active_handoff_bytes());
+    for (const auto& binding : bindings)
+        if (binding && binding->vision)
+            bytes = std::max(bytes, binding->vision->active_handoff_bytes());
     return bytes;
 }
 

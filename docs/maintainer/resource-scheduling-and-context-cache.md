@@ -6,7 +6,7 @@
 
 ## 1. 核心思路
 
-NInfer 在单 GPU、单常驻模型、启动固定的 1–8 个执行槽上运行。Hybrid 模型复用一个前缀，需要
+当前产品通过 LocalExecutor 在一个 rank、一张 GPU、单常驻模型及启动固定的 1–8 个 resident lanes 上运行。Hybrid 模型复用一个前缀，需要
 该位置的完整 recurrent state 和连续 KV 覆盖。KV 可以逐页共享，recurrent state 则是某个位置
 的完整恢复镜像。因此，缓存管理同时使用三个单位：
 
@@ -27,32 +27,36 @@ prefill chunk 仅切分调度工作，不自动保存 state。真实采用和重
 
 | 部分 | 拥有的事实与决定 |
 |---|---|
-| Frontend | 模板渲染、token/位置/媒体身份、typed rewrite 与实际输入恢复位置、共享 marker 的精确边界 |
-| Engine 请求记录 | 原始票号、输入与输出对象、预算、取消、首次时间、跨暂停的续接关系 |
-| Scheduler | 执行成员、fresh 扫描与有限越过、prefill/replay 轮转、抢占和恢复门控 |
-| ResourceManager | 私有续接与公共条目、前缀索引、等待引用、需求证据、来源选择与回收权限 |
-| Native Program | 模型账本、后端 frontier、完整恢复点、工作单元需求、状态提交与恢复 |
-| Program 内的 stores | State、KV、Host backing、引用、reader lease、预留和副本的真实占用 |
+| Frontend | 模板、token/位置/媒体身份、typed rewrite、精确恢复位置与共享 marker |
+| Engine 请求记录 | 原始票号、输入/输出对象、预算、取消、首次时间、跨暂停的续接关系 |
+| Scheduler | 执行成员、fresh 扫描与有限越过、prefill/Replay 轮转、抢占与恢复门控 |
+| ResourceManager | 私有续接与公共入口、前缀索引、等待引用、需求证据、来源排序与回收权限 |
+| 原生 Session | 模型账本、Main/backend 前沿、完整恢复点、工作需求、逻辑提交和恢复数学 |
+| ContextDirectory | State/page/history/row 身份、空间分配、coverage、引用、reader leases、Host 范围与预留 |
+| Executor / RankProgram | 执行额度与 ticket、物理 backing、COW/传输/页表动作、计算、Graph 与完成事件 |
 
 ```mermaid
 flowchart TD
-    F[Frontend：精确输入与恢复边界] --> Q[请求记录]
+    F[Frontend：精确输入与恢复边界] --> Q[Engine 请求记录]
     Q --> S[Scheduler：本轮工作集合]
     Q --> R[ResourceManager：候选与保留顺序]
-    R --> N[Program：校验、绑定、执行与提交]
+    R --> N[原生 Session：模型前沿与事务]
     S --> N
-    N --> P[Stores：实际分配与引用]
-    P --> T[传输：预留、复制、发布、释放]
-    T --> N
+    N --> D[ContextDirectory：唯一分配与引用账本]
+    N --> X[Executor：拥有型 work 与 ticket]
+    X --> P[RankProgram：固定存储与实际执行]
+    P --> X
+    X --> N
     N --> E[Engine：输出与生命周期发布]
 ```
 
-Runtime 从 Program 查询真实占用和可释放量。逻辑记录可以共享同一份物理内容，解除一个记录也
-可能释放零字节。检查点所有者要求内容保持可恢复；reader lease 则保护本次实际读取的副本，直到
-计算或传输完成。缓存记录的保留等级不等于整条历史被 pin。
+Runtime 向 Session 查询目录中的占用和可释放量，rank 不再次选择缓存来源或物理页号。
+多个逻辑入口可以共享一份内容，解除一个入口可能释放零字节。checkpoint owner 保护恢复资格，
+reader lease 保护实际读取的副本直至计算或传输完成；保留等级不等于整条历史被 pin。
 
-一个 Engine 控制线程推进策略、事务和引用结算。Program 拥有自己的可变 state、workspace、
-context stores 和 CUDA Graph，不与其他 Program 共享可变分配。
+控制线程推进策略、Session 事务和引用结算。RankProgram 拥有固定 Device/Host backing、frame、workspace
+与 Graph；ContextActions 只携带值身份、范围及有寿命的映射数组。目录和物理存储的合同见
+[Paged KV](paged-kv-cache.md)，模型账本与输出提交见[Engine 架构](engine-architecture.md)。
 
 <a id="capacity"></a>
 ## 3. 容量与执行许可
@@ -76,7 +80,7 @@ Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界
 按[启动生命周期](engine-architecture.md#25-实例生命周期与固定执行)从剩余显存中单独扣除。
 显式或自动容量都要落在这条曲线内并满足预算。容量并不平均切给每个 lane。
 
-Program 的 pool 目录在启动时固定，`KvPoolId` 标识具体 pool；目录给出几何、Device 容量与
+Session 的 pool 目录在启动时固定，`KvPoolId` 标识具体 pool；目录给出几何、Device 容量与
 Host page stride，名称仅用于诊断。模型内部保留 Text/MTP/Draft Full 角色；Runtime 的需求、
 缺口、占用和释放量使用 `ContextResources<N>`：State slots、按 pool ID 索引的 KV page groups、
 Host allocated bytes。`N` 由原生架构声明，普通执行查询不分配动态容器。
@@ -94,21 +98,26 @@ KV 的分项占用用于观测，不能再次相加成额外配额。传输目�
 必要请求输入、token 账本、prepared media、Responses 存储和 Frontend 媒体缓存各有自己的
 生命周期与现有数量、长度或媒体预算约束。Host context 容量不覆盖这些内存，也不限制进程总 RAM。
 物理容量同时约束 Native 元数据规模；空逻辑记录和索引分支及时删除。
+PreparedSession 在最终启动预算检查前建立目录、checkpoint catalog 和控制容器，成功后移交 Session。
+Spark 的统一内存核算包含这些 Host 元数据；容量重建先释放控制 owner，再释放 rank backing，分别观测回收量。
 
 ### 3.2 执行与恢复许可
 
-Program 根据实际绑定状态计算 Prefill、Replay、Decode/Verify、Control 或 Normalize 的 typed KV
+Session 根据实际绑定状态计算 Prefill、Replay、Decode/Verify、Control 或 Normalize 的 typed KV
 覆盖，包含 speculative 峰值与后端需要。State 与缺失副本另外取得；写入冲突所需的尾页 COW 计入绑定或 unit 许可。
 一次 unit 的多个 typed pool 申请共同成功，失败归还本次部分预留并返回具体缺口。
+此外，Executor 为执行取得 frame 和后续 decision/commit/discard 额度。Session 拿到这份完整许可后
+才进入不可撤销的活动目录准备；此后的异常是执行实例失败，不作为普通资源不足回到准入选择。
 
 Engine 按恢复优先、原票号优先取得 resident 单元许可，形成可运行子集；一行暂时不足不会阻止
 其他已许可行执行。Fresh admission 使用余量，不能花掉现存许可。普通 unit 结算释放未用预留，
-后续增长继续按需申请。算子内部不选择缓存受害者。
+后续增长继续按需申请。trim 失去逻辑引用的在途页与 row 仍保留至 DeviceRetired；下一单元所需的
+growth reservation 在这些页实际归还后补足，不为新旧许可暂时占两份容量。算子内部不选择缓存受害者。
 
 同步回收已经改变容量时，当场重试当前许可；需要等待传输完成时才交回调度周期。
 
 暂停恢复一次取得完整 State、缺失 KV、尾页以及“重建至旧 frontier + 首个真实新单元”的覆盖。
-Native 跨 Replay chunk 持有尚未物化的真实 reservation；到达旧 frontier 或完成 bridge 不解除
+Session 跨 Replay chunk 持有尚未物化的真实 reservation；到达旧 frontier 或完成后端 history 对齐不解除
 保护。新 prefill 提交、生成/control 提交新 token 或请求进入终态后，恢复许可才结束。
 
 一个请求可以暂时独占大部分 KV。回收可选缓存并暂停其他请求后，唯一请求仍无法取得合法单元时，
@@ -166,8 +175,11 @@ ledger_frontier    = execution_frontier + 1
 ledger[execution_frontier] = 已提交、下一次待输入的 token
 ```
 
-精确命中可以使用保存的 tail hidden 进入采样。MTP 的 frontier−1 bridge、DFlash context
-append 和 speculative accepted-prefix fold 由 Native 完成。尚未提交的 suffix 不成为恢复点。
+精确命中可以使用保存的 tail hidden 采样 anchor。两种模型的 MTP 稳定边界统一为
+`Main=F, MTP history=max(F-1,0)`；本轮生成 drafts，再 Verify/Decision/Commit，不携带上一轮预生成的 drafts。
+采用 A 个输出后，Main 为 F+A，MTP history 为 F+A−1；history 用真实 target conditioning 重建。
+Prefill、Replay、Control 共用同一对齐规则。DFlash context append 与各自的 accepted-prefix fold 由原生模型完成，
+尚未提交的 suffix 不成为恢复点。
 
 前缀索引的 digest 用于缩小候选范围，采用前还要校验 token、位置、媒体与执行身份。独立重算得到
 的 state 与 KV 不能因为 token 相同就拼接；共享页和跨介质副本沿用其真实内容身份。
@@ -199,7 +211,7 @@ Prefill/Replay chunk 结束本身不产生保存机会。
 
 Engine 在跨过语义 frontier 前调用 Native 准备目的 state 与检查点描述。私有输入点可先退休
 本记录已经过时的输入点，再尝试 Device 槽，容量不足时可使用 Host。私有和公共保存都持有
-`KVPrefixRef`，只读前缀不复制尾页；同一位置的不同用途记录可以共享同一 StateImage 和 KV 内容。
+`HistoryPrefix`，只读前缀不复制尾页；同一位置的不同用途记录可以共享同一 StateImage 和 KV 内容。
 
 同点兼有私有与共享用途时，共享部分不足仍可保留私有点。捕获属于可选缓存写入，回收须通过
 新增恢复收益与被替换内容的准入检查，不抢占 active 请求。没有合适空间就跳过保存，继续必要执行。
@@ -235,7 +247,7 @@ Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本�
 保存输入点。
 
 正常结束将合法执行态 freeze 为新 E。取消可以使本请求已接管的可选旧缓存消失，其他独立所有者
-继续有效。Session 是查找提示和命名入口，较旧请求晚完成不能覆盖较新的 `publication_order`。
+继续有效。产品 session key 是查找提示和命名入口，较旧请求晚完成不能覆盖较新的 `publication_order`。
 未命名历史仍可按精确内容复用。
 
 <a id="sources"></a>
@@ -248,7 +260,8 @@ Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本�
 合法 session 提示、私有用途、较新 publication order 和稳定序号。同一 Native handle、相同
 接管方式与携带点的重复候选合并；独立计算得到的同语义位置仍分别处理。
 
-来源成本模型比较当前恢复传输与剩余计算。机器传输与 artifact prefill 校准影响排序，不决定
+来源成本模型比较当前恢复传输与剩余计算。KV 的 DMA 工作量来自 rank 准备后导出的无地址
+KVTransferProfile，目录不猜测 pitch 或 plane 合并方式。机器传输与 artifact prefill 校准影响排序，不决定
 内容是否可恢复。缓存回收另用实际恢复覆盖损失，不估计未来请求概率；实际许可由 Native 申请。
 
 来源评估只读。Native 计算来源的 Move/Fork、兼容携带点与获准退休的旧点，并根据首个合法单元
@@ -306,7 +319,7 @@ Native 根据实际 State/KV 引用枚举有限的降级和删除动作，每个
 与必要传输。共享内容的所有可选持有者必须一起满足准入；active/transfer reader 另外限制能否
 动它。释放零个当前稀缺资源的动作不参加比较。
 
-Qwen3.5 与 Qwen4Exp 共用恢复评分和物理持有者算法。Program 按 checkpoint 发布、退休与代际
+Qwen3.5 与 Qwen4Exp 共用恢复评分和物理持有者算法。原生 Session 按 checkpoint 发布、退休与代际
 维护精确前缀森林；相同 identity/frontier 的别名共享语义节点，仍各自持有实际 State/KV 引用。
 Digest 和 identity tag 只做 shortlist，建立祖先关系需要 backing 相同或完整 token、位置及
 Vision/rewrite 身份证明。索引不持有 snapshot、资源引用或 reader lease。
@@ -427,16 +440,17 @@ lane 和容量。Fresh admission 不主动抢占 resident。
 
 同时最多一个请求持有完整恢复许可。它优先重建旧历史并完成首个真实新单元，其他可运行单元
 继续执行；恢复期跳过可选 capture。Native 持有跨 chunk 的真实容量，Runtime 以
-`recovery_pending` 判断保护结束。到达旧 frontier、完成 MTP bridge 或单纯回读 Snapshot 都不算
+`recovery_pending` 判断保护结束。到达旧 frontier、完成 MTP history 对齐或单纯回读 Snapshot 都不算
 新进展；新 prefill、生成/control 提交或终态才结束保护。
 
 Prefill chunk 的边界为已经驻留的请求提供轮转机会。全部 lane 被占用时，新请求仍要等到某个
 resident 结束、取消或因资源压力暂停；缩短 chunk 本身不会使它提前进入。因此，短请求排队可能
 跨过长请求的多个 chunk，分析这类时延要分别检查 lane 准入和每个执行单元的耗时。
 
-Engine 在轮首、准入后的执行选择前、Control/Decode 后各有界推进上下文事务。已完成的绑定
-及时进入原有许可与语义 capture 流程；Control/Decode 执行后只刷新尚未执行的 Prefill/Replay
-许可，每轮仍为一个 compact decode batch 和一个 prefill turn。未完成的异步事件不自旋等待。
+Engine 在周期内消费 ticket 的 decision/result/retirement 及上下文事件，已完成绑定及时进入许可和
+语义 capture 流程。一个周期保留已经安排的成员，结果事件不会重新开启整轮 Decode；Control/Decode
+后只刷新本轮尚未执行的 Prefill/Replay 许可，仍为一个 compact decode batch 和一个 prefill turn。
+ResultReady 可以触发输出 preview，只有 DeviceRetired 才允许复用相关 frame、row 和传输存储。
 
 完成、取消、永久缩减、较年轻请求暂停释放资源等事件提供恢复机会。失败的恢复局部等待下一事件；
 刚暂停的请求不因自身释放立刻恢复。没有真实执行或传输能够释放资源时，最老请求须通过回收与
@@ -463,25 +477,31 @@ Replay 不重新发布旧输出、不重复扣预算、不再次采样历史 tok
 实际计数的 forced control 恢复；RNG 沿用逻辑位置、seed 和 purpose。Replay 跨 chunk 推进，
 不增加跨请求复用热度。
 
-MTP 丢弃未使用 drafts，并在恢复后的合法单元中重建；DFlash/DFlash2 保持各自 context 和 local
+MTP 未采用的本轮 drafts 不进入暂停快照，恢复后从稳定 Main/history 前沿生成新 drafts；
+DFlash/DFlash2 保持各自 context 和 local
 state 规则。Vision 保留 prepared media、媒体身份和 MRoPE，失效的视觉 handoff 按需重新编码。
 这些恢复约束与普通执行使用同一模型数学实现。
 
 <a id="transfers"></a>
 ## 9. 传输与取消
 
-Program 同时至多有一个上下文事务，可执行绑定、捕获、demotion 或暂停；已经取得许可且不依赖
-其来源的工作可以继续运行。事务遵循：
+Session 同时至多有一个上下文操作，可执行绑定、捕获、demotion 或暂停。它使用独立 Context frame，
+与 Compute frame 分开；已取得许可且不依赖其来源的工作可以继续运行。事务遵循：
 
 ```text
 确定源与物理集合 → 取得源 lease 与目的预留 → 提交复制
                 → 等待完成事件 → 发布副本/交接 → 释放可释放的来源
 ```
 
-初次绑定还取得首单元许可；暂停恢复绑定取得完整恢复许可。DMA 提交前取消撤销本次预留；
-提交后等待真实 reader 完成再释放。绑定的不可逆所有权交接另外由采用提交点界定。未完成副本不能成为查询来源。
-Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到完成误用已复用描述。
+初次绑定还取得首单元许可；暂停恢复绑定取得完整恢复许可。尚未提交的独立 binding reservation 可以撤销；
+已接受的普通计算目录准备和已经提交的 DMA 必须执行至退役，取消只改变结果的采用意图。
+绑定的不可逆所有权交接另外由采用提交点界定。未完成副本不能成为查询来源。
+SessionEpoch、SequenceId、ResidencyId、ticket/frame generation 和命令顺序防止迟到完成误用新的绑定；
+目录内部的 State/page/history identity 也有各自 generation。
 设备错误进入 Engine 统一 failure cleanup；普通资源不足返回策略层处理。
+ContextTransaction 保留控制侧来源/目的，ContextMigration 保留实际执行事件和 pinned mapping staging。
+取消后的 transaction 仍占原执行槽；copy 完成后才 publish 或 discard。部分提交尚未录到 fence 时，
+rank 排空实际 stream 并保留首个错误，再允许控制侧释放 leases。
 
 恢复取得完整目的空间，可能出现最终驻留分布可容纳、交换中间态却不能同时容纳的情况。例如 GPU
 中有 B、Host 中有 A，恢复 A 的完整目的与 B 的 Host 写回目标可能竞争同一余量。没有其他释放者
@@ -521,5 +541,6 @@ Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到
 
 - [Scheduler](../../src/runtime/engine/scheduler.h)、[ResourceManager](../../src/runtime/engine/context_cache/resource_manager.h)：成员与策略。
 - [EngineCore](../../src/runtime/engine/engine_core.h)：事务编排、生命周期与发布。
-- [Program](../../src/models/qwen3_5/program/program.h)：模型恢复与资源操作合同。
-- [Native 源码组织](../../src/models/qwen3_5/program_sources.cmake)：规划、存储、绑定和各事务实现。
+- [Qwen3.5 Session](../../src/models/qwen3_5/session/session.h)、[Qwen4Exp Session](../../src/models/qwen4_exp/session/session.h)：原生恢复、模型前沿和事务。
+- [ContextDirectory](../../src/models/common/context/directory.h)：唯一分配、引用与迁移预留。
+- [Executor](../../src/runtime/executor/executor.h)：执行许可、提交与完成；[物理动作槽](../../src/models/common/context/transfer.h)负责 rank 存储交接。

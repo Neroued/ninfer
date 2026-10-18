@@ -308,7 +308,7 @@ Scale words 的有效域为 `0x00..0x7e`；零结果保留 codebook 的符号。
 | 部分 | Bytes | GiB | 当前放置 |
 |---|---:|---:|---|
 | Main 非 routed-expert、非 PLE 表权重 | 7418143232 | 6.908684 | GPU |
-| Main routed experts | 67947921408 | 63.281433 | GPU resident，或 registered Host backing 加 Program GPU cache |
+| Main routed experts | 67947921408 | 63.281433 | GPU resident，或 registered Host backing 加 RankProgram GPU cache |
 | PLE NF4 表 | 29127344640 | 27.126954 | V3 磁盘原位 backing |
 | Vision | 897862112 | 0.836199 | 启用时 GPU |
 | MTP experts | 2516889600 | 2.344036 | 启用时 GPU |
@@ -323,7 +323,8 @@ Text-only 权重及控制值约 97.317072 GiB。全部组件在 offload 模式�
 
 Offload 模式的 Host backing 包含已缓存到 GPU 的 experts，eviction 无需写回；resident
 模式直接绑定 GPU bank，不保留 Host expert 副本。PLE 启动只读目录、控制值和 divisors，不整体加载表。
-Model 持有不可变权重与 PLE 文件/LUT，Program 持有可变缓存和执行资源。
+ModelDefinition 持有配置、表示描述与 Host 控制值；ModelShard 持有本地不可变权重与 PLE 文件 backing。
+Session 管理逻辑状态和上下文目录，RankProgram 持有可变缓存和物理执行资源。
 完整资源预算见[执行与状态](qwen4_exp-execution.md)。
 
 ## 7. 数学来源

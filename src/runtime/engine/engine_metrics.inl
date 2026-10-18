@@ -118,8 +118,8 @@ void EngineCore<Instance>::finish_engine_phase(const HostPhaseMeasurement& measu
 }
 
 template <class Instance>
-void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing,
-                                                 const ActiveExposureSet& exposed) noexcept {
+void EngineCore<Instance>::record_execution_timing(runtime::ExecutionTiming timing,
+                                                   const ActiveExposureSet& exposed) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
     stats.program_submit_ns += timing.submit_host_ns;
     stats.program_post_ns += timing.post_host_ns;
@@ -136,13 +136,13 @@ void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing
 }
 
 template <class Instance>
-void EngineCore<Instance>::finish_program_call(const HostPhaseMeasurement& measurement,
-                                               runtime::ExecutionTiming timing) noexcept {
+void EngineCore<Instance>::finish_execution_call(const HostPhaseMeasurement& measurement,
+                                                 runtime::ExecutionTiming timing) noexcept {
     const std::uint64_t wall     = elapsed_ns(measurement.started, Clock::now());
     const std::uint64_t nested   = worker_accounted_elapsed_ns_ - measurement.accounted_before;
     const std::uint64_t observed = timing.elapsed_ns() + nested;
     if (wall > observed) { timing.submit_host_ns += wall - observed; }
-    record_program_timing(timing, measurement.exposed);
+    record_execution_timing(timing, measurement.exposed);
 }
 
 template <class Instance>
@@ -164,7 +164,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
     auto& snapshot                       = stats_snapshot_;
     snapshot                             = cumulative_stats_;
-    const auto physical                  = instance_.program->physical_usage();
+    const auto physical                  = instance_.session->physical_usage();
     snapshot.device_state_occupied_slots = physical.occupied.state_slots;
     for (auto& pool : snapshot.kv_pools) {
         pool.occupied_page_groups = physical.occupied.kv_page_groups[pool.id];
@@ -271,7 +271,7 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
     snapshot.context_transfers.state = request->context_transfers[0];
     snapshot.context_transfers.kv.assign(request->context_transfers.begin() + 1,
                                          request->context_transfers.begin() + 1 +
-                                             instance_.program->kv_pools().size());
+                                             instance_.session->kv_pools().size());
 }
 
 template <class Instance>

@@ -4,7 +4,7 @@
 
 目标是让 GBNF、JSON、JSON Schema 和工具调用共用一套 token 约束机制，接入现有普通采样、MTP、DFlash、DFlash2、thinking、流式输出与抢占恢复。NInfer 保持单 GPU、固定 resident lanes、原生 C++/CUDA 执行。
 
-总体选择：vendor XGrammar 的 CPU 核心；Frontend 构造符合模型输出语义的 grammar；请求拥有 matcher；Program 管理位图缓冲和执行时序；Sampling Ops 在合法集合内建立目标分布。模型状态、语法状态和用户可见输出沿同一提交边界前进。
+总体选择：vendor XGrammar 的 CPU 核心；Frontend 构造符合模型输出语义的 grammar；请求拥有 matcher；Session 管理逻辑提交，RankProgram 管理位图缓冲和执行时序；Sampling Ops 在合法集合内建立目标分布。模型状态、语法状态和用户可见输出沿同一提交边界前进。
 
 ## 1. 功能与语义
 
@@ -81,12 +81,13 @@ GBNF 是直接的 grammar 输入，适合作为底层机制的最小完整使用
 | 通用文本约束适配 | Schema 校验与组合归约、源定位、共享编译资源、CPU 位图和临时 matcher 操作 |
 | 模型 Frontend | 原始词表与控制 token；thinking/content/tool 封装；continuation 前缀；工具值表示 |
 | 请求 OutputSession | 可变 matcher、输出解析、preview 与正式提交 |
-| Engine | 请求生命周期、每轮 request/row 映射、调用期 mask 服务、批次提交和结果发布 |
-| Program | Device/pinned buffers、逐位置数据排列、固定执行组合、CUDA Graph 和物理状态提交 |
+| Engine | 请求生命周期、冻结的 request/row 映射、决策输入准备、批次提交和结果发布 |
+| Session | 原生生成事务、逻辑前沿、接受前缀与执行结果采用 |
+| Executor / RankProgram | owning 决策消息、Device/pinned buffers、逐位置排列、CUDA Graph 与物理提交 |
 | Sampling / Speculative Ops | 合法候选筛选、概率归一化、p/q 接受、残差与采样结果 |
 | Gateway / CLI | 文件获取、协议字段翻译、协议错误和响应编码 |
 
-通用适配位于 `src/text/`；Qwen 输出语义位于 `src/models/common/qwen/frontend/`。执行数据合同属于 `src/runtime/contract/`，物理消费者由 Program/Ops 拥有。
+通用适配位于 `src/text/`；Qwen 输出语义位于 `src/models/common/qwen/frontend/`。执行数据合同属于 `src/runtime/contract/`，物理消费者由 RankProgram/Ops 拥有。
 
 ## 3. 请求输入与编译
 
@@ -293,7 +294,7 @@ Frontend 拥有 Qwen 的输出阶段规则，grammar 和 OutputSession 的发布
 
 沿用现有 thinking budget。执行前通过 `model_token_budget_remaining()` 限定本轮可产出的长度，控制串在已提交轮次之后注入。
 
-固定 control tokens 通过同一 matcher 的 preview/commit 推进：先检查控制串及关闭边界，Program 成功追加后才确认 matcher 与 decoder 状态。控制串不调用 sampler，不消耗 sampling RNG，沿现有合同计入总输出预算。
+固定 control tokens 通过同一 matcher 的 preview/commit 推进：先检查控制串及关闭边界，Session 确认追加完成后才确认 matcher 与 decoder 状态。控制串不调用 sampler，不消耗 sampling RNG，沿现有合同计入总输出预算。
 
 不为 grammar 单独增加第二份 thinking token 计数。Lookahead 的阶段变换可以撤销；正式预算仍只由真实提交推进。
 
@@ -322,12 +323,12 @@ CompiledGrammar 共享；matcher、decoder 与临时预览均不跨请求共享�
 | 操作 | 是否产生临时状态 | 何时成为正式状态 |
 |---|---|---|
 | 构造 mask 的 lookahead | 临时接受 draft，结束时回退 | 永不自行提交 |
-| 输出 preview | 接受实际 produced 前缀，同时预览 decoder、EOS 与预算 | Program commit 成功后 |
-| forced control preview | 接受固定控制串，预览阶段变化 | Program append 成功后 |
+| 输出 preview | 接受实际 produced 前缀，同时预览 decoder、EOS 与预算 | Session 接受 commit receipt 并采用逻辑状态后 |
+| forced control preview | 接受固定控制串，预览阶段变化 | Session 返回 ControlComplete 后 |
 
 实现使用一次调用内的 mark/rollback 事务，不每轮深拷贝整个 matcher 历史。Lookahead 始终回到基线；输出 preview 可以将 matcher 暂留在 provisional 状态，commit 时只确认已完成的推进，discard 时回到 mark。
 
-preview 与 lookahead 互斥，不能在已有未提交 preview 时开始下一轮 mask。所有可能失败的 token 接受、结构检查和所需分配在 preview 完成；Program 成功之后的 matcher commit 是无分配、无语法检查的确认操作。
+preview 与 lookahead 互斥，不能在已有未提交 preview 时开始下一轮 mask。所有可能失败的 token 接受、结构检查和所需分配在 preview 完成；模型提交被接受之后的 matcher commit 是无分配、无语法检查的确认操作。
 
 当一个 token 跨越模型 framing 与正文边界，事务记录的是该 token 引起的完整状态变化。不能只按“送给 JSON 的 token 数”回退，从而漏掉边界匹配进度。
 
@@ -336,14 +337,14 @@ preview 与 lookahead 互斥，不能在已有未提交 preview 时开始下一�
 普通成功行仍满足：nonterminal 接受全部 produced；terminal 可以只接受一个非空前缀。取消行接受零 token。切换 thinking/content 不是 terminal，逐位置约束必须让本轮剩余 token 正常继续。
 
 ```text
-Program 产生 PendingBatch
+Session 从 ResultReady 产生 owning PendingBatch
   → 对每行预览真正输出，确定 accepted prefix
-  → Program 提交相同前缀的 KV/GDN、ledger、RNG/penalty 状态
+  → Executor 接受该前缀的物理 commit，Session 采用 ledger 与原生前沿
   → 确认该前缀的 matcher、decoder 与预算
   → 发布用户事件
 ```
 
-如果 preview 失败，所有该批未确认的 matcher preview 先恢复，Program 的 PendingBatch 按现有事务中止。Program commit 失败时不确认语法状态，不发布本轮内容。
+如果 preview 失败，所有该批未确认的 matcher preview 先恢复，Session 的 PendingBatch 按现有事务中止。模型 commit 接受失败时不确认语法状态，不发布本轮内容。
 
 ### 6.4 抢占、恢复与释放
 
@@ -369,11 +370,11 @@ bit  = token_id % 32
 
 word 使用最低位对应较小 token ID 的约定，末个 word 超出 V 的位清零。固定 stride 的逻辑位置为 `row × (K+1) + position`；mask 的词表维度不使用 logits 的物理 padding 宽度。
 
-provider 接收的 draft 列表只包含新 proposal，不包含 target verify 输入中的 anchor。位置0基于请求已提交输出的 frontier；当前 Program 的物理 execution frontier 可以比 accepted ledger 少一个 token，这个已接受 anchor 不能再次送入 matcher。
+DecisionNeeded 携带的 draft 列表只包含新 proposal，不包含 target verify 输入中的 anchor。位置0基于请求已提交输出的 frontier；当前模型的物理 execution frontier 可以比 accepted ledger 少一个 token，这个已接受 anchor 不能再次送入 matcher。
 
-Program 在启动容量规划中为所选 backend 和最大 B 分配 pinned Host mask、Device mask、逐位置状态以及 DFlash 所需 Host draft IDs/event。逻辑区可按互斥的 prefill/decode 阶段共享。掩码容量计入 Device/Host 资源说明，运行中不按 schema 新建 Device allocation。
+RankProgram 在启动容量规划中为所选 backend 和最大 B 分配 pinned Host mask、Device mask、逐位置状态以及 DFlash 所需 Host draft IDs/event。逻辑区可按互斥的 prefill/decode 阶段共享。掩码容量计入 Device/Host 资源说明，运行中不按 schema 新建 Device allocation。
 
-纯无约束 batch 不调用 provider、不传 mask，也不执行 mask 检查 kernel。混合 batch 中，无约束行使用显式 disabled 描述，不物化全词表的全1位图。
+纯无约束 batch 不请求决策输入、不传 mask，也不执行 mask 检查 kernel。混合 batch 中，无约束行使用显式 disabled 描述，不物化全词表的全1位图。
 
 ### 7.2 每位置状态
 
@@ -387,7 +388,7 @@ Program 在启动容量规划中为所选 backend 和最大 B 分配 pinned Host
 `Unreachable` 不意味着 kernel 不会读取这一列：已有批量候选构造可能预计算多列。固定 buffer 的所有被读取字段都必须有效；占位分布不进入可见接受前缀。
 
 实现用 nullable `SamplingMask` 表达无约束行，packed words 表达 Ready，Host 位集记录 DeadEnd 位置。
-DeadEnd/Unreachable 的 device 列填入安全占位；Program 按实际 licensed extent 检查是否经过 DeadEnd，
+DeadEnd/Unreachable 的 device 列填入安全占位；Session 按实际 licensed extent 检查是否经过 DeadEnd，
 通过 PendingBatch 单行失败交给 Engine。失败行不提交占位 token，其余行正常提交。
 
 第一处非法 draft 所在的预测位置本身仍为 Ready，拥有其之前合法前缀的 mask。非法的是 proposal token，不是用来拒绝它的 target 分布。
@@ -417,7 +418,7 @@ GBNF/JSON 等不拥有 RNG。Mask 的生成、临时回退和编译不消耗采�
 | 中间 prefill chunk | 不生成新输出，不取 mask、不推进 matcher |
 | Prefill finalization | 在真正采样首 token 前提供初始 mask；可复用准备阶段检查所得位图 |
 | Exact prefix hit | `sample_from_hidden()` 使用同一请求 mask，不能复用缓存创建者的采样选择 |
-| Ordinary decode | worker 先填当前一行 mask，上传后执行现有整图；每个请求可有不同 grammar |
+| Ordinary decode | Engine 响应当前一行的 DecisionNeeded；rank 上传 mask 后执行采样，每个请求可有不同 grammar |
 | Forced control | 不采样；按第5节做 matcher preview，并随物理追加提交 |
 | Replay | 不执行输出约束，不重复接受历史；恢复后的第一个新输出重新走正常 mask 路线 |
 
@@ -476,68 +477,62 @@ EOS 已被临时接受之后，不再调用 terminated matcher。固定宽度 GP
 
 ### 8.4 MTP
 
-MTP 的本轮 draft 随上一轮 egress 返回 Host，并保存于 sequence。Forward 阶段使用这些 draft
-执行 target forward；Finish 阶段完成 acceptance、MTP 状态对齐和下一轮 proposal。下一轮
-proposal 保持不受约束。首 token、extent=0 和输出预算尾部使用各自的有效行数。
+Qwen3.5 与 Qwen4Exp 均在当前 decode unit 生成 proposal，随后执行 target verify 和 acceptance。
+轮间不保存下一轮 draft 列表。稳定状态的 Main frontier 为 F，MTP history frontier 为
+max(F−1,0)；本轮从已保存的 target conditioning 与已确认 anchor 开始生成草稿。
 
-## 9. Speculative CPU/GPU 时序
+约束只影响 target 分布。Proposal 的 ID、extent 与 q 保持原有数学定义；extent=0 和混合
+有效长度按行处理。实际接受 A 个输入后，按 target conditioning 重建所需 MTP history，
+然后在物理退役时释放本轮临时数据。
 
-### 9.1 两段执行
+## 9. 决策消息、设备执行与提交
 
-MTP、DFlash、DFlash2 的每个 decode unit 都由 Forward 和 Finish 两段组成。Graph 与 eager
-使用相同的 native 调用；约束、无约束和混合 batch 使用同一套两段 Graph。
+### 9.1 当前轮的数据交接
 
-| 阶段 | MTP | DFlash / DFlash2 |
-|---|---|---|
-| Forward | 上传本轮输入，执行 target forward | 上传输入、补齐 draft 上下文、生成草稿、D2H 草稿 ID、ready event、target forward |
-| CPU mask | 使用 sequence 中已有的 draft IDs | 等待 Forward 中的 draft-ready event，读取 pinned IDs |
-| Finish | acceptance、MTP 状态对齐、下一轮 proposal、egress | acceptance、egress |
+RankProgram 在草稿 ID 可读取时发出 `DecisionNeeded`。Session 转发 ticket、stage 和
+owning draft 列表；Engine 使用该 ticket 冻结的 Request/row 映射调用 OutputSession 的
+lookahead，生成 owning `DecisionInput`。其中只有受约束行，包含逐位置 words 和 dead bits。
 
-Engine 传入一个借用本批 OutputSession 的 mask provider，映射 compact row 与 request。Program
-在 worker 调用栈上同步使用它进行 lookahead、填充 mask 和回退；provider 的借用止于 decode 返回。
-`Program::decode()` 返回 PendingBatch，随后仍由 Engine 完成 preview、Program commit 和输出提交。
+普通采样使用相同消息，draft 列表为空。无约束 batch 直接推进；混合 batch 不为无约束行
+构造全词表全1位图。Matcher 和可调用回调均不进入 RankProgram。
 
-### 9.2 提交与依赖
-
-Program 在 Forward 前绑定 sampling 中的 Device mask 地址、步长和逐行启用状态。CPU 在 Forward
-提交后填内容，再将 mask 上传到同一 compute stream，Finish 排在上传之后。
-
-DFlash 的 Forward Graph 在草稿 D2H 后通过 `cudaEventRecordExternal` 记录事件，随后继续 target
-forward。CPU 等待该事件即可读取本轮草稿，因此 mask 计算可以与 target forward 重叠。Eager 在
-同一位置记录普通 CUDA event。MTP 的草稿已经在 Host，提交 Forward 后即可计算 mask。
-
-```mermaid
-flowchart LR
-    subgraph A["DFlash Forward Graph"]
-        P["上下文补齐、proposal"] --> D["D2H draft IDs、ready event"]
-        D --> T["Target forward"]
-    end
-    D --> C["CPU 等待草稿就绪、生成 mask"]
-    C --> U["H2D mask"]
-    T --> U
-    U --> B["Finish Graph：acceptance、egress"]
-    B --> E["preview → commit → 发布"]
+```text
+Rank proposal / target forward
+  → 草稿可读：DecisionNeeded(ticket, stage, drafts)
+  → Engine：matcher lookahead → owning DecisionInput
+  → Rank：上传位图 → sampling / acceptance → ResultReady
+  → Session PendingBatch → Engine output preview
+  → commit receipt → Session 逻辑采用 → OutputSession commit → 发布
+  → DeviceRetired → CommitComplete 与 frame 释放
 ```
 
-无约束 batch 直接连续提交两段，跳过 CPU 等待和 mask 处理。DFlash 的小型草稿拷贝与 event 保留在
-固定 Forward 中。混合 batch 保持同一组成员，无约束行的 mask 标记 disabled。
+### 9.2 Graph 与完成依赖
 
-Graph 按 exact-B 和各阶段实际拓扑捕获。DFlash Forward 保留 draft 的上下文档位；Finish 不依赖
-上下文长度，每个 B 只有一份。MTP 两段各自复用更新兼容的上下文 profile。Schema 内容、请求 ID
-和 mask bytes 都是执行输入。启动时验证 profile 更新，并按 Forward→Finish 成对 warmup。
+原生 RankProgram 按数学依赖组织 Main、proposal、采样/acceptance 和 history commit 的
+Graph。每个阶段继续使用 exact-B、稳定 buffers 和所属 Op 的上下文更新合同；grammar
+内容、请求 ID、mask bytes 都是执行输入。
+
+草稿回传完成事件与 target forward 的最后完成事件分开，允许 Host lookahead 与已经提交的
+设备工作重叠。`poll()` 查询就绪状态，尚未就绪时返回；它不在调用栈上等待 matcher 回调。
+位图准备可以早于 target forward 完成，但对应采样必须排在位图上传之后。
+
+真正提交 H2D 后才发 `DecisionConsumed`，由 Engine 记录上传字节数。接收 `supply()`
+不等于已经上传。草稿、位图及输出都关联同一个 ticket、frame generation 和冻结的行顺序。
 
 ### 9.3 所有权与存活期
 
-Program 持有两段 Graph、pinned IDs、Host/Device mask 和 ready event。Graph 先于其引用的事件与
-buffers 销毁。重复 launch、profile 更新和构造失败清理遵循同一存活期。
+RankProgram 持有 Graph、pinned IDs、Host/Device mask 和完成事件；Graph 先于其引用的
+buffers 和 events 销毁。Host mask 在 H2D 完成前不可覆盖，Device mask 保留到采样或验证
+结束。DFlash2 的 q 和 candidate IDs 保持在设备中。
 
-从 unit 入场到 PendingBatch 消费，membership、sequence、block tables 和 buffers 保持稳定。
-Target logits、hidden、ReplaySSM records 和 proposal 数据保留到各自的最后消费者；两段的临时
-workspace 独立从 arena 起点使用。Host mask 在 H2D 完成前保持有效，Device mask 保留至 Finish
-结束。DFlash2 的 q 和 candidate IDs 始终留在 GPU。
+ResultReady 之后仍保留 target hidden、verify records 和提交所需数据。commit receipt
+确认有序接受，Session 才采用逻辑前沿并允许输出发布；frame 和来源 leases 到 DeviceRetired
+才回收。CommitComplete 补齐包括物理提交在内的真实时间观测，取消和失败行也遵守该退休边界。
 
-CPU lookahead 失败时先恢复 matcher 的临时状态；Program 收束已提交的 GPU 工作后再释放该 unit。
-DFlash pending features 按实际提交的前缀更新上下文，MTP 的下一轮草稿沿用原有提交与失效规则。
+DFlash 延迟消费的 target features 属于 residency 的持久存储，直到下一轮上下文追加或
+normalize 完成；它们不随一轮 frame 提前释放。MTP history 对齐在本轮提交中完成。
+CPU lookahead 失败时先回退 matcher 的临时状态，再 discard 对应生成事务；已提交的设备
+读者完成后才释放其资源。
 
 ## 10. 错误、终止和单行失败
 
@@ -551,7 +546,7 @@ Runtime integrity 错误不被包装成用户 schema 错误。例如 row members
 
 若 CPU 已知普通下一位置 DeadEnd，可以直接结束该请求，不提交无意义采样。DFlash 或 speculative lookahead 则须由实际验证路径判定是否达到 DeadEnd。
 
-为此 PendingBatch 增加明确的单行结果状态，区分正常产出与请求级约束失败。失败行本轮提交零 token，使用 Program 的零接受释放语义回收该行；Engine 按 error 完成请求，与用户 cancellation 分开统计。其余正常行继续完成本批提交。
+为此 PendingBatch 增加明确的单行结果状态，区分正常产出与请求级约束失败。失败行本轮提交零 token，使用 Session 的零接受提交及退役语义回收该行；Engine 按 error 完成请求，与用户 cancellation 分开统计。其余正常行继续完成本批提交。
 
 即使该失败行在内部已经验证过几个 draft，本轮也不发布这段未提交结果；此前已提交的输出保留。失败行不消耗本轮公开生成预算，不更新正式 matcher。这个扩展只增加单行结果判别，不改变成功行的 nonterminal/terminal accepted-prefix 规则。
 
@@ -600,7 +595,7 @@ B × (K+1) × ceil(V/32) × 4 bytes
 
 V=262144 的示例中，一行32 KiB；B=8、K=15 时4 MiB。Host/Device 分别占用，另加少量位置状态和 draft IDs。这里是容量估算，不是实际传输耗时。
 
-核心优化选择：词表和编译复用；按请求推进 matcher；没有每轮完整输出重放；mask buffer 预分配；GPU 中直接消费位图；speculative CPU mask 与 target forward 重叠；约束与无约束共享两段执行。
+核心优化选择：词表和编译复用；按请求推进 matcher；没有每轮完整输出重放；mask buffer 预分配；GPU 中直接消费位图；speculative CPU mask 与 target forward 重叠；约束与无约束共享原生执行阶段。
 
 各行 mask 在 worker 上顺序生成。普通 decode 在采样前准备 mask；speculative decode 在 Forward 提交后准备。编译线程与活跃 matcher 推进分别持有自己的对象。
 
@@ -612,7 +607,9 @@ Draft 保持不受约束，可能降低 constrained workload 的接受率。报�
 
 同一对象记录编译缓存 hit/built/waited、实际求 mask 的位置数及成功提交的 mask H2D 字节数。启用 `phase_timings` 时还记录 OutputSession 准备、mask/lookahead/rollback、matcher accept/discard 的 CPU 秒数。被回退的推演仍是已付出的工作，不回退工作计数。三个 HTTP 入口和 inference bench 均开启这些时间观测。
 
-DFlash draft-ready 等待是现有 Device wait 的子区间。Program 每批记录一次，Engine 全局累计拥有唯一计数；每请求的 `constraint_draft_wait_exposed_seconds` 表示本请求所经历的等待，同批请求之间不能相加。
+Device wait 及其 `constraint_draft_wait_exposed_seconds` 子项只记录实际阻塞等待。
+事件轮询期间不把整个 submit 到 ResultReady 的墙钟时间记为阻塞等待；普通异步路径该项可以为零。
+完整生成延迟与每轮墙钟单独计量，Host 提交、轮询、matcher 和结果处理按实际执行区间累计。
 
 HTTP 聚合结果、SSE 终态、request_done 日志与 benchmark JSON 使用相同的 constraint 表示。Prometheus 的请求/缓存/工作计数在请求结算时汇总，包含取消与长度中断；准备失败和执行异常仍走原错误计数。Draft wait 从 Engine 全局计数读取。指标标签使用固定枚举，不包含 grammar/schema 内容。
 
@@ -675,7 +672,7 @@ A/B 使用相同 prompt，分别要求对象字段和有限枚举。编译资源
 
 本设计复用 [Engine 架构](engine-architecture.md)的 worker、请求所有权、PendingBatch 和发布顺序，以及[资源调度与上下文缓存](resource-scheduling-and-context-cache.md)的抢占恢复合同。[DFlash](dflash.md)和现有 Sampling/Speculative Ops 继续拥有 proposal 与数学执行。
 
-约束执行合同集中在 mask 数据流、受约束采样、调用期 provider、matcher 事务和单行约束失败。Artifact、权重绑定、模型公式和 KV/GDN 缓存身份不承担请求约束配置。
+约束执行合同集中在 owning 决策消息、mask 数据流、受约束采样、matcher 事务和单行约束失败。Artifact、权重绑定、模型公式和 KV/GDN 缓存身份不承担请求约束配置。
 
 XGrammar 的固定来源与本地改动见 [vendor 说明](../../third_party/xgrammar/README.ninfer.md)。
 

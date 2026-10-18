@@ -1,7 +1,6 @@
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
 #include "core/buffer.h"
-#include "core/host_kv_arena.h"
 #include "artifact/fixture.h"
 
 #include <cstring>
@@ -30,12 +29,6 @@ void image(DeviceContext& device, bool mtp) {
     const auto layout = q4::plan_state_image(b, config(mtp), 2);
     DeviceBuffer backing(device.device(), b.finish());
     q4::StateViews state(backing.span(), layout);
-    const auto root = state.initialize(0, 248044, device.execution_view());
-    require(root.main_frontier == 0 &&
-                root.ple_raw_tail == std::array<std::int32_t, 2>{248044, 248044} &&
-                root.mtp_frontier.has_value() == mtp,
-            "initial continuation metadata");
-    device.synchronize();
     PinnedHostBuffer expected(state.storage().image_bytes()),
         returned(state.storage().image_bytes());
     auto* bytes = static_cast<unsigned char*>(expected.data());
@@ -122,27 +115,23 @@ void cache(DeviceContext& device, KvCacheStorage storage, std::uint32_t layers,
     require(view.main.block_tables.data == view.index.block_tables.data &&
                 view.index.keys.ne[1] == 16 && view.main.k_pages.ne[1] == 64,
             "QSA page group view");
-    auto reserve = pool.reserve(2);
-    auto source = pool.materialize_one(*reserve), destination = pool.materialize_one(*reserve);
     for (std::size_t i = 0; i < pool.plane_count(); ++i) {
         const auto& plane = pool.plane(i);
         CUDA_CHECK(cudaMemsetAsync(plane.data, (i + 1) & 255, plane.bytes(), device.stream()));
     }
-    const std::array src{source.handle()}, dst{destination.handle()};
-    pool.zero_pages(dst, device.stream());
-    pool.copy_page(src[0], dst[0], device.stream());
+    const std::array<std::int32_t, 1> src{0}, dst{1};
+    pool.zero_pages(dst, device.execution_view());
+    pool.copy_page(src[0], dst[0], device.execution_view());
     const auto host_layout = plan_host_kv_page_layout(pool.geometry());
-    HostContextArena arena(host_layout.page_stride * 2, host_layout.page_stride);
-    HostKVArena host(arena, {&host_layout, 1});
-    auto original = host.allocate(host_layout, 1), restored = host.allocate(host_layout, 1);
-    pool.copy_to_host(dst, host.writable_view(*original), device.stream());
-    pool.zero_pages(dst, device.stream());
-    pool.copy_from_host(host.view(*original), dst, device.stream());
-    pool.copy_to_host(dst, host.writable_view(*restored), device.stream());
+    PinnedHostBuffer original(host_layout.page_stride), restored(host_layout.page_stride);
+    pool.copy_to_host(dst, original.span(), host_layout, device.execution_view());
+    pool.zero_pages(dst, device.execution_view());
+    pool.copy_from_host(original.span(), host_layout, dst, device.execution_view());
+    pool.copy_to_host(dst, restored.span(), host_layout, device.execution_view());
     device.synchronize();
     for (std::size_t i = 0; i < host_layout.planes.size(); ++i) {
         const auto& plane = host_layout.planes[i];
-        const auto* begin = host.view(*restored).data() + plane.offset;
+        const auto* begin = static_cast<const std::byte*>(restored.data()) + plane.offset;
         require(std::all_of(begin, begin + plane.page_payload_bytes,
                             [&](std::byte byte) { return byte == std::byte((i + 1) & 255); }),
                 "QSA copy/Host roundtrip dropped a plane");

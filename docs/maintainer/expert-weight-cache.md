@@ -16,7 +16,7 @@ Qwen3.5 MoE 与 Qwen4Exp Main 均使用这套公共调度，支持 eager 和分�
 `WeightBankRegion` 显式指定展平 parent 上的起始行、矩阵行数、数量和行步长。
 几何来自 `WeightGeometry`；bank 不另行定义 codec。
 
-`WeightBankView` 借用 Model 的不可变 `WeightParent`。`matrix_weight` 可以取得一个
+`WeightBankView` 借用 ModelShard 的不可变 `WeightParent`。`matrix_weight` 可以取得一个
 原生矩阵视图，包括每次 Use 独立传入的 activation divisor。矩阵字节数与步长允许不同：
 例如 GU bank 中所有 gate 构成的视图，矩阵行数是 I、步长是 2I。
 
@@ -35,14 +35,15 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
 
 ## 逻辑加载与放置
 
-加载顺序是 `plan_load → resolve_load → materialize_model`：
+加载顺序是 `read_definition → resolve_load → materialize_model`：
 
 1. `Binder` 检查逻辑引用、Use 和所选资源；辅助值按对应元素区间取得 owning Host 值。
-   `PreparedResources` 持有已读资源，移动到最终 backing 后保留 frontend 借用的地址。
-2. `LoadPlan` 保留配置、逻辑引用、Use 和 expert source 描述，提供无 backing 的权重几何
-   和不消费计划的放置查询。Engine 显式建立不可变 `ModelProfile`，在读取大权重前查询
+   `ModelDefinition` 持有这些已读 Host 资源及其 `PreparedResources`，Frontend 借用其稳定地址。
+2. `ModelDefinition` 保留配置、逻辑引用、Use 和 expert source 描述，提供无 backing 的权重几何。
+   Engine 显式建立不可变 `ModelProfile`，在读取大权重前查询
    实际 Op 的 workspace 并联合解析容量。纯逻辑 binder 不承担执行布局约束。
-   `resolve_load` 指定目标 GPU，以及 Main experts 使用 GPU 或 CPU 来源。
+   `resolve_load` 产生一次本地 materialization 的 `ResolvedLoadPlan`，指定目标 GPU，
+   以及 Main experts 使用 GPU 或 CPU 来源。
    MTP、router、shared expert 和其余固定权重仍在 GPU；放置沿显式 WeightId 展开。
 3. `plan_materialization` 按 `(physical object, Device)` 去重，并用 `LayoutBuilder`
    分别规划 Host/Device backing。Host 的 `CpuOnly` 与 `CudaTransfer` 需求合并为一份来源；
@@ -53,31 +54,31 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
    边界页和 CPU/GPU 双端需求使用有界 staging，一次读取后分发。
    Host 放置保留文件的页内偏移；大块 Host backing 在读取前并行触页，`CudaTransfer`
    区域随后由 `CudaHostRegistration` 长期注册，仍是可缓存的 CPU 内存。
-   Model 持有 allocation 与 registration；Program 结束使用后，先注销，再释放 Host backing。
+   ModelShard 持有 allocation 与 registration；RankProgram 结束使用后，先注销，再释放 Host backing。
    仅有 `CpuOnly` 需求的加载不创建 CUDA stream、event 或 pinned buffer。
 5. `bind_view(reference, backing, device)` 明确选择实际位置。
-   Model 持有最终 backing，所有原生权重与 bank 视图借用它，不依赖 Reader 生命周期。
+   ModelShard 持有最终 backing，所有原生权重与 bank 视图借用它，不依赖 Reader 生命周期。
 
 这里保留完整 parent 原编码，不运行期 repack，也不把 Host 来源保存成大量单 expert 对象。
 `Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源。
 workspace 查询消费数学 profile；完整 GPU FFN 显式接受 resident/cached CUDA bank，
 混合单层执行另外借用原生 Host bank 和交接资源。
 Qwen3.5 MoE 与 Qwen4Exp 均支持完整 GPU 放置；5090 预算不足时可选择 Host Main experts
-和 Program GPU cache。Spark 使用完整 GPU 放置。Qwen4Exp 的 block-FP8 MTP experts 常驻 GPU，
+和 RankProgram GPU cache。Spark 使用完整 GPU 放置。Qwen4Exp 的 block-FP8 MTP experts 常驻 GPU，
 模型编排见 [Qwen4Exp 执行](qwen4_exp-execution.md)。
 
 ## 副本容量与 GPU 寻址
 
 `describe_expert_cache` 先返回无指针的布局及容量：数据池 C、各 bank entry 布局、
 Host 目录条目数、GPU offset/divisor 表和 pinned 索引快照容量。
-`ExpertCache` 随 Program 建立；调用者显式提供 upload execution view，并在 acquire/release
-提供 consumer execution view。Model 来源、DeviceContext 和被借用的 streams 必须比缓存活得更久。
+`ExpertCache` 随 RankProgram 建立；调用者显式提供 upload execution view，并在 acquire/release
+提供 consumer execution view。ModelShard 来源、DeviceContext 和被借用的 streams 必须比缓存活得更久。
 全 resident 来源要求 C=0，不创建动态 offset/divisor/上传槽存储。
-注册来源的 Host 容量由 Model 计费；注册字节数是其中的子集，不再加一份权重容量。
+注册来源的 Host 容量由 ModelShard 计费；注册字节数是其中的子集，不再加一份权重容量。
 
 CPU 来源的每个 entry 是完整 expert 的 GU/down 数据块，只包含 codes/high/scales。
 各 plane 至少 16-byte 对齐，entry 按 256-byte 对齐；不同 bank 使用自己的 entry 大小。
-所有 bank 共用一个 byte pool；Program 显式规划固定区和可复用区域，不把小 expert 填充成最大 expert。
+所有 bank 共用一个 byte pool；RankProgram 显式规划固定区和可复用区域，不把小 expert 填充成最大 expert。
 entry 不是序列化 parent，不追加虚假的 divisor trailer。
 
 NVFP4 的 matrix divisor 是静态元数据：CPU 来源在启动时镜像到 GPU，常驻 GPU 来源
@@ -118,11 +119,11 @@ Flash Next Main 48 个 bank 的两组 divisor 共 196,608 B；offset 表同为 1
 完整重建一个可复用区域：新布局不能重叠、切断已有 entry 或借用区域外的同一 key。
 调用者先 release 旧消费者；上传流等待其完成事件后覆盖 payload 与索引。未提交的旧上传被取消，
 已提交上传通过同一条流排序。替换不搬移区域外副本，也不执行权重 D2D。
-替换的 reader wait 当即排入上传流。Program 必须先提交当前层的完整上传及发布事件，
+替换的 reader wait 当即排入上传流。RankProgram 必须先提交当前层的完整上传及发布事件，
 再替换后续预取窗口，避免后续窗口的等待挡住尚未提交的当前层数据。
 
 `prepare(ExpertCacheRequest)` 选择已有安置的 required 和 prefetch，重复 key 只计一次。
-它只改变上传需求，保留所选条目的地址与跨批进度。布局、窗口轮转和保留集合由 Program 决定。
+它只改变上传需求，保留所选条目的地址与跨批进度。布局、窗口轮转和保留集合由 RankProgram 决定。
 
 `progress(ExpertUploadBudget)` 按本次 payload 字节数与批次数预算提交工作，不显式等待 GPU。
 启动配置同时限制单批 payload、复制描述符数和在途批次数；零预算只检查完成状态。
@@ -161,7 +162,7 @@ Host 的 release 不代表 GPU 已完成读取。CUDA 提交失败后停止接�
 缓存不包含 CPU 线程池、不执行 MoE 数学，也不拥有模型执行策略。
 上层通过 required/prefetch 和 progress 预算表达实际需求；已经提交的复制不能撤回。
 注册及首次上传的准备成本在启动阶段处理。CPU 计算与 DMA 可以同时读取不可变来源，
-但共享系统内存带宽；Program 为权重上传和小 bridge 分配独立 streams。
+但共享系统内存带宽；RankProgram 为权重上传和小 bridge 分配独立 streams。
 
 ## MoE 计算交接
 
@@ -189,7 +190,7 @@ CPU 权重接口不携带 activation divisor。GPU activation divisor 属于 Use
 融合 GU/down 分别取相关 Use 的 activation policy 交集；NVFP4 A4 需要共同的正值 activation divisor。
 
 Op 不分配长期资源或上传权重；CUDA 分支消费 Device 路由，CPU 分支同步消费 Host 路由。
-Program 提供 scratch 和执行 view，负责发布、acquire/release 及 bridge 完成依赖。
+RankProgram 提供 scratch 和执行 view，负责发布、acquire/release 及 bridge 完成依赖。
 固定 profile 的 CUDA Graph 可以重放新的路由、mask 和
 索引内容；更新必须发生在旧消费者结束之后。shared 始终驻留 GPU，不进入动态 expert 集合。
 
@@ -205,13 +206,13 @@ BF16 输出。Qwen3.5 使用后者，HC 架构可消费前者的独立 block 输
 调用方先用 cache `prepare/progress` 发布 required。混合调用先在计算流提交 route，
 回传 hidden 和连续的 IDs/coefficients，再提交 GPU routed/shared。小 T 的复制直接按计算流
 排序，较大 T 使用独立 bridge 流及事件，使传输与 GPU 计算重叠。调用方持有 GPU 分工的 lease；
-控制线程等输入就绪后运行同步 CPU collective，与 GPU 分支重叠。
+RankWorker 等输入就绪后运行同步 CPU collective，与 GPU 分支重叠。
 CPU FP32 分项通过同一传输流上传，计算流按依赖合并两份分项与 residual。正常路径只等待 CPU 输入，
-最终输出按计算流排序。一份 frame 由单个控制线程在固定 streams 上连续复用；下一次
+最终输出按计算流排序。一份 frame 由同一 RankWorker 在固定 streams 上连续复用；下一次
 route/D2H 经过上一层 combine，因而不会覆盖仍在上传的 Host 分项。资源销毁排空两条流。
 若本次路由没有 CPU assignment，跳过 CPU collective 和分项回传。单层 cache 交接在 capture 外执行。
 
-Program 记录每次完整 traversal 中实际参与计算的 CPU 层数；连续相同 T 下，CPU 频繁参与时
+RankProgram 记录每次完整 traversal 中实际参与计算的 CPU 层数；连续相同 T 下，CPU 频繁参与时
 在层间保持团队轮询，稀疏参与时允许休眠。启停使用不同阈值，T 改变或 traversal 未完成时
 重新观察。该策略不依赖 expert 的具体 ID、GPU 命中率假设或请求阶段，作用域在 traversal
 结束时释放；完整 GPU 流式计算不保持 CPU 团队活跃。
@@ -219,13 +220,13 @@ Program 记录每次完整 traversal 中实际参与计算的 CPU 层数；连�
 ## Engine 预算与逐层执行
 
 `NINFER_VRAM_BUDGET_MIB` 是引擎可使用的 Device 容量上限，另受启动时实际空闲显存限制。
-预算包含固定权重、Program State/KV、workspace、cache、offset/divisor 表、bridge/masks
+预算包含固定权重、RankProgram State/KV、workspace、cache、offset/divisor 表、bridge/masks
 及运行时余量。自动 KV 先保证一个完整上下文；Host 模式把其余容量优先用于 expert。
 显式 KV 配置仍完整兑现。Host 来源、注册范围和 pinned frame 单独报告，注册范围是
 Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 GPU。
 
-Qwen3.5 的完整 GPU 放置可行时使用融合路径，不创建 Host expert 副本；Host 路径保留完整
-原编码来源，Qwen4Exp 当前固定采用后者。
+两种架构的完整 GPU 放置可行时使用融合路径，不创建 Host expert 副本；Host 路径保留完整
+原编码来源。
 `EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列。
 35B-A3B 和 Flash Next 配置默认使用模型私有的静态标定排序，其他配置使用 ID 顺序；
 显式排列覆盖默认值。排序只决定缓存放置，不改变 router、coefficients 或 expert 数学，
@@ -233,11 +234,11 @@ Qwen3.5 的完整 GPU 放置可行时使用融合路径，不创建 Host expert 
 `expert_priority.cpp`；同配置的其他训练权重可提供自己的排序。
 各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
-`moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
+`moe.cpu_workers=0` 自动选择物理核并为执行调用线程留核；非零指定团队规模。
 
-`moe::Schedule` 由 Program 持有，封装 offload traversal、CPU 活动和图交接；其具体
+`moe::Schedule` 由 RankProgram 持有，封装 offload traversal、CPU 活动和图交接；其具体
 `offload::Resources`、CPU/team 计划与分段图只在提供 offload 的目标编译。
-Resident 调用直接消费 Model bank，复用完整 GPU 融合 Op。公共 plan 按实际 MoE 调用顺序组织，
+Resident 调用直接消费 ModelShard bank，复用完整 GPU 融合 Op。公共 plan 按实际 MoE 调用顺序组织，
 bank ID 与模型层号独立。模型提供 Main/MTP 的 bank 放置与优先级；混合计算阈值及参考 CPU 团队规模作为
 计算 profile 的策略输入，缓存规划不固定任何模型几何。扣除固定资源、KV、workspace、bridge/masks 和索引后，
 剩余容量 C 分成固定区 R 和流式窗口。启动时联合求解均衡的固定额度及窗口容量：每层完整
@@ -283,7 +284,7 @@ MTP 的 Main verification 和 DFlash 的 target 使用同一分段调度；MTP �
 延续常驻 Graph。相同 exact-B 的 target executable 在 draft 的不同拓扑间共享，
 每次选择 profile 同时安装对应 target envelope；MoE 段不随 context 档位复制。
 约束 mask 在首个 target GPU 段提交后准备。Graph 实例与 bridge/masks
-均由 Program 持有。启动校准借用已加载的 Host bank，以单层窗口承载权重，但按候选正式计划
+均由 RankProgram 持有。启动校准借用已加载的 Host bank，以单层窗口承载权重，但按候选正式计划
 捕获 All/None/MaskOnes 和 steady 段；CPU/GPU 计算仍使用同一组执行原语。
 expert ID 与 offset 改变不要求重新校准，计算变体集合改变时校准对应集合。
 销毁临时资源后扣除重建估计，再确定 expert cache 额度；销毁时先结束设备

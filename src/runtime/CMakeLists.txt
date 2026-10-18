@@ -10,14 +10,14 @@ target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core PRIVATE ninfer::
 
 # Public Engine and common contracts; model execution remains in the model layer.
 add_library(ninfer_engine STATIC
-  engine/model_construction.cpp
+  engine/startup.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(ninfer_engine PRIVATE
-  ninfer_model_runtime
+  ninfer_model_execution
   ninfer_artifact
   ninfer_core
   ninfer_runtime_support

@@ -1,7 +1,7 @@
 #include "models/qwen3_5/program/planning/moe.h"
 
 #include "models/qwen3_5/execution/profile.h"
-#include "models/qwen3_5/load.h"
+#include "models/qwen3_5/definition.h"
 
 #include <numeric>
 #include <stdexcept>
@@ -9,7 +9,7 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-std::vector<ExpertBankCacheSpec> bank_specs(const LoadPlan& source) {
+std::vector<ExpertBankCacheSpec> bank_specs(const ModelDefinition& source) {
     std::vector<ExpertBankCacheSpec> out;
     for (const auto& bank : source.expert_banks())
         out.push_back({bank.gate_up.layout, bank.down.layout, true});
@@ -21,7 +21,7 @@ std::vector<ExpertBankCacheSpec> bank_specs(const LoadPlan& source) {
 
 } // namespace
 
-std::shared_ptr<const moe::Plan> describe_moe_plan(const LoadPlan& source,
+std::shared_ptr<const moe::Plan> describe_moe_plan(const ModelDefinition& source,
                                                    const execution::ModelProfile& profile,
                                                    const MoeOptions& options) {
     if (options.expert_priority && options.expert_priority->size() != profile.text.layers.size())

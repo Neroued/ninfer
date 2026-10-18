@@ -1,6 +1,6 @@
 #include "models/qwen3_5/execution/profile.h"
 
-#include "models/qwen3_5/load.h"
+#include "models/qwen3_5/definition.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
@@ -14,10 +14,9 @@ std::int32_t dimension(std::uint64_t n) {
     return static_cast<std::int32_t>(n);
 }
 
-template <class Source>
 class Describe {
 public:
-    explicit Describe(const Source& plan) : plan_(plan) {}
+    explicit Describe(const ModelDefinition& plan) : plan_(plan) {}
 
     template <class Id>
     ops::LinearProfile linear(Id id) const {
@@ -111,11 +110,10 @@ public:
     }
 
 private:
-    const Source& plan_;
+    const ModelDefinition& plan_;
 };
 
-template <class Source>
-std::shared_ptr<const ModelProfile> describe_model_impl(const Source& plan) {
+std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& plan) {
     auto out           = std::make_shared<ModelProfile>();
     out->config        = plan.config();
     out->options       = plan.options();
@@ -134,12 +132,9 @@ std::shared_ptr<const ModelProfile> describe_model_impl(const Source& plan) {
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const LoadPlan& source) {
+std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
     return describe_model_impl(source);
 }
 
-std::shared_ptr<const ModelProfile> describe_model(const Model& source) {
-    return describe_model_impl(source);
-}
 
 } // namespace ninfer::models::qwen3_5::execution

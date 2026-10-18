@@ -32,10 +32,14 @@ public:
 
     void upload(cudaStream_t stream) override { executable_.upload(stream); }
 
-    void replay(Tensor& output, CudaExecutionView cuda,
-                const std::function<void()>& after_gpu_submit) override {
-        executable_.replay(resources_, bank_, output, cuda, after_gpu_submit);
+    bool start(Tensor& output, CudaExecutionView cuda,
+               std::function<void()> after_gpu_submit) override {
+        return executable_.start(resources_, bank_, output, cuda, std::move(after_gpu_submit));
     }
+
+    bool poll() override { return executable_.poll(); }
+
+    void cancel() override { executable_.cancel(); }
 private:
     Resources& resources_;
     ExpertBankId bank_;
@@ -73,12 +77,16 @@ public:
         : description_(describe(*plan)),
           resources_(std::move(plan), layers, sources, device, purpose) {}
 
-    void before_layer(ExpertBankId bank) override { resources_.before_layer(bank); }
+    bool try_before_layer(ExpertBankId bank) override { return resources_.try_before_layer(bank); }
 
-    void execute(ExpertBankId bank, const Tensor& hidden, Tensor& output, MemoryArena& workspace,
-                 const ops::MoeExecutionHints& hints) override {
-        resources_.execute(bank, hidden, output, workspace, hints);
+    bool start(ExpertBankId bank, const Tensor& hidden, Tensor& output, MemoryArena& workspace,
+               const ops::MoeExecutionHints& hints) override {
+        return resources_.start(bank, hidden, output, workspace, hints);
     }
+
+    bool poll() override { return resources_.poll(); }
+
+    void cancel() override { resources_.cancel(); }
 
     std::shared_ptr<const moe::LayerGraphDefinition>
     capture_layer(ExpertBankId bank, CudaExecutionView cuda, std::int32_t tokens,

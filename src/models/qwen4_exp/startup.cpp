@@ -5,15 +5,18 @@
 
 namespace ninfer::models::qwen4_exp {
 Startup::Startup(const artifact::Reader& reader, const EngineOptions& options, Device device)
-    : reader_(reader), selection_(load_options(options)), source_(plan_load(reader, selection_)),
-      table_(source_->ple_table().geometry()) {
-    profile = execution::describe_model(*source_);
+    : reader_(reader), definition_(read_definition(reader, load_options(options))) {
+    profile       = execution::describe_model(*definition_);
+    auto resident = resolve_load(reader_, definition_, device);
+    table_        = resident.ple_table_owner();
     placements_.push_back(
-        {WeightPlacement::Resident, source_->placement(device, device).device_capacity_bytes});
+        {WeightPlacement::Resident, resident.materialization().device_capacity_bytes});
     offload_ = describe_moe_plan(*profile, options.moe);
-    if (offload_)
-        placements_.push_back({WeightPlacement::HostExperts,
-                               source_->placement(device, Device::cpu()).device_capacity_bytes});
+    if (offload_) {
+        const auto host = resolve_load(reader_, definition_, device, Device::cpu(), table_);
+        placements_.push_back(
+            {WeightPlacement::HostExperts, host.materialization().device_capacity_bytes});
+    }
 }
 
 std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
@@ -22,8 +25,8 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
                                                     std::size_t available) const {
     const bool host = placement == WeightPlacement::HostExperts;
     if (host && !offload_) return {};
-    auto planned =
-        plan_execution(profile, table_, options, device, available, host ? offload_ : nullptr);
+    auto planned = plan_execution(profile, table_->geometry(), options, device, available,
+                                  host ? offload_ : nullptr);
     if (!planned) return {};
     const auto capacity = planned->capacity;
     const auto chunk    = planned->shape.prefill_chunk;
@@ -31,24 +34,22 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     return ExecutionPlan{std::move(*planned), capacity, placement, chunk, {moe}};
 }
 
-std::unique_ptr<Model> Startup::materialize(DeviceContext& device, WeightPlacement placement,
-                                            const StartupObserver& observer) {
-    if (!source_) source_.emplace(plan_load(reader_, selection_));
-    auto resolved =
-        resolve_load(std::move(*source_), device.device(),
-                     placement == WeightPlacement::HostExperts ? Device::cpu() : device.device());
-    source_.reset();
+std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPlacement placement,
+                                                 const StartupObserver& observer) {
+    auto resolved = resolve_load(
+        reader_, definition_, device.device(),
+        placement == WeightPlacement::HostExperts ? Device::cpu() : device.device(), table_);
     return materialize_model(std::move(resolved), device, &observer);
 }
 
-qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& o) const {
-    const auto generation = nlohmann::json::parse(model.resources().generation_config_json);
+qwen::Frontend Startup::frontend(const EngineOptions& o) const {
+    const auto generation = nlohmann::json::parse(definition_->resources().generation_config_json);
     SamplingPreset preset;
     preset.temperature = generation.value("temperature", 1.0F);
     preset.top_k       = generation.value("top_k", 20);
     preset.top_p       = generation.value("top_p", 0.95F);
     preset.min_p       = generation.value("min_p", 0.0F);
-    return qwen::make_frontend(model.resources(),
+    return qwen::make_frontend(definition_->resources(),
                                {.chat_template_path       = o.chat_template_path,
                                 .grammar_cache_bytes      = o.grammar_cache_bytes,
                                 .vision_enabled           = o.enable_vision,
@@ -59,10 +60,11 @@ qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& o) con
                                {preset, preset});
 }
 
-std::unique_ptr<Program> create_program(const execution::Parameters& p,
-                                        qwen4_exp::ExecutionPlan&& plan, DeviceContext& device,
-                                        const StartupObserver&) {
-    return std::make_unique<Program>(p, std::move(plan), device);
+std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& p,
+                                                 qwen4_exp::ExecutionPlan&& plan,
+                                                 DeviceContext& device,
+                                                 const StartupObserver& observer) {
+    return std::make_unique<RankProgram>(p, std::move(plan), device, observer);
 }
 
 GraphPreparationPlan Startup::graph_plan(const EngineOptions& options,
@@ -76,7 +78,8 @@ Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
     return calibrate_graphs(parameters, device, options, preparation.experts);
 }
 
-std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uint32_t chunk) {
+std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe,
+                              std::uint32_t chunk) {
     using Json    = nlohmann::json;
     const auto& c = model.config().text;
     Json facts{{"implementation", "qwen4-exp-eager-1"},
@@ -118,9 +121,9 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
     return qwen::frontend::sha256_hex(qwen::frontend::sha256(facts.dump()));
 }
 
-std::string Startup::prefill_signature(const Model& model, const ExecutionPreparation& preparation,
+std::string Startup::prefill_signature(const ExecutionPreparation& preparation,
                                        std::uint32_t chunk) const {
-    return qwen4_exp::prefill_signature(model, preparation.experts.get(), chunk);
+    return qwen4_exp::prefill_signature(*definition_, preparation.experts.get(), chunk);
 }
 
 } // namespace ninfer::models::qwen4_exp

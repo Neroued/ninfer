@@ -2,7 +2,7 @@
 
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
 The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
-implementation selection behind those contracts. Model benchmarks measure Program/model
+implementation selection behind those contracts. Model benchmarks measure native model
 composition. Correctness lives in the affected test suites; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
@@ -296,7 +296,7 @@ and lets production dispatch choose the implementation. Candidate crossover work
 task-local temporary sweep, puts the winner or boundary in production dispatch, and deletes losing
 candidates and temporary controls afterward; private launchers and route forcing do not belong in
 this retained benchmark. An Op-scoped Linear qualification uses this benchmark directly and does
-not load an artifact or invoke the target, Program, Engine, or round benchmarks documented
+not load an artifact or invoke the target, model, Engine, or round benchmarks documented
 elsewhere in this file.
 
 Build the benchmark and measure one exact production point:
@@ -1388,8 +1388,10 @@ cmake --build build/rtx5090-dev --parallel --target ninfer_mtp_pack_bench
 ## Model MTP round benchmark
 
 `ninfer_qwen3_5_mtp_round_bench` measures the native MTP proposal and verification round. It
-constructs the same v3 ModelInstance used by Engine, prepares a fixed token seed, and drives the
-production Program's decode/commit schedule. It reports round latency and licensed-token counts:
+constructs the same `InferenceInstance` used by Engine, prepares a fixed token seed, and drives
+the production Session and Executor. The v3 output reports complete-round wall latency from
+submission through result, commit and Device retirement, cumulative Host time spent inside the
+Session calls, and licensed-token counts. Resource reservation is outside the measured interval.
 
 ```bash
 cmake --build build/rtx5090-dev --parallel --target ninfer_qwen3_5_mtp_round_bench
@@ -1399,10 +1401,13 @@ cmake --build build/rtx5090-dev --parallel --target ninfer_qwen3_5_mtp_round_ben
 
 ## 35B complete DFlash round benchmark
 
-`ninfer_qwen3_5_dflash_round_bench` drives the production Program through consecutive
+`ninfer_qwen3_5_dflash_round_bench` drives the production Session and Executor through consecutive
 steady DFlash rounds. A measured round includes the previous confirmed feature-to-context append,
-the six-layer proposal, target verify/accept, and host publication. It reports GPU and wall latency,
-real acceptance, per-position acceptance, mean licensed length, and published tokens/s:
+the six-layer proposal, target verify/accept, commit, and Device retirement. Its v4 output reports
+complete-round wall latency, cumulative Host call time, real acceptance, per-position acceptance,
+mean licensed length, and committed tokens/s. Host call time includes submission, polling and
+commit work; it excludes the yield intervals between polls. Neither measurement is a GPU interval.
+Resource reservation is outside the measured interval.
 
 ```bash
 cmake --build build/rtx5090-dev --parallel \
@@ -1559,8 +1564,8 @@ startup and warmup. It includes all requests in those repetitions.
 `reps` contains request samples in repetition-major order, with explicit `repetition` and `row`.
 `output_tok_s` divides each repetition's actual outputs by its wall time.
 `decode_output_tok_s` counts actual outputs after the first token, allowing early grammar EOS.
-`decode_engine_tok_s` uses the Program's speculative round statistics, so it also describes work performed by a final partially
-committed speculative round. Reports also contain the command and machine information needed to
+`decode_engine_tok_s` uses the Session's speculative round statistics, so it also describes work
+performed by a final partially committed speculative round. Reports also contain the command and machine information needed to
 interpret a local measurement.
 
 Raw reports and profiler captures remain local under `profiles/bench`, `profiles/ncu`, and
@@ -1627,8 +1632,8 @@ reference, not an isolated measurement of overlap. `both` alternates order, reve
 input's order on successive corpus passes, and reports min/median/p95/max and paired differences.
 `--gap-us N` adds an excluded inter-call gap. Select a CPU affinity allowed on the current machine.
 `--keep-active` keeps workers polling throughout warmup and measurement; without it, the team
-uses its ordinary bounded spin and park policy. This layer benchmark does not apply the Program's
-adaptive waiting policy.
+uses its ordinary bounded spin and park policy. This layer benchmark does not apply the model
+schedule's adaptive waiting policy.
 
 For a timeline, capture this executable with `nsys --trace=cuda,nvtx`; the model marks CPU input
 wait and CPU computation separately. `--profile` brackets measured calls with CUDA profiler API

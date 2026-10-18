@@ -4,6 +4,7 @@
 #include "core/weight_view.h"
 
 #include <array>
+#include <span>
 
 namespace ninfer::artifact {
 class Reader;
@@ -41,11 +42,11 @@ struct LookupParameters {
     std::uint64_t rows;
 };
 
-// Reads controls and divisors, without materializing table rows or opening direct-I/O backing.
+// Parses controls and reads divisors, without materializing table rows or opening I/O backing.
 // The supported representation is complete NF4_G16_E4M3FN/RowPagedG16_4K shards of width 160.
 [[nodiscard]] LookupParameters load_lookup_parameters(const artifact::Reader&,
                                                       const artifact::Binding& table,
-                                                      artifact::ObjectHandle controls,
+                                                      std::span<const std::byte> controls,
                                                       HashGeometry);
 
 } // namespace ninfer::models::qwen4_exp::ple

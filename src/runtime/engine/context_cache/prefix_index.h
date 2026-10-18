@@ -14,16 +14,16 @@ template <class Model>
 class PrefixIndex {
 public:
     using Handle  = typename Model::CheckpointHandle;
-    using Program = typename Model::Program;
+    using Session = typename Model::Session;
     using Base    = typename Model::RequestBasePlan;
 
-    void insert(Program& program, Handle handle, std::uint32_t frontier) {
-        insert_at(program, root_, handle, frontier);
+    void insert(Session& session, Handle handle, std::uint32_t frontier) {
+        insert_at(session, root_, handle, frontier);
     }
 
     void erase(Handle handle) { erase_at(root_, handle, true); }
 
-    [[nodiscard]] std::vector<Handle> matches(const Program& program, const Base& base) const {
+    [[nodiscard]] std::vector<Handle> matches(const Session& session, const Base& base) const {
         std::vector<Handle> result;
         const Node* current = &root_;
         while (current) {
@@ -32,7 +32,7 @@ public:
             for (const auto& child : current->children) {
                 if (child->frontier > base.summary().prompt_tokens) { continue; }
                 const auto key = base.prefix_shortlist_key(child->frontier);
-                if (key && *key == program.checkpoint_key(child->representative, child->frontier)) {
+                if (key && *key == session.checkpoint_key(child->representative, child->frontier)) {
                     next = child.get();
                     break;
                 }
@@ -53,7 +53,7 @@ private:
         std::vector<std::unique_ptr<Node>> children;
     };
 
-    static void insert_at(Program& program, Node& node, Handle handle, std::uint32_t frontier) {
+    static void insert_at(Session& session, Node& node, Handle handle, std::uint32_t frontier) {
         if (node.frontier == frontier) {
             if (std::find(node.checkpoints.begin(), node.checkpoints.end(), handle) ==
                 node.checkpoints.end()) {
@@ -63,15 +63,15 @@ private:
             return;
         }
         for (auto& child : node.children) {
-            if (program.checkpoint_key(child->representative, node.frontier + 1U) !=
-                program.checkpoint_key(handle, node.frontier + 1U)) {
+            if (session.checkpoint_key(child->representative, node.frontier + 1U) !=
+                session.checkpoint_key(handle, node.frontier + 1U)) {
                 continue;
             }
             std::uint32_t low = node.frontier + 1U, high = std::min(frontier, child->frontier);
             while (low < high) {
                 const auto middle = low + (high - low + 1U) / 2U;
-                if (program.checkpoint_key(child->representative, middle) ==
-                    program.checkpoint_key(handle, middle)) {
+                if (session.checkpoint_key(child->representative, middle) ==
+                    session.checkpoint_key(handle, middle)) {
                     low = middle;
                 } else {
                     high = middle - 1U;
@@ -84,7 +84,7 @@ private:
                 branch->children.push_back(std::move(child));
                 child = std::move(branch);
             }
-            insert_at(program, *child, handle, frontier);
+            insert_at(session, *child, handle, frontier);
             return;
         }
         auto child            = std::make_unique<Node>();

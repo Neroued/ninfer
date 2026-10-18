@@ -13,8 +13,7 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
-class LoadPlan;
-class Model;
+class ModelDefinition;
 
 namespace execution {
 
@@ -95,8 +94,7 @@ struct ModelProfile {
     std::optional<ProposalProfile> proposal;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const LoadPlan&);
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const Model&);
+[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
 
 } // namespace execution
 } // namespace ninfer::models::qwen3_5

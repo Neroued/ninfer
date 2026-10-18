@@ -13,20 +13,16 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
                  CudaExecutionView cuda)
     : parameters_(p), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
       scope_(execution.workspace.scope()),
-      roots_(
-          workspace::roots(execution.workspace, p.model.config().text, batch.tokens * batch.batch)),
+      roots_(workspace::roots(execution.workspace, p.profile->config.text,
+                              batch.tokens * batch.batch)),
       expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch)
                                          : std::nullopt) {
-    if (batch.tokens <= 0 || batch.batch < 1 || batch.batch > kMaximumConcurrency ||
+    if (batch.tokens <= 0 || batch.batch < 1 ||
+        batch.batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
         (std::holds_alternative<SequenceSlots>(update) && batch.batch != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
         (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
-}
-
-void TextRun::prefix(std::optional<VisualEmbeddingView> visual) {
-    stem(visual);
-    for (std::uint32_t i = 0; i < parameters_.model.config().text.ple.layer; ++i) layer(i);
 }
 
 void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
@@ -35,28 +31,34 @@ void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
                    cuda_);
     if (visual) ops::scatter(visual->features, visual->columns, roots_.input, cuda_);
     ops::hc_expand_norm(roots_.input, p.layers.front().attention_hc.norm,
-                        parameters_.model.config().text.norm_epsilon, roots_.residual,
+                        parameters_.profile->config.text.norm_epsilon, roots_.residual,
                         roots_.normalized, cuda_);
 }
 
-void TextRun::layer(std::uint32_t i) {
-    nvtx::ScopedRange layer(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
+bool TextRun::advance_layer(std::uint32_t i) {
+    const nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
     const auto& p = parameters_.text.layers[i];
-    if (execution_.experts) execution_.experts->before_layer(p.moe.bank);
-    mixer(i);
-    {
-        auto scratch = execution_.workspace.scope();
-        if (execution_.experts)
-            execution_.experts->execute(p.moe.bank, roots_.input, roots_.output,
-                                        execution_.workspace, {});
-        else
+    if (waiting_moe_) {
+        if (!execution_.experts->poll()) return false;
+        waiting_moe_ = false;
+    } else {
+        if (execution_.experts && !execution_.experts->try_before_layer(p.moe.bank)) return false;
+        mixer(i);
+        if (execution_.experts) {
+            if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
+                                           execution_.workspace, {})) {
+                waiting_moe_ = true;
+                return false;
+            }
+        } else
             resident_moe(i);
     }
     combine(i);
+    return true;
 }
 
 void TextRun::mixer(std::uint32_t i) {
-    const auto& config = parameters_.model.config().text;
+    const auto& config = parameters_.profile->config.text;
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
     auto& arena        = execution_.workspace;
@@ -105,7 +107,7 @@ void TextRun::gpu_moe(const moe::GpuCall& call) {
 }
 
 void TextRun::combine(std::uint32_t i) {
-    const auto& config = parameters_.model.config().text;
+    const auto& config = parameters_.profile->config.text;
     if (i + 1 == config.ple.layer) {
         ops::hc_combine(roots_.residual, roots_.output, roots_.injection, roots_.residual, cuda_);
     } else {
@@ -119,22 +121,16 @@ void TextRun::combine(std::uint32_t i) {
 
 void TextRun::consume_ple(const Tensor& embedding) {
     const auto& p    = parameters_.text;
-    const auto start = parameters_.model.config().text.ple.layer;
+    const auto start = parameters_.profile->config.text.ple.layer;
     ops::PleConvRecordWindowView records;
     if (!std::holds_alternative<SequenceSlots>(update_))
         records = {execution_.ple_records.slice(2, 0, batch_.batch), batch_.record_offsets};
     const auto after = std::holds_alternative<VerifyRecords>(update_)
                            ? std::nullopt
                            : std::optional{execution_.states.ple(batch_.destination_slots)};
-    ple(embedding, parameters_.model.config().text, p.ple, batch_,
+    ple(embedding, parameters_.profile->config.text, p.ple, batch_,
         execution_.states.ple(batch_.source_slots), after, records, p.layers[start].attention_hc,
         roots_.residual, roots_.normalized, execution_.workspace, cuda_);
-}
-
-void TextRun::suffix(TextOutputs output, Tensor logits) {
-    const auto start = parameters_.model.config().text.ple.layer;
-    for (std::uint32_t i = start; i < parameters_.text.layers.size(); ++i) layer(i);
-    finish(output, logits);
 }
 
 void TextRun::finish(TextOutputs output, Tensor logits) {
@@ -143,7 +139,7 @@ void TextRun::finish(TextOutputs output, Tensor logits) {
         copy_bytes_async({output.conditioning.data, output.conditioning.bytes(), cuda_.device()},
                          {roots_.residual.data, roots_.residual.bytes(), cuda_.device()}, cuda_);
     auto sample = output.sample.view(
-        {dimension(parameters_.model.config().text.hidden), batch_.tokens * batch_.batch});
+        {dimension(parameters_.profile->config.text.hidden), batch_.tokens * batch_.batch});
     ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, sample, cuda_);
     if (logits.data) {
         logits = logits.view({logits.ne[0], batch_.tokens * batch_.batch});

@@ -1,5 +1,7 @@
 #include "core/device.h"
-#include "core/host_kv_arena.h"
+#include "core/buffer.h"
+#include "core/paged_kv_geometry.h"
+#include "models/common/context/directory/allocation.h"
 #include "models/qwen3_5/state/state_image.h"
 
 #include <cuda_runtime.h>
@@ -16,7 +18,8 @@
 
 namespace {
 
-namespace q36 = ninfer::models::qwen3_5;
+namespace q36     = ninfer::models::qwen3_5;
+namespace context = ninfer::models::context;
 
 int failures = 0;
 
@@ -48,7 +51,8 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
                 .key_head_dim   = 3,
                 .conv_dtype     = ninfer::DType::BF16,
             },
-        .hidden = 7,
+        .hidden       = 7,
+        .dflash_local = std::nullopt,
     };
     if (dflash) {
         spec.dflash_local = dflash2
@@ -148,16 +152,21 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     }
     fill_slot(pool, 0, dflash ? 0x19 : 0x25, device.execution_view());
     pool.storage().clear(1, device.execution_view());
-    ninfer::HostContextArena host(planned.layout.images.image_stride,
-                                  planned.layout.images.image_stride);
+    context::HostAllocator host(0, planned.layout.images.image_stride,
+                                planned.layout.images.image_stride);
+    ninfer::PinnedHostBuffer host_bytes(host.capacity_bytes());
     auto allocation = host.allocate(pool.storage().image_bytes());
     expect(allocation && !host.can_allocate(pool.storage().image_bytes()), "Host reservation");
-    pool.storage().copy_to_host(0, allocation->span(), device.execution_view());
+    pool.storage().copy_to_host(
+        0, host_bytes.span().subspan(allocation->extent().offset, allocation->bytes()),
+        device.execution_view());
     device.synchronize();
     allocation->publish();
     expect(host.reserved_bytes() == 0 && host.live_bytes() == pool.storage().image_bytes(),
            "Host publication preserves one allocation");
-    pool.storage().copy_from_host(allocation->span(), 1, device.execution_view());
+    pool.storage().copy_from_host(
+        host_bytes.span().subspan(allocation->extent().offset, allocation->bytes()), 1,
+        device.execution_view());
     device.synchronize();
     expect_slot(pool, 1, dflash ? 0x19 : 0x25, "complete Host roundtrip");
     if (dflash) {
@@ -185,34 +194,31 @@ void test_shared_host_capacity() {
     expect(image_bytes % page.page_stride == 0,
            "shared Host fixture image consists of complete KV page extents");
     const auto pages_per_image = static_cast<std::uint32_t>(image_bytes / page.page_stride);
-    ninfer::HostContextArena backing(image_bytes * 2, std::min(image_bytes, page.page_stride));
-    const std::array layouts{page};
-    ninfer::HostKVArena kv(backing, layouts);
-    auto source                     = backing.allocate(image_bytes);
-    const std::byte* original_bytes = source->data();
+    context::HostAllocator backing(0, image_bytes * 2, std::min(image_bytes, page.page_stride));
+    auto source                = backing.allocate(image_bytes);
+    const auto original_offset = source->extent().offset;
     source->publish();
-    auto destination = kv.allocate(page, pages_per_image);
+    auto destination = backing.allocate(page.page_stride * pages_per_image);
     expect(destination && backing.live_bytes() == image_bytes &&
                backing.reserved_bytes() == image_bytes && !backing.can_allocate(image_bytes) &&
-               !backing.allocate(image_bytes) && !kv.allocate(page, 1),
+               !backing.allocate(image_bytes) && !backing.allocate(page.page_stride),
            "State and in-flight KV destination consume the same actual backing");
     destination.reset();
     expect(backing.reserved_bytes() == 0 && backing.live_bytes() == image_bytes &&
-               source->data() == original_bytes,
+               source->extent().offset == original_offset,
            "KV transfer cancellation retains the pinned State source");
     expect(source->release(), "shared Host state release");
-    auto all_kv = kv.allocate(page, pages_per_image * 2);
-    expect(all_kv && kv.view(*all_kv).data() == original_bytes &&
+    auto all_kv = backing.allocate(page.page_stride * pages_per_image * 2);
+    expect(all_kv && all_kv->extent().offset == original_offset &&
                backing.occupied_bytes() == backing.capacity_bytes(),
            "KV reuses the exact physical extent previously occupied by State");
     all_kv->publish();
-    const auto stale = kv.view(*all_kv);
-    auto parts       = kv.split(std::move(*all_kv), pages_per_image);
-    expect(!stale.valid() && backing.live_bytes() == image_bytes * 2,
-           "KV split invalidates old views while keeping unique byte accounting");
+    auto parts = backing.split(std::move(*all_kv), page.page_stride * pages_per_image);
+    expect(!all_kv->valid() && backing.live_bytes() == image_bytes * 2,
+           "KV split transfers ownership while keeping unique byte accounting");
     (void)parts.first.release();
     auto recovered = backing.allocate(image_bytes);
-    expect(recovered && recovered->data() == original_bytes &&
+    expect(recovered && recovered->extent().offset == original_offset &&
                backing.occupied_bytes() == backing.capacity_bytes(),
            "State reuses the exact physical extent released by split KV");
     expect(recovered->release(), "shared Host recovered state release");

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/common/context/kv_history.h"
-#include "models/common/context/state_store.h"
+#include "models/common/context/directory/history.h"
+#include "models/common/context/directory/state.h"
 
 #include <memory>
 #include <optional>
@@ -16,8 +16,8 @@ namespace ninfer::models::context {
 template <class Metadata, class Identity>
 class ContextSnapshot {
 public:
-    ContextSnapshot(StateImageStore& states, Continuation<Metadata> continuation,
-                    std::vector<KVPrefixRef> prefixes, std::shared_ptr<const Identity> identity)
+    ContextSnapshot(StateDirectory& states, Continuation<Metadata> continuation,
+                    std::vector<HistoryPrefix> prefixes, std::shared_ptr<const Identity> identity)
         : states_(&states), continuation_(std::move(continuation)), prefixes_(std::move(prefixes)),
           identity_(std::move(identity)) {
         if (!identity_) throw std::invalid_argument("snapshot has no input identity");
@@ -69,11 +69,13 @@ public:
         return identity_;
     }
 
-    [[nodiscard]] const KVPrefixRef& prefix(std::size_t index) const { return prefixes_.at(index); }
+    [[nodiscard]] const HistoryPrefix& prefix(std::size_t index) const {
+        return prefixes_.at(index);
+    }
 
-    [[nodiscard]] std::span<const KVPrefixRef> prefixes() const noexcept { return prefixes_; }
+    [[nodiscard]] std::span<const HistoryPrefix> prefixes() const noexcept { return prefixes_; }
 
-    [[nodiscard]] StateImageStore::Handle take_mutable_image() {
+    [[nodiscard]] StateId take_mutable_image() {
         if (!states_) throw std::logic_error("snapshot image already consumed");
         states_->consume_checkpoint(continuation_.image);
         states_ = nullptr;
@@ -86,9 +88,9 @@ private:
         states_ = nullptr;
     }
 
-    StateImageStore* states_;
+    StateDirectory* states_;
     Continuation<Metadata> continuation_;
-    std::vector<KVPrefixRef> prefixes_;
+    std::vector<HistoryPrefix> prefixes_;
     std::shared_ptr<const Identity> identity_;
 };
 

@@ -66,10 +66,10 @@ struct MtpParameters {
 
 class Parameters {
 public:
-    explicit Parameters(const Model&, std::shared_ptr<const ModelProfile> = {});
+    explicit Parameters(const ModelShard&, std::shared_ptr<const ModelProfile>);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
-    const Model& model;
+    const ModelShard& model;
     const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;

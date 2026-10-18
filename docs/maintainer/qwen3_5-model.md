@@ -225,6 +225,11 @@ the configured blocks in chunks. It preserves state and positions across chunks.
 RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
+A prefill Work retains its nominal token budget across internal rewrite and Vision
+segments. RankProgram advances their state and history in order within the same frame; these
+mathematical boundaries do not yield to the Scheduler. Session ends the Work at the nominal
+chunk limit, a reserved capture, or the prompt frontier. Only the final prompt segment samples.
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 
@@ -241,18 +246,23 @@ The stem concatenates embedding first, hidden second. MTP has private stem, bloc
 KV state. Its attention and Dense/MoE geometry come from Text. It can recursively propose several
 tokens using the previous MTP hidden output.
 
-For prompt tokens x_0 through x_n and the target's first generated token x_(n+1), MTP prefill uses:
+For prompt tokens x_0 through x_n, MTP history construction uses:
 
 ```text
-token inputs    = [x_1, x_2, ..., x_n, x_(n+1)]
-hidden inputs   = [h_0, h_1, ..., h_(n-1), h_n]
-position inputs = [p_0, p_1, ..., p_(n-1), p_n]
+token inputs    = [x_1, x_2, ..., x_n]
+hidden inputs   = [h_0, h_1, ..., h_(n-1)]
+position inputs = [p_0, p_1, ..., p_(n-1)]
 ```
 
-Tokens shift; hidden states and positions do not. The whole aligned sequence populates MTP KV.
-Shifted media placeholders use their corresponding composed Vision embedding columns.
-[`mtp_alignment.h`](../../src/models/qwen3_5/program/speculative/mtp_alignment.h) and the prefill
-implementation own chunk-boundary and continuation alignment.
+Tokens shift; hidden states and positions do not. At a stable target frontier F, MTP history has
+frontier `max(F-1,0)`. The current round's first draft step pairs the unprocessed anchor with the
+saved target hidden at F-1; no draft is carried from the preceding round. Shifted media placeholders
+use their corresponding composed Vision embedding columns.
+[`program/mtp.cpp`](../../src/models/qwen3_5/program/mtp.cpp) implements history alignment and
+draft execution; Session owns the committed frontiers.
+For speculative commit, RankProgram prepares a history-rebuild Graph for each exact batch and
+accepted input width. It consumes the chosen lengths from the fixed commit frame; prefill and
+ordinary alignment retain their native execution path.
 
 An optional proposal head supplies an indexed vocabulary subset for draft prediction. Its row map
 converts proposal rows to actual token IDs. Full target verification continues to use the full
@@ -286,7 +296,7 @@ Those columns replace matching placeholder embeddings. Vision has no autoregress
 
 Frontend admission uses aggregate media bytes, pixels, patch/token budgets and Engine context
 capacity. The aggregate limit is 131,072 raw patches / 32,768 merged tokens; a single tower item
-uses at most 16,384 merged tokens, additionally bounded by context. Program executes items
+uses at most 16,384 merged tokens, additionally bounded by context. RankProgram executes items
 sequentially and reuses their output handoff after scattering the previous item.
 
 The prepared prompt stores axis-major `[3,T]` positions in temporal, height, width order:
@@ -320,14 +330,15 @@ does not infer execution identity from tokenizer filenames, release names or sam
 
 Each StateImage contains the Text GDN state and continuation hidden. Per GDN layer, recurrent
 state has one `[Dv,Dk]` matrix per value head, and convolution history has
-`(2 * key_width + value_width) * (kernel_width - 1)` values. Program sizes Device/Host StateImage
+`(2 * key_width + value_width) * (kernel_width - 1)` values. Startup plans Device/Host StateImage
 capacity under the [context resource contract](resource-scheduling-and-context-cache.md#capacity).
 ReplaySSM records are separate pending-round scratch when speculation is enabled.
 
 Text GQA KV grows with visible context. Selected MTP owns separate KV; DFlash backends own the
-state described in their reference. Continuation hidden values and prefix checkpoints belong to
-Program. Workspace, storage capacities and graph buffers are derived from actual parameters and
-startup options by the planners described in [Engine architecture](engine-architecture.md).
+state described in their reference. Session owns continuation metadata, prefix checkpoints and
+directory references; RankProgram owns hidden-value and KV backing. Workspace, storage capacities
+and graph buffers are derived from actual parameters and startup options by the planners described
+in [Engine architecture](engine-architecture.md).
 
 Speculation verifies the candidate sequence against processed target distributions, commits the
 accepted prefix and continuation state, then publishes output. Greedy acceptance compares a

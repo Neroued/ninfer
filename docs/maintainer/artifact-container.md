@@ -576,7 +576,8 @@ Reader 的 JSON 与符号索引用于冷加载，运行时使用解析后的引�
 | 精简配置、逻辑参数 shape/覆盖、组件关系、所选功能数据缺失 | 对应架构 binder |
 | Codes/scales、编码 padding 与源数值转换正确性 | Converter、codec 与相应验证 |
 | 实际原生参数、format/layout/shape/phase 支持不足 | Op 准备、容量查询、warmup 或执行 |
-| 状态存储、实际容量与生命周期 | Program 与状态实现 |
+| 状态身份、范围分配与引用生命周期 | Session 与 ContextDirectory |
+| 固定物理存储、执行与退役 | RankProgram 与 ContextStorage |
 
 运行时沿实际消费者完成必要检查，使用已转换的 payload；常规上传依赖 producer 建立的
 codes/scales 合同。数值资格验证按现有 Op/codec 规则执行。

@@ -7,7 +7,7 @@
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "runtime/engine/model_construction.h"
+#include "runtime/engine/startup.h"
 
 #include <algorithm>
 #include <limits>
@@ -19,13 +19,6 @@
 
 namespace ninfer {
 namespace {
-
-DeviceContext initialize_device(const EngineOptions& options) {
-    StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
-    phase.complete();
-    return device;
-}
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -148,46 +141,38 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Qwen35         = runtime::ModelInstance<models::qwen3_5::RuntimeTypes>;
+    using Qwen35         = runtime::InferenceInstance<models::qwen3_5::RuntimeTypes>;
     using GenerationCore = runtime::EngineCore<Qwen35>;
     using ScoringCore    = runtime::CausalScoreCore<Qwen35>;
-    using Qwen4          = runtime::ModelInstance<models::qwen4_exp::RuntimeTypes>;
+    using Qwen4          = runtime::InferenceInstance<models::qwen4_exp::RuntimeTypes>;
     using Core =
         std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
                      std::unique_ptr<runtime::EngineCore<Qwen4>>,
                      std::unique_ptr<runtime::CausalScoreCore<Qwen4>>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+        : options(runtime::normalize_engine_options(std::move(engine_options))) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed    = runtime::construct_model(options, device);
-        active              = std::move(constructed.instance);
-        load                = std::move(constructed.load);
-        load.cuda_sync_mode = device.sync_mode();
-        sampling_defaults   = frontend().sampling_defaults();
+        auto constructed  = runtime::construct_model(options);
+        active            = std::move(constructed.instance);
+        load              = std::move(constructed.load);
+        sampling_defaults = frontend().sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         std::visit(
             [&](auto& instance) {
                 using Instance = typename std::remove_cvref_t<decltype(instance)>::element_type;
                 if (options.purpose == EnginePurpose::CausalScoring) {
-                    core = std::make_unique<runtime::CausalScoreCore<Instance>>(*instance, device);
+                    core = std::make_unique<runtime::CausalScoreCore<Instance>>(*instance);
                 } else {
                     core = std::make_unique<runtime::EngineCore<Instance>>(
-                        *instance, device, options, std::move(constructed.context_cost));
+                        *instance, options, std::move(constructed.context_cost));
                 }
             },
             active);
         finalize_phase.complete();
     }
 
-    ~Impl() noexcept {
-        device.bind_to_current_thread_noexcept();
-        core.emplace<std::monostate>();
-        try {
-            device.synchronize();
-        } catch (...) {}
-    }
+    ~Impl() noexcept { core.emplace<std::monostate>(); }
 
     [[nodiscard]] const models::qwen::Frontend& frontend() const {
         return std::visit(
@@ -198,7 +183,6 @@ public:
     }
 
     EngineOptions options;
-    DeviceContext device;
     runtime::ActiveModel active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;

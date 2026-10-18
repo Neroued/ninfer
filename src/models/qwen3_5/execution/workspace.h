@@ -43,11 +43,6 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     return out;
 }
 
-template <class Allocator>
-Tensor visual_scatter_indices(Allocator& allocator, std::int32_t tokens) {
-    return vector(allocator, DType::I32, tokens);
-}
-
 struct TextAttentionProjectionRoots {
     Tensor hidden;
     Tensor query;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/buffer.h"
+#include "core/platform.h"
 #include "ninfer/ops/gdn_control.h"
 #include "ops/op_tester.h"
 #include "ops/suite.h"
@@ -37,8 +38,11 @@ struct Profile {
     Storage storage = Storage::Parent;
 };
 
-inline constexpr std::array kProfiles{Profile{48, 5120}, Profile{48, 5120, Storage::Pair},
-                                      Profile{32, 2048}, Profile{48, 2560}};
+inline constexpr std::array kProfiles{
+#if NINFER_TARGET_SPARK
+    Profile{24, 2560},
+#endif
+    Profile{48, 5120}, Profile{48, 5120, Storage::Pair}, Profile{32, 2048}, Profile{48, 2560}};
 
 struct Case {
     int columns;

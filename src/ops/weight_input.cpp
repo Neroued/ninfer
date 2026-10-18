@@ -198,7 +198,8 @@ ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const W
     const auto& shape = matrix(a);
     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
                                    shape == std::vector<std::uint64_t>{32, 2048} ||
-                                   shape == std::vector<std::uint64_t>{48, 2560}),
+                                   shape == std::vector<std::uint64_t>{48, 2560} ||
+                                   shape == std::vector<std::uint64_t>{24, 2560}),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {

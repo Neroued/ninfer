@@ -110,8 +110,10 @@ int validate(Profile p, bool normalize_input, CudaExecutionView execution) {
                                           [&] { f.invoke(small, execution); });
         if (small.used()) ++failed;
     }
-    MemoryArena overlapping(MemorySpan{f.device_x.data(), f.capacity, f.device_x.device()});
-    failed += rejects(name + " scratch overlap", [&] { f.invoke(overlapping, execution); });
+    if (f.capacity) {
+        MemoryArena overlapping(MemorySpan{f.device_x.data(), f.capacity, f.device_x.device()});
+        failed += rejects(name + " scratch overlap", [&] { f.invoke(overlapping, execution); });
+    }
     failed += verify_exact((name + " rejected g untouched").c_str(),
                            from_device<std::uint32_t>(f.g.data(), old_g.size()), old_g);
     failed += verify_exact((name + " rejected beta untouched").c_str(),

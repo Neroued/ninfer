@@ -1,6 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/control/execute.h"
 #include "ops/linear_attention/gated_delta_net/control/bf16/launch.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "core/platform.h"
 
 namespace ninfer::ops::detail::gdn_control {
 namespace {
@@ -28,6 +29,12 @@ void execute_projection(const Tensor& x, const Weights& weights, const Tensor& a
         launch_n64_k2048(in, out, plan, scratch, execution);
         return;
     case 2560:
+#if NINFER_TARGET_SPARK
+        if (weights.geometry.heads == 24) {
+            launch_n48_k2560(in, out, plan, scratch, execution);
+            return;
+        }
+#endif
         launch_n96_k2560(in, out, plan, scratch, execution);
         return;
     }

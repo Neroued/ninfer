@@ -20,7 +20,10 @@ void unique(std::vector<Case>& cases) {
 
 std::vector<Case> projection_cases(Profile p) {
     std::vector<Case> outputs{{1}, {4}, {8}, {64}, {128}};
-    if (p.input_rows == 2560)
+    if (p.heads == 24) {
+        for (int m = 1; m <= 128; ++m) outputs.push_back({m});
+        boundaries(outputs, {16, 32, 64, 128, 256, 512, 1024, 2048, 4096});
+    } else if (p.input_rows == 2560)
         boundaries(outputs,
                    {1, 4, 8, 192, 448, 512, 896, 1024, 1280, 2048, 2688, 5120, 7168, 8192});
     else if (p.input_rows == 5120)
@@ -85,12 +88,17 @@ void add_projection_cases(OpSuite& suite) {
                               return run(profile, c, normalize,
                                          cuda_environment().context.execution_view());
                           },
-                          {{"format", "bf16"}, {"execution", graph ? "graph" : "eager"}});
+                          {{"format", "bf16"},
+                           {"execution", graph ? "graph" : "eager"},
+                           {"suite", prefix}});
             }
-            suite.add(prefix + "/contract", [=] {
-                return validate(profile, normalize, cuda_environment().context.execution_view()) +
-                       validate_capacity(profile, normalize);
-            });
+            suite.add(prefix + "/contract",
+                      [=] {
+                          return validate(profile, normalize,
+                                          cuda_environment().context.execution_view()) +
+                                 validate_capacity(profile, normalize);
+                      },
+                      {{"suite", prefix}});
         }
 }
 } // namespace ninfer::test::gdn_control

@@ -43,6 +43,7 @@ inline Options parse(int argc, char** argv) {
                    "  --heads H --input-rows K --weights parent|pair --batch B\n"
                    "  --tokens M[,M...] or --sweep START:END[:STEP]\n"
                    "Projection [2H,K]: [96,5120], [64,2048], [96,2560]. Norm excludes K=2560.\n"
+                   "Spark projection also admits [48,2560] (H=24).\n"
                    "Paired weights: [48,5120]. Direct control: H=48. Matrix M=tokens*batch.\n";
             measurement::help();
             std::exit(0);
@@ -83,15 +84,8 @@ inline Options parse(int argc, char** argv) {
     }
     if (have_tokens && have_sweep)
         throw std::invalid_argument("tokens and sweep are mutually exclusive");
-    const bool geometry = (o.heads == 48 && (o.input_rows == 2560 || o.input_rows == 5120)) ||
-                          (o.heads == 32 && o.input_rows == 2048);
-    if (o.op == Op::Control) {
-        if (have_weights || have_rows)
-            throw std::invalid_argument("direct control has no projection weights or input rows");
-        if (o.heads != 48) throw std::invalid_argument("control requires H=48");
-    } else if (!geometry || (o.storage == Storage::Pair && o.input_rows != 5120) ||
-               (o.op == Op::NormProjection && o.input_rows == 2560))
-        throw std::invalid_argument("unsupported control profile");
+    if (o.op == Op::Control && (have_weights || have_rows))
+        throw std::invalid_argument("direct control has no projection weights or input rows");
     for (int m : o.tokens) (void)columns(m, o.batch);
     return o;
 }

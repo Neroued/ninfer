@@ -65,7 +65,7 @@ Weights::Weights(Profile p, Pattern pattern)
     upload();
     const std::uint64_t count = a.size();
     // Retain coverage of logical projections over a differently shaped contiguous parent.
-    // The new 2560 profile uses its actual [96,2560] stored parent.
+    // K=2560 profiles use their actual [2H,2560] stored parent.
     const bool reshaped_parent = p.storage == Storage::Parent && p.input_rows != 2560;
     const std::array<std::uint64_t, 2> parent_shape{
         std::uint64_t(reshaped_parent                ? 4 * p.heads

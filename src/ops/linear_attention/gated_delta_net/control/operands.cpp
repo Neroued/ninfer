@@ -1,5 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/control/operands.h"
 #include "ops/common/host/operands.h"
+#include "core/platform.h"
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -55,9 +56,11 @@ Geometry describe_profile(const ProjectionProfile& weights) {
     const auto& a = weights.first;
     require(valid_linear_policy(a.policy), "invalid activation permission");
     if (!weights.second) {
-        require(a.qtype == QType::BF16 &&
-                    ((a.n == 96 && (a.k == 5120 || a.k == 2560)) || (a.n == 64 && a.k == 2048)),
-                "unsupported parent geometry");
+        bool supported = (a.n == 96 && (a.k == 5120 || a.k == 2560)) || (a.n == 64 && a.k == 2048);
+#if NINFER_TARGET_SPARK
+        supported = supported || (a.n == 48 && a.k == 2560);
+#endif
+        require(a.qtype == QType::BF16 && supported, "unsupported parent geometry");
         return {a.n / 2, a.k};
     }
     const auto& b = *weights.second;

@@ -1,5 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/control/plan.h"
 #include "ops/linear_attention/gated_delta_net/control/workspace.h"
+#include "core/platform.h"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -48,6 +49,9 @@ std::span<const Route> routes(Geometry geometry, bool norm = false) {
     if (geometry.heads == 48 && geometry.input_rows == 5120) return kN96K5120;
     if (geometry.heads == 32 && geometry.input_rows == 2048) return kN64K2048;
     if (geometry.heads == 48 && geometry.input_rows == 2560) return routes_n96_k2560();
+#if NINFER_TARGET_SPARK
+    if (geometry.heads == 24 && geometry.input_rows == 2560) return routes_n48_k2560();
+#endif
     throw std::invalid_argument("gdn_control: unsupported geometry");
 }
 

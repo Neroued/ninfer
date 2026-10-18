@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"
 
 #include "core/device.h"
@@ -73,6 +74,11 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
         }
     }
     switch (weight.k) {
+#if NINFER_TARGET_SPARK
+    case 4096:
+        launch_quantize_exact<Nvfp4ActivationGeometry<4096>>(x, weight, workspace, layout, stream);
+        return;
+#endif
     case Nvfp4Activation5120Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
         return;

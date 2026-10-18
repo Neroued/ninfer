@@ -4,6 +4,21 @@
 
 namespace ninfer::ops::detail {
 
+void launch_q8_n4096_k4096_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream);
+
+void launch_q8_n12288_k4096_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                      cudaStream_t stream);
+
+void launch_q8_n2560_k3072_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream);
+
+void launch_q8_n6144_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream);
+
+void launch_q8_n8192_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream);
+
 void launch_q8_n2560_k6144_prefill512(const Tensor& x, const Weight& weight, Tensor& out,
                                       cudaStream_t stream);
 

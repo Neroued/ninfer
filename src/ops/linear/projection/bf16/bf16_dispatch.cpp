@@ -1,5 +1,6 @@
 #include "ops/linear/projection/bf16/bf16_dispatch.h"
 #include "ops/linear/projection/bf16/bf16_shapes.h"
+#include "core/platform.h"
 #include <array>
 #include <stdexcept>
 
@@ -11,6 +12,19 @@ struct ShapeEntry {
 };
 
 constexpr std::array kShapes{
+#if NINFER_TARGET_SPARK
+    ShapeEntry{1152, 2560, select_bf16_n1152_k2560},
+    ShapeEntry{7296, 2560, select_bf16_n7296_k2560},
+    ShapeEntry{640, 2560, select_bf16_n640_k2560},
+    ShapeEntry{2560, 320, select_bf16_n2560_k320},
+    ShapeEntry{77440, 4096, select_bf16_n77440_k4096},
+    ShapeEntry{4096, 1024, select_bf16_n4096_k1024},
+    ShapeEntry{2048, 4096, select_bf16_n2048_k4096},
+    ShapeEntry{4096, 128, select_bf16_n4096_k128},
+    ShapeEntry{288, 4096, select_bf16_n288_k4096},
+    ShapeEntry{2560, 3072, select_bf16_n2560_k3072},
+    ShapeEntry{124160, 2560, select_bf16_n124160_k2560},
+#endif
     ShapeEntry{14336, 5120, select_bf16_n14336_k5120},
     ShapeEntry{5120, 6144, select_bf16_n5120_k6144},
     ShapeEntry{48, 2560, select_bf16_n48_k2560},

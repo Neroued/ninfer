@@ -1,4 +1,4 @@
-// Cold-cache benchmark for the public pure Linear contract.
+// Public pure Linear benchmark with explicit cache conditioning.
 //
 // Examples:
 //   ./build/rtx5090-dev/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
@@ -99,6 +99,8 @@ struct Options {
     bool have_suite     = false;
     bool profile        = false;
     bool graph          = false;
+    bool cold           = true;
+    bool body_timer     = false;
     int graph_calls     = 1;
     QType qtype         = QType::Q4_G64_FP16;
     LinearPolicy policy = LinearPolicy::A16Only;
@@ -133,37 +135,40 @@ struct PointGroup {
 };
 
 struct Result {
+    const char* timer_scope = "eager-launch";
+    const char* cache       = "cold";
     const char* execution   = "eager";
     std::size_t graph_nodes = 0;
     int graph_calls         = 1;
     std::string labels;
-    const char* qtype_name         = "";
-    const char* policy_name        = "";
-    std::int32_t n                 = 0;
-    std::int32_t k                 = 0;
-    std::int32_t t                 = 0;
-    std::uint64_t weight_bytes     = 0;
-    std::uint64_t x_bytes          = 0;
-    std::uint64_t out_bytes        = 0;
-    std::uint64_t model_bytes      = 0;
-    double useful_flops            = 0.0;
-    double median_us               = 0.0;
-    double min_us                  = 0.0;
-    double p95_us                  = 0.0;
-    double effective_gbs           = 0.0;
-    double dram_spec_pct           = 0.0;
-    double sustained_read_pct      = 0.0;
-    double useful_tflops           = 0.0;
-    const char* tensor_profile     = "";
-    double tensor_peak_tflops      = std::numeric_limits<double>::quiet_NaN();
-    double tensor_peak_pct         = std::numeric_limits<double>::quiet_NaN();
-    double memory_floor_us         = 0.0;
-    double memory_floor_pct        = 0.0;
-    double t1_linear_extrapolation = std::numeric_limits<double>::quiet_NaN();
-    double delta_pct               = std::numeric_limits<double>::quiet_NaN();
-    int warmup                     = 0;
-    int repeat                     = 0;
-    std::uint64_t flush_bytes      = 0;
+    const char* qtype_name               = "";
+    const char* policy_name              = "";
+    std::int32_t n                       = 0;
+    std::int32_t k                       = 0;
+    std::int32_t t                       = 0;
+    std::uint64_t weight_bytes           = 0;
+    std::uint64_t x_bytes                = 0;
+    std::uint64_t out_bytes              = 0;
+    std::uint64_t model_bytes            = 0;
+    double useful_flops                  = 0.0;
+    double median_us                     = 0.0;
+    double min_us                        = 0.0;
+    double p95_us                        = 0.0;
+    double effective_gbs                 = 0.0;
+    double dram_spec_pct                 = 0.0;
+    double sustained_read_pct            = 0.0;
+    double useful_tflops                 = 0.0;
+    const char* tensor_profile           = "";
+    double tensor_peak_tflops            = std::numeric_limits<double>::quiet_NaN();
+    double tensor_peak_pct               = std::numeric_limits<double>::quiet_NaN();
+    double memory_floor_us               = 0.0;
+    double memory_floor_pct              = 0.0;
+    double t1_linear_extrapolation       = std::numeric_limits<double>::quiet_NaN();
+    double delta_pct                     = std::numeric_limits<double>::quiet_NaN();
+    int warmup                           = 0;
+    int repeat                           = 0;
+    std::uint64_t flush_bytes            = 0;
+    std::size_t workspace_capacity_bytes = 0;
 };
 
 struct LinearBenchWeight {
@@ -263,10 +268,12 @@ void usage(const char* argv0) {
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
+                 "  --cache MODE       cold (default) or warm; report separately.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
+                 "  --graph-timer MODE launch (default) or body; body brackets captured GPU work.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
                  "  --warmup N         Warmup calls per point (default %d).\n"
-                 "  --repeat N         Measured cold-cache samples per point (default %d).\n"
+                 "  --repeat N         Measured samples per point (default %d).\n"
                  "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
                  "  --csv-out PATH     Write all ordinary measurement rows as CSV.\n"
                  "  -h, --help         Show this text.\n",
@@ -311,6 +318,16 @@ Options parse_args(int argc, char** argv) {
             opt.graph = mode == "graph";
         } else if (arg == "--graph-calls") {
             opt.graph_calls = bench::measurement::integer(next("graph-calls"), 0);
+        } else if (arg == "--graph-timer") {
+            const std::string_view mode(next("graph-timer"));
+            if (mode != "launch" && mode != "body")
+                throw std::invalid_argument("graph-timer must be launch or body");
+            opt.body_timer = mode == "body";
+        } else if (arg == "--cache") {
+            const std::string_view mode(next("cache"));
+            if (mode != "cold" && mode != "warm")
+                throw std::invalid_argument("cache must be cold or warm");
+            opt.cold = mode == "cold";
         } else if (arg == "--profile") {
             opt.profile = true;
         } else if (arg == "--warmup") {
@@ -332,6 +349,8 @@ Options parse_args(int argc, char** argv) {
     }
 
     if (argc == 1) { throw std::invalid_argument("select one exact point, sweep, or suite"); }
+    if (opt.body_timer && (!opt.graph || opt.profile))
+        throw std::invalid_argument("body timer requires graph timing without --profile");
     if (opt.graph_calls < 1 || opt.graph_calls > 64 ||
         (opt.graph_calls != 1 && (!opt.graph || opt.profile)))
         throw std::invalid_argument(
@@ -496,12 +515,15 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
     const bool nvfp4_problem =
+        (point.n == 12288 && point.k == 4096) || (point.n == 4096 && point.k == 6144) ||
         (point.k == 5120 && (point.n == 14336 || point.n == 16384 || point.n == 34816)) ||
         (point.n == 5120 && (point.k == 6144 || point.k == 17408));
     if (point.qtype == QType::NVFP4 && nvfp4_problem) {
         const bool a4 =
             point.policy == LinearPolicy::AllowA4 &&
-            ((point.n == 14336 && point.t >= 4) || point.n == 16384 || point.n == 34816 ||
+            ((point.n == 12288 && point.k == 4096 && point.t >= 17) ||
+             (point.n == 4096 && point.k == 6144 && point.t >= 9) ||
+             (point.n == 14336 && point.t >= 4) || point.n == 16384 || point.n == 34816 ||
              (point.k == 6144 && point.t >= 17) || (point.k == 17408 && point.t >= 8));
         if (a4) {
             profile = "NVFP4_F32ACC";
@@ -513,10 +535,12 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         }
     }
     if (point.qtype == QType::Q8_G32_FP16 &&
-        ((point.n == 2560 && point.k == 6144) || (point.n == 6144 && point.k == 2560) ||
-         (point.n == 10240 && point.k == 2560) || (point.n == 12288 && point.k == 2560) ||
-         (point.n == 16384 && point.k == 2560)) &&
-        point.t > 1) {
+        (((point.n == 12288 || point.n == 4096) && point.k == 4096) ||
+         (point.n == 2560 && (point.k == 3072 || point.k == 6144)) ||
+         (point.n == 6144 && point.k == 2560) || (point.n == 10240 && point.k == 2560) ||
+         (point.n == 12288 && point.k == 2560) || (point.n == 16384 && point.k == 2560) ||
+         (point.n == 8192 && point.k == 2560)) &&
+        point.t > 1 && !(point.n == 12288 && point.t <= 8 && point.k == 4096)) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
@@ -542,7 +566,15 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         return bench::kRoofline.mxfp8_f32_tflops;
     }
     if (point.qtype == QType::BF16 &&
-        ((point.n == 256 && point.k == 5120) ||
+        (((point.n == 1152 || point.n == 7296 || point.n == 640) && point.k == 2560 &&
+          point.t >= 2) ||
+         (point.n == 2560 && point.k == 320) ||
+         (point.n == 4096 && point.k == 128) ||
+         (point.n == 288 && point.k == 4096 && point.t >= 2) ||
+         (point.n == 2048 && point.k == 4096 && point.t >= 2) ||
+         (point.n == 4096 && point.k == 1024 && point.t >= 2) ||
+         (point.n == 77440 && point.k == 4096 && point.t >= 9) ||
+         (point.n == 256 && point.k == 5120) ||
          ((point.n == 48 || point.n == 96) && point.k == 2560 && point.t >= 17) ||
          (point.n == 1664 && point.k == 2560 && point.t >= 2) ||
          (point.n == 2560 && point.k == 4608 && point.t >= 3) ||
@@ -553,9 +585,11 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
          (point.n == 1152 && point.k == 1536 && point.t >= 4) ||
          (point.n == 3456 && point.k == 1152 && point.t >= 4) ||
          (point.n == 2560 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 2560 && point.k == 3072 && point.t >= 2) ||
          (point.n == 2560 && point.k == 6144 && point.t >= 2) ||
          (point.n == 13952 && point.k == 2560 && point.t >= 2) ||
          (point.n == 248320 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 124160 && point.k == 2560 && point.t >= 9) ||
          (point.n == 12800 && point.k == 2560 && point.t >= 2) ||
          (point.n == 10240 && point.k == 320 && point.t >= 2) ||
          (point.n == 320 && point.k == 10240 && point.t >= 9) ||
@@ -584,16 +618,18 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         static_cast<double>(model_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
 
     Result result;
-    result.labels             = join_labels(point.labels);
-    result.qtype_name         = qtype_name(point.qtype);
-    result.policy_name        = policy_name(point.policy);
-    result.n                  = point.n;
-    result.k                  = point.k;
-    result.t                  = point.t;
-    result.weight_bytes       = weight.model_weight_bytes();
-    result.x_bytes            = x_bytes;
-    result.out_bytes          = out_bytes;
-    result.model_bytes        = model_bytes;
+    result.labels                   = join_labels(point.labels);
+    result.qtype_name               = qtype_name(point.qtype);
+    result.policy_name              = policy_name(point.policy);
+    result.n                        = point.n;
+    result.k                        = point.k;
+    result.t                        = point.t;
+    result.weight_bytes             = weight.model_weight_bytes();
+    result.x_bytes                  = x_bytes;
+    result.out_bytes                = out_bytes;
+    result.model_bytes              = model_bytes;
+    result.workspace_capacity_bytes = ops::linear_workspace_capacity_bytes(
+        point.qtype, point.n, point.k, point.policy, point.t, point.t);
     result.useful_flops       = useful_flops;
     result.median_us          = timing.median_us;
     result.min_us             = timing.min_us;
@@ -608,13 +644,14 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     }
     result.memory_floor_us  = memory_floor_us;
     result.memory_floor_pct = memory_floor_us / timing.median_us * 100.0;
-    if (opt.graph_calls > 1) {
+    if (!opt.cold || opt.graph_calls > 1) {
         result.dram_spec_pct = result.sustained_read_pct = result.memory_floor_us =
             result.memory_floor_pct                      = std::numeric_limits<double>::quiet_NaN();
     }
     result.warmup      = opt.warmup;
     result.repeat      = opt.repeat;
-    result.flush_bytes = opt.flush_bytes;
+    result.flush_bytes = opt.cold ? opt.flush_bytes : 0;
+    result.cache = !opt.cold ? "warm" : opt.graph_calls == 1 ? "cold" : "cold-before-graph-bundle";
     return result;
 }
 
@@ -660,19 +697,39 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt,
             ops::linear(activation, weight.weight, output, group.policy, workspace, cuda);
         };
         bench::TimedGraph graph;
-        if (opt.graph)
+        if (opt.graph && !opt.body_timer)
             graph.capture(cuda, [&](CudaExecutionView cuda) {
                 for (int call = 0; call < opt.graph_calls; ++call) launch(cuda);
             });
-        bench::ColdTiming timing =
-            opt.graph ? bench::measure_cold_graph(graph, flush, cuda, opt.warmup, opt.repeat)
-                      : bench::measure_cold_launch(launch, flush, cuda, opt.warmup, opt.repeat);
+        bench::ColdTiming timing;
+        std::size_t graph_nodes = graph.nodes();
+        if (opt.body_timer) {
+            bench::measurement::Options measurement;
+            measurement.warmup  = opt.warmup;
+            measurement.repeat  = opt.repeat;
+            const auto measured = bench::measurement::measure(
+                [&](CudaExecutionView execution) {
+                    for (int call = 0; call < opt.graph_calls; ++call) launch(execution);
+                },
+                [](auto) {}, flush, cuda, measurement, "graph", opt.cold ? "cold" : "warm");
+            timing      = measured.gpu;
+            graph_nodes = measured.nodes;
+        } else if (opt.cold)
+            timing = opt.graph
+                         ? bench::measure_cold_graph(graph, flush, cuda, opt.warmup, opt.repeat)
+                         : bench::measure_cold_launch(launch, flush, cuda, opt.warmup, opt.repeat);
+        else
+            timing = opt.graph ? bench::measure_graph(graph, cuda, opt.warmup, opt.repeat)
+                               : bench::measure_launch(launch, cuda, opt.warmup, opt.repeat);
         timing.median_us /= opt.graph_calls;
         timing.min_us /= opt.graph_calls;
         timing.p95_us /= opt.graph_calls;
         Result result      = make_result(point, weight, timing, opt);
+        result.timer_scope = !opt.graph       ? "eager-launch"
+                             : opt.body_timer ? "gpu-body"
+                                              : "graph-launch";
         result.execution   = opt.graph ? "graph" : "eager";
-        result.graph_nodes = graph.nodes();
+        result.graph_nodes = graph_nodes;
         result.graph_calls = opt.graph_calls;
         if (point.t == 1) { t1_median = result.median_us; }
         if (std::isfinite(t1_median)) {
@@ -724,11 +781,11 @@ void run_profile(const BenchPoint& point, const Options& opt, bench::L2FlushBuff
     };
     std::printf("# execution=%s graph_nodes=%zu\n", opt.graph ? "graph" : "eager", graph.nodes());
     for (int i = 0; i < opt.warmup; ++i) {
-        bench::flush_l2(flush, cuda);
+        if (opt.cold) bench::flush_l2(flush, cuda);
         launch();
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    bench::flush_l2(flush, cuda);
+    if (opt.cold) bench::flush_l2(flush, cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const std::uint64_t x_bytes     = checked_mul(x_elements, 2, "activation bytes");
@@ -752,6 +809,9 @@ void run_profile(const BenchPoint& point, const Options& opt, bench::L2FlushBuff
 void print_header(const Options& opt) {
     std::printf("# execution=%s graph_calls=%d cuda_runtime=%d\n", opt.graph ? "graph" : "eager",
                 opt.graph_calls, CUDART_VERSION);
+    std::printf("# timer_scope=%s\n", !opt.graph       ? "eager-launch"
+                                      : opt.body_timer ? "gpu-body"
+                                                       : "graph-launch");
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
@@ -761,7 +821,9 @@ void print_header(const Options& opt) {
     std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%s cache=%s\n",
                 bench::kRoofline.memory_gbs,
                 bench::format_metric(bench::kRoofline.sustained_read_gbs).c_str(),
-                opt.graph_calls == 1 ? "cold" : "cold-before-graph-bundle");
+                !opt.cold              ? "warm"
+                : opt.graph_calls == 1 ? "cold"
+                                       : "cold-before-graph-bundle");
     std::printf("# dense_fp8_tensor_tflops fp16_acc=%s fp32_acc=%s mxfp8_fp32_acc=%s\n",
                 bench::format_metric(bench::kRoofline.fp8_f16_tflops).c_str(),
                 bench::format_metric(bench::kRoofline.fp8_f32_tflops).c_str(),
@@ -812,7 +874,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
-           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls\n";
+           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls,cache,timer_scope,"
+           "workspace_capacity_bytes\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -836,7 +899,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << ','
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
-        out << ',' << result.graph_calls << '\n';
+        out << ',' << result.graph_calls << ',' << result.cache << ',' << result.timer_scope << ','
+            << result.workspace_capacity_bytes << '\n';
     }
 }
 

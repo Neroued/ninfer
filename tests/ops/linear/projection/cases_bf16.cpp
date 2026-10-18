@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear.h"
@@ -118,7 +119,22 @@ struct Geometry {
 };
 
 const std::array kNewGeometries{
-    Geometry{48, 2560, {1, 8, 12, 16, 128}},
+#if NINFER_TARGET_SPARK
+    Geometry{1152, 2560, {1, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{7296, 2560, {1, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{640, 2560, {1, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{2560, 320, {1, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{77440, 4096, {1,    8,    16,   96,   128,  256,  384,  512,  576,  640,
+                           768,  896,  1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920,
+                           2048, 2176, 2304, 2432, 2560, 3072, 3583, 3584, 4096}},
+    Geometry{4096, 1024, {1, 8, 16, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{2048, 4096, {1, 8, 16, 32, 128, 512, 1024, 2048, 4096}},
+    Geometry{4096, 128, {1, 32, 128, 512, 1024, 2048, 4096}},
+    Geometry{288, 4096, {1, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}},
+    Geometry{2560, 3072, {1, 16, 32, 64, 96, 128, 256, 576, 896, 1152, 4096}},
+    Geometry{124160, 2560, {8, 16, 96, 128, 256, 384, 512, 576, 640, 1024, 1152, 2560, 3584, 4096}},
+#endif
+    Geometry{48, 2560, {1, 8, 12, 16, 64, 128, 256, 1024}},
     Geometry{96, 2560, {1, 4, 16, 128, 512}},
     Geometry{1664, 2560, {1,   16,  32,  48,   64,   96,   128,  160,  256,  336,  448,  512,
                           560, 640, 896, 1024, 1152, 1280, 1408, 1440, 1664, 1856, 2048, 4096}},
@@ -184,7 +200,8 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
     const bool text        = shape.domain == ColumnDomain::Text;
     const int step         = raw ? 4 : 1;
     const int maximum      = raw ? 131072 : text ? std::numeric_limits<int>::max() : 32768;
-    const bool wide        = shape.n == 2560 && shape.k == 2560;
+    const bool wide        = (shape.n == 2560 && (shape.k == 2560 || shape.k == 3072)) ||
+                      shape.n == 124160 || shape.n == 77440 || shape.n == 48;
     auto test     = linear_suite::make_case("bf16", shape.n, shape.k, 0, ops::LinearPolicy::A16Only,
                                             linear_suite::Execution::Eager, "column-domain");
     test.policies = 7;
@@ -253,7 +270,8 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
         return failures;
     });
     std::set<int> points;
-    if (shape.n <= 640 || raw) {
+    if (shape.n <= 640 || raw || shape.n == 77440 || (shape.n == 2048 && shape.k == 4096) ||
+        (shape.n == 4096 && shape.k == 1024)) {
         for (int t = step; t <= 128; t += step) points.insert(t);
     } else {
         for (int t : {1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128})
@@ -294,7 +312,9 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
         add_shape(suite, ninfer::QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
                   {shape.n, shape.k, seed + 1, Comparison::Full, true, full});
     }
-    if (shape.n <= 640 || shape.k == 320 || shape.k % 64 != 0) {
+    if (shape.n <= 640 || shape.k == 320 || shape.k % 64 != 0 ||
+        (shape.n == 2048 && shape.k == 4096) || (shape.n == 4096 && shape.k == 1024) ||
+        (shape.n == 4096 && shape.k == 128)) {
         std::set<int> tail_points{step, 4, 8, 128};
         std::vector<Invocation> tail;
         for (int t : tail_points) tail.push_back({t});
@@ -304,7 +324,9 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
                    shape.n <= 640 ? Comparison::Full : Comparison::Sampled, true, tail,
                    ActivationPattern::KTail});
     }
-    if (shape.n <= 96) {
+    if (shape.n <= 96 || (shape.n == 288 && shape.k == 4096) ||
+        (shape.n == 2048 && shape.k == 4096) || (shape.n == 4096 && shape.k == 1024) ||
+        (shape.n == 4096 && shape.k == 128)) {
         const std::array cancel{Invocation{1}, Invocation{4}, Invocation{8}, Invocation{128},
                                 Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
         add_shape(suite, ninfer::QType::BF16, ActivationRecipe::TokenBlocks, cancellation_weight,

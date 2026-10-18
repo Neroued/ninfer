@@ -141,6 +141,7 @@ public:
         CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
         std::size_t n = 0;
         CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &n));
+        nodes_ = n;
         std::vector<cudaGraphNode_t> nodes(n);
         CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &n));
         for (const auto node : nodes) {
@@ -163,16 +164,20 @@ public:
     }
 
     std::size_t kernels() const { return kernels_; }
+
+    std::size_t nodes() const { return nodes_; }
 private:
     cudaGraph_t graph_    = nullptr;
     cudaGraphExec_t exec_ = nullptr;
     cudaEvent_t start_ = nullptr, stop_ = nullptr;
     std::size_t kernels_ = 0;
+    std::size_t nodes_   = 0;
 };
 
 struct Result {
     ColdTiming gpu, host;
     std::size_t kernels = 0;
+    std::size_t nodes   = 0;
 };
 
 template <class Launch, class Restore>
@@ -228,7 +233,8 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExe
     }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    return {summarize_timings(std::move(gpu)), summarize_timings(std::move(host)), graph.kernels()};
+    return {summarize_timings(std::move(gpu)), summarize_timings(std::move(host)), graph.kernels(),
+            graph.nodes()};
 }
 
 struct Row {

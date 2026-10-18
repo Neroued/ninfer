@@ -10,3 +10,7 @@ target_sources(ninfer_ops PRIVATE
 target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a4_tma.cu"
 )
+
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  include("${CMAKE_CURRENT_LIST_DIR}/dgx_spark/sources.cmake")
+endif()

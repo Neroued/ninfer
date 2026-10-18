@@ -1,4 +1,5 @@
 #include "ops/linear/projection/runner.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,10 @@ struct Geometry {
 };
 
 const std::array kGeometries{
+#if NINFER_TARGET_SPARK
+    Geometry{4096, 4096, 947U},  Geometry{12288, 4096, 911U}, Geometry{2560, 3072, 383U},
+    Geometry{8192, 2560, 373U},
+#endif
     Geometry{1024, 2048, 257U},  Geometry{1024, 5120, 223U},  Geometry{2048, 4096, 251U},
     Geometry{2048, 4608, 271U},  Geometry{2048, 16384, 283U}, Geometry{2560, 6144, 307U},
     Geometry{4608, 4608, 277U},  Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},
@@ -66,6 +71,32 @@ void q8_a16_conformance(Suite& suite) {
         if (shape.n == 2048 && shape.k == 4096) {
             for (int t : {895, 896, 897}) calls.push_back({t});
         }
+        if (shape.n == 4096 && shape.k == 4096) {
+            for (int t : {255, 257}) calls.push_back({t});
+            calls.push_back({256, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+        }
+        if ((shape.n == 12288 || shape.n == 4096) && shape.k == 4096) {
+            for (int t :
+                 {6, 191, 192, 193, 511, 512, 513, 1023, 1025, 2047, 2048, 2049, 4095, 4096, 4097})
+                calls.push_back({t});
+            for (int t : {1,   4,   6,   8,   9,   24,   25,   40,   41,   96,  97,
+                          128, 129, 192, 193, 512, 1023, 1024, 1025, 2048, 4096})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+        }
+        if (shape.n == 8192 && shape.k == 2560) {
+            for (int t : {6, 191, 192, 193, 511, 512, 513, 1023, 1025, 2048, 4096, 4097})
+                calls.push_back({t});
+            for (int t : {1, 6, 16, 17, 32, 33, 96, 97, 128, 129, 192, 193, 512, 1024, 4096})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+        }
+        if (shape.n == 2560 && shape.k == 3072) {
+            for (int t : {6, 191, 192, 193, 511, 512, 513, 575, 576, 577, 1023, 1025, 2047, 2048,
+                          2049, 4096, 4097})
+                calls.push_back({t});
+            for (int t :
+                 {1, 6, 16, 17, 32, 33, 64, 65, 96, 97, 128, 129, 192, 193, 512, 1024, 4096})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+        }
         if (shape.n == 2560 && shape.k == 6144) {
             for (int t : {50, 51, 52, 511, 512, 513, 1025, 2047, 2048, 2049, 4096})
                 calls.push_back({t});
@@ -94,7 +125,9 @@ void q8_a16_conformance(Suite& suite) {
                 calls.push_back({t, CallForm::A16Convenience});
         }
         if (shape.n == 6144 && shape.k == 2560) {
-            for (int t : {94, 112, 113, 512, 513, 1025}) calls.push_back({t});
+            for (int t : {6, 94, 112, 113, 192, 193, 512, 513, 1023, 1025, 2048, 4096, 4097})
+                calls.push_back({t});
+            calls.push_back({6, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
             for (int t : {17, 24, 25,  32,  33,  40,  41,  64,  65,  80,   81,  95,
                           96, 97, 112, 113, 127, 128, 129, 512, 513, 1024, 1025})
                 calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
@@ -112,7 +145,9 @@ void q8_a16_conformance(Suite& suite) {
             for (int t : {8, 16, 24, 32, 40, 48, 63, 64, 96, 128, 512, 1024})
                 calls.push_back({t, CallForm::A16Convenience});
         }
-        if ((shape.n == 2560 && shape.k == 6144) || (shape.n == 12288 && shape.k == 2560) ||
+        if (((shape.n == 12288 || shape.n == 4096) && shape.k == 4096) ||
+            (shape.n == 2560 && shape.k == 3072) || (shape.n == 8192 && shape.k == 2560) ||
+            (shape.n == 2560 && shape.k == 6144) || (shape.n == 12288 && shape.k == 2560) ||
             (shape.n == 10240 && shape.k == 2560) || (shape.n == 6144 && shape.k == 2560) ||
             (shape.n == 16384 && shape.k == 2560)) {
             auto test     = linear_suite::make_case("q8", shape.n, shape.k, 0,
@@ -155,9 +190,26 @@ void q8_a16_conformance(Suite& suite) {
                   make_q8_g32_fp16_weight,
                   {shape.n, shape.k, shape.seed, Comparison::Sampled, true, calls});
     }
+#if NINFER_TARGET_SPARK
+    const std::array stress_calls{Invocation{1}, Invocation{6}, Invocation{41}, Invocation{128},
+                                  Invocation{1024}};
+    for (const Geometry geometry : {Geometry{12288, 4096, 929U}, Geometry{4096, 4096, 967U}}) {
+        for (const auto pattern : {ActivationPattern::KTail, ActivationPattern::Cancellation}) {
+            ShapeCase shape{geometry.n,          geometry.k, geometry.seed,
+                            Comparison::Sampled, true,       stress_calls};
+            shape.activation_pattern = pattern;
+            add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::Hashed,
+                      make_q8_g32_fp16_weight, shape);
+        }
+    }
+#endif
     const std::array full_calls{Invocation{1}, Invocation{4}, Invocation{8}};
     for (const Geometry shape :
          {Geometry{2560, 6144, 311U}, Geometry{12288, 2560, 317U}, Geometry{10240, 2560, 337U},
+#if NINFER_TARGET_SPARK
+          Geometry{2560, 3072, 389U}, Geometry{8192, 2560, 379U}, Geometry{12288, 4096, 919U},
+          Geometry{4096, 4096, 953U},
+#endif
           Geometry{6144, 2560, 349U}, Geometry{16384, 2560, 367U}}) {
         add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::TokenBlocks,
                   make_q8_g32_fp16_weight,

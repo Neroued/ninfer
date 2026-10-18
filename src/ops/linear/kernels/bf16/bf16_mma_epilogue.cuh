@@ -26,10 +26,10 @@ private:
         return pointer(output.segment(row), row, token);
     }
 
-public:
-    template <class Output>
-    __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
-                                                   float4 v, int, int tokens) const {
+protected:
+    template <bool Streaming, class Output>
+    __device__ __forceinline__ void store_fragment_impl(const Output& output, int row, int token,
+                                                        float4 v, int tokens) const {
         const unsigned lane = threadIdx.x & 31;
         const int rb = row - int(lane >> 2), tb = token - 2 * int(lane & 3);
         const unsigned source = (lane & 3) * 8 + (lane >> 3);
@@ -46,8 +46,37 @@ public:
         const unsigned ev = ((e0 >> shift) & 0xffffU) | (((e1 >> shift) & 0xffffU) << 16);
         const unsigned od = ((o0 >> shift) & 0xffffU) | (((o1 >> shift) & 0xffffU) << 16);
         const int rr = rb + 2 * int(lane & 7), tt = tb + 2 * int(lane >> 3);
-        if (tt < tokens) common::store_vec(pointer(output, rr, tt), ev);
-        if (tt + 1 < tokens) common::store_vec(pointer(output, rr, tt + 1), od);
+        if (tt < tokens) {
+            if constexpr (Streaming)
+                asm volatile("st.global.cs.u32 [%0], %1;" ::"l"(pointer(output, rr, tt)), "r"(ev)
+                             : "memory");
+            else
+                common::store_vec(pointer(output, rr, tt), ev);
+        }
+        if (tt + 1 < tokens) {
+            if constexpr (Streaming)
+                asm volatile("st.global.cs.u32 [%0], %1;" ::"l"(pointer(output, rr, tt + 1)),
+                             "r"(od)
+                             : "memory");
+            else
+                common::store_vec(pointer(output, rr, tt + 1), od);
+        }
+    }
+
+public:
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
+                                                   float4 v, int, int tokens) const {
+        store_fragment_impl<false>(output, row, token, v, tokens);
+    }
+};
+
+// Evict streaming output first so large head projections can retain reused operands in L2.
+struct Bf16MmaStreamingWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
+                                                   float4 v, int, int tokens) const {
+        store_fragment_impl<true>(output, row, token, v, tokens);
     }
 };
 

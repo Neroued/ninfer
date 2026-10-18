@@ -770,11 +770,12 @@ int main(int argc, char** argv) {
     };
     const auto split = [&](int channels, int q, int k, int v, int t, bool alias, bool offset,
                            unsigned seed, bool captured = false) {
-        suite.add("causal_conv/split/c" + std::to_string(channels) + "/t" + std::to_string(t) +
-                      (alias ? "/alias" : "/disjoint") + (offset ? "/offset" : "/aligned") +
-                      (captured ? "/graph" : ""),
-                  [=] { return split_case(channels, q, k, v, t, alias, offset, seed, captured); },
-                  {{"execution", captured ? "graph" : "eager"}});
+        suite.add(
+            "causal_conv/split/c" + std::to_string(channels) + "/t" + std::to_string(t) +
+                (alias ? "/alias" : "/disjoint") + (offset ? "/offset" : "/aligned") +
+                (captured ? "/graph" : ""),
+            [=] { return split_case(channels, q, k, v, t, alias, offset, seed, captured); },
+            {{"execution", captured ? "graph" : "eager"}, {"suite", std::to_string(channels)}});
     };
     const auto split_rejection = [&](int t) {
         suite.add("causal_conv/split_contract/t" + std::to_string(t),
@@ -850,6 +851,17 @@ int main(int argc, char** argv) {
 
     split(kQwen27Channels, 2048, 2048, 6144, 17, true, false, 8017U, true);
     split(kQwen27Channels, 2048, 2048, 6144, 257, true, true, 8257U, true);
+
+    // Local Q/K/V channels; qualify complete outputs and exact history transitions.
+    for (int t = 1; t <= 16; ++t)
+        for (bool alias : {false, true}) split(5120, 1024, 1024, 3072, t, alias, false, 9000U + t);
+    for (int t : {17,  31,  32,  33,  63,  64,   65,   127,  128,  129, 255,
+                  256, 257, 511, 512, 513, 1023, 1024, 1025, 2048, 4096})
+        for (bool alias : {false, true}) split(5120, 1024, 1024, 3072, t, alias, false, 10000U + t);
+    for (int t : {1, 6, 16, 33, 257, 512, 4096})
+        for (bool alias : {false, true})
+            split(5120, 1024, 1024, 3072, t, alias, false, 11000U + t, true);
+    for (int t : {16, 33, 257}) split(5120, 1024, 1024, 3072, t, false, true, 12000U + t);
 
     // Argument rejection, on both sides of the route bound.
     split_rejection(16);

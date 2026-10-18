@@ -109,6 +109,10 @@ void launch_token_parallel_split(const Tensor& x, const Tensor& weight, const Te
                                  Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                                  CausalConvSplitGeometry geometry, cudaStream_t stream) {
     switch (geometry) {
+    case CausalConvSplitGeometry::Rows1024x1024x3072:
+        launch_token_parallel_split_geometry<1024, 1024, 3072>(
+            x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
+        return;
     case CausalConvSplitGeometry::Rows2048x2048x4096:
         launch_token_parallel_split_geometry<2048, 2048, 4096>(
             x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
@@ -150,6 +154,10 @@ void launch_prefill_split(const Tensor& x, const Tensor& weight, const Tensor& c
                           Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                           CausalConvSplitGeometry geometry, cudaStream_t stream) {
     switch (geometry) {
+    case CausalConvSplitGeometry::Rows1024x1024x3072:
+        launch_prefill_split_geometry<1024, 1024, 3072>(
+            x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
+        return;
     case CausalConvSplitGeometry::Rows2048x2048x4096:
         launch_prefill_split_geometry<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out,
                                                         out0, out1, out2, stream);
@@ -308,6 +316,9 @@ void launch_causal_conv_split(const Tensor& x, const Tensor& weight, const Tenso
                               Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                               CausalConvSplitGeometry geometry, cudaStream_t stream) {
 #if NINFER_TARGET_SPARK
+    if (geometry == CausalConvSplitGeometry::Rows1024x1024x3072 && x.ne[1] > 16)
+        return launch_causal_conv_split_5120(x, weight, state_in, state_out, out0, out1, out2,
+                                             stream);
     if (geometry == CausalConvSplitGeometry::Rows2048x2048x6144 && x.ne[1] > 16)
         return launch_causal_conv_split_10240(x, weight, state_in, state_out, out0, out1, out2,
                                               stream);

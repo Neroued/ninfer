@@ -28,4 +28,7 @@ void launch_bf16_gu_compensated(const Tensor&, const Weight&, __nv_bfloat16*, fl
 void launch_nvfp4_down_tma128(const Weight&, Tensor&, Nvfp4A4Workspace, int tokens, cudaStream_t);
 void launch_nvfp4_down_tma256(const Weight&, Tensor&, Nvfp4A4Workspace, int tokens, cudaStream_t);
 
+void launch_bf16_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&, const float* routed,
+                          float limit, MemoryArena&, cudaStream_t);
+
 } // namespace ninfer::ops::detail::swiglu_ffn

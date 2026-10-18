@@ -148,8 +148,7 @@ struct SigmoidRouteProfile {
 };
 
 // Native BF16 control [E,H] produces logits=control*x without an intermediate BF16 cast.
-// Choice is
-// sigmoid(logit)+correction_bias[e]; TopK is descending, ties by lower global ID.
+// Choice is sigmoid(logit)+correction_bias[e]; TopK is descending, ties by lower global ID.
 // Coefficients are scaling_factor*sigmoid(selected_logit)/(sum_selected_sigmoid+epsilon):
 // correction bias affects selection only. Both normalization parameters are positive finite.
 // Supports registered H/E/K geometries. Bias is contiguous FP32[E], routes I32/FP32[K,T].
@@ -161,6 +160,36 @@ struct SigmoidRouteProfile {
 void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile&, const Weight& control,
                         const Tensor& correction_bias, ExpertRoutes& routes, MemoryArena&,
                         CudaExecutionView);
+
+struct SigmoidMoeProfile {
+    SigmoidRouteProfile routing;
+    RoutedSwiGLUProfile routed;
+    SwiGLUProfile shared;
+};
+
+struct SigmoidMoeWeights {
+    Weight control;
+    Tensor correction_bias;
+    CudaSwiGLUExperts routed;
+    SwiGLUWeights shared;
+};
+
+// Complete local contribution: routed_swiglu(topk_sigmoid_route(x),subset,x)+shared(x).
+// Shared is unscaled, exactly once, including zero routed hits. Only final output is BF16.
+// Supports registered block-scaled routed and native BF16 shared profiles,
+// both with explicit finite positive clamp limits.
+// Destination is contiguous BF16[H,T], Write; no residual, rank, communication or shared gate.
+// Router, native bank/subset and shared semantics follow the profiles above; all matrices and
+// control inputs are immutable and disjoint from output/live caller scratch. Graph replay may
+// change x/bias/routes-inducing data, mask and index contents after prior consumers finish.
+// None skips router/routed inputs and computes unscaled shared; those unused views may be empty.
+// No hidden allocation/transfer/readback; workspace covers every positive T in the interval.
+[[nodiscard]] std::size_t topk_sigmoid_swiglu_moe_workspace_capacity_bytes(const SigmoidMoeProfile&,
+                                                                           ExpertSubsetKind,
+                                                                           std::int32_t min_tokens,
+                                                                           std::int32_t max_tokens);
+void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const SigmoidMoeWeights&,
+                             ExpertSubset, Tensor& destination, MemoryArena&, CudaExecutionView);
 
 // F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with the explicit profile clamp when present.
 // Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled

@@ -35,10 +35,28 @@ void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float lim
             planes, weights.down.weight, tokens, output, stream);
 }
 
+namespace {
+struct AddRoutedOutput {
+    __nv_bfloat16* destination;
+    const float* routed;
+
+    __device__ void store(int row, int token, float value) const {
+        const auto index   = std::int64_t(token) * 4096 + row;
+        destination[index] = __float2bfloat16_rn(value + routed[index]);
+    }
+};
+} // namespace
+
 void launch_bf16_ffn(const Tensor& x, const SwiGLUWeights& weights, Tensor& out, float limit,
                      MemoryArena& ws, cudaStream_t stream) {
     run(x, weights, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), 4096}, limit, ws,
         stream);
 }
 
+void launch_bf16_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& out,
+                          const float* routed, float limit, MemoryArena& workspace,
+                          cudaStream_t stream) {
+    run(x, weights, AddRoutedOutput{static_cast<__nv_bfloat16*>(out.data), routed}, limit,
+        workspace, stream);
+}
 } // namespace ninfer::ops::detail::swiglu_ffn

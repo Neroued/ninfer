@@ -92,9 +92,14 @@ ninfer_add_op_bench(ninfer_sigmoid_route_bench
 ninfer_add_op_bench(ninfer_moe_clamped_ep_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/clamped_ep.cu"
           "${PROJECT_SOURCE_DIR}/tests/ops/moe/clamped_ep_fixture.cpp")
-target_include_directories(ninfer_moe_clamped_ep_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
-target_compile_definitions(ninfer_moe_clamped_ep_bench PRIVATE NINFER_CLAMPED_EP_BENCH=1)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(ninfer_moe_clamped_ep_bench PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math;-ffp-contract=off>)
-endif()
+ninfer_add_op_bench(ninfer_sigmoid_moe_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/sigmoid_moe.cu"
+          "${PROJECT_SOURCE_DIR}/tests/ops/moe/clamped_ep_fixture.cpp")
+foreach(target IN ITEMS ninfer_moe_clamped_ep_bench ninfer_sigmoid_moe_bench)
+  target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+  target_compile_definitions(${target} PRIVATE NINFER_CLAMPED_EP_BENCH=1)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math;-ffp-contract=off>)
+  endif()
+endforeach()

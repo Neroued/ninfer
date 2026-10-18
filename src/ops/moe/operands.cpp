@@ -299,6 +299,17 @@ void MoeOperands::shared(const SwiGLUWeights& weights, const SwiGLUProfile& prof
     matrix(weights.down.weight, profile.hidden, profile.intermediate, profile.down_type);
 }
 
+void MoeOperands::unscaled_shared(const SwiGLUWeights& weights, const SwiGLUProfile& p) {
+    auto prepared        = swiglu_profile(weights);
+    prepared.clamp_limit = p.clamp_limit;
+    require(prepared == p, "MoE: unscaled shared weights differ from profile");
+    for (const Weight* w : {&weights.gate_up.weight, &weights.down.weight})
+        require(w->group == 0 && w->group_size == 0 && w->high_plane_bytes == 0,
+                "MoE: invalid unscaled shared metadata");
+    matrix(weights.gate_up.weight, 2 * p.intermediate, p.hidden, QType::BF16);
+    matrix(weights.down.weight, p.hidden, p.intermediate, QType::BF16);
+}
+
 void MoeOperands::workspace(const MemoryArena& workspace, std::size_t bytes) {
     operand::device(workspace.device(), device_, op_, "workspace");
     require(workspace.used() <= workspace.capacity() &&

@@ -292,6 +292,18 @@ void add_gated_rmsnorm_cases(ninfer::test::OpSuite& suite) {
                   },
                   {{"execution", c.graph ? "graph" : "eager"}});
     };
+    for (int t : {1,   4,   6,   8,   15,  16,  17,  31,  32,   33,   64,
+                  112, 113, 114, 128, 255, 256, 257, 512, 1024, 2048, 4096})
+        add(Gate::Sigmoid, "D128/H24 columns",
+            {{128, 24, t}, 5000U + t, 4.F, false, t == 16 || t == 257});
+    for (int b : {2, 8})
+        for (int t : {1, 2, 3, 4, 5, 6, 16})
+            add(Gate::Sigmoid, "D128/H24 T/B",
+                {{128, 24, t, b}, 6000U + 100 * b + t, 4.F, false, t == 6 || t == 16});
+    for (auto pattern : {Pattern::ZeroInput, Pattern::ZeroGate, Pattern::GateEdges,
+                         Pattern::DirectGain, Pattern::NegativeGate, Pattern::RoundingGate})
+        add(Gate::Sigmoid, ("D128/H24 pattern" + std::to_string(int(pattern))).c_str(),
+            {{128, 24, 6, 8}, 7000U, 4.F, false, true, pattern});
     for (Gate kind : {Gate::Silu, Gate::Sigmoid}) {
         add(kind, "single column", {{128, 48}, 1401U});
         for (int columns :

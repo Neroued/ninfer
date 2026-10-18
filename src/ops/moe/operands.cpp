@@ -45,6 +45,7 @@ void validate_route_profile(const RouteProfile& p) {
 }
 
 void validate_expert_profile(const RoutedSwiGLUProfile& p) {
+    require(!p.ffn.clamp_limit, "routed SwiGLU: clamped profile is not registered");
     validate_route_profile({p.ffn.hidden, p.experts, p.top_k});
     const auto& f = p.ffn;
     if (f.hidden == 2560) {
@@ -70,6 +71,7 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
 }
 
 void validate_shared_profile(const SwiGLUProfile& p, int hidden) {
+    require(!p.clamp_limit, "shared SwiGLU: clamped profile is not registered");
     if (hidden == 2560) {
         require(p.hidden == hidden && (p.intermediate == 320 || p.intermediate == 640) &&
                     p.gate_up_type == QType::BF16 && p.down_type == QType::BF16 &&

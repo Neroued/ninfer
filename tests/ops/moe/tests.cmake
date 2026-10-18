@@ -58,3 +58,9 @@ ninfer_add_op_test(ninfer_moe_ep_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ep.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/ep_fixture.cpp"
   LIBRARIES ninfer_ops)
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_add_op_test(ninfer_swiglu_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_swiglu.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_bf16.cpp"
+    LIBRARIES ninfer_ops ninfer_linear_test_support)
+endif()

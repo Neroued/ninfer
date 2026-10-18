@@ -28,3 +28,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/fp8/${NINFER_TARGET
 include("${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/fp8/${NINFER_TARGET}/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/fp8/${NINFER_TARGET}/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/bf16/${NINFER_TARGET}/sources.cmake")
+target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/swiglu/entry.cpp")
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4_gate_up.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/bf16.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/bf16_gate_up.cu")
+  target_sources(ninfer_ops_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4_tma.cu")
+endif()

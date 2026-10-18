@@ -17,6 +17,9 @@ struct SwiGLUProfile {
     QType gate_up_type = QType::BF16, down_type = QType::BF16;
     QuantLayout gate_up_layout = QuantLayout::Contiguous, down_layout = QuantLayout::Contiguous;
     LinearPolicy gate_up_policy = LinearPolicy::A16Only, down_policy = LinearPolicy::A16Only;
+    // Absent: SiLU(gate)*up. Present: SiLU(min(gate,L))*clamp(up,-L,L), L finite and positive.
+    std::optional<float> clamp_limit;
+    friend bool operator==(const SwiGLUProfile&, const SwiGLUProfile&) = default;
 };
 
 struct RouteProfile {
@@ -63,6 +66,20 @@ struct CpuSwiGLUExperts {
 struct SwiGLUWeights {
     SingleProjectionWeight gate_up, down;
 };
+
+// Complete unscaled FFN y=down*(activation(gate*x,up*x)), coefficient exactly one.
+// x and destination are contiguous 16-byte-aligned BF16 [H,T], T>0. Gate/up is [2I,H],
+// down [H,I]; inputs and native weight planes are immutable and disjoint from destination
+// and live caller scratch. Profile and prepared weights must agree. No observable product
+// rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
+// Capacity covers the inclusive extent interval from a 256-byte-aligned arena cursor.
+// No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
+// Supports registered BF16 and NVFP4 profiles with an explicit finite positive clamp limit.
+[[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+void swiglu(const Tensor& x, const SwiGLUProfile& profile, const SwiGLUWeights& weights,
+            Tensor& destination, MemoryArena& workspace, CudaExecutionView execution);
 
 struct ScaledSwiGLUTerm {
     SwiGLUWeights weights;

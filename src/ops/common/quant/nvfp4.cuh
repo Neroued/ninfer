@@ -134,6 +134,27 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     return result;
 }
 
+// FP32 producer input with the same explicit calibrated tensor divisor and rounded G16 scale.
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const float* source,
+                                                                float divisor) {
+    float2 values[8];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        values[pair] = load_vec<float2>(source + pair * 2);
+        maximum      = fmaxf(maximum, fmaxf(fabsf(values[pair].x), fabsf(values[pair].y)));
+    }
+    Nvfp4QuantizedK16 result{};
+    result.scale = nvfp4_activation_scale(maximum, divisor);
+    if (!result.scale) return result;
+    const float scale = decode_e4m3(result.scale);
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair)
+        values[pair] = nvfp4_activation_values(values[pair], divisor, scale);
+    pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
+    return result;
+}
+
 // FP32 input, no tensor divisor. For a nonzero group, clamp its E4M3 scale to
 // [2^-9, 448] before encoding. This is distinct from the BF16 activation profile.
 struct Nvfp4Group16 {

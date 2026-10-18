@@ -2,7 +2,7 @@
 
 namespace ninfer::ops::detail::moe_routed {
 namespace {
-Plan select_plan(int tokens, bool) {
+Plan select_plan(int tokens, int) {
     Plan plan;
     plan.implementation = kernel::ExpertImplementation::BlockScaled;
     const int columns   = tokens <= 16 ? 8 : tokens <= 128 ? 32 : 64;

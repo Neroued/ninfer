@@ -5,12 +5,12 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
 template <class Arena>
-Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool shared) {
+Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, int shared_intermediate) {
     Storage out;
     if (routed && plan.vector) {
         out.vector_activation =
             static_cast<float*>(arena.alloc(DType::FP32, {kIntermediate, kTopK * tokens}).data);
-        if (shared) {
+        if (shared_intermediate) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
         }
     } else if (routed) {
@@ -46,7 +46,12 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool s
         g.assignments      = integers(assignments);
         if (!plan.atomic_output) { g.inverse = integers(assignments); }
     }
-    if (shared) { out.shared_activation = arena.alloc(DType::FP32, {kIntermediate, tokens}).data; }
+    if (shared_intermediate) {
+        const bool vector     = plan.shared_algorithm == SharedAlgorithm::Vector;
+        const auto type       = vector ? DType::FP32 : DType::BF16;
+        const int planes      = vector || !plan.shared_split_activation ? 1 : 2;
+        out.shared_activation = arena.alloc(type, {shared_intermediate, tokens, planes}).data;
+    }
     return out;
 }
 

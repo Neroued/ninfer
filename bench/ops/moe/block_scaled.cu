@@ -2,6 +2,7 @@
 #include "ninfer/ops/moe.h"
 #include "ninfer_bench_common.h"
 #include "timing.h"
+#include "op_measurement.cuh"
 
 #include <numeric>
 #include <random>
@@ -17,7 +18,7 @@ struct Options {
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
     std::string format       = "nvfp4";
     std::string distribution = "all", operation = "routed", cache = "both";
-    int warmup = 5, repeat = 30;
+    int warmup = 5, repeat = 30, shared_intermediate = I;
 };
 
 Options parse(int argc, char** argv) {
@@ -28,7 +29,8 @@ Options parse(int argc, char** argv) {
             std::puts(
                 "--format nvfp4|fp8 --tokens M[,M...] --distribution independent|same|mixed|all "
                 "--operation "
-                "routed|routed-shared|complete|route --cache cold|warm|both --warmup N --repeat N");
+                "routed|routed-shared|complete|route|shared --shared-intermediate 320|640 "
+                "--cache cold|warm|both --warmup N --repeat N");
             std::exit(0);
         }
         if (++a == argc) { throw std::invalid_argument("missing option value"); }
@@ -44,6 +46,8 @@ Options parse(int argc, char** argv) {
             o.distribution = value;
         } else if (key == "--operation") {
             o.operation = value;
+        } else if (key == "--shared-intermediate") {
+            o.shared_intermediate = std::stoi(value);
         } else if (key == "--cache") {
             o.cache = value;
         } else if (key == "--warmup") {
@@ -57,10 +61,11 @@ Options parse(int argc, char** argv) {
     if ((o.format != "nvfp4" && o.format != "fp8") || o.tokens.empty() ||
         std::any_of(o.tokens.begin(), o.tokens.end(), [](int x) { return x <= 0; }) ||
         o.warmup < 0 || o.repeat <= 0 ||
+        (o.shared_intermediate != 320 && o.shared_intermediate != 640) ||
         (o.distribution != "all" && o.distribution != "independent" && o.distribution != "same" &&
          o.distribution != "mixed") ||
         (o.operation != "routed" && o.operation != "routed-shared" && o.operation != "complete" &&
-         o.operation != "route") ||
+         o.operation != "route" && o.operation != "shared") ||
         (o.cache != "cold" && o.cache != "warm" && o.cache != "both")) {
         throw std::invalid_argument("invalid benchmark options");
     }
@@ -143,15 +148,17 @@ Weight dense(const DeviceBuffer& b, int n, int k) {
 struct Fixture {
     Bank gu, down;
     const bool fp8;
-    DeviceBuffer control     = bench::make_buffer(std::size_t(E + 1) * H * 2);
-    DeviceBuffer shared_gu   = bench::make_bf16(2 * I * H, 991, -.012F, .012F);
-    DeviceBuffer shared_down = bench::make_bf16(H * I, 1011, -.025F, .025F);
+    DeviceBuffer control = bench::make_buffer(std::size_t(E + 1) * H * 2);
+    DeviceBuffer shared_gu;
+    DeviceBuffer shared_down;
     bench::L2FlushBuffer flush{256ULL << 20};
     ops::MoeWeights weights;
     ops::MoeProfile profile;
 
-    explicit Fixture(bool is_fp8)
-        : gu(2 * I, H, 811, is_fp8), down(H, I, 919, is_fp8), fp8(is_fp8) {
+    explicit Fixture(bool is_fp8, int shared_intermediate)
+        : gu(2 * I, H, 811, is_fp8), down(H, I, 919, is_fp8), fp8(is_fp8),
+          shared_gu(bench::make_bf16(2 * shared_intermediate * H, 991, -.012F, .012F)),
+          shared_down(bench::make_bf16(H * shared_intermediate, 1011, -.025F, .025F)) {
         std::vector<std::uint16_t> router(std::size_t(E + 1) * H);
         for (int e = 0; e <= E; ++e) { router[std::size_t(e) * H + e] = bench::f32_to_bf16(2); }
         control.copy_from_host(router.data(), control.size());
@@ -160,7 +167,8 @@ struct Fixture {
                 : ops::ExpertActivationDivisors{719.7991333F, 313.927002F};
         weights         = {dense(control, E + 1, H),
                            {{gu.view(), down.view(), E, control.device()}, activation_divisors},
-                           {{dense(shared_gu, 2 * I, H)}, {dense(shared_down, H, I)}}};
+                           {{dense(shared_gu, 2 * shared_intermediate, H)},
+                            {dense(shared_down, H, shared_intermediate)}}};
         const auto type = fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4;
         const auto layout =
             fp8 ? QuantLayout::BlockScaleM128K128 : QuantLayout::BlockScaleK16M128x4;
@@ -224,8 +232,8 @@ struct Workload {
 
     static std::size_t capacity(const ops::MoeProfile& p, int m, const std::string& operation) {
         if (operation == "complete") {
-            return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(p, ops::MoeEpilogue::Write,
-                                                                         m, m);
+            return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                p, ops::ExpertSubsetKind::All, ops::MoeEpilogue::Write, m, m);
         }
         if (operation == "route") {
             return ops::topk_softmax_route_workspace_capacity_bytes({H, E, TopK}, m, m);
@@ -241,8 +249,8 @@ struct Workload {
 
     void launch(Fixture& f, const std::string& operation, CudaExecutionView cuda) {
         if (operation == "complete") {
-            ops::topk_softmax_swiglu_moe(x, f.profile, f.weights, ops::MoeEpilogue::Write, y, arena,
-                                         cuda);
+            ops::topk_softmax_swiglu_moe(x, f.profile, f.weights, {}, ops::MoeEpilogue::Write, y,
+                                         arena, cuda);
         } else if (operation == "route") {
             ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, arena,
                                     cuda);
@@ -255,18 +263,85 @@ struct Workload {
         }
     }
 };
+
+void measure_shared(const Options& options) {
+    const int intermediate = options.shared_intermediate;
+    const bool fp8         = options.format == "fp8";
+    const auto type        = fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4;
+    const auto layout = fp8 ? QuantLayout::BlockScaleM128K128 : QuantLayout::BlockScaleK16M128x4;
+    const auto policy = fp8 ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::AllowA4;
+    const ops::RoutedSwiGLUProfile routed{
+        {H, I, type, type, layout, layout, policy, policy}, E, TopK};
+    auto gate_up = bench::make_bf16(2 * intermediate * H, 991, -.012F, .012F);
+    auto down    = bench::make_bf16(H * intermediate, 1011, -.025F, .025F);
+    const ops::SwiGLUWeights weights{{dense(gate_up, 2 * intermediate, H)},
+                                     {dense(down, H, intermediate)}};
+    const auto profile   = ops::swiglu_profile(weights);
+    const auto execution = bench::device_context().execution_view();
+    bench::measurement::Options timing;
+    timing.warmup = options.warmup;
+    timing.repeat = options.repeat;
+    bench::L2FlushBuffer flush(timing.flush_bytes);
+    bench::measurement::Csv csv({}, "routed_profile,logical_bytes,useful_flops,logical_GBps,"
+                                    "logical_TFLOps,memory_lower_bound_us,compute_lower_bound_us");
+    for (int tokens : options.tokens) {
+        auto input          = bench::make_bf16(std::size_t(H) * tokens, 151, -.7F, .7F);
+        auto output         = bench::make_buffer(std::size_t(H) * tokens * 2);
+        auto coefficients   = bench::make_f32(tokens, 103, .25F, .5F);
+        const auto capacity = ops::routed_swiglu_workspace_capacity_bytes(
+            routed, profile, ops::ExpertSubsetKind::None, DType::BF16, ops::MoeEpilogue::Write,
+            tokens, tokens);
+        auto scratch = bench::make_buffer(capacity);
+        MemoryArena workspace(scratch.span());
+        Tensor x(input.span(), DType::BF16, {H, tokens});
+        Tensor y(output.span(), DType::BF16, {H, tokens});
+        const ops::ScaledSwiGLUTerm shared{weights,
+                                           Tensor(coefficients.span(), DType::FP32, {tokens})};
+        const auto call = [&](CudaExecutionView cuda) {
+            ops::routed_swiglu(x, routed, {}, {}, {ops::ExpertSubsetKind::None}, shared,
+                               ops::MoeEpilogue::Write, y, workspace, cuda);
+        };
+        bench::measurement::Row row;
+        row.op              = "routed_swiglu/shared";
+        row.format          = "bf16";
+        row.policy          = "a16";
+        row.n               = H;
+        row.k               = intermediate;
+        row.tokens          = tokens;
+        row.workspace_bytes = capacity;
+        const auto bytes    = 6ULL * H * intermediate + (4ULL * H + 4) * tokens;
+        const double flops  = 6.0 * H * intermediate * tokens;
+        for (const auto& cache : bench::measurement::selections(options.cache, "cold", "warm")) {
+            const auto result = bench::measurement::measure(
+                call, [](auto) {}, flush, execution, timing, "graph", cache);
+            row.workspace_peak = workspace.peak_used();
+            std::ostringstream metrics;
+            metrics << options.format << ',' << bytes << ',' << flops << ','
+                    << bytes / (result.gpu.median_us * 1000) << ','
+                    << flops / (result.gpu.median_us * 1e6) << ','
+                    << bytes / (bench::kRoofline.memory_gbs * 1000) << ','
+                    << flops / (bench::kRoofline.bf16_f32_tflops * 1e6);
+            csv.write(row, result, "graph", cache, metrics.str());
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const auto options = parse(argc, argv);
-        Fixture fixture(options.format == "fp8");
+        if (options.operation == "shared") {
+            measure_shared(options);
+            return 0;
+        }
+        Fixture fixture(options.format == "fp8", options.shared_intermediate);
         cudaStream_t stream;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const auto execution = bench::device_context().execution_view(stream);
-        std::puts(
-            "format,operation,distribution,M,unique,cache,median_us,p95_us,min_us,workspace_MiB,"
-            "useful_TFLOPs,unique_weight_GBps");
+        std::puts("format,operation,distribution,shared_intermediate,M,unique,cache,median_us,p95_"
+                  "us,min_us,workspace_MiB,"
+                  "useful_TFLOPs,unique_weight_GBps");
         for (const std::string distribution : {"independent", "same", "mixed"}) {
             if (options.distribution != "all" && options.distribution != distribution) { continue; }
             for (int m : options.tokens) {
@@ -288,20 +363,22 @@ int main(int argc, char** argv) {
                     double flops     = options.operation == "route" ? 2.0 * H * (E + 1) * m
                                                                     : 6.0 * H * I * TopK * m;
                     if (options.operation == "complete" || options.operation == "routed-shared") {
-                        flops += 6.0 * H * I * m;
+                        flops += 6.0 * H * options.shared_intermediate * m;
                     }
                     if (options.operation == "complete") { flops += 2.0 * H * (E + 1) * m; }
-                    const double bytes =
-                        options.operation == "route"
-                            ? 2.0 * H * (E + 1)
-                            : double(state.unique) *
-                                  (fixture.gu.code_bytes + fixture.gu.scale_bytes +
-                                   fixture.down.code_bytes + fixture.down.scale_bytes +
-                                   (fixture.fp8 ? 0 : 8));
-                    std::printf("%s,%s,%s,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    double bytes = options.operation == "route"
+                                       ? 2.0 * H * (E + 1)
+                                       : double(state.unique) *
+                                             (fixture.gu.code_bytes + fixture.gu.scale_bytes +
+                                              fixture.down.code_bytes + fixture.down.scale_bytes +
+                                              (fixture.fp8 ? 0 : 8));
+                    if (options.operation == "complete" || options.operation == "routed-shared")
+                        bytes += 6.0 * H * options.shared_intermediate;
+                    if (options.operation == "complete") bytes += 2.0 * H * (E + 1);
+                    std::printf("%s,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                                 options.format.c_str(), options.operation.c_str(),
-                                distribution.c_str(), m, state.unique, cache.c_str(),
-                                stats.median_us, stats.p95_us, stats.min_us,
+                                distribution.c_str(), options.shared_intermediate, m, state.unique,
+                                cache.c_str(), stats.median_us, stats.p95_us, stats.min_us,
                                 state.workspace_bytes / 1048576.0, flops / stats.median_us / 1e6,
                                 bytes / stats.median_us / 1e3);
                     std::fflush(stdout);

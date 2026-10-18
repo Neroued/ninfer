@@ -4,7 +4,8 @@ namespace ninfer::models::moe {
 
 std::size_t workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epilogue,
                             std::int32_t first, std::int32_t last) {
-    return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, epilogue, first, last);
+    return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+        profile, ops::ExpertSubsetKind::All, epilogue, first, last);
 }
 
 void execute(const Tensor& hidden, const Parameters& parameters,
@@ -18,7 +19,7 @@ void execute(const Tensor& hidden, const Parameters& parameters,
     MemoryArena scratch(storage);
     const ops::MoeWeights weights{
         parameters.control, {experts, parameters.activation_divisors}, parameters.shared};
-    ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, epilogue, output, scratch,
+    ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, {}, epilogue, output, scratch,
                                  execution, hints);
 }
 

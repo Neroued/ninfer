@@ -18,9 +18,11 @@ struct Plan {
     bool atomic_output         = false;
     bool single_block_grouping = false;
     // GU consumes the original expert-major jobs; only down may reorder them.
-    bool column_major_down = false;
+    bool column_major_down      = false;
+    bool preserve_balanced_down = false;
 
     SharedAlgorithm shared_algorithm = SharedAlgorithm::Vector;
+    bool shared_split_activation     = true;
     // Complete may widen shared/control tiles independently of routed-shared.
     bool network_topk      = false;
     int shared_columns     = 32;
@@ -52,21 +54,26 @@ struct Storage {
     Groups groups{};
 };
 
-// The complete entry prepares shared activations and, when allocated, route counts first.
+struct Preparation {
+    bool shared_activation = false;
+    bool route_counts      = false;
+};
+
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue mode,
             Tensor& destination, const Plan& plan, const Storage& storage,
-            CudaExecutionView execution, bool shared_prepared = false);
+            CudaExecutionView execution, Preparation prepared = {});
 void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const ExpertRoutes& routes,
                    MoeEpilogue mode, Tensor& destination, const Storage& storage, const Plan& plan,
                    CudaExecutionView execution, bool prepared = false);
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
-                           const Tensor& shared, float* scores, const Storage& storage,
-                           const Plan& plan, CudaExecutionView execution);
+                           ExpertSubset subset, const Tensor& shared, float* scores,
+                           const Storage& storage, const Plan& plan, CudaExecutionView execution);
 
 // Overwrites job_experts/job_columns after GU has finished on the same stream.
 // Counts, offsets, packed assignments and all quantized payloads remain unchanged.
-void launch_column_jobs(Groups groups, int tokens, int columns, CudaExecutionView execution);
+void launch_column_jobs(Groups groups, int tokens, int columns, bool preserve_balanced,
+                        CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled

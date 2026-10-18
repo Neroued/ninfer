@@ -24,6 +24,9 @@ void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& ro
                   const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
                   const MoeExecutionHints& hints, CudaExecutionView execution);
 
+void launch_shared_gate(const Tensor& x, const Weight& control, const Tensor& shared,
+                        CudaExecutionView execution);
+
 template <class Arena>
 RouteStorage allocate_route(Arena& arena, const RouterPlan& plan, int tokens, int experts) {
     const int rows =

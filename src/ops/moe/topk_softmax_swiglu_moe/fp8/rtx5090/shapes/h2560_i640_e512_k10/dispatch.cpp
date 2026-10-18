@@ -2,7 +2,7 @@
 
 namespace ninfer::ops::detail::moe_complete {
 namespace {
-Plan select_plan(int tokens) {
+Plan select_plan(int tokens, int, ExpertSubsetKind) {
     Plan plan;
     plan.implementation = kernel::ExpertImplementation::BlockScaled;
     const int columns   = tokens <= 16 ? 8 : tokens <= 32 ? 16 : tokens <= 64 ? 32 : 64;

@@ -81,7 +81,8 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
         launch_mma<true, C>(x, experts, routes, s, plan, execution);
     });
     if (plan.column_major_down) {
-        launch_column_jobs(s.groups, x.ne[1], plan.job_columns(), execution);
+        launch_column_jobs(s.groups, x.ne[1], plan.job_columns(), plan.preserve_balanced_down,
+                           execution);
     }
     with_columns<false>(plan.down_columns, [&]<int C>() {
         if constexpr (C == 128) {

@@ -8,14 +8,14 @@ constexpr int kGroupedFirst = 20;
 constexpr int kWideFirst    = 384;
 constexpr std::array kAllocationBoundaries{2, kGroupedFirst, kWideFirst};
 
-Plan select_plan(int tokens) {
+Plan select_plan(int tokens, int, ExpertSubsetKind subset) {
     Plan plan;
     plan.integer.grouped = tokens >= kGroupedFirst;
     plan.router          = {.algorithm         = tokens == 1            ? RouterAlgorithm::Vector
                                                  : plan.integer.grouped ? RouterAlgorithm::Mma
                                                                         : RouterAlgorithm::TokenTile,
                             .programmatic      = !plan.integer.grouped,
-                            .count_assignments = plan.integer.grouped};
+                            .count_assignments = plan.integer.grouped && subset == ExpertSubsetKind::All};
     plan.integer.token   = {.paths_per_block    = tokens == 1   ? 9
                                                   : tokens <= 5 ? 1
                                                                 : 9,
@@ -32,6 +32,10 @@ Plan select_plan(int tokens) {
                             .shared_columns     = 64,
                             .direct_numerator   = 7,
                             .direct_denominator = 16};
+    plan.integer.shared  = {.token   = {.paths_per_block = 1,
+                                        .output_rows     = tokens == 1 ? 1 : 4,
+                                        .single_token    = tokens == 1},
+                            .columns = tokens >= 16 ? 64 : 0};
     return plan;
 }
 } // namespace

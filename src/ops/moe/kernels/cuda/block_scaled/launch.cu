@@ -137,11 +137,31 @@ __global__ void reduce(Storage storage, const float* coefficients, Output output
 // One 512-thread CTA emits column layer j across all experts. Its first output
 // index is sum_e min(j, jobs_e), followed by the prefix of experts with jobs_e > j.
 // Only the job metadata changes; packed assignments and GU products keep their offsets.
+template <bool PreserveBalanced>
 __global__ void order_jobs(Groups g, int columns) {
     __shared__ int warp_offsets[16], warp_before[16], base;
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
-    const int jobs  = (g.counts[e] + columns - 1) / columns;
-    const int j     = blockIdx.x;
+    const int jobs = (g.counts[e] + columns - 1) / columns;
+    const int j    = blockIdx.x;
+    if constexpr (PreserveBalanced) {
+        int maximum = jobs;
+#pragma unroll
+        for (int d = 16; d; d /= 2)
+            maximum = max(maximum, __shfl_down_sync(0xffffffff, maximum, d));
+        if (!lane) warp_before[warp] = maximum;
+        __syncthreads();
+        if (!warp) {
+            int total = lane < 16 ? warp_before[lane] : 0;
+#pragma unroll
+            for (int d = 16; d; d /= 2) total = max(total, __shfl_down_sync(0xffffffff, total, d));
+            if (!lane) base = total;
+        }
+        __syncthreads();
+        // GU consumed expert-major jobs. Keeping adjacent pairs reuses their
+        // weights; larger hotspot groups retain column ordering for scheduling.
+        // The predicate is uniform and derived solely from Device group counts.
+        if (base <= 2) return;
+    }
     const int value = int(jobs > j);
     int prefix = value, before = min(j, jobs);
 #pragma unroll
@@ -178,20 +198,25 @@ __global__ void order_jobs(Groups g, int columns) {
 
 } // namespace
 
-void launch_column_jobs(Groups groups, int tokens, int columns, CudaExecutionView execution) {
+void launch_column_jobs(Groups groups, int tokens, int columns, bool preserve_balanced,
+                        CudaExecutionView execution) {
     // Stream ordering is the lifetime boundary: GU must finish reading the
     // expert-major metadata before this launch overwrites it for down.
     if (tokens <= columns) { return; }
     if (!groups.counts) { throw std::logic_error("job ordering requires counted groups"); }
-    order_jobs<<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(groups,
-                                                                                      columns);
+    if (preserve_balanced)
+        order_jobs<true><<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(
+            groups, columns);
+    else
+        order_jobs<false><<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(
+            groups, columns);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue mode,
             Tensor& destination, const Plan& plan, const Storage& s, CudaExecutionView execution,
-            bool shared_prepared) {
+            Preparation prepared) {
     const auto stream = execution.stream();
     if (subset.kind != ExpertSubsetKind::None && plan.vector) {
         if (plan.format == QType::NVFP4) {
@@ -207,16 +232,16 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         const auto* ids       = static_cast<const int*>(routes.ids.data);
         const auto* mask      = static_cast<const int*>(subset.mask.data);
         if (plan.format == QType::NVFP4) {
-            nvfp4::launch_input(x, experts, s, execution, !shared_prepared);
+            nvfp4::launch_input(x, experts, s, execution, !prepared.route_counts);
         } else {
-            fp8::launch_input(x, experts, s, execution, !shared_prepared);
+            fp8::launch_input(x, experts, s, execution, !prepared.route_counts);
         }
         if (plan.single_block_grouping) {
             group_small<<<1, kExperts, 0, stream>>>(ids, subset.kind, mask, s.groups, assignments,
                                                     plan.job_columns());
             CUDA_CHECK(cudaGetLastError());
         } else {
-            if (!shared_prepared) {
+            if (!prepared.route_counts) {
                 count_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
                     ids, subset.kind, mask, s.groups.counts, assignments);
                 CUDA_CHECK(cudaGetLastError());
@@ -234,7 +259,8 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         }
     }
     if (shared) {
-        launch_shared(x, *shared, routes, mode, destination, s, plan, execution, shared_prepared);
+        launch_shared(x, *shared, routes, mode, destination, s, plan, execution,
+                      prepared.shared_activation);
     } else {
         with_output(destination, mode, [&](auto output) {
             const int elements = x.ne[1] * kHidden;

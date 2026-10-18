@@ -133,9 +133,9 @@ ExecutionRequirements describe_execution(const ops::MoeProfile& profile, Subset 
         throw std::invalid_argument("MoE output epilogue is invalid");
     const auto cpu = cpu_subset(gpu_subset);
     if (gpu_subset == Subset::All) {
-        return {
-            0, 0, 0,
-            ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, epilogue, first, last)};
+        return {0, 0, 0,
+                ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                    profile, ops::ExpertSubsetKind::All, epilogue, first, last)};
     }
     const ops::RouteProfile route{profile.routed.ffn.hidden, profile.routed.experts,
                                   profile.routed.top_k};

@@ -201,8 +201,9 @@ double unique_weight_bytes(const Result& result) {
         result.operation == Operation::Route || result.operation == Operation::Complete;
     const bool shared =
         result.operation == Operation::RoutedShared || result.operation == Operation::Complete;
+    const int router_rows = result.subset == ops::ExpertSubsetKind::None ? 1 : kRouterRows;
     const std::uint64_t fixed =
-        (router ? std::uint64_t(kRouterRows) * kHidden * 2 : 0) +
+        (router ? std::uint64_t(router_rows) * kHidden * 2 : 0) +
         (shared ? packed_weight_bytes(QType::Q8_G32_FP16, 1024, kHidden) +
                       packed_weight_bytes(QType::Q8_G32_FP16, kHidden, kIntermediate)
                 : 0);
@@ -220,7 +221,8 @@ double logical_flops(const Result& result) {
         result.operation == Operation::Route || result.operation == Operation::Complete;
     const bool shared =
         result.operation == Operation::RoutedShared || result.operation == Operation::Complete;
-    return result.tokens * ((router ? 2.0 * kRouterRows * kHidden : 0) + (shared ? ffn : 0)) +
+    const int router_rows = result.subset == ops::ExpertSubsetKind::None ? 1 : kRouterRows;
+    return result.tokens * ((router ? 2.0 * router_rows * kHidden : 0) + (shared ? ffn : 0)) +
            (result.operation == Operation::Route ? 0 : result.selected_assignments * ffn);
 }
 
@@ -303,7 +305,7 @@ void usage(const char* argv0) {
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
                  "  --op complete|route|routed|routed-shared (default complete).\n"
-                 "  --subset all|mask-ones|mask-zeros|none (routed Ops only).\n"
+                 "  --subset all|mask-ones|mask-zeros|none (except route).\n"
                  "  Complete adds to BF16 residual; routed Ops write FP32.\n"
                  "  --codec q4-q5|q4-q6|q8-q8|all  Routed weight profile (default q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
@@ -404,9 +406,8 @@ Options parse_options(int argc, char** argv) {
         options.codec != "all") {
         throw std::invalid_argument("--codec must be q4-q5, q4-q6, q8-q8, or all");
     }
-    if (options.subset != ops::ExpertSubsetKind::All &&
-        (options.operation == Operation::Complete || options.operation == Operation::Route)) {
-        throw std::invalid_argument("--subset requires a routed Op");
+    if (options.subset != ops::ExpertSubsetKind::All && options.operation == Operation::Route) {
+        throw std::invalid_argument("route produces global TopK and does not accept --subset");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -720,8 +721,9 @@ public:
         const auto& weights = fixture_.weights();
         switch (operation_) {
         case Operation::Complete:
-            ops::topk_softmax_swiglu_moe(x_, profile, weights, ops::MoeEpilogue::AddResidual,
-                                         destination_tensor_, workspace_, cuda);
+            ops::topk_softmax_swiglu_moe(x_, profile, weights, subset_,
+                                         ops::MoeEpilogue::AddResidual, destination_tensor_,
+                                         workspace_, cuda);
             break;
         case Operation::Route:
             ops::topk_softmax_route(x_, {kHidden, kExperts, kTopK}, weights.control, routes_,
@@ -745,7 +747,7 @@ private:
         switch (options.operation) {
         case Operation::Complete:
             return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                p, ops::MoeEpilogue::AddResidual, tokens, tokens);
+                p, options.subset, ops::MoeEpilogue::AddResidual, tokens, tokens);
         case Operation::Route:
             return ops::topk_softmax_route_workspace_capacity_bytes({kHidden, kExperts, kTopK},
                                                                     tokens, tokens);

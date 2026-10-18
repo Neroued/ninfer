@@ -18,7 +18,8 @@ struct Plan {
 };
 
 struct ShapePolicy {
-    Plan (*select)(int tokens, bool shared);
+    // A zero shared width denotes an absent shared term.
+    Plan (*select)(int tokens, int shared_intermediate);
     std::span<const int> allocation_boundaries;
 };
 

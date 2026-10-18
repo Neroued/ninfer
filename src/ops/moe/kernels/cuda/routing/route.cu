@@ -26,6 +26,19 @@ __device__ __forceinline__ float dot_eight(const __nv_bfloat16* a, const __nv_bf
     return fmaf(a3.y, b3.y, sum);
 }
 
+__global__ void shared_gate(const __nv_bfloat16* x, const __nv_bfloat16* weight, float* beta,
+                            int hidden, int tokens) {
+    const int token = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane  = threadIdx.x % 32;
+    if (token >= tokens) { return; }
+    float sum = 0;
+    for (int k = lane * 8; k < hidden; k += 32 * 8) {
+        sum += dot_eight(x + std::int64_t(token) * hidden + k, weight + k);
+    }
+    sum = warp_reduce_sum(sum);
+    if (!lane) { beta[token] = 1.0F / (1.0F + __expf(-sum)); }
+}
+
 template <class Shape>
 __global__ void router_vector(const __nv_bfloat16* x, const __nv_bfloat16* weights, float* scores,
                               MoeExecutionHints hints) {
@@ -231,5 +244,14 @@ void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& ro
         launch_route_shape<SwiGLUH2048I512E256K8>(x, control, routes, shared, plan, storage, hints,
                                                   execution);
     }
+}
+
+void launch_shared_gate(const Tensor& x, const Weight& control, const Tensor& shared,
+                        CudaExecutionView execution) {
+    const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
+    shared_gate<<<(x.ne[1] + 3) / 4, 128, 0, execution.stream()>>>(
+        static_cast<const __nv_bfloat16*>(x.data), weights + (control.n - 1) * control.k,
+        static_cast<float*>(shared.data), control.k, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::moe_cuda::routing

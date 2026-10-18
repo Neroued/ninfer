@@ -21,7 +21,7 @@ struct Plan {
 };
 
 struct ShapePolicy {
-    Plan (*select)(int tokens);
+    Plan (*select)(int tokens, int shared_intermediate, ExpertSubsetKind subset);
     std::span<const int> allocation_boundaries;
 };
 

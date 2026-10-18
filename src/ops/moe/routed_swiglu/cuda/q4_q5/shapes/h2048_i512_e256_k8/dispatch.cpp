@@ -7,7 +7,8 @@ namespace {
 constexpr int kGroupedFirst = 47;
 constexpr std::array kAllocationBoundaries{kGroupedFirst, 768};
 
-Plan select_plan(int tokens, bool shared) {
+Plan select_plan(int tokens, int shared_intermediate) {
+    const bool shared = shared_intermediate != 0;
     Plan plan;
     plan.integer.grouped = tokens >= kGroupedFirst;
     plan.integer.token   = {.paths_per_block    = tokens == 1 ? (shared ? 9 : 8) : (shared ? 3 : 4),

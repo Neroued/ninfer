@@ -8,7 +8,8 @@ constexpr int kGroupedFirst = 20;
 constexpr int kWideFirst    = 384;
 constexpr std::array kAllocationBoundaries{kGroupedFirst, kWideFirst};
 
-Plan select_plan(int tokens, bool shared) {
+Plan select_plan(int tokens, int shared_intermediate) {
+    const bool shared = shared_intermediate != 0;
     Plan plan;
     plan.integer.grouped = tokens >= kGroupedFirst;
     plan.integer.token   = {.paths_per_block    = tokens == 1   ? (shared ? 9 : 8)

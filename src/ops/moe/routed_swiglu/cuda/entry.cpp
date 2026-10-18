@@ -20,11 +20,13 @@ struct CallStorage {
 
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSubsetKind subset,
-                     bool shared, bool split_activation) {
+                     int shared_intermediate, bool split_activation) {
+    const bool shared = shared_intermediate != 0;
     if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
         CallStorage out;
-        out.block_scaled = block_scaled::allocate(arena, plan.block_scaled, tokens,
-                                                  subset != ExpertSubsetKind::None, shared);
+        out.block_scaled =
+            block_scaled::allocate(arena, plan.block_scaled, tokens,
+                                   subset != ExpertSubsetKind::None, shared_intermediate);
         return out;
     }
     if (subset == ExpertSubsetKind::None) {
@@ -44,14 +46,14 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
     detail::validate_subset_kind(subset);
     detail::validate_output(type, mode);
     if (shared) { detail::validate_shared_profile(*shared, profile.ffn.hidden); }
-    const auto boundaries =
-        subset == ExpertSubsetKind::None ? std::span<const int>{} : shape.allocation_boundaries;
-    return detail::interval_capacity(first, last, boundaries, impl::kSliceTokens, [&](int tokens) {
-        WorkspaceLayoutBuilder layout;
-        (void)allocate(layout, shape.select(tokens, shared != nullptr), tokens, subset,
-                       shared != nullptr, profile.ffn.gate_up_type == QType::Q8_G32_FP16);
-        return layout.peak_bytes(1);
-    });
+    const int shared_intermediate = shared ? shared->intermediate : 0;
+    return detail::interval_capacity(
+        first, last, shape.allocation_boundaries, impl::kSliceTokens, [&](int tokens) {
+            WorkspaceLayoutBuilder layout;
+            (void)allocate(layout, shape.select(tokens, shared_intermediate), tokens, subset,
+                           shared_intermediate, profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+            return layout.peak_bytes(1);
+        });
 }
 
 void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiGLUExperts& experts,
@@ -70,7 +72,7 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
     std::optional<SwiGLUProfile> shared_profile;
     if (shared) {
         shared_profile = swiglu_profile(shared->weights);
-        operands.shared(shared->weights, profile.ffn.hidden);
+        operands.shared(shared->weights, *shared_profile);
         operands.coefficient(shared->coefficients, tokens, false);
     }
     operands.workspace(workspace, capacity(profile, shared_profile ? &*shared_profile : nullptr,
@@ -81,6 +83,7 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         if (mode == MoeEpilogue::Write) { kernel::launch_zero(destination, execution); }
         return;
     }
+    const int shared_intermediate = shared_profile ? shared_profile->intermediate : 0;
     for (std::int64_t start = 0; start < tokens; start += impl::kSliceTokens) {
         const int offset = static_cast<int>(start);
         const int count  = std::min(tokens - offset, impl::kSliceTokens);
@@ -96,8 +99,8 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
         auto scope         = workspace.scope();
-        const auto plan    = shape.select(count, shared != nullptr);
-        const auto buffers = allocate(workspace, plan, count, subset.kind, shared != nullptr,
+        const auto plan    = shape.select(count, shared_intermediate);
+        const auto buffers = allocate(workspace, plan, count, subset.kind, shared_intermediate,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             block_scaled::launch(input, experts, selection, subset, term ? &*term : nullptr, mode,

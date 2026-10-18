@@ -53,3 +53,8 @@ endif()
 ninfer_add_op_test(ninfer_moe_block_scaled_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_block_scaled.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_moe_ep_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ep.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/ep_fixture.cpp"
+  LIBRARIES ninfer_ops)

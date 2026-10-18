@@ -71,8 +71,9 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
 
 void validate_shared_profile(const SwiGLUProfile& p, int hidden) {
     if (hidden == 2560) {
-        require(p.hidden == hidden && p.intermediate == 640 && p.gate_up_type == QType::BF16 &&
-                    p.down_type == QType::BF16 && p.gate_up_layout == QuantLayout::Contiguous &&
+        require(p.hidden == hidden && (p.intermediate == 320 || p.intermediate == 640) &&
+                    p.gate_up_type == QType::BF16 && p.down_type == QType::BF16 &&
+                    p.gate_up_layout == QuantLayout::Contiguous &&
                     p.down_layout == QuantLayout::Contiguous &&
                     p.gate_up_policy == LinearPolicy::A16Only &&
                     p.down_policy == LinearPolicy::A16Only,
@@ -259,11 +260,14 @@ void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
     read(w.scales, bytes.scales);
 }
 
-void MoeOperands::shared(const SwiGLUWeights& weights, int hidden) {
-    const auto profile = swiglu_profile(weights);
-    validate_shared_profile(profile, hidden);
-    matrix(weights.gate_up.weight, 2 * profile.intermediate, hidden, profile.gate_up_type);
-    matrix(weights.down.weight, hidden, profile.intermediate, profile.down_type);
+void MoeOperands::shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile) {
+    validate_shared_profile(profile, profile.hidden);
+    const auto actual = swiglu_profile(weights);
+    require(actual.gate_up_policy == profile.gate_up_policy &&
+                actual.down_policy == profile.down_policy,
+            "MoE: shared weight policy differs from profile");
+    matrix(weights.gate_up.weight, 2 * profile.intermediate, profile.hidden, profile.gate_up_type);
+    matrix(weights.down.weight, profile.hidden, profile.intermediate, profile.down_type);
 }
 
 void MoeOperands::workspace(const MemoryArena& workspace, std::size_t bytes) {

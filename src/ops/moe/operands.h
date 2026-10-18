@@ -25,7 +25,7 @@ public:
     void coefficient(const Tensor& value, int tokens, bool writing);
     void subset(ExpertSubset subset, int experts);
     void experts(const CudaSwiGLUExperts& weights, const RoutedSwiGLUProfile& profile);
-    void shared(const SwiGLUWeights& weights, int hidden);
+    void shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile);
     void workspace(const MemoryArena& workspace, std::size_t bytes);
     void finish() const;
 

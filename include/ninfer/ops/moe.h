@@ -172,16 +172,20 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    Tensor& destination, MemoryArena& workspace, CpuExecutionView execution);
 
 // Complete top-k-softmax routed SwiGLU plus sigmoid-gated shared SwiGLU, with the same routing,
-// expert and residual formulas above. Destination is BF16 [H,T]. Every routed expert is readable.
+// expert and residual formulas above. TopK is selected globally, then restricted to subset without
+// renormalizing its coefficients. The local shared term is added exactly once. Destination is
+// BF16 [H,T]. Only selected routed weights/index entries must be readable; None reads neither.
 // Only destination and caller scratch are mutated; they are mutually disjoint and overlap no
 // input. Hints affect cache warming only. CUDA Graph capture/replay is supported.
 // Capacity queries cover every positive T in their inclusive interval, from an aligned local
 // workspace cursor, with no dependence on route values. Output storage is excluded from scratch.
 [[nodiscard]] std::size_t
-topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& profile, MoeEpilogue epilogue,
-                                                 std::int32_t min_tokens, std::int32_t max_tokens);
+topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& profile, ExpertSubsetKind subset,
+                                                 MoeEpilogue epilogue, std::int32_t min_tokens,
+                                                 std::int32_t max_tokens);
 void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const MoeWeights& weights,
-                             MoeEpilogue epilogue, Tensor& destination, MemoryArena& workspace,
-                             CudaExecutionView execution, const MoeExecutionHints& hints = {});
+                             ExpertSubset subset, MoeEpilogue epilogue, Tensor& destination,
+                             MemoryArena& workspace, CudaExecutionView execution,
+                             const MoeExecutionHints& hints = {});
 
 } // namespace ninfer::ops

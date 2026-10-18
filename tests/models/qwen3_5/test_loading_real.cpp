@@ -174,7 +174,7 @@ void check_native_inputs(const q35::ModelShard& model) {
                     model.input(moe.experts.front().down).policy),
                 ops::swiglu_profile(shared)};
             (void)ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                profile, ops::MoeEpilogue::AddResidual, 1, 1);
+                profile, ops::ExpertSubsetKind::All, ops::MoeEpilogue::AddResidual, 1, 1);
         }
     };
     const auto& weights = model.definition().weights();

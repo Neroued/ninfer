@@ -70,3 +70,14 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/benchmarks.c
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gated_residual/benchmarks.cmake")
+
+ninfer_add_op_bench(ninfer_moe_ep_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/ep.cu"
+          "${PROJECT_SOURCE_DIR}/tests/ops/moe/ep_fixture.cpp")
+target_include_directories(ninfer_moe_ep_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+# The encoded fixture's independent FP64 oracle remains ordinary strict C++.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ninfer_moe_ep_bench PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
+    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+endif()

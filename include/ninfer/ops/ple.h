@@ -3,7 +3,60 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <array>
+#include <span>
+
 namespace ninfer::ops {
+
+struct NgramHashParameters {
+    std::array<std::uint64_t, 3> multipliers{};
+    std::array<std::uint32_t, 16> vocab_sizes{}, offsets{};
+};
+
+struct NgramTokenTailView {
+    Tensor token_ids; // I32 [2,S], oldest first; missing history is represented by EOS.
+    Tensor slots;     // Contiguous I32 [B].
+};
+
+struct Nf4EmbeddingShard {
+    ConstMemorySpan pages;
+    Tensor decode; // Contiguous BF16 [16,128], indexed by code then E4M3 scale byte.
+    std::uint32_t row_begin = 0, rows = 0;
+};
+
+/**
+ * Concatenate sixteen exact NF4 row lookups into BF16 embedding [2560,T,B].
+ * For each live (t,b), x=token_ids[t,b], p is the preceding ID and o the ID before p;
+ * IDs before t=0 come from before.token_ids[:,before.slots[b]]. If p==eos, replace o by eos.
+ * All products/XOR use U64 wrap. Let u=x*m[0] XOR p*m[1], extended by XOR o*m[2] for heads
+ * 8..15. Head h selects offsets[h] + positive_mod(signed_I64_bits(u), vocab_sizes[h]).
+ * Each head contributes 160 features, in head order. A row absent from shards contributes
+ * exact +0 words. Shards are a Host descriptor list of up to 128 disjoint, sorted global row
+ * ranges; they may cover only part of the table. Each positive vocabulary and its offset fit
+ * the U32 row domain. eos and the consumed token IDs are nonnegative I32.
+ *
+ * Shard pages retain RowPagedG16_4K encoding: 45 rows per 4096-byte page, each row holding
+ * 80 low-even NF4 code bytes followed by ten nonnegative E4M3 scale bytes (0..126).
+ * decode supplies the exact BF16 words for that shard, as prepared by make_nf4_bf16_lut().
+ * The Op indexes these supplied words without floating-point arithmetic, preserving signed
+ * zero. Exclusive row ownership permits combining partial outputs as packed I32/U32 words;
+ * the Op itself performs no communication.
+ *
+ * T>0, B=1..8. token_ids is Device I32 [T,B], before.token_ids is I32 [2,S], S>0; both have
+ * contiguous dimension zero and a non-overlapping, naturally aligned outer stride. Metadata
+ * valid_columns and before.slots are contiguous Device I32 [B]. For n=valid_columns[b],
+ * 0<=n<=T; live rows have a valid tail slot. Output is contiguous, 16-byte-aligned BF16
+ * [2560,T,B]. Columns t>=n are exact +0 and read no token IDs or tail. All storage belongs to
+ * execution.device(); pages cover ceil(rows/45)*4096 bytes and decode is naturally aligned.
+ * Output overlaps no addressed input, page span or decode table. Inputs are preserved.
+ * No state, frontier or count is changed. No workspace, hidden allocation or Host readback is
+ * required. CUDA Graph replay consumes current Device IDs, tails and metadata; descriptor and
+ * hash values are captured by value, and their referenced storage outlives every consumer.
+ */
+void ngram_embedding_lookup(const Tensor& token_ids, const Tensor& valid_columns,
+                            const NgramTokenTailView& before, const NgramHashParameters& hash,
+                            std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
+                            Tensor& embedding, CudaExecutionView execution);
 
 /**
  * Shared PLE domain and view conventions:

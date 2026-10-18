@@ -228,7 +228,7 @@ def _server_command(
         "--request-log-jsonl",
         str(request_log_jsonl),
         *_without_stats_interval((*common_args, *profile_args)),
-        "--log-stats-interval-ms", "1000",
+        "--stats-interval", "1000",
     ]
 
 
@@ -237,9 +237,9 @@ def _without_stats_interval(arguments: Sequence[str]) -> list[str]:
     result = []
     values = iter(arguments)
     for argument in values:
-        if argument == "--log-stats-interval-ms":
+        if argument == "--stats-interval":
             next(values, None)
-        elif not argument.startswith("--log-stats-interval-ms="):
+        elif not argument.startswith("--stats-interval="):
             result.append(argument)
     return result
 

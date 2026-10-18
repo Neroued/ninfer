@@ -1,0 +1,94 @@
+# Complete NInfer startup configuration reference.
+# Schema and behavior: docs/startup-configuration.md.
+# Copy this file and adjust the model path for local use.
+# All configurable fields are listed; mutually exclusive alternatives are commented out.
+# Relative paths use this file's directory. Explicit command-line values take precedence.
+
+[model]
+path = "out/qwen3_8_flash_next.ninfer"
+chat_template = "" # Empty uses the artifact's template.
+vision = false
+
+[engine]
+device = 0
+max_context = 8192
+kv_dtype = "bf16" # bf16 / int8 / fp8 / nvfp4 / k8v4
+kv_capacity = "context" # Positive integer, context, or auto; context is not multiplied by concurrency.
+prefill_chunk = "default" # default or a positive multiple of 128; no hardware performance estimation.
+cuda_graph = true
+max_concurrency = 1
+max_pending_requests = 16
+pending_timeout = "30s" # Queue timeout before execution, not a total generation deadline.
+
+[context_cache]
+prefix_reuse = "default" # CLI: false; serve: true. Also accepts true/false.
+extra_state_slots = "default" # CLI: 0; serve: max_concurrency. Also accepts a nonnegative integer.
+host_capacity = "default" # CLI/Spark: 0; RTX 5090 serve: 8 GiB + 8 native StateImages.
+# Explicit capacities accept "8GiB", "0B", or integer bytes; excludes CPU experts and PLE.
+cost_presets = "" # Optional context-cost JSON path; empty uses existing defaults.
+
+[speculative]
+backend = "none" # none / mtp / dflash / dflash2
+draft_tokens = 0 # none: 0; MTP: 1..5; DFlash/DFlash2: 1..15.
+proposal_head = "full" # full / optimized; support depends on the model and artifact.
+
+[media]
+cache_capacity = "1GiB" # 0B disables the retained media cache.
+live_capacity = "2GiB" # Includes live patch payloads retained in the cache, counted once.
+preprocess_threads = "auto" # auto uses at most 16; explicit values: 1..64.
+
+[generation]
+max_tokens = "default" # CLI: 128; serve: 8192. Also accepts a positive integer.
+thinking = "model" # model / true / false
+preserve_thinking = "model" # model / true / false
+thinking_budget = "none" # none or a positive integer; limits model-origin thinking tokens only.
+
+[generation.sampling]
+temperature = "model" # model or [0,2]; 0 selects greedy sampling.
+top_k = "model" # model or an integer in [0,20]; 0 uses the current limit of 20.
+top_p = "model" # model or [0,1]
+min_p = "model" # model or [0,1]
+presence_penalty = "model" # model or [-2,2]
+frequency_penalty = "model" # model or [-2,2]
+seed = "default" # CLI: 0; serve: random per request. Also accepts random or a uint64 value.
+# Seeds above TOML's signed integer range use decimal strings, e.g. "18446744073709551615".
+
+[server]
+host = "127.0.0.1"
+port = 8080
+api_key = "" # Empty disables authentication; display and logs show only disabled/configured.
+model_id = "" # Empty uses the artifact's public name.
+cors = false
+max_request_size = "384MiB"
+
+[server.responses]
+max_records = 1024
+max_size = "256MiB" # Responses store capacity, separate from the KV/State context cache.
+
+[logging]
+level = "info" # trace / debug / info / warning / error / critical / off
+stats_interval = "5s" # serve only; 0ms disables periodic throughput logs.
+request_jsonl = "" # serve only; empty disables structured request logging.
+
+[cli]
+prompt = "Explain sparse attention briefly."
+# messages = "examples/cli/messages/text_smoke_zh.json" # Remove or comment out prompt when using messages.
+reasoning_effort = "model" # model / none / minimal / low / medium / high / xhigh / max
+raw_output = false
+print_token_ids = false
+stop_token_ids = []
+stop = [] # Content stop strings, e.g. ["END"]; each string must be nonempty.
+reasoning_stop = [] # Reasoning stop strings.
+
+[cli.constraint]
+kind = "none" # none / grammar / json_object / json_schema / regex / choice
+# Select one kind and set its fields below; leave fields for other kinds commented out.
+# grammar_file = "./answer.gbnf" # kind = "grammar"
+# json_schema_file = "./answer.schema.json" # kind = "json_schema"
+# kind = "json_object" needs no additional fields.
+# regex = '(BUG|TASK)-[0-9]{4}' # kind = "regex"; an empty regex is meaningful.
+# choices = ["positive", "neutral", "negative"] # kind = "choice"; entries may be empty strings.
+
+# Startup configuration is displayed automatically through the info-level log.
+# Command-line controls are not file fields: --config, --help, --clear-stops.
+# Environment controls remain separate: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.

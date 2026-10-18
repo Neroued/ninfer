@@ -20,6 +20,7 @@ namespace {
 
 using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -63,7 +64,7 @@ std::string api_param(const std::function<void()>& action) {
 
 ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default_thinking = true) {
     ServeOptions options;
-    options.enable_thinking = default_thinking;
+    options.launch.generation.enable_thinking = default_thinking;
     return resolve_prompt_semantics(request, options);
 }
 
@@ -467,7 +468,7 @@ int test_thinking_and_count_tokens() {
         Json{{"type", "enabled"}, {"budget_tokens", 1024}, {"display", "summarized"}};
     const GenerationRequest enabled = parse(body).generation;
     ServeOptions server;
-    server.default_thinking_budget = 777;
+    server.launch.generation.thinking_budget = 777;
     const ninfer::RequestOptions options =
         to_request_options(enabled, server, semantics(enabled), true);
     int failures = check(enabled.enable_thinking == true && enabled.thinking_budget == 1024 &&

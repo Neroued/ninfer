@@ -198,7 +198,7 @@ int main() {
         options.max_concurrency = 1;
         options.kv_capacity     = KvCapacityPolicy::explicit_capacity(128);
         options.context_cache   = {
-              .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+              .enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
         artifact::Reader reader(path);
         auto definition = q4::read_definition(reader, models::load_options(options));
         auto profile    = q4::execution::describe_model(*definition);

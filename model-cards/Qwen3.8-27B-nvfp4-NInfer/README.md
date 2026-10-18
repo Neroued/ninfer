@@ -150,7 +150,7 @@ printf '%s  %s\n' \
 This release includes the complete DFlash2 companion weights from
 `z-lab/Qwen3.8-27B-DFlash2` at revision
 `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`. Select
-`--spec dflash2 --draft-tokens 7 --lm-head-draft`; draft counts 1..15 are supported.
+`--spec dflash2 --draft-tokens 7 --proposal-head optimized`; draft counts 1..15 are supported.
 DFlash2 requires the runtime revision listed below. Existing performance and evaluation tables
 retain their stated MTP configurations and revisions.
 
@@ -179,10 +179,10 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 32768 \
-  --max-new 8192 \
+  --max-tokens 8192 \
   --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --proposal-head optimized
 ```
 
 For images, videos, and structured chat history, see the
@@ -198,9 +198,9 @@ For images, videos, and structured chat history, see the
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --proposal-head optimized \
   --preserve-thinking
 ```
 
@@ -222,7 +222,7 @@ The artifact supports:
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
 - DFlash2 with draft windows from one to fifteen using the included
-  DFlash2 companion weights (`--spec dflash2 --draft-tokens 7`, optionally `--lm-head-draft`);
+  DFlash2 companion weights (`--spec dflash2 --draft-tokens 7`, optionally `--proposal-head optimized`);
 - BF16, INT8, FP8, NVFP4, and K8V4 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;

@@ -129,10 +129,10 @@ hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
 ./build/apps/ninfer models/qwen3_6_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 32768 \
-  --max-new 8192 \
+  --max-tokens 8192 \
   --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --proposal-head optimized
 ```
 
 For images, videos, and structured chat history, see the
@@ -148,9 +148,9 @@ For images, videos, and structured chat history, see the
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --proposal-head optimized \
   --preserve-thinking
 ```
 

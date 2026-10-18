@@ -238,7 +238,7 @@ int main() {
         options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(512);
         options.speculative.backend               = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens          = 1;
-        options.context_cache.device_state_slots  = 4;
+        options.context_cache.extra_state_slots   = 4;
         options.context_cache.host_capacity_bytes = 256ULL * 1024 * 1024;
         artifact::Reader reader(path);
         auto definition = q4::read_definition(reader, models::load_options(options));

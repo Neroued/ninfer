@@ -13,14 +13,16 @@ namespace {
 class TemporaryInput final {
 public:
     TemporaryInput()
-        : path_(std::filesystem::temp_directory_path() /
+        : path_(std::filesystem::path(NINFER_SOURCE_DIR) / ".agent-tmp" /
                 ("ninfer-prompt-input-" +
-                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-                 ".json")) {}
+                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())) /
+                "messages.json") {
+        std::filesystem::create_directories(path_.parent_path());
+    }
 
     ~TemporaryInput() {
         std::error_code ignored;
-        std::filesystem::remove(path_, ignored);
+        std::filesystem::remove_all(path_.parent_path(), ignored);
     }
 
     TemporaryInput(const TemporaryInput&)            = delete;
@@ -58,6 +60,18 @@ int main() {
         prompt.messages.size() != 2 || prompt.messages[1].tool_calls.size() != 1 ||
         prompt.messages[1].tool_calls.front().arguments_json != arguments) {
         std::cerr << "local messages JSON changed prompt-bearing object member order\n";
+        return 1;
+    }
+    {
+        std::ofstream asset(input_file.path().parent_path() / "asset.bin", std::ios::binary);
+        asset << "test";
+        std::ofstream messages(input_file.path());
+        messages << R"([{"role":"user","content":[{"type":"image","image":"asset.bin"}]}])";
+    }
+    const auto media = ninfer::product::prompt_from_messages(input_file.path(), false, true);
+    if (media.messages.front().parts.front().media.bytes !=
+        std::vector<std::uint8_t>{'t', 'e', 's', 't'}) {
+        std::cerr << "media paths were not resolved relative to the messages file\n";
         return 1;
     }
     std::cout << "ok\n";

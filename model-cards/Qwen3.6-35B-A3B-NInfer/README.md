@@ -120,10 +120,10 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 32768 \
-  --max-new 8192 \
+  --max-tokens 8192 \
   --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --proposal-head optimized
 ```
 
 For DFlash, the measured block-8 configuration uses seven draft tokens:
@@ -132,10 +132,10 @@ For DFlash, the measured block-8 configuration uses seven draft tokens:
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 32768 \
-  --max-new 8192 \
+  --max-tokens 8192 \
   --kv-dtype fp8 \
   --spec dflash --draft-tokens 7 \
-  --lm-head-draft
+  --proposal-head optimized
 ```
 
 `--draft-tokens` accepts `1..5` for MTP and `1..15` for DFlash. The DFlash value `7` is the
@@ -156,9 +156,9 @@ For images, videos, and structured chat history, see the
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --proposal-head optimized \
   --preserve-thinking
 ```
 

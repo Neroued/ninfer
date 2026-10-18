@@ -8,7 +8,7 @@
     "content": [
       {
         "type": "image",
-        "image": "examples/cli/media/natural_scene.png"
+        "image": "../media/natural_scene.png"
       },
       {
         "type": "text",
@@ -25,7 +25,7 @@
     "content": [
       {
         "type": "video",
-        "video": "examples/cli/media/temporal_events.mp4"
+        "video": "../media/temporal_events.mp4"
       },
       {
         "type": "text",

@@ -429,7 +429,7 @@ int main(int argc, char** argv) {
         options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
         options.use_cuda_graph                    = mode != "eager";
         options.context_cache.enabled             = !pressure_mode;
-        options.context_cache.device_state_slots  = pressure_mode ? 0 : 8;
+        options.context_cache.extra_state_slots   = pressure_mode ? 0 : 8;
         options.context_cache.host_capacity_bytes = mode == "replay" ? 0 : 512ULL << 20;
         if (backend == "mtp")
             options.speculative.backend = ninfer::SpeculativeBackend::Mtp;

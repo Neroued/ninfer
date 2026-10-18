@@ -273,7 +273,13 @@ class Corpus:
         self._data_urls[relative] = value
         return value
 
-    def _inline_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _inline_messages(self, messages: list[dict[str, Any]], media_root: Path) -> list[dict[str, Any]]:
+        def inline_source(source: str) -> str:
+            if source.startswith(("data:", "http://", "https://")):
+                return source
+            path = (media_root / source.removeprefix("file://")).resolve()
+            return self.data_url(str(path.relative_to(REPO_ROOT)))
+
         result = copy.deepcopy(messages)
         for message in result:
             content = message.get("content")
@@ -292,7 +298,7 @@ class Corpus:
                         source = source.get("url")
                     if not isinstance(source, str):
                         raise CorpusError("image fixture has no source path")
-                    url = source if source.startswith("data:") else self.data_url(source)
+                    url = inline_source(source)
                     converted.append({"type": "image_url", "image_url": {"url": url}})
                 elif part_type in {"video", "video_url"}:
                     source = part.get("video") or part.get("video_url")
@@ -300,7 +306,7 @@ class Corpus:
                         source = source.get("url")
                     if not isinstance(source, str):
                         raise CorpusError("video fixture has no source path")
-                    url = source if source.startswith("data:") else self.data_url(source)
+                    url = inline_source(source)
                     converted.append({"type": "video_url", "video_url": {"url": url}})
                 else:
                     raise CorpusError(f"unsupported fixture content type: {part_type!r}")
@@ -315,7 +321,7 @@ class Corpus:
         messages = self._read_json(self._path(record))
         if not isinstance(messages, list) or not messages:
             raise CorpusError(f"media fixture {name} is not a messages array")
-        return self._inline_messages(messages)
+        return self._inline_messages(messages, self._path(record).parent)
 
     def load_image_messages(self, index: int, *, prompt: str = "Answer with the image number.") -> list[dict[str, Any]]:
         images = self.manifest["media"]["load-images"]

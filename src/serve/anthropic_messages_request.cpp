@@ -838,7 +838,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                    int effective_max_tokens) {
+                    std::uint32_t effective_max_tokens) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -855,7 +855,8 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
         if (!budget || *budget < 1024) {
             bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
         }
-        if (purpose == ParsePurpose::Messages && *budget >= effective_max_tokens) {
+        if (purpose == ParsePurpose::Messages &&
+            static_cast<std::uint32_t>(*budget) >= effective_max_tokens) {
             bad_request("thinking.budget_tokens must be less than max_tokens", "thinking");
         }
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
@@ -1005,7 +1006,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+                         std::uint32_t effective_max_tokens) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);

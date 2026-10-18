@@ -453,10 +453,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
     logger_->info("context | history {} | {} active + {} extra device states | host {}",
-                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.extra_state_slots,
                   product::format_pretty_bytes(*cache.host_capacity_bytes));
 
-    if (service.options().enable_vision) {
+    if (service.options().launch.engine.enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
         logger_->info("media | {} preprocess workers | cache {} | live {}",
                       media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),

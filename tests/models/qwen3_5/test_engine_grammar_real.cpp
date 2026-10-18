@@ -155,7 +155,7 @@ int main(int argc, char** argv) {
         options.enable_vision   = argc > 4 && std::string_view(argv[4]) == "vision";
         options.prefill_chunk   = 128;
         options.kv_cache        = ninfer::KvCacheStorage::Fp8E4M3Row256;
-        options.context_cache.device_state_slots  = 8;
+        options.context_cache.extra_state_slots   = 8;
         options.context_cache.host_capacity_bytes = 128ULL << 20;
         options.use_cuda_graph = argc < 3 || std::string_view(argv[2]) != "eager";
         if (backend == "mtp")

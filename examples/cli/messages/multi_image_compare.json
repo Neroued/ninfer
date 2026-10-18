@@ -4,11 +4,11 @@
     "content": [
       {
         "type": "image",
-        "image": "examples/cli/media/compare_left.png"
+        "image": "../media/compare_left.png"
       },
       {
         "type": "image",
-        "image": "examples/cli/media/compare_right.png"
+        "image": "../media/compare_right.png"
       },
       {
         "type": "text",

@@ -1,9 +1,8 @@
-add_executable(ninfer
-  cli/main.cpp
-  cli/options.cpp)
+add_executable(ninfer cli/main.cpp)
 ninfer_internal_includes(ninfer)
 target_link_libraries(ninfer PRIVATE
   ninfer_engine
+  ninfer_product_config
   ninfer_product_logging
   ninfer_product_prompt_input)
 

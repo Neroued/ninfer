@@ -31,10 +31,10 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
     artifact.write_bytes(b"artifact")
     config = tmp_path / "baseline.json"
     profile = campaign.CASES["cold-short"].profile
-    common_args = ["--kv-dtype", "bf16", "--log-stats-interval-ms", "0"]
+    common_args = ["--kv-dtype", "bf16", "--stats-interval", "0"]
     profile_args = [
         "--max-context", "8192", "--old-capacity", "7",
-        "--host-context-mib", "513.125", "--log-stats-interval-ms=2000",
+        "--host-cache-capacity", "513.125MiB", "--stats-interval=2000",
     ]
     config.write_text(json.dumps({
         "common_args": common_args,
@@ -77,7 +77,7 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
         "--port", str(campaign.PORT), "--request-log-jsonl",
         manifest["plans"][0]["request_log_jsonl"],
         "--kv-dtype", "bf16", "--max-context", "8192", "--old-capacity", "7",
-        "--host-context-mib", "513.125", "--log-stats-interval-ms", "1000",
+        "--host-cache-capacity", "513.125MiB", "--stats-interval", "1000",
     ]
     assert manifest["serve"] == str(serve)
     assert manifest["weights_source"] == str(artifact)

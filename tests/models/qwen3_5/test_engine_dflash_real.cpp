@@ -34,7 +34,7 @@ ninfer::EngineOptions dflash_engine_options(const char* artifact, ninfer::Propos
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = std::getenv("NINFER_TEST_EAGER") == nullptr;
-    options.context_cache.device_state_slots = 2;
+    options.context_cache.extra_state_slots = 2;
     return options;
 }
 

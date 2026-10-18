@@ -85,8 +85,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{
-                   .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+        options.context_cache =
+            ContextCacheOptions{.enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
@@ -95,12 +95,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
-    ContextCacheOptions& cache = options.context_cache;
-    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0) cache.host_capacity_bytes = 0;
+    ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
-    cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
+    cache.extra_state_slots         = cache.extra_state_slots.value_or(concurrency);
     const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
+        static_cast<std::uint64_t>(concurrency) + *cache.extra_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
     }

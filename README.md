@@ -78,9 +78,9 @@ Start a long-running text/agent server with two execution lanes and prefix cachi
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --proposal-head optimized \
   --preserve-thinking
 ```
 
@@ -108,10 +108,10 @@ Run a one-shot CLI request with a 32,768-token allocation:
 ./build/rtx5090-release/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode, then give a concise conclusion." \
   --max-context 32768 \
-  --max-new 8192 \
+  --max-tokens 8192 \
   --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --proposal-head optimized
 ```
 
 Answer content is written to stdout. Human-readable startup/runtime diagnostics and the CLI-owned
@@ -122,6 +122,13 @@ Redirected stderr receives persistent readable progress without terminal control
 `--log-level debug` for complete startup detail. Option and local input errors remain direct command
 diagnostics. Use `--messages FILE` and `--vision` for structured image/video input; see the
 [CLI guide](docs/cli.md) and [committed examples](examples/cli/).
+
+Both programs accept `--config FILE`. Copy the complete root
+[ninfer.example.toml](ninfer.example.toml) to a local TOML file, set `model.path`, then run
+`ninfer --config ninfer.local.toml` or `ninfer-serve --config ninfer.local.toml`.
+Explicit command-line values override the file. Local TOML files are ignored by Git; the example
+remains tracked. Startup logs show the effective configuration and its sources before loading.
+See [startup configuration](docs/startup-configuration.md) for every field and its behavior.
 
 ## Resource-aware long-context reuse
 
@@ -219,9 +226,9 @@ docker run --rm \
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
+  --proposal-head optimized \
   --preserve-thinking
 ```
 

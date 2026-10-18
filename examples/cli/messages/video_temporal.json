@@ -4,7 +4,7 @@
     "content": [
       {
         "type": "video",
-        "video": "examples/cli/media/temporal_events.mp4"
+        "video": "../media/temporal_events.mp4"
       },
       {
         "type": "text",

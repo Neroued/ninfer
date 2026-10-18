@@ -107,7 +107,7 @@ ninfer::EngineOptions engine_options(const std::filesystem::path& artifact,
     }
     // History is deliberately disabled: the two cases exercise only the requests' own recovery.
     options.context_cache.enabled             = false;
-    options.context_cache.device_state_slots  = 0;
+    options.context_cache.extra_state_slots   = 0;
     options.context_cache.host_capacity_bytes = snapshot ? kSnapshotHostBytes : 0;
     return options;
 }

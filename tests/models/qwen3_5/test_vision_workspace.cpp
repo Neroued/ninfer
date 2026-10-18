@@ -165,11 +165,11 @@ int main() {
             options.prefill_chunk       = 1024;
             options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
             options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
-            options.speculative.draft_tokens         = 3;
-            options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
-            options.enable_vision                    = true;
-            options.use_cuda_graph                   = false;
-            options.context_cache.device_state_slots = 1;
+            options.speculative.draft_tokens        = 3;
+            options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
+            options.enable_vision                   = true;
+            options.use_cuda_graph                  = false;
+            options.context_cache.extra_state_slots = 1;
             auto planner       = q35::make_sequence_planner(parameters, device, options);
             const auto pages   = planner.capacity_curve().minimum_primary_page_groups;
             auto plan          = std::move(planner).finalize(pages);

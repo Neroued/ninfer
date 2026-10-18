@@ -537,7 +537,7 @@ int main() {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = kDrafts;
         options.context_cache.enabled    = false;
-        options.context_cache.device_state_slots  = 2;
+        options.context_cache.extra_state_slots   = 2;
         options.context_cache.host_capacity_bytes = 0;
         Native fixture(definition, model, profile, options, 4);
         Cases cases(fixture);

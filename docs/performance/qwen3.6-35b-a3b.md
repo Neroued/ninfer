@@ -26,7 +26,7 @@ points and 485 formal requests completed without request, CUDA, or out-of-memory
 | CUDA Graph / prefix reuse | Enabled / disabled |
 | Stochastic sampling | Temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.0, frequency penalty 0 |
 | Greedy sampling | Exact argmax |
-| Speculative proposal head | Optimized (`--lm-head-draft`) |
+| Speculative proposal head | Optimized (`--proposal-head optimized`) |
 
 The build and artifact remain fixed across all points. Each point starts a fresh server; model
 loading and startup warmup complete before measurement. Three short startup checks are outside

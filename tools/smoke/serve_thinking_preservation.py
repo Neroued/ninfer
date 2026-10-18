@@ -308,7 +308,7 @@ def main() -> None:
             "1",
             "--max-pending-requests",
             "4",
-            "--log-stats-interval-ms",
+            "--stats-interval",
             "0",
             "--request-log-jsonl",
             str(request_log),
@@ -316,8 +316,8 @@ def main() -> None:
             args.backend,
             "--draft-tokens",
             "3",
-            "--lm-head-draft",
-            "--greedy",
+            "--proposal-head", "optimized",
+            "--temperature", "0",
         ]
         with server_log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(

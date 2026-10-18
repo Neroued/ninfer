@@ -138,6 +138,12 @@ steady-clock deadlines so logging work does not accumulate drift. Missed periods
 in a burst. A partial shutdown interval may be retained by JSONL, but does not create an irregular
 pretty throughput record.
 
+CLI and serve log their merged startup configuration at INFO before model loading, media acquisition,
+or port binding. The configuration view comes from typed startup options and records field sources;
+API keys are represented as disabled/configured. Serve JSONL writes `startup_config` before heavy
+initialization and `server_start` with resolved resources after preparation. See
+[startup configuration](../startup-configuration.md) for the shared contract.
+
 Engine startup is an inclusive typed hierarchy. `engine-startup` contains CUDA initialization,
 artifact inspection, semantic binding, weight materialization, model/frontend construction,
 runtime resource planning, RankProgram and PreparedSession construction, and Engine finalization.
@@ -160,8 +166,7 @@ transport happen after that transaction; their failures are operational `respons
 not create a second request JSONL terminal.
 
 Tool-call buffered inference remains a successful request outcome. Schema mismatches are
-machine-only counters. Request JSONL version 30 removes the obsolete empty-argument omission
-counter: parameters encoded as JSON must contain a JSON value. If an unrecognized tool header is
+machine-only counters. Parameters encoded as JSON must contain a JSON value. If an unrecognized tool header is
 returned to text before a call starts, Serve emits one warning carrying only the stable fallback
 classification. Malformed structure or parameter JSON after a recognized header is a request error
 on the free-generation route. A constrained decoder failure is reported as an internal contract

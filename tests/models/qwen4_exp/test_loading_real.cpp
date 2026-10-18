@@ -2,6 +2,7 @@
 #include "models/qwen4_exp/program/resources.h"
 #include "artifact/fixture.h"
 #include "core/transfer.h"
+#include "core/platform.h"
 
 #include <chrono>
 #include <cstring>
@@ -163,7 +164,7 @@ int main(int argc, char** argv) {
                 scoring.prefill_chunk  = 4096;
                 scoring.kv_capacity    = KvCapacityPolicy::explicit_capacity(4096);
                 scoring.context_cache  = {
-                     .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+                     .enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
                 auto definition = q4::read_definition(reader, models::load_options(scoring));
                 auto load       = q4::resolve_load(reader, definition, device.device(),
                                              host ? Device::cpu() : device.device());
@@ -184,7 +185,8 @@ int main(int argc, char** argv) {
                     options.prefill_chunk   = 4096;
                     options.max_concurrency = 1;
                     options.kv_capacity     = KvCapacityPolicy::explicit_capacity(4096);
-                    options.context_cache.host_capacity_bytes = 256 * 1024 * 1024;
+                    options.context_cache.host_capacity_bytes =
+                        NINFER_SHARED_PHYSICAL_MEMORY ? 0 : 256 * 1024 * 1024;
                     if (mtp) {
                         options.speculative.backend      = SpeculativeBackend::Mtp;
                         options.speculative.draft_tokens = 5;

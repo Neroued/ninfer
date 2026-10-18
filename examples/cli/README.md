@@ -11,7 +11,7 @@ also live beside them when they deliberately have no frozen output oracle.
 
 ## Quick start
 
-Run from the repository root because media paths in the JSON files are repository-relative:
+Commands below start at the repository root. Media paths inside JSON are relative to each messages file:
 
 ```bash
 CLI=./build/apps/ninfer
@@ -19,10 +19,10 @@ MODEL=models/qwen3_6_27b.ninfer
 
 $CLI "$MODEL" \
   --messages examples/cli/messages/text_smoke_zh.json \
-  --no-thinking --greedy --max-new 8
+  --no-thinking --temperature 0 --max-tokens 8
 ```
 
-Expected stdout is exactly `42`. `--no-thinking --greedy` is the normal comparison mode for simple
+Expected stdout is exactly `42`. `--no-thinking --temperature 0` is the normal comparison mode for simple
 cases. Reasoning, progress, timings, memory, and MTP statistics are written to stderr; answer content
 is written to stdout.
 
@@ -40,23 +40,23 @@ python3 -m examples.cli.send_to_serve \
   --model qwen3.6-27b --no-thinking --max-tokens 64
 ```
 
-Start `ninfer-serve` with `--vision` for media fixtures. Relative media paths use the current
-working directory by default; pass `--media-root` when invoking the command elsewhere. `--dry-run`
+Start `ninfer-serve` with `--vision` for media fixtures. Relative media paths use the messages
+file directory; `--media-root` explicitly overrides this base. `--dry-run`
 prints the exact converted request without contacting a server.
 
 ## Text and multimodal cases
 
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/text_chat_history.json \
-  --no-thinking --greedy --max-new 32
+  --no-thinking --temperature 0 --max-tokens 32
 
 $CLI "$MODEL" --messages examples/cli/messages/text_code_review.json \
-  --no-thinking --greedy --max-new 256
+  --no-thinking --temperature 0 --max-tokens 256
 
 for CASE in image_chart image_natural video_temporal multi_image_compare \
             mixed_image_video mixed_multiturn; do
   $CLI "$MODEL" --messages "examples/cli/messages/${CASE}.json" \
-    --max-context 8192 --no-thinking --greedy --max-new 128 --vision
+    --max-context 8192 --no-thinking --temperature 0 --max-tokens 128 --vision
 done
 ```
 
@@ -77,8 +77,8 @@ To exercise MTP through the same input path:
 
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/text_smoke_zh.json \
-  --no-thinking --greedy --max-new 8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
+  --no-thinking --temperature 0 --max-tokens 8 \
+  --spec mtp --draft-tokens 3 --proposal-head optimized
 ```
 
 ## Thinking cases
@@ -88,13 +88,13 @@ to answer content; the model is free to stop before the requested maximum.
 
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/thinking_logic_grid.json \
-  --greedy --max-context 16384 --max-new 8192
+  --temperature 0 --max-context 16384 --max-tokens 8192
 
 $CLI "$MODEL" --messages examples/cli/messages/thinking_multimodal_checksum.json \
-  --greedy --max-context 8192 --max-new 4096 --vision
+  --temperature 0 --max-context 8192 --max-tokens 4096 --vision
 
 $CLI "$MODEL" --messages examples/cli/messages/reasoning_jacobian_counterexample_3d.json \
-  --greedy --max-context 32768 --max-new 16384
+  --temperature 0 --max-context 32768 --max-tokens 16384
 ```
 
 The logic grid has one solution and must end with `CHECK=4606`. The multimodal case reads independent
@@ -110,7 +110,7 @@ model's stop token, not to discover the smallest `max-new` value that happens to
 ```bash
 for CASE in 01 15 30; do
   $CLI "$MODEL" --messages "examples/cli/messages/long_decode_aime26_${CASE}.json" \
-    --greedy --max-context 262144 --kv-dtype int8 --max-new 65536
+    --temperature 0 --max-context 262144 --kv-dtype int8 --max-tokens 65536
 done
 ```
 
@@ -124,19 +124,19 @@ document with the same retrieval needle placed at 50% depth.
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/long_niah_8k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 128
+  --no-thinking --temperature 0 --max-tokens 128
 
 $CLI "$MODEL" --messages examples/cli/messages/long_niah_64k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 128
+  --no-thinking --temperature 0 --max-tokens 128
 
 $CLI "$MODEL" --messages examples/cli/messages/long_niah_128k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 128
+  --no-thinking --temperature 0 --max-tokens 128
 
 $CLI "$MODEL" --messages examples/cli/messages/long_niah_256k.json \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
-  --no-thinking --greedy --max-new 128
+  --no-thinking --temperature 0 --max-tokens 128
 ```
 
 All four must output:

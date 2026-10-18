@@ -17,8 +17,8 @@ int main() {
         }
     };
     EngineOptions options;
-    options.max_concurrency                  = 2;
-    options.context_cache.device_state_slots = 1;
+    options.max_concurrency                 = 2;
+    options.context_cache.extra_state_slots = 1;
     MemorySummary memory;
     memory.kv_capacity_page_groups     = 256;
     memory.host_context_capacity_bytes = 1048576;

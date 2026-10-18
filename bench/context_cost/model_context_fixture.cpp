@@ -489,7 +489,7 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     engine_options.enable_vision         = true;
     engine_options.use_cuda_graph        = true;
     engine_options.context_cache.enabled = false;
-    engine_options.context_cache.device_state_slots  = 0;
+    engine_options.context_cache.extra_state_slots   = 0;
     engine_options.context_cache.host_capacity_bytes = 0;
 
     Engine engine(engine_options);

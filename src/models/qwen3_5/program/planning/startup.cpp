@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/common/moe/execution.h"
+#include "models/common/context/storage.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/planning.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -69,7 +70,7 @@ std::uint32_t page_count(std::uint32_t capacity) {
 ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto& profile = *plan.profile;
     const auto& config  = profile.config.text;
-    if (!plan.context_cache.device_state_slots)
+    if (!plan.context_cache.extra_state_slots)
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     ResourceSpec spec;
     spec.decoder = {
@@ -86,7 +87,7 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
     };
     spec.state_images = {
         .slot_count = checked_i32(static_cast<std::uint64_t>(plan.max_concurrency) +
-                                      *plan.context_cache.device_state_slots,
+                                      *plan.context_cache.extra_state_slots,
                                   "Qwen3.5 StateImage slot count exceeds int32"),
         .linear =
             {
@@ -627,34 +628,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
-    auto impl                  = std::make_unique<SequencePlanImpl>();
-    impl->profile              = inputs.profile;
-    impl->moe                  = inputs.moe;
-    impl->capacity             = inputs.capacity;
-    impl->main_page_groups     = main_page_groups;
-    impl->kv_capacity          = static_cast<std::uint32_t>(checked_i32(
+    auto impl                               = std::make_unique<SequencePlanImpl>();
+    impl->profile                           = inputs.profile;
+    impl->moe                               = inputs.moe;
+    impl->capacity                          = inputs.capacity;
+    impl->main_page_groups                  = main_page_groups;
+    impl->kv_capacity                       = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency      = inputs.max_concurrency;
-    impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->draft_window         = inputs.draft_window;
-    impl->speculative_backend  = inputs.speculative_backend;
-    impl->proposal_head        = inputs.proposal_head;
-    impl->features             = inputs.features;
-    impl->use_cuda_graph       = inputs.use_cuda_graph;
-    impl->causal_scoring       = inputs.causal_scoring;
-    impl->multiprocessor_count = inputs.multiprocessor_count;
-    impl->context_cache        = inputs.context_cache;
-    impl->kv_storage           = inputs.kv_storage;
-    impl->persistent           = persistent_layout(*impl);
-    if (!impl->context_cache.host_capacity_bytes) {
-        // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
-        impl->context_cache.host_capacity_bytes =
-            checked_add(8ULL * 1024 * 1024 * 1024,
-                        checked_mul(8, impl->persistent.state_images.images.image_stride,
-                                    "Host context state default overflow"),
-                        "Host context default overflow");
-    }
+    impl->max_concurrency                   = inputs.max_concurrency;
+    impl->prefill_chunk                     = inputs.prefill_chunk;
+    impl->draft_window                      = inputs.draft_window;
+    impl->speculative_backend               = inputs.speculative_backend;
+    impl->proposal_head                     = inputs.proposal_head;
+    impl->features                          = inputs.features;
+    impl->use_cuda_graph                    = inputs.use_cuda_graph;
+    impl->causal_scoring                    = inputs.causal_scoring;
+    impl->multiprocessor_count              = inputs.multiprocessor_count;
+    impl->context_cache                     = inputs.context_cache;
+    impl->kv_storage                        = inputs.kv_storage;
+    impl->persistent                        = persistent_layout(*impl);
+    impl->context_cache.host_capacity_bytes = context::host_context_capacity(
+        impl->context_cache.host_capacity_bytes, impl->persistent.state_images.images.image_stride);
     impl->persistent.host_context_bytes = impl->context_cache.host_capacity_bytes.value();
     impl->workspace                     = build_workspace_plan(*impl);
     impl->device_reservation_bytes =

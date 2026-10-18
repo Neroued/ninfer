@@ -1813,7 +1813,7 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(256);
     options.max_concurrency                   = 2;
     options.context_cache.enabled             = true;
-    options.context_cache.device_state_slots  = 2;
+    options.context_cache.extra_state_slots   = 2;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options, 4);
     q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
@@ -1937,7 +1937,7 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(128);
     options.max_concurrency                   = 2;
     options.context_cache.enabled             = false;
-    options.context_cache.device_state_slots  = 0;
+    options.context_cache.extra_state_slots   = 0;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options, 2);
     q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
@@ -2061,7 +2061,7 @@ void fresh_scoring(const char* artifact) {
     options.use_cuda_graph = false;
     options.max_context = options.prefill_chunk = 128;
     options.kv_capacity                         = KvCapacityPolicy::explicit_capacity(128);
-    options.context_cache = {.enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+    options.context_cache = {.enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
     DeviceContext device;
     artifact::Reader reader(artifact);
     auto definition = q35::read_definition(reader, models::load_options(options));
@@ -2160,7 +2160,7 @@ int main(int argc, char** argv) {
         options.use_cuda_graph           = false;
         options.speculative.backend      = backend;
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
-        options.context_cache.device_state_slots  = 2;
+        options.context_cache.extra_state_slots   = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
         {
             SessionFixture instance(definition, model, profile, options, 16);
@@ -2195,7 +2195,7 @@ int main(int argc, char** argv) {
         }
         options.max_context                       = kCapacity;
         options.max_concurrency                   = 1;
-        options.context_cache.device_state_slots  = 0;
+        options.context_cache.extra_state_slots   = 0;
         options.context_cache.host_capacity_bytes = 0;
         {
             SessionFixture instance(definition, model, profile, options, 8);
@@ -2203,7 +2203,7 @@ int main(int argc, char** argv) {
             no_capture_fixture.capture_without_destination();
             no_capture_fixture.private_move();
         }
-        options.context_cache.device_state_slots = 1;
+        options.context_cache.extra_state_slots = 1;
         {
             SessionFixture instance(definition, model, profile, options, 8);
             Fixture capture_retry_fixture(instance.rank, instance.session, frontend);

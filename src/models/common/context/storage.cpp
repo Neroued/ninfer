@@ -1,4 +1,5 @@
 #include "models/common/context/storage.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <cstring>
@@ -30,6 +31,20 @@ std::size_t run_end(std::span<const std::int32_t> pages, std::size_t begin) {
 }
 
 } // namespace
+
+std::size_t host_context_capacity(std::optional<std::size_t> requested, std::size_t image_stride) {
+    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0) {
+        if (requested.value_or(0) != 0)
+            throw std::invalid_argument(
+                "Host context storage is not supported on this target; use 0B or default");
+        return 0;
+    }
+    if (requested) return *requested;
+    constexpr std::size_t base = 8ULL << 30;
+    if (image_stride > (std::numeric_limits<std::size_t>::max() - base) / 8)
+        throw std::overflow_error("Host context default capacity overflow");
+    return base + 8 * image_stride;
+}
 
 DevicePageStorage::DevicePageStorage(MemorySpan backing, const DeviceKVPagePoolLayout& layout)
     : spec_(layout.spec) {

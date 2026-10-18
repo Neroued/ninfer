@@ -8,7 +8,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::serve::ServeOptions;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }

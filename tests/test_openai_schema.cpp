@@ -18,6 +18,7 @@ namespace {
 
 using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const std::string& label) {
     if (condition) { return 0; }

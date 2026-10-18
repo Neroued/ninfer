@@ -26,7 +26,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     OpenAIChatRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = options_.launch.generation.max_tokens;
         request                   = parse_chat_completion_request(parse_json_body(req), limits);
         validate_openai_model(request.model, public_model_id_);
     } catch (const ApiException& exception) {

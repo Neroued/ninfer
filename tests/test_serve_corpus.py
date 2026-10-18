@@ -225,14 +225,14 @@ def test_selected_kv_reaches_server_and_is_verified(
         "speculative_backend": backend,
         "speculative_draft_window": draft_tokens,
         "proposal_head": head,
-        "context_cache": {"device_state_slots": 0, "host_capacity_bytes": 0},
+        "context_cache": {"extra_state_slots": 0, "host_capacity_bytes": 0},
     }
     event = {
         "artifact_type": corpus.SERVER_LOG_ARTIFACT_TYPE,
         "schema_version": corpus.SERVER_LOG_SCHEMA_VERSION,
         "event": "server_start",
         "engine": engine,
-        "sampling_defaults": {"greedy": False},
+        "sampling_defaults": {"server_overrides": {"temperature": 0.6}},
         "artifact": {"path": str(artifact), "prefill_signature": "bindings"},
         "server": {"public_model_id": "model"},
         "server_instance_id": "instance",
@@ -273,11 +273,11 @@ def test_selected_kv_reaches_server_and_is_verified(
         )
         validate = lambda: corpus.validate_server_start(event, spec, args.device)
     assert command[command.index("--kv-dtype") + 1] == kv_dtype
-    assert command[command.index("--device-state-slots") + 1] == "0"
-    assert command[command.index("--host-context-mib") + 1] == "0"
-    assert ("--lm-head-draft" in command) == (head == "optimized")
+    assert command[command.index("--extra-state-slots") + 1] == "0"
+    assert command[command.index("--host-cache-capacity") + 1] == "0"
+    assert ("--proposal-head" in command) == (head == "optimized")
     assert validate() == ("instance", "bindings")
-    for field in ("device_state_slots", "host_capacity_bytes"):
+    for field in ("extra_state_slots", "host_capacity_bytes"):
         engine["context_cache"][field] = 1
         with pytest.raises(corpus.CampaignError, match="context cache capacity differs"):
             validate()

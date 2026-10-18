@@ -247,7 +247,7 @@ The NVFP4 serving command was:
 build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080 \
   --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
+  --spec mtp --draft-tokens 3 --proposal-head optimized
 ```
 
 Run the configured reasoning suite in a separate shell using the evaluation environment above:

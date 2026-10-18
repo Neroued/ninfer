@@ -177,8 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--media-root",
         type=Path,
-        default=Path.cwd(),
-        help="base directory for relative CLI media paths (default: current directory)",
+        help="base directory for relative media paths (default: messages file directory)",
     )
     parser.add_argument("--output", type=Path, help="optional response JSON output path")
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending it")
@@ -196,7 +195,7 @@ def main() -> int:
     args = parse_args()
     try:
         messages, tools = load_cli_messages(args.messages)
-        messages = to_openai_messages(messages, args.media_root.resolve())
+        messages = to_openai_messages(messages, (args.media_root or args.messages.resolve().parent).resolve())
     except RuntimeError as error:
         print(f"send_to_serve: {error}", file=sys.stderr)
         return 2

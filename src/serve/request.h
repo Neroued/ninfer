@@ -45,7 +45,7 @@ private:
 
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    std::uint32_t default_max_tokens = 8192;
 };
 
 enum class ContentKind {
@@ -176,7 +176,7 @@ struct GenerationRequest {
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
-    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
+    std::uint32_t max_tokens             = 0; // resolved budget; zero means immediate output limit
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;

@@ -26,7 +26,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 当前限制：
 
 - Speculative backend 仅支持原生 MTP，使用完整共享 BF16 head；不支持 DFlash、DFlash2
-  或 indexed proposal head，因此不使用 `--lm-head-draft`。
+  或 indexed proposal head，因此不使用 `--proposal-head optimized`。
 - Offload 模式保留完整 Host expert 来源。GPU 缓存没有请求自适应排序或 decode 动态换入；
   小批量缺失 expert 由 CPU 计算，没有按需换入 GPU 计算的第三条分工路径。
 - PLE 当前只有磁盘准备路径，没有整表 RAM/GPU lookup。

@@ -5,7 +5,7 @@
 
 #include "ninfer/engine.h"
 #include "serve/request.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <chrono>
 #include <cstddef>
@@ -117,12 +117,13 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    explicit GenerationService(product::ServeOptions options,
+                               StartupObserver startup_observer = {});
 
-    [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    [[nodiscard]] const product::ServeOptions& options() const noexcept { return options_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
-    // value instead of reinterpreting optional defaults from ServeOptions.
+    // value instead of reinterpreting optional defaults from product::ServeOptions.
     [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
@@ -174,7 +175,7 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
-    ServeOptions options_;
+    product::ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

@@ -1,6 +1,9 @@
-#include "options.h"
+#include "product/config/options.h"
+#include "product/logging/configuration.h"
 
-#include <functional>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -8,145 +11,255 @@
 
 namespace {
 
-ninfer::cli::Options parse(std::vector<std::string> arguments) {
+namespace fs = std::filesystem;
+using ninfer::product::ConstraintKind;
+
+ninfer::product::CliOptions parse(std::vector<std::string> arguments) {
     std::vector<char*> argv;
-    argv.reserve(arguments.size());
-    for (std::string& argument : arguments) { argv.push_back(argument.data()); }
-    return ninfer::cli::parse_options(static_cast<int>(argv.size()), argv.data());
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    return ninfer::product::parse_cli_options(static_cast<int>(argv.size()), argv.data());
 }
 
-bool rejects(const std::function<void()>& operation) {
+ninfer::product::ServeOptions serve(std::vector<std::string> arguments) {
+    std::vector<char*> argv;
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    return ninfer::product::parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+template <class Function>
+std::string rejection(Function&& function) {
     try {
-        operation();
-    } catch (const std::invalid_argument&) { return true; }
-    return false;
+        function();
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    throw std::runtime_error("invalid configuration was accepted");
 }
 
-int check(bool condition, const char* message) {
-    if (condition) { return 0; }
-    std::cerr << message << '\n';
-    return 1;
+struct Files {
+    fs::path root = fs::path(NINFER_SOURCE_DIR) / ".agent-tmp" /
+                    ("config-test-" +
+                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    Files() { fs::create_directories(root); }
+
+    ~Files() {
+        std::error_code error;
+        fs::remove_all(root, error);
+    }
+
+    fs::path write(std::string_view source) const {
+        const auto path = root / "test.toml";
+        std::ofstream file(path);
+        file << source;
+        if (!file) throw std::runtime_error("cannot write configuration fixture");
+        return path;
+    }
+};
+
+void test_arguments() {
+    const auto defaults = parse({"ninfer", "--prompt", "hello", "model.ninfer"});
+    const auto& engine  = defaults.launch.engine;
+    require(engine.max_context == 8192 && engine.kv_capacity.explicit_tokens == 8192,
+            "shared context defaults differ");
+    require(!engine.context_cache.enabled && engine.context_cache.extra_state_slots == 0 &&
+                engine.context_cache.host_capacity_bytes == 0,
+            "CLI cache defaults differ");
+    require(defaults.launch.generation.max_tokens == 128 &&
+                defaults.launch.generation.sampling.seed == 0,
+            "CLI generation defaults differ");
+    const auto resources =
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--max-concurrency", "4",
+               "--extra-state-slots", "2", "--host-cache-capacity", "64MiB", "--prefix-reuse",
+               "--preserve-thinking", "--cuda-graph=false"});
+    require(resources.launch.engine.context_cache.extra_state_slots == 2 &&
+                resources.launch.engine.context_cache.host_capacity_bytes == (64ULL << 20) &&
+                resources.launch.engine.context_cache.enabled &&
+                !resources.launch.engine.use_cuda_graph &&
+                resources.launch.generation.preserve_thinking == true,
+            "explicit resources were overwritten");
+    require(parse({"ninfer", "--config", "does-not-exist.toml", "--help"}).help_requested,
+            "help accessed the configuration file");
+    require(parse({"ninfer", "model.ninfer", "--prompt", "--help"}).prompt == "--help",
+            "an option value was interpreted as help");
+    require(parse({"ninfer", "--prompt", "x", "--", "-model.ninfer"})
+                    .launch.engine.artifact_path.filename() == "-model.ninfer",
+            "option terminator did not preserve positional input");
+    for (auto suffix :
+         std::vector<std::vector<std::string>>{{"--prefill-chunk", "0"},
+                                               {"--prefill-chunk", "129"},
+                                               {"--prefill-chunk", "auto"},
+                                               {"--thinking-budget", "0"},
+                                               {"--thinking-budget", "8", "--no-thinking"},
+                                               {"--reasoning-effort", "high", "--no-thinking"},
+                                               {"--regex", "a", "--choice", "b"},
+                                               {"--prompt", "other", "--messages", "messages.json"},
+                                               {"--seed", "18446744073709551616"},
+                                               {"--temperature", "nan"},
+                                               {"--spec", "dflash2", "--draft-tokens", "16"}}) {
+        std::vector<std::string> args{"ninfer", "model.ninfer", "--prompt", "hello"};
+        args.insert(args.end(), suffix.begin(), suffix.end());
+        rejection([&] { parse(args); });
+    }
+    const auto literals = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
+                                 "--choice", "a|b", "--choice", "你好"});
+    require(literals.constraint.kind == ConstraintKind::Choice &&
+                literals.constraint.choices == std::vector<std::string>{"", "a|b", "你好"},
+            "literal choices changed");
+    require(parse({"ninfer", "model.ninfer", "--prompt", "x", "--regex", ""}).constraint.kind ==
+                ConstraintKind::Regex,
+            "empty regex was treated as absent");
+    for (const auto* backend : {"mtp", "dflash", "dflash2"}) {
+        const auto configured = parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", backend,
+                                       "--draft-tokens", "3", "--vision"});
+        require(configured.launch.engine.speculative.draft_tokens == 3 &&
+                    configured.launch.engine.enable_vision,
+                "speculative and Vision controls were not retained");
+    }
+}
+
+void test_file_merge(const Files& files) {
+    const auto path = files.write(R"(
+[model]
+path = "weights/model.ninfer"
+vision = true
+[engine]
+max_context = 16384
+kv_capacity = "context"
+prefill_chunk = 4096
+cuda_graph = true
+[context_cache]
+extra_state_slots = 3
+host_capacity = "0.0625MiB"
+[speculative]
+backend = "mtp"
+draft_tokens = 3
+proposal_head = "optimized"
+[generation]
+thinking = true
+[generation.sampling]
+temperature = 0.8
+seed = "18446744073709551615"
+[cli]
+prompt = "file prompt"
+reasoning_effort = "high"
+stop_token_ids = [42]
+stop = ["END"]
+[cli.constraint]
+kind = "regex"
+regex = "file"
+)");
+    const auto base = parse({"ninfer", "--config", path.string()});
+    require(base.launch.engine.artifact_path == files.root / "weights/model.ninfer",
+            "file-relative model path changed");
+    require(base.launch.engine.kv_capacity.explicit_tokens == 16384 &&
+                base.launch.engine.context_cache.host_capacity_bytes == 65536,
+            "file values or exact capacity conversion failed");
+    require(base.launch.generation.sampling.seed == UINT64_MAX,
+            "uint64 seed string lost precision");
+    const auto replaced = parse({"ninfer",
+                                 "--max-context=32768",
+                                 "--config",
+                                 path.string(),
+                                 "--messages",
+                                 "local.json",
+                                 "--no-vision",
+                                 "--spec",
+                                 "none",
+                                 "--temperature",
+                                 "model",
+                                 "--seed",
+                                 "default",
+                                 "--no-thinking",
+                                 "--extra-state-slots",
+                                 "default",
+                                 "--host-cache-capacity",
+                                 "default",
+                                 "--choice",
+                                 "",
+                                 "--clear-stops",
+                                 "--reasoning-stop",
+                                 "FIN"});
+    require(replaced.launch.engine.kv_capacity.explicit_tokens == 32768 &&
+                !replaced.launch.engine.enable_vision,
+            "command-line overrides were applied before the file");
+    require(replaced.prompt.empty() && replaced.messages_path == fs::absolute("local.json"),
+            "input choice or argv path base failed");
+    require(replaced.launch.engine.speculative.backend == ninfer::SpeculativeBackend::None &&
+                replaced.launch.engine.speculative.draft_tokens == 0 &&
+                replaced.launch.engine.speculative.proposal_head == ninfer::ProposalHead::Full,
+            "disabled backend retained dependent settings");
+    require(!replaced.launch.generation.sampling.temperature &&
+                replaced.launch.generation.sampling.seed == 0 &&
+                replaced.launch.engine.context_cache.extra_state_slots == 0 &&
+                replaced.launch.engine.context_cache.host_capacity_bytes == 0,
+            "explicit reset inherited lower-priority values");
+    require(replaced.launch.generation.enable_thinking == false && !replaced.reasoning_effort,
+            "higher-priority thinking did not replace the effort");
+    require(replaced.constraint.kind == ConstraintKind::Choice &&
+                replaced.constraint.choices == std::vector<std::string>{""},
+            "constraint selection did not replace the whole group");
+    require(replaced.stop_token_ids.empty() && replaced.stop_strings.size() == 1 &&
+                replaced.stop_strings[0].text == "FIN" &&
+                replaced.stop_strings[0].channel == ninfer::OutputChannel::Reasoning,
+            "clear-stops did not reset all three lists");
+    const auto lists = parse({"ninfer", "--config", path.string(), "--stop", "A", "--stop", "B",
+                              "--constraint", "none"});
+    require(lists.stop_token_ids == std::vector<ninfer::TokenId>{42} &&
+                lists.stop_strings.size() == 2 && lists.stop_strings.front().text == "A" &&
+                lists.constraint.kind == ConstraintKind::None,
+            "first list occurrence did not replace only its inherited list");
+    const auto rendered =
+        ninfer::product::format_configuration(ninfer::product::configuration_view(replaced));
+    require(rendered.find("[argv:") != std::string::npos &&
+                rendered.find("[file:") != std::string::npos,
+            "configuration display lost provenance");
+}
+
+void test_file_errors_and_example(const Files& files) {
+    for (const auto* extra :
+         {"[unknown]\n", "[engine]\ndevice = '0'\n", "[engine]\nmax_context = 1.5\n",
+          "[model]\nvision = 'false'\n", "[engine]\ndevice = -1\n",
+          "[generation.sampling]\ntemperature = inf\n", "[engine]\ndevice = 0\ndevice = 1\n",
+          "[engine]\nkv_capacity = 1\n", "[speculative]\nbackend = 'mtp'\n"}) {
+        const auto path =
+            files.write(std::string("model.path = 'model.ninfer'\ncli.prompt = 'x'\n") + extra);
+        const auto message = rejection([&] { parse({"ninfer", "--config", path.string()}); });
+        require(message.find(path.string() + ":") != std::string::npos,
+                "file diagnostic lost source location");
+    }
+    const auto inactive = files.write("model.path = 'model.ninfer'\ncli.prompt = 'x'\ncli.messages "
+                                      "= 'missing.json'\ncli.constraint.kind = 'grammar'\n");
+    require(serve({"ninfer-serve", "--config", inactive.string()}).launch.engine.max_context ==
+                8192,
+            "inactive CLI paths were opened or required");
+    const auto example = fs::path(NINFER_SOURCE_DIR) / "ninfer.example.toml";
+    const auto cli     = parse({"ninfer", "--config", example.string()});
+    const auto server  = serve({"ninfer-serve", "--config", example.string()});
+    require(cli.launch.engine.artifact_path ==
+                fs::path(NINFER_SOURCE_DIR) / "out/qwen3_8_flash_next.ninfer",
+            "root example path is not relative to its file");
+    require(cli.launch.generation.max_tokens == 128 &&
+                server.launch.generation.max_tokens == 8192 &&
+                cli.launch.engine.context_cache.extra_state_slots == 0 &&
+                !server.launch.engine.context_cache.extra_state_slots,
+            "shared example did not select entry-specific defaults");
 }
 
 } // namespace
 
 int main() {
-    int failures = 0;
-    failures +=
-        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--prefill-chunk", "8192"})
-                      .prefill_chunk == 8192,
-              "explicit prefill chunk was not preserved");
-    for (const auto* value : {"auto", "0", "129"}) {
-        failures += check(rejects([&] {
-                              (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
-                                           "--prefill-chunk", value});
-                          }),
-                          "invalid prefill chunk was accepted");
+    try {
+        Files files;
+        test_arguments();
+        test_file_merge(files);
+        test_file_errors_and_example(files);
+        std::cout << "ok\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
     }
-    const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
-                               "--choice", "a|b", "--choice", "你好"});
-    failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
-                      "choice flags changed literal text or order");
-    failures +=
-        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
-              "empty regex must be distinct from no regex");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", "",
-                                       "--choice", "yes"});
-                      }),
-                      "regex and choice were accepted together");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex",
-                                       "a", "--json-object"});
-                      }),
-                      "regex and JSON were accepted together");
-    failures += check(
-        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
-                .grammar_path == "answer.gbnf",
-        "grammar file argument was lost");
-    failures +=
-        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
-              "JSON object CLI option lost");
-    failures += check(
-        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file", "answer.json"})
-                .json_schema_path == "answer.json",
-        "schema file CLI option lost");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
-                                       "--json-object", "--grammar-file", "a.gbnf"});
-                      }),
-                      "conflicting CLI constraints accepted");
-    const ninfer::cli::Options configured =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
-    failures += check(configured.thinking_budget == 37,
-                      "--thinking-budget did not preserve its positive value");
-    failures +=
-        check(ninfer::cli::usage_text("ninfer-cli").find("--thinking-budget") != std::string::npos,
-              "CLI help omits --thinking-budget");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--thinking-budget", "0"});
-                      }),
-                      "zero --thinking-budget was accepted");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--thinking-budget", "8", "--no-thinking"});
-                      }),
-                      "--thinking-budget was accepted with --no-thinking");
-    const ninfer::cli::Options with_effort =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "8",
-               "--reasoning-effort", "medium"});
-    failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
-                      "thinking budget did not coexist with reasoning effort");
-    const ninfer::cli::Options dflash_vision =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
-               "--draft-tokens", "7"});
-    failures += check(dflash_vision.enable_vision &&
-                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
-                          dflash_vision.speculative.draft_tokens == 7,
-                      "CLI did not preserve the combined DFlash and Vision startup features");
-    for (const auto k : {1U, 2U, 7U, 15U}) {
-        const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                    "dflash2", "--draft-tokens", std::to_string(k)});
-        failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
-                              dflash2.speculative.draft_tokens == k,
-                          "CLI did not preserve the DFlash2 draft count");
-    }
-    for (const auto k : {0U, 16U}) {
-        failures +=
-            check(rejects([&] {
-                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                   "dflash2", "--draft-tokens", std::to_string(k)});
-                  }),
-                  "CLI accepted an unsupported DFlash2 draft count");
-    }
-    const ninfer::cli::Options nvfp4 =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
-    failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,
-                      "--kv-dtype nvfp4 did not select group-16 NVFP4 KV");
-    const ninfer::cli::Options k8v4 =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k8v4"});
-    failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
-                      "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
-    const std::string help = ninfer::cli::usage_text("ninfer-cli");
-    failures +=
-        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
-              "CLI help omits a production KV storage mode");
-    const ninfer::cli::Options logging =
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
-    failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
-                      "CLI log level was not parsed");
-    failures += check(help.find("--log-level") != std::string::npos,
-                      "CLI help omits the log-level control");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--log-level", "verbose"});
-                      }),
-                      "CLI accepted an unknown log level");
-    failures +=
-        check(rejects([] {
-                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
-              }),
-              "CLI accepted top_k beyond the executable candidate domain");
-    return failures == 0 ? 0 : 1;
 }

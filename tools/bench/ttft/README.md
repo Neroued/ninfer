@@ -127,11 +127,11 @@ binary to use its own CLI without compatibility flags in the candidate:
 
 ```json
 {
-  "common_args": ["--kv-dtype", "fp8", "--no-thinking", "--greedy"],
+  "common_args": ["--kv-dtype", "fp8", "--no-thinking", "--temperature", "0"],
   "profiles": {
     "cache-hot": ["--max-context", "8192", "--kv-capacity", "8192",
-                  "--max-concurrency", "1", "--device-state-slots", "2",
-                  "--host-context-mib", "0"]
+                  "--max-concurrency", "1", "--extra-state-slots", "2",
+                  "--host-cache-capacity", "0"]
   }
 }
 ```
@@ -139,7 +139,7 @@ binary to use its own CLI without compatibility flags in the candidate:
 The controller applies a common one-second statistics interval, enables request logging, and
 records these effective arguments in its manifest. Host capacity is a unified byte budget for KV
 and state; when comparing a baseline with separate pools, match its actual aggregate backing.
-`--device-state-slots` remains extra state capacity beyond active lanes.
+`--extra-state-slots` remains extra state capacity beyond active lanes.
 
 Servers read the selected artifact directly. Server warmup completes before measurement and does
 not populate the logical prefix cache.

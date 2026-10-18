@@ -145,12 +145,12 @@ run_step() {
         --kv-capacity auto \
         --max-concurrency "${concurrency}" \
         --max-pending-requests "${concurrency}" \
-        --pending-timeout-ms 86400000 \
+        --pending-timeout 86400s \
         --prefill-chunk 1024 \
         --kv-dtype int8 \
         --spec mtp \
         --draft-tokens 3 \
-        --lm-head-draft \
+        --proposal-head optimized \
         "${vision_args[@]}" \
         --request-log-jsonl "${request_log}" \
         >"${server_log}" 2>&1 &

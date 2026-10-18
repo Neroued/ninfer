@@ -201,7 +201,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",
-          options_.max_concurrency + options_.context_cache.device_state_slots.value(),
+          options_.max_concurrency + options_.context_cache.extra_state_slots.value(),
           "Total device StateImage slots, including resident lanes.");
     header("device_kv_used_page_groups", "gauge", "Occupied physical KV page groups by pool.");
     header("device_kv_capacity_page_groups", "gauge", "Physical KV page-group capacity by pool.");

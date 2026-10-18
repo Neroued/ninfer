@@ -129,7 +129,7 @@ struct ContextCacheOptions {
     // available when history is disabled.
     bool enabled = true;
     // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
-    std::optional<std::uint32_t> device_state_slots;
+    std::optional<std::uint32_t> extra_state_slots;
     // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations.
     // RTX 5090 defaults to 8 GiB plus eight model StateImages; DGX Spark resolves this to zero.
     // This does not bound total process RAM.
@@ -159,8 +159,8 @@ struct EngineOptions {
     std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
-    std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t max_context          = 8192; // Logical ceiling of one request or score window.
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

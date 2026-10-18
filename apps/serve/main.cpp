@@ -1,8 +1,9 @@
 #include "product/logging/logging.h"
+#include "product/logging/configuration.h"
 #include "product/logging/startup_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <spdlog/logger.h>
 
@@ -28,25 +29,27 @@ void handle_signal(int) {
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::serve::ServeOptions options;
+    ninfer::product::ServeOptions options;
     try {
-        options = ninfer::serve::parse_serve_options(argc, argv);
+        options = ninfer::product::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
         std::cerr << "ninfer-serve: " << exception.what() << '\n';
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        std::cerr << ninfer::product::startup_usage_text(argv[0],
+                                                         ninfer::product::EntryPoint::Serve);
         return 1;
     } catch (const std::exception& exception) {
         std::cerr << "ninfer-serve: " << exception.what() << '\n';
         return 1;
     }
     if (options.help_requested) {
-        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        std::cout << ninfer::product::startup_usage_text(argv[0],
+                                                         ninfer::product::EntryPoint::Serve);
         return 0;
     }
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer-serve",
-         .level        = options.log_level,
+         .level        = options.launch.logging.level,
          .presentation = ninfer::product::LogPresentation::Service});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
@@ -54,6 +57,7 @@ int main(int argc, char** argv) {
     bool serving = false;
 
     try {
+        ninfer::product::log_configuration(*logger, ninfer::product::configuration_view(options));
         ninfer::serve::HttpServer server(options, logger);
         if (!server.bind()) {
             operational_log.bind_failure(options.host, options.port);

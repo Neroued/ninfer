@@ -1,5 +1,6 @@
-#include "options.h"
+#include "product/config/options.h"
 #include "product/logging/logging.h"
+#include "product/logging/configuration.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/prompt_input/prompt_input.h"
@@ -277,79 +278,71 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::cli::Options cli;
+    ninfer::product::CliOptions cli;
     try {
-        cli = ninfer::cli::parse_options(argc, argv);
+        cli = ninfer::product::parse_cli_options(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
-        std::cerr << ninfer::cli::usage_text(argv[0]);
+        std::cerr << ninfer::product::startup_usage_text(argv[0], ninfer::product::EntryPoint::Cli);
         return 1;
     }
     if (cli.help_requested) {
-        std::cout << ninfer::cli::usage_text(argv[0]);
+        std::cout << ninfer::product::startup_usage_text(argv[0], ninfer::product::EntryPoint::Cli);
         return 0;
     }
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer",
-         .level        = cli.log_level,
+         .level        = cli.launch.logging.level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
-
+        ninfer::product::log_configuration(*logger, ninfer::product::configuration_view(cli));
+        const auto& defaults = cli.launch.generation;
         ninfer::PromptInput input =
             cli.messages_path.empty()
-                ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
-                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
-                                                        cli.enable_vision);
-        input.options.reasoning_effort = cli.reasoning_effort;
+                ? ninfer::product::prompt_from_text(cli.prompt, defaults.enable_thinking)
+                : ninfer::product::prompt_from_messages(cli.messages_path, defaults.enable_thinking,
+                                                        cli.launch.engine.enable_vision);
+        input.options.reasoning_effort  = cli.reasoning_effort;
+        input.options.preserve_thinking = defaults.preserve_thinking;
 
         ninfer::RequestOptions request;
-        if (cli.json_object)
+        if (cli.constraint.kind == ninfer::product::ConstraintKind::JsonObject)
             request.constraint = ninfer::OutputConstraint::json_object();
-        else if (cli.regex)
-            request.constraint = ninfer::OutputConstraint::regex(*cli.regex);
-        else if (!cli.choices.empty())
-            request.constraint = ninfer::OutputConstraint::choice(cli.choices);
-        else if (!cli.grammar_path.empty() || !cli.json_schema_path.empty()) {
-            const auto& path = cli.grammar_path.empty() ? cli.json_schema_path : cli.grammar_path;
+        else if (cli.constraint.kind == ninfer::product::ConstraintKind::Regex)
+            request.constraint = ninfer::OutputConstraint::regex(cli.constraint.regex);
+        else if (cli.constraint.kind == ninfer::product::ConstraintKind::Choice)
+            request.constraint = ninfer::OutputConstraint::choice(cli.constraint.choices);
+        else if (cli.constraint.kind == ninfer::product::ConstraintKind::Grammar ||
+                 cli.constraint.kind == ninfer::product::ConstraintKind::JsonSchema) {
+            const auto& path = cli.constraint.path;
             std::ifstream file(path, std::ios::binary);
             if (!file) throw std::invalid_argument("cannot open constraint file: " + path.string());
             std::string source(std::istreambuf_iterator<char>(file), {});
             if (file.bad()) throw std::runtime_error("failed to read constraint file");
-            request.constraint = cli.grammar_path.empty()
+            request.constraint = cli.constraint.kind == ninfer::product::ConstraintKind::JsonSchema
                                      ? ninfer::OutputConstraint::json_schema(std::move(source))
                                      : ninfer::OutputConstraint::grammar(std::move(source));
         }
-        request.execution.sampling                = cli.sampling;
-        request.execution.requested_output_tokens = cli.max_new;
-        request.execution.thinking.budget         = cli.thinking_budget;
+        request.execution.sampling = defaults.sampling;
+        if (!request.execution.sampling.seed)
+            request.execution.sampling.seed = ninfer::product::random_sampling_seed();
+        request.execution.requested_output_tokens = defaults.max_tokens;
+        request.execution.thinking.budget         = defaults.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
 
-        ninfer::EngineOptions engine_options;
-        engine_options.artifact_path      = cli.artifact_path;
-        engine_options.chat_template_path = cli.chat_template_path;
-        engine_options.device             = cli.device;
-        engine_options.max_context        = cli.max_context;
-        engine_options.kv_capacity        = cli.kv_capacity;
-        engine_options.prefill_chunk      = cli.prefill_chunk;
-        engine_options.kv_cache           = cli.kv_cache;
-        engine_options.speculative        = cli.speculative;
-        engine_options.enable_vision      = cli.enable_vision;
-        engine_options.use_cuda_graph     = cli.use_cuda_graph;
-        // One CLI invocation owns exactly one request and needs neither history nor pause
-        // storage, so select those resource capacities explicitly.
-        engine_options.context_cache.enabled             = false;
-        engine_options.context_cache.device_state_slots  = 0;
-        engine_options.context_cache.host_capacity_bytes = 0;
-        engine_options.startup_observer                  = startup_log.observer();
+        auto engine_options             = cli.launch.engine;
+        engine_options.startup_observer = startup_log.observer();
 
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
+        ninfer::product::log_resolved_configuration(*logger, engine.options(),
+                                                    engine.memory_summary());
         engine.reset_memory_peaks();
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));

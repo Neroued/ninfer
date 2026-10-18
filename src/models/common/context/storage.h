@@ -9,11 +9,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
 
 namespace ninfer::models::context {
+
+// Resolve the target's Host context budget after the native StateImage size is known.
+[[nodiscard]] std::size_t host_context_capacity(std::optional<std::size_t> requested,
+                                                std::size_t image_stride);
 
 // Borrows fixed rank-local backing. Page ownership and generations belong to the directory.
 // Calls are serialized by the rank worker; the caller retains all backing until completion.

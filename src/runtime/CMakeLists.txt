@@ -17,6 +17,7 @@ add_library(ninfer_engine STATIC
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(ninfer_engine PRIVATE
+  ninfer_deployment
   ninfer_model_execution
   ninfer_artifact
   ninfer_core
@@ -25,3 +26,10 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_text
   ninfer_media_decode)
 add_library(ninfer::engine ALIAS ninfer_engine)
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  add_library(ninfer_runtime_distributed STATIC executor/protocol.cpp executor/resources.cpp)
+  ninfer_internal_includes(ninfer_runtime_distributed)
+  target_link_libraries(ninfer_runtime_distributed PUBLIC ninfer_distributed_control)
+  target_link_libraries(ninfer_engine PRIVATE ninfer_runtime_distributed)
+endif()

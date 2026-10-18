@@ -1639,3 +1639,25 @@ For a timeline, capture this executable with `nsys --trace=cuda,nvtx`; the model
 wait and CPU computation separately. `--profile` brackets measured calls with CUDA profiler API
 calls when capture by that API is appropriate. Profiled durations do not replace ordinary wall
 measurements.
+
+## Distributed collectives
+
+`ninfer_collective_bench` requires `NINFER_ENABLE_DISTRIBUTED=ON`, system NCCL, and an explicit
+two-node deployment TOML. Use the deployment example in `ninfer.example.toml`, setting both worker
+paths to `bench/ninfer_collective_bench` in matching builds. Run from its coordinator node:
+
+```bash
+./build/dgx-spark-dev/bench/ninfer_collective_bench --config distributed.local.toml
+```
+
+It measures 8 B unsigned candidate keys and BF16 payloads of 5 KiB, 40 KiB, 320 KiB, 5 MiB and
+20 MiB. Each shape runs a single AllReduce and a 96-call stream-ordered chain, both eager and
+captured in one Graph. Buffers are allocated and populated once; each call reads unchanged input
+and writes a separate output. Startup, first-use communication, capture and five warmup iterations
+are excluded. Timed batches contain 100 single-call iterations or ten 96-call iterations.
+
+CSV records each rank's device interval per iteration, their maximum, Host enqueue time and logical
+payload GB/s. These are sustained repeated-enqueue measurements, not isolated request latency or
+wire bandwidth. Single-collective graphs can expose NCCL/CUDA replay overhead absent from a long
+captured chain; retain both results. The control connection sends one command per measured shape,
+not one per collective. No model inference or application throughput is measured here.

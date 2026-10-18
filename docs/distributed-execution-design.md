@@ -1,6 +1,10 @@
 # NInfer 分布式执行设计
 
-状态：D1 单 rank 的执行所有权拆分已实现；D2–D6 尚未实现。
+状态：D1 已实现。D2 的部署解析、SSH/本地启动、控制传输、DistributedExecutor、
+NCCL collective/P2P 与原生 Work 编码已实现，并通过双 Spark 的独立执行程序验证。
+产品 worker 的模型准备入口、共同资源规划和 Engine 接线仍依赖 D3 的 rank 物化；
+Qwen3_5 与 Qwen4Exp 当前模型准备入口支持单 rank；多 rank 请求到达各模型的原生
+准备入口后，由对应实现报错。D3–D6 尚未实现。
 本文定义集中调度下的多机目标合同、所有权及实施边界。已实现的 LocalExecutor、Session、
 RankProgram 与上下文管理由[引擎架构](maintainer/engine-architecture.md)维护。
 
@@ -31,6 +35,44 @@ experts EP2。架构使用任意长度的 rank/group 描述，后续四机及其
 
 Spark 保持 GPU 模型计算与 Device State/KV，采用现有 Device 前缀复用和 Replay。
 现有 RTX 5090 的 CPU expert、Host cache 和传输功能由本地执行实现继续提供。
+
+### 1.1 已实现的执行基础
+
+错误归属与实现所有权一致：Deployment 检查节点/rank 引用、路径和配置结构；Runtime
+编排执行与生命周期；模型准备入口解析并验证自己的并行策略；loader、通信 backend 与
+Op 分别验证实际物化、通信和计算要求。CLI/serve 负责配置与错误呈现。上层不维护下层
+的能力清单，也不因某个模型尚未完成接入而统一拒绝整个部署模式。
+
+模型定义与准备先于本地 CUDA 初始化。单 rank 部署在协调节点直接使用 LocalExecutor，
+采用该 rank 的 device、artifact 与进程环境；模型 loader 校验本地 artifact 与协调侧
+Definition 的身份。多 rank 的模型准备由后续各模型的 ParallelPlan 承接。
+
+`distributed/` 持有进程、连接和 communicator；`runtime/executor/` 持有票据及完成语义；
+`models/qwen4_exp/work.*` 与 `wire.*` 持有模型值合同和逐字段编码。控制头包含版本、
+epoch、kind 和 payload 长度；执行 envelope 进一步携带 ticket、CommandSequence、
+计划身份、owners 和 result owner。物理 group 的有序成员与 TP/EP 等角色分开；同一
+角色可在不相交的 rank 集合中使用不同 group。
+
+每个进程一个 I/O owner，通过 poll/eventfd 服务控制连接。CUDA 调用留在执行线程。
+普通消息与 continuation 使用独立的有界发送容量，准备的 `ControlBudget` 给出
+Work、decision、commit、event 和资源报告的 payload 上限。Executor 在接受任务前
+检查整个 frame 池的后续消息额度，实际编码再次检查上限；排队容量不依赖 GPU 完成后
+临时申请。当前执行协议每张 compute ticket 有至多一次 Host decision 交接。
+
+worker 按共同命令顺序应用本 rank 的命令；非 owner 消费 envelope 并推进水位。
+慢 rank 的 Supply/Commit 等待其本地阶段。ContextResult 与 DeviceRetired 覆盖全部
+必需 owners，compute ResultReady 来自 result owner。决策输入的消费事实汇总完成后
+才发布依赖它的结果。资源查询与峰值重置实际到达每个 worker；rank 报告保留独立值，
+共同逻辑容量及汇总解释由模型准备后的 codec 提供。
+
+取消在 RankProgram 明确的安全边界执行；失败先 abort communicator，再析构可能等待
+GPU 的 Program。控制 owner 关闭 socket，协调端回收进程。正常退出等待 Stopped，允许
+此前已发送的 Progress 到达。通信入队使用 NCCL nonblocking 状态检查，设备完成仍由
+调用 stream 的完成凭证表达。collective 支持 BF16、FP16、FP32 和整数，U32/U64 保留
+PLE words 与候选 key 的无符号语义。
+
+Vision binding 编码已安装输入的身份，解码后的 binding 保留独立 shared owner。
+实际 Vision payload 的传输与安装随 D5 的 item-owner 执行接入；本轮没有把地址发送到远端。
 
 ## 2. 所有权与实例结构
 
@@ -93,31 +135,28 @@ RankProgram 报告已经准备的执行容量，Executor 据此管理可提交�
 分布式部署的协调进程负责 Engine/Frontend；每个 GPU rank 使用独立 worker 进程，
 包括协调节点上的 GPU。每个 worker 有一个负责 CUDA 提交的执行线程。
 
-节点入口负责启动本节点的 workers、转发退出状态并收尾子进程。分布式 worker 在
-CUDA 初始化前通过独立 executable 启动。一次部署的成员、rank 映射和模型副本固定。
+协调侧 ExecutionGroup 启动、观察并收尾全部 rank 进程：本节点使用 posix_spawn，
+远端使用非交互 SSH 启动指定 executable。worker 在 CUDA 初始化前接收 bootstrap，
+取得 rank 身份、控制地址和进程环境。一次部署的成员、rank 映射和模型副本固定。
 
-定义 `DeploymentSpec`：
+`DeploymentOptions` 对应启动 TOML 中的 `[distributed]`：
 
 | 字段 | 含义 |
 |---|---|
-| `coordinator_node` / `rendezvous` | 协调节点与控制连接入口 |
-| `nodes[]` | node ID、连接地址、本地 artifact 路径 |
+| `coordinator_node` / `control_host` / `control_port` | 协调节点与控制连接入口；端口 0 自动选择 |
+| `connect_timeout` / `shutdown_timeout` | 启动连接与执行组退出的期限 |
+| `nodes[]` | node ID、SSH 目标、本地 worker/artifact 绝对路径及进程环境 |
 | `ranks[]` | global rank、node ID、本地 CUDA ordinal |
 | `parallel` | 请求的模型并行配置，交给原生并行规划器解析 |
 
-部署描述采用 JSON，所有节点读取相同成员与策略描述，通过 `node_rank` 选择本地条目。
-global rank、node ID、CUDA ordinal 和 group 内 rank 是不同字段。
+协调侧沿用 `--config FILE` 读取部署。完整 topology 由模型规划器生成后分发，worker
+无需读取协调机的本地配置文件。global rank、node ID、CUDA ordinal 和 group 内 rank
+是不同字段；TP/EP/DP/PP 坐标来自计划，进程标题展示这些坐标，日志沿用 NInfer 格式。
 
-目标启动接口如下；这是待实现接口，不是当前 CLI 已支持的命令：
-
-```text
-协调节点：ninfer / ninfer-serve MODEL --deployment FILE --node-rank 0
-其他节点：ninfer-worker --deployment FILE --node-rank N
-单设备：  原有 ninfer / ninfer-serve MODEL
-```
-
-协调节点入口启动本地 rank workers，其他节点入口启动自己负责的 ranks。SSH launcher
-只将这些命令自动化，不参与执行协议；前端服务仅在协调节点开放。
+SSH 负责进程启动及日志/退出状态转发；控制连接建立后使用 Unix/TCP 传递命令，GPU
+张量通过 NCCL。前端服务仅在协调侧开放。产品 worker 的模型物化接线状态见第 1.1 节；
+已可运行的双机检查和通信测量命令见[测试](../tests/README.md#distributed-execution)与
+[基准](../bench/README.md#distributed-collectives)。
 
 ### 3.2 启动协议
 
@@ -656,7 +695,8 @@ apps/worker/                         节点 worker 启动与收尾入口
 src/runtime/executor/                Executor、ticket、共同消息与 Local/Distributed 实现
 src/runtime/contract/                调度、提交、资源与观测的共同合同
 src/distributed/                     bootstrap、控制传输、groups、NCCL backend
-src/models/<arch>/session/           ModelSession、原生事务和 work 编码
+src/models/<arch>/work.* / wire.*    原生 Work 值合同与逐字段编码
+src/models/<arch>/session/           ModelSession、原生事务
 src/models/<arch>/parallel/          并行策略、切片及本地几何规划
 src/models/<arch>/program/           RankProgram、backing、frames、Graph
 src/models/<arch>/execution/         原生模型执行与 stage 边界组合

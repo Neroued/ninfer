@@ -31,9 +31,12 @@ Published artifact downloads are listed in the [project README](../README.md).
 
 - [Distributed execution](distributed-execution-design.md) — selected architecture for centralized
   scheduling, local/distributed executors, rank ownership, parallel plans and communication;
-  implementation is pending.
+  local execution and distributed execution foundations are implemented; multi-rank model
+  integration is pending.
 - [Qwen4Exp parallel strategy](qwen4_exp-parallel-design.md) — selected initial dual-Spark
   TP2/EP2 strategy, state shards, computation/graph composition and implementation dependencies.
+- [Qwen4Exp dual-Spark roadmap](qwen4_exp-distributed-roadmap.md) — D2–D6 implementation sequence,
+  shared infrastructure, sharded loading, inference integration and stage completion checklist.
 - [GLM5Next design and implementation](designs/glm5next/README.md) — selected dual-Spark
   placement, KDA ReplaySSM, Kpool Sparse MLA, mHC and the existing Op checklist; separates
   decisions, implementation status and retirement of designs after code takes ownership.

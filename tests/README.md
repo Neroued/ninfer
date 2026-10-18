@@ -17,6 +17,7 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
+- `distributed/` — typed native work, bounded transport, and opt-in two-rank GPU execution;
 - `cpu/` — topology/ISA, bounded task admission, bound collectives, publication and shutdown;
 - `io/` — bounded direct reads, partial submission, completion, wakeup and borrowed-buffer lifetime;
 - `models/qwen4_exp/` — native bank binding, state/page-group layouts and transfers, plus PLE
@@ -529,3 +530,25 @@ The reclaim test loads Main experts on Host and MTP/fixed weights on Device, the
 native checkpoint contents without generating text. It checks complete holder quotes, actual-page
 batch coverage, typed shortage clipping, stale holders/readers/residency, Main/MTP/State migrations,
 and quoted Host release against final store occupancy. It requires the same Host memory headroom.
+
+## Distributed execution
+
+Configure with `-DNINFER_ENABLE_DISTRIBUTED=ON` and system NCCL development libraries.
+`ninfer_distributed_protocol_test` is an ordinary CTest entry; it checks native Work values,
+decision/commit requirements, input ownership, memory reports and transport backpressure.
+
+The two-GPU test is explicit. Create a local TOML file using the commented deployment section in
+`ninfer.example.toml`; set each node's `worker` to its absolute path to
+`tests/ninfer_distributed_execution_test`. Both nodes need the matching binary and `lib/` directory.
+From the configured coordinator:
+
+```bash
+./build/dgx-spark-dev/tests/ninfer_distributed_execution_test --config distributed.local.toml
+```
+
+The test launches local/SSH workers and uses the production Executor, transport and NCCL backend.
+It checks SUM, unsigned MAX and exact PLE words, Gather/Scatter/Broadcast/P2P, Graph replay,
+decision input, delayed-rank commit, owner subsets, cancellation, retirement, resource queries,
+peak reset, remote launch failure and failure during a collective. No model payload is loaded.
+The test's Program supplies an independent small mathematical/state reference; it is not a model
+registration or an alternative inference entry.

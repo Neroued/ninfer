@@ -115,6 +115,12 @@ public:
                std::any_of(context_.begin(), context_.end(), occupied);
     }
 
+    [[nodiscard]] bool in_flight() const noexcept {
+        const auto submitted = [](const auto& slot) { return slot.state == State::Submitted; };
+        return std::any_of(compute_.begin(), compute_.end(), submitted) ||
+               std::any_of(context_.begin(), context_.end(), submitted);
+    }
+
 private:
     enum class State : std::uint8_t { Free, Reserved, Submitted };
 

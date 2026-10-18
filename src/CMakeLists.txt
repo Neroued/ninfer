@@ -1,5 +1,6 @@
 # Components own targets and dependencies; source manifests remain explicit.
 add_subdirectory(core)
+add_subdirectory(distributed)
 add_subdirectory(artifact)
 add_subdirectory(ops)
 

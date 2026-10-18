@@ -5,6 +5,7 @@
 #include <spdlog/logger.h>
 
 #include <iomanip>
+#include <algorithm>
 #include <sstream>
 #include <type_traits>
 
@@ -51,11 +52,14 @@ std::string format_configuration(const StartupConfigurationView& view) {
     if (!view.config_path.empty())
         out << "  file         " << format_pretty_text(view.config_path.string()) << '\n';
     std::string previous;
+    std::size_t label_width = 28;
+    for (const auto& item : view.items)
+        label_width = std::max(label_width, item.key.size() - item.key.find('.') + 1);
     for (const auto& item : view.items) {
         const auto dot   = item.key.find('.');
         const auto group = item.key.substr(0, dot);
-        out << std::left << std::setw(15) << (group == previous ? "" : group) << std::setw(28)
-            << item.key.substr(dot + 1) << value_text(item);
+        out << std::left << std::setw(15) << (group == previous ? "" : group)
+            << std::setw(label_width) << item.key.substr(dot + 1) << value_text(item);
         if (item.source.kind == ConfigSourceKind::File)
             out << "  [file:" << item.source.line << ']';
         else if (item.source.kind == ConfigSourceKind::CommandLine)

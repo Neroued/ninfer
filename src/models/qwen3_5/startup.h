@@ -18,7 +18,8 @@ public:
     using ExecutionPlan = models::ExecutionPlan<SequencePlan, ExecutionPreparation>;
     using Calibration   = GraphCalibration;
 
-    Startup(const artifact::Reader&, const EngineOptions&, Device);
+    Startup(const artifact::Reader& definition_source, const artifact::Reader& rank_source,
+            const EngineOptions&, Device);
 
     [[nodiscard]] Architecture architecture() const noexcept { return architecture_; }
 

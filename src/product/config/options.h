@@ -54,6 +54,7 @@ struct LaunchOptions {
 
 [[nodiscard]] LaunchOptions default_launch_options(EntryPoint entry);
 [[nodiscard]] std::uint64_t random_sampling_seed();
+[[nodiscard]] DeploymentOptions read_deployment_file(const std::filesystem::path&);
 
 enum class ConstraintKind { None, Grammar, JsonObject, JsonSchema, Regex, Choice };
 

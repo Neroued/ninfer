@@ -26,5 +26,5 @@ add_library(ninfer_product_config STATIC
   config/configuration.cpp)
 ninfer_internal_includes(ninfer_product_config)
 target_link_libraries(ninfer_product_config
-  PUBLIC ninfer_product_logging
+  PUBLIC ninfer_product_logging ninfer_deployment
   PRIVATE ninfer::toml)

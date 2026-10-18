@@ -12,6 +12,7 @@ ninfer_cuda_non_rdc_archive(ninfer_ops_non_rdc)
 target_link_libraries(ninfer_ops_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
 target_sources(ninfer_ops PRIVATE weight_input.cpp)
+include("${CMAKE_CURRENT_LIST_DIR}/collective/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/common/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/elementwise/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/indexing/sources.cmake")

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/deployment.h"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -154,6 +156,7 @@ struct MoeOptions {
 };
 
 struct EngineOptions {
+    std::optional<DeploymentOptions> deployment;
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
     std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;

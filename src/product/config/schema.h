@@ -98,8 +98,16 @@ using StartupPatch = std::array<std::optional<Assignment>, static_cast<std::size
 [[nodiscard]] std::span<const FieldSpec> fields();
 [[nodiscard]] const FieldSpec& field_spec(Field field);
 [[nodiscard]] bool applies_to(const FieldSpec& spec, EntryPoint entry);
+[[nodiscard]] std::uint32_t parse_duration_ms(const RawValue& value, bool positive);
 [[nodiscard]] FieldValue parse_field_value(Field field, const RawValue& value, bool command_line);
-[[nodiscard]] StartupPatch read_config_file(const std::filesystem::path& path);
+
+struct FileConfiguration {
+    StartupPatch fields;
+    std::optional<DeploymentOptions> deployment;
+    std::map<std::string, ConfigSource, std::less<>> deployment_sources;
+};
+
+[[nodiscard]] FileConfiguration read_config_file(const std::filesystem::path& path);
 [[noreturn]] void field_error(const FieldSpec& spec, const ConfigSource& source,
                               const std::filesystem::path& config_path, std::string_view message);
 

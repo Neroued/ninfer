@@ -8,12 +8,30 @@
 #include "artifact/formats.h"
 #include "models/registry.h"
 #include "core/startup.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <chrono>
+#include <charconv>
+#include <cstdlib>
+#include <limits>
+#include <cerrno>
+#include <system_error>
 #include <set>
 
 namespace ninfer::runtime::detail {
+
+inline std::size_t device_budget(std::size_t available) {
+    const char* value = std::getenv("NINFER_VRAM_BUDGET_MIB");
+    if (!value) return available;
+    const std::string_view text(value);
+    std::uint64_t mib = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), mib);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !mib ||
+        mib > std::numeric_limits<std::size_t>::max() / (1024ULL * 1024))
+        throw std::invalid_argument("NINFER_VRAM_BUDGET_MIB requires a positive MiB integer");
+    return std::min(available, static_cast<std::size_t>(mib * 1024 * 1024));
+}
 
 template <class Plan>
 struct CalibratedPlan {
@@ -184,13 +202,35 @@ initialize_program(const Setup& setup, RankModelInstance<typename Setup::Types>&
 }
 
 template <class Setup>
-BuiltModel<typename Setup::Types>
-build_model(const artifact::Reader& reader, EngineOptions& options,
-            std::unique_ptr<DeviceContext> device_owner, const StartupMemoryBudget& budget,
-            std::chrono::steady_clock::time_point start) {
-    auto& device = *device_owner;
+BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& reader,
+                                                    EngineOptions& options,
+                                                    std::chrono::steady_clock::time_point start) {
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    Setup setup(reader, options, device.device());
+    std::unique_ptr<artifact::Reader> rank_reader;
+    if (options.deployment && options.deployment->ranks.size() == 1) {
+        const auto& node = options.deployment->nodes.front();
+        for (const auto& [key, value] : node.environment)
+            if (::setenv(key.c_str(), value.c_str(), 1))
+                throw std::system_error(errno, std::generic_category(),
+                                        "set local rank environment");
+        rank_reader = std::make_unique<artifact::Reader>(node.artifact);
+    }
+    Setup setup(reader, rank_reader ? *rank_reader : reader, options, Device::cuda(options.device));
+    std::unique_ptr<DeviceContext> device_owner;
+    {
+        StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
+        device_owner = std::make_unique<DeviceContext>(options.device);
+        phase.complete();
+    }
+    auto& device       = *device_owner;
+    const auto initial = device_memory_snapshot(device.device());
+    const auto limit   = device_budget(initial.free_bytes);
+    const auto headroom =
+        std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes);
+    const auto host_reservation = (NINFER_SHARED_PHYSICAL_MEMORY != 0) && options.enable_vision
+                                      ? options.media_live_bytes
+                                      : 0;
+    StartupMemoryBudget budget(initial, limit, headroom, host_reservation);
     const auto choices   = setup.placements();
     std::size_t selected = 0;
     const auto choose    = [&](std::size_t available) {

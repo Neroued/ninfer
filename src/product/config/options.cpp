@@ -298,11 +298,12 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
         return parsed;
     }
     StartupPatch merged;
+    FileConfiguration file;
     if (!command.config_path.empty()) {
         command.config_path = std::filesystem::absolute(command.config_path).lexically_normal();
-        auto file           = read_config_file(command.config_path);
-        check_layer(file, entry, command.config_path);
-        merge_layer(merged, std::move(file), entry);
+        file                = read_config_file(command.config_path);
+        check_layer(file.fields, entry, command.config_path);
+        merge_layer(merged, std::move(file.fields), entry);
     }
     auto cli = command_patch(command);
     check_layer(cli, entry, command.config_path);
@@ -314,6 +315,8 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
     auto& sampling   = generation.sampling;
     launch.provenance.config_path = command.config_path;
     launch.provenance.argv        = std::move(command.argv);
+    engine.deployment             = std::move(file.deployment);
+    launch.provenance.fields      = std::move(file.deployment_sources);
     bool kv_follows_context       = true;
     for (const auto& spec : fields()) {
         const auto& setting = assignment(merged, spec.field);

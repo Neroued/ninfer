@@ -1,5 +1,11 @@
 include(cmake/NinferBenchmarks.cmake)
 include(ops/benchmarks.cmake)
+if(NINFER_ENABLE_DISTRIBUTED AND NINFER_BUILD_ENGINE)
+  add_executable(ninfer_collective_bench distributed/collective.cpp)
+  ninfer_internal_includes(ninfer_collective_bench)
+  target_link_libraries(ninfer_collective_bench PRIVATE
+    ninfer_distributed_control ninfer_ops ninfer_product_config)
+endif()
 if(NINFER_BUILD_ENGINE)
   include(inference/benchmarks.cmake)
   include(context_cost/benchmarks.cmake)

@@ -184,7 +184,7 @@ public:
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
 
-    [[nodiscard]] MemorySummary memory_summary() const override {
+    [[nodiscard]] MemorySummary memory_summary() override {
         return worker_->program().memory_summary();
     }
 

@@ -4,8 +4,16 @@
 #include <nlohmann/json.hpp>
 
 namespace ninfer::models::qwen4_exp {
-Startup::Startup(const artifact::Reader& reader, const EngineOptions& options, Device device)
-    : reader_(reader), definition_(read_definition(reader, load_options(options))) {
+Startup::Startup(const artifact::Reader& definition_source, const artifact::Reader& rank_source,
+                 const EngineOptions& options, Device device)
+    : reader_(rank_source), definition_(read_definition(definition_source, load_options(options))) {
+    if (options.deployment) {
+        const auto& deployment = *options.deployment;
+        const auto& parallel   = deployment.parallel;
+        if (deployment.ranks.size() != 1 || parallel.tp != 1 || parallel.ep != 1 ||
+            parallel.dp != 1 || parallel.pp != 1)
+            throw std::invalid_argument("Qwen4Exp parallel model preparation is not implemented");
+    }
     profile       = execution::describe_model(*definition_);
     auto resident = resolve_load(reader_, definition_, device);
     table_        = resident.ple_table_owner();

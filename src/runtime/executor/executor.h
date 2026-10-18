@@ -23,7 +23,7 @@ public:
     virtual void fail(std::string message)                       = 0;
     [[nodiscard]] virtual bool failed() const noexcept           = 0;
     [[nodiscard]] virtual bool has_pending_work() const noexcept = 0;
-    [[nodiscard]] virtual MemorySummary memory_summary() const   = 0;
+    [[nodiscard]] virtual MemorySummary memory_summary()         = 0;
     virtual void reset_memory_peaks() noexcept                   = 0;
 };
 

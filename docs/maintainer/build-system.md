@@ -53,6 +53,7 @@ composition. The default configuration is Release. Ninja links and archives shar
 | `NINFER_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator; requires Engine |
 | `BUILD_TESTING` | OFF | Tests for the selected components |
 | `NINFER_BUILD_BENCHMARKS` | OFF | Benchmarks for the selected components |
+| `NINFER_ENABLE_DISTRIBUTED` | OFF | Process/control transport, distributed execution and NCCL collectives |
 
 Core, Artifact and Ops are always present. An Ops development build disables both Engine and Apps;
 it does not discover FFmpeg, curl, Jinja, XGrammar or spdlog. Engine adds FFmpeg and the frontend
@@ -68,6 +69,13 @@ executor or AVX objects; its CPU MoE Op entry reports unsupported. Artifact Host
 worker startup/affinity facilities directly, without depending on the arithmetic executor.
 Core's direct-file I/O uses liburing >= 2.5.
 Its registered files and buffers are caller-owned; the queue creates no CUDA resources or threads.
+
+Distributed builds discover system `nccl.h` and `libnccl`. `ninfer_deployment` owns value-only
+deployment and topology validation; `ninfer_distributed_wire` owns address-free encoding;
+`ninfer_distributed_control` owns bootstrap, processes and transport;
+`ninfer_distributed_cuda` owns NCCL contexts. Runtime owns command/event codecs and
+the distributed executor. The build option is independent of `NINFER_TARGET`; disabled builds
+do not discover or link NCCL. Dependencies belong to the system installation.
 
 CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
 FFmpeg is discovered without a version floor. The libcurl 7.85 minimum follows the use of

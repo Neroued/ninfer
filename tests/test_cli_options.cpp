@@ -248,6 +248,69 @@ void test_file_errors_and_example(const Files& files) {
             "shared example did not select entry-specific defaults");
 }
 
+void test_deployment(const Files& files) {
+    const std::string source = R"(
+model.path = 'model.ninfer'
+cli.prompt = 'hello'
+[distributed]
+coordinator_node = 10
+control_host = '192.168.100.51'
+connect_timeout = '15s'
+shutdown_timeout = '2s'
+[distributed.parallel]
+tp = 2
+ep = 2
+[[distributed.nodes]]
+id = 10
+worker = '/home/neroued/ninfer/build/apps/ninfer-worker'
+artifact = '/home/neroued/ninfer/out/model.ninfer'
+[[distributed.nodes]]
+id = 20
+ssh = 'neroued@192.168.100.50'
+worker = '/home/neroued/ninfer/build/apps/ninfer-worker'
+artifact = '/home/neroued/ninfer/out/model.ninfer'
+[distributed.nodes.environment]
+NCCL_SOCKET_IFNAME = '=enp1s0f0np0'
+[[distributed.ranks]]
+rank = 0
+node = 10
+device = 0
+[[distributed.ranks]]
+rank = 1
+node = 20
+device = 0
+)";
+    const auto path          = files.write(source);
+    const auto cli           = parse({"ninfer", "--config", path.string()});
+    const auto server        = serve({"ninfer-serve", "--config", path.string()});
+    require(cli.launch.engine.deployment && server.launch.engine.deployment,
+            "entry lost deployment configuration");
+    const auto& d = *cli.launch.engine.deployment;
+    require(d.coordinator_node == 10 && d.parallel.tp == 2 && d.parallel.ep == 2 &&
+                d.parallel.dp == 1 && d.ranks.size() == 2 && d.connect_timeout_ms == 15000 &&
+                d.shutdown_timeout_ms == 2000 && d.control_port == 0 &&
+                d.nodes[1].environment.at("NCCL_SOCKET_IFNAME") == "=enp1s0f0np0",
+            "deployment values differ");
+    const auto printed =
+        ninfer::product::format_configuration(ninfer::product::configuration_view(cli));
+    require(printed.find("nodes[1].ssh") != std::string::npos &&
+                printed.find("192.168.100.50") != std::string::npos,
+            "deployment is missing from startup display");
+    for (const auto& [before, after] :
+         std::vector<std::pair<std::string, std::string>>{{"rank = 1", "rank = 0"},
+                                                          {"node = 20", "node = 99"},
+                                                          {"tp = 2", "tp = 0"},
+                                                          {"connect_timeout", "connect_timout"},
+                                                          {"worker = '/", "worker = '"}}) {
+        auto invalid = source;
+        invalid.replace(invalid.find(before), before.size(), after);
+        const auto file  = files.write(invalid);
+        const auto error = rejection([&] { parse({"ninfer", "--config", file.string()}); });
+        require(error.find(file.string() + ":") != std::string::npos,
+                "deployment diagnostic lost its source location");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +319,7 @@ int main() {
         test_arguments();
         test_file_merge(files);
         test_file_errors_and_example(files);
+        test_deployment(files);
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

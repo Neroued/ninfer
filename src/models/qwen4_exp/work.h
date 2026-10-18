@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/context/contract.h"
+#include "models/qwen4_exp/execution_shape.h"
 #include "ninfer/types.h"
 #include "runtime/contract/resources.h"
 #include "runtime/executor/contract.h"
@@ -128,5 +129,23 @@ struct ExecutionTypes {
     using Result = qwen4_exp::Result;
     using Commit = qwen4_exp::Commit;
 };
+
+// Value-level execution requirements shared by the coordinator and rank. Residency ownership,
+// physical ranges and current device stages are checked by RankProgram.
+struct WorkContract {
+    ExecutionShape shape;
+    std::uint32_t vocabulary, public_tokens;
+    bool mtp, vision;
+
+    void validate(const Work&, runtime::FrameKind) const;
+    void validate(const Work&, const Result&, const Commit&) const;
+    void validate_commit(const Work&, std::span<const RowResult>, const Commit&) const;
+    void validate(const Work&, const runtime::DecisionRequest&,
+                  const runtime::DecisionInput&) const;
+};
+
+[[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
+void validate_decision_rows(const runtime::DecisionInput&, std::uint32_t stage,
+                            std::uint32_t vocabulary, std::span<const std::uint32_t> positions);
 
 } // namespace ninfer::models::qwen4_exp

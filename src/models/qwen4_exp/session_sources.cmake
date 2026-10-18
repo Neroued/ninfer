@@ -1,4 +1,5 @@
 target_sources(ninfer_model_control PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/session.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/request.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/context.cpp"
@@ -8,3 +9,8 @@ target_sources(ninfer_model_control PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/session/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/scoring.cpp")
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_control PRIVATE "${CMAKE_CURRENT_LIST_DIR}/wire.cpp")
+  target_link_libraries(ninfer_model_control PRIVATE ninfer_distributed_wire)
+endif()

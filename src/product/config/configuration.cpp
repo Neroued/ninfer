@@ -311,6 +311,44 @@ StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli
              source == launch.provenance.fields.end() ? ConfigSource{} : source->second,
              spec.unit});
     }
+    if (e.deployment) {
+        const auto append = [&](std::string key, ConfigurationValue value,
+                                ConfigurationUnit unit = ConfigurationUnit::None) {
+            const auto source = launch.provenance.fields.find(key);
+            out.items.push_back(
+                {std::move(key), std::move(value),
+                 source == launch.provenance.fields.end() ? ConfigSource{} : source->second, unit});
+        };
+        const auto& d = *e.deployment;
+        append("distributed.coordinator_node", std::uint64_t{d.coordinator_node});
+        append("distributed.control_host", d.control_host);
+        append("distributed.control_port", std::uint64_t{d.control_port});
+        append("distributed.connect_timeout", std::uint64_t{d.connect_timeout_ms},
+               ConfigurationUnit::Milliseconds);
+        append("distributed.shutdown_timeout", std::uint64_t{d.shutdown_timeout_ms},
+               ConfigurationUnit::Milliseconds);
+        append("distributed.parallel.tp", std::uint64_t{d.parallel.tp});
+        append("distributed.parallel.ep", std::uint64_t{d.parallel.ep});
+        append("distributed.parallel.dp", std::uint64_t{d.parallel.dp});
+        append("distributed.parallel.pp", std::uint64_t{d.parallel.pp});
+        for (std::size_t i = 0; i < d.nodes.size(); ++i) {
+            const auto key   = "distributed.nodes[" + std::to_string(i) + "].";
+            const auto& node = d.nodes[i];
+            append(key + "id", std::uint64_t{node.id});
+            append(key + "ssh", node.ssh);
+            append(key + "worker", node.worker.string());
+            append(key + "artifact", node.artifact.string());
+            for (const auto& [name, value] : node.environment)
+                append(key + "environment." + name, value);
+        }
+        for (std::size_t i = 0; i < d.ranks.size(); ++i) {
+            const auto key   = "distributed.ranks[" + std::to_string(i) + "].";
+            const auto& rank = d.ranks[i];
+            append(key + "rank", std::uint64_t{rank.rank});
+            append(key + "node", std::uint64_t{rank.node});
+            append(key + "device", static_cast<std::uint64_t>(rank.device));
+        }
+    }
     for (const char* name : {"NINFER_VRAM_BUDGET_MIB", "NINFER_CUDA_SYNC"}) {
         if (const char* value = std::getenv(name)) out.environment.emplace(name, value);
     }

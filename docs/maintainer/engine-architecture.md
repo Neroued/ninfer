@@ -132,6 +132,13 @@ DeviceContext 地址从启动到销毁保持稳定，所有借用其 stream 的 
 Executor 抽象位于执行单元和生命周期边界，原生层遍历及 Op 分派仍由模型直接编排。
 Work 拥有输入和纯值存储动作，不借用 Engine 调用栈中的 matcher、请求对象或 CUDA 地址。
 
+Qwen4Exp 的 `WorkContract` 校验无地址的形状、成员、前沿、决策 masks 和提交前缀；
+RankProgram 再校验实际 residency、物理容量、存储动作和当前设备阶段。两类校验共用
+同一数学与状态要求，协调侧无需持有本地 Parameters 或 Device Storage。
+
+模型准备入口拥有自身并行策略的解析与支持范围；Runtime 只编排构造过程并传递配置。
+loader、通信和 Op 对各自实际实现的要求负责，上层传播其错误，不复制或提前猜测这些限制。
+
 执行许可先保留 frame 和该 ticket 后续的 supply/commit/discard 容量。
 Session 建立 pending 事务后进入不可撤销的目录准备；此后即使取消，也必须执行已接受的 COW/mapping 动作至退役。
 准备失败使执行实例失败并排空，不能把已改变的活动目录当成一次可回滚的准入失败。

@@ -91,6 +91,7 @@ public:
     void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;
     void supply(runtime::ExecutionTicket, runtime::CommandSequence, runtime::DecisionInput&&);
     void prepare_commit(runtime::ExecutionTicket, const Commit&) const;
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const;
     void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
     void discard(runtime::ExecutionTicket, runtime::CommandSequence);
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();

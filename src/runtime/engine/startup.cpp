@@ -1,13 +1,10 @@
 #include "runtime/engine/startup.h"
-#include "core/platform.h"
 #include "runtime/engine/startup.inl"
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen4_exp/startup.h"
 
 #include <atomic>
-#include <charconv>
-#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -59,19 +56,6 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
-std::size_t device_budget(std::size_t available) {
-    const char* value = std::getenv("NINFER_VRAM_BUDGET_MIB");
-    if (!value) return available;
-    const std::string_view text(value);
-    std::uint64_t mib = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), mib);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !mib ||
-        mib > std::numeric_limits<std::size_t>::max() / (1024ULL * 1024)) {
-        throw std::invalid_argument("NINFER_VRAM_BUDGET_MIB requires a positive MiB integer");
-    }
-    return std::min(available, static_cast<std::size_t>(mib * 1024 * 1024));
-}
-
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
@@ -113,36 +97,23 @@ SessionEpoch next_session_epoch() noexcept {
 
 ConstructedModel construct_model(EngineOptions& options) {
     validate_options(options);
-    std::unique_ptr<DeviceContext> device_owner;
-    {
-        StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-        device_owner = std::make_unique<DeviceContext>(options.device);
-        phase.complete();
+    if (options.deployment) {
+        validate_deployment(*options.deployment);
+        if (options.deployment->ranks.size() == 1)
+            options.device = options.deployment->ranks.front().device;
     }
-    auto& device       = *device_owner;
-    const auto start   = Clock::now();
-    const auto initial = device_memory_snapshot(device.device());
-    const auto limit   = device_budget(initial.free_bytes);
-    const auto headroom =
-        std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes);
-    // Retained and in-flight prepared media share the live-byte account.
-    const auto host_reservation = (NINFER_SHARED_PHYSICAL_MEMORY != 0) && options.enable_vision
-                                      ? options.media_live_bytes
-                                      : 0;
-    StartupMemoryBudget budget(initial, limit, headroom, host_reservation);
+    const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
     case models::Architecture::Qwen4Exp: {
-        auto built = detail::build_model<models::qwen4_exp::Startup>(
-            reader, options, std::move(device_owner), budget, start);
+        auto built = detail::build_local_model<models::qwen4_exp::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
     }
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {
-        auto built = detail::build_model<models::qwen3_5::Startup>(
-            reader, options, std::move(device_owner), budget, start);
+        auto built = detail::build_local_model<models::qwen3_5::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
     }
     }

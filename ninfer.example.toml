@@ -92,3 +92,38 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # Startup configuration is displayed automatically through the info-level log.
 # Command-line controls are not file fields: --config, --help, --clear-stops.
 # Environment controls remain separate: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.
+
+# Distributed execution-group example. Keep disabled for local CLI/serve execution.
+# Current model integration status: docs/qwen4_exp-distributed-roadmap.md.
+# Worker and artifact paths are absolute paths on each node. Control port 0 selects a free port.
+# The execution test and collective benchmark use their own executable as the worker path.
+# [distributed]
+# coordinator_node = 0
+# control_host = "192.168.100.51"
+# control_port = 0
+# connect_timeout = "60s"
+# shutdown_timeout = "30s"
+# [distributed.parallel]
+# tp = 2
+# ep = 2
+# dp = 1
+# pp = 1
+# [[distributed.nodes]]
+# id = 0
+# worker = "/home/neroued/ninfer/build/dgx-spark-dev/tests/ninfer_distributed_execution_test"
+# artifact = "/home/neroued/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer"
+# environment = { NCCL_SOCKET_IFNAME = "=enp1s0f0np0", NCCL_IB_HCA = "=rocep1s0f0,roceP2p1s0f0" }
+# [[distributed.nodes]]
+# id = 1
+# ssh = "neroued@192.168.100.50"
+# worker = "/home/neroued/ninfer/build/dgx-spark-dev/tests/ninfer_distributed_execution_test"
+# artifact = "/home/neroued/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer"
+# environment = { NCCL_SOCKET_IFNAME = "=enp1s0f0np0", NCCL_IB_HCA = "=rocep1s0f0,roceP2p1s0f0" }
+# [[distributed.ranks]]
+# rank = 0
+# node = 0
+# device = 0
+# [[distributed.ranks]]
+# rank = 1
+# node = 1
+# device = 0

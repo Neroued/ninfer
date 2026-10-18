@@ -31,6 +31,7 @@ public:
     void prepare_commit(runtime::ExecutionTicket, Commit&) const;
     void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
     void discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const;
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     [[nodiscard]] MemorySummary memory_summary() const;

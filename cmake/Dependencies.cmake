@@ -1,5 +1,13 @@
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
+if(NINFER_ENABLE_DISTRIBUTED)
+  find_path(NCCL_INCLUDE_DIR nccl.h REQUIRED)
+  find_library(NCCL_LIBRARY NAMES nccl REQUIRED)
+  add_library(ninfer::nccl UNKNOWN IMPORTED GLOBAL)
+  set_target_properties(ninfer::nccl PROPERTIES
+    IMPORTED_LOCATION "${NCCL_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}")
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HWLOC REQUIRED IMPORTED_TARGET hwloc>=2.5)
 pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing>=2.5)

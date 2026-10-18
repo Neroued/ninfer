@@ -10,6 +10,7 @@ option(NINFER_BUILD_ENGINE "Build models, frontend and Engine" ON)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_ENABLE_DISTRIBUTED "Build distributed execution and NCCL communication" OFF)
 
 if(NINFER_BUILD_APPS AND NOT NINFER_BUILD_ENGINE)
   message(FATAL_ERROR "NINFER_BUILD_APPS requires NINFER_BUILD_ENGINE")

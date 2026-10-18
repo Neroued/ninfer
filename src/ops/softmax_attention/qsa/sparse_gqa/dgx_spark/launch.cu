@@ -8,19 +8,20 @@
 namespace ninfer::ops::detail::qsa {
 namespace {
 template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load, int N, int Parts,
-          int PrefixQueries = 0>
-void launch_columns(SparseGqaArguments a, int queries, cudaStream_t stream) {
+          int PrefixQueries = 0, int KvHeads>
+void launch_columns(SparseGqaKernelArguments<KvHeads> a, int queries, cudaStream_t stream) {
     constexpr auto kernel =
-        sparse_gqa_columns_kernel<Storage, N, Parts, Vector, Load, PrefixQueries>;
+        sparse_gqa_columns_kernel<Storage, N, Parts, Vector, Load, PrefixQueries, KvHeads>;
     constexpr int bytes =
         sizeof(SparseGqaStorage<Storage, N, Parts, Load, SparseGqaWarpSplit::Output>);
     const int shared = common::prepare_shared<bytes, kernel, true>();
     a.key_rows       = N;
-    kernel<<<dim3(queries * 2, a.splits), Parts * 32, shared, stream>>>(a);
+    kernel<<<dim3(queries * a.kv_heads, a.splits), Parts * 32, shared, stream>>>(a);
 }
 
-template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load>
-void launch_mma(SparseGqaArguments a, SparseGqaLaunchPlan plan, int queries, cudaStream_t stream) {
+template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load, int KvHeads>
+void launch_mma(SparseGqaKernelArguments<KvHeads> a, SparseGqaLaunchPlan plan, int queries,
+                cudaStream_t stream) {
     switch (plan.kernel) {
     case SparseGqaKernel::Columns16:
         launch_columns<Storage, Vector, Load, 16, 2>(a, queries, stream);
@@ -33,15 +34,16 @@ void launch_mma(SparseGqaArguments a, SparseGqaLaunchPlan plan, int queries, cud
         break;
     default:
         sparse_gqa_mma_kernel<Storage, 32, 2, Vector, Load>
-            <<<dim3(queries * 2, a.splits), 64, sizeof(SparseGqaStorage<Storage, 32, 2, Load>),
-               stream>>>(a);
+            <<<dim3(queries * a.kv_heads, a.splits), 64,
+               sizeof(SparseGqaStorage<Storage, 32, 2, Load>), stream>>>(a);
         break;
     }
 }
 
-template <KvCacheStorage Storage, bool Vector>
-void launch(SparseGqaArguments a, SparseGqaPlan plan, SparseGqaLaunchPlan selected, int queries,
-            CudaExecutionView execution) {
+template <KvCacheStorage Storage, bool Vector, int KvHeads>
+void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLaunchPlan selected,
+            int queries, CudaExecutionView execution) {
+    SparseGqaKernelArguments<KvHeads> a{arguments};
     const auto stream = execution.stream();
     a.splits          = selected.splits;
     // The merge must interpret the same sequence partition as the producing kernel.
@@ -51,7 +53,8 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, SparseGqaLaunchPlan select
         constexpr int Queries = 8, N = 32, Parts = kSparseQuantized<Storage> ? 2 : 1;
         constexpr int Warps   = Queries * 12 / 16 * Parts;
         constexpr auto load   = Async ? SparseGqaLoad::Staged : SparseGqaLoad::Direct;
-        constexpr auto kernel = sparse_gqa_grouped_kernel<Storage, N, Parts, Queries, Vector, load>;
+        constexpr auto kernel =
+            sparse_gqa_grouped_kernel<Storage, N, Parts, Queries, Vector, load, KvHeads>;
         constexpr int bytes   = std::max(
             (sizeof(SparseGqaStorage<Storage, N, Warps, load, SparseGqaWarpSplit::Output>) + 15) /
                     16 * 16 +
@@ -60,19 +63,32 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, SparseGqaLaunchPlan select
         const int shared = common::prepare_shared<bytes, kernel, true>();
         auto prefix      = a;
         prefix.key_rows  = N;
-        kernel<<<(queries + Queries - 1) / Queries * 2, Warps * 32, shared, stream>>>(prefix);
+        kernel<<<(queries + Queries - 1) / Queries * a.kv_heads, Warps * 32, shared, stream>>>(
+            prefix);
         // Device metadata gives each query to exactly one pass, including mixed histories
         // and partial groups. Both nodes remain present for every execution envelope.
+        // The two passes remain selected only by Device metadata. Avoid a nearly
+        // empty final residency wave in the sparse fallback's 16-key tile on GB10.
+        if constexpr (Storage == KvCacheStorage::BFloat16) {
+            const auto remainder = (queries * a.kv_heads) % (2 * execution.multiprocessor_count());
+            if (a.kv_heads == 1 && remainder > 0 &&
+                remainder <= execution.multiprocessor_count() / 2) {
+                auto fallback     = a;
+                fallback.key_rows = 32;
+                launch_columns<Storage, Vector, load, 32, 2, Queries>(fallback, queries, stream);
+                return;
+            }
+        }
         launch_columns<Storage, Vector, load, 16, 2, Queries>(a, queries, stream);
         return;
     }
     if (plan.instance == SparseGqaInstance::Simt) {
         if (selected.kernel == SparseGqaKernel::Simt4)
             sparse_gqa_simt_kernel<Storage, 4, Vector>
-                <<<dim3(queries * 24, a.splits), 128, 0, stream>>>(a);
+                <<<dim3(queries * a.query_heads, a.splits), 128, 0, stream>>>(a);
         else
             sparse_gqa_simt_kernel<Storage, 8, Vector>
-                <<<dim3(queries * 24, a.splits), 256, 0, stream>>>(a);
+                <<<dim3(queries * a.query_heads, a.splits), 256, 0, stream>>>(a);
     } else if constexpr (Async) {
         if (selected.load == SparseGqaLoad::InPlace)
             launch_mma<Storage, Vector, SparseGqaLoad::InPlace>(a, selected, queries, stream);
@@ -81,18 +97,25 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, SparseGqaLaunchPlan select
     } else {
         launch_mma<Storage, Vector, SparseGqaLoad::Direct>(a, selected, queries, stream);
     }
-    if (plan.partial) sparse_gqa_merge_kernel<Storage><<<queries * 24, 128, 0, stream>>>(a);
+    if (plan.partial)
+        sparse_gqa_merge_kernel<Storage><<<queries * a.query_heads, 128, 0, stream>>>(a);
 }
 } // namespace
 
-void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, SparseGqaPlan plan,
-                                SparseGqaLaunchPlan selected, int queries,
+void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, int kv_heads,
+                                SparseGqaPlan plan, SparseGqaLaunchPlan selected, int queries,
                                 CudaExecutionView execution) {
     const auto dispatch = [&]<KvCacheStorage Storage>() {
-        if (selected.vector_cache)
-            launch<Storage, true>(a, plan, selected, queries, execution);
+        const auto geometry = [&]<int KvHeads>() {
+            if (selected.vector_cache)
+                launch<Storage, true, KvHeads>(a, plan, selected, queries, execution);
+            else
+                launch<Storage, false, KvHeads>(a, plan, selected, queries, execution);
+        };
+        if (kv_heads == 1)
+            geometry.template operator()<1>();
         else
-            launch<Storage, false>(a, plan, selected, queries, execution);
+            geometry.template operator()<2>();
     };
     switch (storage) {
     case KvCacheStorage::BFloat16:

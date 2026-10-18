@@ -121,22 +121,24 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
         row.policy          = "bf16_output";
         row.tokens          = tokens;
         row.batch           = options.batch;
-        row.qk_heads        = 24;
-        row.value_heads     = 2;
+        row.qk_heads        = options.query_heads;
+        row.value_heads     = options.kv_heads;
         row.valid           = qsa::csv_list(fixture.lengths);
         row.workspace_bytes = fixture.workspace_bytes;
         qsa::Metrics metrics;
         metrics.live_queries =
             std::accumulate(fixture.lengths.begin(), fixture.lengths.end(), 0ULL);
         metrics.selected_tokens = fixture.selected_tokens;
-        metrics.qk_flops = metrics.pv_flops = fixture.selected_tokens * 2 * 24 * 256;
-        metrics.kv_read                     = fixture.unique_tokens * fixture.token_bytes;
-        metrics.per_query_cache_bytes       = fixture.selected_tokens * fixture.token_bytes;
-        metrics.read_bytes = metrics.kv_read + fixture.active_queries * 6144 * 2 * 2 +
-                             fixture.selected_ids * 4 + metrics.live_queries * 8 +
-                             options.batch * 4 + fixture.active_rows * 4 +
-                             fixture.table_entries * 4;
-        metrics.write_bytes = std::uint64_t(tokens) * options.batch * 6144 * 2;
+        metrics.qk_flops        = metrics.pv_flops =
+            fixture.selected_tokens * 2 * options.query_heads * 256;
+        metrics.kv_read               = fixture.unique_tokens * fixture.token_bytes;
+        metrics.per_query_cache_bytes = fixture.selected_tokens * fixture.token_bytes;
+        metrics.read_bytes =
+            metrics.kv_read + fixture.active_queries * (256 * options.query_heads) * 2 * 2 +
+            fixture.selected_ids * 4 + metrics.live_queries * 8 + options.batch * 4 +
+            fixture.active_rows * 4 + fixture.table_entries * 4;
+        metrics.write_bytes =
+            std::uint64_t(tokens) * options.batch * (256 * options.query_heads) * 2;
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))

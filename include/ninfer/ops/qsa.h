@@ -132,15 +132,14 @@ struct QsaSparseGqaExecutionEnvelope {
     std::uint32_t max_visible_tokens = 262144;
 };
 
-/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, B and envelope.
- * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, query/KV heads, B
+ * and envelope. Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
  * multiprocessor_count is the positive physical SM count used by execution.
  */
-[[nodiscard]] std::size_t
-qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min_tokens,
-                                        std::int32_t max_tokens, std::int32_t batch_size,
-                                        QsaSparseGqaExecutionEnvelope envelope,
-                                        std::int32_t multiprocessor_count);
+[[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
+    KvCacheStorage storage, std::int32_t query_heads, std::int32_t kv_heads,
+    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size,
+    QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count);
 
 /**
  * Op: qsa_sparse_gqa
@@ -158,10 +157,10 @@ qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min
  * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
  *
  * Domain / numeric:
- * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,24,T,B].
- * Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and
- * Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256), with
- * [leading_extent,64,2,G] geometry. Features are contiguous; naturally aligned positive,
+ * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
+ * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64,
+ * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
+ * with [leading_extent,64,Hkv,G] geometry. Features are contiguous; naturally aligned positive,
  * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
  * quantized to low-bit operands. The A16 numerical policy applies to the complete attention
  * and gate; intermediate arithmetic remains private. Decoded KV tiles stay on chip; there is

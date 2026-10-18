@@ -2,11 +2,13 @@
 #include "ops/common/host/operands.h"
 
 namespace ninfer::ops::detail::qsa {
-SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage, int tokens, int batch,
+int sparse_gqa_direct_queries(int, int) { return 256; }
+
+SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage, int tokens, int batch, int kv_heads,
                                      QsaSparseGqaExecutionEnvelope envelope, int sms) {
     const auto queries = std::int64_t(tokens) * batch;
     const auto visible = envelope.max_visible_tokens;
-    if (queries >= kSparseGqaDirectQueries)
+    if (queries >= sparse_gqa_direct_queries(kv_heads, sms))
         return visible <= 2051 ? SparseGqaPlan{64, 1, SparseGqaInstance::FullPrefix, false}
                                : SparseGqaPlan{32, 1, SparseGqaInstance::Mma, false};
     // Budget parallel partitions independently of history. The envelope only bounds the
@@ -36,7 +38,7 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const PagedKVBatchLayerView& cache,
         return {SparseGqaLoad::InPlace, vector, plan.splits};
     // In-place expansion adds barriers but retains three CTAs/SM. Choose it only when
     // that residency removes a wave; otherwise use a separate packed staging slot.
-    const auto blocks  = std::int64_t(queries) * 2 * plan.splits;
+    const auto blocks  = std::int64_t(queries) * cache.num_kv_heads * plan.splits;
     const bool inplace = (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
     return {inplace ? SparseGqaLoad::InPlace : SparseGqaLoad::Staged, vector, plan.splits};
 }

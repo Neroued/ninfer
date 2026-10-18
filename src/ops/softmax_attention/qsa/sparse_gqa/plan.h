@@ -8,7 +8,7 @@
 
 namespace ninfer::ops::detail::qsa {
 
-inline constexpr int kSparseGqaDirectQueries = 256;
+int sparse_gqa_direct_queries(int kv_heads, int sms);
 enum class SparseGqaInstance { Mma, Simt, FullPrefix, Grouped };
 
 struct SparseGqaPlan {
@@ -18,7 +18,7 @@ struct SparseGqaPlan {
     std::uint32_t visible_tokens = 0;
 };
 
-SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch,
+SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch, int kv_heads,
                                      QsaSparseGqaExecutionEnvelope envelope, int sms);
 
 enum class SparseGqaKernel { Sequence, Columns16, Columns32, Columns32Wide, Simt4, Simt8 };
@@ -39,14 +39,14 @@ struct SparseGqaWorkspace {
 
 template <class Allocator>
 SparseGqaWorkspace allocate_sparse_gqa_workspace(Allocator& allocator, int tokens, int batch,
-                                                 SparseGqaPlan plan) {
+                                                 int query_heads, SparseGqaPlan plan) {
     if (!plan.partial) return {};
-    return {allocator.alloc(DType::FP32, {256, 24, tokens, batch * plan.splits}, 256),
-            allocator.alloc(DType::FP32, {24, tokens, batch * plan.splits}, 256),
-            allocator.alloc(DType::FP32, {24, tokens, batch * plan.splits}, 256)};
+    return {allocator.alloc(DType::FP32, {256, query_heads, tokens, batch * plan.splits}, 256),
+            allocator.alloc(DType::FP32, {query_heads, tokens, batch * plan.splits}, 256),
+            allocator.alloc(DType::FP32, {query_heads, tokens, batch * plan.splits}, 256)};
 }
 
-void launch_sparse_gqa_instance(SparseGqaArguments arguments, KvCacheStorage storage,
+void launch_sparse_gqa_instance(SparseGqaArguments arguments, KvCacheStorage storage, int kv_heads,
                                 SparseGqaPlan plan, SparseGqaLaunchPlan launch, int queries,
                                 CudaExecutionView execution);
 

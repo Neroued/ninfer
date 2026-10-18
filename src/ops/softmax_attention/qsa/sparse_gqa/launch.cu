@@ -33,14 +33,15 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBat
                          plan.key_rows,
                          0};
     const auto queries = std::int64_t(a.tokens) * a.batch;
-    // This slab only bounds grid.x (including the 24-head merge); scratch/output indexing
+    // This slab only bounds grid.x (including the per-head merge); scratch/output indexing
     // stays global and T is not a semantic launch limit.
     constexpr int slab = 1 << 24;
     for (a.begin = 0; a.begin < queries; a.begin += slab) {
         const int n = int(std::min<std::int64_t>(slab, queries - a.begin));
         const auto selected_launch =
             select_sparse_gqa_launch(cache, plan, n, a.batch, execution.multiprocessor_count());
-        launch_sparse_gqa_instance(a, cache.storage, plan, selected_launch, n, execution);
+        launch_sparse_gqa_instance(a, cache.storage, cache.num_kv_heads, plan, selected_launch, n,
+                                   execution);
     }
     CUDA_CHECK(cudaGetLastError());
 }

@@ -56,8 +56,10 @@ struct Options {
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
     KvCacheStorage storage = KvCacheStorage::BFloat16;
     int rounds             = 1;
+    int query_heads = 24, kv_heads = 2;
     std::vector<int> capacities{16}, bases{6};
-    std::vector<int> contexts{8192};
+    std::vector<int> contexts{8192}, prefixes;
+    bool explicit_contexts         = false;
     int context_capacity           = 0;
     bool context_capacity_explicit = false;
     int selected_blocks            = 512;
@@ -66,7 +68,6 @@ struct Options {
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
     int axes     = 1;
-    int kv_heads = 2;
     bool inplace = false;
 };
 
@@ -83,7 +84,7 @@ inline Options parse_options(int argc, char** argv) {
                          "  --op input-proj|tail-extract|prepare|indexer|sparse-gqa (default "
                          "input-proj)\n"
                          "  --projection qg|kv-index|qkgv-index|all\n"
-                         "  --kv-heads 1|2 (input projection/prepare, default 2)\n"
+                         "  --kv-heads 1|2 (input projection/prepare/sparse GQA, default 2)\n"
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
                          "Prepare: --tokens T[,T...] --batch B --axes 1|3 --inplace\n"
@@ -93,7 +94,9 @@ inline Options parse_options(int argc, char** argv) {
                          "Indexer: --tokens T[,T...] --batch B --contexts L[,L...]\n"
                          "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
                          "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
-                         "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n"
+                         "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n  "
+                         "--query-heads Hq --kv-heads Hkv (24/2 or 12/1)\n  --prefix-tokens "
+                         "P[,P...] (derive each context as prefix + valid length)\n"
                          "  --selection random|shared|contiguous --selected-blocks 0..512\n"
                          "  --context-capacity N (default maximum L)\n"
                          "  --kv-cache bf16|int8|fp8|nvfp4|k8v4 (default bf16)\n"
@@ -120,13 +123,21 @@ inline Options parse_options(int argc, char** argv) {
         cache_option |= flag == "--kv-cache";
         indexer_only |= flag == "--contexts" || flag == "--context-capacity";
         base_options |= flag == "--base-positions";
-        sparse_only |= flag == "--selection" || flag == "--selected-blocks";
+        sparse_only |= flag == "--selection" || flag == "--selected-blocks" ||
+                       flag == "--query-heads" || flag == "--prefix-tokens";
         score_option |= flag == "--score-pattern";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
-        else if (flag == "--contexts")
-            o.contexts = measurement::integers(value, 0);
+        else if (flag == "--query-heads")
+            o.query_heads = measurement::integer(value);
+        else if (flag == "--kv-heads")
+            o.kv_heads = measurement::integer(value);
+        else if (flag == "--contexts") {
+            o.contexts          = measurement::integers(value, 0);
+            o.explicit_contexts = true;
+        } else if (flag == "--prefix-tokens")
+            o.prefixes = measurement::integers(value, 0);
         else if (flag == "--score-pattern")
             o.score_pattern = value;
         else if (flag == "--selection")
@@ -146,9 +157,7 @@ inline Options parse_options(int argc, char** argv) {
                     matched   = true;
                 }
             if (!matched) throw std::invalid_argument("kv-cache: bf16|int8|fp8|nvfp4|k8v4");
-        } else if (flag == "--kv-heads")
-            o.kv_heads = measurement::integer(value, 1, 2);
-        else if (flag == "--axes")
+        } else if (flag == "--axes")
             o.axes = measurement::integer(value);
         else if (flag == "--capacity")
             o.capacities = measurement::integers(value);
@@ -191,7 +200,7 @@ inline Options parse_options(int argc, char** argv) {
     if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare" && o.op != "indexer" &&
         o.op != "sparse-gqa")
         throw std::invalid_argument("op: input-proj|tail-extract|prepare|indexer|sparse-gqa");
-    if ((o.op != "input-proj" && o.op != "prepare" && head_options) ||
+    if ((o.op != "input-proj" && o.op != "prepare" && o.op != "sparse-gqa" && head_options) ||
         (o.op != "indexer" && score_option) ||
         (o.op != "prepare" && o.op != "sparse-gqa" && cache_option) ||
         (o.op != "sparse-gqa" && sparse_only) ||
@@ -204,6 +213,8 @@ inline Options parse_options(int argc, char** argv) {
         (o.op == "indexer" &&
          (tail_only || projection_only || prepare_only || base_options || o.inplace)))
         throw std::invalid_argument("options must belong to the selected QSA Op");
+    if (!o.prefixes.empty() && o.explicit_contexts)
+        throw std::invalid_argument("prefix-tokens and contexts are alternatives");
     if (o.score_pattern != "random" && o.score_pattern != "ties")
         throw std::invalid_argument("score-pattern: random|ties");
     if (o.selected_blocks > 512 ||

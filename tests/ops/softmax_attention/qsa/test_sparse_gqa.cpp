@@ -21,8 +21,8 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
     std::vector<double> selected;
     selected.reserve(reference.values.size());
     for (int m : reference.queries)
-        selected.insert(selected.end(), got.begin() + std::size_t(m) * 6144,
-                        got.begin() + std::size_t(m + 1) * 6144);
+        selected.insert(selected.end(), got.begin() + std::size_t(m) * (256 * f.q_heads),
+                        got.begin() + std::size_t(m + 1) * (256 * f.q_heads));
     int failures = selected.empty()
                        ? 0
                        : verify_reduction(label, selected, reference.values, kSparseA16Criterion);
@@ -33,8 +33,8 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
     const auto words = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
     for (int m = 0; m < f.T * f.B; ++m)
         if (f.visible[m].empty())
-            for (int i = 0; i < 6144; ++i)
-                if (words[std::size_t(m) * 6144 + i] != 0) {
+            for (int i = 0; i < 256 * f.q_heads; ++i)
+                if (words[std::size_t(m) * (256 * f.q_heads) + i] != 0) {
                     ++failures;
                     break;
                 }
@@ -74,11 +74,14 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
 
 int run(DeviceContext& device, int t, int b, int history, bool padded = false, int cap = 512,
         float magnitude = 1, bool graph = false, KvCacheStorage storage = KvCacheStorage::BFloat16,
-        int live_limit = std::numeric_limits<int>::max()) {
-    Fixture f(t, b, history, padded, storage);
+        int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
+        bool dense_rows = false) {
+    Fixture f(t, b, history, padded, storage, false, query_heads);
+    f.dense_rows     = dense_rows;
     f.live_limit     = live_limit;
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        storage, t, t, b, f.envelope, device.execution_view().multiprocessor_count());
+        storage, f.q_heads, f.kv_heads, t, t, b, f.envelope,
+        device.execution_view().multiprocessor_count());
     GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
     MemoryArena arena(scratch.span().subspan(0, std::max<std::size_t>(bytes, 256)));
     DecodeGraphExecutable executable;
@@ -108,19 +111,19 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
 }
 
 int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                  int tokens = 1, std::uint32_t bound = 1) {
-    Fixture f(tokens, 1, 1, false, storage);
+                  int tokens = 1, std::uint32_t bound = 1, int query_heads = 24) {
+    Fixture f(tokens, 1, 1, false, storage, false, query_heads);
     f.envelope.max_visible_tokens = bound;
     f.reset();
     std::fill(f.ghost.begin(), f.ghost.end(), f32_to_bf16(1.0f));
     const int page = f.tables[f.selectors[0] * f.table_stride];
-    for (int h = 0; h < 2; ++h)
+    for (int h = 0; h < f.kv_heads; ++h)
         for (int d = 0; d < 256; ++d)
             f.values.host[f.values.offset(d, h, 0, page)] = half(1.00390625f);
     f.upload();
     if (f.encoded_value) {
         auto& v = *f.encoded_value;
-        for (int h = 0; h < 2; ++h) {
+        for (int h = 0; h < f.kv_heads; ++h) {
             const auto db = v.data.offset(0, h, page), sb = v.scales.offset(0, h, page);
             std::fill_n(v.data.host.begin() + db, v.format.data_extent, 0);
             std::fill_n(v.scales.host.begin() + sb,
@@ -147,9 +150,10 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
     }
     ninfer::DeviceBuffer workspace_storage(
         ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                       storage, tokens, tokens, 1, f.envelope,
-                                       device.execution_view().multiprocessor_count())));
+        std::max<std::size_t>(256,
+                              ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                  storage, f.q_heads, f.kv_heads, tokens, tokens, 1, f.envelope,
+                                  device.execution_view().multiprocessor_count())));
     MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
@@ -157,8 +161,9 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                          " T=" + std::to_string(tokens) + " bound=" + std::to_string(bound));
 }
 
-int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4) {
-    Fixture f(3, batch, 2053, padded, storage);
+int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4,
+                   int query_heads = 24) {
+    Fixture f(3, batch, 2053, padded, storage, false, query_heads);
     f.reset(0, 1);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
     DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
@@ -210,14 +215,16 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
                 copy(static_cast<int*>(ids.data()) + std::size_t(m) * 512,
                      f.ids.data() + std::size_t(m) * 512, f.counts[m] * 4);
             if (f.visible[m].empty()) continue;
-            const auto off = std::size_t(m) * 6144;
-            copy(static_cast<std::uint16_t*>(q.data()) + off, f.qhost.data() + off, 12288);
-            copy(static_cast<std::uint16_t*>(gate.data()) + off, f.ghost.data() + off, 12288);
+            const auto off = std::size_t(m) * (256 * f.q_heads);
+            copy(static_cast<std::uint16_t*>(q.data()) + off, f.qhost.data() + off,
+                 std::size_t(f.q_heads) * 512);
+            copy(static_cast<std::uint16_t*>(gate.data()) + off, f.ghost.data() + off,
+                 std::size_t(f.q_heads) * 512);
             for (int token : f.visible[m]) {
                 const int idx      = f.selectors[b] * f.table_stride + token / 64,
                           physical = f.tables[idx];
                 copy(static_cast<int*>(table.data()) + idx, f.tables.data() + idx, 4);
-                for (int h = 0; h < 2; ++h)
+                for (int h = 0; h < f.kv_heads; ++h)
                     for (int i = 0; i < 4; ++i) {
                         if (!bytes[i]) continue;
                         const auto& plane = *targets[i];
@@ -228,10 +235,11 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
                     }
             }
         }
-    ninfer::DeviceBuffer workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            storage, 3, 3, batch, f.envelope, device.execution_view().multiprocessor_count()));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                               storage, f.q_heads, f.kv_heads, 3, 3, batch,
+                                               f.envelope,
+                                               device.execution_view().multiprocessor_count()));
     MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
@@ -242,10 +250,12 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
 }
 
 int graph_update(DeviceContext& device, int tokens, int batch,
-                 KvCacheStorage storage = KvCacheStorage::BFloat16, bool padded = true) {
-    Fixture f(tokens, batch, 8192, padded, storage);
+                 KvCacheStorage storage = KvCacheStorage::BFloat16, bool padded = true,
+                 int query_heads = 24) {
+    Fixture f(tokens, batch, 8192, padded, storage, false, query_heads);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        storage, tokens, tokens, batch, {262144}, device.execution_view().multiprocessor_count());
+        storage, f.q_heads, f.kv_heads, tokens, tokens, batch, {262144},
+        device.execution_view().multiprocessor_count());
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(bytes, 256));
     MemoryArena workspace(workspace_storage.span());
@@ -295,13 +305,13 @@ int validation(DeviceContext& device) {
     const int padded_alias = rejects([&] { padded.launch(workspace, device.execution_view()); });
     int failures           = rejects([&] {
         (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            static_cast<KvCacheStorage>(-1), 1, 1, 1, f.envelope,
+            static_cast<KvCacheStorage>(-1), 24, 2, 1, 1, 1, f.envelope,
             device.execution_view().multiprocessor_count());
     });
     failures += padded_alias;
     failures += rejects([&] {
         (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            KvCacheStorage::BFloat16, 2, 1, 1, f.envelope,
+            KvCacheStorage::BFloat16, 24, 2, 2, 1, 1, f.envelope,
             device.execution_view().multiprocessor_count());
     });
     const auto out = f.output;
@@ -323,26 +333,28 @@ int validation(DeviceContext& device) {
             std::size_t maximum = 0;
             for (int t = 1; t <= 512; ++t)
                 maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                                storage, t, t, batch, f.envelope,
+                                                storage, 24, 2, t, t, batch, f.envelope,
                                                 execution.multiprocessor_count()));
-            failures += maximum !=
-                        ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                            storage, 1, 512, batch, f.envelope, execution.multiprocessor_count());
+            failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                       storage, 24, 2, 1, 512, batch, f.envelope,
+                                       execution.multiprocessor_count());
         }
     }
     return failures;
 }
 
-int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history) {
+int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history,
+                 int query_heads = 24) {
     // Scale planes have their own strides/alignment, independently of vector-aligned data.
-    Fixture f(tokens, 1, history, false, storage, true);
+    Fixture f(tokens, 1, history, false, storage, true, query_heads);
     f.live_limit = 4;
     f.reset();
     ninfer::DeviceBuffer arena_storage(
         ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                       storage, tokens, tokens, 1, f.envelope,
-                                       device.execution_view().multiprocessor_count())));
+        std::max<std::size_t>(256,
+                              ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                  storage, f.q_heads, f.kv_heads, tokens, tokens, 1, f.envelope,
+                                  device.execution_view().multiprocessor_count())));
     MemoryArena arena(arena_storage.span());
     f.launch(arena, device.execution_view());
     device.synchronize();
@@ -373,16 +385,17 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
 void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, int cap = 512,
               float magnitude = 1, bool graph = false,
               KvCacheStorage storage = KvCacheStorage::BFloat16,
-              int live_limit         = std::numeric_limits<int>::max()) {
+              int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
+              bool dense_rows = false) {
     const auto format = kv_cache_storage_name(storage);
-    suite.add(std::string("sparse_gqa/") + format + "/t" + std::to_string(t) + "/b" +
-                  std::to_string(b) + "/l" + std::to_string(history) + "/cap" +
-                  std::to_string(cap) + (padded ? "/padded" : "/contiguous") + "/qk" +
+    suite.add(std::string(query_heads == 12 ? "sparse_gqa_local/" : "sparse_gqa/") + format + "/t" +
+                  std::to_string(t) + "/b" + std::to_string(b) + "/l" + std::to_string(history) +
+                  "/cap" + std::to_string(cap) + (padded ? "/padded" : "/contiguous") + "/qk" +
                   std::to_string(magnitude) + "/live" + std::to_string(live_limit) +
-                  (graph ? "/graph" : "/eager"),
+                  (graph ? "/graph" : "/eager") + (dense_rows ? "/dense_rows" : ""),
               [=] {
                   return run(cuda_environment().context, t, b, history, padded, cap, magnitude,
-                             graph, storage, live_limit);
+                             graph, storage, live_limit, query_heads, dense_rows);
               },
               {{"format", format}, {"execution", graph ? "graph" : "eager"}});
 }
@@ -459,13 +472,74 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
                                    8192, false, 17, 1, false, storage);
                     });
 }
+
+void add_local_cases(OpSuite& suite, KvCacheStorage storage) {
+    const auto add = [&](int t, int b, int history, bool padded = false, int cap = 512,
+                         bool graph = false, bool dense = false) {
+        add_case(suite, t, b, history, padded, cap, 1.F, graph, storage,
+                 std::numeric_limits<int>::max(), 12, dense);
+    };
+    for (int l : {1, 3, 4, 63, 64, 65, 128, 512, 2048, 2051, 2052, 8192, 32768, 131072, 262144})
+        add(1, 1, l);
+    for (int b = 1; b <= 8; ++b) add(1, b, 8192, false, 512, false, true);
+    for (int b : {1, 2, 4, 8})
+        for (int t : {2, 4, 6, 8, 16}) add(t, b, 32771, false, 512, t == 6);
+    add(6, 8, 32771, false, 512, true, true);
+    add(16, 8, 32771, true, 512, false, true);
+    for (int t :
+         {127, 128, 129, 255, 256, 257, 320, 383, 384, 385, 511, 512, 513, 1024, 2048, 4096})
+        add(t, 1, 8192);
+    for (int t : {128, 512, 1024, 2048, 4096})
+        for (int prefix : {0, 32768, 131072}) add(t, 1, prefix + t, false, 512, false, true);
+    add(257, 2, 8192);
+    add(65, 8, 1024);
+    for (int cap : {0, 32, 128}) add(6, 4, 32771, true, cap, true);
+    for (float magnitude : {0.1F, 1.8F})
+        add_case(suite, 8, 1, 32772, false, 512, magnitude, false, storage,
+                 std::numeric_limits<int>::max(), 12);
+    const std::string prefix = std::string("sparse_gqa_local/") + kv_cache_storage_name(storage);
+    suite.add(prefix + "/metadata_update",
+              [=] { return graph_update(cuda_environment().context, 33, 8, storage, true, 12); });
+    suite.add(prefix + "/gate_rounding",
+              [=] { return gate_rounding(cuda_environment().context, storage, 1, 1, 12); });
+    for (bool padded : {false, true})
+        suite.add(prefix + "/read_footprint/" + (padded ? "padded" : "contiguous"), [=] {
+            return read_footprint(cuda_environment().context, storage, padded, 4, 12);
+        });
+    if (storage != KvCacheStorage::BFloat16)
+        suite.add(prefix + "/scale_layout",
+                  [=] { return scale_layout(cuda_environment().context, storage, 256, 8192, 12); });
+    suite.add(prefix + "/capacity", [=] {
+        auto& device = cuda_environment().context;
+        int failures = 0;
+        for (int b : {1, 2, 4, 8}) {
+            std::size_t maximum = 0;
+            for (int t = 1; t <= 513; ++t)
+                maximum = std::max(
+                    maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                 storage, 12, 1, t, t, b, {262144}, device.multiprocessor_count()));
+            failures +=
+                maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                               storage, 12, 1, 1, 513, b, {262144}, device.multiprocessor_count());
+        }
+        for (auto [qh, kh] : {std::pair{12, 2}, {24, 1}, {8, 1}, {0, 0}})
+            failures += rejects([&] {
+                (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                    storage, qh, kh, 1, 16, 8, {262144}, device.multiprocessor_count());
+            });
+        return failures;
+    });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         add_cases(suite, storage);
+        add_local_cases(suite, storage);
+    }
     return suite.main(argc, argv);
 }

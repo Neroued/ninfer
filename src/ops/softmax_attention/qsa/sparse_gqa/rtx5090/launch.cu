@@ -5,51 +5,60 @@
 
 namespace ninfer::ops::detail::qsa {
 namespace {
-template <KvCacheStorage Storage, bool VectorCache>
-void launch(SparseGqaArguments a, SparseGqaPlan plan, SparseGqaLaunchPlan launch_plan, int queries,
-            CudaExecutionView execution) {
+template <KvCacheStorage Storage, bool VectorCache, int KvHeads>
+void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
+            SparseGqaLaunchPlan launch_plan, int queries, CudaExecutionView execution) {
+    SparseGqaKernelArguments<KvHeads> a{arguments};
     a.splits             = launch_plan.splits;
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
     if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
-        constexpr auto kernel = sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load>;
+        constexpr auto kernel =
+            sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load, KvHeads>;
         constexpr int bytes =
             (sizeof(SparseGqaStorage<Storage, 64, 4, load>) + 15) / 16 * 16 + 4 * 16 * 256 * 2;
         const int shared = common::prepare_shared<bytes, kernel, true>();
-        kernel<<<(queries + 3) / 4 * 2, 128, shared, execution.stream()>>>(a);
+        kernel<<<(queries + 3) / 4 * a.kv_heads, 128, shared, execution.stream()>>>(a);
     } else if (plan.instance == SparseGqaInstance::Simt) {
         sparse_gqa_simt_kernel<Storage, 8, VectorCache>
-            <<<dim3(queries * 24, a.splits), 256, 0, execution.stream()>>>(a);
+            <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
     } else if constexpr (Async) {
         if (launch_plan.load == SparseGqaLoad::InPlace)
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
-                <<<dim3(queries * 2, a.splits), 64,
+                <<<dim3(queries * a.kv_heads, a.splits), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::InPlace>),
                    execution.stream()>>>(a);
         else
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::Staged>
-                <<<dim3(queries * 2, a.splits), 64,
+                <<<dim3(queries * a.kv_heads, a.splits), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::Staged>),
                    execution.stream()>>>(a);
     } else {
         sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache>
-            <<<dim3(queries * 2, a.splits), 64, sizeof(SparseGqaStorage<Storage, 32, 2>),
+            <<<dim3(queries * a.kv_heads, a.splits), 64, sizeof(SparseGqaStorage<Storage, 32, 2>),
                execution.stream()>>>(a);
     }
     if (plan.partial)
-        sparse_gqa_merge_kernel<Storage><<<queries * 24, 128, 0, execution.stream()>>>(a);
+        sparse_gqa_merge_kernel<Storage>
+            <<<queries * a.query_heads, 128, 0, execution.stream()>>>(a);
 }
 
 } // namespace
 
-void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, SparseGqaPlan plan,
-                                SparseGqaLaunchPlan launch_plan, int queries,
+void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, int kv_heads,
+                                SparseGqaPlan plan, SparseGqaLaunchPlan launch_plan, int queries,
                                 CudaExecutionView execution) {
     const auto dispatch = [&]<KvCacheStorage Storage>() {
-        if (launch_plan.vector_cache)
-            launch<Storage, true>(a, plan, launch_plan, queries, execution);
+        const auto geometry = [&]<int KvHeads>() {
+            if (launch_plan.vector_cache)
+                launch<Storage, true, KvHeads>(a, plan, launch_plan, queries, execution);
+            else
+                launch<Storage, false, KvHeads>(a, plan, launch_plan, queries, execution);
+        };
+        if (kv_heads == 1)
+            geometry.template operator()<1>();
         else
-            launch<Storage, false>(a, plan, launch_plan, queries, execution);
+            geometry.template operator()<2>();
     };
     switch (storage) {
     case KvCacheStorage::BFloat16:

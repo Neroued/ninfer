@@ -37,9 +37,23 @@ struct SparseGqaArguments {
         const int tiles = (n + key_rows - 1) / key_rows;
         return {c, (p + 1) / 4, n, tiles, tiles < splits ? tiles : splits};
     }
+};
+
+// Head geometry stays constant through the contraction and output address calculations.
+template <int KvHeads>
+struct SparseGqaKernelArguments : SparseGqaArguments {
+    static constexpr int kv_heads = KvHeads, query_heads = 12 * KvHeads;
+
+    __device__ static unsigned group_query(unsigned x) { return x / kv_heads; }
+
+    __device__ static unsigned group_head(unsigned x) { return x % kv_heads; }
+
+    __device__ static unsigned head_query(unsigned x) { return x / query_heads; }
+
+    __device__ static unsigned head_index(unsigned x) { return x % query_heads; }
 
     __device__ std::int64_t partial_row(std::int64_t q, int split, int h) const {
-        return ((std::int64_t(split) * batch * tokens + q) * 24 + h);
+        return ((std::int64_t(split) * batch * tokens + q) * query_heads + h);
     }
 };
 

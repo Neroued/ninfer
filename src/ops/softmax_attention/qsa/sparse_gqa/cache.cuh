@@ -117,9 +117,10 @@ __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
 
 // Q is transformed only in registers and the existing shared prologue space. No A8/A4 operand
 // or additional global Q tensor is formed. Row order matches the MMA's padded 16-head tiles.
-template <KvCacheStorage Storage, int Warps, int Queries>
-__device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64_t first,
-                                         std::int64_t last, int head, std::uint16_t* target) {
+template <KvCacheStorage Storage, int Warps, int Queries, int KvHeads>
+__device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>& a,
+                                         std::int64_t first, std::int64_t last, int head,
+                                         std::uint16_t* target) {
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if constexpr (kSparseQuantized<Storage>) {
         for (int row = warp; row < Queries * 16; row += Warps) {
@@ -129,8 +130,8 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64
             if (q < last && h < 12) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
-                    values[i] =
-                        __bfloat162float(a.query[(q * 24 + head * 12 + h) * 256 + lane + 32 * i]);
+                    values[i] = __bfloat162float(
+                        a.query[(q * a.query_heads + head * 12 + h) * 256 + lane + 32 * i]);
                 kv::normalized_hadamard_d256_inplace(values, lane);
             }
 #pragma unroll
@@ -143,8 +144,8 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64
             const int row = i / 32, d = i % 32 * 8, h = row % 16;
             auto* dst = target + row * 256 + common::swizzle_xor_64(row, d);
             if (first + row / 16 < last && h < 12)
-                common::cp_async<16>(dst,
-                                     a.query + ((first + row / 16) * 24 + head * 12 + h) * 256 + d);
+                common::cp_async<16>(
+                    dst, a.query + ((first + row / 16) * a.query_heads + head * 12 + h) * 256 + d);
             else
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
         }

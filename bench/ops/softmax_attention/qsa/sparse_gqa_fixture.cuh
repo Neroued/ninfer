@@ -13,15 +13,17 @@
 
 namespace ninfer::bench::qsa {
 
-// Every storage profile starts with the same represented BF16 source values. The public append
-// codec initializes persistent bytes outside the timer; the benchmark owns only plane copying.
-__global__ void initialize_sparse_source(__nv_bfloat16* words, std::size_t count, bool value) {
+// Every storage profile starts with the same represented BF16 source values. Existing row
+// codecs initialize persistent bytes outside timing; the benchmark owns plane copying.
+__global__ void initialize_sparse_source(__nv_bfloat16* words, std::size_t count, bool value,
+                                         int heads) {
     const unsigned seed = value ? 1311u : 701u;
     for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
          i += std::size_t(gridDim.x) * blockDim.x) {
-        const auto token = i / 512;
-        unsigned x =
-            unsigned((token / 64 * 2 + i / 256 % 2) * 64 * 256 + token % 64 * 256 + i % 256) + seed;
+        const auto token = i / (256 * heads);
+        unsigned x = unsigned((token / 64 * heads + i / 256 % heads) * 64 * 256 + token % 64 * 256 +
+                              i % 256) +
+                     seed;
         x ^= x >> 16;
         x *= 0x7feb352dU;
         x ^= x >> 15;
@@ -33,13 +35,27 @@ __global__ void initialize_sparse_source(__nv_bfloat16* words, std::size_t count
 
 __global__ void copy_sparse_plane(const std::uint8_t* src, std::uint8_t* dst, int row_bytes,
                                   std::int64_t row_stride, std::int64_t head_stride,
-                                  std::int64_t page_stride, std::size_t bytes) {
+                                  std::int64_t page_stride, std::size_t bytes, int heads) {
     for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < bytes;
          i += std::size_t(gridDim.x) * blockDim.x) {
-        const auto row     = i / row_bytes;
-        dst[row / 128 * page_stride + row / 64 % 2 * head_stride + row % 64 * row_stride +
-            i % row_bytes] = src[i];
+        const auto row         = i / row_bytes;
+        const auto encoded_row = heads == 1 ? row / 128 * 128 + row % 2 * 64 + row / 2 % 64 : row;
+        dst[row / (64 * heads) * page_stride + row / 64 % heads * head_stride +
+            row % 64 * row_stride + i % row_bytes] = src[encoded_row * row_bytes + i % row_bytes];
     }
+}
+
+inline std::vector<int> sparse_contexts(const Options& o, int tokens) {
+    if (o.prefixes.empty()) return broadcast(o.contexts, o.batch);
+    auto result      = broadcast(o.prefixes, o.batch);
+    const auto valid = o.valid == "dense" ? std::vector<int>(o.batch, tokens)
+                                          : broadcast(measurement::integers(o.valid, 0), o.batch);
+    for (int b = 0; b < o.batch; ++b) {
+        if (valid[b] > 262144 || result[b] > 262144 - valid[b])
+            throw std::invalid_argument("prefix/valid exceeds maximum context");
+        result[b] += valid[b];
+    }
+    return result;
 }
 
 struct SparseGqaFixture {
@@ -68,7 +84,7 @@ struct SparseGqaFixture {
     std::size_t active_queries = 0, selected_ids = 0, table_entries = 0, active_rows = 0;
 
     SparseGqaFixture(const Options& o, int tokens, CudaExecutionView execution)
-        : contexts(broadcast(o.contexts, o.batch)),
+        : contexts(sparse_contexts(o, tokens)),
           lengths(o.valid == "dense" ? std::vector<int>(o.batch, tokens)
                                      : broadcast(measurement::integers(o.valid, 0), o.batch)) {
         envelope.max_visible_tokens = o.context_capacity_explicit
@@ -84,20 +100,20 @@ struct SparseGqaFixture {
                 throw std::invalid_argument("invalid sparse context/valid length");
             pages += (contexts[b] + 63) / 64;
         }
-        query_data          = make_bf16(std::size_t(6144) * tokens * B, 101, -1.5f, 1.5f);
-        gate_data           = make_bf16(std::size_t(6144) * tokens * B, 103, -4.f, 4.f);
-        output_data         = make_zeros(query_data.size());
+        query_data  = make_bf16(std::size_t(256 * o.query_heads) * tokens * B, 101, -1.5f, 1.5f);
+        gate_data   = make_bf16(std::size_t(256 * o.query_heads) * tokens * B, 103, -4.f, 4.f);
+        output_data = make_zeros(query_data.size());
         const auto layout   = paged_kv_storage_layout(o.storage, 256);
-        token_bytes         = 2 * layout.physical_bytes_per_token_head();
+        token_bytes         = o.kv_heads * layout.physical_bytes_per_token_head();
         const auto allocate = [&](DeviceBuffer& storage, DType dtype, int features) {
             if (!features) return Tensor{};
             const int element = dtype_size(dtype);
             const int leading = o.layout == "unaligned" ? element : 0;
             const int row     = features * element + leading;
-            const int head = 64 * row, page = 2 * head * (o.layout == "layered" ? 2 : 1);
+            const int head = 64 * row, page = o.kv_heads * head * (o.layout == "layered" ? 2 : 1);
             storage = DeviceBuffer(ninfer::bench::device_context().device(),
                                    std::size_t(page) * pages + leading);
-            Tensor view(storage.span().subspan(leading), dtype, {features, 64, 2, pages});
+            Tensor view(storage.span().subspan(leading), dtype, {features, 64, o.kv_heads, pages});
             view.nb[1] = row;
             view.nb[2] = head;
             view.nb[3] = page;
@@ -113,42 +129,56 @@ struct SparseGqaFixture {
         {
             const int rows = pages * 64;
             DeviceBuffer raw_key(ninfer::bench::device_context().device(),
-                                 std::size_t(rows) * 512 * 2);
+                                 std::size_t(rows) * 256 * o.kv_heads * 2);
             DeviceBuffer raw_value(ninfer::bench::device_context().device(), raw_key.size());
             initialize_sparse_source<<<1024, 256, 0, execution.stream()>>>(
-                static_cast<__nv_bfloat16*>(raw_key.data()), raw_key.size() / 2, false);
+                static_cast<__nv_bfloat16*>(raw_key.data()), raw_key.size() / 2, false, o.kv_heads);
             initialize_sparse_source<<<1024, 256, 0, execution.stream()>>>(
-                static_cast<__nv_bfloat16*>(raw_value.data()), raw_value.size() / 2, true);
+                static_cast<__nv_bfloat16*>(raw_value.data()), raw_value.size() / 2, true,
+                o.kv_heads);
             std::vector<int> coordinates(rows), mapping(pages);
             std::iota(coordinates.begin(), coordinates.end(), 0);
             std::iota(mapping.begin(), mapping.end(), 0);
             auto source_positions = measurement::make_i32(coordinates),
                  identity_table   = measurement::make_i32(mapping);
             CUDA_CHECK(cudaStreamSynchronize(nullptr));
+            // The public append codec accepts two heads. Pair adjacent source rows when
+            // preparing a one-head fixture, then restore their row order during the copy.
+            const int encoded_tokens = rows * o.kv_heads / 2;
+            const int encoded_pages  = (encoded_tokens + 63) / 64;
             Tensor contiguous[4];
             DeviceBuffer buffers[4];
             const Tensor planes[]{key, value, ks, vs};
             for (int i = 0; i < 4; ++i) {
                 if (!planes[i].data) continue;
-                buffers[i] =
-                    DeviceBuffer(ninfer::bench::device_context().device(), planes[i].bytes());
-                contiguous[i] =
-                    Tensor(buffers[i].span(), planes[i].dtype, {planes[i].ne[0], 64, 2, pages});
+                buffers[i]    = DeviceBuffer(ninfer::bench::device_context().device(),
+                                             std::size_t(planes[i].ne[0]) *
+                                                 dtype_size(planes[i].dtype) * 64 * 2 * encoded_pages);
+                contiguous[i] = Tensor(buffers[i].span(), planes[i].dtype,
+                                       {planes[i].ne[0], 64, 2, encoded_pages});
             }
-            ops::kv_cache_append(Tensor(raw_key.span(), DType::BF16, {256, 2, rows}),
-                                 Tensor(raw_value.span(), DType::BF16, {256, 2, rows}),
-                                 Tensor(source_positions.span(), DType::I32, {rows}),
-                                 {contiguous[0], contiguous[1], contiguous[2], contiguous[3],
-                                  Tensor(identity_table.span(), DType::I32, {pages}), 256, 2,
-                                  o.storage},
-                                 execution);
+            const auto source_k = Tensor(raw_key.span(), DType::BF16, {256, 2, encoded_tokens});
+            const auto source_v = Tensor(raw_value.span(), DType::BF16, {256, 2, encoded_tokens});
+            const auto pos      = Tensor(source_positions.span(), DType::I32, {encoded_tokens});
+            const PagedKVLayerView encoded{
+                contiguous[0],
+                contiguous[1],
+                contiguous[2],
+                contiguous[3],
+                Tensor(identity_table.span(), DType::I32, {encoded_pages}),
+                256,
+                2,
+                o.storage};
+            ops::kv_cache_append(source_k, source_v, pos, encoded, execution);
             for (int i = 0; i < 4; ++i) {
                 if (!planes[i].data) continue;
                 copy_sparse_plane<<<1024, 256, 0, execution.stream()>>>(
                     static_cast<const std::uint8_t*>(contiguous[i].data),
                     static_cast<std::uint8_t*>(planes[i].data),
                     planes[i].ne[0] * dtype_size(planes[i].dtype), planes[i].nb[1], planes[i].nb[2],
-                    planes[i].nb[3], contiguous[i].bytes());
+                    planes[i].nb[3],
+                    std::size_t(rows) * o.kv_heads * planes[i].ne[0] * dtype_size(planes[i].dtype),
+                    o.kv_heads);
             }
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
@@ -220,17 +250,18 @@ struct SparseGqaFixture {
         tables     = measurement::make_i32(table);
         ids        = measurement::make_i32(block_ids);
         counts     = measurement::make_i32(block_counts);
-        query      = Tensor(query_data.span(), DType::BF16, {256, 24, tokens, B});
-        gate       = Tensor(gate_data.span(), DType::BF16, {256, 24, tokens, B});
-        out        = Tensor(output_data.span(), DType::BF16, {256, 24, tokens, B});
-        cache      = {key, value, ks,       vs, Tensor(tables.span(), DType::I32, {logical, B}),
-                      256, 2,     o.storage};
-        batch      = {Tensor(positions.span(), DType::I32, {tokens, B}),
-                      Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
-        selected   = {Tensor(ids.span(), DType::I32, {512, tokens, B}),
-                      Tensor(counts.span(), DType::I32, {tokens, B})};
+        query      = Tensor(query_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
+        gate       = Tensor(gate_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
+        out        = Tensor(output_data.span(), DType::BF16, {256, o.query_heads, tokens, B});
+        cache    = {key, value,      ks,       vs, Tensor(tables.span(), DType::I32, {logical, B}),
+                    256, o.kv_heads, o.storage};
+        batch    = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                    Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
+        selected = {Tensor(ids.span(), DType::I32, {512, tokens, B}),
+                    Tensor(counts.span(), DType::I32, {tokens, B})};
         workspace_bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-            cache.storage, tokens, tokens, B, envelope, execution.multiprocessor_count());
+            cache.storage, o.query_heads, o.kv_heads, tokens, tokens, B, envelope,
+            execution.multiprocessor_count());
         workspace_storage =
             DeviceBuffer(execution.device(), std::max<std::size_t>(256, workspace_bytes));
         workspace.emplace(workspace_storage.span());

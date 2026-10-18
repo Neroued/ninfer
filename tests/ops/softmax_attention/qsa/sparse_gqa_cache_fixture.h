@@ -12,11 +12,11 @@ struct EncodedPlane {
     GuardedDeviceBuffer device;
     Tensor view;
 
-    EncodedPlane(int features, DType dtype, int pages, bool padded)
+    EncodedPlane(int features, DType dtype, int pages, bool padded, int heads = 2)
         : leading(padded ? dtype_size(dtype) : 0), element(dtype_size(dtype)),
           row(features * element + (padded ? element : 0)), head(64 * row + leading),
-          page(2 * head + leading), host(leading + page * pages, 0xcd), device(host.size()),
-          view(device.span().subspan(leading), dtype, {features, 64, 2, pages}) {
+          page(heads * head + leading), host(leading + page * pages, 0xcd), device(host.size()),
+          view(device.span().subspan(leading), dtype, {features, 64, heads, pages}) {
         view.nb[1] = row;
         view.nb[2] = head;
         view.nb[3] = page;
@@ -39,16 +39,17 @@ struct EncodedVector {
     prepare::VectorEncoding format;
     EncodedPlane data, scales;
 
-    EncodedVector(prepare::VectorEncoding fmt, int pages, bool padded, bool padded_scales = false)
-        : format(fmt), data(fmt.data_extent, fmt.data_dtype, pages, padded),
-          scales(fmt.scale_extent, fmt.scale_dtype, pages, padded || padded_scales) {}
+    EncodedVector(prepare::VectorEncoding fmt, int pages, bool padded, bool padded_scales = false,
+                  int heads = 2)
+        : format(fmt), data(fmt.data_extent, fmt.data_dtype, pages, padded, heads),
+          scales(fmt.scale_extent, fmt.scale_dtype, pages, padded || padded_scales, heads) {}
 
     template <class Source>
     void encode(const Source& source) {
         std::fill(data.host.begin(), data.host.end(), 0xcd);
         std::fill(scales.host.begin(), scales.host.end(), 0xcd);
         for (int p = 0; p < data.view.ne[3]; ++p)
-            for (int h = 0; h < 2; ++h)
+            for (int h = 0; h < data.view.ne[2]; ++h)
                 for (int r = 0; r < 64; ++r) {
                     const auto first   = source.host[source.offset(0, h, r, p)];
                     const auto initial = source.view.dtype == DType::BF16

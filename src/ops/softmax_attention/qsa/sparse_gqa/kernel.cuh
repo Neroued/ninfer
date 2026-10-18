@@ -8,8 +8,8 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
-__device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+__device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads> a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                std::int64_t q, int head, int split) {
     constexpr int NK = N / Warps, QKNt = NK / 8, PVKs = NK / 16;
@@ -21,8 +21,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     if (work.size == 0) {
         if (a.numerator == nullptr)
             for (int i = tid; i < 12 * 128; i += Warps * 32)
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + i / 128) * 256 +
-                                             (i % 128) * 2) = 0;
+                *reinterpret_cast<unsigned*>(
+                    a.out + (q * a.query_heads + head * 12 + i / 128) * 256 + (i % 128) * 2) = 0;
         return;
     }
     if (split >= work.splits) return;
@@ -200,8 +200,9 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     }
 }
 
-template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load>
-__device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
+template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load,
+          int KvHeads>
+__device__ __forceinline__ void sparse_gqa_compute(SparseGqaKernelArguments<KvHeads> a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                    std::int64_t q, int head, int split) {
     sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split);
@@ -216,21 +217,22 @@ __device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
-__launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArguments a) {
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+__launch_bounds__(Warps * 32) __global__
+    void sparse_gqa_mma_kernel(SparseGqaKernelArguments<KvHeads> a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
-    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(a, s, a.begin + blockIdx.x / 2,
-                                                             blockIdx.x % 2, blockIdx.y);
+    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
+        a, s, a.begin + a.group_query(blockIdx.x), a.group_head(blockIdx.x), blockIdx.y);
 }
 
-template <KvCacheStorage Storage>
-__global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
-    const auto q = a.begin + blockIdx.x / 24;
-    const int h = blockIdx.x % 24, d = threadIdx.x * 2;
+template <KvCacheStorage Storage, int KvHeads>
+__global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads> a) {
+    const auto q = a.begin + a.head_query(blockIdx.x);
+    const int h = a.head_index(blockIdx.x), d = threadIdx.x * 2;
     const auto work = a.work(q);
     if (!work.size) {
-        *reinterpret_cast<unsigned*>(a.out + (q * 24 + h) * 256 + d) = 0;
+        *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + h) * 256 + d) = 0;
         return;
     }
     __shared__ float weights[64], denominator;

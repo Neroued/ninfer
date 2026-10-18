@@ -6,16 +6,16 @@
 
 namespace ninfer::ops::detail::qsa {
 template <KvCacheStorage Storage, int N, int Parts, bool Vector, SparseGqaLoad Load,
-          int PrefixQueries = 0>
+          int PrefixQueries = 0, int KvHeads>
 __launch_bounds__(Parts * 32) __global__
-    void sparse_gqa_columns_kernel(const __grid_constant__ SparseGqaArguments a) {
+    void sparse_gqa_columns_kernel(const __grid_constant__ SparseGqaKernelArguments<KvHeads> a) {
     static_assert(N >= 16 && N % 16 == 0 && Parts > 0 && 256 % (Parts * 8) == 0);
     extern __shared__ __align__(16) unsigned char shared[];
     auto& s =
         *reinterpret_cast<SparseGqaStorage<Storage, N, Parts, Load, SparseGqaWarpSplit::Output>*>(
             shared);
-    const auto q   = a.begin + blockIdx.x / 2;
-    const int head = blockIdx.x % 2, split = blockIdx.y;
+    const auto q   = a.begin + a.group_query(blockIdx.x);
+    const int head = a.group_head(blockIdx.x), split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if constexpr (PrefixQueries > 0) {
         const auto first = a.begin + (q - a.begin) / PrefixQueries * PrefixQueries;
@@ -25,8 +25,8 @@ __launch_bounds__(Parts * 32) __global__
     if (work.size == 0) {
         if (a.numerator == nullptr)
             for (int i = tid; i < 12 * 128; i += Parts * 32)
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + i / 128) * 256 +
-                                             (i % 128) * 2) = 0;
+                *reinterpret_cast<unsigned*>(
+                    a.out + (q * a.query_heads + head * 12 + i / 128) * 256 + (i % 128) * 2) = 0;
         return;
     }
     if (split >= work.splits) return;

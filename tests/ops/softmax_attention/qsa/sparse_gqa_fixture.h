@@ -32,10 +32,10 @@ struct Plane {
     GuardedDeviceBuffer device;
     Tensor view;
 
-    Plane(int pages, DType dtype, int padding)
+    Plane(int pages, DType dtype, int padding, int heads = 2)
         : leading(padding ? 1 : 0), row(256 + padding), head(64 * row + padding),
-          page(2 * head + padding), host(leading + page * pages), device(host.size() * 2),
-          view(device.span().subspan(leading * 2), dtype, {256, 64, 2, pages}) {
+          page(heads * head + padding), host(leading + page * pages), device(host.size() * 2),
+          view(device.span().subspan(leading * 2), dtype, {256, 64, heads, pages}) {
         view.nb[1] = row * 2;
         view.nb[2] = head * 2;
         view.nb[3] = page * 2;
@@ -47,8 +47,9 @@ struct Plane {
 };
 
 struct Fixture {
-    int T, B, history, table_width, table_stride, pages;
-    int live_limit = std::numeric_limits<int>::max();
+    int T, B, q_heads, kv_heads, history, table_width, table_stride, pages;
+    bool dense_rows = false;
+    int live_limit  = std::numeric_limits<int>::max();
     std::vector<std::uint16_t> qhost, ghost;
     std::vector<int> positions, valid, selectors, tables, ids, counts;
     std::vector<std::vector<int>> visible;
@@ -63,29 +64,31 @@ struct Fixture {
     ops::QsaSparseGqaExecutionEnvelope envelope;
 
     Fixture(int tokens, int batch_size, int max_history, bool padded,
-            KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false)
-        : T(tokens), B(batch_size), history(max_history), table_width((history + 63) / 64),
+            KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false,
+            int query_heads = 24)
+        : T(tokens), B(batch_size), q_heads(query_heads), kv_heads(query_heads / 12),
+          history(max_history), table_width((history + 63) / 64),
           table_stride(table_width + (padded ? 3 : 0)), pages(std::min(table_width, 521) * B + 2),
-          qhost(std::size_t(T) * B * 6144), ghost(qhost.size()), positions(T * B), valid(B),
-          selectors(B), tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512),
-          counts(T * B), visible(T * B), keys(pages, DType::BF16, padded ? 1 : 0),
-          values(pages, DType::FP16, padded ? 3 : 0), storage(format), q(qhost.size() * 2),
-          gate(ghost.size() * 2), out(qhost.size() * 2), pos(positions.size() * 4), lengths(B * 4),
-          rows(B * 4), table(tables.size() * 4), selections(ids.size() * 4),
-          sizes(counts.size() * 4) {
+          qhost(std::size_t(T) * B * (256 * q_heads)), ghost(qhost.size()), positions(T * B),
+          valid(B), selectors(B), tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512),
+          counts(T * B), visible(T * B), keys(pages, DType::BF16, padded ? 1 : 0, kv_heads),
+          values(pages, DType::FP16, padded ? 3 : 0, kv_heads), storage(format),
+          q(qhost.size() * 2), gate(ghost.size() * 2), out(qhost.size() * 2),
+          pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 4),
+          selections(ids.size() * 4), sizes(counts.size() * 4) {
         envelope.max_visible_tokens = history;
-        query                       = Tensor(q.span(), DType::BF16, {256, 24, T, B});
-        output_gate                 = Tensor(gate.span(), DType::BF16, {256, 24, T, B});
-        output                      = Tensor(out.span(), DType::BF16, {256, 24, T, B});
+        query                       = Tensor(q.span(), DType::BF16, {256, q_heads, T, B});
+        output_gate                 = Tensor(gate.span(), DType::BF16, {256, q_heads, T, B});
+        output                      = Tensor(out.span(), DType::BF16, {256, q_heads, T, B});
         Tensor bt(table.span(), DType::I32, {table_width, B + 1});
         bt.nb[1] = table_stride * 4;
-        cache    = {keys.view, values.view, {}, {}, bt, 256, 2, KvCacheStorage::BFloat16};
+        cache    = {keys.view, values.view, {}, {}, bt, 256, kv_heads, KvCacheStorage::BFloat16};
         if (storage != KvCacheStorage::BFloat16) {
             const auto formats = prepare::cache_encoding(storage);
-            encoded_key =
-                std::make_unique<EncodedVector>(formats.key, pages, padded, padded_scales);
-            encoded_value =
-                std::make_unique<EncodedVector>(formats.value, pages, padded, padded_scales);
+            encoded_key = std::make_unique<EncodedVector>(formats.key, pages, padded, padded_scales,
+                                                          kv_heads);
+            encoded_value       = std::make_unique<EncodedVector>(formats.value, pages, padded,
+                                                                  padded_scales, kv_heads);
             cache.k_pages       = encoded_key->data.view;
             cache.v_pages       = encoded_value->data.view;
             cache.k_scale_pages = encoded_key->scales.view;
@@ -147,8 +150,8 @@ struct Fixture {
                 for (int j = C * 4; j <= p; ++j) visible[m].push_back(j);
                 std::sort(visible[m].begin(), visible[m].end());
                 if (visible[m].empty()) continue;
-                for (int i = 0; i < 6144; ++i) {
-                    const auto index = std::size_t(m) * 6144 + i;
+                for (int i = 0; i < (256 * q_heads); ++i) {
+                    const auto index = std::size_t(m) * (256 * q_heads) + i;
                     qhost[index]     = f32_to_bf16(sample(index + 711 + phase) * magnitude);
                     ghost[index]     = f32_to_bf16(sample(index + 129 + phase) * 4);
                 }
@@ -161,7 +164,7 @@ struct Fixture {
         for (int row = 0; row < pages * 64; ++row) {
             if (!populated[row]) continue;
             const int page = row / 64, token = row % 64;
-            for (int h = 0; h < 2; ++h)
+            for (int h = 0; h < kv_heads; ++h)
                 for (int d = 0; d < 256; ++d) {
                     const auto seed = std::uint32_t((page * 128 + h * 64 + token) * 256 + d);
                     keys.host[keys.offset(d, h, token, page)] =
@@ -219,7 +222,7 @@ struct Fixture {
                     if (t < live) result.queries.push_back(b * T + t);
             }
         }
-        result.values.resize(result.queries.size() * 6144);
+        result.values.resize(result.queries.size() * (256 * q_heads));
         std::vector<int> row_indices(std::size_t(pages) * 64, -1);
         std::vector<int> rows;
         for (int m : result.queries)
@@ -230,25 +233,29 @@ struct Fixture {
                 row_indices[row] = int(rows.size());
                 rows.push_back(row);
             }
-        std::vector<double> decoded_keys(rows.size() * 512), decoded_values(decoded_keys.size());
-        parallel_rows(int(rows.size()), std::uint64_t(rows.size()) * 512, [&](int first, int last) {
-            for (int i = first; i < last; ++i)
-                for (int h = 0; h < 2; ++h)
-                    for (int d = 0; d < 256; ++d) {
-                        const int page = rows[i] / 64, token = rows[i] % 64;
-                        const auto index = std::size_t(i) * 512 + h * 256 + d;
-                        decoded_keys[index] =
-                            encoded_key
-                                ? encoded_key->decode(d, h, token, page)
-                                : double(bf16_to_f32(keys.host[keys.offset(d, h, token, page)]));
-                        decoded_values[index] =
-                            encoded_value
-                                ? encoded_value->decode(d, h, token, page)
-                                : double(unhalf(values.host[values.offset(d, h, token, page)]));
-                    }
-        });
+        std::vector<double> decoded_keys(rows.size() * (256 * kv_heads)),
+            decoded_values(decoded_keys.size());
         parallel_rows(
-            int(result.queries.size()), std::uint64_t(result.queries.size()) * 6144 * 2048,
+            int(rows.size()), std::uint64_t(rows.size()) * (256 * kv_heads),
+            [&](int first, int last) {
+                for (int i = first; i < last; ++i)
+                    for (int h = 0; h < kv_heads; ++h)
+                        for (int d = 0; d < 256; ++d) {
+                            const int page = rows[i] / 64, token = rows[i] % 64;
+                            const auto index = std::size_t(i) * (256 * kv_heads) + h * 256 + d;
+                            decoded_keys[index] =
+                                encoded_key ? encoded_key->decode(d, h, token, page)
+                                            : double(bf16_to_f32(
+                                                  keys.host[keys.offset(d, h, token, page)]));
+                            decoded_values[index] =
+                                encoded_value
+                                    ? encoded_value->decode(d, h, token, page)
+                                    : double(unhalf(values.host[values.offset(d, h, token, page)]));
+                        }
+            });
+        parallel_rows(
+            int(result.queries.size()),
+            std::uint64_t(result.queries.size()) * (256 * q_heads) * 2048,
             [&](int first, int last) {
                 for (int qi = first; qi < last; ++qi) {
                     const int m = result.queries[qi];
@@ -258,37 +265,40 @@ struct Fixture {
                         const int page = tables[selectors[m / T] * table_stride + token / 64];
                         kv_rows.push_back(row_indices[page * 64 + token % 64]);
                     }
-                    std::array<double, 6144> transformed_query;
-                    for (int h = 0; h < 24; ++h) {
+                    std::vector<double> transformed_query(256 * q_heads);
+                    for (int h = 0; h < q_heads; ++h) {
                         std::array<double, 256> row;
                         for (int d = 0; d < 256; ++d)
-                            row[d] = bf16_to_f32(qhost[(std::size_t(m) * 24 + h) * 256 + d]);
+                            row[d] = bf16_to_f32(qhost[(std::size_t(m) * q_heads + h) * 256 + d]);
                         if (encoded_key) prepare::hadamard(row);
                         std::copy(row.begin(), row.end(), transformed_query.begin() + h * 256);
                     }
                     naive_dense_softmax_attention(
-                        {256, 24, 2}, 1, int(visible[m].size()), 1.0 / 16,
+                        {256, q_heads, kv_heads}, 1, int(visible[m].size()), 1.0 / 16,
                         [&](int d, int h, int) { return transformed_query[h * 256 + d]; },
                         [&](int d, int h, int j) {
-                            return decoded_keys[std::size_t(kv_rows[j]) * 512 + h * 256 + d];
+                            return decoded_keys[std::size_t(kv_rows[j]) * (256 * kv_heads) +
+                                                h * 256 + d];
                         },
                         [&](int d, int h, int j) {
-                            return decoded_values[std::size_t(kv_rows[j]) * 512 + h * 256 + d];
+                            return decoded_values[std::size_t(kv_rows[j]) * (256 * kv_heads) +
+                                                  h * 256 + d];
                         },
                         [](int, int) { return true; },
                         [&](int d, int h, int, double x) {
-                            result.values[(std::size_t(qi) * 24 + h) * 256 + d] = x;
+                            result.values[(std::size_t(qi) * q_heads + h) * 256 + d] = x;
                         },
                         result.queries.size() == 1);
-                    for (int h = 0; h < 24; ++h) {
-                        const auto base = (std::size_t(qi) * 24 + h) * 256;
+                    for (int h = 0; h < q_heads; ++h) {
+                        const auto base = (std::size_t(qi) * q_heads + h) * 256;
                         std::array<double, 256> row;
                         std::copy_n(result.values.begin() + base, 256, row.begin());
                         if (encoded_value && encoded_value->format.rotate) prepare::hadamard(row);
                         for (int d = 0; d < 256; ++d)
                             result.values[base + d] =
-                                row[d] / (1.0 + std::exp(-double(bf16_to_f32(
-                                                    ghost[(std::size_t(m) * 24 + h) * 256 + d]))));
+                                row[d] /
+                                (1.0 + std::exp(-double(bf16_to_f32(
+                                           ghost[(std::size_t(m) * q_heads + h) * 256 + d]))));
                     }
                 }
             });

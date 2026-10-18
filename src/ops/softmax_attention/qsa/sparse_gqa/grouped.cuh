@@ -4,10 +4,10 @@
 #include "ops/softmax_attention/kernels/softmax.cuh"
 
 namespace ninfer::ops::detail::qsa {
-template <KvCacheStorage Storage, int N, int Parts, int Queries, bool Vector, SparseGqaLoad Load>
-__global__
-__launch_bounds__(Queries* Parts *
-                  24) void sparse_gqa_grouped_kernel(const __grid_constant__ SparseGqaArguments a) {
+template <KvCacheStorage Storage, int N, int Parts, int Queries, bool Vector, SparseGqaLoad Load,
+          int KvHeads>
+__global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel(
+    const __grid_constant__ SparseGqaKernelArguments<KvHeads> a) {
     static_assert(Queries % 4 == 0 && N % 16 == 0 && 256 % (Parts * 8) == 0);
     // Twelve heads per query occupy consecutive MMA rows, without per-query padding.
     constexpr int Rows = Queries * 12, Warps = Rows / 16 * Parts, Columns = 256 / Parts / 8;
@@ -15,9 +15,9 @@ __launch_bounds__(Queries* Parts *
     using Tile = SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Output>;
     auto& s    = *reinterpret_cast<Tile*>(packed_smem);
     auto* qs   = reinterpret_cast<std::uint16_t*>(packed_smem + (sizeof(Tile) + 15) / 16 * 16);
-    const auto first = a.begin + std::int64_t(blockIdx.x / 2) * Queries,
+    const auto first = a.begin + std::int64_t(a.group_query(blockIdx.x)) * Queries,
                total = std::int64_t(a.tokens) * a.batch;
-    const int head = blockIdx.x % 2, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int head = a.group_head(blockIdx.x), tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if (!sparse_gqa_all_selected<Queries>(a, first)) return;
     const int b     = first / a.tokens;
     const auto last = min(first + Queries, std::int64_t(b) * a.tokens + a.valid[b]);
@@ -30,8 +30,8 @@ __launch_bounds__(Queries* Parts *
             if (q < last) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
-                    values[i] =
-                        __bfloat162float(a.query[(q * 24 + head * 12 + h) * 256 + lane + 32 * i]);
+                    values[i] = __bfloat162float(
+                        a.query[(q * a.query_heads + head * 12 + h) * 256 + lane + 32 * i]);
                 kv::normalized_hadamard_d256_inplace(values, lane);
             }
 #pragma unroll
@@ -45,7 +45,8 @@ __launch_bounds__(Queries* Parts *
             auto* dst    = qs + row * 256 + common::swizzle_xor_64(row, d);
             const auto q = first + row / 12;
             if (q < last)
-                common::cp_async<16>(dst, a.query + (q * 24 + head * 12 + row % 12) * 256 + d);
+                common::cp_async<16>(dst, a.query +
+                                              (q * a.query_heads + head * 12 + row % 12) * 256 + d);
             else
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
         }
@@ -166,7 +167,8 @@ __launch_bounds__(Queries* Parts *
                     sparse_gqa_store(a, q, head * 12 + h, d, acc[n][2 * j] * inv,
                                      acc[n][2 * j + 1] * inv);
             } else
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + h) * 256 + d) = 0;
+                *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + head * 12 + h) * 256 +
+                                             d) = 0;
         }
     }
     if constexpr (kSparseRotatedValue<Storage>) {

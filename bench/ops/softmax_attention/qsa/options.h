@@ -19,14 +19,14 @@ inline const char* name(Projection p) {
     throw std::invalid_argument("invalid QSA projection");
 }
 
-inline std::vector<int> segments(Projection p) {
+inline std::vector<int> segments(Projection p, int kv_heads) {
     switch (p) {
     case Projection::QueryGate:
-        return {6144, 6144};
+        return {3072 * kv_heads, 3072 * kv_heads};
     case Projection::KeyValueIndex:
-        return {512, 512, 512, 128};
+        return {256 * kv_heads, 256 * kv_heads, 512, 128};
     case Projection::Joint:
-        return {6144, 512, 6144, 512, 512, 128};
+        return {3072 * kv_heads, 256 * kv_heads, 3072 * kv_heads, 256 * kv_heads, 512, 128};
     }
     throw std::invalid_argument("invalid QSA projection");
 }
@@ -66,13 +66,14 @@ struct Options {
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
     int axes     = 1;
+    int kv_heads = 2;
     bool inplace = false;
 };
 
 inline Options parse_options(int argc, char** argv) {
     Options o;
     bool token_options = false, state_options = false;
-    bool projection_only = false, tail_only = false, prepare_only = false;
+    bool projection_only = false, tail_only = false, prepare_only = false, head_options = false;
     bool indexer_only = false, base_options = false, sparse_only = false, cache_option = false;
     bool score_option = false;
     for (int i = 1; i < argc; ++i) {
@@ -82,6 +83,7 @@ inline Options parse_options(int argc, char** argv) {
                          "  --op input-proj|tail-extract|prepare|indexer|sparse-gqa (default "
                          "input-proj)\n"
                          "  --projection qg|kv-index|qkgv-index|all\n"
+                         "  --kv-heads 1|2 (input projection/prepare, default 2)\n"
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
                          "Prepare: --tokens T[,T...] --batch B --axes 1|3 --inplace\n"
@@ -112,6 +114,7 @@ inline Options parse_options(int argc, char** argv) {
         state_options |= flag == "--batch" || flag == "--base-positions" || flag == "--valid" ||
                          flag == "--layout";
         projection_only |= flag == "--entry" || flag == "--projection";
+        head_options |= flag == "--kv-heads";
         tail_only |= flag == "--capacity" || flag == "--accepted";
         prepare_only |= flag == "--axes";
         cache_option |= flag == "--kv-cache";
@@ -143,7 +146,9 @@ inline Options parse_options(int argc, char** argv) {
                     matched   = true;
                 }
             if (!matched) throw std::invalid_argument("kv-cache: bf16|int8|fp8|nvfp4|k8v4");
-        } else if (flag == "--axes")
+        } else if (flag == "--kv-heads")
+            o.kv_heads = measurement::integer(value, 1, 2);
+        else if (flag == "--axes")
             o.axes = measurement::integer(value);
         else if (flag == "--capacity")
             o.capacities = measurement::integers(value);
@@ -186,7 +191,8 @@ inline Options parse_options(int argc, char** argv) {
     if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare" && o.op != "indexer" &&
         o.op != "sparse-gqa")
         throw std::invalid_argument("op: input-proj|tail-extract|prepare|indexer|sparse-gqa");
-    if ((o.op != "indexer" && score_option) ||
+    if ((o.op != "input-proj" && o.op != "prepare" && head_options) ||
+        (o.op != "indexer" && score_option) ||
         (o.op != "prepare" && o.op != "sparse-gqa" && cache_option) ||
         (o.op != "sparse-gqa" && sparse_only) ||
         (o.op == "sparse-gqa" &&

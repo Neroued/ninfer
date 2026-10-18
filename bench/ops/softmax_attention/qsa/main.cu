@@ -51,11 +51,12 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
         row.tokens         = tokens;
         row.batch          = options.batch;
         row.valid          = qsa::csv_list(fixture.counts);
-        row.qk_heads       = 24;
-        row.value_heads    = 2;
+        row.qk_heads       = 12 * options.kv_heads;
+        row.value_heads    = options.kv_heads;
         const auto metrics = qsa::prepare_metrics(
-            tokens, options.axes, fixture.bases, fixture.counts,
-            2 * paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head());
+            tokens, options.axes, options.kv_heads, fixture.bases, fixture.counts,
+            options.kv_heads *
+                paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head());
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -182,9 +183,11 @@ int main(int argc, char** argv) {
             measure_prepare(options, device, flush);
             return 0;
         }
-        measurement::Csv csv(options.timing.csv_out, "projection,round");
+        measurement::Csv csv(options.timing.csv_out,
+                             "projection,round,logical_bytes,useful_flops,logical_GBps,"
+                             "logical_TFLOps,memory_reference_us,compute_reference_us");
         for (auto projection : options.projections) {
-            qsa::Weights weights(projection);
+            qsa::Weights weights(projection, options.kv_heads);
             for (int tokens : options.tokens) {
                 qsa::Fixture fixture(weights, tokens);
                 measurement::Row row;
@@ -201,22 +204,25 @@ int main(int argc, char** argv) {
                         for (const auto& cache :
                              measurement::selections(options.timing.cache, "cold", "warm")) {
                             for (const auto& entry : entries) {
-                                const bool baseline = entry == "linear";
-                                row.op              = baseline ? "linear" : "linear_split";
-                                const auto result   = measurement::measure(
+                                const bool contiguous = entry == "linear";
+                                row.op                = contiguous ? "linear" : "linear_split";
+                                const auto result     = measurement::measure(
                                     [&](CudaExecutionView cuda) {
-                                        if (baseline)
+                                        if (contiguous)
                                             ops::linear(fixture.x, weights.weight, fixture.packed,
-                                                          cuda);
+                                                            cuda);
                                         else
                                             ops::linear_split(fixture.x, weights.weight,
-                                                                fixture.split, cuda);
+                                                                  fixture.split, cuda);
                                     },
                                     [](auto) {}, flush, device.execution_view(), options.timing,
                                     execution, cache);
                                 csv.write(row, result, execution, cache,
                                           std::string(qsa::name(projection)) + "," +
-                                              std::to_string(round));
+                                              std::to_string(round) + "," +
+                                              qsa::projection_metrics_csv(
+                                                  weights.weight.payload_bytes, row.n, row.k,
+                                                  tokens, result.gpu.median_us));
                             }
                         }
                 }

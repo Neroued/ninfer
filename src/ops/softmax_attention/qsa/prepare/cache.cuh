@@ -73,7 +73,7 @@ __device__ __forceinline__ void store_quantized(const float (&values)[8], std::u
     }
 }
 
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, int KvHeads>
 __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, int t, int b,
                                            int lane, float2 sc, float* scratch = nullptr) {
     const auto m          = t + std::int64_t(b) * a.tokens;
@@ -81,8 +81,8 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
     const int page        = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
     auto* key             = a.keys.at(p % 64, head, page);
     auto* value           = a.values.at(p % 64, head, page);
-    const auto* raw_key   = a.k + (m * 2 + head) * 256;
-    const auto* raw_value = a.v + (m * 2 + head) * 256;
+    const auto* raw_key   = a.k + (m * KvHeads + head) * 256;
+    const auto* raw_value = a.v + (m * KvHeads + head) * 256;
     if constexpr (Storage == KvCacheStorage::BFloat16) {
         prepare_head<256>(raw_key, a.wk, reinterpret_cast<__nv_bfloat16*>(key), a.epsilon, sc,
                           lane);

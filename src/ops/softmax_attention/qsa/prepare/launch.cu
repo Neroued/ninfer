@@ -60,6 +60,7 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
                        p.query.ne[2],
                        p.query.ne[3],
                        rope.ne[1],
+                       p.key.ne[1],
                        params.rms_epsilon,
                        {}};
     // Default model frequencies are constructed once on Host, with no Device allocation.
@@ -80,35 +81,47 @@ struct PreparePlan {
 };
 
 PreparePlan select_prepare_plan(const PrepareArguments& args, float theta) {
-    // Spark keeps adjacent CTAs on contiguous token data, including bulk calls.
-    return {NINFER_TARGET_SPARK || std::int64_t(args.tokens) * args.batch <= 320, theta >= 1,
+    const auto columns     = std::int64_t(args.tokens) * args.batch;
+    const bool token_major = NINFER_TARGET_SPARK
+                                 ? args.kv_heads == 2 || columns < 256 || columns > 1024
+                                 : columns <= 320;
+    return {token_major, theta >= 1,
             common::operand::aligned(args.wq, 16) && common::operand::aligned(args.wiq, 8)};
 }
 
-template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights>
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvHeads>
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
+    constexpr int groups = PrepareGeometry<KvHeads>::groups;
     if (plan.token_major)
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, true>
-            <<<dim3(args.tokens * 8, args.batch), 128, 0, stream>>>(args);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, true, KvHeads>
+            <<<dim3(args.tokens * groups, args.batch), 128, 0, stream>>>(args);
     else
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, false>
-            <<<dim3(args.tokens, args.batch, 8), 128, 0, stream>>>(args);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, false, KvHeads>
+            <<<dim3(args.tokens, args.batch, groups), 128, 0, stream>>>(args);
+}
+
+template <KvCacheStorage Storage, int KvHeads>
+void dispatch_geometry(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
+    // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
+    if (plan.bounded_phase) {
+        if (plan.vector_weights)
+            submit<Storage, true, true, KvHeads>(args, plan, stream);
+        else
+            submit<Storage, true, false, KvHeads>(args, plan, stream);
+    } else {
+        if (plan.vector_weights)
+            submit<Storage, false, true, KvHeads>(args, plan, stream);
+        else
+            submit<Storage, false, false, KvHeads>(args, plan, stream);
+    }
 }
 
 template <KvCacheStorage Storage>
 void dispatch(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
-    // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
-    if (plan.bounded_phase) {
-        if (plan.vector_weights)
-            submit<Storage, true, true>(args, plan, stream);
-        else
-            submit<Storage, true, false>(args, plan, stream);
-    } else {
-        if (plan.vector_weights)
-            submit<Storage, false, true>(args, plan, stream);
-        else
-            submit<Storage, false, false>(args, plan, stream);
-    }
+    if (args.kv_heads == 1)
+        dispatch_geometry<Storage, 1>(args, plan, stream);
+    else
+        dispatch_geometry<Storage, 2>(args, plan, stream);
 }
 
 } // namespace

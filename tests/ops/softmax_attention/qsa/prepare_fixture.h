@@ -33,8 +33,8 @@ struct Buffer {
         std::size_t words = 1;
         for (int d = 0; d < 4; ++d) words += std::size_t(view.ne[d] - 1) * view.nb[d] / sizeof(T);
         host.resize(words);
-        device    = std::make_unique<GuardedDeviceBuffer>(words * sizeof(T));
-        view.data = device->data();
+        device      = std::make_unique<GuardedDeviceBuffer>(words * sizeof(T));
+        view.data   = device->data();
         view.device = device->device();
     }
 
@@ -72,9 +72,9 @@ struct CachePlane {
     std::vector<std::uint8_t> host;
     std::unique_ptr<GuardedDeviceBuffer> device;
 
-    CachePlane(DType dtype, int features, int pages, bool padded) {
+    CachePlane(DType dtype, int features, int pages, bool padded, int heads) {
         if (features == 0) return;
-        view               = Tensor::metadata(dtype, {features, 64, 2, pages});
+        view               = Tensor::metadata(dtype, {features, 64, heads, pages});
         const auto element = dtype_size(dtype);
         if (padded)
             for (int d = 1; d < 4; ++d)
@@ -82,8 +82,8 @@ struct CachePlane {
         std::size_t bytes = element;
         for (int d = 0; d < 4; ++d) bytes += (view.ne[d] - 1) * view.nb[d];
         host.resize(bytes);
-        device    = std::make_unique<GuardedDeviceBuffer>(bytes);
-        view.data = device->data();
+        device      = std::make_unique<GuardedDeviceBuffer>(bytes);
+        view.data   = device->data();
         view.device = device->device();
     }
 
@@ -106,7 +106,7 @@ struct CachePlane {
 };
 
 struct Fixture {
-    int T, B, A, alias, R, pages_per_row;
+    int T, B, A, alias, R, pages_per_row, kv_heads, query_heads;
     KvCacheStorage storage;
     CacheEncoding encoding;
     bool exact_key  = false;
@@ -126,25 +126,25 @@ struct Fixture {
     Tensor query_output, iq_output;
 
     Fixture(int tokens, int rows, int axes, int aliases = 0, int layout = 0, int capacity = 0,
-            KvCacheStorage kv_storage = KvCacheStorage::BFloat16)
+            KvCacheStorage kv_storage = KvCacheStorage::BFloat16, int heads = 2)
         : T(tokens), B(rows), A(axes), alias(aliases), R(capacity ? capacity : tokens + 4),
-          pages_per_row((tokens + 126) / 64), storage(kv_storage),
-          encoding(cache_encoding(storage)), q(DType::BF16, {256, 24, T, B}),
-          k(DType::BF16, {256, 2, T, B}), v(DType::BF16, {256, 2, T, B}),
-          iq(DType::BF16, {128, 4, T, B}), ik(DType::BF16, {128, T, B}),
-          out_q(DType::BF16, {256, 24, T, B}), out_iq(DType::BF16, {128, 4, T, B}),
-          wq(DType::BF16, {256}), wk(DType::BF16, {256}), wiq(DType::BF16, {128}),
-          wik(DType::BF16, {128}), tail(DType::BF16, {128, 3, B + 2}, layout),
-          records(DType::BF16, {128, R, B}, layout),
+          pages_per_row((tokens + 126) / 64), kv_heads(heads), query_heads(12 * heads),
+          storage(kv_storage), encoding(cache_encoding(storage)),
+          q(DType::BF16, {256, query_heads, T, B}), k(DType::BF16, {256, kv_heads, T, B}),
+          v(DType::BF16, {256, kv_heads, T, B}), iq(DType::BF16, {128, 4, T, B}),
+          ik(DType::BF16, {128, T, B}), out_q(DType::BF16, {256, query_heads, T, B}),
+          out_iq(DType::BF16, {128, 4, T, B}), wq(DType::BF16, {256}), wk(DType::BF16, {256}),
+          wiq(DType::BF16, {128}), wik(DType::BF16, {128}),
+          tail(DType::BF16, {128, 3, B + 2}, layout), records(DType::BF16, {128, R, B}, layout),
           compressed(DType::BF16, {128, 16, 1, B * pages_per_row + 2}, layout != 0),
           keys(encoding.key.data_dtype, encoding.key.data_extent, B * pages_per_row + 2,
-               layout != 0),
+               layout != 0, kv_heads),
           values(encoding.value.data_dtype, encoding.value.data_extent, B * pages_per_row + 2,
-                 layout != 0),
+                 layout != 0, kv_heads),
           key_scales(encoding.key.scale_dtype, encoding.key.scale_extent, B * pages_per_row + 2,
-                     layout != 0),
+                     layout != 0, kv_heads),
           value_scales(encoding.value.scale_dtype, encoding.value.scale_extent,
-                       B * pages_per_row + 2, layout != 0),
+                       B * pages_per_row + 2, layout != 0, kv_heads),
           first(DType::I32, {3, B + 2}, layout), record_rope(DType::I32, {3, R, B}, layout),
           positions(DType::I32, {T, B}), rope(DType::I32, {T, A, B}), valid(DType::I32, {B}),
           table_rows(DType::I32, {B}), slots(DType::I32, {B}), offsets(DType::I32, {B}),
@@ -154,9 +154,9 @@ struct Fixture {
         batch      = {positions.view, valid.view, table_rows.view};
         before     = {tail.view, first.view, slots.view};
         write      = {records.view, record_rope.view, offsets.view};
-        cache = {{keys.view, values.view, key_scales.view, value_scales.view, tables.view, 256, 2,
-                  storage},
-                 {compressed.view, tables.view}};
+        cache      = {{keys.view, values.view, key_scales.view, value_scales.view, tables.view, 256,
+                       kv_heads, storage},
+                      {compressed.view, tables.view}};
         query_output = alias & 1 ? q.view : out_q.view;
         iq_output    = alias & 2 ? iq.view : out_iq.view;
         reset(0);
@@ -207,10 +207,10 @@ struct Fixture {
                 const int logical = p / 64;
                 tables.at(logical, table_rows.at(b)) =
                     1 + (B - 1 - b) * pages_per_row + pages_per_row - 1 - (logical - f / 64);
-                for (int h = 0; h < 24; ++h)
+                for (int h = 0; h < query_heads; ++h)
                     for (int c = 0; c < 256; ++c)
                         q.at(c, h, t, b) = sample(p, b, c + 256 * h, 3 + phase);
-                for (int h = 0; h < 2; ++h)
+                for (int h = 0; h < kv_heads; ++h)
                     for (int c = 0; c < 256; ++c) {
                         k.at(c, h, t, b) = sample(p, b, c + 256 * h, 7 + phase);
                         v.at(c, h, t, b) = sample(p, b, c + 256 * h, 11 + phase);

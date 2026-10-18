@@ -47,9 +47,9 @@ struct PrepareFixture {
     Tensor rho, query, index_query;
 
     PrepareFixture(const Options& o, int tokens)
-        : q(make_bf16(std::size_t(6144) * tokens * o.batch, 101)),
-          k(make_bf16(std::size_t(512) * tokens * o.batch, 103)),
-          v(make_bf16(std::size_t(512) * tokens * o.batch, 107)),
+        : q(make_bf16(std::size_t(3072 * o.kv_heads) * tokens * o.batch, 101)),
+          k(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 103)),
+          v(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 107)),
           iq(make_bf16(std::size_t(512) * tokens * o.batch, 109)),
           ik(make_bf16(std::size_t(128) * tokens * o.batch, 113)), wq(make_bf16(256, 127)),
           wk(make_bf16(256, 131)), wiq(make_bf16(128, 137)), wik(make_bf16(128, 139)),
@@ -101,8 +101,8 @@ struct PrepareFixture {
         const auto schema         = paged_kv_storage_layout(o.storage, 256);
         const auto allocate_plane = [=](DeviceBuffer& buffer, DType dtype, int leading) {
             if (leading == 0) return Tensor{};
-            buffer = make_zeros(std::size_t(pages) * leading * 64 * 2 * dtype_size(dtype));
-            return Tensor(buffer.span(), dtype, {leading, 64, 2, pages});
+            buffer = make_zeros(std::size_t(pages) * leading * 64 * o.kv_heads * dtype_size(dtype));
+            return Tensor(buffer.span(), dtype, {leading, 64, o.kv_heads, pages});
         };
         const auto k_data =
             allocate_plane(keys, schema.key.data_dtype, schema.key.data_leading_extent);
@@ -113,9 +113,9 @@ struct PrepareFixture {
         const auto v_scales = allocate_plane(value_scales, schema.value.scale_dtype,
                                              schema.value.scale_leading_extent);
         index_keys          = make_zeros(std::size_t(pages) * 128 * 16 * 2);
-        projected           = {Tensor(q.span(), DType::BF16, {256, 24, tokens, B}),
-                               Tensor(k.span(), DType::BF16, {256, 2, tokens, B}),
-                               Tensor(v.span(), DType::BF16, {256, 2, tokens, B}),
+        projected           = {Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
+                               Tensor(k.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
+                               Tensor(v.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
                                Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
                                Tensor(ik.span(), DType::BF16, {128, tokens, B})};
         parameters = {Tensor(wq.span(), DType::BF16, {256}), Tensor(wk.span(), DType::BF16, {256}),
@@ -126,11 +126,11 @@ struct PrepareFixture {
         before     = {before_raw.view, before_rope.view, Tensor(slots.span(), DType::I32, {B})};
         records    = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
         Tensor block_tables(tables.span(), DType::I32, {logical, B});
-        cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, 2, o.storage},
+        cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, o.kv_heads, o.storage},
                  {Tensor(index_keys.span(), DType::BF16, {128, 16, 1, pages}), block_tables}};
         rho   = Tensor(rope.span(), DType::I32, {tokens, A, B});
-        query =
-            o.inplace ? projected.query : Tensor(out_q.span(), DType::BF16, {256, 24, tokens, B});
+        query = o.inplace ? projected.query
+                          : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
         index_query = o.inplace ? projected.index_query
                                 : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});
         if (o.inplace) {

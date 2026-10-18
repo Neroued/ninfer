@@ -17,8 +17,9 @@ struct Weights {
     DeviceBuffer storage;
     Weight weight;
 
-    explicit Weights(Projection projection)
-        : rows(segments(projection)), parent_rows(std::accumulate(rows.begin(), rows.end(), 0)) {
+    Weights(Projection projection, int kv_heads)
+        : rows(segments(projection, kv_heads)),
+          parent_rows(std::accumulate(rows.begin(), rows.end(), 0)) {
         if (projection == Projection::QueryGate) {
             auto packed = make_row_split_weight(QType::Q8_G32_FP16, parent_rows, kInputRows,
                                                 kInputRows, 701U);

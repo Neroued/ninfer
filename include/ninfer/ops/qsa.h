@@ -32,9 +32,9 @@ struct QsaBatchView {
 };
 
 struct QsaProjectionView {
-    Tensor query;       // BF16 [256,24,T,B].
-    Tensor key;         // BF16 [256,2,T,B].
-    Tensor value;       // BF16 [256,2,T,B].
+    Tensor query;       // BF16 [256,Hq,T,B].
+    Tensor key;         // BF16 [256,Hkv,T,B].
+    Tensor value;       // BF16 [256,Hkv,T,B].
     Tensor index_query; // BF16 [128,4,T,B].
     Tensor index_key;   // BF16 [128,T,B], raw projection.
 };
@@ -228,16 +228,19 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  *
  * Logical shapes / supported domain:
  * The current rotary implementation accepts rotary_dim=64, interleaved sections [11,11,10].
- * T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are contiguous
- * and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors. Positions
- * are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device I32 [B].
- * Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride rules.
- * Main-cache data and scale planes:
- *   BFloat16: BF16 K / FP16 V [256,64,2,G]; no scales.
- *   Int8Group64: I8 K/V [256,64,2,G]; FP16 scales [4,64,2,G].
- *   Fp8E4M3Row256: FP8_E4M3FN K/V [256,64,2,G]; FP16 scales [1,64,2,G].
- *   Nvfp4Group16: packed U8 K/V [128,64,2,G]; U8 E4M3 scales [16,64,2,G].
- *   Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
+ * Hkv=1 or 2, Hq=12*Hkv; index queries always have four heads. Cache and projections agree on
+ * Hkv. T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are
+ * contiguous and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors.
+ * Positions are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device
+ * I32 [B]. Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride
+ * rules. Main-cache data and scale planes:
+ *
+ * - BFloat16: BF16 K / FP16 V [256,64,Hkv,G]; no scales.
+ * - Int8Group64: I8 K/V [256,64,Hkv,G]; FP16 scales [4,64,Hkv,G].
+ * - Fp8E4M3Row256: FP8_E4M3FN K/V [256,64,Hkv,G]; FP16 scales [1,64,Hkv,G].
+ * - Nvfp4Group16: packed U8 K/V [128,64,Hkv,G]; U8 E4M3 scales [16,64,Hkv,G].
+ * - Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
+ *
  * Cache planes are page-major with contiguous features and non-overlapping positive outer
  * strides; tables have contiguous I32 page entries and a non-overlapping row stride.
  * Both caches share G and the identical block_tables view. R and the state pool size are positive.

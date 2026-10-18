@@ -37,7 +37,7 @@ struct PrepareArguments {
     PrepareColumns<std::int32_t> rope_records;
     PreparePage<__nv_bfloat16> index_keys;
     PreparePage<std::uint8_t> keys, values, key_scales, value_scales;
-    int tokens, batch, axes;
+    int tokens, batch, axes, kv_heads;
     float epsilon;
     double frequency[32];
 };

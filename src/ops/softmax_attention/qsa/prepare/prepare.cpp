@@ -23,6 +23,9 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
                  Tensor& query, Tensor& index_query, CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
     const int tokens = p.query.ne[2], rows = p.query.ne[3], axes = rope_positions.ne[1];
+    const int kv_heads = p.key.ne[1];
+    v.require(kv_heads == 1 || kv_heads == 2, "unsupported head geometry");
+    const int query_heads = 12 * kv_heads;
     v.require(tokens > 0 && rows >= 1 && rows <= 8 && (axes == 1 || axes == 3), "T/B/A");
     v.require(parameters.rms_epsilon > 0 && std::isfinite(parameters.rms_epsilon) &&
                   parameters.rope_theta > 0 && std::isfinite(parameters.rope_theta),
@@ -30,12 +33,12 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
     v.require(parameters.rotary_dim == 64 && parameters.rope_interleaved &&
                   parameters.rope_sections == std::array<std::uint32_t, 3>{11, 11, 10},
               "unsupported rotary geometry");
-    v.dense(p.query, DType::BF16, {256, 24, tokens, rows}, 16, "query projection");
-    v.dense(p.key, DType::BF16, {256, 2, tokens, rows}, 16, "key projection");
-    v.dense(p.value, DType::BF16, {256, 2, tokens, rows}, 16, "value projection");
+    v.dense(p.query, DType::BF16, {256, query_heads, tokens, rows}, 16, "query projection");
+    v.dense(p.key, DType::BF16, {256, kv_heads, tokens, rows}, 16, "key projection");
+    v.dense(p.value, DType::BF16, {256, kv_heads, tokens, rows}, 16, "value projection");
     v.dense(p.index_query, DType::BF16, {128, 4, tokens, rows}, 16, "index-query projection");
     v.dense(p.index_key, DType::BF16, {128, tokens, rows, 1}, 16, "index-key projection");
-    v.dense(query, DType::BF16, {256, 24, tokens, rows}, 16, "query output");
+    v.dense(query, DType::BF16, {256, query_heads, tokens, rows}, 16, "query output");
     v.dense(index_query, DType::BF16, {128, 4, tokens, rows}, 16, "index-query output");
     v.dense(parameters.query_norm, DType::BF16, {256, 1, 1, 1}, 2, "query norm");
     v.dense(parameters.key_norm, DType::BF16, {256, 1, 1, 1}, 2, "key norm");
@@ -53,13 +56,14 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
 
     const auto& main = cache.main;
     const int pages  = main.k_pages.ne[3];
-    v.require(main.head_dim == 256 && main.num_kv_heads == 2, "cache geometry");
+    v.require(main.head_dim == 256 && main.num_kv_heads == kv_heads, "cache geometry");
     const auto layout        = paged_kv_storage_layout(main.storage, 256);
     const auto vector_planes = [&](const Tensor& data, const Tensor& scale,
                                    const PagedKVVectorLayout& schema) {
-        v.plane(data, schema.data_dtype, {schema.data_leading_extent, 64, 2, pages}, "cache data");
+        v.plane(data, schema.data_dtype, {schema.data_leading_extent, 64, kv_heads, pages},
+                "cache data");
         if (schema.has_scale())
-            v.plane(scale, schema.scale_dtype, {schema.scale_leading_extent, 64, 2, pages},
+            v.plane(scale, schema.scale_dtype, {schema.scale_leading_extent, 64, kv_heads, pages},
                     "cache scale");
         else
             v.require(scale.data == nullptr, "absent cache scale");

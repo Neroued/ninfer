@@ -99,19 +99,19 @@ int verify(Fixture& f, const std::string& label) {
         const int n = f.valid.at(b), base = f.bases[b];
         for (int t = 0; t < f.T; ++t) {
             if (t >= n) {
-                for (int h = 0; h < 24; ++h)
+                for (int h = 0; h < f.query_heads; ++h)
                     for (int c = 0; c < 256; ++c) failures += actual_q[f.q.index(c, h, t, b)] != 0;
                 for (int h = 0; h < 4; ++h)
                     for (int c = 0; c < 128; ++c)
                         failures += actual_iq[f.iq.index(c, h, t, b)] != 0;
                 continue;
             }
-            for (int h = 0; h < 24; ++h)
+            for (int h = 0; h < f.query_heads; ++h)
                 head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error);
             for (int h = 0; h < 4; ++h)
                 head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
             const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
-            for (int h = 0; h < 2; ++h) {
+            for (int h = 0; h < f.kv_heads; ++h) {
                 const auto ideal = ideal_head(f.k, h, t, b, f.wk);
                 if (f.storage == KvCacheStorage::BFloat16) {
                     for (int c = 0; c < 256; ++c) {
@@ -223,8 +223,8 @@ int verify(Fixture& f, const std::string& label) {
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
-        KvCacheStorage storage = KvCacheStorage::BFloat16) {
-    Fixture f(t, b, axes, alias, layout, capacity, storage);
+        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2) {
+    Fixture f(t, b, axes, alias, layout, capacity, storage, kv_heads);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -255,8 +255,9 @@ int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, in
     return failures;
 }
 
-int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16) {
-    Fixture f(4, 1, 3, 0, 2, 0, storage);
+int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
+                 int kv_heads = 2) {
+    Fixture f(4, 1, 3, 0, 2, 0, storage, kv_heads);
     f.base_origin = 6;
     f.reset(0, true);
     f.launch(device.execution_view());
@@ -293,8 +294,9 @@ int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage:
     return failures;
 }
 
-int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16) {
-    Fixture f(9, 1, 3, 3, 2, 0, storage);
+int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
+             int kv_heads = 2) {
+    Fixture f(9, 1, 3, 3, 2, 0, storage, kv_heads);
     f.base_origin = 63;
     f.reset(0, true);
     f.launch(device.execution_view());
@@ -393,10 +395,10 @@ int coordinate_handoff(DeviceContext& device) {
 }
 
 int norm_alignment_and_phase(DeviceContext& device,
-                             KvCacheStorage storage = KvCacheStorage::BFloat16) {
+                             KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2) {
     int failures = 0;
     for (int tokens : {129, 321}) {
-        Fixture f(tokens, 1, 1, 3, 1, 0, storage);
+        Fixture f(tokens, 1, 1, 3, 1, 0, storage, kv_heads);
         Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129});
         std::copy(f.wq.host.begin(), f.wq.host.end(), wq.host.begin() + 1);
         std::copy(f.wiq.host.begin(), f.wiq.host.end(), wiq.host.begin() + 1);
@@ -469,8 +471,15 @@ int rejects(const char* label, F&& call) {
 
 int validation(DeviceContext& device) {
     Fixture f(1, 1, 1);
-    int failures         = 0;
-    auto saved           = f.cache;
+    int failures              = 0;
+    auto saved                = f.cache;
+    f.cache.main.num_kv_heads = 1;
+    failures += rejects("cache/projection heads", [&] { f.launch(device.execution_view()); });
+    f.cache                 = saved;
+    const auto projected    = f.projected;
+    f.projected.query.ne[1] = 12;
+    failures += rejects("query/key head ratio", [&] { f.launch(device.execution_view()); });
+    f.projected          = projected;
     f.cache.main.storage = KvCacheStorage::Int8Group64;
     failures += rejects("storage/plane mismatch", [&] { f.launch(device.execution_view()); });
     f.cache = saved;
@@ -501,7 +510,7 @@ int exact_key_encoding(DeviceContext& device, KvCacheStorage storage) {
     int witnesses = 0;
     for (int t = 0; t < f.T; ++t) {
         f.rope.at(t, 0, 0) = 0;
-        for (int h = 0; h < 2; ++h) {
+        for (int h = 0; h < f.kv_heads; ++h) {
             std::array<float, 256> exact, rounded;
             for (int c = 0; c < 256; ++c) {
                 const float sign   = bf16_to_f32(sample(t, h, c, 719)) < 0 ? -1 : 1;
@@ -537,7 +546,7 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage) {
     constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
     constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
     for (int t = 0; t < f.T; ++t)
-        for (int h = 0; h < 2; ++h)
+        for (int h = 0; h < f.kv_heads; ++h)
             for (int c = 0; c < 256; ++c) {
                 const float sign   = (c / 8 + h) % 2 ? -1 : 1;
                 f.v.at(c, h, t, 0) = f32_to_bf16(sign * amplitudes[t] * values[c % 8]);
@@ -616,6 +625,45 @@ int main(int argc, char** argv) {
                   [=] { return read_footprint(cuda_environment().context, storage); },
                   {{"format", kv_cache_storage_name(storage)}});
     }
+
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        const std::string prefix =
+            std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/h12_1";
+        for (auto [t, b] : {std::pair{1, 1},
+                            {6, 4},
+                            {17, 8},
+                            {128, 1},
+                            {255, 1},
+                            {256, 1},
+                            {257, 1},
+                            {319, 1},
+                            {320, 1},
+                            {321, 1},
+                            {1023, 1},
+                            {1024, 1},
+                            {1025, 1},
+                            {4096, 1}})
+            suite.add(prefix + "/t" + std::to_string(t) + "/b" + std::to_string(b),
+                      [=] {
+                          return run(cuda_environment().context, t, b, b == 1 ? 1 : 3, t % 4, t % 3,
+                                     0, storage, 1);
+                      },
+                      {{"format", kv_cache_storage_name(storage)}, {"execution", "graph"}});
+        suite.add(prefix + "/continuation",
+                  [=] { return continuation(cuda_environment().context, storage, 1); },
+                  {{"format", kv_cache_storage_name(storage)}});
+        suite.add(prefix + "/chunking",
+                  [=] { return chunking(cuda_environment().context, storage, 1); },
+                  {{"format", kv_cache_storage_name(storage)}});
+    }
+    suite.add("qsa_prepare/bf16/h12_1/norm_alignment",
+              [] {
+                  return norm_alignment_and_phase(cuda_environment().context,
+                                                  KvCacheStorage::BFloat16, 1);
+              },
+              {{"format", "bf16"}});
 
     return suite.main(argc, argv);
 }

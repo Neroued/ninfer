@@ -11,6 +11,18 @@
 
 namespace ninfer::bench::qsa {
 
+inline std::string projection_metrics_csv(std::uint64_t weight_bytes, int n, int k, int tokens,
+                                          double elapsed_us) {
+    const auto bytes   = weight_bytes + 2ULL * (n + k) * tokens;
+    const double flops = 2.0 * n * k * tokens;
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6) << bytes << ',' << flops << ','
+        << bytes / (elapsed_us * 1000) << ',' << flops / (elapsed_us * 1e6) << ','
+        << bytes / (kRoofline.memory_gbs * 1000) << ','
+        << flops / (kRoofline.bf16_f32_tflops * 1e6);
+    return out.str();
+}
+
 // Unique semantic payloads per call, independent of CTA tiling and workspace representation.
 // The per-query cache sum exposes reuse; neither byte count is measured DRAM traffic.
 struct Metrics {
@@ -70,11 +82,11 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
     return m;
 }
 
-inline Metrics prepare_metrics(int tokens, int axes, std::span<const int> bases,
+inline Metrics prepare_metrics(int tokens, int axes, int kv_heads, std::span<const int> bases,
                                std::span<const int> lengths, std::uint64_t kv_token_bytes) {
     Metrics m;
     m.read_bytes           = lengths.size() * sizeof(std::int32_t);
-    m.write_bytes          = std::uint64_t(tokens) * lengths.size() * (6144 + 512) * 2;
+    m.write_bytes          = std::uint64_t(tokens) * lengths.size() * (3072 * kv_heads + 512) * 2;
     std::uint64_t complete = 0;
     for (std::size_t b = 0; b < lengths.size(); ++b) {
         const int n = lengths[b], first = bases[b];
@@ -82,7 +94,7 @@ inline Metrics prepare_metrics(int tokens, int axes, std::span<const int> bases,
         m.live_queries += n;
         const int blocks = (first + n) / 4 - first / 4;
         complete += blocks;
-        m.read_bytes += std::uint64_t(n) * ((6144 + 512 + 512 + 512 + 128) * 2 + 4 * (axes + 1));
+        m.read_bytes += std::uint64_t(n) * ((3584 * kv_heads + 512 + 128) * 2 + 4 * (axes + 1));
         m.read_bytes += 8 + 4ULL * ((first + n - 1) / 64 - first / 64 + 1);
         if (blocks && first % 4) m.read_bytes += 256ULL * (first % 4) + 12 + 4;
     }

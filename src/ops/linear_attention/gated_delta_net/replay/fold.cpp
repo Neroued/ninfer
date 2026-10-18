@@ -2,6 +2,7 @@
 #include "ops/linear_attention/gated_delta_net/replay/validation.h"
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
 #include <array>
+#include <algorithm>
 
 namespace ninfer::ops {
 namespace {
@@ -152,6 +153,11 @@ void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows,
                             "state/records");
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
         validate_fold_rows(records_, states_, rows);
+    // Row descriptors are host values, including under Graph capture. Preserve full validation
+    // above; an all-zero commit has no device work or state/record reads.
+    if (std::none_of(rows.begin(), rows.end(),
+                     [](const GdnReplayFoldRow& row) { return row.commit_columns != 0; }))
+        return;
     detail::gated_delta_net::launch_replay_fold(
         records_, states_, packed, static_cast<std::int32_t>(rows.size()), execution.stream());
 }

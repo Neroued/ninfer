@@ -124,7 +124,7 @@ public:
     BodyTimedGraph& operator=(const BodyTimedGraph&) = delete;
 
     template <class Launch>
-    void capture(CudaExecutionView cuda, Launch&& launch) {
+    void capture(CudaExecutionView cuda, Launch&& launch, bool allow_empty = false) {
         const auto stream = cuda.stream();
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         try {
@@ -149,7 +149,7 @@ public:
             CUDA_CHECK(cudaGraphNodeGetType(node, &type));
             if (type == cudaGraphNodeTypeKernel) ++kernels_;
         }
-        if (!kernels_) throw std::runtime_error("captured Op has no kernels");
+        if (!kernels_ && !allow_empty) throw std::runtime_error("captured Op has no kernels");
     }
 
     void launch(CudaExecutionView cuda) const {
@@ -182,7 +182,8 @@ struct Result {
 
 template <class Launch, class Restore>
 Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExecutionView cuda,
-               const Options& options, const std::string& execution, const std::string& cache) {
+               const Options& options, const std::string& execution, const std::string& cache,
+               bool allow_empty = false) {
     const auto stream = cuda.stream();
     // Complete fixture uploads and poison fills before using the capture stream.
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -191,7 +192,7 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExe
     CUDA_CHECK(cudaStreamSynchronize(stream));
     BodyTimedGraph graph;
     // Capture also counts the actual Op kernels for an eager row, without timing setup.
-    graph.capture(cuda, launch);
+    graph.capture(cuda, launch, allow_empty);
     const bool captured = execution == "graph";
     const auto invoke   = [&] {
         if (captured)

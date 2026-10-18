@@ -1,3 +1,4 @@
+#include "core/platform.h"
 #include "ops/suite.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
@@ -33,7 +34,6 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kQkHeads        = 16;
 constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::size_t kGuardBytes      = 256;
 
@@ -86,10 +86,12 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
              bool distinct_destination = false) {
+    const int kQkHeads                           = profile.value_heads == 24 ? 8 : 16;
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
-    if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
-    const std::int32_t slot_count = rows == 1 ? 3 : 11;
+    if (distinct_destination)
+        for (int row = 0; row < rows; ++row) destination_slots[row] = rows == 1 ? 1 : 11 + row;
+    const std::int32_t slot_count = rows == 1 ? 3 : distinct_destination ? 11 + rows : 11;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -383,7 +385,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         definition.capture(context.stream(),
                            [&] { fold_plan.execute(fold_rows, context.execution_view()); });
         graph.instantiate(definition);
-        // Host row descriptors are captured by value. Restore GPU state between replays.
+        // Host row descriptors are captured by value. Mutating them after capture must
+        // not alter the graph's accepted prefixes. GPU state remains a live operand.
+        for (auto& row : fold_rows) row.commit_columns = 0;
+        // Restore GPU state between replays.
         for (int replay = 0; replay < 2; ++replay) {
             cuda_check(cudaMemcpyAsync(state_base, original.data(), state_bytes,
                                        cudaMemcpyDeviceToDevice, context.stream()),
@@ -530,14 +535,16 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     return failures;
 }
 
-int run_record_fold_rounds(bool q8 = false) {
+int run_record_fold_rounds(bool q8 = false, bool local = false) {
     using ninfer::test::input_projection::DevicePackedWeight;
     using ninfer::test::input_projection::make_bf16_activation;
 
-    const FoldProfile kProfile{q8 ? 36 : 48, 48, 10240};
+    const FoldProfile kProfile{q8 ? 36 : 48, local ? 24 : 48, local ? 5120 : 10240};
+    const int kQkHeads                   = local ? 8 : 16;
+    const int kQueryRows                 = 128 * kQkHeads;
     const std::int32_t kHidden           = q8 ? 2560 : 5120;
-    constexpr std::int32_t kValueRows    = 6144;
-    constexpr std::int32_t kZRows        = 6144;
+    const std::int32_t kValueRows        = local ? 3072 : 6144;
+    const std::int32_t kZRows            = local ? 3072 : 6144;
     constexpr std::int32_t kWidth        = 16;
     constexpr std::int32_t kStateSlots   = kWidth + 1;
     constexpr std::int32_t kInitialSlot  = kWidth;
@@ -545,7 +552,8 @@ int run_record_fold_rounds(bool q8 = false) {
     constexpr float kScale               = 1.0F / std::sqrt(128.0F);
 
     DevicePackedWeight qk_parent(quantized_weight::make_patterned_weight(
-        q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16, q8 ? 16384 : 4096, kHidden, 1901U));
+        q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16, q8 ? (local ? 8192 : 16384) : 4096, kHidden,
+        1901U));
     std::optional<DevicePackedWeight> vz_parent;
     if (!q8)
         vz_parent.emplace(
@@ -621,9 +629,9 @@ int run_record_fold_rounds(bool q8 = false) {
     }
 
     DeviceBuffer snapshot_q(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(2048) * kWidth * sizeof(std::uint16_t));
+                            static_cast<std::size_t>(kQueryRows) * kWidth * sizeof(std::uint16_t));
     DeviceBuffer snapshot_k(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(2048) * kWidth * sizeof(std::uint16_t));
+                            static_cast<std::size_t>(kQueryRows) * kWidth * sizeof(std::uint16_t));
     DeviceBuffer snapshot_v(ninfer::test::cuda_environment().context.device(),
                             static_cast<std::size_t>(kValueRows) * kWidth * sizeof(std::uint16_t));
     DeviceBuffer snapshot_z(ninfer::test::cuda_environment().context.device(),
@@ -643,12 +651,12 @@ int run_record_fold_rounds(bool q8 = false) {
     Tensor initial_selector(device_initial.span(), DType::I32, {1});
     Tensor snapshot_selector(device_snapshot.span(), DType::I32, {1});
     Tensor valid;
-    Tensor snapshot_query(snapshot_q.span(), DType::BF16, {2048, kWidth, 1});
-    Tensor snapshot_key(snapshot_k.span(), DType::BF16, {2048, kWidth, 1});
+    Tensor snapshot_query(snapshot_q.span(), DType::BF16, {kQueryRows, kWidth, 1});
+    Tensor snapshot_key(snapshot_k.span(), DType::BF16, {kQueryRows, kWidth, 1});
     Tensor snapshot_value(snapshot_v.span(), DType::BF16, {kValueRows, kWidth, 1});
     Tensor snapshot_z_tensor(snapshot_z.span(), DType::BF16, {kZRows, kWidth, 1});
-    Tensor record_query(record_q.span(), DType::BF16, {2048, kWidth, 1});
-    Tensor record_key(record_k.span(), DType::BF16, {2048, kWidth, 1});
+    Tensor record_query(record_q.span(), DType::BF16, {kQueryRows, kWidth, 1});
+    Tensor record_key(record_k.span(), DType::BF16, {kQueryRows, kWidth, 1});
     Tensor record_value(record_v.span(), DType::BF16, {kValueRows, kWidth, 1});
     Tensor record_z_tensor(record_z.span(), DType::BF16, {kZRows, kWidth, 1});
     Tensor snapshot_output(snapshot_out.span(), DType::BF16,
@@ -772,10 +780,10 @@ int run_record_fold_rounds(bool q8 = false) {
                 }
                 return 0;
             };
-            failures += compare_bf16(snapshot_q, record_q, static_cast<std::size_t>(2048) * kWidth,
-                                     "query");
-            failures +=
-                compare_bf16(snapshot_k, record_k, static_cast<std::size_t>(2048) * kWidth, "key");
+            failures += compare_bf16(snapshot_q, record_q,
+                                     static_cast<std::size_t>(kQueryRows) * kWidth, "query");
+            failures += compare_bf16(snapshot_k, record_k,
+                                     static_cast<std::size_t>(kQueryRows) * kWidth, "key");
             failures += compare_bf16(snapshot_v, record_v,
                                      static_cast<std::size_t>(kValueRows) * kWidth, "value");
             failures +=
@@ -823,9 +831,10 @@ int main(int argc, char** argv) {
     OpSuite suite;
     const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
                          unsigned seed, bool distinct = false) {
-        std::string id = "gdn_fold/l" + std::to_string(p.layers) + "/h" +
-                         std::to_string(p.value_heads) + "/w" + std::to_string(width) + "/b" +
-                         std::to_string(batch) + (distinct ? "/disjoint" : "/alias") + "/commits";
+        std::string id = std::string(p.value_heads == 24 ? "gdn_fold_local/l" : "gdn_fold/l") +
+                         std::to_string(p.layers) + "/h" + std::to_string(p.value_heads) + "/w" +
+                         std::to_string(width) + "/b" + std::to_string(batch) +
+                         (distinct ? "/disjoint" : "/alias") + "/commits";
         for (int c : commits) id += "_" + std::to_string(c);
         suite.add(id, [=] { return run_case(p, width, batch, commits, seed, distinct); },
                   {{"execution", width == 16 && batch == 8 ? "graph" : "eager"}});
@@ -852,5 +861,24 @@ int main(int argc, char** argv) {
     suite.add("gdn_fold/record_rounds/q8", [] { return run_record_fold_rounds(true); },
               {{"format", "q8"}});
 
+    for (int b = 1; b <= 8; ++b) {
+        for (int t : {2, 4, 6, 8, 16}) {
+            add({36, 24, 5120}, t, b, std::vector<int>(b, t), 2200U + 100 * b + t, true);
+            std::vector<int> mixed(b);
+            for (int row = 0; row < b; ++row) mixed[row] = (3 * row + 1) % (t + 1);
+            add({36, 24, 5120}, t, b, mixed, 3200U + 100 * b + t);
+        }
+        add({36, 24, 5120}, 16, b, std::vector<int>(b, 0), 4200U + b, true);
+        add({36, 24, 5120}, 16, b, std::vector<int>(b, 1), 4300U + b, true);
+    }
+    for (int first = 0; first < 16; first += 8) {
+        std::vector<int> commits(8);
+        for (int b = 0; b < 8; ++b) commits[b] = first + b;
+        add({36, 24, 5120}, 16, 8, commits, 4400U + first, true);
+    }
+#if NINFER_TARGET_SPARK
+    suite.add("gdn_fold_local/record_rounds/q8", [] { return run_record_fold_rounds(true, true); },
+              {{"format", "q8"}});
+#endif
     return suite.main(argc, argv);
 }

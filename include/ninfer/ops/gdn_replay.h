@@ -44,7 +44,7 @@ struct GdnReplayFoldRow {
  * while changing host row descriptors requires a new capture.
  *
  * Registered (layers, Q/K heads, V heads, conv channels) geometries are (48,16,48,10240),
- * (30,16,32,8192), and (36,16,48,10240). The Op owns no workspace or device
+ * (30,16,32,8192), (36,16,48,10240), and (36,8,24,5120). The Op owns no workspace or device
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
  */

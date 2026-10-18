@@ -58,7 +58,9 @@ struct Traffic {
         "logical_GBps,modeled_request_GBps,memory_roofline_GBps,streaming_memory_reference_us";
 
     std::string csv(double gpu_us) const {
-        const auto rate = [gpu_us](std::uint64_t bytes) { return bytes / (gpu_us * 1000.0); };
+        const auto rate = [gpu_us](std::uint64_t bytes) {
+            return gpu_us > 0 ? bytes / (gpu_us * 1000.0) : 0.0;
+        };
         std::ostringstream out;
         out << std::fixed << std::setprecision(6) << active_rows << ',' << valid_tokens << ','
             << logical.read << ',' << logical.write << ',' << logical.total() << ',' << state.read

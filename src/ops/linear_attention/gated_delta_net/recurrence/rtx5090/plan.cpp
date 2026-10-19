@@ -2,6 +2,10 @@
 #include <climits>
 
 namespace ninfer::ops::detail::gated_delta_net {
+RecurrenceRoute select_recurrence_route(int /*qk_heads*/, int /*value_heads*/, int tokens) {
+    return tokens < 16 ? RecurrenceRoute::Recurrent : RecurrenceRoute::Chunked;
+}
+
 int select_value_tile(int /*qk_heads*/, int value_heads, int /*tokens*/, int multiprocessor_count) {
     // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
     // to weight the SM-wave count. These are launch-heuristic weights, not measured latency.

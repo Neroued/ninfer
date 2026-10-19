@@ -11,7 +11,7 @@ struct RecurrencePlan {
     chunked::WorkspaceLayout workspace;
 };
 
-RecurrenceRoute select_recurrence_route(int tokens);
+RecurrenceRoute select_recurrence_route(int qk_heads, int value_heads, int tokens);
 int select_value_tile(int qk_heads, int value_heads, int tokens, int multiprocessor_count);
 chunked::WorkspaceLayout recurrence_workspace_layout(int qk_heads, int value_heads, int tokens);
 RecurrencePlan select_recurrence_plan(int qk_heads, int value_heads, int tokens, int sm_count);

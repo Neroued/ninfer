@@ -170,9 +170,9 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
         options.mode == Mode::ChunkedRaw || options.mode == Mode::ChunkedNormalized;
     const bool force_recurrent = options.mode == Mode::Recurrent;
     const bool chunked =
-        force_chunked ||
-        (!force_recurrent && gated_delta_net_detail::select_recurrence_route(tokens) ==
-                                 gated_delta_net_detail::RecurrenceRoute::Chunked);
+        force_chunked || (!force_recurrent && gated_delta_net_detail::select_recurrence_route(
+                                                  options.qk_heads, options.value_heads, tokens) ==
+                                                  gated_delta_net_detail::RecurrenceRoute::Chunked);
     const Problem problem{options.qk_heads, options.value_heads, tokens};
     Operands operands(problem, !normalize);
     const std::size_t state_elements = std::size_t(state_dim) * state_dim * problem.value_heads;

@@ -795,7 +795,7 @@ int main(int argc, char** argv) {
                       255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2048, 4096})
             for (bool alias : {false, true})
                 add({"local", 8, 24, t, normalize}, 21000U + t, InputPattern::Ordinary, alias);
-        for (int t : {1, 16, 17, 129, 1024})
+        for (int t : {1, 10, 11, 12, 16, 17, 129, 1024})
             suite.add("gdn_local/graph/t" + std::to_string(t) +
                           (normalize ? "/normalized" : "/raw"),
                       [=] { return graph_case({"local-graph", 8, 24, t, normalize}, 1, false); },

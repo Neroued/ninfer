@@ -2,6 +2,11 @@
 #include <climits>
 
 namespace ninfer::ops::detail::gated_delta_net {
+RecurrenceRoute select_recurrence_route(int qk_heads, int value_heads, int tokens) {
+    const int chunked_first = qk_heads == 8 && value_heads == 24 ? 11 : 16;
+    return tokens < chunked_first ? RecurrenceRoute::Recurrent : RecurrenceRoute::Chunked;
+}
+
 int select_value_tile(int qk_heads, int value_heads, int tokens, int multiprocessor_count) {
     if (qk_heads == 8 && value_heads == 24) return tokens <= 128 ? 32 : 64;
     if (value_heads == 32 || value_heads == 48) {

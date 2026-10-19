@@ -1,9 +1,10 @@
 if(NINFER_BUILD_ENGINE)
   ninfer_add_test(ninfer_bench_support_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_ninfer_bench_support.cpp"
-            ${PROJECT_SOURCE_DIR}/bench/inference/ninfer_bench_support.cpp
+            ${PROJECT_SOURCE_DIR}/bench/inference/options.cpp
+            ${PROJECT_SOURCE_DIR}/bench/inference/report.cpp
     NEEDS_SOURCE_DIR
-    LIBRARIES ninfer_product_logging ninfer_engine ninfer::json)
+    LIBRARIES ninfer_product_config ninfer::json)
 
   target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/inference)
 endif()

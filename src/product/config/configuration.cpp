@@ -95,16 +95,17 @@ const char* log_level_name(LogLevel level) {
     return "unknown";
 }
 
-StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli,
+StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, const CliOptions* cli,
                               const ServeOptions* server) {
     const auto& e = launch.engine;
     const auto& g = launch.generation;
     const auto& s = g.sampling;
-    StartupConfigurationView out{.entry       = cli ? EntryPoint::Cli : EntryPoint::Serve,
+    StartupConfigurationView out{.entry       = entry,
                                  .config_path = launch.provenance.config_path,
                                  .argv        = launch.provenance.argv};
     for (const auto& spec : fields()) {
         if (!applies_to(spec, out.entry)) continue;
+        if ((spec.scope == Scope::Cli && !cli) || (spec.scope == Scope::Serve && !server)) continue;
         ConfigurationValue value;
         switch (spec.field) {
         case Field::ModelPath:
@@ -361,11 +362,15 @@ StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli
 } // namespace
 
 StartupConfigurationView configuration_view(const CliOptions& options) {
-    return view(options.launch, &options, nullptr);
+    return view(options.launch, EntryPoint::Cli, &options, nullptr);
 }
 
 StartupConfigurationView configuration_view(const ServeOptions& options) {
-    return view(options.launch, nullptr, &options);
+    return view(options.launch, EntryPoint::Serve, nullptr, &options);
+}
+
+StartupConfigurationView configuration_view(const LaunchOptions& options, EntryPoint entry) {
+    return view(options, entry, nullptr, nullptr);
 }
 
 } // namespace ninfer::product

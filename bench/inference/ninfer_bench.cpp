@@ -1,308 +1,153 @@
-#include "ninfer_bench_support.h"
+#include "options.h"
+#include "report.h"
 
 #include "ninfer/engine.h"
+#include "product/logging/configuration.h"
+#include "product/logging/startup_log.h"
+#include "product/prompt_input/prompt_input.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#include <spdlog/logger.h>
 
 #include <chrono>
-#include <exception>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <limits>
-#include <sstream>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 namespace {
 
-std::string command_line(int argc, char** argv) {
-    std::ostringstream out;
-    for (int i = 0; i < argc; ++i) {
-        if (i != 0) { out << ' '; }
-        out << argv[i];
-    }
-    return out.str();
-}
+using namespace ninfer;
 
-std::string cuda_version_string(int version) {
-    if (version <= 0) { return {}; }
-    return std::to_string(version / 1000) + "." + std::to_string((version % 1000) / 10);
-}
+class ProfilerRange {
+public:
+    explicit ProfilerRange(bool enabled) : enabled_(enabled) {
+        if (enabled_) check(cudaProfilerStart(), "cudaProfilerStart");
+    }
 
-void fill_cuda_environment(ninfer::bench::BenchEnvironment& env, int device) {
-    env.device_id       = device;
-    int runtime_version = 0;
-    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
-        env.cuda_runtime_version = cuda_version_string(runtime_version);
+    ~ProfilerRange() {
+        if (enabled_) (void)cudaProfilerStop();
     }
-    int driver_version = 0;
-    if (cudaDriverGetVersion(&driver_version) == cudaSuccess) {
-        env.cuda_driver_version = cuda_version_string(driver_version);
-    }
-    cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
-        env.gpu_name = properties.name;
-    }
-}
 
-void require_cuda(cudaError_t status, const char* operation) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    void finish() {
+        if (!enabled_) return;
+        enabled_ = false;
+        check(cudaProfilerStop(), "cudaProfilerStop");
     }
-}
 
-bool has_decode_tests(const std::vector<ninfer::bench::BenchTest>& tests) {
-    for (const auto& test : tests) {
-        if (test.has_decode()) { return true; }
+private:
+    static void check(cudaError_t status, const char* operation) {
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
     }
-    return false;
-}
 
-ninfer::RequestOptions
-benchmark_request(const ninfer::bench::BenchTest& test,
-                  const std::optional<ninfer::OutputConstraint>& constraint) {
-    ninfer::RequestOptions options;
-    options.execution.requested_output_tokens = test.requested_output_tokens();
-    options.execution.allow_prefix_reuse      = false;
-    options.execution.sampling.temperature    = 0.0F;
-    options.stop.include_model_defaults       = false;
-    options.output.raw                        = true;
-    options.output.preserve_special_tokens    = true;
-    if (constraint) {
-        options.constraint                     = constraint;
-        options.stop.include_model_defaults    = true;
-        options.output.raw                     = false;
-        options.output.preserve_special_tokens = false;
-    }
-    return options;
-}
+    bool enabled_;
+};
 
-void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironment& env,
-                    const ninfer::bench::BenchTest& test,
-                    const std::vector<ninfer::TokenId>& corpus,
-                    ninfer::bench::TestResult* measured = nullptr) {
-    const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
-                                  ? ninfer::bench::kDecodeSeedTokens
-                                  : test.n_prompt;
-    std::vector<ninfer::PreparedPrompt> prompts;
-    std::vector<ninfer::GenerationHandle> handles;
-    std::vector<ninfer::GenerationResult> generated;
-    prompts.reserve(env.concurrency);
-    handles.reserve(env.concurrency);
-    generated.reserve(env.concurrency);
-    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        prompts.push_back(
-            engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false));
+bench::Repetition run(Engine& engine, const bench::Options& options,
+                      const std::vector<PromptInput>& inputs,
+                      std::span<const RequestOptions> requests, bool measured) {
+    std::vector<PreparedPrompt> prompts;
+    std::vector<GenerationHandle> handles;
+    bench::Repetition repetition;
+    prompts.reserve(requests.size());
+    handles.reserve(requests.size());
+    repetition.requests.reserve(requests.size());
+    for (std::size_t row = 0; row < requests.size(); ++row)
+        prompts.push_back(engine.prepare(inputs[inputs.size() == 1 ? 0 : row]));
+    if (measured) {
+        engine.reset_measurement_peaks();
+        repetition.before = engine.snapshot();
     }
+    ProfilerRange profile(measured && options.profile_measured);
     const auto started = std::chrono::steady_clock::now();
-    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        const bool constrained =
-            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
+    for (std::size_t row = 0; row < requests.size(); ++row)
         handles.push_back(
-            engine.submit(std::move(prompts[row]),
-                          benchmark_request(test, constrained ? env.constraint : std::nullopt),
-                          ninfer::OutputConsumerMode::Aggregate, {.constraint_timings = true}));
-    }
-    for (auto& handle : handles) { generated.push_back(handle.wait()); }
-    const double wall_seconds =
+            engine.submit(std::move(prompts[row]), requests[row], OutputConsumerMode::Aggregate));
+    for (auto& handle : handles) repetition.requests.push_back(handle.wait());
+    repetition.wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        auto& result = generated[row];
-        const bool constrained =
-            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
-        const auto count    = static_cast<std::uint32_t>(result.generated_token_ids.size());
-        const bool at_limit = result.finish_reason == ninfer::FinishReason::OutputLimit &&
-                              count == test.requested_output_tokens();
-        const bool grammar_done = constrained &&
-                                  result.finish_reason == ninfer::FinishReason::StopToken &&
-                                  count <= test.requested_output_tokens();
-        if (!at_limit && !grammar_done) {
-            throw std::runtime_error(test.label +
-                                     " did not finish at its output limit or grammar EOS");
-        }
-        if (measured) {
-            measured->reps.push_back({result.stats.timings, std::move(result.stats.speculative),
-                                      count, result.stats.constraint,
-                                      result.stats.engine_timing.executor_flush_exposed_seconds});
-        }
-    }
-    if (measured) { measured->repetition_wall_seconds.push_back(wall_seconds); }
+    if (measured) repetition.after = engine.snapshot();
+    profile.finish();
+    return repetition;
 }
 
-void prime_decode_graph(ninfer::Engine& engine, ninfer::bench::BenchEnvironment& env,
-                        const std::vector<ninfer::TokenId>& corpus) {
-    if (!env.use_cuda_graph || env.decode_graph_prime_output_tokens == 0) { return; }
-    const int decode_tokens = static_cast<int>(env.decode_graph_prime_output_tokens - 1);
-    const ninfer::bench::BenchTest prime{ninfer::bench::TestKind::Decode, 0, decode_tokens,
-                                         "decode-graph-prime"};
-    run_repetition(engine, env, prime, corpus);
-    env.decode_graph_primed = true;
-}
-
-void write_output(const ninfer::bench::BenchOptions& options, const std::string& text) {
+void write_report(const bench::Options& options, const std::string& report) {
     if (options.output_file.empty()) {
-        std::cout << text;
+        std::cout << report;
         return;
     }
-    const std::filesystem::path path(options.output_file);
-    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
-    std::ofstream output(path);
-    if (!output) { throw std::runtime_error("failed to open output file: " + options.output_file); }
-    output << text;
-    std::cout << "wrote " << options.output_file << '\n';
+    const auto parent = options.output_file.parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent);
+    std::ofstream file(options.output_file);
+    if (!file) throw std::runtime_error("cannot open report: " + options.output_file.string());
+    file << report;
+    file.close();
+    if (!file) throw std::runtime_error("cannot write report: " + options.output_file.string());
+    std::cerr << "wrote " << options.output_file << '\n';
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::bench::BenchOptions options;
     try {
-        options = ninfer::bench::parse_args(argc, argv);
-    } catch (const std::exception& error) {
-        std::cerr << "ninfer_bench: " << error.what() << '\n';
-        return 2;
-    }
-    if (options.help_requested) {
-        std::cout << ninfer::bench::usage_text(argc > 0 ? argv[0] : "ninfer_bench");
-        return 0;
-    }
-
-    try {
-        const std::vector<ninfer::TokenId> corpus =
-            ninfer::bench::load_corpus_ids(options.corpus_path);
-        const std::vector<ninfer::bench::BenchTest> tests = ninfer::bench::expand_tests(options);
-        if (options.profile_measured && (tests.size() != 1 || options.repetitions != 1)) {
-            throw std::invalid_argument(
-                "--profile-measured requires exactly one benchmark test and -r 1");
+        const auto options = bench::parse_options(argc, argv);
+        if (options.help_requested) {
+            std::cout << bench::usage_text(argc ? argv[0] : "ninfer_bench");
+            return 0;
         }
-        ninfer::bench::validate_prompt_lengths(tests, corpus.size());
-        const std::uint32_t max_context = ninfer::bench::resolve_max_context(
-            tests, options.max_context, options.speculative, options.use_cuda_graph);
+        product::LoggingRuntime logging({.logger_name  = "ninfer_bench",
+                                         .level        = options.launch.logging.level,
+                                         .presentation = product::LogPresentation::Tool});
+        const auto logger = logging.logger();
+        product::log_configuration(
+            *logger, product::configuration_view(options.launch, product::EntryPoint::Bench));
+        product::StartupLogRenderer startup_log(logging);
+        auto engine_options             = options.launch.engine;
+        engine_options.startup_observer = startup_log.observer();
 
-        ninfer::EngineOptions engine_options;
-        engine_options.artifact_path   = options.artifact_path;
-        engine_options.device          = options.device;
-        engine_options.max_context     = max_context;
-        engine_options.max_concurrency = options.concurrency;
-        const std::uint64_t kv_capacity =
-            ((static_cast<std::uint64_t>(max_context) + 63U) / 64U) * 64U * options.concurrency;
-        if (kv_capacity > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::invalid_argument("concurrent benchmark KV capacity exceeds uint32");
-        }
-        engine_options.kv_capacity =
-            ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(kv_capacity));
-        engine_options.prefill_chunk                     = options.prefill_chunk;
-        engine_options.kv_cache                          = options.kv_cache;
-        engine_options.context_cache.enabled             = false;
-        engine_options.context_cache.extra_state_slots   = 0;
-        engine_options.context_cache.host_capacity_bytes = 0;
-        engine_options.speculative                       = options.speculative;
-        engine_options.use_cuda_graph                    = options.use_cuda_graph;
+        const auto& defaults = options.launch.generation;
+        std::vector<PromptInput> inputs;
+        for (const auto& source : options.inputs) {
+            auto input = source.kind == bench::InputKind::Prompt
+                             ? product::prompt_from_text(source.value, defaults.enable_thinking)
+                             : product::prompt_from_messages(source.value, defaults.enable_thinking,
+                                                             engine_options.enable_vision);
 
-        ninfer::bench::BenchEnvironment env;
-        env.artifact_path            = options.artifact_path;
-        env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
-        env.max_context              = max_context;
-        env.prefill_chunk            = options.prefill_chunk;
-        env.kv_cache                 = options.kv_cache;
-        env.speculative              = options.speculative;
-        env.use_cuda_graph           = options.use_cuda_graph;
-        env.repetitions              = options.repetitions;
-        env.warmup                   = options.warmup;
-        env.corpus_path              = options.corpus_path;
-        env.corpus_tokens            = corpus.size();
-        env.concurrency              = options.concurrency;
-        env.constraint_file          = options.constraint_file;
-        env.constraint               = options.constraint;
-        env.mixed_constraints        = options.mixed_constraints;
-        if (env.constraint && (env.constraint->kind == ninfer::OutputConstraintKind::Grammar ||
-                               env.constraint->kind == ninfer::OutputConstraintKind::JsonSchema)) {
-            std::ifstream input(options.constraint_file, std::ios::binary);
-            if (!input)
-                throw std::runtime_error("cannot read constraint: " + options.constraint_file);
-            env.constraint->source.assign(std::istreambuf_iterator<char>(input), {});
-            if (input.bad()) throw std::runtime_error("failed to read constraint file");
+            input.options.preserve_thinking = defaults.preserve_thinking;
+            inputs.push_back(std::move(input));
         }
-        if (options.use_cuda_graph && has_decode_tests(tests)) {
-            env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.speculative);
+        std::vector<RequestOptions> requests(options.concurrency);
+        std::vector<std::uint64_t> seeds;
+        for (auto& request : requests) {
+            request.execution.sampling = defaults.sampling;
+            if (!request.execution.sampling.seed)
+                request.execution.sampling.seed = product::random_sampling_seed();
+            seeds.push_back(*request.execution.sampling.seed);
+            request.execution.requested_output_tokens = defaults.max_tokens;
+            request.execution.thinking.budget         = defaults.thinking_budget;
         }
 
-        std::cerr << "[ninfer_bench] loading " << options.artifact_path
-                  << " (max_context=" << max_context
-                  << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
-        ninfer::Engine engine(std::move(engine_options));
-        fill_cuda_environment(env, options.device);
-        env.description   = engine.description();
-        env.startup       = engine.startup_report();
-        env.snapshot      = engine.snapshot();
-        env.prefill_chunk = env.description.prefill_chunk;
-
-        prime_decode_graph(engine, env, corpus);
-
-        std::vector<ninfer::bench::TestResult> results;
-        results.reserve(tests.size());
-        for (std::size_t i = 0; i < tests.size(); ++i) {
-            const auto& test = tests[i];
-            std::cerr << "[ninfer_bench] test " << (i + 1) << '/' << tests.size() << ' '
-                      << test.label << ": warmup=" << options.warmup
-                      << " reps=" << options.repetitions << '\n';
-
-            ninfer::bench::TestResult result;
-            result.test        = test;
-            result.concurrency = env.concurrency;
-            engine.reset_measurement_peaks();
-            for (int warmup = 0; warmup < options.warmup; ++warmup) {
-                run_repetition(engine, env, test, corpus);
-            }
-            const auto before = engine.snapshot();
-            result.reps.reserve(static_cast<std::size_t>(options.repetitions) * env.concurrency);
-            if (options.profile_measured) {
-                require_cuda(cudaDeviceSynchronize(), "profile pre-boundary synchronize");
-                require_cuda(cudaProfilerStart(), "cudaProfilerStart");
-            }
-            for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-                run_repetition(engine, env, test, corpus, &result);
-            }
-            if (options.profile_measured) {
-                require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");
-                require_cuda(cudaProfilerStop(), "cudaProfilerStop");
-            }
-            const auto after = engine.snapshot();
-            for (const auto& rank : after.ranks) {
-                result.max_rank_workspace_peak_bytes =
-                    std::max(result.max_rank_workspace_peak_bytes,
-                             rank.memory.workspace.measurement_peak_bytes);
-                result.rank_peaks.push_back(
-                    {rank.rank, rank.memory.workspace.measurement_peak_bytes});
-                const auto old = std::find_if(before.ranks.begin(), before.ranks.end(),
-                                              [&](const auto& r) { return r.rank == rank.rank; });
-                if (rank.memory.experts) {
-                    const auto previous = old != before.ranks.end() && old->memory.experts
-                                              ? old->memory.experts->uploaded_bytes
-                                              : 0;
-                    result.expert_upload_bytes += rank.memory.experts->uploaded_bytes - previous;
-                }
-            }
-            results.push_back(std::move(result));
+        Engine engine(std::move(engine_options));
+        startup_log.engine_ready(engine.startup_report().load);
+        product::log_resolved_configuration(*logger, engine.description());
+        const auto initial = engine.snapshot();
+        logger->info("benchmark: {} requests, {} output tokens/request, {} warmup, {} repetitions",
+                     options.concurrency, options.launch.generation.max_tokens, options.warmup,
+                     options.repetitions);
+        for (std::uint32_t i = 0; i < options.warmup; ++i) {
+            (void)run(engine, options, inputs, requests, false);
+            logger->info("warmup {}/{} complete", i + 1, options.warmup);
         }
-
-        std::string report;
-        switch (options.output) {
-        case ninfer::bench::OutputFormat::Table:
-            report = ninfer::bench::format_table(env, results);
-            break;
-        case ninfer::bench::OutputFormat::Json:
-            report = ninfer::bench::format_json(env, command_line(argc, argv), results);
-            break;
-        case ninfer::bench::OutputFormat::Csv:
-            report = ninfer::bench::format_csv(env, results);
-            break;
+        std::vector<bench::Repetition> repetitions;
+        repetitions.reserve(options.repetitions);
+        for (std::uint32_t i = 0; i < options.repetitions; ++i) {
+            repetitions.push_back(run(engine, options, inputs, requests, true));
+            logger->info("repetition {}/{} complete", i + 1, options.repetitions);
         }
-        write_output(options, report);
+        const auto report = bench::make_report(
+            options, engine.description(), engine.startup_report(), initial, seeds, repetitions);
+        write_report(options, bench::format_report(report, options.output));
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ninfer_bench: " << error.what() << '\n';

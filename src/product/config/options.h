@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -14,7 +15,7 @@
 
 namespace ninfer::product {
 
-enum class EntryPoint { Cli, Serve };
+enum class EntryPoint { Cli, Serve, Bench };
 enum class ConfigSourceKind { Default, File, CommandLine };
 
 struct ConfigSource {
@@ -98,6 +99,27 @@ struct ServeOptions {
 
 [[nodiscard]] CliOptions parse_cli_options(int argc, char** argv);
 [[nodiscard]] ServeOptions parse_serve_options(int argc, char** argv);
+
+struct CommandLineOption {
+    std::string_view flag;
+    bool takes_value = true;
+};
+
+struct CommandLineArgument {
+    std::string flag;
+    std::string value;
+};
+
+struct ParsedLaunchOptions {
+    bool help_requested = false;
+    LaunchOptions launch;
+    std::vector<CommandLineArgument> extra_arguments;
+};
+
+// Parse shared startup settings and preserve application-owned arguments in input order.
+[[nodiscard]] ParsedLaunchOptions
+parse_launch_options(int argc, char** argv, EntryPoint entry,
+                     std::span<const CommandLineOption> extra_options = {});
 [[nodiscard]] std::string startup_usage_text(std::string_view executable, EntryPoint entry);
 
 using ConfigurationValue = std::variant<bool, std::uint64_t, double, std::string,
@@ -121,5 +143,7 @@ struct StartupConfigurationView {
 
 [[nodiscard]] StartupConfigurationView configuration_view(const CliOptions& options);
 [[nodiscard]] StartupConfigurationView configuration_view(const ServeOptions& options);
+[[nodiscard]] StartupConfigurationView configuration_view(const LaunchOptions& options,
+                                                          EntryPoint entry);
 
 } // namespace ninfer::product

@@ -48,7 +48,11 @@ std::string value_text(const ConfigurationItem& item) {
 
 std::string format_configuration(const StartupConfigurationView& view) {
     std::ostringstream out;
-    out << "configuration  " << (view.entry == EntryPoint::Cli ? "cli" : "serve") << '\n';
+    out << "configuration  "
+        << (view.entry == EntryPoint::Cli     ? "cli"
+            : view.entry == EntryPoint::Serve ? "serve"
+                                              : "bench")
+        << '\n';
     if (!view.config_path.empty())
         out << "  file         " << format_pretty_text(view.config_path.string()) << '\n';
     std::string previous;

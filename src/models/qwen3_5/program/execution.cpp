@@ -7,23 +7,6 @@
 namespace ninfer::models::qwen3_5::detail {
 
 void RankProgramImpl::progress() {
-    const auto started        = std::chrono::steady_clock::now();
-    const auto ticket         = compute ? std::optional(compute->request.ticket) : std::nullopt;
-    const auto pending_events = events.size();
-    advance();
-    if (!ticket) return;
-    const auto elapsed =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - started)
-                                       .count());
-    if (compute && compute->request.ticket == *ticket) compute->timing.submit_host_ns += elapsed;
-    for (std::size_t i = pending_events; i < events.size(); ++i) {
-        auto* result = std::get_if<runtime::ResultReady<ExecutionTypes>>(&events[i]);
-        if (result && result->ticket == *ticket) result->result.timing.submit_host_ns += elapsed;
-    }
-}
-
-void RankProgramImpl::advance() {
     if (context_operation && context_ready.ready()) {
         const auto ticket    = context_operation->request.ticket;
         const auto command   = context_operation->last_command;
@@ -32,8 +15,8 @@ void RankProgramImpl::advance() {
         result.transfers.assign(transfers.begin(), transfers.end());
         context_actions->finish();
         events.emplace_back(
-            runtime::ResultReady<ExecutionTypes>{ticket, Result{std::move(result), {}}});
-        events.emplace_back(runtime::DeviceRetired{ticket, command});
+            runtime::ResultReady<ExecutionTypes>{ticket, Result{std::move(result)}});
+        events.emplace_back(runtime::DeviceRetired{ticket, command, retirement_observation()});
         context_operation.reset();
     }
     if (!compute) return;
@@ -45,6 +28,7 @@ void RankProgramImpl::advance() {
         }
         if (graphs) graphs->cancel();
         if (resources.moe) resources.moe->cancel();
+        gpu_timer.record_retirement();
         compute_retired.record(device.stream());
         operation.stage = ComputeStage::Retiring;
     }
@@ -53,6 +37,7 @@ void RankProgramImpl::advance() {
         case ComputeStage::Inputs:
             if (std::holds_alternative<NormalizeWork>(operation.request.work.operation)) {
                 append_draft_history(operation);
+                gpu_timer.record_result();
                 result_ready.record(device.stream());
                 operation.stage = ComputeStage::Readback;
                 break;
@@ -76,6 +61,7 @@ void RankProgramImpl::advance() {
                 if (backend == SpeculativeBackend::Mtp && !operation.speculative)
                     align_mtp_history(operation);
                 if (operation.fused_decision) {
+                    gpu_timer.record_result();
                     result_ready.record(device.stream());
                     operation.stage = ComputeStage::Readback;
                 } else {
@@ -113,14 +99,15 @@ void RankProgramImpl::advance() {
                                            cudaMemcpyDeviceToDevice, device.stream()));
             }
             if (operation.width) prefill_timer.record_stop();
+            gpu_timer.record_result();
             result_ready.record(device.stream());
             operation.stage = ComputeStage::History;
             break;
         case ComputeStage::History:
             if (!result_ready.ready()) return;
             if (operation.width)
-                operation.timing.gpu_elapsed_ns +=
-                    static_cast<std::uint64_t>(prefill_timer.elapsed_ms() * 1.0e6);
+                operation.gpu.add_prefill(
+                    static_cast<std::uint64_t>(prefill_timer.elapsed_ms() * 1.0e6));
             if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation)) {
                 auto& result       = std::get<ForwardResult>(operation.result->output);
                 const auto& window = forward->inputs[operation.forward_row];
@@ -128,8 +115,8 @@ void RankProgramImpl::advance() {
                 const auto lane = operation.rows[operation.forward_row].member.residency.lane.value;
                 auto& residency = residencies[lane];
                 if (residency.vision) {
-                    result.vision_seconds +=
-                        residency.vision->elapsed_seconds() - operation.vision_before;
+                    operation.gpu.add_vision(static_cast<std::uint64_t>(
+                        (residency.vision->elapsed_seconds() - operation.vision_before) * 1.0e9));
                     if (window.prompt_begin + operation.forward_offset >=
                         residency.vision_input->plan.uses.back().end) {
                         residency.vision.reset();

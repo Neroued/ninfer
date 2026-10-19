@@ -95,6 +95,7 @@ struct RequestFailure {
 };
 
 struct ThroughputReport {
+    ExecutionStatistics previous_execution{}, current_execution{};
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;

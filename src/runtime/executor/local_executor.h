@@ -2,6 +2,7 @@
 
 #include "runtime/executor/executor.h"
 #include "runtime/executor/rank_worker.h"
+#include "runtime/observability/snapshot.h"
 
 #include <exception>
 #include <type_traits>
@@ -16,7 +17,11 @@ public:
 
     LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch)
         : worker_(std::move(worker)), epoch_(epoch), pool_(worker_->program().capacity()),
-          compute_(pool_.capacity().compute_frames), context_(pool_.capacity().context_frames) {}
+          compute_(pool_.capacity().compute_frames), context_(pool_.capacity().context_frames) {
+        this->observations_.resize(1);
+        this->observations_[0].hardware = worker_->device_name();
+        sample_resources(true);
+    }
 
     ~LocalExecutor() override {
         try {
@@ -47,8 +52,11 @@ public:
                                      pool_.accept(std::move(reservation))};
         auto& flight = slot(ticket.frame);
         flight       = {ticket, next_command(), Phase::Running, {}};
+        flight.clock.start(Protocol::describe_work(work), observation_time_ns());
         try {
-            worker_->program().start({ticket, flight.command, std::move(work)});
+            observe_host_call(host_.submit_ns, [&] {
+                worker_->program().start({ticket, flight.command, std::move(work)});
+            });
         } catch (...) { record_failure(ticket); }
         return ticket;
     }
@@ -63,7 +71,9 @@ public:
         flight.command = next_command();
         flight.phase   = Phase::Running;
         try {
-            worker_->program().supply(ticket, flight.command, std::move(input));
+            observe_host_call(host_.supply_ns, [&] {
+                worker_->program().supply(ticket, flight.command, std::move(input));
+            });
         } catch (...) { record_failure(ticket); }
     }
 
@@ -78,11 +88,14 @@ public:
         flight.command = next_command();
         flight.phase   = Phase::Retiring;
         try {
-            worker_->program().commit(ticket, flight.command, std::move(commit));
+            observe_host_call(host_.commit_ns, [&] {
+                worker_->program().commit(ticket, flight.command, std::move(commit));
+            });
         } catch (...) {
             record_failure(ticket);
             throw;
         }
+        flight.clock.resolve(observation_time_ns());
         return {ticket, flight.command};
     }
 
@@ -93,17 +106,21 @@ public:
         flight.command = next_command();
         flight.phase   = Phase::Discarding;
         try {
-            worker_->program().discard(ticket, flight.command);
+            observe_host_call(host_.discard_ns,
+                              [&] { worker_->program().discard(ticket, flight.command); });
+            flight.clock.resolve(observation_time_ns());
         } catch (...) { record_failure(ticket); }
     }
 
     [[nodiscard]] std::optional<Event> poll() override {
         if (failure_) return Event{std::exchange(failure_, {}).value()};
         if (failed_ || closed_) return {};
+        sample_resources(false);
         std::optional<Event> event;
         try {
             for (;;) {
-                event = worker_->program().poll();
+                event =
+                    observe_host_call(host_.progress_ns, [&] { return worker_->program().poll(); });
                 if (!event) return {};
                 if (std::holds_alternative<ExecutionFailed>(*event)) {
                     failed_ = true;
@@ -118,7 +135,7 @@ public:
                     break;
             }
             std::visit(
-                [&](const auto& value) {
+                [&](auto& value) {
                     using Value  = std::decay_t<decltype(value)>;
                     auto& flight = find(value.ticket);
                     if constexpr (std::is_same_v<Value, DecisionNeeded>) {
@@ -138,12 +155,20 @@ public:
                         flight.phase = value.ticket.frame.kind == FrameKind::Compute
                                            ? Phase::Result
                                            : Phase::Retiring;
+                        flight.clock.result(observation_time_ns());
+                        value.execution = flight.clock.finish(observation_time_ns());
                     } else if constexpr (std::is_same_v<Value, DeviceRetired>) {
                         if ((flight.phase != Phase::Retiring &&
                              flight.phase != Phase::Discarding) ||
                             value.command != flight.command) {
                             throw std::logic_error("execution retired before its final command");
                         }
+                        value.execution              = flight.clock.finish(observation_time_ns());
+                        value.observed.host          = host_;
+                        value.execution.max_rank_gpu = value.observed.gpu;
+                        this->observe_retirement(0, value.observed,
+                                                 value.ticket.frame.kind == FrameKind::Compute);
+                        accumulate(this->execution_statistics_, value.execution);
                         pool_.retire(value.ticket.frame);
                         flight = {};
                     } else {
@@ -184,13 +209,23 @@ public:
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
 
-    [[nodiscard]] MemorySummary memory_summary() override {
-        return worker_->program().memory_summary();
+    void reset_measurement_peaks() override {
+        worker_->program().reset_measurement_peaks();
+        this->observations_[0].memory = worker_->program().observe_resources();
     }
 
-    void reset_memory_peaks() noexcept override { worker_->program().reset_memory_peaks(); }
-
 private:
+    void sample_resources(bool force) {
+        auto& snapshot = this->observations_[0];
+        const auto now = observation_time_ns();
+        if (!force && now - snapshot.stamp.sampled_ns < kResourceSamplePeriodNs) return;
+        snapshot.memory = worker_->program().observe_resources();
+        snapshot.host   = host_;
+        if (force || !pool_.in_flight())
+            snapshot.physical_memory = sample_physical_memory(worker_->device());
+        snapshot.stamp       = {snapshot.stamp.sequence + 1, now};
+        snapshot.received_ns = now;
+    }
     enum class Phase : std::uint8_t { Empty, Running, Decision, Result, Retiring, Discarding };
 
     struct Flight {
@@ -198,6 +233,7 @@ private:
         CommandSequence command;
         Phase phase                  = Phase::Empty;
         std::uint32_t decision_stage = 0;
+        ExecutionClock clock;
     };
 
     [[nodiscard]] Flight& slot(FrameId frame) {
@@ -236,6 +272,7 @@ private:
     std::vector<Flight> compute_, context_;
     std::uint64_t next_execution_ = 0, next_command_ = 0;
     bool failed_ = false, closed_ = false;
+    RankHostStatistics host_;
     std::optional<ExecutionFailed> failure_;
 };
 

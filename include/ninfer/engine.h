@@ -102,13 +102,12 @@ public:
                               const CancellationView& cancellation = {});
 
     [[nodiscard]] const EngineOptions& options() const;
-    [[nodiscard]] LoadSummary load_summary() const;
-    [[nodiscard]] MemorySummary memory_summary() const;
-    [[nodiscard]] RuntimeStats runtime_stats() const;
-    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    [[nodiscard]] const EngineDescription& description() const;
+    [[nodiscard]] const StartupReport& startup_report() const;
+    [[nodiscard]] EngineSnapshot snapshot() const;
     [[nodiscard]] bool is_available() const;
 
-    void reset_memory_peaks() noexcept;
+    void reset_measurement_peaks();
 
 private:
     class Impl;

@@ -149,7 +149,8 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
                 auto& round = batch.rounds[depth][m];
                 round.installed_draft.resize(depth);
                 round.graph.prepare(
-                    p.cuda, [&] { body(batch, &round, b, depth, static_cast<DeviceRound>(m)); });
+                    p.cuda, [&] { body(batch, &round, b, depth, static_cast<DeviceRound>(m)); },
+                    p.parallel ? &*p.parallel : nullptr);
             }
             // Replay a complete round after construction; all ranks enter the same variant.
             replay(b, DeviceRound::Sample, std::vector<std::uint32_t>(depth, bounds_.back()),
@@ -158,20 +159,24 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
         }
         for (int verify = 0; verify < (drafts ? 2 : 1); ++verify)
             for (int sampled = 0; sampled < 2; ++sampled) {
-                batch.decisions[verify * 2 + sampled].prepare(p.cuda, [&] {
-                    if (verify)
-                        p.vocabulary_accept(b, sampled ? 20 : 1);
-                    else
-                        p.vocabulary_sample(b, false, sampled ? 20 : 1);
-                    p.copy_sample_result(b, verify);
-                });
+                batch.decisions[verify * 2 + sampled].prepare(
+                    p.cuda,
+                    [&] {
+                        if (verify)
+                            p.vocabulary_accept(b, sampled ? 20 : 1);
+                        else
+                            p.vocabulary_sample(b, false, sampled ? 20 : 1);
+                        p.copy_sample_result(b, verify);
+                    },
+                    p.parallel ? &*p.parallel : nullptr);
             }
     }
     if (drafts)
         for (std::uint32_t b = 1; b <= p.shape.max_concurrency; ++b)
             for (int rebuild = 0; rebuild < 2; ++rebuild)
-                batches_[b - 1].finish[rebuild].prepare(p.cuda,
-                                                        [&] { p.finish_verify(b, rebuild); });
+                batches_[b - 1].finish[rebuild].prepare(
+                    p.cuda, [&] { p.finish_verify(b, rebuild); },
+                    p.parallel ? &*p.parallel : nullptr);
     workspace_peak_ = r.workspace.peak_used();
 }
 
@@ -199,16 +204,17 @@ void DeviceGraphs::replay(std::uint32_t batch, DeviceRound mode,
             round.installed_draft[step] = selected;
         }
     }
-    round.graph.executable.launch(owner_.cuda.stream());
+    round.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
 }
 
 void DeviceGraphs::decide(std::uint32_t batch, bool verify, std::int32_t candidates) {
-    batches_.at(batch - 1).decisions[verify * 2 + (candidates == 20)].executable.launch(
-        owner_.cuda.stream());
+    batches_.at(batch - 1).decisions[verify * 2 + (candidates == 20)].launch(
+        owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
 }
 
 void DeviceGraphs::finish(std::uint32_t batch, bool rebuild_history) {
-    batches_.at(batch - 1).finish[rebuild_history].executable.launch(owner_.cuda.stream());
+    batches_.at(batch - 1).finish[rebuild_history].launch(
+        owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

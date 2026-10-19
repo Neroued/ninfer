@@ -39,8 +39,10 @@ public:
     [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const;
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
-    [[nodiscard]] MemorySummary memory_summary() const;
-    void reset_memory_peaks() noexcept;
+    [[nodiscard]] RankMemoryUsage observe_resources() const;
+    [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
+    [[nodiscard]] RankMemoryBudget resource_budget() const;
+    void reset_measurement_peaks() noexcept;
 
 private:
     std::unique_ptr<detail::RankProgramImpl> impl_;

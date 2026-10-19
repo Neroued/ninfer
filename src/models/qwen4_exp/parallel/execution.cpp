@@ -70,6 +70,20 @@ void ParallelExecution::broadcast(Tensor& value, std::uint32_t owner, CudaExecut
             value.dtype, value.numel(), owner, cuda);
 }
 
+void ParallelExecution::record_graph(CommunicationWork& work, const std::function<void()>& body) {
+#if NINFER_ENABLE_DISTRIBUTED
+    binding_.group->record_graph(work, body);
+#else
+    body();
+#endif
+}
+
+void ParallelExecution::replayed(const CommunicationWork& work) const {
+#if NINFER_ENABLE_DISTRIBUTED
+    binding_.group->replayed(work);
+#endif
+}
+
 void ParallelExecution::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(cuda_.stream())); }
 
 } // namespace ninfer::models::qwen4_exp

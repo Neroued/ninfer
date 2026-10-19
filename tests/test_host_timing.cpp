@@ -1,110 +1,60 @@
-#include "runtime/contract/timing.h"
+#include "runtime/observability/execution.h"
 #include "runtime/engine/request_record.h"
 
-#include <cmath>
-#include <cstdint>
 #include <iostream>
 
-namespace {
-
-int check(bool condition, const char* message) {
-    if (condition) { return 0; }
-    std::cerr << message << '\n';
-    return 1;
-}
-
-bool near(double lhs, double rhs) { return std::abs(lhs - rhs) <= 1.0e-20; }
-
-} // namespace
-
 int main() {
-    int failures = 0;
-
-    ninfer::runtime::ExecutionTiming sum{
-        .submit_host_ns = 11, .device_wait_ns = 13, .post_host_ns = 17};
-    sum += ninfer::runtime::ExecutionTiming{
-        .submit_host_ns = 19,
-        .device_wait_ns = 23,
-        .post_host_ns   = 29,
+    using namespace ninfer;
+    using namespace ninfer::runtime;
+    int failures     = 0;
+    const auto check = [&](bool value, const char* message) {
+        if (!value) {
+            ++failures;
+            std::cerr << message << '\n';
+        }
     };
-    failures += check(sum.submit_host_ns == 30 && sum.device_wait_ns == 36 &&
-                          sum.post_host_ns == 46 && sum.host_ns() == 76 && sum.elapsed_ns() == 112,
-                      "ExecutionTiming integer phase arithmetic is inconsistent");
-
-    ninfer::runtime::ExecutionTimingRecorder aggregate(
-        ninfer::runtime::ExecutionTimingPhase::Paused);
-    aggregate.include(sum);
-    const ninfer::runtime::ExecutionTiming observed = aggregate.finish();
-    failures += check(observed.submit_host_ns == sum.submit_host_ns &&
-                          observed.device_wait_ns == sum.device_wait_ns &&
-                          observed.post_host_ns == sum.post_host_ns,
-                      "paused timing composition changed an included child observation");
-
-    ninfer::runtime::ExecutionTimingRecorder post_only(ninfer::runtime::ExecutionTimingPhase::Post);
-    const ninfer::runtime::ExecutionTiming post_observed = post_only.finish();
-    failures += check(post_observed.submit_host_ns == 0 && post_observed.device_wait_ns == 0,
-                      "post-only recorder attributed initialization to another phase");
-
-    ninfer::runtime::ExecutionTiming abandoned_observation;
-    {
-        ninfer::runtime::ExecutionTimingRecorder abandoned(
-            ninfer::runtime::ExecutionTimingPhase::Paused, &abandoned_observation);
-        abandoned.include(sum);
-    }
-    failures += check(abandoned_observation.submit_host_ns == sum.submit_host_ns &&
-                          abandoned_observation.device_wait_ns == sum.device_wait_ns &&
-                          abandoned_observation.post_host_ns == sum.post_host_ns,
-                      "abandoned Program timing was lost during exception unwinding");
-
-    ninfer::runtime::RequestHostTiming request{
-        .queue_wait_ns                   = 1,
-        .engine_boundary_exposed_ns      = 2,
-        .program_submit_exposed_ns       = 3,
-        .program_post_exposed_ns         = 5,
-        .engine_commit_output_exposed_ns = 7,
-        .engine_maintenance_exposed_ns   = 11,
-        .device_wait_exposed_ns          = 13,
-        .decode_host_exposed_ns          = 17,
-        .decode_device_wait_exposed_ns   = 19,
-        .prefill_units                   = 23,
-        .decode_rounds                   = 29,
-        .control_units                   = 31,
-    };
-    const ninfer::GenerationEngineTiming public_timing = request.public_snapshot();
-    failures += check(near(public_timing.queue_wait_seconds, 1.0e-9) &&
-                          near(public_timing.engine_boundary_exposed_seconds, 2.0e-9) &&
-                          near(public_timing.program_submit_exposed_seconds, 3.0e-9) &&
-                          near(public_timing.program_post_exposed_seconds, 5.0e-9) &&
-                          near(public_timing.engine_commit_output_exposed_seconds, 7.0e-9) &&
-                          near(public_timing.engine_maintenance_exposed_seconds, 11.0e-9) &&
-                          near(public_timing.device_wait_exposed_seconds, 13.0e-9) &&
-                          near(public_timing.decode_host_exposed_seconds, 17.0e-9) &&
-                          near(public_timing.decode_device_wait_exposed_seconds, 19.0e-9) &&
-                          public_timing.prefill_units == 23 && public_timing.decode_rounds == 29 &&
-                          public_timing.control_units == 31,
-                      "request timing publication changed integer observations");
-
-    ninfer::runtime::RequestHostTiming batch_row_a;
-    ninfer::runtime::RequestHostTiming batch_row_b;
-    const ninfer::runtime::ExecutionTiming shared_program{
-        .submit_host_ns = 10,
-        .device_wait_ns = 20,
-        .post_host_ns   = 30,
-    };
-    for (ninfer::runtime::RequestHostTiming* row : {&batch_row_a, &batch_row_b}) {
-        row->expose_engine(ninfer::runtime::RequestEngineHostPhase::Boundary, 100, true);
-        row->expose_program(shared_program, true);
-    }
-    failures += check(batch_row_a.engine_boundary_exposed_ns == 100 &&
-                          batch_row_b.engine_boundary_exposed_ns == 100 &&
-                          batch_row_a.program_submit_exposed_ns == 10 &&
-                          batch_row_b.program_submit_exposed_ns == 10 &&
-                          batch_row_a.decode_host_exposed_ns == 140 &&
-                          batch_row_b.decode_host_exposed_ns == 140 &&
-                          batch_row_a.device_wait_exposed_ns == 20 &&
-                          batch_row_b.device_wait_exposed_ns == 20,
-                      "compact-batch rows did not each receive full elapsed exposure");
-
-    if (failures == 0) { std::cout << "ok\n"; }
-    return failures == 0 ? 0 : 1;
+    ExecutionClock clock;
+    clock.start({ExecutionKind::Decode, 2, 2, 8}, 100);
+    clock.result(160);
+    clock.resolve(180);
+    const auto sample = clock.finish(210);
+    check(sample.latency.result_ns == 60 && sample.latency.resolution_ns == 20 &&
+              sample.latency.retirement_ns == 30 && sample.latency.total_ns == 110,
+          "accepted/result/resolve/retire boundaries must partition one execution");
+    ExecutionStatistics global{};
+    accumulate(global, sample);
+    RequestExecutionStatistics a{}, b{};
+    for (auto* row : {&a, &b}) (*row)[1].observe(sample.latency);
+    check(global[1].units == 1 && global[1].rows == 2 && global[1].scheduled_positions == 8 &&
+              global[1].exposure.total.total_ns == 110 && a[1].total.total_ns == 110 &&
+              b[1].total.total_ns == 110,
+          "batch work is counted once, each member observes its full latency");
+    clock.start({ExecutionKind::Context}, 300);
+    clock.result(320);
+    const auto context = clock.finish(330);
+    check(context.latency.result_ns == 20 && !context.latency.resolution_ns &&
+              !context.latency.retirement_ns && context.latency.total_ns == 30,
+          "automatic retirement must not fabricate a commit interval");
+    clock.start({ExecutionKind::Decode}, 400);
+    clock.resolve(410);
+    const auto cancelled = clock.finish(450);
+    check(!cancelled.latency.result_ns && !cancelled.latency.resolution_ns &&
+              cancelled.latency.retirement_ns == 40 && cancelled.latency.total_ns == 50,
+          "discard before result preserves actual drain time");
+    RequestHostTiming request;
+    request.expose_engine(RequestEngineHostPhase::Boundary, 20, true);
+    request.expose_call(CoordinatorCall::Session, 10, true);
+    request.expose_call(CoordinatorCall::Poll, 5, true);
+    request.expose_call(CoordinatorCall::Yield, 30, true);
+    check(request.decode_host_exposed_ns == 35 && request.decode_scheduler_yield_exposed_ns == 30,
+          "yield/relock latency is not host-active time or GPU time");
+    GpuExecutionObservation gpu;
+    merge_gpu_intervals(gpu, {.result_stream_ns = 20, .prefill_stream_ns = 50});
+    merge_gpu_intervals(gpu, {.result_stream_ns = 30});
+    std::array<DurationCounter, 4> measured{};
+    accumulate_gpu(measured, gpu);
+    check(measured[0].count == 1 && measured[0].total_ns == 30 && measured[1].count == 0 &&
+              measured[2].total_ns == 50,
+          "rank max is per execution; unavailable GPU intervals stay unmeasured");
+    return failures ? 1 : 0;
 }

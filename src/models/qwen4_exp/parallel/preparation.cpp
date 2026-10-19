@@ -106,11 +106,15 @@ void RankPreparation::release_program() {
 RankExecutionDescription RankPreparation::describe() const {
     const auto& program = *instance_->program;
     RankExecutionDescription result{program.session_plan(), program.capacity(),
-                                    program.memory_summary()};
-    if (result.memory.cuda_graph) {
-        const auto increment     = result.memory.cuda_graph->preparation_increment_bytes;
-        result.memory.cuda_graph = graph_memory_;
-        result.memory.cuda_graph->preparation_increment_bytes = increment;
+                                    program.resource_budget()};
+    result.observation.rank     = profile_->local.rank;
+    result.observation.memory   = program.observe_resources();
+    result.observation.hardware = device_.properties().name;
+    result.observation.physical_memory.emplace();
+    if (result.budget.graphs) {
+        const auto increment = result.budget.graphs->preparation_increment_bytes;
+        result.budget.graphs = graph_memory_;
+        result.budget.graphs->preparation_increment_bytes = increment;
     }
     return result;
 }

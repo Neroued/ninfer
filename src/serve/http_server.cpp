@@ -40,11 +40,15 @@ void ensure_http_request_id(const httplib::Request& request, httplib::Response& 
     }
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const ninfer::EngineSnapshot& before,
+                                        const ninfer::EngineSnapshot& after,
                                         double interval_seconds) {
+    const auto& previous = before.runtime;
+    const auto& current  = after.runtime;
     return ThroughputReport{
-        .interval_seconds = interval_seconds,
+        .previous_execution = before.executions,
+        .current_execution  = after.executions,
+        .interval_seconds   = interval_seconds,
         .computed_prefill_tokens =
             current.computed_prefill_tokens - previous.computed_prefill_tokens,
         .committed_decode_tokens =
@@ -90,14 +94,15 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.host_context_reserved_bytes ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
-           report.current.host_work.program_submit_ns !=
-               report.previous.host_work.program_submit_ns ||
-           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
+           report.current.host_work.session_call_ns != report.previous.host_work.session_call_ns ||
+           report.current.host_work.executor_poll_ns !=
+               report.previous.host_work.executor_poll_ns ||
            report.current.host_work.engine_commit_output_ns !=
                report.previous.host_work.engine_commit_output_ns ||
            report.current.host_work.engine_maintenance_ns !=
                report.previous.host_work.engine_maintenance_ns ||
-           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
+           report.current.host_work.scheduler_yield_ns !=
+               report.previous.host_work.scheduler_yield_ns;
 }
 
 const char* endpoint_name(std::string_view path) noexcept {
@@ -286,7 +291,7 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    ninfer::EngineSnapshot previous = service_->snapshot();
     Clock::time_point previous_time = Clock::now();
     const auto interval = std::chrono::milliseconds(options_.launch.logging.stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
@@ -299,9 +304,9 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
+        const ninfer::EngineSnapshot current = service_->snapshot();
+        const Clock::time_point now          = Clock::now();
+        const ThroughputReport report        = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
@@ -311,9 +316,9 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
-    const Clock::time_point now        = Clock::now();
-    ThroughputReport tail              = make_throughput_report(
+    const ninfer::EngineSnapshot current = service_->snapshot();
+    const Clock::time_point now          = Clock::now();
+    ThroughputReport tail                = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
@@ -434,7 +439,7 @@ void HttpServer::register_routes() {
         handle_models(req, res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+        const auto stats = service_->snapshot();
         res.set_header("Cache-Control", "no-store");
         res.set_content(metrics_.render(stats, service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
@@ -510,18 +515,17 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
-    // memory_summary waits for the completed worker boundary, including warmup publication.
-    const ninfer::MemorySummary memory  = service.memory_summary();
-    const ninfer::RuntimeStats baseline = service.runtime_stats();
+    const ninfer::LoadSummary load = service.startup_report().load;
     if (!options_.model_id_override && load.model_name.empty()) {
         throw std::logic_error("loaded artifact model name must not be empty");
     }
     public_model_id_ = options_.model_id_override.value_or(load.model_name);
     service_         = &service;
-    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
-    request_jsonl_.write_server_start(options_, service.engine_options(),
-                                      service.sampling_defaults(), public_model_id_, load, memory);
+    metrics_.configure(public_model_id_, service.engine_options(), service.description(),
+                       service.startup_report(), service.snapshot());
+    request_jsonl_.write_server_start(
+        options_, service.engine_options(), service.sampling_defaults(), public_model_id_,
+        service.description(), service.startup_report(), service.snapshot());
 }
 
 bool HttpServer::listen() {

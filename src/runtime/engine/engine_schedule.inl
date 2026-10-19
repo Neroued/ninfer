@@ -112,9 +112,8 @@ void EngineCore<Instance>::resolve_context_progress(
     }
     const auto owner = materializing_ ? materializing_->request : context_owner_;
     record_context_work(progress, owner);
-    if (owner && progress.request_timings) {
-        owner->generation_timings = *progress.request_timings;
-        owner->speculative_stats  = std::move(progress.request_speculative);
+    if (owner && progress.kind == decltype(progress.kind)::Pause) {
+        owner->speculative_stats = std::move(progress.request_speculative);
     }
     if (materializing_) {
         const auto control  = std::move(*materializing_);
@@ -325,7 +324,7 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane) {
     ExecutionCallScope call(*this);
     const auto pause_started = Clock::now();
     if (!instance_.session->start_pause(*request->sequence, save_snapshot)) { return false; }
-    call.finish({});
+    call.finish();
     if (!request->is_replaying()) { request->resume_phase = request->model_state; }
     request->model_state = EngineRequestState::Pausing;
     request->paused_at   = pause_started;
@@ -930,9 +929,9 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             progressed |= advance_cycle();
             {
-                ExecutionCallScope call(*this);
+                ExecutionCallScope call(*this, CoordinatorCall::Flush);
                 instance_.executor->flush();
-                call.finish({});
+                call.finish();
             }
             outstanding = execution_outstanding();
         } catch (...) {
@@ -945,7 +944,8 @@ void EngineCore<Instance>::worker_loop() noexcept {
             execution_lock.unlock();
             std::this_thread::yield();
             execution_lock.lock();
-            record_execution_timing({.device_wait_ns = elapsed_ns(started, Clock::now())}, exposed);
+            record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
+                                    exposed);
         }
         execution_lock.unlock();
         if (!outstanding && !progressed) {

@@ -33,22 +33,16 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     auto codec = setup.codec();
     activate_execution_group(*group, prepared,
                              std::chrono::milliseconds(options.deployment->connect_timeout_ms));
-    auto executor =
-        std::make_unique<Distributed>(std::move(group), setup.capacity(), std::move(codec));
+    auto executor = std::make_unique<Distributed>(std::move(group), setup.capacity(),
+                                                  std::move(codec), setup.observations());
     executor->bind_to_current_thread();
-    const auto measured = setup.memory();
     StartupMemorySummary memory;
-    memory.device_budget_bytes             = measured.device_budget_bytes;
-    memory.cuda_graph                      = measured.cuda_graph;
-    memory.startup_retained_bytes          = measured.startup_retained_bytes;
-    auto& capacity                         = memory.kv_capacity_resolution;
-    capacity.mode                          = options.kv_capacity.mode;
-    capacity.primary_page_groups           = prepared.pages;
-    capacity.resolved_tokens               = measured.kv_capacity;
-    capacity.runtime_reservation_bytes     = measured.runtime_reservation_bytes;
-    capacity.available_after_startup_bytes = measured.available_after_startup_bytes;
-    capacity.automatic_headroom_bytes      = measured.kv_capacity_headroom_bytes;
-    capacity.planned_slack_bytes           = measured.planned_slack_bytes;
+    memory.rank_budgets          = setup.memory_budgets();
+    auto& capacity               = memory.kv_capacity_resolution;
+    capacity.mode                = options.kv_capacity.mode;
+    capacity.primary_page_groups = prepared.pages;
+    capacity.resolved_tokens =
+        prepared.reports.front().capacity.curve.resolved_tokens(prepared.pages);
     capacity.maximum_primary_page_groups =
         prepared.reports.front().capacity.curve.maximum_primary_page_groups;
     LoadSummary load;
@@ -61,8 +55,8 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     for (const auto& report : prepared.reports) {
         load.artifact_bytes_read += report.read_bytes;
         load.host_to_device_bytes += report.upload_bytes;
-        load.upload_seconds = std::max(load.upload_seconds, report.load_seconds);
-        load.peak_staging_bytes += report.staging_bytes;
+        load.upload_seconds         = std::max(load.upload_seconds, report.load_seconds);
+        load.max_rank_staging_bytes = std::max(load.max_rank_staging_bytes, report.staging_bytes);
         load.device_object_count += report.device_objects;
         load.host_object_count += report.host_objects;
         capacity.minimum_runtime_reservation_bytes +=

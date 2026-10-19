@@ -7,17 +7,11 @@
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/vision/control.h"
 
-#include <chrono>
 #include <deque>
 
 namespace ninfer::models::qwen4_exp::detail {
 using Image        = context::StateId;
 using Continuation = context::Continuation<ContinuationMetadata>;
-using Clock        = std::chrono::steady_clock;
-
-inline double seconds(Clock::time_point start) {
-    return std::chrono::duration<double>(Clock::now() - start).count();
-}
 
 struct CapturePoint {
     std::uint32_t frontier;
@@ -89,10 +83,7 @@ struct Sequence {
     std::size_t next_capture         = 0;
     std::unique_ptr<CaptureReservation> capture;
     bool capture_pending = false;
-    GenerationTimings timings;
     SpeculativeStats speculative;
-    Clock::time_point started = Clock::now();
-    std::optional<Clock::time_point> first_output;
 };
 
 struct Suspended {
@@ -196,13 +187,12 @@ struct ComputeTransaction {
     std::vector<std::uint32_t> extents;
     std::vector<std::optional<std::uint32_t>> splits;
     std::optional<ComputeResult> result;
+    ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
     std::unique_ptr<context::ContextTransaction> completion;
     bool committed = false;
     bool discarded = false;
     std::optional<SessionEvent> event;
-    Clock::time_point started = Clock::now();
-    std::optional<Clock::time_point> commit_started;
 
     ComputeTransaction(Kind kind, context::ContextDirectory& directory)
         : kind(kind), context(directory) {}
@@ -246,7 +236,7 @@ public:
                                                       context::ContextTransaction&);
     void adopt_commit(Sequence&, const ContinuationMetadata&, bool state_written,
                       bool retain_recovery) noexcept;
-    void retire_compute();
+    void retire_compute(const runtime::DeviceRetired&);
     void finish_result(ComputeResult);
     void finish_score(ScoreResult);
     [[nodiscard]] bool submit_score();

@@ -63,7 +63,6 @@ void SessionImpl::retire_context(runtime::DeviceRetired retired) {
             transfer.direction == runtime::ContextTransferDirection::HostToDevice)
             out.operations.state_restores += transfer.image_count;
     if (auto* pause = std::get_if<PauseOperation>(&operation.action)) {
-        out.request_timings     = pause->paused.impl_->control.timings;
         out.request_speculative = pause->paused.impl_->control.speculative_stats;
     }
     if (transaction.cancelled()) {

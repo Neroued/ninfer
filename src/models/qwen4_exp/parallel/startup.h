@@ -21,7 +21,8 @@ public:
     void resolve(std::span<const distributed::wire::Bytes>, EngineOptions&);
     [[nodiscard]] PreparedSession session() const;
     [[nodiscard]] Codec codec() const;
-    [[nodiscard]] MemorySummary memory() const;
+    [[nodiscard]] std::vector<RankSnapshot> observations() const;
+    [[nodiscard]] std::vector<RankMemoryBudget> memory_budgets() const;
 
     [[nodiscard]] runtime::ExecutionCapacity capacity() const { return plan_.capacity; }
 

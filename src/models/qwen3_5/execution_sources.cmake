@@ -1,4 +1,5 @@
 target_sources(ninfer_model_execution PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/dense_mlp.cpp"

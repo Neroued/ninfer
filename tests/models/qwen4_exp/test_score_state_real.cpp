@@ -134,9 +134,11 @@ public:
 
     void drain() { implementation.drain(); }
 
-    [[nodiscard]] MemorySummary memory_summary() const { return implementation.memory_summary(); }
+    [[nodiscard]] RankMemoryUsage observe_resources() const {
+        return implementation.observe_resources();
+    }
 
-    void reset_memory_peaks() noexcept { implementation.reset_memory_peaks(); }
+    void reset_measurement_peaks() noexcept { implementation.reset_measurement_peaks(); }
 
     q4::detail::RankProgramImpl implementation;
     unsigned starts = 0, results = 0;
@@ -205,8 +207,9 @@ int main() {
         auto load       = q4::resolve_load(reader, definition, device->device(), device->device());
         const auto geometry = load.ple_table().geometry();
         auto model          = q4::materialize_model(std::move(load), *device);
-        auto execution      = q4::plan_execution(profile, geometry, options, *device,
-                                                 device_memory_snapshot(device->device()).free_bytes);
+        auto execution =
+            q4::plan_execution(profile, geometry, options, *device,
+                               device_memory_snapshot(device->device()).available_bytes());
         require(execution.has_value(), "fresh scoring execution resources do not fit");
         auto plan = q4::plan_session(*execution);
         auto instance =

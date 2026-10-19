@@ -92,11 +92,11 @@ Json timings_json(const CompletionTimings& timings) {
 CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
     return make_completion_timings(
         static_cast<std::uint32_t>(std::max(0, outcome.prompt_tokens)),
-        outcome.metrics.prefix_cache_hit_tokens,
+        outcome.stats.reused_prompt_tokens,
         static_cast<std::uint32_t>(std::max(0, outcome.completion_tokens)),
-        outcome.metrics.prompt_wall_seconds * 1000.0,
-        outcome.metrics.generation_wall_seconds * 1000.0, outcome.metrics.speculative_draft_tokens,
-        outcome.metrics.speculative_accepted_tokens);
+        outcome.stats.timings.prompt_wall_seconds * 1000.0,
+        outcome.stats.timings.generation_wall_seconds * 1000.0,
+        outcome.stats.speculative.drafted_tokens, outcome.stats.speculative.accepted_tokens);
 }
 
 CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
@@ -180,7 +180,7 @@ CompletionUsage usage_from(const GenerationOutcome& outcome) {
     return CompletionUsage{
         .prompt_tokens     = outcome.prompt_tokens,
         .completion_tokens = outcome.completion_tokens,
-        .cached_tokens     = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens),
+        .cached_tokens     = static_cast<int>(outcome.stats.reused_prompt_tokens),
         .reasoning_tokens  = outcome.reasoning_tokens,
     };
 }
@@ -257,8 +257,8 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                                            {"finish_reason", Json(finish_reason(outcome))}}});
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
-    if (outcome.constraint)
-        payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (outcome.stats.constraint)
+        payload["constraint"] = product::constraint_observation_json(outcome.stats.constraint);
     return payload.dump();
 }
 
@@ -396,7 +396,7 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
 
-    const Json constraint     = product::constraint_observation_json(outcome.constraint);
+    const Json constraint     = product::constraint_observation_json(outcome.stats.constraint);
     const Json final_timings  = timings_json(outcome_timings(outcome));
     const Json output_timings = timings_per_token_ ? final_timings : Json(nullptr);
     std::vector<std::string> events;

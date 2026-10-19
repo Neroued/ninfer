@@ -101,10 +101,7 @@ EngineCore<Instance>::record_committed_output(const std::shared_ptr<Request>& re
                                               std::uint32_t accepted_tokens) {
     if (accepted_tokens == 0) { return std::nullopt; }
     cumulative_stats_.generated_tokens += accepted_tokens;
-    const bool observe_wall =
-        request->observation.phase_timings || request->observation.live_timings;
-    const bool need_now         = !request->first_token || observe_wall;
-    const Clock::time_point now = need_now ? Clock::now() : Clock::time_point{};
+    const Clock::time_point now = Clock::now();
     if (!request->first_token) {
         request->first_token = now;
         if (request->observation.first_token) {
@@ -125,7 +122,6 @@ EngineCore<Instance>::record_committed_output(const std::shared_ptr<Request>& re
             request->cv.notify_one();
         }
     }
-    if (!observe_wall) { return std::nullopt; }
     if (!request->admitted_at || !request->first_token) {
         throw std::logic_error("committed output has no observed admission boundary");
     }
@@ -218,7 +214,7 @@ void EngineCore<Instance>::publish_generation_start(const std::shared_ptr<Reques
         throw std::logic_error("request admission published generation start twice");
     }
     request->admitted_begin = begin;
-    if (request->observation.phase_timings || request->observation.live_timings ||
+    if (request->observation.constraint_timings || request->observation.live_timings ||
         request->observation.prompt_progress) {
         if (!request->admitted_at) {
             throw std::logic_error("generation start has no binding timestamp");
@@ -331,7 +327,7 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
     }
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;
-    if (request->observation.phase_timings && request->first_token) {
+    if (request->first_token) {
         if (!request->admitted_at || !request->last_token) {
             throw std::logic_error("observed request completed without stable timing bounds");
         }
@@ -348,46 +344,55 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
         request->queue_wait_recorded       = true;
     }
     GenerationResult result;
-    result.engine_request_id            = request->id;
-    result.admission                    = request->admission;
-    result.computed_prefill_tokens      = request->computed_prompt_tokens;
-    result.scheduling.preemptions       = request->preemption_count;
-    result.scheduling.replay_restores   = request->replay_restores;
-    result.scheduling.snapshot_restores = request->snapshot_restores;
-    result.scheduling.replayed_tokens   = request->replayed_tokens;
+    result.stats.engine_request_id            = request->id;
+    result.stats.admission                    = request->admission;
+    result.stats.computed_prefill_tokens      = request->computed_prompt_tokens;
+    result.stats.scheduling.preemptions       = request->preemption_count;
+    result.stats.scheduling.replay_restores   = request->replay_restores;
+    result.stats.scheduling.snapshot_restores = request->snapshot_restores;
+    result.stats.scheduling.replayed_tokens   = request->replayed_tokens;
     if (request->paused_at) {
         request->paused_ns += elapsed_ns(*request->paused_at, Clock::now());
         request->paused_at.reset();
     }
-    result.scheduling.paused_ns            = request->paused_ns;
-    result.scheduling.device_to_host_bytes = request->device_to_host_bytes;
-    result.scheduling.host_to_device_bytes = request->host_to_device_bytes;
-    result.prompt                          = request->prompt_summary;
-    result.generated_token_ids             = std::move(request->generated);
-    result.content                         = std::move(request->content);
-    result.reasoning                       = std::move(request->reasoning);
-    result.constraint                      = request->output.constraint_observation();
-    result.tool_calls                      = request->output.take_tool_calls();
-    result.tool_call_parse                 = request->output.tool_call_parse_diagnostics();
-    result.reasoning_tokens                = request->output.reasoning_tokens();
-    result.finish_reason                   = reason;
-    result.matched_stop_string             = request->output.matched_stop_string();
+    result.stats.scheduling.paused_ns            = request->paused_ns;
+    result.stats.scheduling.device_to_host_bytes = request->device_to_host_bytes;
+    result.stats.scheduling.host_to_device_bytes = request->host_to_device_bytes;
+    result.prompt                                = request->prompt_summary;
+    result.generated_token_ids                   = std::move(request->generated);
+    result.content                               = std::move(request->content);
+    result.reasoning                             = std::move(request->reasoning);
+    result.stats.constraint                      = request->output.constraint_observation();
+    result.tool_calls                            = request->output.take_tool_calls();
+    result.tool_call_parse                       = request->output.tool_call_parse_diagnostics();
+    result.reasoning_tokens                      = request->output.reasoning_tokens();
+    result.finish_reason                         = reason;
+    result.matched_stop_string                   = request->output.matched_stop_string();
     if (request->begin) {
-        result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-        result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+        result.stats.reused_prompt_tokens = request->begin->reused_prompt_tokens;
+        result.stats.prefix_reuse_path    = request->begin->prefix_reuse_path;
     }
-    result.timings                 = request->generation_timings;
-    result.timings.prepare_seconds = request->prepare_seconds;
-    result.speculative             = std::move(request->speculative_stats);
-    result.thinking                = request->output.thinking_stats();
+    result.stats.executions             = request->executions;
+    result.stats.max_rank_gpu           = request->max_rank_gpu;
+    result.stats.timings.vision_seconds = request->max_rank_gpu[3].total_ns * 1.0e-9;
+    const auto work_seconds             = [&](ExecutionKind kind) {
+        return request->executions[static_cast<std::size_t>(kind)].total.total_ns * 1e-9;
+    };
+    result.stats.timings.prefill_seconds = work_seconds(ExecutionKind::Prefill);
+    result.stats.timings.decode_seconds  = work_seconds(ExecutionKind::Decode);
+    result.stats.timings.replay_seconds  = work_seconds(ExecutionKind::Replay);
+    result.stats.timings.control_seconds = work_seconds(ExecutionKind::Control);
+    result.stats.timings.prepare_seconds = request->prepare_seconds;
+    result.stats.speculative             = std::move(request->speculative_stats);
+    result.stats.thinking                = request->output.thinking_stats();
     if (request->first_token) {
-        result.timings.first_token_seconds =
+        result.stats.timings.first_token_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(*request->first_token - request->submitted).count();
     }
-    result.timings.prompt_wall_seconds     = prompt_wall_seconds;
-    result.timings.generation_wall_seconds = generation_wall_seconds;
-    result.timings.total_seconds =
+    result.stats.timings.prompt_wall_seconds     = prompt_wall_seconds;
+    result.stats.timings.generation_wall_seconds = generation_wall_seconds;
+    result.stats.timings.total_seconds =
         request->prepare_seconds +
         std::chrono::duration<double>(Clock::now() - request->submitted).count();
     request->sequence.reset();
@@ -396,8 +401,9 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
     request->budget.reset();
     request->terminal_reason.reset();
     finish_engine_phase(completion, EngineHostPhase::CommitOutput);
-    result.engine_timing       = request->host_timing.public_snapshot();
-    result.first_output_timing = request->first_output_timing;
+    result.stats.engine_timing       = request->host_timing.public_snapshot();
+    result.stats.first_output_timing = request->first_output_timing;
+    publish_runtime_stats();
     {
         std::lock_guard lock(request->mutex);
         if (request->response_done) { return; }
@@ -474,12 +480,12 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
         }
         if (request->consumed_by_commit) {
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            remove_completed_slot(lane);
             if (request->terminal_error) {
                 complete_error(request, std::exchange(request->terminal_error, {}));
             } else {
                 complete_success(request, *request->terminal_reason);
             }
-            remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
             continue;
@@ -489,9 +495,8 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
             if (aborted.status != ConsumeStatus::Consumed) {
                 throw std::logic_error("invalid output sequence could not be aborted");
             }
-            request->generation_timings = aborted.timings;
-            request->speculative_stats  = std::move(aborted.speculative);
-            const auto error            = std::exchange(request->terminal_error, {});
+            request->speculative_stats = std::move(aborted.speculative);
+            const auto error           = std::exchange(request->terminal_error, {});
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_error(request, error);
             remove_completed_slot(lane);
@@ -511,13 +516,12 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
         resources_.finish(*instance_.session, request->continuation_owner, *request->base_plan,
                           request->publication_order);
         request->continuation_owner = 0;
-        request->generation_timings = finished.timings;
         request->speculative_stats  = std::move(finished.speculative);
         request->terminal_reason.reset();
 
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
-        complete_success(request, reason);
         remove_completed_slot(lane);
+        complete_success(request, reason);
         boundary = begin_host_phase();
         changed  = true;
     }
@@ -546,8 +550,7 @@ void EngineCore<Instance>::cancel_active_requests(
         if (aborted.status != ConsumeStatus::Consumed) {
             throw std::logic_error("cancelled sequence could not be aborted");
         }
-        request->generation_timings = aborted.timings;
-        request->speculative_stats  = std::move(aborted.speculative);
+        request->speculative_stats = std::move(aborted.speculative);
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
         append_output(request, request->output.commit_preview());
         complete_success(request, FinishReason::Cancelled);

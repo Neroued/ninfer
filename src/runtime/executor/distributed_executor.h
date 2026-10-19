@@ -4,6 +4,7 @@
 #include "runtime/executor/executor.h"
 #include "runtime/executor/protocol.h"
 #include "runtime/executor/input.h"
+#include "runtime/observability/snapshot.h"
 
 #include <algorithm>
 #include <deque>
@@ -22,11 +23,23 @@ public:
     using Commit = typename Types::Commit;
 
     DistributedExecutor(std::unique_ptr<distributed::ExecutionGroup> group,
-                        ExecutionCapacity capacity, Codec codec)
+                        ExecutionCapacity capacity, Codec codec,
+                        std::vector<RankSnapshot> initial_observations = {})
         : group_(std::move(group)), pool_(capacity), codec_(std::move(codec)),
           compute_(capacity.compute_frames), context_(capacity.context_frames),
-          progress_(group_->topology().ranks.size()), memory_reports_(progress_.size()) {
+          progress_(group_->topology().ranks.size()), reset_reports_(progress_.size()) {
         validate_control_capacity();
+        this->observations_.resize(progress_.size());
+        if (!initial_observations.empty()) this->observations_ = std::move(initial_observations);
+        for (const auto& rank : group_->topology().ranks) {
+            this->observations_[rank.rank].rank = rank.rank;
+            this->observations_[rank.rank].node = rank.node;
+            // Runtime communication counters start at activation, after preparation and capture.
+            for (auto& counters : this->observations_[rank.rank].communication) {
+                counters.eager = {};
+                counters.graph = {};
+            }
+        }
     }
 
     ~DistributedExecutor() override {
@@ -63,6 +76,7 @@ public:
         prepared.context_results.resize(group_->topology().ranks.size());
         prepared.consumed.resize(group_->topology().ranks.size());
         (void)pool_.accept(std::move(reservation));
+        prepared.clock.start(Types::describe_work(*prepared.work), observation_time_ns());
         slot(id.frame) = std::move(prepared);
         ++next_execution_;
         try {
@@ -109,6 +123,7 @@ public:
         }
         flight.command = envelope.command;
         flight.phase   = Phase::Retiring;
+        flight.clock.resolve(observation_time_ns());
         ++next_command_;
         return {id, flight.command};
     }
@@ -125,6 +140,7 @@ public:
         auto messages  = encode(envelope, distributed::wire::Kind::Discard, [](auto&, auto) {});
         flight.command = envelope.command;
         flight.phase   = Phase::Discarding;
+        flight.clock.resolve(observation_time_ns());
         ++next_command_;
         std::erase_if(events_, [&](const Event& event) {
             return std::visit(
@@ -149,6 +165,37 @@ public:
                 if (message.epoch != epoch().value)
                     throw std::logic_error("stale rank event epoch");
                 distributed::wire::Decoder in(message.payload);
+                if (message.kind == distributed::wire::Kind::Observation) {
+                    auto snapshot = protocol::rank_snapshot(in);
+                    in.finish();
+                    const auto& identity = group_->topology().rank(incoming->peer);
+                    if (snapshot.rank != identity.rank || snapshot.node != identity.node)
+                        throw std::logic_error("resource observation has an invalid rank");
+                    auto& previous = this->observations_.at(incoming->peer);
+                    if (snapshot.stamp.sequence <= previous.stamp.sequence) continue;
+                    snapshot.received_ns         = observation_time_ns();
+                    snapshot.gpu_intervals       = previous.gpu_intervals;
+                    snapshot.communication_eager = previous.communication_eager;
+                    snapshot.communication_graph = previous.communication_graph;
+                    snapshot.compute_paths       = previous.compute_paths;
+                    merge_host_observations(snapshot.host, previous.host);
+                    auto& memory                         = snapshot.memory;
+                    const auto& old                      = previous.memory;
+                    memory.workspace.required_peak_bytes = std::max(
+                        memory.workspace.required_peak_bytes, old.workspace.required_peak_bytes);
+                    memory.workspace.measurement_peak_bytes =
+                        std::max(memory.workspace.measurement_peak_bytes,
+                                 old.workspace.measurement_peak_bytes);
+                    if (memory.ple && old.ple)
+                        memory.ple->uploaded_bytes =
+                            std::max(memory.ple->uploaded_bytes, old.ple->uploaded_bytes);
+                    if (memory.experts && old.experts)
+                        memory.experts->uploaded_bytes =
+                            std::max(memory.experts->uploaded_bytes, old.experts->uploaded_bytes);
+
+                    previous = std::move(snapshot);
+                    continue;
+                }
                 if (message.kind == distributed::wire::Kind::InputReady) {
                     const auto id = in.u64();
                     in.finish();
@@ -172,14 +219,23 @@ public:
                     progress = {applied, retired};
                     continue;
                 }
-                if (message.kind == distributed::wire::Kind::MemoryReport) {
+                if (message.kind == distributed::wire::Kind::MeasurementReset) {
                     if (message.payload.size() > codec_.control_budget().report)
                         throw std::logic_error(
                             "rank resource report exceeded its prepared capacity");
-                    if (!memory_query_ || in.u64() != memory_query_ ||
-                        memory_reports_.at(incoming->peer))
-                        throw std::logic_error("unexpected rank memory report");
-                    memory_reports_[incoming->peer] = protocol::memory_summary(in);
+                    if (!reset_query_ || in.u64() != reset_query_ ||
+                        reset_reports_.at(incoming->peer))
+                        throw std::logic_error("unexpected measurement reset acknowledgement");
+                    auto updated                = protocol::rank_snapshot(in);
+                    auto& previous              = this->observations_[incoming->peer];
+                    updated.gpu_intervals       = previous.gpu_intervals;
+                    updated.communication_eager = previous.communication_eager;
+                    updated.communication_graph = previous.communication_graph;
+                    updated.compute_paths       = previous.compute_paths;
+                    merge_host_observations(updated.host, previous.host);
+                    previous                                        = std::move(updated);
+                    this->observations_[incoming->peer].received_ns = observation_time_ns();
+                    reset_reports_[incoming->peer]                  = true;
                     in.finish();
                     continue;
                 }
@@ -252,20 +308,9 @@ public:
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
 
-    [[nodiscard]] MemorySummary memory_summary() override {
-        query_memory(false);
-        return codec_.merge_memory(group_->topology(), memory_reports_);
-    }
-
-    [[nodiscard]] const std::vector<std::optional<MemorySummary>>&
-    rank_memory_reports() const noexcept {
-        return memory_reports_;
-    }
-
-    void reset_memory_peaks() noexcept override {
-        try {
-            query_memory(true);
-        } catch (const std::exception& error) { fail(error.what()); }
+    void reset_measurement_peaks() override {
+        if (pool_.busy()) throw std::logic_error("measurement window requires an idle executor");
+        reset_resource_window();
     }
 
 private:
@@ -285,6 +330,8 @@ private:
         std::vector<InputTransfers::Key> inputs;
         bool supplied = false, consumed_published = false, result_published = false;
         bool cancel_requested = false;
+        ExecutionClock clock;
+        GpuExecutionObservation gpu;
     };
 
     [[nodiscard]] Flight& slot(FrameId frame) {
@@ -372,24 +419,23 @@ private:
             throw std::invalid_argument("transport cannot reserve all execution continuations");
     }
 
-    void query_memory(bool reset) {
+    void reset_resource_window() {
         require_available();
-        std::fill(memory_reports_.begin(), memory_reports_.end(), std::nullopt);
+        std::fill(reset_reports_.begin(), reset_reports_.end(), false);
         distributed::wire::Encoder out;
-        out.u64(++memory_query_);
-        out.boolean(reset);
+        out.u64(++reset_query_);
         auto message = std::make_shared<distributed::wire::Message>(distributed::wire::Message{
-            distributed::wire::Kind::MemoryQuery, epoch().value, std::move(out).take()});
+            distributed::wire::Kind::ResetMeasurement, epoch().value, std::move(out).take()});
         std::vector<distributed::OutgoingMessage> messages;
         for (const auto& rank : group_->topology().ranks) messages.push_back({rank.rank, message});
         send(messages, true);
         std::deque<Event> deferred;
         const auto until = std::chrono::steady_clock::now() + group_->shutdown_timeout();
-        while (std::any_of(memory_reports_.begin(), memory_reports_.end(),
+        while (std::any_of(reset_reports_.begin(), reset_reports_.end(),
                            [](const auto& value) { return !value; })) {
             if (std::chrono::steady_clock::now() >= until) {
-                fail("rank memory query timed out");
-                throw std::runtime_error("rank memory query timed out");
+                fail("rank measurement reset timed out");
+                throw std::runtime_error("rank measurement reset timed out");
             }
             if (auto event = poll()) {
                 if (const auto* error = std::get_if<ExecutionFailed>(&*event))
@@ -439,7 +485,9 @@ private:
         if (f.supplied && !f.consumed_published) return;
         f.result_published = true;
         f.phase = f.ticket.frame.kind == FrameKind::Compute ? Phase::Result : Phase::Retiring;
-        events_.emplace_back(ResultReady<Types>{f.ticket, *f.result});
+        f.clock.result(observation_time_ns());
+        events_.emplace_back(
+            ResultReady<Types>{f.ticket, *f.result, f.clock.finish(observation_time_ns())});
     }
 
     void consume(distributed::RankId rank, Event event) {
@@ -498,6 +546,9 @@ private:
                         }
                         publish_result(f);
                     } else if constexpr (std::is_same_v<T, DeviceRetired>) {
+                        this->observe_retirement(rank, value.observed,
+                                                 value.ticket.frame.kind == FrameKind::Compute);
+                        merge_gpu_intervals(f.gpu, value.observed.gpu);
                         if (f.ticket.frame.kind == FrameKind::Compute &&
                             f.phase != Phase::Retiring && f.phase != Phase::Discarding)
                             throw std::logic_error("compute frame retired before resolution");
@@ -508,7 +559,10 @@ private:
                                         [&](auto r) { return f.retired[r]; })) {
                             if (f.ticket.frame.kind == FrameKind::Context && !f.result_published)
                                 throw std::logic_error("context retired before publication");
-                            events_.emplace_back(DeviceRetired{f.ticket, f.command});
+                            auto observed         = f.clock.finish(observation_time_ns());
+                            observed.max_rank_gpu = f.gpu;
+                            accumulate(this->execution_statistics_, observed);
+                            events_.emplace_back(DeviceRetired{f.ticket, f.command, {}, observed});
                             retire_inputs(*f.work);
                             pool_.retire(f.ticket.frame);
                             f = {};
@@ -530,11 +584,11 @@ private:
     };
 
     std::vector<Progress> progress_;
-    std::vector<std::optional<MemorySummary>> memory_reports_;
+    std::vector<bool> reset_reports_;
     std::deque<Event> events_;
     std::optional<ExecutionFailed> failure_;
     std::uint64_t next_execution_ = 0, next_command_ = 0;
-    std::uint64_t memory_query_ = 0;
+    std::uint64_t reset_query_ = 0;
     bool failed_ = false, closed_ = false;
 };
 

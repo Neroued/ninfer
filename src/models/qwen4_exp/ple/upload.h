@@ -55,6 +55,7 @@ public:
     [[nodiscard]] Tensor device_slot(std::uint32_t slot, std::uint32_t tokens,
                                      std::uint32_t batch) const;
     [[nodiscard]] UploadMemory memory() const noexcept;
+    [[nodiscard]] std::uint64_t uploaded_bytes() const noexcept;
     [[nodiscard]] static UploadMemory memory(std::uint32_t max_positions, std::uint32_t slots);
 
 private:

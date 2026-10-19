@@ -160,6 +160,11 @@ private:
             instance_.executor->flush();
             auto event = call([&] { return instance_.session->poll(); });
             if (event) {
+                if constexpr (!std::is_same_v<Result, runtime::ExecutionComplete>) {
+                    if ((!ticket || event->ticket == *ticket) &&
+                        std::holds_alternative<runtime::ExecutionComplete>(event->result))
+                        continue;
+                }
                 if ((ticket && event->ticket != *ticket) ||
                     !std::holds_alternative<Result>(event->result)) {
                     throw std::logic_error("benchmark received an unrelated Session result");
@@ -171,7 +176,7 @@ private:
     }
 
     void retire(runtime::ExecutionTicket ticket, std::span<const model::SequenceHandle> sequences) {
-        const auto complete = await<runtime::CommitComplete>(ticket);
+        const auto complete = await<runtime::ExecutionComplete>(ticket);
         if (complete.row_count != sequences.size() ||
             std::any_of(sequences.begin(), sequences.end(), [&](const auto sequence) {
                 return instance_.session->execution_pending(sequence);

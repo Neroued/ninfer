@@ -13,6 +13,7 @@ void RankProgramImpl::launch_score(ComputeOperation& operation) {
         frame.score_targets.ne[0],
         static_cast<std::uint32_t>(work.targets.size()) - operation.score_cursor);
     if (!operation.score_count) {
+        gpu_timer.record_result();
         result_ready.record(device.stream());
         operation.stage = ComputeStage::Readback;
         return;
@@ -37,6 +38,7 @@ void RankProgramImpl::launch_score(ComputeOperation& operation) {
                          scores, device.execution_view());
     CUDA_CHECK(cudaMemcpyAsync(frame.host_score_logprobs.data, scores.data, scores.bytes(),
                                cudaMemcpyDeviceToHost, device.stream()));
+    gpu_timer.record_result();
     result_ready.record(device.stream());
     operation.stage = ComputeStage::Readback;
 }

@@ -295,8 +295,8 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         "objects {} | host objects {}",
         format_pretty_text(load.architecture), format_pretty_bytes(load.artifact_bytes_read),
         format_pretty_bytes(load.host_to_device_bytes),
-        format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
-        format_pretty_count(load.host_object_count));
+        format_pretty_bytes(load.max_rank_staging_bytes),
+        format_pretty_count(load.device_object_count), format_pretty_count(load.host_object_count));
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),

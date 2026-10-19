@@ -26,7 +26,7 @@ constexpr std::uint32_t kOutputTokens    = 256;
 constexpr std::uint32_t kCapacity        = 512;
 constexpr std::size_t kSnapshotHostBytes = 512ULL << 20;
 const ninfer::GenerationObservationOptions kObservations{
-    .phase_timings = true, .live_timings = true, .prompt_progress = true};
+    .constraint_timings = true, .live_timings = true, .prompt_progress = true};
 
 enum class CancelStage {
     None,
@@ -223,39 +223,43 @@ public:
         }
         require(content_ == result.content && reasoning_ == result.reasoning,
                 "stream and terminal response disagree after recovery");
-        require(result.reused_prompt_tokens == 0 &&
-                    result.prefix_reuse_path == ninfer::PrefixReusePath::Root,
+        require(result.stats.reused_prompt_tokens == 0 &&
+                    result.stats.prefix_reuse_path == ninfer::PrefixReusePath::Root,
                 "self recovery was incorrectly reported as an initial history hit");
-        require(result.speculative.backend == selected &&
-                    (selected == ninfer::SpeculativeBackend::None ||
-                     (result.speculative.enabled && result.speculative.draft_window == 3 &&
-                      result.speculative.rounds + result.speculative.fallback_steps != 0)),
-                "request did not execute the selected backend");
         require(
-            result.timings.first_token_seconds > 0.0 && result.timings.prefill_seconds > 0.0 &&
-                result.timings.decode_seconds > 0.0 && result.timings.prompt_wall_seconds > 0.0 &&
-                result.timings.generation_wall_seconds > 0.0 &&
-                result.engine_timing.prefill_units > 0 && result.engine_timing.decode_rounds > 0,
-            "request lost accumulated prefill/decode timings or work when it stopped");
-        require((!content_.empty() || !reasoning_.empty()) && result.first_output_timing,
+            result.stats.speculative.backend == selected &&
+                (selected == ninfer::SpeculativeBackend::None ||
+                 (result.stats.speculative.enabled && result.stats.speculative.draft_window == 3 &&
+                  result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0)),
+            "request did not execute the selected backend");
+        require(result.stats.timings.first_token_seconds > 0.0 &&
+                    result.stats.timings.prefill_seconds > 0.0 &&
+                    result.stats.timings.decode_seconds > 0.0 &&
+                    result.stats.timings.prompt_wall_seconds > 0.0 &&
+                    result.stats.timings.generation_wall_seconds > 0.0 &&
+                    result.stats.engine_timing.prefill_units > 0 &&
+                    result.stats.engine_timing.decode_rounds > 0,
+                "request lost accumulated prefill/decode timings or work when it stopped");
+        require((!content_.empty() || !reasoning_.empty()) && result.stats.first_output_timing,
                 "nonempty streamed output has no first-output snapshot");
-        const auto& first           = *result.first_output_timing;
-        constexpr double epsilon    = 1.0e-9;
-        const double engine_elapsed = result.timings.total_seconds - result.timings.prepare_seconds;
+        const auto& first        = *result.stats.first_output_timing;
+        constexpr double epsilon = 1.0e-9;
+        const double engine_elapsed =
+            result.stats.timings.total_seconds - result.stats.timings.prepare_seconds;
         const double partitioned = first.engine.queue_wait_seconds + first.initial_binding_seconds +
                                    static_cast<double>(first.scheduling.paused_ns) * 1.0e-9;
         require(first.elapsed_seconds > 0.0 && first.elapsed_seconds < engine_elapsed + epsilon &&
                     partitioned <= first.elapsed_seconds + epsilon,
                 "first-output wall-time boundaries overlap or exceed the completed lifetime");
-        require(first.computed_prefill_tokens <= result.computed_prefill_tokens &&
+        require(first.computed_prefill_tokens <= result.stats.computed_prefill_tokens &&
                     first.computed_prefill_tokens == kPromptTokens &&
-                    first.prefill.gpu_seconds > 0.0,
-                "first-output snapshot omitted completed initial prefill or GPU work");
-        require(first.engine.decode_rounds < result.engine_timing.decode_rounds &&
-                    first.engine.program_submit_exposed_seconds <=
-                        result.engine_timing.program_submit_exposed_seconds + epsilon &&
-                    first.engine.device_wait_exposed_seconds <=
-                        result.engine_timing.device_wait_exposed_seconds + epsilon,
+                    (first.prefill.total.count > 0 || first.pending_execution.has_value()),
+                "first-output snapshot omitted completed or pending initial prefill");
+        require(first.engine.decode_rounds < result.stats.engine_timing.decode_rounds &&
+                    first.engine.session_call_exposed_seconds <=
+                        result.stats.engine_timing.session_call_exposed_seconds + epsilon &&
+                    first.engine.scheduler_yield_exposed_seconds <=
+                        result.stats.engine_timing.scheduler_yield_exposed_seconds + epsilon,
                 "continued decoding rewrote the frozen first-output work counters");
         require(first.scheduling.preemptions == 0 && first.scheduling.replay_restores == 0 &&
                     first.scheduling.snapshot_restores == 0 &&
@@ -267,8 +271,8 @@ public:
             first_d2h += resource[0].bytes;
             first_h2d += resource[1].bytes;
         }
-        require(first_d2h <= result.scheduling.device_to_host_bytes &&
-                    first_h2d <= result.scheduling.host_to_device_bytes,
+        require(first_d2h <= result.stats.scheduling.device_to_host_bytes &&
+                    first_h2d <= result.stats.scheduling.host_to_device_bytes,
                 "first-output transfers exceed the request's completed transfer accounting");
     }
 
@@ -285,7 +289,7 @@ private:
     std::string reasoning_;
 };
 
-void settled(const ninfer::RuntimeStats& stats, const ninfer::MemorySummary& memory) {
+void settled(const ninfer::RuntimeStats& stats) {
     require(stats.running_requests == 0 && stats.waiting_requests == 0 &&
                 stats.paused_requests == 0 && stats.replaying_requests == 0 &&
                 stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
@@ -295,8 +299,7 @@ void settled(const ninfer::RuntimeStats& stats, const ninfer::MemorySummary& mem
     require(stats.device_state_occupied_slots == 0 &&
                 std::all_of(stats.kv_pools.begin(), stats.kv_pools.end(),
                             [](const auto& pool) { return pool.occupied_page_groups == 0; }) &&
-                stats.host_context_occupied_bytes == 0 && stats.host_context_reserved_bytes == 0 &&
-                memory.host_context_occupied_bytes == 0 && memory.host_context_reserved_bytes == 0,
+                stats.host_context_occupied_bytes == 0 && stats.host_context_reserved_bytes == 0,
             "completed recovery retained physical resources with history disabled");
 }
 
@@ -304,12 +307,12 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
               std::string_view backend_name, bool snapshot,
               CancelStage cancel_stage = CancelStage::None) {
     ninfer::Engine engine(engine_options(artifact, selected, snapshot));
-    const auto memory = engine.memory_summary();
+    const auto& memory = engine.description();
     require(memory.max_context == kCapacity && memory.kv_capacity == kCapacity,
             "Engine changed the fixed pressure workload's context capacity");
     require(memory.host_context_capacity_bytes <= (snapshot ? kSnapshotHostBytes : 0),
             "Engine exceeded the fixture's fixed Host quota");
-    const auto before = engine.runtime_stats();
+    const auto before = engine.snapshot().runtime;
     std::array<unsigned, 2> first_token_counts{};
     std::array<ninfer::GenerationObservationOptions, 2> observations{kObservations, kObservations};
     for (std::size_t i = 0; i < observations.size(); ++i) {
@@ -380,7 +383,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     const ninfer::CancellationView cancellation([&] {
         if (cancellation_requested) { return true; }
         if (cancel_stage == CancelStage::None) { return false; }
-        const auto stats    = engine.runtime_stats();
+        const auto stats    = engine.snapshot().runtime;
         const bool observed = cancel_stage == CancelStage::Paused
                                   ? stats.paused_requests == 1
                                   : stats.replaying_requests != 0 && stats.replayed_tokens != 0;
@@ -406,14 +409,13 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                 "cancellation fixture did not observe the requested paused/replaying state");
     }
     second_sink.validate(second_result, selected, cancel_stage != CancelStage::None);
-    require(first_result->engine_request_id != second_result.engine_request_id,
+    require(first_result->stats.engine_request_id != second_result.stats.engine_request_id,
             "concurrent requests lost their independent identity");
 
     // The physical snapshot also waits for the completed worker boundary before we inspect its
     // published counters; wait() may return as soon as the terminal response is available.
-    const auto completed_memory = engine.memory_summary();
-    const auto after            = engine.runtime_stats();
-    settled(after, completed_memory);
+    const auto after = engine.snapshot().runtime;
+    settled(after);
     require(first_token_counts[0] == 1 && first_token_counts[1] == 1,
             "recovery or cancellation duplicated/lost first-token observations");
     require(after.prompt_tokens - before.prompt_tokens == 2 * kPromptTokens &&
@@ -422,13 +424,14 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                         second_result.generated_token_ids.size(),
             "metrics duplicated recovered inputs or omitted first generated tokens");
     require(after.speculative_rounds - before.speculative_rounds ==
-                    first_result->speculative.rounds + second_result.speculative.rounds &&
+                    first_result->stats.speculative.rounds +
+                        second_result.stats.speculative.rounds &&
                 after.speculative_draft_tokens - before.speculative_draft_tokens ==
-                    first_result->speculative.drafted_tokens +
-                        second_result.speculative.drafted_tokens &&
+                    first_result->stats.speculative.drafted_tokens +
+                        second_result.stats.speculative.drafted_tokens &&
                 after.speculative_accepted_tokens - before.speculative_accepted_tokens ==
-                    first_result->speculative.accepted_tokens +
-                        second_result.speculative.accepted_tokens,
+                    first_result->stats.speculative.accepted_tokens +
+                        second_result.stats.speculative.accepted_tokens,
             "live speculative counters disagree with settled work across recovery");
     require(after.decode_row_rounds - before.decode_row_rounds >
                 after.decode_rounds - before.decode_rounds,
@@ -442,13 +445,13 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     ninfer::GenerationSchedulingStats totals;
     for (const auto* result :
          std::array<const ninfer::GenerationResult*, 2>{&*first_result, &second_result}) {
-        totals.preemptions += result->scheduling.preemptions;
-        totals.replay_restores += result->scheduling.replay_restores;
-        totals.snapshot_restores += result->scheduling.snapshot_restores;
-        totals.replayed_tokens += result->scheduling.replayed_tokens;
-        totals.paused_ns += result->scheduling.paused_ns;
-        totals.device_to_host_bytes += result->scheduling.device_to_host_bytes;
-        totals.host_to_device_bytes += result->scheduling.host_to_device_bytes;
+        totals.preemptions += result->stats.scheduling.preemptions;
+        totals.replay_restores += result->stats.scheduling.replay_restores;
+        totals.snapshot_restores += result->stats.scheduling.snapshot_restores;
+        totals.replayed_tokens += result->stats.scheduling.replayed_tokens;
+        totals.paused_ns += result->stats.scheduling.paused_ns;
+        totals.device_to_host_bytes += result->stats.scheduling.device_to_host_bytes;
+        totals.host_to_device_bytes += result->stats.scheduling.host_to_device_bytes;
     }
     const char* label = cancel_stage == CancelStage::Paused   ? "cancel-paused"
                         : cancel_stage == CancelStage::Replay ? "cancel-replay"
@@ -484,22 +487,22 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                 after.replayed_tokens - before.replayed_tokens == totals.replayed_tokens,
             "request and Engine scheduling counters disagree");
     if (cancel_stage != CancelStage::None) {
-        require(first_result->scheduling.preemptions == 0 &&
-                    second_result.scheduling.preemptions != 0 &&
-                    second_result.scheduling.paused_ns != 0,
+        require(first_result->stats.scheduling.preemptions == 0 &&
+                    second_result.stats.scheduling.preemptions != 0 &&
+                    second_result.stats.scheduling.paused_ns != 0,
                 "cancellation pressure did not preserve the oldest resident");
         // The consumer may still have committed events queued when it observes paused state.
         // validate() checks the complete drained stream against the terminal result as well.
         require(second_result.generated_token_ids.size() >= committed_at_cancellation,
                 "cancellation discarded tokens already committed to the stream");
-        require(second_result.scheduling.snapshot_restores == 0 &&
+        require(second_result.stats.scheduling.snapshot_restores == 0 &&
                     totals.device_to_host_bytes == 0 && totals.host_to_device_bytes == 0,
                 "Host=0 cancellation unexpectedly used a physical snapshot");
         // The stats observation and cancellation delivery are not atomic. Cumulative counters
         // preserve prior recovery work but cannot identify work after cancellation took effect.
-        require(second_result.scheduling.replay_restores >=
+        require(second_result.stats.scheduling.replay_restores >=
                         cancellation_observed.replay_restores - before.replay_restores &&
-                    second_result.scheduling.replayed_tokens >=
+                    second_result.stats.scheduling.replayed_tokens >=
                         cancellation_observed.replayed_tokens - before.replayed_tokens,
                 "cancellation lost recovery work observed before cancellation");
     } else if (snapshot) {
@@ -521,8 +524,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(probe.generated_token_ids.size() == 4 &&
                 probe.finish_reason == ninfer::FinishReason::OutputLimit,
             "request after recovery could not reuse the released execution resources");
-    const auto settled_memory = engine.memory_summary();
-    settled(engine.runtime_stats(), settled_memory);
+    settled(engine.snapshot().runtime);
     require(engine.is_available(), "Engine became unavailable after recovery");
 }
 

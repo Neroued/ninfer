@@ -100,7 +100,7 @@ OpenAIResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
     runtime.temperature = prepared.sampling.temperature;
     runtime.top_p       = prepared.sampling.top_p;
     if (outcome != nullptr) {
-        runtime.cached_input_tokens = static_cast<int>(outcome->metrics.prefix_cache_hit_tokens);
+        runtime.cached_input_tokens = static_cast<int>(outcome->stats.reused_prompt_tokens);
     }
     return runtime;
 }
@@ -274,9 +274,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         prepared = service_->prepare(
             resolved.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            {.phase_timings = true,
-             .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token   = first_token_observer()},
+            {.constraint_timings = true,
+             .scheduling         = scheduling_observer(req_id, metadata.http_request_id),
+             .first_token        = first_token_observer()},
             [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());

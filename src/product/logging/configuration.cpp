@@ -78,12 +78,11 @@ void log_configuration(spdlog::logger& logger, const StartupConfigurationView& v
     if (logger.should_log(spdlog::level::info)) logger.info("\n{}", format_configuration(view));
 }
 
-void log_resolved_configuration(spdlog::logger& logger, const EngineOptions& options,
-                                const MemorySummary& memory) {
-    logger.info("resolved       prefill chunk={}  KV={} tokens  StateImages={}+{}  Host={}",
-                options.prefill_chunk, memory.kv_capacity, options.max_concurrency,
-                options.context_cache.extra_state_slots.value(),
-                format_pretty_bytes(options.context_cache.host_capacity_bytes.value()));
+void log_resolved_configuration(spdlog::logger& logger, const EngineDescription& description) {
+    logger.info("resolved       prefill chunk={}  KV={} tokens  StateImages={}  Host={}",
+                description.prefill_chunk, description.kv_capacity,
+                description.device_state_capacity,
+                format_pretty_bytes(description.host_context_capacity_bytes));
 }
 
 } // namespace ninfer::product

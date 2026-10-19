@@ -71,6 +71,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.u8(static_cast<std::uint8_t>(o.speculative.proposal_head));
     out.boolean(o.enable_vision);
     out.boolean(o.use_cuda_graph);
+    out.boolean(o.observability.gpu_timing);
     out.boolean(o.context_cache.enabled);
     out.u32(o.context_cache.extra_state_slots.value_or(o.max_concurrency));
     out.u64(o.context_cache.host_capacity_bytes.value_or(0));
@@ -123,6 +124,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     o.speculative.proposal_head         = static_cast<ProposalHead>(in.u8());
     o.enable_vision                     = in.boolean();
     o.use_cuda_graph                    = in.boolean();
+    o.observability.gpu_timing          = in.boolean();
     o.context_cache.enabled             = in.boolean();
     o.context_cache.extra_state_slots   = in.u32();
     o.context_cache.host_capacity_bytes = in.u64();
@@ -139,6 +141,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.u8(static_cast<std::uint8_t>(s.purpose));
     out.boolean(s.context_cache);
     out.boolean(s.cuda_graph);
+    out.boolean(s.gpu_timing);
     const auto& c = p.context;
     out.u32(c.state.logical_capacity);
     out.u32(c.state.device_slots);
@@ -171,7 +174,8 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.u64(p.vision_max_merged_tokens);
     out.u32(r.capacity.compute_frames);
     out.u32(r.capacity.context_frames);
-    runtime::protocol::encode(out, r.memory);
+    runtime::protocol::encode(out, r.budget);
+    runtime::protocol::encode(out, r.observation);
 }
 
 RankExecutionDescription decode_rank_execution(Decoder& in) {
@@ -183,6 +187,7 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                in.u32(),
                static_cast<KvCacheStorage>(in.u8()),
                static_cast<EnginePurpose>(in.u8()),
+               in.boolean(),
                in.boolean(),
                in.boolean()};
     auto& c = p.context;
@@ -209,7 +214,8 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
     }
     p.vision_max_merged_tokens = in.u64();
     r.capacity                 = {in.u32(), in.u32()};
-    r.memory                   = runtime::protocol::memory_summary(in);
+    r.budget                   = runtime::protocol::memory_budget(in);
+    r.observation              = runtime::protocol::rank_snapshot(in);
     return r;
 }
 } // namespace ninfer::models::qwen4_exp

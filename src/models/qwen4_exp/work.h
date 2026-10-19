@@ -90,12 +90,10 @@ struct RowResult {
     std::vector<TokenId> tokens;
     std::vector<TokenId> input_tokens;
     std::uint32_t dead_positions = 0;
-    double vision_seconds        = 0;
 };
 
 struct ComputeResult {
     std::vector<RowResult> rows;
-    runtime::ExecutionTiming timing;
 };
 
 struct ContextResult {
@@ -105,7 +103,6 @@ struct ContextResult {
 struct ScoreResult {
     std::uint32_t processed = 0;
     std::vector<float> logprobs;
-    runtime::ExecutionTiming timing;
 };
 
 using Result = std::variant<ComputeResult, ContextResult, ScoreResult>;
@@ -125,6 +122,7 @@ struct Commit {
 };
 
 struct ExecutionTypes {
+    [[nodiscard]] static ExecutionWork describe_work(const qwen4_exp::Work&);
     using Work   = qwen4_exp::Work;
     using Result = qwen4_exp::Result;
     using Commit = qwen4_exp::Commit;

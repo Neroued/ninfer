@@ -9,7 +9,6 @@
 #include "models/common/qwen/vision/control.h"
 
 #include <array>
-#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -119,7 +118,6 @@ struct CaptureReservation {
 struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     ResolvedSamplingParameters sampling_host;
-    GenerationTimings timings;
     SpeculativeStats speculative_stats;
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
@@ -346,8 +344,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const;
-    void reset_memory_peaks() noexcept;
+    void reset_measurement_peaks();
 
     std::shared_ptr<const ModelDefinition> definition;
     SessionPlan plan;
@@ -404,9 +401,7 @@ public:
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
         std::optional<GeneratedResult> generated;
-        runtime::ExecutionTiming timing;
-        double vision_seconds              = 0.0;
-        context::Clock::time_point started = context::Clock::now();
+        ExecutionSample observed_result;
         std::optional<SessionEvent> completion;
         std::vector<runtime::CommitDecision> decisions;
         bool result_ready = false;
@@ -423,7 +418,6 @@ public:
         std::uint32_t first_target = 0;
         std::uint32_t cursor       = 0;
         std::vector<float> logprobs;
-        runtime::ExecutionTiming timing;
     };
 
     std::optional<Scoring> scoring;

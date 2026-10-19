@@ -48,6 +48,7 @@ struct UploadSlots::Impl {
 
     Device device;
     std::uint32_t max_positions;
+    std::uint64_t uploaded_bytes = 0;
     std::vector<Slot> slots;
     std::vector<MemorySpan> outputs;
 
@@ -153,6 +154,7 @@ void UploadSlots::upload(const HostEmbedding& input, CudaExecutionView transfer)
     slot.transfer   = transfer.stream();
     try {
         copy_bytes_async(slot.device.span().subspan(0, bytes), input.values, transfer);
+        p.uploaded_bytes += bytes;
         slot.uploaded.record(transfer.stream());
     } catch (...) { p.submission_failed(slot); }
 }
@@ -181,6 +183,8 @@ void UploadSlots::consumer_submitted(Ticket ticket, CudaExecutionView consumer) 
 bool UploadSlots::upload_complete(Ticket ticket) const {
     return impl_->current(ticket).uploaded.ready();
 }
+
+std::uint64_t UploadSlots::uploaded_bytes() const noexcept { return impl_->uploaded_bytes; }
 
 bool UploadSlots::try_release(Ticket ticket) {
     auto& slot = impl_->slots.at(ticket.slot);

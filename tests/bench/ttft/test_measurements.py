@@ -329,7 +329,7 @@ def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
         "event": "throughput", "server_instance_id": "serve-test",
         "interval_seconds": 0.125 if final else 1.0,
         "host_work": {"elapsed_seconds": {"total": host_seconds},
-                      "device_wait_seconds": 0.25},
+                      "scheduler_yield_seconds": 0.25},
         "context_cache": {"occupancy": occupancy},
     }
     if final is not None:
@@ -363,7 +363,7 @@ def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path):
     assert global_work["transfers"]["kv_pools"]["0"]["d2h"]["bytes"] == 150
     assert global_work["transfers"]["state"]["d2h"]["bytes"] == 25
     assert global_work["host_work"]["elapsed_seconds"]["total"] == pytest.approx(0.12)
-    assert global_work["host_work"]["device_wait_seconds"] == 0.5
+    assert global_work["host_work"]["scheduler_yield_seconds"] == 0.5
     assert global_work["occupancy"]["host_context_occupied_bytes"] == {"sampled_max": 800, "last": 200}
     assert global_work["host_context_peak_occupied_bytes"] == 1000
     assert summary["stream_observations"][0]["device_to_host_bytes"] == 0
@@ -457,14 +457,14 @@ def first_output_event():
         "elapsed_seconds": 0.070, "initial_binding_seconds": 0.010,
         "engine": {"queue_wait_seconds": 0.030,
                    "host_exposed_seconds": {"engine_boundary": 0.003, "total": 0.004},
-                   "device_wait_exposed_seconds": 0.011},
+                   "scheduler_yield_exposed_seconds": 0.011},
         "scheduling": {"paused_ns": 5_000_000, "preemptions": 1, "snapshot_restores": 1,
                        "replay_restores": 0, "replayed_tokens": 0},
         "computed_prefill_tokens": 20,
-        "prefill": {"submit_seconds": 0.002, "wait_seconds": 0.006,
-                    "post_seconds": 0.001, "gpu_seconds": 0.007},
-        "replay": {"submit_seconds": 0, "wait_seconds": 0,
-                   "post_seconds": 0, "gpu_seconds": 0},
+        "prefill": {"result": {"count": 1, "total_ns": 2_000_000},
+                    "total": {"count": 1, "total_ns": 9_000_000}},
+        "replay": {"total": {"count": 0, "total_ns": 0}},
+        "pending_execution": {"result_ns": 7_000_000},
         "context_transfers": {"kv_pools": [{"pool_id": 0, "transfers": {"h2d": {"bytes": 1024, "seconds": 0.008}}}]},
     }
     return event
@@ -501,8 +501,8 @@ def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path
     assert row["http_residual_ms"] == pytest.approx(10)
     assert sum(row[f"{stage}_pct"] for stage in
                ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")) == pytest.approx(100)
-    assert row["prefill_program_ms"] == 9
-    assert row["prefill_gpu_ms"] == 7
+    assert row["prefill_total_ms"] == 9
+    assert row["pending_result_ms"] == 7
     assert row["kv_pool_0_h2d_ms"] == 8
     assert row["state_d2h_ms"] is None
     assert row["preemptions_before_first"] == 1

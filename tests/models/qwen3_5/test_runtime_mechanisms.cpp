@@ -4,7 +4,6 @@
 #include "models/common/qwen/vision/control.h"
 
 #include "models/common/qwen/prefix_identity.h"
-#include "runtime/contract/timing.h"
 
 #include <algorithm>
 #include <array>
@@ -24,22 +23,6 @@ void expect(bool condition, std::string_view message) {
     if (condition) { return; }
     ++failures;
     std::cerr << "FAIL: " << message << '\n';
-}
-
-void test_execution_timing_domains() {
-    using namespace ninfer::runtime;
-    ExecutionTimingRecorder recorder(ExecutionTimingPhase::Paused);
-    recorder.include(
-        {.submit_host_ns = 10, .device_wait_ns = 20, .post_host_ns = 30, .gpu_elapsed_ns = 100});
-    recorder.include(
-        {.submit_host_ns = 4, .device_wait_ns = 5, .post_host_ns = 6, .gpu_elapsed_ns = 80});
-    const auto timing = recorder.finish();
-    expect(timing.gpu_elapsed_ns == 180 && timing.host_ns() == 50 && timing.elapsed_ns() == 75,
-           "overlapping GPU intervals must accumulate separately from Host and wall phases");
-    const auto repeated = recorder.finish();
-    expect(repeated.gpu_elapsed_ns == timing.gpu_elapsed_ns &&
-               repeated.elapsed_ns() == timing.elapsed_ns(),
-           "reading a completed execution timing must not accumulate its work again");
 }
 
 q35::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
@@ -451,7 +434,6 @@ void test_regular_prefix_identity() {
 } // namespace
 
 int main() {
-    test_execution_timing_domains();
     test_decoder_layout();
     test_visual_embedding_windows();
     test_vision_control();

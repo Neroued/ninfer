@@ -1,7 +1,6 @@
 #pragma once
 
 #include "runtime/contract/request.h"
-#include "runtime/contract/timing.h"
 #include <array>
 #include <compare>
 
@@ -36,8 +35,8 @@ struct CommitDecision {
     std::optional<std::uint32_t> prefix_execution_split_after;
 };
 
-struct CommitComplete {
-    std::array<GenerationTimings, kMaximumConcurrency> timings{};
+struct ExecutionComplete {
+    ExecutionSample sample;
     std::size_t row_count = 0;
 };
 

@@ -104,7 +104,7 @@ void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironmen
         handles.push_back(
             engine.submit(std::move(prompts[row]),
                           benchmark_request(test, constrained ? env.constraint : std::nullopt),
-                          ninfer::OutputConsumerMode::Aggregate, {.phase_timings = true}));
+                          ninfer::OutputConsumerMode::Aggregate, {.constraint_timings = true}));
     }
     for (auto& handle : handles) { generated.push_back(handle.wait()); }
     const double wall_seconds =
@@ -124,9 +124,9 @@ void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironmen
                                      " did not finish at its output limit or grammar EOS");
         }
         if (measured) {
-            measured->reps.push_back({result.timings, std::move(result.speculative), count,
-                                      result.constraint,
-                                      result.engine_timing.constraint_draft_wait_exposed_seconds});
+            measured->reps.push_back({result.stats.timings, std::move(result.stats.speculative),
+                                      count, result.stats.constraint,
+                                      result.stats.engine_timing.executor_flush_exposed_seconds});
         }
     }
     if (measured) { measured->repetition_wall_seconds.push_back(wall_seconds); }
@@ -236,9 +236,10 @@ int main(int argc, char** argv) {
                   << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
         ninfer::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
-        env.load          = engine.load_summary();
-        env.memory        = engine.memory_summary();
-        env.prefill_chunk = env.memory.prefill_chunk;
+        env.description   = engine.description();
+        env.startup       = engine.startup_report();
+        env.snapshot      = engine.snapshot();
+        env.prefill_chunk = env.description.prefill_chunk;
 
         prime_decode_graph(engine, env, corpus);
 
@@ -253,11 +254,11 @@ int main(int argc, char** argv) {
             ninfer::bench::TestResult result;
             result.test        = test;
             result.concurrency = env.concurrency;
-            engine.reset_memory_peaks();
+            engine.reset_measurement_peaks();
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
                 run_repetition(engine, env, test, corpus);
             }
-            const auto before = engine.memory_summary();
+            const auto before = engine.snapshot();
             result.reps.reserve(static_cast<std::size_t>(options.repetitions) * env.concurrency);
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile pre-boundary synchronize");
@@ -270,12 +271,21 @@ int main(int argc, char** argv) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");
                 require_cuda(cudaProfilerStop(), "cudaProfilerStop");
             }
-            const ninfer::MemorySummary memory    = engine.memory_summary();
-            result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
-            result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
-            if (memory.moe) {
-                result.expert_upload_bytes =
-                    memory.moe->uploaded_bytes - before.moe->uploaded_bytes;
+            const auto after = engine.snapshot();
+            for (const auto& rank : after.ranks) {
+                result.max_rank_workspace_peak_bytes =
+                    std::max(result.max_rank_workspace_peak_bytes,
+                             rank.memory.workspace.measurement_peak_bytes);
+                result.rank_peaks.push_back(
+                    {rank.rank, rank.memory.workspace.measurement_peak_bytes});
+                const auto old = std::find_if(before.ranks.begin(), before.ranks.end(),
+                                              [&](const auto& r) { return r.rank == rank.rank; });
+                if (rank.memory.experts) {
+                    const auto previous = old != before.ranks.end() && old->memory.experts
+                                              ? old->memory.experts->uploaded_bytes
+                                              : 0;
+                    result.expert_upload_bytes += rank.memory.experts->uploaded_bytes - previous;
+                }
             }
             results.push_back(std::move(result));
         }

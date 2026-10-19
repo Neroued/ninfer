@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/observability/gpu_timing.h"
+
 #include "models/qwen4_exp/program/program.h"
 #include "models/qwen4_exp/program/resources.h"
 #include "models/qwen4_exp/program/ple_pipeline.h"
@@ -19,8 +21,8 @@ struct ResidentBinding {
     runtime::ExecutionMember member;
     std::shared_ptr<const qwen::VisionExecutionInput> vision_input;
     std::unique_ptr<qwen::VisionPrefillExecution> vision;
-    double observed_vision_seconds = 0;
-    bool distributed_vision_ready  = false;
+    std::uint64_t observed_vision_ns = 0;
+    bool distributed_vision_ready    = false;
     std::vector<std::uint32_t> feature_offsets;
     std::optional<CudaEventTimer> vision_timer;
 };
@@ -77,7 +79,7 @@ struct ComputeFrame {
     std::optional<WorkRow> control_window;
     std::vector<std::uint32_t> dead_positions;
     runtime::CommandSequence retirement;
-    runtime::ExecutionTiming timing;
+    GpuExecutionObservation gpu;
     ComputeResult result;
 };
 
@@ -151,11 +153,13 @@ public:
     prepare_vision(ResidentBinding&, std::uint32_t begin, std::uint32_t tokens);
     [[nodiscard]] qwen::VisionChunk prepare_parallel_vision(ResidentBinding&, std::uint32_t begin,
                                                             std::uint32_t tokens);
-    double collect_vision_timing(ResidentBinding&, std::uint32_t committed_frontier);
+    std::optional<std::uint64_t> collect_vision_timing(ResidentBinding&,
+                                                       std::uint32_t committed_frontier);
     void retire_vision(ResidentBinding&) noexcept;
     [[nodiscard]] std::size_t active_vision_bytes() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const;
-    void reset_memory_peaks() noexcept;
+    [[nodiscard]] RankMemoryUsage observe_resources() const;
+    [[nodiscard]] RankExecutionObservation retirement_observation() const noexcept;
+    void reset_measurement_peaks() noexcept;
 
     const execution::Parameters& parameters;
     DeviceContext& device;
@@ -169,7 +173,9 @@ public:
     std::unique_ptr<Graphs> graphs;
     std::unique_ptr<DeviceGraphs> device_graphs;
     std::optional<GraphMemorySummary> graph_memory;
+    std::size_t workspace_lifetime_peak = 0;
     CudaEventTimer prefill_timer;
+    runtime::ExecutionGpuTimer gpu_timer;
     CudaCompletionEvent compute_done, context_done;
     qwen::VisionHandoffState vision_handoff;
     std::size_t vision_handoff_peak_bytes = 0, vision_workspace_peak_bytes = 0;

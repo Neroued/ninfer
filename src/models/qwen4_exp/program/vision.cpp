@@ -43,13 +43,15 @@ RankProgramImpl::prepare_vision(ResidentBinding& binding, std::uint32_t begin,
         chunk.embeddings.slice(1, static_cast<std::int32_t>(slice.source_begin), count), indices};
 }
 
-double RankProgramImpl::collect_vision_timing(ResidentBinding& binding,
-                                              std::uint32_t committed_frontier) {
-    if (!binding.vision && !binding.vision_timer) return 0;
-    const auto elapsed   = binding.vision_timer ? binding.vision_timer->elapsed_ms() * 0.001
-                                                : binding.vision->elapsed_seconds();
-    const auto increment = elapsed - binding.observed_vision_seconds;
-    binding.observed_vision_seconds = elapsed;
+std::optional<std::uint64_t>
+RankProgramImpl::collect_vision_timing(ResidentBinding& binding, std::uint32_t committed_frontier) {
+    if (!binding.vision && !binding.vision_timer) return {};
+    const auto elapsed = static_cast<std::uint64_t>(
+        (binding.vision_timer ? double(binding.vision_timer->elapsed_ms()) * 1.0e6
+                              : binding.vision->elapsed_seconds() * 1.0e9) +
+        0.5);
+    const auto increment       = elapsed - binding.observed_vision_ns;
+    binding.observed_vision_ns = elapsed;
     if (committed_frontier >= binding.vision_input->plan.uses.back().end) retire_vision(binding);
     return increment;
 }
@@ -59,7 +61,7 @@ void RankProgramImpl::retire_vision(ResidentBinding& binding) noexcept {
     binding.vision_timer.reset();
     binding.feature_offsets.clear();
     binding.distributed_vision_ready = false;
-    binding.observed_vision_seconds  = 0;
+    binding.observed_vision_ns       = 0;
 }
 
 qwen::VisionChunk RankProgramImpl::prepare_parallel_vision(ResidentBinding& binding,
@@ -114,9 +116,17 @@ qwen::VisionChunk RankProgramImpl::prepare_parallel_vision(ResidentBinding& bind
 
 std::size_t RankProgramImpl::active_vision_bytes() const noexcept {
     std::size_t bytes = 0;
-    for (const auto& binding : bindings)
-        if (binding && binding->vision)
-            bytes = std::max(bytes, binding->vision->active_handoff_bytes());
+    for (const auto& binding : bindings) {
+        if (!binding) continue;
+        if (binding->vision) bytes = std::max(bytes, binding->vision->active_handoff_bytes());
+        if (binding->distributed_vision_ready) {
+            const auto& input = *binding->vision_input;
+            for (const auto& use : input.plan.uses)
+                if (binding->feature_offsets[use.prepared_item_index] != UINT32_MAX)
+                    bytes += input.plan.control->items[use.control_index].merged_count *
+                             parameters.profile->config.text.hidden * sizeof(std::uint16_t);
+        }
+    }
     return bytes;
 }
 

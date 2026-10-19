@@ -16,7 +16,7 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/draft_commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/lifecycle.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/scoring.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/program/memory.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/observations.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graph_bodies.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graph_preparation.cpp"

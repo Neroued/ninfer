@@ -592,14 +592,14 @@ int test_content_and_cache_hints() {
 
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
-    outcome.text                            = "answer";
-    outcome.reasoning                       = "thought";
-    outcome.prompt_tokens                   = 100;
-    outcome.completion_tokens               = 12;
-    outcome.reasoning_tokens                = 5;
-    outcome.finish_reason                   = ninfer::FinishReason::StopString;
-    outcome.matched_stop_string             = "STOP";
-    outcome.metrics.prefix_cache_hit_tokens = 60;
+    outcome.text                       = "answer";
+    outcome.reasoning                  = "thought";
+    outcome.prompt_tokens              = 100;
+    outcome.completion_tokens          = 12;
+    outcome.reasoning_tokens           = 5;
+    outcome.finish_reason              = ninfer::FinishReason::StopString;
+    outcome.matched_stop_string        = "STOP";
+    outcome.stats.reused_prompt_tokens = 60;
     return outcome;
 }
 
@@ -619,8 +619,8 @@ int test_aggregate_and_errors() {
                           response["usage"]["output_tokens_details"]["thinking_tokens"] == 5,
                       "aggregate cache/reasoning usage was fabricated or lost");
 
-    outcome.prompt_tokens                   = 10;
-    outcome.metrics.prefix_cache_hit_tokens = 1000;
+    outcome.prompt_tokens              = 10;
+    outcome.stats.reused_prompt_tokens = 1000;
     const Json clamped = Json::parse(make_anthropic_messages_response(identity, outcome));
     failures += check(clamped["usage"]["input_tokens"] == 0 &&
                           clamped["usage"]["cache_read_input_tokens"] == 10,
@@ -659,10 +659,10 @@ int test_tool_call_presentation() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_tool", "claude-local");
     GenerationOutcome outcome;
-    outcome.text          = "I need one more check.";
-    outcome.finish_reason = ninfer::FinishReason::StopToken;
-    outcome.constraint    = ninfer::ConstraintObservation{
-           .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = true};
+    outcome.text             = "I need one more check.";
+    outcome.finish_reason    = ninfer::FinishReason::StopToken;
+    outcome.stats.constraint = ninfer::ConstraintObservation{
+        .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = true};
     const std::string arguments = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name           = "Edit",
@@ -715,8 +715,8 @@ int test_tool_call_presentation() {
     }
     failures += check(saw_edit_start && saw_arguments && saw_tool_stop && constraint_events == 1,
                       "Anthropic stream did not terminate the recovered Edit as tool_use");
-    outcome.finish_reason          = ninfer::FinishReason::OutputLimit;
-    outcome.constraint->terminated = false;
+    outcome.finish_reason                = ninfer::FinishReason::OutputLimit;
+    outcome.stats.constraint->terminated = false;
     const auto partial = Json::parse(make_anthropic_messages_response(identity, outcome));
     failures += check(partial["stop_reason"] == "max_tokens" && partial["content"].size() == 2 &&
                           partial["constraint"]["complete"] == true &&

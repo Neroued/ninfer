@@ -266,9 +266,7 @@ void Session::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->physical_usage(); }
 
-MemorySummary Session::memory_summary() const { return impl_->memory_summary(); }
-
-void Session::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+void Session::reset_measurement_peaks() { impl_->reset_measurement_peaks(); }
 
 } // namespace ninfer::models::qwen3_5
 
@@ -338,8 +336,7 @@ FinishResult SessionImpl::finish(SequenceHandle h) noexcept {
         auto& state   = sequences[l];
         auto& request = requests[l];
         if (request.lifecycle != Lifecycle::Finishable) return {};
-        FinishResult out{
-            runtime::ConsumeStatus::Consumed, request.timings, request.speculative_stats, {}};
+        FinishResult out{runtime::ConsumeStatus::Consumed, request.speculative_stats, {}};
         if (request.publish_continuation) out.checkpoint = detach_checkpoint(state);
         clear_lane(state, request);
         return out;
@@ -349,26 +346,14 @@ FinishResult SessionImpl::finish(SequenceHandle h) noexcept {
 AbortResult SessionImpl::abort(SequenceHandle h) noexcept {
     if (!valid_sequence(h) || execution_pending(h) || context_blocks(h)) return {};
     const auto l = lane(h);
-    AbortResult out{runtime::ConsumeStatus::Consumed, requests[l].timings,
-                    requests[l].speculative_stats};
+    AbortResult out{runtime::ConsumeStatus::Consumed, requests[l].speculative_stats};
     clear_lane(sequences[l], requests[l]);
     return out;
 }
 
-MemorySummary SessionImpl::memory_summary() const {
-    auto out                        = executor().memory_summary();
-    const auto usage                = physical_usage();
-    out.host_context_capacity_bytes = plan.context.host.bytes;
-    out.host_context_occupied_bytes = usage.occupied.host_bytes;
-    out.host_context_reserved_bytes = usage.host_reserved_bytes;
-    out.host_state_occupied_slots   = usage.host_state_slots;
-    out.host_kv_occupied_bytes      = usage.host_kv_bytes;
-    return out;
-}
-
-void SessionImpl::reset_memory_peaks() noexcept {
+void SessionImpl::reset_measurement_peaks() {
+    executor().reset_measurement_peaks();
     directory.host_allocation().reset_peak();
-    executor().reset_memory_peaks();
 }
 
 } // namespace ninfer::models::qwen3_5::detail

@@ -23,7 +23,7 @@ std::size_t device_budget(std::size_t available) {
 
 StartupMemoryBudget::StartupMemoryBudget(DeviceMemorySnapshot initial, std::size_t limit,
                                          std::size_t headroom, std::size_t host_reservation)
-    : initial_(initial), limit_(std::min(initial.free_bytes, limit)), headroom_(headroom),
+    : initial_(initial), limit_(std::min(initial.available_bytes(), limit)), headroom_(headroom),
       host_reservation_(host_reservation) {
     if (limit_ <= headroom_ || host_reservation_ >= limit_ - headroom_)
         throw std::invalid_argument("Device budget is smaller than runtime headroom");
@@ -32,7 +32,8 @@ StartupMemoryBudget::StartupMemoryBudget(DeviceMemorySnapshot initial, std::size
 std::size_t StartupMemoryBudget::available(DeviceMemorySnapshot current) const {
     const auto consumed = static_cast<std::size_t>(
         std::max<std::int64_t>(0, device_memory_growth(initial_, current)));
-    const auto remaining = std::min(current.free_bytes, consumed < limit_ ? limit_ - consumed : 0);
+    const auto remaining =
+        std::min(current.available_bytes(), consumed < limit_ ? limit_ - consumed : 0);
     return remaining > headroom() ? remaining - headroom() : 0;
 }
 

@@ -114,11 +114,16 @@ template <class Types>
 struct ResultReady {
     ExecutionTicket ticket;
     typename Types::Result result;
+    ExecutionSample execution;
 };
 
 struct DeviceRetired {
     ExecutionTicket ticket;
     CommandSequence command;
+    RankExecutionObservation observed;
+    // Filled by the Executor after its existing retirement condition is satisfied. This
+    // coordinator-local sample is not sent over the wire.
+    ExecutionSample execution;
 };
 
 struct ExecutionFailed {

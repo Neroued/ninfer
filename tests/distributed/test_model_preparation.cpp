@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
                         !prepared.reports[i].host_weight_bytes,
                     "prepared execution resources differ from the native plan");
             std::cout << "rank=" << i << " weights=" << prepared.reports[i].weight_bytes
-                      << " runtime=" << d.memory.runtime_reservation_bytes
+                      << " runtime=" << d.budget.runtime_reservation_bytes
                       << " state=" << d.session.context.state.image_bytes
                       << " slots=" << d.session.context.state.device_slots
                       << " pages=" << prepared.pages << " attempt=" << prepared.attempt
@@ -226,17 +226,18 @@ int main(int argc, char** argv) {
         auto session    = q4::prepare_session(definition, plan.session);
         q4::ExecutionCodec codec(*definition, descriptions.front(), parallel.topology);
         rt::activate_execution_group(*group, prepared, std::chrono::seconds(30));
-        Executor executor(std::move(group), plan.capacity, std::move(codec));
+        std::vector<RankSnapshot> initial;
+        for (const auto& d : descriptions) initial.push_back(d.observation);
+        Executor executor(std::move(group), plan.capacity, std::move(codec), std::move(initial));
         executor.bind_to_current_thread();
         contexts(executor, plan.session);
-        const auto memory = executor.memory_summary();
-        require(!memory.device && memory.kv_capacity == options.kv_capacity.explicit_tokens &&
-                    memory.weights.capacity_bytes ==
-                        descriptions[0].memory.weights.capacity_bytes +
-                            descriptions[1].memory.weights.capacity_bytes,
-                "group memory confused logical capacity with physical rank bytes");
-        require(executor.rank_memory_reports().size() == descriptions.size(),
-                "per-rank memory reports were lost");
+        require(executor.observations().size() == descriptions.size(),
+                "per-rank resource observations were lost");
+        for (std::size_t i = 0; i < descriptions.size(); ++i)
+            require(executor.observations()[i].rank == i &&
+                        executor.observations()[i].memory.allocations.device_weights_bytes ==
+                            descriptions[i].observation.memory.allocations.device_weights_bytes,
+                    "resource observation confused rank identities or backing ownership");
         {
             q4::Session running(std::move(session), executor);
             bind_requests(running, frontend);

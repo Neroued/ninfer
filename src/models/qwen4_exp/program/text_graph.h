@@ -6,11 +6,15 @@
 
 namespace ninfer::models::qwen4_exp {
 
+class ParallelExecution;
+
 struct GraphSegment {
+    CommunicationWork communication;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
 
-    void prepare(CudaExecutionView, const std::function<void()>&);
+    void prepare(CudaExecutionView, const std::function<void()>&, ParallelExecution* = nullptr);
+    void launch(CudaExecutionView, ParallelExecution* = nullptr);
 };
 
 // One exact T/B traversal. Resident execution submits one graph, with replaceable QSA

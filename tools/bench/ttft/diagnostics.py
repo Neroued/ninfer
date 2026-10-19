@@ -31,10 +31,10 @@ OCCUPANCY_FIELDS = (
 
 TTFT_STAGES = ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")
 ENGINE_HOST_PHASES = (
-    "engine_boundary", "program_submit", "program_post", "engine_commit_output",
-    "engine_maintenance", "total",
+    "engine_boundary", "session_call", "executor_poll", "engine_commit_output",
+    "engine_maintenance", "executor_flush", "total",
 )
-WORK_PHASES = ("submit", "wait", "post", "gpu")
+WORK_PHASES = ("result", "resolution", "retirement", "total")
 
 
 def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
@@ -58,9 +58,9 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         "engine_elapsed_ms": None,
         **{f"{stage}_{suffix}": None for stage in TTFT_STAGES for suffix in ("ms", "pct")},
         **{f"host_{phase}_ms": None for phase in ENGINE_HOST_PHASES},
-        "device_wait_exposed_ms": None,
+        "scheduler_yield_exposed_ms": None,
         **{f"{work}_{phase}_ms": None for work in ("prefill", "replay")
-           for phase in (*WORK_PHASES, "program")},
+           for phase in WORK_PHASES},
         **{f"{resource}_{direction}_{field}": None for resource in TRANSFER_RESOURCES
            for direction in TRANSFER_DIRECTIONS for field in ("ms", "bytes")},
         **{f"prepare_{field}_ms": None for field in
@@ -132,14 +132,17 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
     host = engine.get("host_exposed_seconds") if isinstance(engine, dict) else None
     for phase in ENGINE_HOST_PHASES:
         row[f"host_{phase}_ms"] = milliseconds(read_seconds(host, phase))
-    row["device_wait_exposed_ms"] = milliseconds(read_seconds(engine, "device_wait_exposed_seconds"))
+    row["scheduler_yield_exposed_ms"] = milliseconds(read_seconds(engine, "scheduler_yield_exposed_seconds"))
     for work in ("prefill", "replay"):
-        timing = first.get(work)
+        timing = first.get(work, {})
         for phase in WORK_PHASES:
-            row[f"{work}_{phase}_ms"] = milliseconds(read_seconds(timing, f"{phase}_seconds"))
-        parts = [row[f"{work}_{phase}_ms"] for phase in ("submit", "wait", "post")]
-        if all(part is not None for part in parts):
-            row[f"{work}_program_ms"] = sum(parts)
+            counter = timing.get(phase, {})
+            elapsed_ns = counter.get("total_ns")
+            row[f"{work}_{phase}_ms"] = (elapsed_ns / 1e6
+                if type(elapsed_ns) is int and elapsed_ns >= 0 else None)
+    pending = first.get("pending_execution")
+    row["pending_result_ms"] = (pending["result_ns"] / 1e6
+        if isinstance(pending, dict) and type(pending.get("result_ns")) is int else None)
     transfers = first.get("context_transfers", {})
     resources = {"state": transfers.get("state", {})} if isinstance(transfers, dict) else {}
     for pool in transfers.get("kv_pools", []) if isinstance(transfers, dict) else []:
@@ -218,15 +221,15 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     host_work = {
         group: {field: total("host_work", group, field) for field in fields}
         for group, fields in (
-            ("elapsed_seconds", ("engine_boundary", "program_submit", "program_post",
+            ("elapsed_seconds", ("engine_boundary", "session_call", "executor_poll",
                                  "engine_commit_output", "engine_maintenance", "total")),
-            ("work_class_seconds", ("decode_host", "decode_device_wait", "prefill_host",
-                                    "prefill_device_wait", "control_host", "control_device_wait")),
+            ("work_class_seconds", ("decode_host", "decode_scheduler_yield", "prefill_host",
+                                    "prefill_scheduler_yield", "control_host", "control_scheduler_yield")),
             ("detail_subset_seconds", ("stats_publication",)),
             ("detail_invocations", ("stats_publication",)),
         )
     }
-    host_work["device_wait_seconds"] = total("host_work", "device_wait_seconds")
+    host_work["scheduler_yield_seconds"] = total("host_work", "scheduler_yield_seconds")
     occupancy = {"kv_pools": pool_occupancy}
     for field in OCCUPANCY_FIELDS:
         values = values_at(("context_cache", "occupancy", field))

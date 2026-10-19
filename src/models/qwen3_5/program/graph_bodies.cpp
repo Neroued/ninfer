@@ -73,7 +73,7 @@ void RankProgramImpl::initialize_graphs() {
     graph_memory = GraphMemorySummary{.preparation_increment_bytes = device_memory_growth(
                                           before, device_memory_snapshot(device.device()))};
     resources.work.reset();
-    reset_memory_peaks();
+    reset_measurement_peaks();
 }
 
 void RankProgramImpl::release_graphs() {

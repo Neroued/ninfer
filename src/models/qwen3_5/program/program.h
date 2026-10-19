@@ -30,9 +30,10 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
 
-    [[nodiscard]] MemorySummary memory_summary() const;
+    [[nodiscard]] RankMemoryUsage observe_resources() const;
+    [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
     [[nodiscard]] std::vector<context::KVTransferProfile> context_transfer_profiles() const;
-    void reset_memory_peaks() noexcept;
+    void reset_measurement_peaks() noexcept;
 
 private:
     explicit RankProgram(std::unique_ptr<detail::RankProgramImpl>);

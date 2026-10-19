@@ -110,7 +110,6 @@ struct GeneratedResult {
 struct ForwardResult {
     std::vector<std::uint32_t> processed_tokens;
     std::optional<GeneratedResult> generated;
-    double vision_seconds = 0.0;
 };
 
 struct ContextResult {
@@ -127,7 +126,6 @@ struct ScoreResult {
 struct Result {
     std::variant<ForwardResult, GeneratedResult, NormalizeResult, ContextResult, ScoreResult>
         output;
-    runtime::ExecutionTiming timing;
 };
 
 struct CommitRow {
@@ -142,6 +140,7 @@ struct Commit {
 };
 
 struct ExecutionTypes {
+    [[nodiscard]] static ExecutionWork describe_work(const qwen3_5::Work&);
     using Work   = qwen3_5::Work;
     using Result = qwen3_5::Result;
     using Commit = qwen3_5::Commit;

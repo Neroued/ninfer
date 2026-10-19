@@ -50,9 +50,13 @@ std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgram::poll() { ret
 
 void RankProgram::drain() { impl_->drain(); }
 
-MemorySummary RankProgram::memory_summary() const { return impl_->memory_summary(); }
+std::optional<GraphMemorySummary> RankProgram::graph_memory_observation() const {
+    return impl_->graph_memory;
+}
 
-void RankProgram::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_resources(); }
+
+void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
 std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles() const {
     std::vector<context::KVTransferProfile> profiles{

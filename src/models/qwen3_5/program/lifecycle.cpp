@@ -21,7 +21,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
                                          : std::size_t(values.profile->public_tokens) *
                                                plan.max_concurrency * sizeof(std::int32_t)),
       result_ready(context), drafts_ready(context), compute_retired(context),
-      context_ready(context), prefill_timer(context) {
+      context_ready(context), prefill_timer(context), gpu_timer(context, plan.gpu_timing) {
     if (parameters.profile != plan.profile || parameters.profile->options != plan.features)
         throw std::invalid_argument("Qwen3.5 rank parameters differ from the prepared plan");
     std::vector<context::ContextPoolStorage> pools{
@@ -101,14 +101,10 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         context_ready.record(device.transfer_stream());
     } else {
         if (compute) throw std::logic_error("Qwen3.5 compute frame is occupied");
-        compute            = std::make_unique<ComputeOperation>(std::move(request));
-        const auto started = std::chrono::steady_clock::now();
+        gpu_timer.begin();
+        compute = std::make_unique<ComputeOperation>(std::move(request));
         compute_actions->submit(compute->request.work.context);
         initialize_inputs(*compute);
-        compute->timing.submit_host_ns +=
-            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - started)
-                                           .count());
     }
     progress();
 }
@@ -124,7 +120,8 @@ void RankProgramImpl::supply(runtime::ExecutionTicket ticket, runtime::CommandSe
 
 void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSequence command,
                              Commit&& value) {
-    auto& operation        = require_compute(ticket);
+    auto& operation = require_compute(ticket);
+    gpu_timer.resolve();
     operation.last_command = command;
     operation.commit       = std::move(value);
     operation.stage        = ComputeStage::Commit;
@@ -132,7 +129,8 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
 }
 
 void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
-    auto& operation        = require_compute(ticket);
+    auto& operation = require_compute(ticket);
+    gpu_timer.resolve();
     operation.last_command = command;
     operation.cancelled    = true;
     progress();

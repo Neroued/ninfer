@@ -498,11 +498,12 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
         GenerationResult generated = engine.generate(std::move(prompt), one_token_request());
         if (generated.generated_token_ids.size() != 1 ||
             generated.finish_reason != FinishReason::OutputLimit ||
-            generated.prefix_reuse_path != PrefixReusePath::Root ||
-            generated.reused_prompt_tokens != 0 || !(generated.timings.prefill_seconds > 0.0)) {
+            generated.stats.prefix_reuse_path != PrefixReusePath::Root ||
+            generated.stats.reused_prompt_tokens != 0 ||
+            !(generated.stats.timings.prefill_seconds > 0.0)) {
             throw std::runtime_error("text prefill calibration left the expected root path");
         }
-        return generated.timings.prefill_seconds * 1'000'000'000.0;
+        return generated.stats.timings.prefill_seconds * 1'000'000'000.0;
     };
 
     const std::vector<std::uint32_t> lengths(root_lengths.begin(), root_lengths.end());
@@ -521,7 +522,7 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     }
 
     PrefillSuiteResult result;
-    result.load = engine.load_summary();
+    result.load = engine.startup_report().load;
     for (const TextCase& test : cases) {
         std::vector<double> samples;
         const auto& endpoint = root_samples.at(test.prefix + test.suffix);
@@ -568,10 +569,10 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
         GenerationResult generated  = engine.generate(std::move(prompt), one_token_request());
         if (patches == 0 || generated.generated_token_ids.size() != 1 ||
             generated.finish_reason != FinishReason::OutputLimit || !generated.prompt.has_media ||
-            !(generated.timings.vision_seconds > 0.0)) {
+            !(generated.stats.timings.vision_seconds > 0.0)) {
             throw std::runtime_error("Vision prefill calibration did not execute Vision");
         }
-        return std::pair{patches, generated.timings.vision_seconds * 1'000'000'000.0};
+        return std::pair{patches, generated.stats.timings.vision_seconds * 1'000'000'000.0};
     };
     (void)run_vision(vision_cases.back().dimension);
     std::array<std::vector<double>, vision_cases.size()> vision_samples;

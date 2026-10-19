@@ -46,9 +46,6 @@ public:
 
     [[nodiscard]] Result merge_context_results(const runtime::protocol::Scope&,
                                                const std::vector<std::optional<Result>>&) const;
-    [[nodiscard]] MemorySummary
-    merge_memory(const distributed::ExecutionTopology&,
-                 const std::vector<std::optional<MemorySummary>>&) const;
 
 private:
     WorkContract contract_;

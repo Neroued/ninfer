@@ -39,7 +39,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
                                                   device, topology, connection.communication());
         const auto requirement = preparing->memory();
         StartupMemoryBudget budget(
-            initial, device_budget(initial.free_bytes), requirement.headroom_bytes,
+            initial, device_budget(initial.available_bytes()), requirement.headroom_bytes,
             NINFER_SHARED_PHYSICAL_MEMORY ? requirement.host_reservation_bytes : 0);
         if (requirement.weight_bytes > budget.available(device_memory_snapshot(device.device())))
             throw DeviceAllocationError("rank immutable weights exceed device budget",
@@ -58,7 +58,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             value.hardware_class = context_cost_hardware_class(
                 device.properties().name, device.properties().major, device.properties().minor);
             value.cuda_sync_mode           = device.sync_mode();
-            value.free_after_weights_bytes = after_weights.free_bytes;
+            value.free_after_weights_bytes = after_weights.available_bytes();
             encode_preparation_report(out, value);
             connection.send(wire::Kind::Prepared, std::move(out).take());
         };
@@ -70,16 +70,29 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         const auto describe       = [&] {
             auto result                                 = preparing->describe();
             const auto after                            = device_memory_snapshot(device.device());
-            result.memory.device_budget_bytes           = budget.limit();
-            result.memory.kv_capacity_headroom_bytes    = budget.headroom();
-            result.memory.available_after_weights_bytes = after_weights.free_bytes;
-            result.memory.available_after_startup_bytes = after.free_bytes;
-            result.memory.planned_slack_bytes           = budget.available(after);
-            result.memory.startup_retained_bytes =
+            auto& observation                           = result.observation;
+            const auto& identity                        = connection.bootstrap().identity;
+            observation.rank                            = identity.rank;
+            observation.node                            = identity.node;
+            observation.hardware                        = device.properties().name;
+            observation.communication                   = connection.communication().statistics();
+            observation.stamp                           = {0, observation_time_ns()};
+            observation.physical_memory                 = PhysicalMemorySample{after.total_bytes,
+                                                               after.cuda_free_bytes,
+                                                               after.system_total_bytes,
+                                                               after.system_available_bytes,
+                                                               after.shared_physical_memory,
+                                                               observation.stamp.sampled_ns};
+            result.budget.limit_bytes                   = budget.limit();
+            result.budget.headroom_bytes                = budget.headroom();
+            result.budget.available_after_weights_bytes = after_weights.available_bytes();
+            result.budget.available_after_startup_bytes = after.available_bytes();
+            result.budget.planned_slack_bytes           = budget.available(after);
+            result.budget.retained_bytes =
                 budget.retained(allocation_snapshot, requirement.weight_bytes);
             const auto planned =
-                result.memory.runtime_reservation_bytes +
-                (result.memory.cuda_graph ? result.memory.cuda_graph->rebuild_estimate_bytes : 0);
+                result.budget.runtime_reservation_bytes +
+                (result.budget.graphs ? result.budget.graphs->rebuild_estimate_bytes : 0);
             const auto observed = device_memory_growth(allocation_snapshot, after);
             opaque_growth = observed > static_cast<std::int64_t>(planned) ? observed - planned : 0;
             accepted      = budget.fits(after);

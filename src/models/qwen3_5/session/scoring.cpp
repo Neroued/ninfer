@@ -52,8 +52,8 @@ void SessionImpl::advance_score() {
         auto done = std::move(*scoring);
         scoring.reset();
         clear_lane(state, request);
-        after_releases.emplace(SessionEvent{
-            done.public_ticket, {}, ScoreComplete{std::move(done.logprobs), done.timing}});
+        after_releases.emplace(
+            SessionEvent{done.public_ticket, {}, ScoreComplete{std::move(done.logprobs)}});
         submit_releases();
         return;
     }

@@ -16,6 +16,7 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/device_ple.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vocabulary.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/observations.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision.cpp"

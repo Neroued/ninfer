@@ -126,16 +126,16 @@ def test_result_record_parses_request_host_exposure() -> None:
             "queue_wait_seconds": 0.001,
             "host_exposed_seconds": {
                 "engine_boundary": 0.001,
-                "program_submit": 0.002,
-                "program_post": 0.003,
+                "session_call": 0.002,
+                "executor_poll": 0.003,
                 "engine_commit_output": 0.004,
                 "engine_maintenance": 0.005,
                 "total": 0.015,
             },
-            "device_wait_exposed_seconds": 0.3,
+            "scheduler_yield_exposed_seconds": 0.3,
             "decode": {
                 "host_exposed_seconds": 0.01,
-                "device_wait_exposed_seconds": 0.2,
+                "scheduler_yield_exposed_seconds": 0.2,
                 "rounds": 2,
             },
         },
@@ -148,7 +148,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     assert record["kv_dtype"] == "fp8"
     assert record["metrics"]["engine_host_exposed_ms"] == pytest.approx(15.0)
     assert record["metrics"]["decode_host_us_per_round"] == pytest.approx(5000.0)
-    assert record["metrics"]["decode_device_wait_us_per_round"] == pytest.approx(
+    assert record["metrics"]["decode_scheduler_yield_us_per_round"] == pytest.approx(
         100000.0
     )
 

@@ -1,14 +1,25 @@
 #include "models/qwen4_exp/program/text_graph.h"
 #include "core/nvtx.h"
+#include "models/qwen4_exp/parallel/execution.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
 
-void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& body) {
-    definition.capture(cuda.stream(), body);
+void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& body,
+                           ParallelExecution* parallel) {
+    const auto capture = [&] { definition.capture(cuda.stream(), body); };
+    if (parallel)
+        parallel->record_graph(communication, capture);
+    else
+        capture();
     executable.instantiate(definition);
     executable.upload(cuda.stream());
+}
+
+void GraphSegment::launch(CudaExecutionView cuda, ParallelExecution* parallel) {
+    executable.launch(cuda.stream());
+    if (parallel) parallel->replayed(communication);
 }
 
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,

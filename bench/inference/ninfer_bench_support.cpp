@@ -1,4 +1,6 @@
 #include "ninfer_bench_support.h"
+#include "product/statistics.h"
+#include <nlohmann/json.hpp>
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 
@@ -219,36 +221,6 @@ std::uint64_t decode_engine_tokens(const TestResult& result, const RepTiming& re
     }
     return rep.speculative.rounds + rep.speculative.accepted_tokens +
            rep.speculative.fallback_steps;
-}
-
-void append_arena_json(std::ostringstream& out, std::string_view name,
-                       const ArenaMemorySummary& arena, std::string_view indent,
-                       bool trailing_comma) {
-    out << indent << '"' << name << "\": {\"capacity_bytes\": " << arena.capacity_bytes
-        << ", \"used_bytes\": " << arena.used_bytes
-        << ", \"peak_used_bytes\": " << arena.peak_used_bytes << '}';
-    if (trailing_comma) { out << ','; }
-    out << '\n';
-}
-
-void append_vision_workspace_json(std::ostringstream& out,
-                                  const std::optional<VisionWorkspaceMemorySummary>& vision,
-                                  std::string_view indent, bool trailing_comma) {
-    out << indent << "\"vision_workspace\": ";
-    if (!vision) {
-        out << "null";
-    } else {
-        out << "{\"aggregate_prompt_tokens\": " << vision->aggregate_prompt_tokens
-            << ", \"max_item_tokens\": " << vision->max_item_tokens
-            << ", \"general_capacity_bytes\": " << vision->general_capacity_bytes
-            << ", \"encode_peak_bytes\": " << vision->encode_peak_bytes
-            << ", \"handoff_offset_bytes\": " << vision->handoff_offset_bytes
-            << ", \"handoff_capacity_bytes\": " << vision->handoff_capacity_bytes
-            << ", \"handoff_active_bytes\": " << vision->handoff_active_bytes
-            << ", \"handoff_peak_bytes\": " << vision->handoff_peak_bytes << '}';
-    }
-    if (trailing_comma) { out << ','; }
-    out << '\n';
 }
 
 void append_speculative_json(std::ostringstream& out, const SpeculativeStats& stats,
@@ -651,29 +623,24 @@ std::vector<double> total_time_series(const TestResult& result) {
 }
 
 std::string format_table(const BenchEnvironment& env, const std::vector<TestResult>& results) {
+    const auto allocations = product::sum_allocations(env.snapshot.ranks);
     std::ostringstream out;
     out << "ninfer_bench product throughput report\n"
-        << "  architecture: " << env.load.architecture << '\n'
-        << "  model:      " << env.load.model_name << '\n'
+        << "  architecture: " << env.startup.load.architecture << '\n'
+        << "  model:      " << env.startup.load.model_name << '\n'
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
         << "  artifact:   " << env.artifact_path << " (" << env.artifact_file_size_bytes
         << " bytes)\n"
-        << "  load:       " << env.load.load_seconds << " s, upload " << env.load.upload_seconds
-        << " s, read " << format_bytes(env.load.artifact_bytes_read) << ", H2D "
-        << format_bytes(env.load.host_to_device_bytes) << ", staging peak "
-        << format_bytes(env.load.peak_staging_bytes) << '\n'
-        << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
-        << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
-        << format_bytes(env.memory.workspace.capacity_bytes) << ", Vision handoff "
-        << (env.memory.vision_workspace
-                ? format_bytes(env.memory.vision_workspace->handoff_capacity_bytes)
-                : "disabled")
-        << " (within workspace), graph rebuild estimate "
-        << format_bytes(
-               env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{}).rebuild_estimate_bytes)
-        << ", KV payload " << format_bytes(env.memory.kv_payload_bytes) << '\n'
+        << "  load:       " << env.startup.load.load_seconds << " s, upload "
+        << env.startup.load.upload_seconds << " s, read "
+        << format_bytes(env.startup.load.artifact_bytes_read) << ", H2D "
+        << format_bytes(env.startup.load.host_to_device_bytes) << ", staging peak "
+        << format_bytes(env.startup.load.max_rank_staging_bytes) << '\n'
+        << "  memory:     total device allocations " << format_bytes(allocations.device_bytes())
+        << ", host allocations " << format_bytes(allocations.host_bytes()) << " across "
+        << env.snapshot.ranks.size() << " ranks\n"
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
@@ -707,7 +674,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                         rate_cell(decode_output_tok_s_series(result)),
                         rate_cell(decode_engine_tok_s_series(result)),
                         rate_cell(output_tok_s_series(result)), acceptance, rounds,
-                        format_bytes(result.workspace_peak_bytes)});
+                        format_bytes(result.max_rank_workspace_peak_bytes)});
     }
 
     std::array<std::size_t, cols> widths{};
@@ -730,12 +697,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
 
 std::string format_json(const BenchEnvironment& env, const std::string& command,
                         const std::vector<TestResult>& results) {
-    const auto graph = env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
     std::ostringstream formats;
     formats << '[';
-    for (std::size_t i = 0; i < env.load.weight_formats.size(); ++i) {
+    for (std::size_t i = 0; i < env.startup.load.weight_formats.size(); ++i) {
         if (i != 0) { formats << ','; }
-        formats << '"' << json_escape(env.load.weight_formats[i]) << '"';
+        formats << '"' << json_escape(env.startup.load.weight_formats[i]) << '"';
     }
     formats << ']';
 
@@ -752,89 +718,22 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
-        << "    \"architecture\": \"" << json_escape(env.load.architecture) << "\",\n"
-        << "    \"name\": \"" << json_escape(env.load.model_name) << "\",\n"
+        << "    \"architecture\": \"" << json_escape(env.startup.load.architecture) << "\",\n"
+        << "    \"name\": \"" << json_escape(env.startup.load.model_name) << "\",\n"
         << "    \"formats\": " << formats.str() << ",\n"
-        << "    \"prefill_signature\": \"" << json_escape(env.load.prefill_signature) << "\",\n"
-        << "    \"load_seconds\": " << number(env.load.load_seconds) << ",\n"
-        << "    \"upload_seconds\": " << number(env.load.upload_seconds) << ",\n"
-        << "    \"artifact_bytes_read\": " << env.load.artifact_bytes_read << ",\n"
-        << "    \"host_to_device_bytes\": " << env.load.host_to_device_bytes << ",\n"
-        << "    \"peak_staging_bytes\": " << env.load.peak_staging_bytes << ",\n"
-        << "    \"device_object_count\": " << env.load.device_object_count << ",\n"
-        << "    \"host_object_count\": " << env.load.host_object_count << "\n"
-        << "  },\n"
-        << "  \"memory\": {\n"
-        << "    \"device\": " << (env.memory.device ? std::to_string(*env.memory.device) : "null")
-        << ",\n"
-        << "    \"device_budget_bytes\": " << env.memory.device_budget_bytes << ",\n"
-        << "    \"max_context\": " << env.memory.max_context << ",\n"
-        << "    \"kv_capacity_mode\": \""
-        << (env.memory.kv_capacity_mode == KvCapacityMode::Automatic ? "auto" : "explicit")
+        << "    \"prefill_signature\": \"" << json_escape(env.startup.load.prefill_signature)
         << "\",\n"
-        << "    \"kv_capacity\": " << env.memory.kv_capacity << ",\n"
-        << "    \"kv_capacity_page_groups\": " << env.memory.kv_capacity_page_groups << ",\n"
-        << "    \"kv_capacity_max_page_groups\": " << env.memory.kv_capacity_max_page_groups
-        << ",\n"
-        << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
-    if (env.memory.moe) {
-        const auto& m = *env.memory.moe;
-        out << "    \"moe\": {\n"
-            << "      \"host_weights_bytes\": " << m.host_weights_bytes << ",\n"
-            << "      \"registered_host_bytes\": " << m.registered_host_bytes << ",\n"
-            << "      \"cache_bytes\": " << m.cache_bytes << ",\n"
-            << "      \"fixed_bytes\": " << m.fixed_bytes << ",\n"
-            << "      \"window_bytes\": " << m.window_bytes << ",\n"
-            << "      \"window_count\": " << m.window_count << ",\n"
-            << "      \"used_bytes\": " << m.used_bytes << ",\n"
-            << "      \"target_bytes\": " << m.target_bytes << ",\n"
-            << "      \"ready_bytes\": " << m.ready_bytes << ",\n"
-            << "      \"cpu_workers\": " << m.cpu_workers << ",\n"
-            << "      \"bridge_device_bytes\": " << m.bridge_device_bytes << ",\n"
-            << "      \"bridge_pinned_bytes\": " << m.bridge_pinned_bytes << ",\n"
-            << "      \"cpu_workspace_bytes\": " << m.cpu_workspace_bytes << ",\n"
-            << "      \"uploaded_bytes\": " << m.uploaded_bytes << ",\n"
-            << "      \"prefetched_bytes\": " << m.prefetched_bytes << ",\n";
-        const auto counts = [&](std::string_view name, const auto& values, bool comma) {
-            out << "      \"" << name << "\": [";
-            for (std::size_t i = 0; i < values.size(); ++i) {
-                if (i) out << ',';
-                out << values[i];
-            }
-            out << ']' << (comma ? ",\n" : "\n");
-        };
-        counts("fixed_experts_per_layer", m.fixed_experts_per_layer, true);
-        counts("target_experts_per_layer", m.target_experts_per_layer, true);
-        counts("ready_experts_per_layer", m.ready_experts_per_layer, false);
-        out << "    },\n";
-    } else {
-        out << "    \"moe\": null,\n";
-    }
-    append_arena_json(out, "weights", env.memory.weights, "    ", true);
-    append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
-    append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
-    append_vision_workspace_json(out, env.memory.vision_workspace, "    ", true);
-    out << "    \"minimum_runtime_reservation_bytes\": "
-        << env.memory.minimum_runtime_reservation_bytes << ",\n"
-        << "    \"kv_capacity_increment_bytes\": " << env.memory.kv_capacity_increment_bytes
-        << ",\n"
-        << "    \"runtime_reservation_bytes\": " << env.memory.runtime_reservation_bytes << ",\n"
-        << "    \"available_after_weights_bytes\": " << env.memory.available_after_weights_bytes
-        << ",\n"
-        << "    \"available_after_startup_bytes\": " << env.memory.available_after_startup_bytes
-        << ",\n"
-        << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
-        << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
-        << "    \"cuda_graph_rebuild_estimate_bytes\": " << graph.rebuild_estimate_bytes << ",\n"
-        << "    \"cuda_graph_prepare_increment_bytes\": " << graph.preparation_increment_bytes
-        << ",\n"
-        << "    \"cuda_graph_calibration_increment_bytes\": " << graph.calibration_increment_bytes
-        << ",\n"
-        << "    \"cuda_graph_calibration_retained_bytes\": " << graph.calibration_retained_bytes
-        << ",\n"
-        << "    \"startup_retained_bytes\": " << env.memory.startup_retained_bytes << ",\n"
-        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
+        << "    \"load_seconds\": " << number(env.startup.load.load_seconds) << ",\n"
+        << "    \"upload_seconds\": " << number(env.startup.load.upload_seconds) << ",\n"
+        << "    \"artifact_bytes_read\": " << env.startup.load.artifact_bytes_read << ",\n"
+        << "    \"host_to_device_bytes\": " << env.startup.load.host_to_device_bytes << ",\n"
+        << "    \"max_rank_staging_bytes\": " << env.startup.load.max_rank_staging_bytes << ",\n"
+        << "    \"device_object_count\": " << env.startup.load.device_object_count << ",\n"
+        << "    \"host_object_count\": " << env.startup.load.host_object_count << "\n"
         << "  },\n"
+        << "  \"resources\": "
+        << product::startup_resources_json(env.description, env.startup, env.snapshot).dump()
+        << ",\n"
         << "  \"config\": {\n"
         << "    \"concurrency\": " << env.concurrency << ",\n"
         << "    \"constraint_file\": \"" << json_escape(env.constraint_file) << "\",\n"
@@ -888,10 +787,17 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         append_stat(out, "decode_seconds", decode_time_series(result), "      ");
         out << ",\n";
         append_stat(out, "total_seconds", total_time_series(result), "      ");
-        out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes
-            << ",\n      \"workspace_allocator_peak_bytes\": "
-            << result.workspace_allocator_peak_bytes
+        out << ",\n      \"max_rank_workspace_peak_bytes\": "
+            << result.max_rank_workspace_peak_bytes
+
             << ",\n      \"expert_upload_bytes\": " << result.expert_upload_bytes << ",\n";
+        out << "      \"rank_workspace_peaks\": [";
+        for (std::size_t i = 0; i < result.rank_peaks.size(); ++i) {
+            if (i) out << ", ";
+            out << "{\"rank\": " << result.rank_peaks[i].first
+                << ", \"bytes\": " << result.rank_peaks[i].second << '}';
+        }
+        out << "],\n";
         append_speculative_json(out, aggregate_speculative(result), "      ");
         out << ",\n      \"repetition_wall_seconds\": [";
         for (std::size_t r = 0; r < result.repetition_wall_seconds.size(); ++r) {
@@ -917,8 +823,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
                 << ",\n";
             out << "          \"constraint\": "
                 << product::constraint_observation_json(rep.constraint).dump() << ",\n"
-                << "          \"constraint_draft_wait_exposed_seconds\": "
-                << number(rep.constraint_draft_wait_exposed_seconds) << ",\n";
+                << "          \"executor_flush_exposed_seconds\": "
+                << number(rep.executor_flush_exposed_seconds) << ",\n";
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");
@@ -943,7 +849,9 @@ std::string csv_field(std::string_view value) {
 } // namespace
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
-    const auto graph = env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
+    const auto allocations         = product::sum_allocations(env.snapshot.ranks);
+    std::uint64_t kv_payload_bytes = 0;
+    for (const auto& rank : env.snapshot.ranks) kv_payload_bytes += rank.memory.kv_payload_bytes;
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
            "context,prefill_chunk,concurrency,constraint_type,constraint_file,constraint_source,"
@@ -952,11 +860,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "backend,draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
-           "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
-           "cuda_graph_rebuild_estimate_bytes,cuda_graph_prepare_increment_bytes,"
-           "cuda_graph_calibration_increment_bytes,cuda_graph_calibration_retained_bytes,"
-           "startup_retained_bytes,"
-           "workspace_peak_bytes,workspace_allocator_peak_bytes,expert_upload_bytes,"
+           "max_rank_workspace_peak_bytes,expert_upload_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
@@ -975,11 +879,11 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                                            : number(static_cast<double>(spec.accepted_tokens) /
                                                     static_cast<double>(spec.drafted_tokens));
         out << result.test.label << ',' << kind_string(result.test.kind) << ','
-            << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.architecture
-            << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
-            << csv_field(env.artifact_path) << ',' << env.max_context << ',' << env.prefill_chunk
-            << ',' << env.concurrency << ',' << constraint_name(env.constraint) << ','
-            << csv_field(env.constraint_file) << ','
+            << result.test.n_prompt << ',' << result.test.n_gen << ','
+            << env.startup.load.architecture << ',' << env.startup.load.prefill_signature << ','
+            << csv_field(env.startup.load.model_name) << ',' << csv_field(env.artifact_path) << ','
+            << env.max_context << ',' << env.prefill_chunk << ',' << env.concurrency << ','
+            << constraint_name(env.constraint) << ',' << csv_field(env.constraint_file) << ','
             << csv_field(env.constraint ? env.constraint->source : "") << ','
             << csv_field(constraint_choices(env.constraint)) << ','
             << (env.mixed_constraints ? "true" : "false") << ','
@@ -987,25 +891,14 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << env.speculative.draft_tokens << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
-            << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
-            << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
-            << ','
-            << (env.memory.vision_workspace
-                    ? std::to_string(env.memory.vision_workspace->general_capacity_bytes)
-                    : std::to_string(env.memory.workspace.capacity_bytes))
-            << ','
-            << (env.memory.vision_workspace
-                    ? std::to_string(env.memory.vision_workspace->handoff_capacity_bytes)
-                    : std::string())
-            << ',' << graph.rebuild_estimate_bytes << ',' << graph.preparation_increment_bytes
-            << ',' << graph.calibration_increment_bytes << ',' << graph.calibration_retained_bytes
-            << ',' << env.memory.startup_retained_bytes << ',' << result.workspace_peak_bytes << ','
-            << result.workspace_allocator_peak_bytes << ',' << result.expert_upload_bytes << ','
-            << spec.rounds << ',' << spec.fallback_steps << ',' << acceptance << ','
-            << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
-            << ',' << stddev(prefill_tok_s_series(result)) << ','
-            << mean(decode_output_tok_s_series(result)) << ','
+            << kv_cache_name(env.kv_cache) << ',' << kv_payload_bytes << ','
+            << env.startup.load.host_to_device_bytes << ',' << allocations.device_weights_bytes
+            << ',' << allocations.persistent_device_bytes << ','
+            << allocations.workspace_device_bytes << ',' << result.max_rank_workspace_peak_bytes
+            << ',' << result.expert_upload_bytes << ',' << spec.rounds << ',' << spec.fallback_steps
+            << ',' << acceptance << ',' << result.reps.size() / result.concurrency << ','
+            << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
+            << ',' << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
             << mean(decode_engine_tok_s_series(result)) << ','
             << stddev(decode_engine_tok_s_series(result)) << ','

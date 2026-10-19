@@ -336,10 +336,14 @@ WorkerConnection::~WorkerConnection() {
 }
 
 void WorkerConnection::send(wire::Kind kind, wire::Bytes payload, bool continuation) {
+    if (!try_send(kind, std::move(payload), continuation))
+        throw std::runtime_error("worker continuation capacity exhausted");
+}
+
+bool WorkerConnection::try_send(wire::Kind kind, wire::Bytes payload, bool continuation) {
     const std::array messages{OutgoingMessage{0, std::make_shared<wire::Message>(wire::Message{
                                                      kind, bootstrap_.epoch, std::move(payload)})}};
-    if (!transport_->try_send(messages, continuation ? Traffic::Continuation : Traffic::Work))
-        throw std::runtime_error("worker continuation capacity exhausted");
+    return transport_->try_send(messages, continuation ? Traffic::Continuation : Traffic::Work);
 }
 
 std::optional<wire::Message> WorkerConnection::poll() {

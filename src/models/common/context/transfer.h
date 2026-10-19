@@ -30,6 +30,8 @@ public:
 
     [[nodiscard]] bool occupied() const noexcept { return occupied_; }
 
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return mapping_.size(); }
+
     [[nodiscard]] std::span<const runtime::ContextTransferObservation> observations();
     void finish();
     void drain();

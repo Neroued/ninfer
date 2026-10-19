@@ -6,6 +6,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/context_cache/types.h"
 #include "runtime/executor/contract.h"
+#include "runtime/observability/execution.h"
 
 #include <atomic>
 #include <chrono>
@@ -29,19 +30,19 @@ enum class RequestEngineHostPhase : std::uint8_t {
 };
 
 struct RequestHostTiming {
-    std::uint64_t queue_wait_ns                    = 0;
-    std::uint64_t engine_boundary_exposed_ns       = 0;
-    std::uint64_t program_submit_exposed_ns        = 0;
-    std::uint64_t program_post_exposed_ns          = 0;
-    std::uint64_t engine_commit_output_exposed_ns  = 0;
-    std::uint64_t engine_maintenance_exposed_ns    = 0;
-    std::uint64_t device_wait_exposed_ns           = 0;
-    std::uint64_t constraint_draft_wait_exposed_ns = 0;
-    std::uint64_t decode_host_exposed_ns           = 0;
-    std::uint64_t decode_device_wait_exposed_ns    = 0;
-    std::uint64_t prefill_units                    = 0;
-    std::uint64_t decode_rounds                    = 0;
-    std::uint64_t control_units                    = 0;
+    std::uint64_t queue_wait_ns                     = 0;
+    std::uint64_t engine_boundary_exposed_ns        = 0;
+    std::uint64_t session_call_exposed_ns           = 0;
+    std::uint64_t executor_poll_exposed_ns          = 0;
+    std::uint64_t engine_commit_output_exposed_ns   = 0;
+    std::uint64_t engine_maintenance_exposed_ns     = 0;
+    std::uint64_t scheduler_yield_exposed_ns        = 0;
+    std::uint64_t executor_flush_exposed_ns         = 0;
+    std::uint64_t decode_host_exposed_ns            = 0;
+    std::uint64_t decode_scheduler_yield_exposed_ns = 0;
+    std::uint64_t prefill_units                     = 0;
+    std::uint64_t decode_rounds                     = 0;
+    std::uint64_t control_units                     = 0;
 
     void expose_engine(RequestEngineHostPhase phase, std::uint64_t elapsed_ns,
                        bool decode_member) noexcept {
@@ -59,14 +60,26 @@ struct RequestHostTiming {
         if (decode_member) { decode_host_exposed_ns += elapsed_ns; }
     }
 
-    void expose_program(ExecutionTiming timing, bool decode_member) noexcept {
-        program_submit_exposed_ns += timing.submit_host_ns;
-        program_post_exposed_ns += timing.post_host_ns;
-        device_wait_exposed_ns += timing.device_wait_ns;
-        constraint_draft_wait_exposed_ns += timing.constraint_draft_wait_ns;
+    void expose_call(CoordinatorCall call, std::uint64_t elapsed, bool decode_member) noexcept {
+        switch (call) {
+        case CoordinatorCall::Session:
+            session_call_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Poll:
+            executor_poll_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Flush:
+            executor_flush_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Yield:
+            scheduler_yield_exposed_ns += elapsed;
+            break;
+        }
         if (decode_member) {
-            decode_host_exposed_ns += timing.host_ns();
-            decode_device_wait_exposed_ns += timing.device_wait_ns;
+            if (call == CoordinatorCall::Yield)
+                decode_scheduler_yield_exposed_ns += elapsed;
+            else
+                decode_host_exposed_ns += elapsed;
         }
     }
 
@@ -76,22 +89,22 @@ struct RequestHostTiming {
             .queue_wait_seconds = static_cast<double>(queue_wait_ns) * kNanosecondsToSeconds,
             .engine_boundary_exposed_seconds =
                 static_cast<double>(engine_boundary_exposed_ns) * kNanosecondsToSeconds,
-            .program_submit_exposed_seconds =
-                static_cast<double>(program_submit_exposed_ns) * kNanosecondsToSeconds,
-            .program_post_exposed_seconds =
-                static_cast<double>(program_post_exposed_ns) * kNanosecondsToSeconds,
+            .session_call_exposed_seconds =
+                static_cast<double>(session_call_exposed_ns) * kNanosecondsToSeconds,
+            .executor_poll_exposed_seconds =
+                static_cast<double>(executor_poll_exposed_ns) * kNanosecondsToSeconds,
             .engine_commit_output_exposed_seconds =
                 static_cast<double>(engine_commit_output_exposed_ns) * kNanosecondsToSeconds,
             .engine_maintenance_exposed_seconds =
                 static_cast<double>(engine_maintenance_exposed_ns) * kNanosecondsToSeconds,
-            .device_wait_exposed_seconds =
-                static_cast<double>(device_wait_exposed_ns) * kNanosecondsToSeconds,
-            .constraint_draft_wait_exposed_seconds =
-                static_cast<double>(constraint_draft_wait_exposed_ns) * kNanosecondsToSeconds,
+            .scheduler_yield_exposed_seconds =
+                static_cast<double>(scheduler_yield_exposed_ns) * kNanosecondsToSeconds,
+            .executor_flush_exposed_seconds =
+                static_cast<double>(executor_flush_exposed_ns) * kNanosecondsToSeconds,
             .decode_host_exposed_seconds =
                 static_cast<double>(decode_host_exposed_ns) * kNanosecondsToSeconds,
-            .decode_device_wait_exposed_seconds =
-                static_cast<double>(decode_device_wait_exposed_ns) * kNanosecondsToSeconds,
+            .decode_scheduler_yield_exposed_seconds =
+                static_cast<double>(decode_scheduler_yield_exposed_ns) * kNanosecondsToSeconds,
             .prefill_units = prefill_units,
             .decode_rounds = decode_rounds,
             .control_units = control_units,
@@ -216,11 +229,11 @@ struct RequestRecord {
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
-    GenerationTimings generation_timings;
+    RequestExecutionStatistics executions;
+    std::array<DurationCounter, 4> max_rank_gpu{};
+    std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;
-    GenerationWorkTiming prefill_work;
-    GenerationWorkTiming replay_work;
     std::array<std::array<GenerationTransferTiming, 3>,
                ModelContract::Session::ContextResources::pool_capacity + 1>
         context_transfers{};

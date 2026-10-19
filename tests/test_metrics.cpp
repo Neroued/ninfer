@@ -19,26 +19,41 @@ int main() {
     EngineOptions options;
     options.max_concurrency                 = 2;
     options.context_cache.extra_state_slots = 1;
-    MemorySummary memory;
-    memory.kv_capacity_page_groups     = 256;
-    memory.host_context_capacity_bytes = 1048576;
-    RuntimeStats baseline;
-    baseline.generated_tokens         = 4;
-    baseline.speculative_draft_tokens = 3;
+    EngineDescription description;
+    description.device_state_capacity       = 3;
+    description.host_context_capacity_bytes = 1048576;
+    StartupReport startup;
+    EngineSnapshot baseline;
+    baseline.runtime.generated_tokens         = 4;
+    baseline.runtime.speculative_draft_tokens = 3;
+    baseline.ranks.resize(1);
+    baseline.ranks[0].gpu_intervals[0] = {1, 1000, 1000};
+    baseline.executions[1].units       = 3;
+    baseline.executions[1].rows        = 5;
     Metrics metrics;
-    metrics.configure("custom\"model\\name\nline", options, memory, baseline);
-    RuntimeStats running = baseline;
-    running.generated_tokens += 5;
-    running.speculative_draft_tokens += 6;
-    running.speculative_accepted_tokens = 3;
-    running.running_requests            = 1;
-    running.host_context_occupied_bytes = 4096;
-    running.host_context_reserved_bytes = 1024;
-    running.kv_pools = {{0, "text", 2, 8}, {1, "draft", 1, 4}, {2, "index", 3, 6}};
-    running.context_transfers.kv.resize(3);
-    running.context_transfers.kv[2][1].bytes = 8192;
+    metrics.configure("custom\"model\\name\nline", options, description, startup, baseline);
+    EngineSnapshot running = baseline;
+    running.executions[1].units += 2;
+    running.executions[1].rows += 4;
+    running.ranks[0].gpu_intervals[0] = {4, 9000, 3000};
+    running.runtime.generated_tokens += 5;
+    running.runtime.speculative_draft_tokens += 6;
+    running.runtime.speculative_accepted_tokens = 3;
+    running.runtime.running_requests            = 1;
+    running.runtime.host_context_occupied_bytes = 4096;
+    running.runtime.host_context_reserved_bytes = 1024;
+    running.runtime.kv_pools = {{0, "text", 2, 8}, {1, "draft", 1, 4}, {2, "index", 3, 6}};
+    running.runtime.context_transfers.kv.resize(3);
+    running.runtime.context_transfers.kv[2][1].bytes = 8192;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
+    check(live.find("ninfer_execution_units_total{kind=\"decode\"} 2\n") != std::string::npos &&
+              live.find("ninfer_execution_rows_total{kind=\"decode\"} 4\n") != std::string::npos &&
+              live.find("ninfer_rank_gpu_interval_samples_total{rank=\"0\",node=\"0\",interval="
+                        "\"result_stream\"} 3\n") != std::string::npos &&
+              live.find("ninfer_rank_gpu_interval_samples_total{rank=\"0\",node=\"0\",interval="
+                        "\"commit_stream\"} 0\n") != std::string::npos,
+          "metrics must distinguish batch/row deltas and measured/unmeasured GPU intervals");
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
@@ -61,9 +76,9 @@ int main() {
           "pool metrics dropped the third pool or used a model role as its identity");
 
     GenerationOutcome outcome;
-    outcome.finish_reason                            = FinishReason::OutputLimit;
-    outcome.metrics.total_seconds                    = 2.0;
-    outcome.metrics.engine_timing.queue_wait_seconds = 0.1;
+    outcome.finish_reason                          = FinishReason::OutputLimit;
+    outcome.stats.timings.total_seconds            = 2.0;
+    outcome.stats.engine_timing.queue_wait_seconds = 0.1;
     std::vector<std::thread> writers;
     for (int i = 0; i < 4; ++i) {
         writers.emplace_back([&] {
@@ -92,11 +107,11 @@ int main() {
           "durations");
     check(final.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos,
           "request settlement must not count the first token again");
-    outcome.constraint = ConstraintObservation{.complete          = true,
-                                               .terminated        = false,
-                                               .cache             = ConstraintCacheAccess::Built,
-                                               .mask_positions    = 5,
-                                               .mask_upload_bytes = 128};
+    outcome.stats.constraint = ConstraintObservation{.complete       = true,
+                                                     .terminated     = false,
+                                                     .cache          = ConstraintCacheAccess::Built,
+                                                     .mask_positions = 5,
+                                                     .mask_upload_bytes = 128};
     metrics.done(outcome);
     const auto constrained = metrics.render(running, false);
     check(constrained.find(

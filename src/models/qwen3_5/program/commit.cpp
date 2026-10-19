@@ -120,6 +120,7 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
         retire_compute();
         return;
     }
+    gpu_timer.record_retirement();
     compute_retired.record(device.stream());
     operation.stage = ComputeStage::Retiring;
 }
@@ -136,9 +137,15 @@ void RankProgramImpl::retire_compute() {
             residency.vision_input.reset();
         }
     }
+    auto observation = retirement_observation();
+    gpu_timer.observe_retirement(compute->gpu);
+    observation.gpu  = compute->gpu;
+    observation.path = compute->graph_started
+                           ? (resources.moe ? ExecutionPath::Mixed : ExecutionPath::Graph)
+                           : ExecutionPath::Eager;
     compute.reset();
     resources.work.reset();
-    events.emplace_back(runtime::DeviceRetired{ticket, command});
+    events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }
 
 } // namespace ninfer::models::qwen3_5::detail

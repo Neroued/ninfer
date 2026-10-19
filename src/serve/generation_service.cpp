@@ -510,38 +510,11 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
-    outcome.thinking            = result.thinking;
-    outcome.constraint          = result.constraint;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 
-    outcome.metrics.prepare_seconds =
-        prepared.service_prepare_seconds + result.timings.prepare_seconds;
-    outcome.metrics.ttft_seconds =
-        outcome.metrics.prepare_seconds +
-        std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
-    outcome.metrics.vision_seconds          = result.timings.vision_seconds;
-    outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
-    outcome.metrics.decode_seconds          = result.timings.decode_seconds;
-    outcome.metrics.prompt_wall_seconds     = result.timings.prompt_wall_seconds;
-    outcome.metrics.generation_wall_seconds = result.timings.generation_wall_seconds;
-    outcome.metrics.total_seconds = prepared.service_prepare_seconds + result.timings.total_seconds;
-    outcome.metrics.engine_timing = result.engine_timing;
-    outcome.metrics.first_output_timing         = std::move(result.first_output_timing);
-    outcome.metrics.scheduling                  = result.scheduling;
-    outcome.metrics.admission                   = result.admission;
-    outcome.metrics.engine_request_id           = result.engine_request_id;
-    outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
-    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
-    outcome.metrics.speculative_backend         = result.speculative.backend;
-    outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
-    outcome.metrics.speculative_rounds          = result.speculative.rounds;
-    outcome.metrics.speculative_draft_tokens    = result.speculative.drafted_tokens;
-    outcome.metrics.speculative_accepted_tokens = result.speculative.accepted_tokens;
-    outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
-    outcome.metrics.speculative_accepted_per_position =
-        std::move(result.speculative.accepted_per_position);
+    outcome.stats                   = std::move(result.stats);
+    outcome.service_prepare_seconds = prepared.service_prepare_seconds;
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;

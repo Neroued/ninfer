@@ -37,6 +37,10 @@ public:
 
     void bind_to_current_thread() { device_->bind_to_current_thread(); }
 
+    [[nodiscard]] Device device() const noexcept { return device_->device(); }
+
+    [[nodiscard]] const char* device_name() const noexcept { return device_->properties().name; }
+
     [[nodiscard]] typename Types::RankProgram& program() noexcept { return *instance_->program; }
 
     [[nodiscard]] const typename Types::RankProgram& program() const noexcept {

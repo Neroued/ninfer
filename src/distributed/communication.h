@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "core/dtype.h"
 #include "distributed/topology.h"
+#include "ninfer/observability/execution.h"
+#include <functional>
 
 #include <atomic>
 #include <chrono>
@@ -32,6 +34,9 @@ public:
     [[nodiscard]] std::uint32_t rank() const noexcept;
     [[nodiscard]] std::uint32_t size() const noexcept;
     [[nodiscard]] Device device() const noexcept;
+    [[nodiscard]] CommunicationStatistics statistics() const noexcept;
+    void record_graph(CommunicationWork&, const std::function<void()>&) const;
+    void replayed(const CommunicationWork&) const noexcept;
     // All mutually dependent sends/receives are enqueued together, in caller order.
     void exchange(std::span<const PeerTransfer>, CudaExecutionView) const;
     void enqueue(Collective, const void* source, void* destination, std::size_t count, DType,
@@ -60,6 +65,9 @@ public:
     void abort() noexcept;
     void close(std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] int version() const;
+    [[nodiscard]] std::vector<CommunicationStatistics> statistics() const;
+    void reset_statistics();
+    void observe_totals(CommunicationWork& eager, CommunicationWork& graph) const noexcept;
 private:
     const DeviceContext& device_;
     std::shared_ptr<std::atomic<bool>> stop_;

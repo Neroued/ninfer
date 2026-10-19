@@ -236,18 +236,21 @@ void RankProgramImpl::after_main() {
     }
     if (f.timer_started) prefill_timer.record_stop();
     if (f.graph_decided) {
+        gpu_timer.record_result();
         compute_done.record(cuda.stream());
         f.phase = ComputePhase::AwaitResult;
         return;
     }
     if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation)) {
         if (forward->sample == SampleKind::None) {
+            gpu_timer.record_result();
             compute_done.record(cuda.stream());
             f.phase = ComputePhase::AwaitResult;
             return;
         }
     }
     if (std::holds_alternative<ScoreWork>(f.request.work.operation)) {
+        gpu_timer.record_result();
         compute_done.record(cuda.stream());
         f.phase = ComputePhase::Score;
     } else
@@ -389,6 +392,7 @@ void RankProgramImpl::prepare_decision() {
             return !(row.sampling.temperature > 0);
         });
         device_graphs->decide(batch, f.verify.has_value(), greedy ? 1 : 20);
+        gpu_timer.record_result();
         compute_done.record(cuda.stream());
         f.phase = ComputePhase::AwaitResult;
         return;
@@ -418,6 +422,7 @@ void RankProgramImpl::prepare_decision() {
         copy_bytes_async(resources.egress().subspan(0, batch * sizeof(TokenId)),
                          {sampled.data, batch * sizeof(TokenId), cuda.device()}, cuda);
     }
+    gpu_timer.record_result();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitResult;
 }

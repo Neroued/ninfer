@@ -22,47 +22,19 @@ namespace ninfer::serve {
 struct RequestLifetime;
 struct RequestCapacity;
 
-struct GenerationMetrics {
-    std::uint64_t engine_request_id       = 0;
-    std::uint32_t computed_prefill_tokens = 0;
-    double prepare_seconds                = 0.0;
-    double ttft_seconds                   = 0.0;
-    double vision_seconds                 = 0.0;
-    double prefill_seconds                = 0.0;
-    double decode_seconds                 = 0.0;
-    double prompt_wall_seconds            = 0.0;
-    double generation_wall_seconds        = 0.0;
-    double total_seconds                  = 0.0;
-    ninfer::GenerationEngineTiming engine_timing;
-    std::optional<ninfer::GenerationFirstOutputTiming> first_output_timing;
-    ninfer::GenerationSchedulingStats scheduling;
-    ninfer::GenerationAdmissionStats admission;
-
-    SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
-    std::uint32_t speculative_draft_window    = 0;
-    std::uint64_t speculative_rounds          = 0;
-    std::uint64_t speculative_draft_tokens    = 0;
-    std::uint64_t speculative_accepted_tokens = 0;
-    std::uint64_t speculative_fallback_steps  = 0;
-    std::vector<std::uint64_t> speculative_accepted_per_position;
-    std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
-};
-
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
-    int prompt_tokens     = 0;
-    int completion_tokens = 0;
-    int reasoning_tokens  = 0;
-    ninfer::ThinkingBudgetStats thinking;
-    std::optional<ninfer::ConstraintObservation> constraint;
+    int prompt_tokens                  = 0;
+    int completion_tokens              = 0;
+    int reasoning_tokens               = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
-    GenerationMetrics metrics;
+    RequestStats stats;
+    double service_prepare_seconds = 0.0;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().
@@ -126,17 +98,13 @@ public:
     // value instead of reinterpreting optional defaults from product::ServeOptions.
     [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] const EngineDescription& description() const { return engine_->description(); }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] const StartupReport& startup_report() const { return engine_->startup_report(); }
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] EngineSnapshot snapshot() const { return engine_->snapshot(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
-
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
-        return engine_->media_cache_summary();
-    }
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();

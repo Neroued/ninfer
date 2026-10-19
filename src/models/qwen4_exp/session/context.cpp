@@ -369,7 +369,6 @@ ContextProgress detail::SessionImpl::complete_context() {
             s.capture_pending = false;
             ++s.next_capture;
         } else if (auto* tx = std::get_if<detail::PauseOperation>(&operation.action)) {
-            result.request_timings     = tx->paused->sequence->timings;
             result.request_speculative = tx->paused->sequence->speculative;
             result.paused.emplace(ResumeState(std::move(tx->paused)));
         } else {

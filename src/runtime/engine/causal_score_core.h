@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/observability/snapshot.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -26,6 +27,8 @@ public:
     using PreparedPrompt = typename ModelContract::PreparedPrompt;
 
     explicit CausalScoreCore(Instance& instance) : instance_(instance) {
+        published_snapshot_.ranks.assign(instance_.executor->observations().begin(),
+                                         instance_.executor->observations().end());
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -79,41 +82,36 @@ public:
         return result.get();
     }
 
-    [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.session->memory_summary();
-        out.device_budget_bytes                = instance_.device_budget_bytes;
-        out.startup_retained_bytes             = instance_.startup_retained_bytes;
-        out.cuda_graph                         = instance_.cuda_graph;
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.primary_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_primary_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_primary_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
+    [[nodiscard]] EngineSnapshot snapshot() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_snapshot_;
     }
-
-    [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
     }
 
-    void reset_memory_peaks() noexcept {
-        try {
-            std::scoped_lock lock(execution_mutex_);
-            instance_.session->reset_memory_peaks();
-        } catch (...) {}
+    void reset_measurement_peaks() {
+        std::scoped_lock execution_lock(execution_mutex_);
+        if (instance_.executor->has_pending_work())
+            throw std::logic_error("measurement window requires an idle engine");
+        instance_.session->reset_measurement_peaks();
+        std::lock_guard stats_lock(stats_mutex_);
+        const auto ranks = instance_.executor->observations();
+        published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
     }
 
 private:
+    void publish() {
+        std::lock_guard lock(stats_mutex_);
+        published_snapshot_.stamp = {published_snapshot_.stamp.sequence + 1, observation_time_ns()};
+        published_snapshot_.scoring    = scoring_;
+        published_snapshot_.executions = instance_.executor->execution_statistics();
+        const auto ranks               = instance_.executor->observations();
+        published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
+    }
+
     struct Job {
         PreparedPrompt prompt;
         std::uint32_t first_target = 0;
@@ -133,6 +131,9 @@ private:
                 job = std::move(job_);
             }
             bool execution_started = false;
+            const auto started     = observation_time_ns();
+            scoring_.active_jobs   = 1;
+            publish();
             try {
                 std::vector<float> result;
                 {
@@ -163,6 +164,11 @@ private:
                         std::this_thread::yield();
                     }
                 }
+                ++scoring_.completed_jobs;
+                scoring_.scored_tokens += result.size();
+                scoring_.active_jobs = 0;
+                scoring_.wall.observe(observation_time_ns() - started);
+                publish();
                 job->promise.set_value(std::move(result));
             } catch (...) {
                 const auto error = std::current_exception();
@@ -176,6 +182,9 @@ private:
                         failed_ = true;
                     }
                 }
+                ++scoring_.failed_jobs;
+                scoring_.active_jobs = 0;
+                publish();
                 try {
                     job->promise.set_exception(error);
                 } catch (...) {}
@@ -185,6 +194,9 @@ private:
 
     Instance& instance_;
     mutable std::mutex execution_mutex_;
+    mutable std::mutex stats_mutex_;
+    EngineSnapshot published_snapshot_;
+    ScoringStatistics scoring_;
     std::mutex call_mutex_;
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;

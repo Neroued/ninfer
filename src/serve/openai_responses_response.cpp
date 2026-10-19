@@ -199,9 +199,9 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     response["output"]       = built.output_items;
     response["incomplete_details"] =
         status == "incomplete" ? Json{{"reason", "max_output_tokens"}} : Json(nullptr);
-    const int observed_cached = std::max(runtime.cached_input_tokens,
-                                         static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
-    const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
+    const int observed_cached =
+        std::max(runtime.cached_input_tokens, static_cast<int>(outcome.stats.reused_prompt_tokens));
+    const int cached_tokens = std::clamp(observed_cached, 0, outcome.prompt_tokens);
     response["usage"] =
         Json{{"input_tokens", outcome.prompt_tokens},
              {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
@@ -209,8 +209,8 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
              {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
              {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
     built.body = std::move(response);
-    if (outcome.constraint)
-        built.body["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (outcome.stats.constraint)
+        built.body["constraint"] = product::constraint_observation_json(outcome.stats.constraint);
     return built;
 }
 

@@ -80,7 +80,7 @@ struct RepTiming {
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
     std::optional<ConstraintObservation> constraint;
-    double constraint_draft_wait_exposed_seconds = 0.0;
+    double executor_flush_exposed_seconds = 0.0;
 };
 
 struct TestResult {
@@ -89,9 +89,9 @@ struct TestResult {
     std::uint32_t concurrency = 1;
     std::vector<RepTiming> reps;
     std::vector<double> repetition_wall_seconds;
-    std::size_t workspace_peak_bytes           = 0;
-    std::size_t workspace_allocator_peak_bytes = 0;
-    std::uint64_t expert_upload_bytes          = 0;
+    std::vector<std::pair<std::uint32_t, std::size_t>> rank_peaks;
+    std::size_t max_rank_workspace_peak_bytes = 0;
+    std::uint64_t expert_upload_bytes         = 0;
 };
 
 struct Stats {
@@ -108,8 +108,9 @@ struct BenchEnvironment {
 
     std::string artifact_path;
     std::uint64_t artifact_file_size_bytes = 0;
-    LoadSummary load;
-    MemorySummary memory;
+    EngineDescription description;
+    StartupReport startup;
+    EngineSnapshot snapshot;
 
     std::uint32_t max_context   = 0;
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;

@@ -2,6 +2,7 @@
 
 #include "distributed/bootstrap.h"
 #include "runtime/executor/protocol.h"
+#include "runtime/observability/snapshot.h"
 
 #include <deque>
 #include <map>
@@ -16,6 +17,11 @@ public:
     WorkerLoop(distributed::WorkerConnection& connection, Program& program, Codec codec)
         : connection_(connection), program_(program), codec_(std::move(codec)),
           compute_(program.capacity().compute_frames), context_(program.capacity().context_frames) {
+        connection_.communication().reset_statistics();
+        const auto& identity  = connection_.bootstrap().identity;
+        observation_.rank     = identity.rank;
+        observation_.node     = identity.node;
+        observation_.hardware = connection_.device().properties().name;
     }
 
     // False means orderly shutdown with every frame retired.
@@ -32,7 +38,8 @@ public:
 private:
     bool advance_impl() {
         connection_.communication().check();
-        while (auto event = program_.poll()) consume(std::move(*event));
+        while (auto event = observe_host_call(host_.progress_ns, [&] { return program_.poll(); }))
+            consume(std::move(*event));
         while (commands_.size() < 64) {
             auto message = connection_.poll();
             if (!message) break;
@@ -53,19 +60,25 @@ private:
                     throw std::logic_error("execution codec has no input resources");
                 continue;
             }
-            if (message->kind == distributed::wire::Kind::MemoryQuery) {
+            if (message->kind == distributed::wire::Kind::ResetMeasurement) {
                 distributed::wire::Decoder query(message->payload);
-                const auto id    = query.u64();
-                const bool reset = query.boolean();
+                const auto id = query.u64();
                 query.finish();
-                if (reset) program_.reset_memory_peaks();
+                if (active()) throw std::logic_error("measurement reset requires an idle rank");
+                program_.reset_measurement_peaks();
+                observation_.memory        = program_.observe_resources();
+                observation_.host          = host_;
+                observation_.communication = connection_.communication().statistics();
+                observation_.physical_memory =
+                    sample_physical_memory(connection_.device().device());
+                observation_.stamp = {observation_.stamp.sequence + 1, observation_time_ns()};
                 distributed::wire::Encoder report;
                 report.u64(id);
-                protocol::encode(report, program_.memory_summary());
+                protocol::encode(report, observation_);
                 auto payload = std::move(report).take();
                 if (payload.size() > codec_.control_budget().report)
                     throw std::logic_error("rank resource report exceeds its prepared capacity");
-                connection_.send(distributed::wire::Kind::MemoryReport, std::move(payload));
+                connection_.send(distributed::wire::Kind::MeasurementReset, std::move(payload));
                 continue;
             }
             if (message->kind == distributed::wire::Kind::Shutdown) {
@@ -94,7 +107,30 @@ private:
             commands_.push_back({std::move(envelope), std::move(*message)});
         }
         if (!commands_.empty()) apply();
+        sample_resources();
         return true;
+    }
+
+    void sample_resources() {
+        if (!received_) return;
+        const auto now = observation_time_ns();
+        if (now - observation_.stamp.sampled_ns < kResourceSamplePeriodNs) return;
+        const auto& rank           = connection_.bootstrap().identity;
+        observation_.rank          = rank.rank;
+        observation_.node          = rank.node;
+        observation_.hardware      = connection_.device().properties().name;
+        observation_.memory        = program_.observe_resources();
+        observation_.host          = host_;
+        observation_.communication = connection_.communication().statistics();
+        if (!active())
+            observation_.physical_memory = sample_physical_memory(connection_.device().device());
+        observation_.stamp = {observation_.stamp.sequence + 1, now};
+        distributed::wire::Encoder out;
+        protocol::encode(out, observation_);
+        // Cumulative samples may be skipped under pressure; execution continuations keep their
+        // reserved capacity and the next sample still contains all completed work.
+        (void)connection_.try_send(distributed::wire::Kind::Observation, std::move(out).take(),
+                                   false);
     }
 
     enum class Phase { Empty, Running, Decision, Result, Retiring, Discarding };
@@ -162,8 +198,10 @@ private:
             in.finish();
             program_.validate_work(work, envelope.ticket.frame.kind);
             flight = {envelope, Phase::Running, 0, {envelope.command.value}};
-            program_.start(
-                ExecutionRequest<Types>{envelope.ticket, envelope.command, std::move(work)});
+            observe_host_call(host_.submit_ns, [&] {
+                program_.start(
+                    ExecutionRequest<Types>{envelope.ticket, envelope.command, std::move(work)});
+            });
         } else {
             auto& flight = find(envelope.ticket);
             if (flight.envelope.scope.owners != envelope.scope.owners ||
@@ -177,7 +215,9 @@ private:
                 if (input.stage != flight.decision_stage)
                     throw std::logic_error("worker decision stage differs");
                 program_.validate_decision(envelope.ticket, input);
-                program_.supply(envelope.ticket, envelope.command, std::move(input));
+                observe_host_call(host_.supply_ns, [&] {
+                    program_.supply(envelope.ticket, envelope.command, std::move(input));
+                });
                 flight.phase = Phase::Running;
                 break;
             }
@@ -186,14 +226,17 @@ private:
                 auto commit = codec_.decode_commit(in);
                 in.finish();
                 program_.prepare_commit(envelope.ticket, commit);
-                program_.commit(envelope.ticket, envelope.command, std::move(commit));
+                observe_host_call(host_.commit_ns, [&] {
+                    program_.commit(envelope.ticket, envelope.command, std::move(commit));
+                });
                 flight.phase = Phase::Retiring;
                 break;
             }
             case distributed::wire::Kind::Discard:
                 if (!program_.can_discard(envelope.ticket)) return;
                 in.finish();
-                program_.discard(envelope.ticket, envelope.command);
+                observe_host_call(host_.discard_ns,
+                                  [&] { program_.discard(envelope.ticket, envelope.command); });
                 flight.phase = Phase::Discarding;
                 break;
             default:
@@ -210,7 +253,7 @@ private:
     void consume(ExecutionEvent<Types> event) {
         bool publish = true;
         std::visit(
-            [&](const auto& value) {
+            [&](auto& value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, ExecutionFailed>) {
                     throw std::runtime_error(value.message);
@@ -232,6 +275,9 @@ private:
                                            : Phase::Retiring;
                         publish = result_owner || value.ticket.frame.kind == FrameKind::Context;
                     } else if constexpr (std::is_same_v<T, DeviceRetired>) {
+                        value.observed.host = host_;
+                        connection_.communication().observe_totals(
+                            value.observed.communication_eager, value.observed.communication_graph);
                         if (flight.envelope.command != value.command ||
                             (flight.phase != Phase::Retiring && flight.phase != Phase::Discarding))
                             throw std::logic_error("worker retired an unresolved frame");
@@ -253,6 +299,8 @@ private:
     distributed::WorkerConnection& connection_;
     Program& program_;
     Codec codec_;
+    RankSnapshot observation_;
+    RankHostStatistics host_;
     std::vector<Flight> compute_, context_;
     std::deque<Command> commands_;
     std::map<std::uint64_t, bool> completed_;

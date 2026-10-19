@@ -237,17 +237,6 @@ std::vector<WorkRow> rows(Decoder& in) {
     return result;
 }
 
-void timing(Encoder& out, const runtime::ExecutionTiming& t) {
-    out.u64(t.submit_host_ns);
-    out.u64(t.device_wait_ns);
-    out.u64(t.constraint_draft_wait_ns);
-    out.u64(t.post_host_ns);
-    out.u64(t.gpu_elapsed_ns);
-}
-
-runtime::ExecutionTiming timing(Decoder& in) {
-    return {in.u64(), in.u64(), in.u64(), in.u64(), in.u64()};
-}
 } // namespace
 
 void VisionInputBindings::install(std::uint64_t id,
@@ -409,9 +398,8 @@ void encode_result(Encoder& out, const Result& result) {
                     integers(out, r.tokens);
                     integers(out, r.input_tokens);
                     out.u32(r.dead_positions);
-                    out.f64(r.vision_seconds);
                 }
-                timing(out, v.timing);
+
             } else if constexpr (std::is_same_v<T, ContextResult>) {
                 out.u8(2);
                 out.u64(v.transfers.size());
@@ -430,7 +418,6 @@ void encode_result(Encoder& out, const Result& result) {
                 out.u32(v.processed);
                 out.u64(v.logprobs.size());
                 for (auto value : v.logprobs) out.f32(value);
-                timing(out, v.timing);
             }
         },
         result);
@@ -440,7 +427,7 @@ Result decode_result(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ComputeResult v;
-        v.rows.resize(in.count(40));
+        v.rows.resize(in.count(4 * 4 + 2 * 8));
         for (auto& r : v.rows) {
             r.processed       = in.u32();
             r.drafts          = in.u32();
@@ -448,9 +435,8 @@ Result decode_result(Decoder& in) {
             r.tokens          = integers<TokenId>(in);
             r.input_tokens    = integers<TokenId>(in);
             r.dead_positions  = in.u32();
-            r.vision_seconds  = in.f64();
         }
-        v.timing = timing(in);
+
         return v;
     }
     case 2: {
@@ -471,7 +457,7 @@ Result decode_result(Decoder& in) {
         v.processed = in.u32();
         v.logprobs.resize(in.count(4));
         for (auto& value : v.logprobs) value = in.f32();
-        v.timing = timing(in);
+
         return v;
     }
     default:

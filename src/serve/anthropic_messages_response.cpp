@@ -88,7 +88,7 @@ StopPresentation stop_presentation(const GenerationOutcome& outcome) {
 Json final_usage(const GenerationOutcome& outcome) {
     const int prompt = std::max(0, outcome.prompt_tokens);
     const int cached = static_cast<int>(std::min<std::uint64_t>(
-        outcome.metrics.prefix_cache_hit_tokens, static_cast<std::uint64_t>(prompt)));
+        outcome.stats.reused_prompt_tokens, static_cast<std::uint64_t>(prompt)));
     return Json{
         {"input_tokens", prompt - cached},
         {"cache_creation_input_tokens", nullptr},
@@ -217,8 +217,8 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"stop_reason", stop.reason},
                          {"stop_sequence", stop.sequence},
                          {"usage", final_usage(outcome)}};
-    if (outcome.constraint)
-        response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (outcome.stats.constraint)
+        response["constraint"] = product::constraint_observation_json(outcome.stats.constraint);
     return response.dump();
 }
 
@@ -398,8 +398,8 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     Json terminal{{"type", "message_delta"},
                   {"delta", Json{{"stop_reason", stop.reason}, {"stop_sequence", stop.sequence}}},
                   {"usage", final_usage(outcome)}};
-    if (outcome.constraint)
-        terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (outcome.stats.constraint)
+        terminal["constraint"] = product::constraint_observation_json(outcome.stats.constraint);
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;

@@ -17,6 +17,7 @@ enum class Field {
     KvCapacity,
     PrefillChunk,
     CudaGraph,
+    GpuTiming,
     MaxConcurrency,
     MaxPendingRequests,
     PendingTimeout,

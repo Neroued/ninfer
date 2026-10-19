@@ -52,6 +52,10 @@ struct Types {
     using Work   = ::Work;
     using Result = ::Result;
     using Commit = ::Commit;
+
+    static ExecutionWork describe_work(const Work& work) {
+        return {ExecutionKind::Decode, 1, work.count, work.count};
+    }
 };
 
 void require(bool condition, const char* message) {
@@ -129,17 +133,6 @@ struct Codec {
         for (auto rank : scope.owners)
             require(results.at(rank)->state == expected.state, "rank states disagree");
         return expected;
-    }
-
-    MemorySummary merge_memory(const dist::ExecutionTopology& topology,
-                               const std::vector<std::optional<MemorySummary>>& reports) const {
-        MemorySummary total;
-        for (const auto& rank : topology.ranks) {
-            const auto& value = reports.at(rank.rank).value();
-            total.workspace.capacity_bytes += value.workspace.capacity_bytes;
-            total.workspace.peak_used_bytes += value.workspace.peak_used_bytes;
-        }
-        return total;
     }
 };
 
@@ -273,16 +266,20 @@ public:
 
     void drain() { device_.synchronize(); }
 
-    MemorySummary memory_summary() const {
-        MemorySummary result;
-        result.device                   = connection_.bootstrap().identity.device;
-        result.workspace.capacity_bytes = compute_.source.size() + compute_.destination.size() +
-                                          context_.source.size() + context_.destination.size();
-        result.workspace.peak_used_bytes = peak_bytes_;
+    RankMemoryUsage observe_resources() const {
+        RankMemoryUsage result;
+        result.allocations.workspace_device_bytes =
+            compute_.source.size() + compute_.destination.size() + context_.source.size() +
+            context_.destination.size();
+        result.workspace.required_peak_bytes    = std::max(lifetime_peak_, peak_bytes_);
+        result.workspace.measurement_peak_bytes = peak_bytes_;
         return result;
     }
 
-    void reset_memory_peaks() noexcept { peak_bytes_ = 0; }
+    void reset_measurement_peaks() noexcept {
+        lifetime_peak_ = std::max(lifetime_peak_, peak_bytes_);
+        peak_bytes_    = 0;
+    }
 
 private:
     enum class Phase { Empty, Running, Decision, AfterDecision, Result, Retiring };
@@ -433,6 +430,7 @@ private:
     Frame compute_, context_;
     DeviceBuffer state_;
     std::uint64_t state_value_ = 0;
+    std::size_t lifetime_peak_ = 0;
     std::size_t peak_bytes_    = 0;
     std::deque<rt::ExecutionEvent<Types>> events_;
 };
@@ -464,8 +462,6 @@ void run(Executor& executor, Work work, std::uint64_t& expected_state, bool canc
     auto reservation = executor.try_reserve(kind);
     require(bool(reservation), "execution frame was not retired");
     const auto ticket = executor.submit(std::move(*reservation), work);
-    require(executor.memory_summary().workspace.capacity_bytes == 4 * (131072 + 256),
-            "rank resource report differs from its actual buffers");
     if (cancel) executor.discard(ticket);
     bool result = false, retired = false;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -551,11 +547,21 @@ int coordinator(int argc, char** argv) {
     run(executor, {Operation::Sum, DType::FP32, 64, false, true, true}, state, true);
     run(executor, {Operation::State, DType::U64, 1}, state);
     run(executor, {Operation::State, DType::U64, 1, false, false, false, -1, 1}, state);
-    require(executor.memory_summary().workspace.peak_used_bytes > 0,
-            "worker resource peaks were not reported");
-    executor.reset_memory_peaks();
-    require(executor.memory_summary().workspace.peak_used_bytes == 0,
-            "resource reset did not reach every worker");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::any_of(executor.observations().begin(), executor.observations().end(),
+                       [](const auto& r) { return !r.memory.workspace.measurement_peak_bytes; })) {
+        require(std::chrono::steady_clock::now() < until, "rank observations did not arrive");
+        (void)executor.poll();
+        std::this_thread::yield();
+    }
+    for (const auto& rank : executor.observations())
+        require(rank.memory.allocations.workspace_device_bytes == 2 * (131072 + 256),
+                "rank resource observation differs from owned buffers");
+    executor.reset_measurement_peaks();
+    for (const auto& rank : executor.observations())
+        require(rank.memory.workspace.measurement_peak_bytes == 0 &&
+                    rank.memory.workspace.required_peak_bytes > 0,
+                "measurement reset erased lifetime peaks or omitted a rank");
     executor.drain();
     {
         Executor failing(prepare(), {1, 1}, {});

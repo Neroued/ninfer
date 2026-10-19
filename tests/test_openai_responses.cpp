@@ -100,13 +100,13 @@ StoredOpenAIResponse stored_parent(OpenAIResponseContext context) {
 
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
-    outcome.text                            = "answer";
-    outcome.reasoning                       = "thought";
-    outcome.prompt_tokens                   = 11;
-    outcome.completion_tokens               = 7;
-    outcome.reasoning_tokens                = 3;
-    outcome.finish_reason                   = ninfer::FinishReason::StopToken;
-    outcome.metrics.prefix_cache_hit_tokens = 4;
+    outcome.text                       = "answer";
+    outcome.reasoning                  = "thought";
+    outcome.prompt_tokens              = 11;
+    outcome.completion_tokens          = 7;
+    outcome.reasoning_tokens           = 3;
+    outcome.finish_reason              = ninfer::FinishReason::StopToken;
+    outcome.stats.reused_prompt_tokens = 4;
     return outcome;
 }
 
@@ -1011,8 +1011,8 @@ int test_sse_sequence_and_failures() {
     wire.insert(wire.end(), next.begin(), next.end());
     next = encoder.content_delta("ans");
     wire.insert(wire.end(), next.begin(), next.end());
-    auto outcome       = sample_outcome();
-    outcome.constraint = ninfer::ConstraintObservation{
+    auto outcome             = sample_outcome();
+    outcome.stats.constraint = ninfer::ConstraintObservation{
         .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
     OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),

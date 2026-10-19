@@ -14,12 +14,14 @@ void RankProgramImpl::score_next() {
         ScoreResult result;
         result.processed = work.row.ids.size();
         result.logprobs  = std::move(f.logprobs);
-        result.timing    = f.timing;
+
         if (f.timer_started)
-            result.timing.gpu_elapsed_ns +=
-                static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5);
-        collect_vision_timing(binding(work.row.member.residency),
-                              work.row.main_frontier + result.processed);
+            f.gpu.add_prefill(
+                static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
+        if (auto ns = collect_vision_timing(binding(work.row.member.residency),
+                                            work.row.main_frontier + result.processed))
+            f.gpu.add_vision(*ns);
+        gpu_timer.observe_result(f.gpu);
         events.emplace_back(
             runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(std::move(result))});
         f.phase = ComputePhase::PendingCommit;
@@ -51,6 +53,7 @@ void RankProgramImpl::score_next() {
     copy_bytes_async(resources.egress().subspan(0, n * sizeof(float)),
                      {buffers.logprobs.data, n * sizeof(float), cuda.device()}, cuda);
     f.score_count = n;
+    gpu_timer.record_result();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitScore;
 }

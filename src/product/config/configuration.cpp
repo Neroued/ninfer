@@ -137,6 +137,9 @@ StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli
             else
                 value = std::uint64_t{e.prefill_chunk};
             break;
+        case Field::GpuTiming:
+            value = e.observability.gpu_timing;
+            break;
         case Field::CudaGraph:
             value = e.use_cuda_graph;
             break;

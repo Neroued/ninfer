@@ -642,6 +642,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend               = inputs.speculative_backend;
     impl->proposal_head                     = inputs.proposal_head;
     impl->features                          = inputs.features;
+    impl->gpu_timing                        = inputs.gpu_timing;
     impl->use_cuda_graph                    = inputs.use_cuda_graph;
     impl->causal_scoring                    = inputs.causal_scoring;
     impl->multiprocessor_count              = inputs.multiprocessor_count;
@@ -685,6 +686,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
+        .gpu_timing           = options.observability.gpu_timing,
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .multiprocessor_count = device.multiprocessor_count(),

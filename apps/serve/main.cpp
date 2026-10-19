@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
         }
 
         ninfer::serve::GenerationService service(options, startup_log.observer());
-        startup_log.engine_ready(service.load_summary());
+        startup_log.engine_ready(service.startup_report().load);
         operational_log.engine_capacity(service);
 
         using Clock                            = std::chrono::steady_clock;

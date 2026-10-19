@@ -33,19 +33,19 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     const auto decision     = header + 12 + batch * (20 + 4 * words * positions);
     // Generated and verification tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
+    wire::Encoder completion;
+    RankExecutionObservation observed;
+    observed.gpu = {0, 0, 0, 0};
+    runtime::protocol::encode(completion, observed);
     const auto event =
-        96 + std::max<std::size_t>({batch * (64 + 8 * positions), 4ULL * s.prefill_chunk + 64,
-                                    32ULL * 3 * (p.context.pools.size() + 1)});
+        std::move(completion).take().size() + 96 +
+        std::max<std::size_t>({batch * (64 + 8 * positions), 4ULL * s.prefill_chunk + 64,
+                               32ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
-    runtime::protocol::encode(report, rank.memory);
+    runtime::protocol::encode(report, rank.observation);
     return {work, context_work, decision, commit, event, 8 + std::move(report).take().size()};
 }
 
-void add(ArenaMemorySummary& a, const ArenaMemorySummary& b) {
-    a.capacity_bytes += b.capacity_bytes;
-    a.used_bytes += b.used_bytes;
-    a.peak_used_bytes += b.peak_used_bytes;
-}
 } // namespace
 
 GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
@@ -74,7 +74,15 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);
-    budget_ = qwen4_exp::control_budget(definition, rank, scope_);
+    auto described = rank;
+    described.observation.communication.clear();
+    for (const auto& group : topology.groups) {
+        if (std::find(group.members.begin(), group.members.end(), rank.observation.rank) !=
+            group.members.end())
+            described.observation.communication.push_back(
+                {group.id, static_cast<std::uint32_t>(group.members.size())});
+    }
+    budget_ = qwen4_exp::control_budget(definition, described, scope_);
 }
 
 void ExecutionCodec::validate_work(const Work& work, runtime::FrameKind kind) const {
@@ -144,53 +152,6 @@ ExecutionCodec::merge_context_results(const runtime::protocol::Scope& scope,
         }
     }
     return combined;
-}
-
-MemorySummary
-ExecutionCodec::merge_memory(const distributed::ExecutionTopology& topology,
-                             const std::vector<std::optional<MemorySummary>>& reports) const {
-    auto total = reports.at(topology.ranks.front().rank).value();
-    if (topology.ranks.size() > 1) total.device.reset();
-    for (std::size_t i = 1; i < topology.ranks.size(); ++i) {
-        const auto& r = reports.at(topology.ranks[i].rank).value();
-        add(total.weights, r.weights);
-        add(total.sequence, r.sequence);
-        add(total.workspace, r.workspace);
-        total.device_budget_bytes += r.device_budget_bytes;
-        total.minimum_runtime_reservation_bytes += r.minimum_runtime_reservation_bytes;
-        total.kv_capacity_increment_bytes += r.kv_capacity_increment_bytes;
-        total.runtime_reservation_bytes += r.runtime_reservation_bytes;
-        total.available_after_weights_bytes += r.available_after_weights_bytes;
-        total.available_after_startup_bytes += r.available_after_startup_bytes;
-        total.kv_capacity_headroom_bytes += r.kv_capacity_headroom_bytes;
-        total.planned_slack_bytes += r.planned_slack_bytes;
-        total.workspace_logical_peak_bytes += r.workspace_logical_peak_bytes;
-        total.startup_retained_bytes += r.startup_retained_bytes;
-        total.kv_payload_bytes += r.kv_payload_bytes;
-        if (r.cuda_graph) {
-            if (!total.cuda_graph) total.cuda_graph.emplace();
-            total.cuda_graph->rebuild_estimate_bytes += r.cuda_graph->rebuild_estimate_bytes;
-            total.cuda_graph->preparation_increment_bytes +=
-                r.cuda_graph->preparation_increment_bytes;
-            total.cuda_graph->calibration_increment_bytes +=
-                r.cuda_graph->calibration_increment_bytes;
-            total.cuda_graph->calibration_retained_bytes +=
-                r.cuda_graph->calibration_retained_bytes;
-        }
-        if (r.vision_workspace && !total.vision_workspace) {
-            total.vision_workspace = r.vision_workspace;
-        } else if (r.vision_workspace) {
-            auto& a       = *total.vision_workspace;
-            const auto& b = *r.vision_workspace;
-            a.general_capacity_bytes += b.general_capacity_bytes;
-            a.encode_peak_bytes += b.encode_peak_bytes;
-            a.handoff_offset_bytes += b.handoff_offset_bytes;
-            a.handoff_capacity_bytes += b.handoff_capacity_bytes;
-            a.handoff_active_bytes += b.handoff_active_bytes;
-            a.handoff_peak_bytes += b.handoff_peak_bytes;
-        }
-    }
-    return total;
 }
 
 } // namespace ninfer::models::qwen4_exp

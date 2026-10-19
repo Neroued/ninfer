@@ -44,6 +44,7 @@ public:
     [[nodiscard]] const ExecutionTopology& topology() const noexcept { return topology_; }
 
     void send(wire::Kind, wire::Bytes = {}, bool continuation = true);
+    [[nodiscard]] bool try_send(wire::Kind, wire::Bytes, bool continuation);
     [[nodiscard]] std::optional<wire::Message> poll();
     void shutdown();
     void fail(std::string_view) noexcept;

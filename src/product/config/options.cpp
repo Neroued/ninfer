@@ -368,6 +368,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
         case Field::PrefillChunk:
             engine.prefill_chunk = u32();
             break;
+        case Field::GpuTiming:
+            engine.observability.gpu_timing = boolean();
+            break;
         case Field::CudaGraph:
             engine.use_cuda_graph = boolean();
             break;

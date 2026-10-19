@@ -7,7 +7,9 @@
 #include "product/speculative_options.h"
 
 #include "ninfer/engine.h"
+#include "product/statistics.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -39,14 +41,6 @@ std::string format_percent(std::uint64_t numerator, std::uint64_t denominator) {
 
 std::string format_bytes(std::uint64_t bytes) {
     return ninfer::product::format_pretty_bytes(bytes);
-}
-
-std::string format_arena_used(const ninfer::ArenaMemorySummary& arena) {
-    return format_bytes(arena.used_bytes) + " / " + format_bytes(arena.capacity_bytes);
-}
-
-std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
-    return format_bytes(arena.peak_used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
 std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
@@ -169,84 +163,74 @@ private:
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
-    print_stage("prepare", "request preparation", result.timings.prepare_seconds);
-    print_stage("generate", "vision", result.timings.vision_seconds);
-    print_stage("generate", "text prefill", result.timings.prefill_seconds);
-    print_stage("generate", "decode", result.timings.decode_seconds);
-    print_stage("generate", "total", result.timings.total_seconds);
+                              const ninfer::Engine& engine) {
+    print_stage("prepare", "request preparation", result.stats.timings.prepare_seconds);
+    print_stage("gpu interval", "vision stream", result.stats.timings.vision_seconds);
+    print_stage("generate", "prefill elapsed", result.stats.timings.prefill_seconds);
+    print_stage("generate", "decode", result.stats.timings.decode_seconds);
+    print_stage("generate", "total", result.stats.timings.total_seconds);
 
     const std::size_t generated = result.generated_token_ids.size();
     const std::size_t decoded   = generated == 0 ? 0 : generated - 1;
-    const double model_seconds  = result.timings.vision_seconds + result.timings.prefill_seconds +
-                                 result.timings.decode_seconds;
+    const double model_seconds =
+        result.stats.timings.prefill_seconds + result.stats.timings.replay_seconds +
+        result.stats.timings.control_seconds + result.stats.timings.decode_seconds;
     print_metric("sampling", format_sampling(sampling));
     print_metric("finish reason", format_finish(result.finish_reason));
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
-    print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
+    print_metric("reused prompt tokens", std::to_string(result.stats.reused_prompt_tokens));
     print_metric("generated tokens", std::to_string(generated));
-    if (result.thinking.configured_budget) {
-        print_metric("thinking budget", std::to_string(*result.thinking.configured_budget));
+    if (result.stats.thinking.configured_budget) {
+        print_metric("thinking budget", std::to_string(*result.stats.thinking.configured_budget));
         print_metric("model thinking tokens",
-                     std::to_string(result.thinking.model_thinking_tokens));
-        print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
-        print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+                     std::to_string(result.stats.thinking.model_thinking_tokens));
+        print_metric("thinking control tokens",
+                     std::to_string(result.stats.thinking.injected_tokens));
+        print_metric("thinking control", result.stats.thinking.applied ? "applied" : "not applied");
     }
     print_metric("model elapsed", format_seconds(model_seconds));
-    print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
-                                              result.timings.prefill_seconds));
-    print_metric("decode speed",
-                 format_rate(static_cast<double>(decoded), result.timings.decode_seconds));
+    print_metric("prefill speed",
+                 format_rate(static_cast<double>(result.stats.computed_prefill_tokens),
+                             result.stats.timings.prefill_seconds));
+    print_metric("decode speed", format_rate(static_cast<double>(decoded),
+                                             result.stats.timings.generation_wall_seconds));
     print_metric("throughput (overall)",
                  format_rate(static_cast<double>(generated), model_seconds));
 
-    const std::uint64_t reserved =
-        static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
-        memory.runtime_reservation_bytes +
-        memory.cuda_graph.value_or(ninfer::GraphMemorySummary{}).rebuild_estimate_bytes +
-        static_cast<std::size_t>(std::max<std::int64_t>(0, memory.startup_retained_bytes));
-    if (memory.device) print_metric("device", std::to_string(*memory.device));
-    print_metric("max context", std::to_string(memory.max_context));
-    print_metric("prefill chunk", std::to_string(memory.prefill_chunk));
-    print_metric("device budget", format_bytes(memory.device_budget_bytes));
-    print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
-    print_metric("KV capacity", std::to_string(memory.kv_capacity));
-    print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
-                                       std::to_string(memory.kv_capacity_max_page_groups));
-    print_metric("gpu weights used", format_arena_used(memory.weights));
-    if (memory.moe) {
-        print_metric("expert Host weights", format_bytes(memory.moe->host_weights_bytes));
-        print_metric("expert GPU cache", format_bytes(memory.moe->cache_bytes));
-        print_metric("expert fixed", format_bytes(memory.moe->fixed_bytes));
-        print_metric("expert windows", format_bytes(memory.moe->window_bytes));
-        print_metric("expert cache used", format_bytes(memory.moe->used_bytes));
-        print_metric("expert cache target", format_bytes(memory.moe->target_bytes));
-        print_metric("expert cache ready", format_bytes(memory.moe->ready_bytes));
-        print_metric("expert CPU workers", std::to_string(memory.moe->cpu_workers));
+    const auto& description = engine.description();
+    const auto& startup     = engine.startup_report();
+    const auto snapshot     = engine.snapshot();
+    print_metric("max context", std::to_string(description.max_context));
+    print_metric("prefill chunk", std::to_string(description.prefill_chunk));
+    print_metric("KV capacity", std::to_string(description.kv_capacity));
+    print_metric("kv cache dtype", format_kv_cache(description.kv_cache));
+    for (std::size_t i = 0; i < description.ranks.size(); ++i) {
+        const auto& rank   = description.ranks[i];
+        const auto& budget = startup.ranks.at(i);
+        const auto found   = std::find_if(snapshot.ranks.begin(), snapshot.ranks.end(),
+                                          [&](const auto& value) { return value.rank == rank.rank; });
+        if (found == snapshot.ranks.end()) continue;
+        const auto& memory       = found->memory;
+        const std::string prefix = "rank " + std::to_string(rank.rank) + " ";
+        print_metric(prefix + "device budget", format_bytes(budget.limit_bytes));
+        print_metric(prefix + "GPU weights", format_bytes(memory.allocations.device_weights_bytes));
+        print_metric(prefix + "GPU persistent",
+                     format_bytes(memory.allocations.persistent_device_bytes));
+        print_metric(prefix + "GPU workspace",
+                     format_bytes(memory.allocations.workspace_device_bytes));
+        print_metric(prefix + "workspace peak",
+                     format_bytes(memory.workspace.measurement_peak_bytes));
+        print_metric(prefix + "GPU allocations", format_bytes(memory.allocations.device_bytes()));
+        print_metric(prefix + "Host allocations", format_bytes(memory.allocations.host_bytes()));
+        print_metric(prefix + "KV payload", format_bytes(memory.kv_payload_bytes));
+        print_metric(prefix + "startup free", format_bytes(budget.available_after_startup_bytes));
+        if (memory.experts) {
+            print_metric(prefix + "expert cache", format_bytes(memory.experts->cache_bytes));
+            print_metric(prefix + "expert ready", format_bytes(memory.experts->ready_bytes));
+        }
     }
-    print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
-    print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
-    print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
-    print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
-    print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
-    print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
-    print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
-    print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
-    if (memory.cuda_graph) {
-        print_metric("graph rebuild estimate",
-                     format_bytes(memory.cuda_graph->rebuild_estimate_bytes));
-        print_metric("graph prepare increment",
-                     std::to_string(memory.cuda_graph->preparation_increment_bytes) + " B");
-        print_metric("graph calibration growth",
-                     std::to_string(memory.cuda_graph->calibration_increment_bytes) + " B");
-        print_metric("graph calibration retained",
-                     std::to_string(memory.cuda_graph->calibration_retained_bytes) + " B");
-    }
-    print_metric("startup retained", std::to_string(memory.startup_retained_bytes) + " B");
-    print_metric("planned device total", format_bytes(reserved));
 
-    const ninfer::SpeculativeStats& speculative = result.speculative;
+    const ninfer::SpeculativeStats& speculative = result.stats.speculative;
     if (speculative.enabled) {
         const std::string backend = ninfer::product::speculative_backend_name(speculative.backend);
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
@@ -340,10 +324,9 @@ int main(int argc, char** argv) {
         engine_options.startup_observer = startup_log.observer();
 
         ninfer::Engine engine(std::move(engine_options));
-        startup_log.engine_ready(engine.load_summary());
-        ninfer::product::log_resolved_configuration(*logger, engine.options(),
-                                                    engine.memory_summary());
-        engine.reset_memory_peaks();
+        startup_log.engine_ready(engine.startup_report().load);
+        ninfer::product::log_resolved_configuration(*logger, engine.description());
+        engine.reset_measurement_peaks();
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
@@ -369,7 +352,7 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary());
+        print_generation_summary(result, sampling, engine);
         return 0;
     } catch (const std::exception& error) {
         logger->error("{}", ninfer::product::format_pretty_text(error.what()));

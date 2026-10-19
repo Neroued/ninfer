@@ -61,6 +61,15 @@ struct Group::Impl {
         }
     }
 
+    CommunicationStatistics statistics;
+    CommunicationWork* capture = nullptr;
+
+    void observed(std::size_t kind, std::uint64_t bytes) {
+        auto& work = capture ? *capture : statistics.eager;
+        ++work.calls[kind];
+        work.payload_bytes[kind] += bytes;
+    }
+
     GroupId id;
     std::uint32_t rank, size;
     Device device;
@@ -79,6 +88,51 @@ std::uint32_t Group::rank() const noexcept { return impl_->rank; }
 std::uint32_t Group::size() const noexcept { return impl_->size; }
 
 Device Group::device() const noexcept { return impl_->device; }
+
+CommunicationStatistics Group::statistics() const noexcept { return impl_->statistics; }
+
+void Group::record_graph(CommunicationWork& into, const std::function<void()>& body) const {
+    if (impl_->capture)
+        throw std::logic_error("communication observation capture is already active");
+    into = {};
+
+    struct Recording {
+        Impl& owner;
+
+        ~Recording() { owner.capture = nullptr; }
+    } recording{*impl_};
+
+    impl_->capture = &into;
+    body();
+}
+
+void Group::replayed(const CommunicationWork& work) const noexcept {
+    impl_->statistics.graph.add(work);
+}
+
+std::vector<CommunicationStatistics> CommunicationContext::statistics() const {
+    std::vector<CommunicationStatistics> result;
+    result.reserve(groups_.size());
+    for (const auto& group : groups_) result.push_back(group->statistics());
+    return result;
+}
+
+void CommunicationContext::observe_totals(CommunicationWork& eager,
+                                          CommunicationWork& graph) const noexcept {
+    eager = {};
+    graph = {};
+    for (const auto& group : groups_) {
+        eager.add(group->impl_->statistics.eager);
+        graph.add(group->impl_->statistics.graph);
+    }
+}
+
+void CommunicationContext::reset_statistics() {
+    for (auto& group : groups_) {
+        group->impl_->statistics.eager = {};
+        group->impl_->statistics.graph = {};
+    }
+}
 
 void Group::enqueue(Collective operation, const void* source, void* destination, std::size_t count,
                     DType type, Reduction reduction, std::uint32_t peer,
@@ -121,6 +175,7 @@ void Group::enqueue(Collective operation, const void* source, void* destination,
         throw std::invalid_argument("invalid communication operation");
     }
     p.ready(result, std::chrono::steady_clock::time_point::max());
+    p.observed(static_cast<std::size_t>(operation), count * dtype_size(type));
 }
 
 void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView execution) const {
@@ -150,6 +205,10 @@ void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView 
     const auto result = ncclGroupEnd();
     check_nccl(failure, "NCCL point-to-point");
     p.ready(result, std::chrono::steady_clock::time_point::max());
+    for (const auto& item : transfers) {
+        if (item.send.bytes) p.observed(4, item.send.bytes);
+        if (item.receive.bytes) p.observed(5, item.receive.bytes);
+    }
 }
 
 CommunicationContext::CommunicationContext(const DeviceContext& device,
@@ -172,12 +231,14 @@ void CommunicationContext::connect(const GroupDescription& description, RankId r
     if (stop_->load()) throw std::logic_error("communication context has stopped");
     for (const auto& g : groups_)
         if (g->id() == description.id) throw std::invalid_argument("duplicate communicator");
-    auto impl    = std::make_unique<Group::Impl>();
-    impl->id     = description.id;
-    impl->rank   = description.index(rank);
-    impl->size   = description.members.size();
-    impl->device = device_.device();
-    impl->stop   = stop_;
+    auto impl              = std::make_unique<Group::Impl>();
+    impl->id               = description.id;
+    impl->rank             = description.index(rank);
+    impl->size             = description.members.size();
+    impl->statistics.group = description.id;
+    impl->statistics.size  = impl->size;
+    impl->device           = device_.device();
+    impl->stop             = stop_;
     if (impl->size > 1) {
         if (unique.size() != sizeof(ncclUniqueId))
             throw std::invalid_argument("invalid NCCL unique ID size");

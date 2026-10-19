@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/observability/execution.h"
+#include <functional>
 
 namespace ninfer::distributed {
 class Group;
@@ -30,6 +32,8 @@ public:
     void broadcast(Tensor&, CudaExecutionView);
     void broadcast(Tensor&, std::uint32_t owner, CudaExecutionView);
     void synchronize() const;
+    void record_graph(CommunicationWork&, const std::function<void()>&);
+    void replayed(const CommunicationWork&) const;
 
 private:
     void enqueue(distributed::Collective, distributed::Reduction, const Tensor&, Tensor&, DType,

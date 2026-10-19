@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/parallel/startup.h"
+#include "runtime/observability/snapshot.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -45,16 +46,22 @@ ParallelStartup::Codec ParallelStartup::codec() const {
     return {*definition_, ranks_.front(), parallel_.topology};
 }
 
-MemorySummary ParallelStartup::memory() const {
-    std::vector<std::optional<MemorySummary>> reports;
-    for (const auto& rank : ranks_) reports.emplace_back(rank.memory);
-    return codec().merge_memory(parallel_.topology, reports);
-}
-
 std::string ParallelStartup::prefill_signature(std::uint32_t chunk) const {
     return qwen4_exp::prefill_signature(*definition_, nullptr, chunk) +
            ";tp=" + std::to_string(parallel_.ranks.size()) +
            ";ep=" + std::to_string(parallel_.ranks.size());
+}
+
+std::vector<RankSnapshot> ParallelStartup::observations() const {
+    std::vector<RankSnapshot> result;
+    for (const auto& rank : ranks_) result.push_back(rank.observation);
+    return result;
+}
+
+std::vector<RankMemoryBudget> ParallelStartup::memory_budgets() const {
+    std::vector<RankMemoryBudget> result;
+    for (const auto& rank : ranks_) result.push_back(rank.budget);
+    return result;
 }
 
 } // namespace ninfer::models::qwen4_exp

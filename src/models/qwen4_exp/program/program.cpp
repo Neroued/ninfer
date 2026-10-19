@@ -30,7 +30,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
     : parameters(p), device(d), cuda(d.execution_view()),
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
-      prefill_timer(d), compute_done(d), context_done(d) {
+      prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d) {
     if (binding.group) parallel.emplace(binding, d);
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
@@ -146,88 +146,6 @@ bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
            (compute->phase == ComputePhase::Decision && !compute->decision);
 }
 
-void RankProgramImpl::reset_memory_peaks() noexcept {
-    resources.workspace.reset_peak();
-    if (graphs) graphs->reset_workspace_peak();
-    if (device_graphs) device_graphs->reset_workspace_peak();
-    vision_handoff_peak_bytes = active_vision_bytes();
-    vision_workspace_peak_bytes =
-        vision_handoff_peak_bytes
-            ? resources.plan.workspace.vision->handoff_offset_bytes + vision_handoff_peak_bytes
-            : 0;
-}
-
-MemorySummary RankProgramImpl::memory_summary() const {
-    const auto& plan    = resources.plan;
-    const auto& weights = parameters.model.storage_stats();
-    MemorySummary out;
-    out.cuda_graph    = graph_memory;
-    out.device        = device.device().index();
-    out.max_context   = shape.max_context;
-    out.prefill_chunk = shape.prefill_chunk;
-    out.kv_capacity   = plan.capacity.resolved_tokens;
-    out.kv_cache      = shape.kv_storage;
-    out.weights       = {weights.device_capacity_bytes, weights.device_capacity_bytes,
-                         weights.device_capacity_bytes};
-    out.sequence      = {plan.persistent.bytes, plan.persistent.bytes, plan.persistent.bytes};
-    const auto active_vision = active_vision_bytes();
-    const auto active_workspace =
-        active_vision ? std::max(resources.workspace.used(),
-                                 plan.workspace.vision->handoff_offset_bytes + active_vision)
-                      : resources.workspace.used();
-    out.workspace = {plan.workspace.bytes, active_workspace,
-                     std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
-                               graphs ? graphs->workspace_peak() : 0,
-                               device_graphs ? device_graphs->workspace_peak() : 0})};
-    if (plan.workspace.vision) {
-        const auto& vision   = *plan.workspace.vision;
-        out.vision_workspace = VisionWorkspaceMemorySummary{
-            .aggregate_prompt_tokens = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(shape.max_context, qwen::kMaximumPromptVisionTokens)),
-            .max_item_tokens        = vision.max_merged_tokens,
-            .general_capacity_bytes = vision.general_capacity_bytes,
-            .encode_peak_bytes      = vision.encode_peak_bytes,
-            .handoff_offset_bytes   = vision.handoff_offset_bytes,
-            .handoff_capacity_bytes = vision.handoff_capacity_bytes,
-            .handoff_active_bytes   = active_vision,
-            .handoff_peak_bytes     = vision_handoff_peak_bytes};
-    }
-    out.workspace_logical_peak_bytes = out.workspace.peak_used_bytes;
-    out.runtime_reservation_bytes    = plan.device_reservation_bytes();
-    out.host_context_capacity_bytes  = plan.host_context_bytes;
-    for (std::uint32_t i = 0; i < resources.pool_count(); ++i) {
-        const auto& pool = resources.pool(i).pages();
-        out.kv_payload_bytes += pool.device_copy_work(1).payload_bytes * pool.capacity_pages();
-    }
-    if (!resources.experts) return out;
-    const auto cache        = resources.experts->cache_usage();
-    const auto& description = plan.moe->description();
-    out.moe.emplace();
-    auto& summary                 = *out.moe;
-    summary.host_weights_bytes    = weights.host_capacity_bytes;
-    summary.registered_host_bytes = weights.registered_host_bytes;
-    summary.cache_bytes           = description.cache_bytes;
-    summary.fixed_bytes           = description.fixed_bytes;
-    summary.window_bytes          = summary.cache_bytes - summary.fixed_bytes;
-    summary.window_count          = description.window_count;
-    summary.used_bytes            = cache.used_bytes;
-    summary.target_bytes          = description.target_bytes;
-    summary.ready_bytes           = cache.ready_cache_bytes;
-    summary.cpu_workers           = description.cpu_workers;
-    summary.bridge_device_bytes   = description.bridge_device_bytes;
-    summary.bridge_pinned_bytes   = description.bridge_pinned_bytes;
-    summary.cpu_workspace_bytes   = description.cpu_workspace_bytes;
-    summary.uploaded_bytes        = cache.data_bytes;
-    summary.prefetched_bytes      = cache.prefetched_bytes;
-    for (const auto& layer : description.layers) {
-        summary.fixed_experts_per_layer.push_back(layer.fixed_experts);
-        summary.target_experts_per_layer.push_back(layer.cache_experts);
-        summary.ready_experts_per_layer.push_back(
-            cache.ready_experts_per_bank.at(layer.bank.index));
-    }
-    return out;
-}
-
 } // namespace ninfer::models::qwen4_exp::detail
 
 namespace ninfer::models::qwen4_exp {
@@ -293,7 +211,21 @@ std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgram::poll() { ret
 
 void RankProgram::drain() { impl_->drain(); }
 
-MemorySummary RankProgram::memory_summary() const { return impl_->memory_summary(); }
+std::optional<GraphMemorySummary> RankProgram::graph_memory_observation() const {
+    return impl_->graph_memory;
+}
+
+RankMemoryBudget RankProgram::resource_budget() const {
+    RankMemoryBudget result;
+    const auto& plan                         = impl_->resources.plan;
+    result.runtime_reservation_bytes         = plan.device_reservation_bytes();
+    result.minimum_runtime_reservation_bytes = plan.capacity.minimum_runtime_reservation_bytes;
+    result.bytes_per_page_group = plan.capacity.bytes_per_additional_primary_page_group;
+    result.graphs               = impl_->graph_memory;
+    return result;
+}
+
+RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_resources(); }
 
 std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles() const {
     std::vector<context::KVTransferProfile> profiles;
@@ -303,6 +235,6 @@ std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles()
     return profiles;
 }
 
-void RankProgram::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
 } // namespace ninfer::models::qwen4_exp

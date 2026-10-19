@@ -127,3 +127,7 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # rank = 1
 # node = 1
 # device = 0
+
+[observability]
+# Optional CUDA stream timing; no extra synchronization.
+gpu_timing = false

@@ -391,6 +391,7 @@ std::optional<SessionEvent> Session::poll() {
                         } else {
                             if (!p.compute || p.compute->ticket != value.ticket)
                                 throw std::logic_error("result belongs to another execution");
+                            p.compute->observed_result = value.execution;
                             if (auto* score = std::get_if<ScoreResult>(&value.result))
                                 p.finish_score(std::move(*score));
                             else
@@ -418,7 +419,7 @@ std::optional<SessionEvent> Session::poll() {
                                 p.events.push_back({value.ticket, {}, std::move(progress)});
                             }
                         } else if (p.compute && p.compute->ticket == value.ticket) {
-                            p.retire_compute();
+                            p.retire_compute(value);
                         } else {
                             throw std::logic_error("retirement belongs to another execution");
                         }
@@ -434,20 +435,9 @@ std::optional<SessionEvent> Session::poll() {
 
 void Session::fail_all_cleanup() noexcept { impl_->cleanup(); }
 
-void Session::reset_memory_peaks() noexcept {
+void Session::reset_measurement_peaks() {
+    impl_->executor->reset_measurement_peaks();
     impl_->directory.host_allocation().reset_peak();
-    impl_->executor->reset_memory_peaks();
-}
-
-MemorySummary Session::memory_summary() const {
-    auto summary                        = impl_->executor->memory_summary();
-    const auto usage                    = impl_->usage();
-    summary.host_context_capacity_bytes = usage.capacity.host_bytes;
-    summary.host_context_occupied_bytes = usage.occupied.host_bytes;
-    summary.host_context_reserved_bytes = usage.host_reserved_bytes;
-    summary.host_state_occupied_slots   = usage.host_state_slots;
-    summary.host_kv_occupied_bytes      = usage.host_kv_bytes;
-    return summary;
 }
 
 ResumeState::ResumeState(std::unique_ptr<detail::Suspended> state) : state_(std::move(state)) {}

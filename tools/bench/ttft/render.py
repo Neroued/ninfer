@@ -557,7 +557,7 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         ((row["case"], row["sample"], row["status"], row.get("intervals", "—"),
           row.get("shutdown_tail", "—"), seconds(row.get("reported_interval_seconds")),
           seconds(row.get("host_work", {}).get("elapsed_seconds", {}).get("total")),
-          seconds(row.get("host_work", {}).get("device_wait_seconds")), row.get("reason", "—"))
+          seconds(row.get("host_work", {}).get("scheduler_yield_seconds")), row.get("reason", "—"))
          for row in rows),
     ))
     available = [row for row in rows if row["status"] == "available"]
@@ -620,10 +620,10 @@ def _request_timing_markdown(summary: dict[str, Any]) -> list[str]:
         rows.append((case, f"{len(measured)}/{len(requests)}", inconsistent,
                      mean(measured, "ttft_ms"),
                      *(mean(measured, f"{stage}_ms") for stage in TTFT_STAGES),
-                     mean(measured, "host_total_ms"), mean(measured, "prefill_gpu_ms")))
+                     mean(measured, "host_total_ms"), mean(measured, "prefill_total_ms")))
     lines.extend(_table(
         ("Case", "Partitioned", "Inconsistent", "TTFT", "Prepare", "Queue", "Bind", "Paused",
-         "Resident", "HTTP residual", "Host exposure", "Prefill GPU interval"), rows,
+         "Resident", "HTTP residual", "Host exposure", "Completed prefill interval"), rows,
     ))
     return [*lines, ""]
 

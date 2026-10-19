@@ -15,11 +15,11 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
         (generated.draft_extents.size() != batch || generated.accepted_drafts.size() != batch))
         throw std::logic_error("decode result omitted its proposal extents");
     PendingBatch out;
-    out.ticket_  = current.ticket;
-    out.members_ = current.members;
-    out.tokens_  = generated.tokens;
-    out.stride_  = generated.row_stride;
-    out.timing_  = current.timing;
+    out.ticket_    = current.ticket;
+    out.members_   = current.members;
+    out.tokens_    = generated.tokens;
+    out.stride_    = generated.row_stride;
+    out.execution_ = current.observed_result;
     for (std::size_t b = 0; b < batch; ++b) {
         const auto count = generated.counts[b];
         if (!count || count > generated.row_stride || count > 16)
@@ -77,9 +77,10 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
     }
     if (!execution || execution->ticket != event.ticket || execution->result_ready)
         throw std::logic_error("execution result does not match its transaction");
-    auto& current        = *execution;
-    current.result_ready = true;
-    current.timing += event.result.timing;
+    auto& current           = *execution;
+    current.result_ready    = true;
+    current.observed_result = event.execution;
+
     if (auto* generated = std::get_if<GeneratedResult>(&event.result.output)) {
         if (current.kind != OperationKind::Decode)
             throw std::logic_error("decode result has the wrong execution kind");
@@ -89,7 +90,7 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
         return;
     }
     if (auto* forward = std::get_if<ForwardResult>(&event.result.output)) {
-        current.vision_seconds = forward->vision_seconds;
+
         if (forward->processed_tokens != current.columns)
             throw std::logic_error("forward result changed its reserved input window");
         for (std::size_t b = 0; b < current.members.size(); ++b)
@@ -107,7 +108,7 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             progress.processed_prompt_tokens = current.columns[0];
             progress.capture_ready           = capture && !forward->generated;
             progress.complete                = end == request.base->summary.prompt_tokens;
-            progress.timing                  = current.timing;
+
             if (forward->generated) {
                 if (!progress.complete)
                     throw std::logic_error("incomplete prefill produced a token");
@@ -121,13 +122,13 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members, std::move(progress)});
         } else if (current.kind == OperationKind::Replay) {
-            current.completion.emplace(SessionEvent{
-                current.ticket, current.members,
-                ReplayProgress{capture, current.columns[0],
-                               end == request.replay_target && !capture, current.timing}});
+            current.completion.emplace(
+                SessionEvent{current.ticket, current.members,
+                             ReplayProgress{capture, current.columns[0],
+                                            end == request.replay_target && !capture}});
         } else if (current.kind == OperationKind::Control) {
             current.completion.emplace(
-                SessionEvent{current.ticket, current.members, ControlComplete{current.timing}});
+                SessionEvent{current.ticket, current.members, ControlComplete{}});
         } else
             throw std::logic_error("unexpected forward result");
         commit_completed_unit();
@@ -155,7 +156,7 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
         scoring->cursor += score->processed_tokens;
         scoring->logprobs.insert(scoring->logprobs.end(), score->logprobs.begin(),
                                  score->logprobs.end());
-        scoring->timing += current.timing;
+
         return;
     }
     throw std::logic_error("unknown native result");
@@ -297,9 +298,9 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         auto& stats = request.speculative_stats;
         if (current.kind == OperationKind::Decode &&
             speculative_backend != SpeculativeBackend::None) {
-            const auto drafted = current.generated->draft_extents.at(b);
-            const auto accepted =
-                std::min(d.accepted_tokens, current.generated->accepted_drafts.at(b));
+            const auto drafted  = current.generated->draft_extents.at(b);
+            const auto accepted = current.generated->accepted_drafts.at(b);
+            stats.committed_draft_tokens += std::min(d.accepted_tokens, accepted);
             if (drafted)
                 ++stats.rounds;
             else
@@ -308,16 +309,13 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             stats.accepted_tokens += accepted;
             for (std::uint32_t j = 0; j < accepted; ++j) ++stats.accepted_per_position[j];
         }
-        auto& row                = result.rows[b];
-        row.disposition          = d.cancelled  ? runtime::CommitDisposition::CancelledReleased
-                                   : d.failed   ? runtime::CommitDisposition::FailedReleased
-                                   : d.terminal ? runtime::CommitDisposition::Finishable
-                                                : runtime::CommitDisposition::Active;
-        row.timings              = request.timings;
-        row.speculative          = stats;
-        row.speculative_counters = {stats.rounds, stats.drafted_tokens, stats.accepted_tokens,
-                                    stats.fallback_steps};
-        result.capture_ready[b]  = !d.terminal && request.capture_pending;
+        auto& row               = result.rows[b];
+        row.disposition         = d.cancelled  ? runtime::CommitDisposition::CancelledReleased
+                                  : d.failed   ? runtime::CommitDisposition::FailedReleased
+                                  : d.terminal ? runtime::CommitDisposition::Finishable
+                                               : runtime::CommitDisposition::Active;
+        row.speculative         = stats;
+        result.capture_ready[b] = !d.terminal && request.capture_pending;
     }
     pending.ticket_ = {};
     return result;
@@ -361,15 +359,10 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
         current.settlement->mark_completed();
         current.settlement->publish();
     }
-    const auto seconds =
-        std::chrono::duration<double>(context::Clock::now() - current.started).count();
-    runtime::CommitComplete complete;
-    complete.row_count = current.members.size();
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         if (!valid_sequence(current.members[b])) continue;
         const auto l  = lane(current.members[b]);
         auto& request = requests[l];
-        request.timings.vision_seconds += current.vision_seconds;
         if (current.kind == OperationKind::Replay &&
             request.replay_cursor == request.replay_target && !request.capture_pending) {
             request.lifecycle = request.resume_lifecycle;
@@ -378,13 +371,10 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
                 initialize_captures(request, request.replay_target,
                                     request.base->summary.prompt_tokens);
         }
-        if (current.kind == OperationKind::Prefill)
-            request.timings.prefill_seconds += std::max(0.0, seconds - current.vision_seconds);
-        else if (current.kind == OperationKind::Decode || current.kind == OperationKind::Control)
-            request.timings.decode_seconds += seconds;
-        complete.timings[b] = request.timings;
     }
-    if (current.generated) events.push_back({current.ticket, current.members, std::move(complete)});
+    if (current.kind != OperationKind::Normalize && current.kind != OperationKind::Score)
+        events.push_back({current.ticket, current.members,
+                          runtime::ExecutionComplete{event.execution, current.members.size()}});
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         if (!valid_sequence(current.members[b])) continue;
         const auto l  = lane(current.members[b]);

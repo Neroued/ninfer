@@ -158,6 +158,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
             decide_decode(operation.batch, operation.width);
             readback_decode();
         }
+        gpu_timer.record_result();
         result_ready.record(device.stream());
         operation.stage = ComputeStage::Readback;
         return;
@@ -201,11 +202,13 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
     }
     CUDA_CHECK(cudaMemcpyAsync(frame.host_egress, frame.egress.data, sizeof(FrameEgress),
                                cudaMemcpyDeviceToHost, device.stream()));
+    gpu_timer.record_result();
     result_ready.record(device.stream());
     operation.stage = ComputeStage::Readback;
 }
 
 void RankProgramImpl::publish_result(ComputeOperation& operation) {
+    gpu_timer.observe_result(operation.gpu);
     Result result;
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
@@ -246,7 +249,6 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
         result.output = NormalizeResult{};
     } else
         result = std::move(*operation.result);
-    result.timing              = operation.timing;
     operation.result_published = true;
     operation.stage            = ComputeStage::AwaitCommit;
     events.emplace_back(

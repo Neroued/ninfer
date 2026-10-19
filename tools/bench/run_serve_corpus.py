@@ -580,15 +580,15 @@ def build_result_record(
         fallback_steps = int(speculative["fallback_steps"])
         queue_wait_seconds = float(engine_timing["queue_wait_seconds"])
         engine_boundary_exposed_seconds = float(host_exposed["engine_boundary"])
-        program_submit_exposed_seconds = float(host_exposed["program_submit"])
-        program_post_exposed_seconds = float(host_exposed["program_post"])
+        session_call_exposed_seconds = float(host_exposed["session_call"])
+        executor_poll_exposed_seconds = float(host_exposed["executor_poll"])
         engine_commit_output_exposed_seconds = float(host_exposed["engine_commit_output"])
         engine_maintenance_exposed_seconds = float(host_exposed["engine_maintenance"])
         engine_host_exposed_seconds = float(host_exposed["total"])
-        device_wait_exposed_seconds = float(engine_timing["device_wait_exposed_seconds"])
+        scheduler_yield_exposed_seconds = float(engine_timing["scheduler_yield_exposed_seconds"])
         decode_host_exposed_seconds = float(decode_engine["host_exposed_seconds"])
-        decode_device_wait_exposed_seconds = float(
-            decode_engine["device_wait_exposed_seconds"]
+        decode_scheduler_yield_exposed_seconds = float(
+            decode_engine["scheduler_yield_exposed_seconds"]
         )
         decode_rounds = int(decode_engine["rounds"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -596,8 +596,8 @@ def build_result_record(
 
     host_phase_sum = (
         engine_boundary_exposed_seconds
-        + program_submit_exposed_seconds
-        + program_post_exposed_seconds
+        + session_call_exposed_seconds
+        + executor_poll_exposed_seconds
         + engine_commit_output_exposed_seconds
         + engine_maintenance_exposed_seconds
     )
@@ -645,22 +645,22 @@ def build_result_record(
         # and per-request normalization but must not be summed across concurrent requests.
         "queue_wait_seconds": queue_wait_seconds,
         "engine_boundary_exposed_seconds": engine_boundary_exposed_seconds,
-        "program_submit_exposed_seconds": program_submit_exposed_seconds,
-        "program_post_exposed_seconds": program_post_exposed_seconds,
+        "session_call_exposed_seconds": session_call_exposed_seconds,
+        "executor_poll_exposed_seconds": executor_poll_exposed_seconds,
         "engine_commit_output_exposed_seconds": engine_commit_output_exposed_seconds,
         "engine_maintenance_exposed_seconds": engine_maintenance_exposed_seconds,
         "engine_host_exposed_seconds": engine_host_exposed_seconds,
-        "device_wait_exposed_seconds": device_wait_exposed_seconds,
+        "scheduler_yield_exposed_seconds": scheduler_yield_exposed_seconds,
         "decode_host_exposed_seconds": decode_host_exposed_seconds,
-        "decode_device_wait_exposed_seconds": decode_device_wait_exposed_seconds,
+        "decode_scheduler_yield_exposed_seconds": decode_scheduler_yield_exposed_seconds,
         "decode_rounds": decode_rounds,
         "queue_wait_ms": queue_wait_seconds * 1000.0,
         "engine_host_exposed_ms": engine_host_exposed_seconds * 1000.0,
         "decode_host_us_per_round": safe_ratio(
             decode_host_exposed_seconds * 1.0e6, float(decode_rounds)
         ),
-        "decode_device_wait_us_per_round": safe_ratio(
-            decode_device_wait_exposed_seconds * 1.0e6, float(decode_rounds)
+        "decode_scheduler_yield_us_per_round": safe_ratio(
+            decode_scheduler_yield_exposed_seconds * 1.0e6, float(decode_rounds)
         ),
     }
     return {
@@ -934,8 +934,8 @@ SUMMARY_FIELDS = (
     "engine_host_exposed_ms_stddev",
     "decode_host_us_per_round_mean",
     "decode_host_us_per_round_stddev",
-    "decode_device_wait_us_per_round_mean",
-    "decode_device_wait_us_per_round_stddev",
+    "decode_scheduler_yield_us_per_round_mean",
+    "decode_scheduler_yield_us_per_round_stddev",
     "speculative_acceptance_mean",
     "speculative_acceptance_stddev",
     "speculative_tokens_per_round_mean",
@@ -990,9 +990,9 @@ def summary_row(
     set_stats(row, "decode_host_us_per_round", records, "decode_host_us_per_round")
     set_stats(
         row,
-        "decode_device_wait_us_per_round",
+        "decode_scheduler_yield_us_per_round",
         records,
-        "decode_device_wait_us_per_round",
+        "decode_scheduler_yield_us_per_round",
     )
     set_stats(row, "speculative_acceptance", records, "speculative_acceptance")
     set_stats(
@@ -1199,7 +1199,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "completion_tokens"),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_mean_stddev(row, "decode_host_us_per_round"),
-                        format_mean_stddev(row, "decode_device_wait_us_per_round"),
+                        format_mean_stddev(row, "decode_scheduler_yield_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
                         format_mean_stddev(
                             row, "speculative_tokens_per_round", digits=2
@@ -1231,7 +1231,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_mean_stddev(row, "decode_host_us_per_round"),
-                        format_mean_stddev(row, "decode_device_wait_us_per_round"),
+                        format_mean_stddev(row, "decode_scheduler_yield_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
                         format_mean_stddev(
                             row, "speculative_tokens_per_round", digits=2

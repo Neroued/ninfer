@@ -77,7 +77,7 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
         operation.rows     = work.rows;
         operation.sampling = work.sampling;
         operation.batch    = static_cast<std::uint32_t>(work.rows.size());
-        operation.result   = Result{ForwardResult{}, {}};
+        operation.result   = Result{ForwardResult{}};
     }
     const auto index   = operation.forward_row;
     const auto& window = work.inputs[index];

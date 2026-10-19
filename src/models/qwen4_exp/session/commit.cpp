@@ -25,27 +25,20 @@ void SessionImpl::finish_result(ComputeResult result) {
     if (result.rows.size() != tx.members.size())
         throw std::logic_error("Qwen4Exp result changed its membership");
     tx.result.emplace(std::move(result));
-    const auto elapsed = seconds(tx.started);
-    bool generated     = false;
+    bool generated = false;
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
-        auto& s         = sequence(tx.members[b]);
         const auto& row = tx.result->rows[b];
         generated |= !row.tokens.empty();
         if (tx.kind != Kind::Mtp && row.processed != tx.rows[b].ids.size())
             throw std::logic_error("Qwen4Exp result changed its input extent");
-        s.timings.vision_seconds += row.vision_seconds;
-        if (tx.kind == Kind::Prefill || tx.kind == Kind::Replay)
-            s.timings.prefill_seconds += std::max(0.0, elapsed - row.vision_seconds);
-        else
-            s.timings.decode_seconds += elapsed;
     }
     if (generated) {
         PendingBatch batch;
-        batch.ticket_  = tx.ticket;
-        batch.members_ = tx.members;
-        batch.decode_  = tx.kind != Kind::Prefill;
-        batch.stride_  = 1;
-        batch.timing_  = tx.result->timing;
+        batch.ticket_    = tx.ticket;
+        batch.members_   = tx.members;
+        batch.decode_    = tx.kind != Kind::Prefill;
+        batch.stride_    = 1;
+        batch.execution_ = tx.observed_result;
         for (const auto& row : tx.result->rows)
             batch.stride_ = std::max<std::uint32_t>(batch.stride_, row.tokens.size());
         batch.tokens_.resize(batch.stride_ * tx.members.size());
@@ -66,7 +59,7 @@ void SessionImpl::finish_result(ComputeResult result) {
                                 s.reused ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
             progress.processed_prompt_tokens = tx.result->rows[0].processed;
             progress.complete                = true;
-            progress.timing                  = tx.result->timing;
+
             progress.pending.emplace(std::move(batch));
             events.push_back({tx.ticket, tx.members, std::move(progress)});
         } else {
@@ -104,16 +97,16 @@ void SessionImpl::finish_result(ComputeResult result) {
         progress.complete                = false;
         progress.capture_ready =
             s.capture && s.request->captures[s.next_capture].frontier == completed[0].main_frontier;
-        progress.timing = tx.result->timing;
+
         tx.event.emplace(SessionEvent{tx.ticket, tx.members, std::move(progress)});
     } else if (tx.kind == Kind::Replay) {
         const auto& s = sequence(tx.members[0]);
-        tx.event.emplace(SessionEvent{tx.ticket, tx.members,
-                                      ReplayProgress{false, tx.result->rows[0].processed,
-                                                     completed[0].main_frontier == s.replay_target,
-                                                     tx.result->timing}});
+        tx.event.emplace(
+            SessionEvent{tx.ticket, tx.members,
+                         ReplayProgress{false, tx.result->rows[0].processed,
+                                        completed[0].main_frontier == s.replay_target}});
     } else if (tx.kind == Kind::Control) {
-        tx.event.emplace(SessionEvent{tx.ticket, tx.members, ControlComplete{tx.result->timing}});
+        tx.event.emplace(SessionEvent{tx.ticket, tx.members, ControlComplete{}});
     } else {
         throw std::logic_error("decode completed without generated tokens");
     }
@@ -135,29 +128,17 @@ void SessionImpl::finish_result(ComputeResult result) {
     }
 }
 
-void SessionImpl::retire_compute() {
+void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     auto& tx = *compute;
-    if (tx.kind == Kind::Mtp && tx.commit_started) {
-        const auto elapsed = seconds(*tx.commit_started);
-        for (const auto handle : tx.members) sequence(handle).timings.decode_seconds += elapsed;
-    }
     tx.context.mark_completed();
     tx.context.publish();
     if (tx.completion) {
         tx.completion->mark_completed();
         tx.completion->publish();
     }
-    if (!tx.decisions.empty() || tx.discarded) {
-        runtime::CommitComplete completion;
-        completion.row_count = tx.members.size();
-        for (std::size_t b = 0; b < tx.members.size(); ++b) {
-            auto& s                 = sequence(tx.members[b]);
-            s.timings.total_seconds = seconds(s.started);
-            if (s.first_output) s.timings.generation_wall_seconds = seconds(*s.first_output);
-            completion.timings[b] = s.timings;
-        }
-        events.push_back({tx.ticket, tx.members, std::move(completion)});
-    }
+    if (tx.kind != Kind::Score)
+        events.push_back({tx.ticket, tx.members,
+                          runtime::ExecutionComplete{event.execution, tx.members.size()}});
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         if (!tx.discarded &&
             (tx.decisions.empty() || (!tx.decisions[b].cancelled && !tx.decisions[b].failed)))
@@ -183,8 +164,7 @@ CommitResult Session::commit(PendingBatch&& batch,
     if (!p.compute || batch.ticket_ != p.compute->ticket || batch.members_ != p.compute->members ||
         !p.compute->result || p.compute->committed || decisions.size() != batch.row_count())
         throw std::logic_error("invalid pending Qwen4Exp transaction");
-    auto& tx          = *p.compute;
-    tx.commit_started = detail::Clock::now();
+    auto& tx = *p.compute;
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& decision = decisions[b];
         const auto produced  = tx.result->rows[b].tokens.size();
@@ -250,18 +230,18 @@ CommitResult Session::commit(PendingBatch&& batch,
         if (batch.decode_ && p.definition->options().mtp()) {
             auto& stats         = s.speculative;
             const auto drafted  = tx.result->rows[b].drafts;
-            const auto accepted = std::min<std::size_t>(decision.accepted_tokens,
-                                                        tx.result->rows[b].tokens.size() - 1);
-            ++stats.rounds;
+            const auto accepted = tx.result->rows[b].accepted_drafts;
+            stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
+            if (drafted)
+                ++stats.rounds;
+            else
+                ++stats.fallback_steps;
             stats.drafted_tokens += drafted;
             stats.accepted_tokens += accepted;
-            stats.fallback_steps += drafted == 0;
             for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
         }
-        const auto& stats        = s.speculative;
-        row.speculative_counters = {stats.rounds, stats.drafted_tokens, stats.accepted_tokens,
-                                    stats.fallback_steps};
-        row.speculative          = stats;
+        const auto& stats = s.speculative;
+        row.speculative   = stats;
 
         if (decision.cancelled || decision.failed) {
             row.disposition = decision.cancelled ? runtime::CommitDisposition::CancelledReleased
@@ -277,19 +257,11 @@ CommitResult Session::commit(PendingBatch&& batch,
             const auto tokens =
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
             detail::append_identity(s, tokens, decision.prefix_execution_split_after);
-            s.phase = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
-            if (!s.first_output) {
-                s.first_output                = detail::Clock::now();
-                s.timings.first_token_seconds = detail::seconds(s.started);
-                s.timings.prompt_wall_seconds = s.timings.first_token_seconds;
-            }
-            s.timings.total_seconds           = detail::seconds(s.started);
-            s.timings.generation_wall_seconds = detail::seconds(*s.first_output);
-            row.disposition         = decision.terminal ? runtime::CommitDisposition::Finishable
-                                                        : runtime::CommitDisposition::Active;
+            s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
+            row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
+                                                : runtime::CommitDisposition::Active;
             result.capture_ready[b] = s.capture_pending;
         }
-        row.timings = s.timings;
     }
     batch.ticket_ = {};
     return result;
@@ -314,7 +286,7 @@ FinishResult Session::finish(SequenceHandle handle) {
     if (!p.valid(handle) || execution_pending(handle) || context_blocks(handle)) return {};
     auto& s = p.sequence(handle);
     if (s.phase != detail::Phase::Finished) return {};
-    FinishResult result{runtime::ConsumeStatus::Consumed, s.timings, s.speculative, {}};
+    FinishResult result{runtime::ConsumeStatus::Consumed, s.speculative, {}};
     if (s.request->summary.publish_continuation)
         result.checkpoint = p.detach(s, runtime::CheckpointRole::Continuation);
     const auto lane = s.lane;
@@ -327,7 +299,7 @@ AbortResult Session::abort(SequenceHandle handle) {
     auto& p = *impl_;
     if (!p.valid(handle) || execution_pending(handle) || context_blocks(handle)) return {};
     auto& s = p.sequence(handle);
-    AbortResult result{runtime::ConsumeStatus::Consumed, s.timings, s.speculative};
+    AbortResult result{runtime::ConsumeStatus::Consumed, s.speculative};
     const auto lane = s.lane;
     p.clear(s);
     p.sequences[lane].reset();

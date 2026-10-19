@@ -44,8 +44,9 @@ std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
     const product::ServeOptions& options, const ninfer::EngineOptions& engine_options,
     const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes);
+    const EngineDescription& description, const StartupReport& startup,
+    const EngineSnapshot& snapshot, const ServerLogEnvironment& environment,
+    std::optional<std::uint64_t> artifact_size_bytes);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -90,8 +91,9 @@ public:
     void write_server_start(const product::ServeOptions& options,
                             const ninfer::EngineOptions& engine_options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const std::string& public_model_id,
+                            const EngineDescription& description, const StartupReport& startup,
+                            const EngineSnapshot& snapshot);
     void write_request_start(const RequestLogContext& context);
     void write_request_scheduling(std::uint64_t request_id, const std::string& http_request_id,
                                   const ninfer::GenerationSchedulingObservation& observation);

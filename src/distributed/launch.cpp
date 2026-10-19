@@ -37,7 +37,7 @@ std::string quote(std::string_view value) {
     return out + "'";
 }
 
-wire::Message bootstrap_message(const WorkerBootstrap& b) {
+wire::Message bootstrap_message(const WorkerBootstrap& b, bool bind_launcher) {
     wire::Encoder out;
     out.u32(b.identity.rank);
     out.u32(b.identity.node);
@@ -58,6 +58,7 @@ wire::Message bootstrap_message(const WorkerBootstrap& b) {
         out.string(value);
     }
     out.u32(b.shutdown_timeout_ms);
+    out.boolean(bind_launcher);
     return {wire::Kind::Join, b.epoch, std::move(out).take()};
 }
 
@@ -101,6 +102,7 @@ struct SpawnAttributes {
 } // namespace
 
 WorkerBootstrap read_worker_bootstrap() {
+    const auto launcher = ::getppid();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     std::array<std::byte, wire::kHeaderBytes> header;
     read_stdin(header, deadline);
@@ -136,8 +138,14 @@ WorkerBootstrap read_worker_bootstrap() {
             !out.environment.emplace(key, value).second)
             throw std::invalid_argument("invalid bootstrap environment");
     }
-    out.shutdown_timeout_ms = in.u32();
+    out.shutdown_timeout_ms  = in.u32();
+    const auto bind_launcher = in.boolean();
     in.finish();
+    if (bind_launcher) {
+        // The remote SSH session owns this worker, including failed NCCL teardown.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL)) check(errno, "bind worker to launcher lifetime");
+        if (launcher <= 1 || ::getppid() != launcher) ::raise(SIGKILL);
+    }
     for (const auto& [key, value] : out.environment)
         if (::setenv(key.c_str(), value.c_str(), 1)) check(errno, "set worker environment");
     const auto short_name = "ninfer-rank" + std::to_string(r.rank);
@@ -229,7 +237,9 @@ WorkerProcess::WorkerProcess(const DeploymentNode& node, WorkerBootstrap bootstr
     impl_->output = std::move(parent_output);
     child_input.close();
     child_output.close();
-    send_message(parent_input, bootstrap_message(bootstrap),
+    // Local workers are terminated directly by this process group owner. Do not bind them to
+    // the spawning thread: an Engine may outlive the thread that constructed it.
+    send_message(parent_input, bootstrap_message(bootstrap, !local),
                  std::chrono::steady_clock::now() +
                      std::chrono::milliseconds(bootstrap.connect_timeout_ms));
 }

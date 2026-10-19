@@ -213,7 +213,7 @@ public:
 
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return failed_.at(row); }
 
-    [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
+    [[nodiscard]] const ExecutionSample& execution_sample() const noexcept { return execution_; }
 
     [[nodiscard]] runtime::ExecutionTicket ticket() const noexcept { return ticket_; }
 
@@ -224,7 +224,7 @@ private:
     std::vector<std::int32_t> counts_;
     std::vector<bool> failed_;
     std::uint32_t stride_ = 1;
-    runtime::ExecutionTiming timing_;
+    ExecutionSample execution_;
     friend class detail::SessionImpl;
 };
 
@@ -232,30 +232,20 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
-    runtime::ExecutionTiming timing;
+
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
 };
 
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
-    GenerationTimings timings;
     SpeculativeStats speculative;
-
-    // Fixed-size cumulative observation, including active rows without copying per-position data.
-    struct SpeculativeCounters {
-        std::uint64_t rounds          = 0;
-        std::uint64_t drafted_tokens  = 0;
-        std::uint64_t accepted_tokens = 0;
-        std::uint64_t fallback_steps  = 0;
-    } speculative_counters;
 };
 
 struct CommitResult {
     std::array<CommitRowResult, kMaximumConcurrency> rows{};
     std::array<bool, kMaximumConcurrency> capture_ready{};
     std::size_t row_count = 0;
-    runtime::ExecutionTiming timing;
 };
 
 struct DiscardResult {
@@ -265,14 +255,12 @@ struct DiscardResult {
 
 struct FinishResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    GenerationTimings timings;
     SpeculativeStats speculative;
     std::optional<CheckpointHandle> checkpoint;
 };
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    GenerationTimings timings;
     SpeculativeStats speculative;
 };
 
@@ -280,7 +268,6 @@ struct ReplayProgress {
     bool capture_ready             = false;
     std::uint32_t processed_tokens = 0;
     bool complete                  = false;
-    runtime::ExecutionTiming timing;
 };
 
 struct CapturePreparation {
@@ -304,7 +291,6 @@ struct ContextProgress {
     std::vector<CheckpointHandle> captured_checkpoints;
     std::vector<runtime::ContextTransferObservation> transfers;
     runtime::ContextOperationCounts operations;
-    std::optional<GenerationTimings> request_timings;
     SpeculativeStats request_speculative;
 };
 
@@ -317,13 +303,10 @@ struct PhysicalUsageSnapshot {
     std::size_t host_kv_bytes            = 0;
 };
 
-struct ControlComplete {
-    runtime::ExecutionTiming timing;
-};
+struct ControlComplete {};
 
 struct ScoreComplete {
     std::vector<float> logprobs;
-    runtime::ExecutionTiming timing;
 };
 
 struct SessionEvent {
@@ -331,7 +314,7 @@ struct SessionEvent {
     std::vector<SequenceHandle> members;
     std::variant<PrefillProgress, PendingBatch, ReplayProgress, ControlComplete, ScoreComplete,
                  ContextProgress, runtime::DecisionRequest, runtime::DecisionConsumed,
-                 runtime::CommitComplete>
+                 runtime::ExecutionComplete>
         result;
 };
 
@@ -421,8 +404,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const;
-    void reset_memory_peaks() noexcept;
+    void reset_measurement_peaks();
 private:
     std::unique_ptr<detail::SessionImpl> impl_;
 };

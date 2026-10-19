@@ -9,6 +9,7 @@
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/executor/contract.h"
+#include "runtime/observability/snapshot.h"
 
 #include <algorithm>
 #include <array>
@@ -73,8 +74,10 @@ public:
             cumulative_stats_.kv_pools.push_back(
                 {pool.id.index, std::string(pool.label), 0, pool.device_page_groups});
         }
-        stats_snapshot_  = cumulative_stats_;
-        published_stats_ = cumulative_stats_;
+        stats_snapshot_             = cumulative_stats_;
+        published_snapshot_.runtime = cumulative_stats_;
+        published_snapshot_.ranks.assign(instance_.executor->observations().begin(),
+                                         instance_.executor->observations().end());
         paused_.reserve(max_outstanding_);
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
@@ -193,8 +196,9 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            const auto constraint_started = observation.phase_timings ? Clock::now() : submitted;
-            auto output                   = instance_.frontend.make_output_session(
+            const auto constraint_started =
+                observation.constraint_timings ? Clock::now() : submitted;
+            auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
                 options.constraint, options.tool_choice);
             if (Clock::now() >= pending_deadline) {
@@ -212,7 +216,7 @@ public:
             }
             const auto ready = Clock::now();
             output.observe_constraint(
-                observation.phase_timings,
+                observation.constraint_timings,
                 std::chrono::duration<double>(ready - constraint_started).count());
             prepare_seconds += std::chrono::duration<double>(ready - submitted).count();
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
@@ -238,29 +242,9 @@ public:
         return Submission(*this, std::move(request));
     }
 
-    [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.session->memory_summary();
-        out.device_budget_bytes                = instance_.device_budget_bytes;
-        out.startup_retained_bytes             = instance_.startup_retained_bytes;
-        out.cuda_graph                         = instance_.cuda_graph;
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.primary_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_primary_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_primary_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
-    }
-
-    [[nodiscard]] RuntimeStats runtime_stats() const {
+    [[nodiscard]] EngineSnapshot snapshot() const {
         std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        return published_snapshot_;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -268,11 +252,14 @@ public:
         return !stopping_ && !failed_;
     }
 
-    void reset_memory_peaks() noexcept {
-        try {
-            std::scoped_lock lock(execution_mutex_);
-            instance_.session->reset_memory_peaks();
-        } catch (...) {}
+    void reset_measurement_peaks() {
+        std::scoped_lock execution_lock(execution_mutex_);
+        if (!resident_empty() || instance_.executor->has_pending_work())
+            throw std::logic_error("measurement window requires an idle engine");
+        instance_.session->reset_measurement_peaks();
+        std::lock_guard stats_lock(stats_mutex_);
+        const auto ranks = instance_.executor->observations();
+        published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
     }
 
 private:
@@ -334,7 +321,7 @@ private:
 
     [[nodiscard]] bool current_decode_contains(std::uint32_t lane) const noexcept;
 
-    void add_class_host_time(std::uint64_t host_ns, std::uint64_t device_wait_ns) noexcept;
+    void add_class_host_time(std::uint64_t host_ns, std::uint64_t scheduler_yield_ns) noexcept;
 
     void expose_engine_phase(const ActiveExposureSet& exposed, EngineHostPhase phase,
                              std::uint64_t elapsed) noexcept;
@@ -342,11 +329,11 @@ private:
     void finish_engine_phase(const HostPhaseMeasurement& measurement,
                              EngineHostPhase phase) noexcept;
 
-    void record_execution_timing(runtime::ExecutionTiming timing,
+    void record_coordinator_call(CoordinatorCall call, std::uint64_t elapsed,
                                  const ActiveExposureSet& exposed) noexcept;
 
     void finish_execution_call(const HostPhaseMeasurement& measurement,
-                               runtime::ExecutionTiming timing) noexcept;
+                               CoordinatorCall call) noexcept;
 
     void record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
                        std::uint64_t RuntimeHostWorkStats::*invocation_member,
@@ -395,22 +382,24 @@ private:
 
     class ExecutionCallScope {
     public:
-        explicit ExecutionCallScope(EngineCore& owner)
-            : owner_(owner), measurement_(owner.begin_host_phase()) {}
+        explicit ExecutionCallScope(EngineCore& owner,
+                                    CoordinatorCall call = CoordinatorCall::Session)
+            : owner_(owner), call_(call), measurement_(owner.begin_host_phase()) {}
 
-        ~ExecutionCallScope() noexcept { finish({}); }
+        ~ExecutionCallScope() noexcept { finish(); }
 
         ExecutionCallScope(const ExecutionCallScope&)            = delete;
         ExecutionCallScope& operator=(const ExecutionCallScope&) = delete;
 
-        void finish(runtime::ExecutionTiming timing) noexcept {
+        void finish() noexcept {
             if (!active_) { return; }
-            owner_.finish_execution_call(measurement_, timing);
+            owner_.finish_execution_call(measurement_, call_);
             active_ = false;
         }
 
     private:
         EngineCore& owner_;
+        CoordinatorCall call_;
         HostPhaseMeasurement measurement_;
         bool active_ = true;
     };
@@ -457,7 +446,6 @@ private:
     record_committed_output(const std::shared_ptr<Request>& request, std::uint32_t accepted_tokens);
 
     void record_first_output(const std::shared_ptr<Request>& request);
-    static void record_execution_work(GenerationWorkTiming& work, ExecutionTiming timing) noexcept;
 
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output,
                        std::optional<GenerationTimingObservation> timing = std::nullopt,
@@ -627,7 +615,7 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats stats_snapshot_;
-    RuntimeStats published_stats_;
+    EngineSnapshot published_snapshot_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

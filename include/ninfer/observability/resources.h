@@ -1,0 +1,152 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace ninfer {
+
+enum class KvCapacityMode : std::uint8_t {
+    Explicit,
+    Automatic,
+};
+
+enum class KvCacheStorage : std::uint8_t {
+    BFloat16,
+    Int8Group64,
+    Fp8E4M3Row256,
+    Nvfp4Group16,
+    Fp8KeyNvfp4Value,
+};
+
+// Logical Vision regions within existing backing; these are subsets of owned allocations.
+// Handoff offsets refer to persistent or workspace backing as indicated.
+struct VisionWorkspaceMemorySummary {
+    bool handoff_in_persistent            = false;
+    std::uint32_t aggregate_prompt_tokens = 0;
+    std::uint32_t max_item_tokens         = 0;
+    std::size_t general_capacity_bytes    = 0;
+    std::size_t encode_required_bytes     = 0;
+    std::size_t handoff_offset_bytes      = 0;
+    std::size_t handoff_capacity_bytes    = 0;
+    std::size_t handoff_active_bytes      = 0;
+    std::size_t handoff_peak_bytes        = 0;
+};
+
+struct MoeMemorySummary {
+    std::size_t host_weights_bytes    = 0;
+    std::size_t registered_host_bytes = 0;
+    std::size_t cache_bytes           = 0;
+    std::size_t fixed_bytes           = 0;
+    std::size_t window_bytes          = 0;
+    std::uint32_t window_count        = 0;
+    std::size_t used_bytes            = 0;
+    std::size_t target_bytes          = 0;
+    std::size_t ready_bytes           = 0;
+    std::uint32_t cpu_workers         = 0;
+    std::vector<std::uint32_t> fixed_experts_per_layer;
+    std::vector<std::uint32_t> target_experts_per_layer;
+    std::vector<std::uint32_t> ready_experts_per_layer;
+    std::size_t bridge_device_bytes = 0;
+    std::size_t bridge_pinned_bytes = 0;
+    std::size_t cpu_workspace_bytes = 0;
+    std::uint64_t uploaded_bytes    = 0;
+    std::uint64_t prefetched_bytes  = 0;
+};
+
+struct GraphMemorySummary {
+    std::size_t rebuild_estimate_bytes = 0;
+    // Signed free-memory deltas; calibration holds its backing while releasing graphs.
+    std::int64_t preparation_increment_bytes = 0;
+    std::int64_t calibration_increment_bytes = 0;
+    std::int64_t calibration_retained_bytes  = 0;
+};
+
+// Owned allocations. Registered ranges, tensor views and layout subregions are not allocations.
+struct MemoryAllocations {
+    std::uint64_t device_weights_bytes     = 0;
+    std::uint64_t host_weights_bytes       = 0;
+    std::uint64_t registered_weights_bytes = 0;
+    std::uint64_t persistent_device_bytes  = 0;
+    std::uint64_t workspace_device_bytes   = 0;
+    std::uint64_t io_pinned_bytes          = 0;
+    std::uint64_t host_context_bytes       = 0;
+    std::uint64_t ple_device_bytes         = 0;
+    std::uint64_t ple_pinned_bytes         = 0;
+    std::uint64_t ple_host_bytes           = 0;
+    std::uint64_t expert_device_bytes      = 0;
+    std::uint64_t expert_pinned_bytes      = 0;
+    std::uint64_t expert_host_bytes        = 0;
+
+    [[nodiscard]] std::uint64_t device_bytes() const noexcept {
+        return device_weights_bytes + persistent_device_bytes + workspace_device_bytes +
+               ple_device_bytes + expert_device_bytes;
+    }
+
+    [[nodiscard]] std::uint64_t host_bytes() const noexcept {
+        return host_weights_bytes + io_pinned_bytes + host_context_bytes + ple_pinned_bytes +
+               ple_host_bytes + expert_pinned_bytes + expert_host_bytes;
+    }
+};
+
+struct WorkspaceUsage {
+    // Host arena cursor, not the lifetime of asynchronous device consumers.
+    std::uint64_t allocation_cursor_bytes = 0;
+    std::uint64_t required_peak_bytes     = 0;
+    std::uint64_t measurement_peak_bytes  = 0;
+};
+
+struct PleReadStats {
+    std::uint64_t rows = 0, cache_hits = 0, shared_rows = 0, shared_pages = 0;
+    std::uint64_t reads = 0, read_bytes = 0, uploaded_bytes = 0;
+};
+
+struct RankMemoryUsage {
+    MemoryAllocations allocations;
+    WorkspaceUsage workspace;
+    std::uint64_t kv_payload_bytes = 0;
+    std::optional<VisionWorkspaceMemorySummary> vision;
+    std::optional<MoeMemorySummary> experts;
+    std::optional<PleReadStats> ple;
+};
+
+struct PhysicalMemorySample {
+    std::uint64_t cuda_total_bytes = 0, cuda_free_bytes = 0;
+    std::uint64_t system_total_bytes = 0, system_available_bytes = 0;
+    bool shared_physical_memory = false;
+    std::uint64_t sampled_ns    = 0;
+};
+
+struct RankMemoryBudget {
+    std::uint64_t limit_bytes                       = 0;
+    std::uint64_t runtime_reservation_bytes         = 0;
+    std::uint64_t minimum_runtime_reservation_bytes = 0;
+    std::uint64_t bytes_per_page_group              = 0;
+    std::uint64_t available_after_weights_bytes     = 0;
+    std::uint64_t available_after_startup_bytes     = 0;
+    std::uint64_t headroom_bytes                    = 0;
+    std::uint64_t planned_slack_bytes               = 0;
+    std::int64_t retained_bytes                     = 0;
+    std::optional<GraphMemorySummary> graphs;
+};
+
+struct MediaCacheSummary {
+    std::size_t capacity_bytes       = 0;
+    std::size_t live_capacity_bytes  = 0;
+    std::size_t retained_bytes       = 0;
+    std::size_t live_bytes           = 0;
+    std::size_t entries              = 0;
+    std::size_t inflight             = 0;
+    std::size_t queued_tasks         = 0;
+    std::size_t active_tasks         = 0;
+    std::uint32_t preprocess_threads = 0;
+    std::uint64_t hits               = 0;
+    std::uint64_t misses             = 0;
+    std::uint64_t singleflight_waits = 0;
+    std::uint64_t evictions          = 0;
+    std::uint64_t oversize_bypasses  = 0;
+};
+
+} // namespace ninfer

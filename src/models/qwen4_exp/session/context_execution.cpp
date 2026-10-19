@@ -14,18 +14,14 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.reused       = previous.reused;
         sequence.resume_phase = previous.phase;
         sequence.next_capture = previous.next_capture;
-        sequence.timings      = previous.timings;
         sequence.speculative  = previous.speculative;
-        sequence.started      = previous.started;
-        sequence.first_output = previous.first_output;
     } else {
-        sequence.id                      = next_sequence++;
-        sequence.epoch                   = identity_generation;
-        sequence.request                 = operation.request;
-        sequence.identity                = *operation.request->identity;
-        sequence.reused                  = operation.frontier;
-        sequence.resume_phase            = Phase::Prefill;
-        sequence.timings.prepare_seconds = operation.request->prompt.prepare.seconds;
+        sequence.id           = next_sequence++;
+        sequence.epoch        = identity_generation;
+        sequence.request      = operation.request;
+        sequence.identity     = *operation.request->identity;
+        sequence.reused       = operation.frontier;
+        sequence.resume_phase = Phase::Prefill;
         if (definition->options().mtp()) {
             sequence.speculative.backend      = SpeculativeBackend::Mtp;
             sequence.speculative.enabled      = true;

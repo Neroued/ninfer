@@ -9,6 +9,8 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
     const auto lane_indices     = std::span<const std::uint32_t>(flight.lanes);
     const bool decode_round     = flight.kind == UnitKind::Decode;
     const std::size_t row_count = flight.requests.size();
+    for (const auto& request : flight.requests)
+        request->pending_execution = pending.execution_sample();
     if (row_count == 0 || row_count != pending.row_count() || pending.row_stride() == 0 ||
         (!pending.row_counts().empty() && pending.row_counts().size() != row_count) ||
         pending.tokens().size() < static_cast<std::size_t>(pending.row_stride()) * row_count) {
@@ -119,7 +121,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
         ExecutionCallScope program_call(*this);
         auto committed = instance_.session->commit(
             std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count));
-        program_call.finish(committed.timing);
+        program_call.finish();
         committed_storage.emplace(std::move(committed));
         phase.resume_range();
     } catch (...) {
@@ -151,7 +153,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
     for (std::size_t row = 0; row < row_count; ++row) {
         const auto& request  = flight.requests[row];
         auto& observed       = request->speculative_stats;
-        const auto& counters = committed.rows[row].speculative_counters;
+        const auto& counters = committed.rows[row].speculative;
         cumulative_stats_.speculative_rounds += counters.rounds - observed.rounds;
         cumulative_stats_.speculative_draft_tokens +=
             counters.drafted_tokens - observed.drafted_tokens;
@@ -159,19 +161,17 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             counters.accepted_tokens - observed.accepted_tokens;
         cumulative_stats_.speculative_fallback_steps +=
             counters.fallback_steps - observed.fallback_steps;
-        observed.rounds          = counters.rounds;
-        observed.drafted_tokens  = counters.drafted_tokens;
-        observed.accepted_tokens = counters.accepted_tokens;
-        observed.fallback_steps  = counters.fallback_steps;
+        observed.rounds                 = counters.rounds;
+        observed.drafted_tokens         = counters.drafted_tokens;
+        observed.accepted_tokens        = counters.accepted_tokens;
+        observed.fallback_steps         = counters.fallback_steps;
+        observed.committed_draft_tokens = counters.committed_draft_tokens;
         if (cancelled[row] || failed[row]) {
-            request->generation_timings = committed.rows[row].timings;
-            request->speculative_stats  = std::move(committed.rows[row].speculative);
+            request->speculative_stats = std::move(committed.rows[row].speculative);
         }
     }
 
     if (decode_round) {
-        ++cumulative_stats_.decode_rounds;
-        cumulative_stats_.decode_row_rounds += row_count;
         for (std::size_t row = 0; row < row_count; ++row) {
             if (!cancelled[row]) {
                 cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
@@ -242,7 +242,6 @@ void EngineCore<Instance>::resolve_prefill_progress(
     const std::shared_ptr<Request>& request, typename ModelContract::PrefillProgress&& progress,
     ComputeFlight flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-    ++cumulative_stats_.host_work.prefill_units;
     ++request->host_timing.prefill_units;
     cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
     if (!request->admitted_begin) {
@@ -322,7 +321,7 @@ template <class Instance>
                             ? instance_.session->start_replay(flight.sequences.front())
                             : instance_.session->start_prefill(flight.sequences.front(),
                                                                request->output.constrained());
-    call.finish({});
+    call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;
     compute_.emplace(std::move(flight));
@@ -341,7 +340,7 @@ template <class Instance>
     ExecutionCallScope call(*this);
     const auto ticket = instance_.session->start_decode(
         flight.sequences, membership.budget_span(), {constrained.data(), flight.requests.size()});
-    call.finish({});
+    call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;
     for (const auto lane : flight.lanes) reserved_units_[lane].reset();
@@ -400,7 +399,7 @@ template <class Instance>
         const auto ticket = instance_.session->start_control(
             flight.sequences, flight.control_tokens, flight.control_stride,
             {splits.data(), flight.requests.size()});
-        call.finish({});
+        call.finish();
         if (!ticket) {
             discard_control_preview(flight);
             return false;
@@ -421,7 +420,6 @@ template <class Instance>
 template <class Instance>
 void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-    ++cumulative_stats_.host_work.control_units;
     cumulative_stats_.committed_decode_tokens += flight.requests.size() * flight.control_stride;
     for (std::size_t row = 0; row < flight.requests.size(); ++row) {
         const auto& request = flight.requests[row];
@@ -464,7 +462,7 @@ void EngineCore<Instance>::supply_decision(ExecutionTicket ticket,
     }
     ExecutionCallScope call(*this);
     instance_.session->supply(ticket, std::move(input));
-    call.finish({});
+    call.finish();
 }
 
 template <class Instance>
@@ -490,9 +488,9 @@ template <class Instance>
     }
     bool progressed = false;
     for (;;) {
-        ExecutionCallScope call(*this);
+        ExecutionCallScope call(*this, CoordinatorCall::Poll);
         auto event = instance_.session->poll();
-        call.finish({});
+        call.finish();
         if (!event) break;
         progressed = true;
         if (auto* decision = std::get_if<DecisionRequest>(&event->result)) {
@@ -516,16 +514,19 @@ template <class Instance>
             boundary = begin_host_phase();
             continue;
         }
-        if (const auto* complete = std::get_if<CommitComplete>(&event->result)) {
-            if (!retiring_ || retiring_->ticket != event->ticket ||
-                retiring_->sequences != event->members ||
-                complete->row_count != retiring_->requests.size()) {
-                throw std::logic_error("commit completion changed its frozen membership");
+        if (const auto* complete = std::get_if<ExecutionComplete>(&event->result)) {
+            const bool retiring = retiring_ && retiring_->ticket == event->ticket;
+            auto& flight        = retiring ? retiring_ : compute_;
+            if (!flight || flight->ticket != event->ticket || flight->sequences != event->members ||
+                complete->row_count != flight->requests.size())
+                throw std::logic_error("execution completion changed its frozen membership");
+            const auto kind = static_cast<std::size_t>(complete->sample.work.kind);
+            for (const auto& request : flight->requests) {
+                request->executions[kind].observe(complete->sample.latency);
+                accumulate_gpu(request->max_rank_gpu, complete->sample.max_rank_gpu);
+                request->pending_execution.reset();
             }
-            for (std::size_t row = 0; row < complete->row_count; ++row) {
-                retiring_->requests[row]->generation_timings = complete->timings[row];
-            }
-            retiring_.reset();
+            if (retiring) retiring_.reset();
             continue;
         }
         if (!compute_ || compute_->ticket != event->ticket ||
@@ -545,15 +546,11 @@ template <class Instance>
         } else if (auto* prefill =
                        std::get_if<typename ModelContract::PrefillProgress>(&event->result)) {
             const auto request = flight.requests.front();
-            if (!request->first_output_timing)
-                record_execution_work(request->prefill_work, prefill->timing);
             resolve_prefill_progress(request, std::move(*prefill), std::move(flight));
             update_recovery(request);
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();
-            if (!request->first_output_timing)
-                record_execution_work(request->replay_work, replay->timing);
             request->replayed_tokens += replay->processed_tokens;
             cumulative_stats_.replayed_tokens += replay->processed_tokens;
             if (replay->capture_ready) reserve_active_capture(request, EngineRequestState::Replay);

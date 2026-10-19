@@ -14,6 +14,7 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         return;
     }
     if (compute) throw std::logic_error("Qwen4Exp compute frame is occupied");
+    gpu_timer.begin();
     compute.emplace();
     auto& f      = *compute;
     f.request    = std::move(request);
@@ -145,7 +146,8 @@ void RankProgramImpl::advance_compute() {
                 f.phase = ComputePhase::ControlCounts;
                 break;
             }
-            f.result.timing = f.timing;
+
+            gpu_timer.observe_result(f.gpu);
             events.emplace_back(
                 runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(f.result)});
             if (resources.compute_actions->occupied()) resources.compute_actions->finish();
@@ -203,13 +205,15 @@ void RankProgramImpl::finish_result() {
             row.accepted_drafts = accepted ? accepted[b] : 0;
             row.dead_positions  = f.dead_positions[b];
         }
-        row.vision_seconds = collect_vision_timing(binding(f.rows[b].member.residency),
-                                                   f.rows[b].main_frontier + row.processed);
+        if (auto ns = collect_vision_timing(binding(f.rows[b].member.residency),
+                                            f.rows[b].main_frontier + row.processed))
+            f.gpu.add_vision(*ns);
     }
     if (f.timer_started)
-        f.timing.gpu_elapsed_ns +=
-            static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5);
-    result.timing = f.timing;
+        f.gpu.add_prefill(
+            static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
+
+    gpu_timer.observe_result(f.gpu);
     events.emplace_back(runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(result)});
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
     f.phase = ComputePhase::PendingCommit;
@@ -220,6 +224,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     if (!compute || compute->request.ticket != ticket)
         throw std::logic_error("Qwen4Exp commit refers to an inactive execution");
     auto& f = *compute;
+    gpu_timer.resolve();
     if (f.verify)
         commit_verify(commit);
     else if (parallel && !std::holds_alternative<ScoreWork>(f.request.work.operation)) {
@@ -236,6 +241,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
             }
     }
     resources.compute_actions->submit(commit.actions);
+    gpu_timer.record_retirement();
     compute_done.record(cuda.stream());
     f.retirement = command;
     f.phase      = ComputePhase::Retiring;
@@ -255,12 +261,14 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
             },
             event);
     });
-    auto& f      = *compute;
+    auto& f = *compute;
+    gpu_timer.resolve();
     f.retirement = command;
     if (host_ple) host_ple->cancel(ticket);
     if (f.graph) f.graph->cancel();
     if (resources.experts) resources.experts->cancel();
     f.run.reset();
+    gpu_timer.record_retirement();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::Retiring;
 }
@@ -269,8 +277,15 @@ void RankProgramImpl::retire_compute() {
     const auto ticket  = compute->request.ticket;
     const auto command = compute->retirement;
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
+    auto observation = retirement_observation();
+    gpu_timer.observe_retirement(compute->gpu);
+    observation.gpu  = compute->gpu;
+    observation.path = compute->graph_main || (compute->graph && compute->graph->resident())
+                           ? ExecutionPath::Graph
+                       : compute->graph ? ExecutionPath::Mixed
+                                        : ExecutionPath::Eager;
     compute.reset();
-    events.emplace_back(runtime::DeviceRetired{ticket, command});
+    events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }
 
 std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgramImpl::poll() {

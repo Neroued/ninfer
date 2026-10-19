@@ -28,10 +28,10 @@ void valid(const ninfer::GenerationResult& result, std::size_t outputs) {
     require(result.generated_token_ids.size() == outputs &&
                 result.finish_reason == ninfer::FinishReason::OutputLimit,
             "DFlash2 did not honor the requested output budget");
-    require(
-        result.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
-            (outputs == 1 || result.speculative.rounds + result.speculative.fallback_steps != 0),
-        "generation bypassed DFlash2");
+    require(result.stats.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                (outputs == 1 ||
+                 result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0),
+            "generation bypassed DFlash2");
 }
 
 ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
@@ -92,14 +92,15 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
         ninfer::Engine engine(options);
-        require(engine.memory_summary().kv_cache == options.kv_cache,
+        require(engine.description().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         const auto& reference = first.generated_token_ids;
-        require(first.speculative.accepted_tokens != 0, "real draft fixture accepted no proposal");
+        require(first.stats.speculative.accepted_tokens != 0,
+                "real draft fixture accepted no proposal");
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
 
@@ -114,7 +115,7 @@ int main(int argc, char** argv) {
         thinking_request.execution.thinking.budget = 1;
         const auto forced = engine.generate(engine.prepare(thinking_prompt), thinking_request);
         valid(forced, 64);
-        require(forced.thinking.applied && forced.thinking.injected_tokens != 0,
+        require(forced.stats.thinking.applied && forced.stats.thinking.injected_tokens != 0,
                 "DFlash2 did not commit the forced thinking-control suffix");
 
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.
@@ -150,7 +151,7 @@ int main(int argc, char** argv) {
         const auto fresh  = engine.generate(engine.prepare_tokens(continuation), request(8, false));
         valid(reused, 8);
         valid(fresh, 8);
-        require(reused.reused_prompt_tokens != 0 && fresh.reused_prompt_tokens == 0,
+        require(reused.stats.reused_prompt_tokens != 0 && fresh.stats.reused_prompt_tokens == 0,
                 "DFlash2 prefix restore did not reuse its retained frontier");
 
         if (k >= 7) {
@@ -164,9 +165,9 @@ int main(int argc, char** argv) {
                 stopped_options.stop.token_ids.push_back(reference[i]);
                 const auto stopped =
                     engine.generate(engine.prepare_tokens(prompt), stopped_options);
-                const auto licensed = 1 + stopped.speculative.rounds +
-                                      stopped.speculative.accepted_tokens +
-                                      stopped.speculative.fallback_steps;
+                const auto licensed = 1 + stopped.stats.speculative.rounds +
+                                      stopped.stats.speculative.accepted_tokens +
+                                      stopped.stats.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
                 require(stopped.finish_reason == ninfer::FinishReason::StopToken &&
                             !stopped.generated_token_ids.empty() &&
@@ -192,13 +193,13 @@ int main(int argc, char** argv) {
                     engine.generate(engine.prepare(media_prompt(kind)), request(8, true));
                 valid(image, 8);
                 valid(reused_image, 8);
-                require(image.prompt.has_media && image.timings.vision_seconds > 0 &&
-                            reused_image.reused_prompt_tokens != 0 &&
-                            reused_image.timings.vision_seconds == 0.0,
+                require(image.prompt.has_media && image.stats.timings.vision_seconds > 0 &&
+                            reused_image.stats.reused_prompt_tokens != 0 &&
+                            reused_image.stats.timings.vision_seconds == 0.0,
                         "Vision DFlash2 capture/restore recomputed retained media");
             }
         }
-        const auto stats = engine.runtime_stats();
+        const auto stats = engine.snapshot().runtime;
         require(stats.kv_pools.size() == 1 && stats.context_transfers.kv.size() == 1,
                 "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
@@ -216,7 +217,8 @@ int main(int argc, char** argv) {
                 engine.generate(engine.prepare_tokens(long_prompt), request(6, false));
             valid(long_reuse, 6);
             valid(long_fresh, 6);
-            require(long_reuse.reused_prompt_tokens > 2048 && long_fresh.reused_prompt_tokens == 0,
+            require(long_reuse.stats.reused_prompt_tokens > 2048 &&
+                        long_fresh.stats.reused_prompt_tokens == 0,
                     "DFlash2 ring wrap lost its retained frontier");
         }
         if (k == 15) {
@@ -228,8 +230,9 @@ int main(int argc, char** argv) {
                     "full proposal window escaped the target context capacity tail");
         }
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
-                  << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
-                  << "/" << first.speculative.drafted_tokens
+                  << " optimized=" << optimized
+                  << " accepted=" << first.stats.speculative.accepted_tokens << "/"
+                  << first.stats.speculative.drafted_tokens
                   << " state_d2h=" << stats.context_transfers.state[0].images
                   << " state_h2d=" << stats.context_transfers.state[1].images << '\n';
     } catch (const std::exception& error) {

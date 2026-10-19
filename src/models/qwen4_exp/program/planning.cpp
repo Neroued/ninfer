@@ -87,10 +87,16 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
                             ple::disk::TableGeometry table, const EngineOptions& o,
                             DeviceContext& device, std::uint32_t pages, const moe::Plan* schedule) {
     ExecutionPlan out;
-    out.profile = std::move(profile);
-    out.shape   = {
-        o.max_context, o.max_concurrency, o.prefill_chunk,         o.speculative.draft_tokens,
-        o.kv_cache,    o.purpose,         o.context_cache.enabled, o.use_cuda_graph};
+    out.profile    = std::move(profile);
+    out.shape      = {o.max_context,
+                      o.max_concurrency,
+                      o.prefill_chunk,
+                      o.speculative.draft_tokens,
+                      o.kv_cache,
+                      o.purpose,
+                      o.context_cache.enabled,
+                      o.use_cuda_graph,
+                      o.observability.gpu_timing};
     out.persistent = persistent(*out.profile, o, pages);
     out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                device.multiprocessor_count(), schedule);

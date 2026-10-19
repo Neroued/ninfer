@@ -157,23 +157,24 @@ ninfer::PromptInput altered_history_after_boundary() {
 }
 
 int verify_dflash_load(const ninfer::Engine& engine) {
-    const ninfer::LoadSummary load = engine.load_summary();
+    const ninfer::LoadSummary load = engine.startup_report().load;
     if (load.architecture != "Qwen3_5MoeForCausalLM" || load.model_name.empty() ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized an invalid artifact payload: target="
                   << load.architecture << " weights=" << load.prefill_signature << '\n';
         return 1;
     }
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.max_context != 4352 || memory.kv_cache != ninfer::KvCacheStorage::BFloat16 ||
-        memory.kv_payload_bytes == 0 || memory.weights.capacity_bytes == 0 ||
-        memory.weights.used_bytes == 0 ||
-        memory.weights.used_bytes > memory.weights.capacity_bytes ||
-        memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
-        memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.vision_workspace.has_value() ||
-        memory.workspace_logical_peak_bytes != 0 ||
-        (memory.cuda_graph.has_value()) != engine.options().use_cuda_graph) {
+    const auto memory = engine.snapshot().ranks.at(0).memory;
+    if (engine.description().max_context != 4352 ||
+        engine.description().kv_cache != ninfer::KvCacheStorage::BFloat16 ||
+        memory.kv_payload_bytes == 0 || memory.allocations.device_weights_bytes == 0 ||
+
+        memory.allocations.persistent_device_bytes == 0 ||
+
+        memory.allocations.workspace_device_bytes == 0 || memory.vision.has_value() ||
+        memory.workspace.measurement_peak_bytes != 0 ||
+        (engine.startup_report().ranks.at(0).graphs.has_value()) !=
+            engine.options().use_cuda_graph) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
@@ -199,9 +200,9 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
             return 1;
         }
 
-        const std::uint64_t fully_licensed = 1 + stopped.speculative.rounds +
-                                             stopped.speculative.accepted_tokens +
-                                             stopped.speculative.fallback_steps;
+        const std::uint64_t fully_licensed = 1 + stopped.stats.speculative.rounds +
+                                             stopped.stats.speculative.accepted_tokens +
+                                             stopped.stats.speculative.fallback_steps;
         if (stopped.generated_token_ids.size() >= fully_licensed) { continue; }
 
         std::vector<ninfer::TokenId> continuation = prompt;
@@ -232,16 +233,16 @@ int exercise_boundary_restore(ninfer::Engine& engine) {
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare(followup_conversation(first, "Answer with one digit.")),
                         greedy_options(4, true));
-    if (restored.reused_prompt_tokens == 0 || restored.generated_token_ids.size() != 4) {
+    if (restored.stats.reused_prompt_tokens == 0 || restored.generated_token_ids.size() != 4) {
         std::cerr << "DFlash assistant-boundary restore did not reuse its cache snapshot: reused="
-                  << restored.reused_prompt_tokens
-                  << " path=" << static_cast<int>(restored.prefix_reuse_path)
+                  << restored.stats.reused_prompt_tokens
+                  << " path=" << static_cast<int>(restored.stats.prefix_reuse_path)
                   << " source_prompt=" << first.prompt.prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size() << '\n';
         return 1;
     }
-    if (restored.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        restored.speculative.rounds == 0) {
+    if (restored.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        restored.stats.speculative.rounds == 0) {
         std::cerr << "DFlash assistant-boundary restore did not return to speculative decode\n";
         return 1;
     }
@@ -259,12 +260,13 @@ int exercise_long_boundary_restore(ninfer::Engine& engine) {
     const std::uint32_t resident_frontier = long_run.prompt.prompt_tokens + generated_tokens - 1;
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare(altered_history_after_boundary()), greedy_options(2, true));
-    if (restored.reused_prompt_tokens == 0 ||
-        resident_frontier - restored.reused_prompt_tokens <= 4096 ||
+    if (restored.stats.reused_prompt_tokens == 0 ||
+        resident_frontier - restored.stats.reused_prompt_tokens <= 4096 ||
         restored.generated_token_ids.size() != 2 ||
-        restored.speculative.backend != ninfer::SpeculativeBackend::DFlash) {
+        restored.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash) {
         std::cerr << "DFlash long-distance restore did not use the saved cyclic cache: resident="
-                  << resident_frontier << " restored=" << restored.reused_prompt_tokens << '\n';
+                  << resident_frontier << " restored=" << restored.stats.reused_prompt_tokens
+                  << '\n';
         return 1;
     }
     return 0;
@@ -273,10 +275,9 @@ int exercise_long_boundary_restore(ninfer::Engine& engine) {
 int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::TokenId>& text_prompt) {
     constexpr std::uint32_t outputs = 12;
     ninfer::Engine engine(dflash_vision_engine_options(artifact));
-    const ninfer::MemorySummary before = engine.memory_summary();
-    if (!before.vision_workspace || before.workspace.capacity_bytes == 0 ||
-        before.vision_workspace->general_capacity_bytes == 0 ||
-        before.vision_workspace->handoff_capacity_bytes == 0) {
+    const auto before = engine.snapshot().ranks.at(0).memory;
+    if (!before.vision || before.allocations.workspace_device_bytes == 0 ||
+        before.vision->general_capacity_bytes == 0 || before.vision->handoff_capacity_bytes == 0) {
         std::cerr << "combined DFlash and Vision Engine has no frozen Vision workspace\n";
         return 1;
     }
@@ -286,14 +287,15 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
                         greedy_options(outputs, false));
     if (!image.prompt.has_media || image.generated_token_ids.size() != outputs ||
         image.finish_reason != ninfer::FinishReason::OutputLimit ||
-        image.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        image.speculative.rounds == 0 || !(image.timings.vision_seconds > 0.0)) {
+        image.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        image.stats.speculative.rounds == 0 || !(image.stats.timings.vision_seconds > 0.0)) {
         std::cerr << "DFlash image generation did not complete through speculative decode: outputs="
-                  << image.generated_token_ids.size() << " rounds=" << image.speculative.rounds
-                  << " vision=" << image.timings.vision_seconds
-                  << " drafted=" << image.speculative.drafted_tokens
-                  << " accepted=" << image.speculative.accepted_tokens
-                  << " fallbacks=" << image.speculative.fallback_steps << '\n';
+                  << image.generated_token_ids.size()
+                  << " rounds=" << image.stats.speculative.rounds
+                  << " vision=" << image.stats.timings.vision_seconds
+                  << " drafted=" << image.stats.speculative.drafted_tokens
+                  << " accepted=" << image.stats.speculative.accepted_tokens
+                  << " fallbacks=" << image.stats.speculative.fallback_steps << '\n';
         return 1;
     }
 
@@ -302,11 +304,12 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
                         greedy_options(outputs, false));
     if (!video.prompt.has_media || video.generated_token_ids.size() != outputs ||
         video.finish_reason != ninfer::FinishReason::OutputLimit ||
-        video.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        video.speculative.rounds == 0 || !(video.timings.vision_seconds > 0.0)) {
+        video.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        video.stats.speculative.rounds == 0 || !(video.stats.timings.vision_seconds > 0.0)) {
         std::cerr << "DFlash video generation did not complete through speculative decode: outputs="
-                  << video.generated_token_ids.size() << " rounds=" << video.speculative.rounds
-                  << " vision=" << video.timings.vision_seconds << '\n';
+                  << video.generated_token_ids.size()
+                  << " rounds=" << video.stats.speculative.rounds
+                  << " vision=" << video.stats.timings.vision_seconds << '\n';
         return 1;
     }
 
@@ -321,10 +324,11 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
         mixed_text.finish_reason != ninfer::FinishReason::OutputLimit ||
         mixed_image.finish_reason != ninfer::FinishReason::OutputLimit ||
         mixed_text.prompt.has_media || !mixed_image.prompt.has_media ||
-        mixed_text.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        mixed_image.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        mixed_text.speculative.rounds == 0 || mixed_image.speculative.rounds == 0 ||
-        mixed_text.timings.vision_seconds != 0.0 || !(mixed_image.timings.vision_seconds > 0.0)) {
+        mixed_text.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        mixed_image.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        mixed_text.stats.speculative.rounds == 0 || mixed_image.stats.speculative.rounds == 0 ||
+        mixed_text.stats.timings.vision_seconds != 0.0 ||
+        !(mixed_image.stats.timings.vision_seconds > 0.0)) {
         std::cerr << "mixed text/Vision DFlash CUDA Graph batch did not complete independently\n";
         return 1;
     }
@@ -333,8 +337,8 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
         engine.prepare(media_conversation(ninfer::MediaKind::Image, "dflash-vision-prefix-real")),
         greedy_options(4, true));
     if (!first.prompt.has_media || first.generated_token_ids.size() != 4 ||
-        first.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        first.speculative.rounds == 0 || !(first.timings.vision_seconds > 0.0)) {
+        first.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        first.stats.speculative.rounds == 0 || !(first.stats.timings.vision_seconds > 0.0)) {
         std::cerr << "retained DFlash Vision prefix did not complete speculative decode\n";
         return 1;
     }
@@ -342,23 +346,23 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
         engine.generate(engine.prepare(media_followup(first)), greedy_options(4, true));
     const ninfer::GenerationResult fresh =
         engine.generate(engine.prepare(media_followup(first)), greedy_options(4, false));
-    if (reused.reused_prompt_tokens == 0 || reused.timings.vision_seconds != 0.0 ||
+    if (reused.stats.reused_prompt_tokens == 0 || reused.stats.timings.vision_seconds != 0.0 ||
         reused.generated_token_ids.size() != 4 || fresh.generated_token_ids.size() != 4 ||
-        reused.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        fresh.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        reused.speculative.rounds == 0 || fresh.speculative.rounds == 0 ||
-        !(fresh.timings.vision_seconds > 0.0)) {
+        reused.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        fresh.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+        reused.stats.speculative.rounds == 0 || fresh.stats.speculative.rounds == 0 ||
+        !(fresh.stats.timings.vision_seconds > 0.0)) {
         std::cerr << "DFlash multimodal continuation did not preserve reusable context: reused="
-                  << reused.reused_prompt_tokens << " vision=" << reused.timings.vision_seconds
-                  << " rounds=" << reused.speculative.rounds << '\n';
+                  << reused.stats.reused_prompt_tokens
+                  << " vision=" << reused.stats.timings.vision_seconds
+                  << " rounds=" << reused.stats.speculative.rounds << '\n';
         return 1;
     }
 
-    const ninfer::MemorySummary after = engine.memory_summary();
-    if (!after.vision_workspace || after.vision_workspace->handoff_active_bytes != 0 ||
-        after.vision_workspace->handoff_peak_bytes == 0 ||
-        after.workspace_logical_peak_bytes == 0 ||
-        after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
+    const auto after = engine.snapshot().ranks.at(0).memory;
+    if (!after.vision || after.vision->handoff_active_bytes != 0 ||
+        after.vision->handoff_peak_bytes == 0 || after.workspace.measurement_peak_bytes == 0 ||
+        after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
         std::cerr
             << "combined DFlash and Vision execution exceeded or bypassed its workspace plan\n";
         return 1;
@@ -396,8 +400,8 @@ int main() {
             const auto valid = [&](const ninfer::GenerationResult& result, std::size_t count) {
                 return result.generated_token_ids.size() == count &&
                        result.finish_reason == ninfer::FinishReason::OutputLimit &&
-                       result.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
-                       result.speculative.rounds != 0;
+                       result.stats.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                       result.stats.speculative.rounds != 0;
             };
             if (!valid(first_result, 17) || !valid(second_result, 9)) {
                 std::cerr << "concurrent full-head DFlash Graph requests did not complete\n";
@@ -410,7 +414,7 @@ int main() {
                 dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
             if (const int result = verify_dflash_load(engine); result != 0) { return result; }
             ninfer::test::speculative_page_boundary(engine);
-            engine.reset_memory_peaks();
+            engine.reset_measurement_peaks();
             const ninfer::GenerationResult dflash =
                 engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
             if (dflash.generated_token_ids.size() != 24 ||
@@ -418,14 +422,15 @@ int main() {
                 std::cerr << "optimized-head DFlash Graph request did not complete\n";
                 return 1;
             }
-            const ninfer::MemorySummary memory = engine.memory_summary();
-            if (memory.workspace_logical_peak_bytes == 0 ||
-                memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
+            const auto memory = engine.snapshot().ranks.at(0).memory;
+            if (memory.workspace.measurement_peak_bytes == 0 ||
+                memory.workspace.measurement_peak_bytes >
+                    memory.allocations.workspace_device_bytes) {
                 std::cerr << "DFlash request did not report a valid planned workspace phase\n";
                 return 1;
             }
-            if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-                dflash.speculative.rounds == 0) {
+            if (dflash.stats.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+                dflash.stats.speculative.rounds == 0) {
                 std::cerr << "DFlash fixture did not execute speculative decode\n";
                 return 1;
             }

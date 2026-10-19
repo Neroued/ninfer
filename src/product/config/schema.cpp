@@ -25,6 +25,8 @@ constexpr FieldSpec kFields[] = {
      "Positive multiple of 128; default is resolved by the model."},
     {Field::CudaGraph, "engine.cuda_graph", "--cuda-graph", "--no-cuda-graph", "",
      "Enable CUDA Graph execution."},
+    {Field::GpuTiming, "observability.gpu_timing", "--gpu-timing", "--no-gpu-timing", "",
+     "Collect result/commit CUDA stream intervals at existing completion boundaries."},
     {Field::MaxConcurrency, "engine.max_concurrency", "--max-concurrency", "", "N",
      "Resident execution lanes (1..8)."},
     {Field::MaxPendingRequests, "engine.max_pending_requests", "--max-pending-requests", "", "N",
@@ -295,6 +297,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     }
     switch (field) {
     case Field::Vision:
+    case Field::GpuTiming:
     case Field::CudaGraph:
     case Field::PrefixReuse:
     case Field::Thinking:

@@ -10,7 +10,8 @@ namespace ninfer::models::qwen4_exp {
 struct RankExecutionDescription {
     SessionPlan session;
     runtime::ExecutionCapacity capacity;
-    MemorySummary memory;
+    RankMemoryBudget budget;
+    RankSnapshot observation;
 };
 
 struct RankLoadRequest {

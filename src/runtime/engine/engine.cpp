@@ -155,8 +155,9 @@ public:
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = runtime::construct_model(options);
         active            = std::move(constructed.instance);
-        load              = std::move(constructed.load);
+        startup.load      = std::move(constructed.load);
         sampling_defaults = frontend().sampling_defaults();
+        initialize_description();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         std::visit(
             [&](auto& instance) {
@@ -184,9 +185,41 @@ public:
 
     EngineOptions options;
     runtime::ActiveModel active;
-    LoadSummary load;
+    EngineDescription description;
+    StartupReport startup;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+
+private:
+    void initialize_description() {
+        description.architecture    = startup.load.architecture;
+        description.model_name      = startup.load.model_name;
+        description.max_context     = options.max_context;
+        description.max_concurrency = options.max_concurrency;
+        description.prefill_chunk   = options.prefill_chunk;
+        description.kv_cache        = options.kv_cache;
+        std::visit(
+            [&](const auto& instance) {
+                const auto usage                        = instance->session->physical_usage();
+                description.device_state_capacity       = usage.capacity.state_slots;
+                description.host_context_capacity_bytes = usage.capacity.host_bytes;
+                description.kv_capacity = instance->kv_capacity_resolution.resolved_tokens;
+                startup.ranks           = instance->rank_budgets;
+                for (const auto& pool : instance->session->kv_pools())
+                    description.kv_pools.push_back(
+                        {pool.id.index, std::string(pool.label), 0, pool.device_page_groups});
+                for (const auto& rank : instance->executor->observations()) {
+                    int device = options.device;
+                    if (options.deployment)
+                        for (const auto& configured : options.deployment->ranks)
+                            if (configured.rank == rank.rank) device = configured.device;
+                    description.ranks.push_back(
+                        {rank.rank, rank.node, device, rank.hardware,
+                         rank.physical_memory && rank.physical_memory->shared_physical_memory});
+                }
+            },
+            active);
+    }
 };
 
 Engine::Engine(EngineOptions options) {
@@ -291,7 +324,6 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         throw std::logic_error("submit requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (observation.live_timings) { observation.phase_timings = true; }
     if (consumer_mode != OutputConsumerMode::Streaming &&
         (observation.live_timings || observation.prompt_progress)) {
         throw std::invalid_argument("live generation observations require a Streaming consumer");
@@ -324,11 +356,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             }
         } immediate{.consumer_mode = consumer_mode};
 
-        immediate.result.prompt                     = prompt_summary;
-        immediate.result.finish_reason              = FinishReason::OutputLimit;
-        immediate.result.thinking.configured_budget = resolved_options.execution.thinking.budget;
-        immediate.result.timings.prepare_seconds    = prepare_seconds;
-        immediate.result.timings.total_seconds      = prepare_seconds;
+        immediate.result.prompt        = prompt_summary;
+        immediate.result.finish_reason = FinishReason::OutputLimit;
+        immediate.result.stats.thinking.configured_budget =
+            resolved_options.execution.thinking.budget;
+        immediate.result.stats.timings.prepare_seconds = prepare_seconds;
+        immediate.result.stats.timings.total_seconds   = prepare_seconds;
         prompt.impl_.reset();
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
             impl_, std::move(immediate), resolved_sampling));
@@ -366,42 +399,29 @@ const EngineOptions& Engine::options() const {
     return impl_->options;
 }
 
-LoadSummary Engine::load_summary() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->load;
+const EngineDescription& Engine::description() const {
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    return impl_->description;
 }
 
-MemorySummary Engine::memory_summary() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> MemorySummary {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+const StartupReport& Engine::startup_report() const {
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    return impl_->startup;
+}
+
+EngineSnapshot Engine::snapshot() const {
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    auto result = std::visit(
+        [](const auto& core) -> EngineSnapshot {
+            using State = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<State, std::monostate>)
                 throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->memory_summary();
-            }
+            else
+                return core->snapshot();
         },
         impl_->core);
-}
-
-MediaCacheSummary Engine::media_cache_summary() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().media_cache_summary();
-}
-
-RuntimeStats Engine::runtime_stats() const {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> RuntimeStats {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->runtime_stats();
-            }
-        },
-        impl_->core);
+    result.media = impl_->frontend().media_cache_summary();
+    return result;
 }
 
 bool Engine::is_available() const {
@@ -418,13 +438,13 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
-void Engine::reset_memory_peaks() noexcept {
+void Engine::reset_measurement_peaks() {
     if (impl_ == nullptr) { return; }
     std::visit(
         [](auto& core) {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (!std::is_same_v<CoreState, std::monostate>) {
-                core->reset_memory_peaks();
+                core->reset_measurement_peaks();
             }
         },
         impl_->core);

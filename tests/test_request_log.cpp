@@ -92,58 +92,65 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.architecture         = "Qwen3_5ForCausalLM";
-    load.model_name           = "qwen3.6-27b";
-    load.weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"};
-    load.load_seconds         = 1.234567890123;
-    load.upload_seconds       = 0.345678901234;
-    load.artifact_bytes_read  = 1000;
-    load.host_to_device_bytes = 900;
-    load.peak_staging_bytes   = 128;
-    load.device_object_count  = 42;
-    load.host_object_count    = 6;
-    load.context_cost         = {
-                .transfer_source   = ninfer::ContextCostPresetSource::External,
-                .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
-                .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
-                .prefill_signature = "example-prefill-signature",
-                .preset_path       = "local-costs.json",
+    load.architecture           = "Qwen3_5ForCausalLM";
+    load.model_name             = "qwen3.6-27b";
+    load.weight_formats         = {"q4_g64_fp16", "q8_g32_fp16"};
+    load.load_seconds           = 1.234567890123;
+    load.upload_seconds         = 0.345678901234;
+    load.artifact_bytes_read    = 1000;
+    load.host_to_device_bytes   = 900;
+    load.max_rank_staging_bytes = 128;
+    load.device_object_count    = 42;
+    load.host_object_count      = 6;
+    load.context_cost           = {
+                  .transfer_source   = ninfer::ContextCostPresetSource::External,
+                  .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+                  .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+                  .prefill_signature = "example-prefill-signature",
+                  .preset_path       = "local-costs.json",
     };
 
-    ninfer::MemorySummary memory;
-    memory.max_context                 = 262144;
-    memory.kv_capacity_mode            = ninfer::KvCapacityMode::Explicit;
-    memory.kv_capacity                 = 524288;
-    memory.kv_capacity_page_groups     = 8192;
-    memory.kv_capacity_max_page_groups = 16384;
-    memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    memory.weights.capacity_bytes      = 100;
-    memory.sequence.capacity_bytes     = 200;
-    memory.workspace.capacity_bytes    = 500;
-    memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
-                   .aggregate_prompt_tokens = 32768,
-                   .max_item_tokens         = 16384,
-                   .general_capacity_bytes  = 300,
-                   .encode_peak_bytes       = 400,
-                   .handoff_offset_bytes    = 300,
-                   .handoff_capacity_bytes  = 200,
-                   .handoff_active_bytes    = 0,
-                   .handoff_peak_bytes      = 150,
+    ninfer::EngineDescription description;
+    description.ranks.push_back({});
+    description.device_state_capacity = 4;
+    description.kv_pools.push_back({0, "main", 0, 8192});
+    ninfer::StartupReport startup_report;
+    startup_report.load = load;
+    startup_report.ranks.resize(1);
+    ninfer::EngineSnapshot snapshot;
+    snapshot.ranks.resize(1);
+    auto& memory                               = snapshot.ranks[0].memory;
+    auto& budget                               = startup_report.ranks[0];
+    description.max_context                    = 262144;
+    description.kv_capacity                    = 524288;
+    description.kv_cache                       = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    memory.allocations.device_weights_bytes    = 100;
+    memory.allocations.persistent_device_bytes = 200;
+    memory.allocations.workspace_device_bytes  = 500;
+    memory.vision                              = ninfer::VisionWorkspaceMemorySummary{
+                                     .aggregate_prompt_tokens = 32768,
+                                     .max_item_tokens         = 16384,
+                                     .general_capacity_bytes  = 300,
+                                     .encode_required_bytes   = 400,
+                                     .handoff_offset_bytes    = 300,
+                                     .handoff_capacity_bytes  = 200,
+                                     .handoff_active_bytes    = 0,
+                                     .handoff_peak_bytes      = 150,
     };
-    memory.minimum_runtime_reservation_bytes = 1300;
-    memory.kv_capacity_increment_bytes       = 100;
-    memory.runtime_reservation_bytes         = 1600;
-    memory.available_after_weights_bytes     = 1700;
-    memory.available_after_startup_bytes     = 180;
-    memory.planned_slack_bytes               = 100;
-    memory.cuda_graph                        = ninfer::GraphMemorySummary{600, -30, 800, 200};
-    memory.startup_retained_bytes            = 1000;
-    memory.kv_payload_bytes                  = 400;
-    memory.host_context_capacity_bytes       = 64ULL << 20;
-    memory.host_context_occupied_bytes       = 12ULL << 20;
-    memory.host_context_reserved_bytes       = 4ULL << 20;
-    memory.host_state_occupied_slots         = 1;
-    memory.host_kv_occupied_bytes            = 8ULL << 20;
+    budget.minimum_runtime_reservation_bytes     = 1300;
+    budget.bytes_per_page_group                  = 100;
+    budget.runtime_reservation_bytes             = 1600;
+    budget.available_after_weights_bytes         = 1700;
+    budget.available_after_startup_bytes         = 180;
+    budget.planned_slack_bytes                   = 100;
+    budget.graphs                                = ninfer::GraphMemorySummary{600, -30, 800, 200};
+    budget.retained_bytes                        = 1000;
+    memory.kv_payload_bytes                      = 400;
+    description.host_context_capacity_bytes      = 64ULL << 20;
+    snapshot.runtime.host_context_occupied_bytes = 12ULL << 20;
+    snapshot.runtime.host_context_reserved_bytes = 4ULL << 20;
+    snapshot.runtime.host_state_occupied_slots   = 1;
+    snapshot.runtime.host_kv_occupied_bytes      = 8ULL << 20;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -157,8 +164,8 @@ int main() {
     environment.cuda_driver_version       = "13.1";
 
     const Json server = Json::parse(format_server_start_json(
-        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
-        memory, environment, std::uint64_t{123456}));
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        description, startup_report, snapshot, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
@@ -175,8 +182,7 @@ int main() {
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
-                          server.at("engine").at("kv_capacity_page_groups") == 8192 &&
-                          server.at("engine").at("kv_capacity_max_page_groups") == 16384,
+                          server.at("engine").at("kv_capacity_page_groups") == 8192,
                       "KV capacity resolution metadata missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
@@ -187,18 +193,18 @@ int main() {
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
-    memory.kv_cache                = options.launch.engine.kv_cache;
+    description.kv_cache           = options.launch.engine.kv_cache;
     const Json nvfp4_server        = Json::parse(format_server_start_json(
-        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
-        memory, environment, std::uint64_t{123456}));
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        description, startup_report, snapshot, environment, std::uint64_t{123456}));
     failures +=
         check(nvfp4_server.at("engine").at("kv_cache") == "nvfp4", "NVFP4 KV report name missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
-    memory.kv_cache                = options.launch.engine.kv_cache;
+    description.kv_cache           = options.launch.engine.kv_cache;
     const Json k8v4_server         = Json::parse(format_server_start_json(
-        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
-        memory, environment, std::uint64_t{123456}));
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        description, startup_report, snapshot, environment, std::uint64_t{123456}));
     failures +=
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
@@ -232,31 +238,78 @@ int main() {
         "server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
-    failures +=
-        check(server.at("memory").at("workspace").at("capacity_bytes") == 500 &&
-                  server.at("memory").at("vision_workspace").at("general_capacity_bytes") == 300 &&
-                  server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
-                  server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
-              "Vision workspace layout missing");
-    failures += check(server.at("memory").at("cuda_graph_rebuild_estimate_bytes") == 600,
+    failures += check(server.at("resources")
+                                  .at("ranks")
+                                  .at(0)
+                                  .at("resources")
+                                  .at("allocations")
+                                  .at("workspace_device_bytes") == 500 &&
+                          server.at("resources")
+                                  .at("ranks")
+                                  .at(0)
+                                  .at("resources")
+                                  .at("vision_workspace")
+                                  .at("general_capacity_bytes") == 300 &&
+                          server.at("resources")
+                                  .at("ranks")
+                                  .at(0)
+                                  .at("resources")
+                                  .at("vision_workspace")
+                                  .at("handoff_capacity_bytes") == 200 &&
+                          server.at("resources")
+                                  .at("ranks")
+                                  .at(0)
+                                  .at("resources")
+                                  .at("vision_workspace")
+                                  .at("handoff_peak_bytes") == 150,
+                      "Vision workspace layout missing");
+    failures += check(server.at("resources")
+                              .at("ranks")
+                              .at(0)
+                              .at("budget")
+                              .at("graph_calibration")
+                              .at("rebuild_estimate_bytes") == 600,
                       "CUDA Graph rebuild estimate missing");
-    failures += check(server.at("memory").at("cuda_graph_prepare_increment_bytes") == -30 &&
-                          server.at("memory").at("cuda_graph_calibration_increment_bytes") == 800 &&
-                          server.at("memory").at("cuda_graph_calibration_retained_bytes") == 200 &&
-                          server.at("memory").at("startup_retained_bytes") == 1000,
-                      "signed Graph and startup deltas missing");
-    failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
-                          server.at("memory").at("available_after_weights_bytes") == 1700 &&
-                          server.at("memory").at("available_after_startup_bytes") == 180 &&
-                          server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
-                          server.at("memory").at("planned_slack_bytes") == 100,
-                      "adaptive KV memory ledger missing");
-    failures += check(server.at("memory").at("host_context_capacity_bytes") == (64ULL << 20) &&
-                          server.at("memory").at("host_context_occupied_bytes") == (12ULL << 20) &&
-                          server.at("memory").at("host_context_reserved_bytes") == (4ULL << 20) &&
-                          server.at("memory").at("host_state_occupied_slots") == 1 &&
-                          server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
-                      "Host context-cache memory ledger missing");
+    failures += check(
+        server.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("preparation_increment_bytes") == -30 &&
+            server.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("calibration_increment_bytes") == 800 &&
+            server.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("calibration_retained_bytes") == 200 &&
+            server.at("resources").at("ranks").at(0).at("budget").at("retained_bytes") == 1000,
+        "signed Graph and startup deltas missing");
+    failures += check(
+        server.at("resources").at("ranks").at(0).at("budget").at("runtime_reservation_bytes") ==
+                1600 &&
+            server.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("available_after_weights_bytes") == 1700 &&
+            server.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("available_after_startup_bytes") == 180 &&
+            server.at("resources").at("ranks").at(0).at("budget").at("headroom_bytes") == 0 &&
+            server.at("resources").at("ranks").at(0).at("budget").at("planned_slack_bytes") == 100,
+        "adaptive KV memory ledger missing");
+    failures +=
+        check(server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
+              "Host context capacity missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
@@ -387,41 +440,42 @@ int main() {
               "operational overload rejection is not warning severity");
 
     GenerationOutcome outcome;
-    outcome.prompt_tokens                   = 401;
-    outcome.completion_tokens               = 1024;
-    outcome.finish_reason                   = ninfer::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds         = 0.1234567890123;
-    outcome.metrics.ttft_seconds            = 0.3580246791357;
-    outcome.metrics.vision_seconds          = 0.0;
-    outcome.metrics.prefill_seconds         = 0.2345678901234;
-    outcome.metrics.decode_seconds          = 5.3456789012345;
-    outcome.metrics.total_seconds           = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.computed_prefill_tokens = 300;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::Checkpoint;
-    outcome.metrics.engine_timing           = {
-                  .queue_wait_seconds                   = 0.001,
-                  .engine_boundary_exposed_seconds      = 0.001,
-                  .program_submit_exposed_seconds       = 0.002,
-                  .program_post_exposed_seconds         = 0.003,
-                  .engine_commit_output_exposed_seconds = 0.004,
-                  .engine_maintenance_exposed_seconds   = 0.005,
-                  .device_wait_exposed_seconds          = 0.3,
-                  .decode_host_exposed_seconds          = 0.01,
-                  .decode_device_wait_exposed_seconds   = 0.2,
-                  .prefill_units                        = 4,
-                  .decode_rounds                        = 2,
-                  .control_units                        = 1,
+    outcome.prompt_tokens                         = 401;
+    outcome.completion_tokens                     = 1024;
+    outcome.finish_reason                         = ninfer::FinishReason::OutputLimit;
+    outcome.stats.timings.prepare_seconds         = 0.1234567890123;
+    outcome.stats.timings.first_token_seconds     = 0.3580246791357;
+    outcome.stats.timings.vision_seconds          = 0.0;
+    outcome.stats.timings.prefill_seconds         = 0.2345678901234;
+    outcome.stats.timings.decode_seconds          = 5.3456789012345;
+    outcome.stats.timings.generation_wall_seconds = 5.3456789012345;
+    outcome.stats.timings.total_seconds           = 5.7037035803702;
+    outcome.stats.reused_prompt_tokens            = 101;
+    outcome.stats.computed_prefill_tokens         = 300;
+    outcome.stats.prefix_reuse_path               = ninfer::PrefixReusePath::Checkpoint;
+    outcome.stats.engine_timing                   = {
+                          .queue_wait_seconds                     = 0.001,
+                          .engine_boundary_exposed_seconds        = 0.001,
+                          .session_call_exposed_seconds           = 0.002,
+                          .executor_poll_exposed_seconds          = 0.003,
+                          .engine_commit_output_exposed_seconds   = 0.004,
+                          .engine_maintenance_exposed_seconds     = 0.005,
+                          .scheduler_yield_exposed_seconds        = 0.3,
+                          .decode_host_exposed_seconds            = 0.01,
+                          .decode_scheduler_yield_exposed_seconds = 0.2,
+                          .prefill_units                          = 4,
+                          .decode_rounds                          = 2,
+                          .control_units                          = 1,
     };
-    outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
-    outcome.metrics.speculative_draft_window          = 3;
-    outcome.metrics.speculative_rounds                = 300;
-    outcome.metrics.speculative_draft_tokens          = 900;
-    outcome.metrics.speculative_accepted_tokens       = 720;
-    outcome.metrics.speculative_fallback_steps        = 2;
-    outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
-    outcome.metrics.engine_request_id                 = 991;
-    outcome.metrics.scheduling                        = {
+    outcome.stats.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.stats.speculative.draft_window          = 3;
+    outcome.stats.speculative.rounds                = 300;
+    outcome.stats.speculative.drafted_tokens        = 900;
+    outcome.stats.speculative.accepted_tokens       = 720;
+    outcome.stats.speculative.fallback_steps        = 2;
+    outcome.stats.speculative.accepted_per_position = {290, 240, 190};
+    outcome.stats.engine_request_id                 = 991;
+    outcome.stats.scheduling                        = {
                                .preemptions          = 3,
                                .snapshot_restores    = 1,
                                .replay_restores      = 2,
@@ -430,10 +484,10 @@ int main() {
                                .device_to_host_bytes = 3145728,
                                .host_to_device_bytes = 2097152,
     };
-    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
-                                                   .model_thinking_tokens = 256,
-                                                   .injected_tokens       = 19,
-                                                   .applied               = true};
+    outcome.stats.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+                                                         .model_thinking_tokens = 256,
+                                                         .injected_tokens       = 19,
+                                                         .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures += check(done.at("request").at("request_id") == 7 &&
@@ -455,11 +509,11 @@ int main() {
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "initial computed prompt tokens must exclude separately reported replay");
-    auto cancelled                            = outcome;
-    cancelled.finish_reason                   = ninfer::FinishReason::Cancelled;
-    cancelled.completion_tokens               = 0;
-    cancelled.metrics.computed_prefill_tokens = 128;
-    cancelled.metrics.prefill_seconds         = 0.25;
+    auto cancelled                          = outcome;
+    cancelled.finish_reason                 = ninfer::FinishReason::Cancelled;
+    cancelled.completion_tokens             = 0;
+    cancelled.stats.computed_prefill_tokens = 128;
+    cancelled.stats.timings.prefill_seconds = 0.25;
     const Json cancelled_done =
         Json::parse(format_request_done_json("server-test", 123456789, context, cancelled));
     failures += check(cancelled_done.at("result").at("computed_prefill_tokens") == 128,
@@ -484,11 +538,11 @@ int main() {
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
-                          outcome.metrics.decode_seconds,
+                          outcome.stats.timings.decode_seconds,
                       "decode time lost precision");
-    failures +=
-        check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
-              "TTFT missing or lost precision");
+    failures += check(done.at("timings_seconds").at("ttft").get<double>() ==
+                          outcome.stats.timings.first_token_seconds,
+                      "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
@@ -505,31 +559,25 @@ int main() {
             done.at("engine_timing").at("units").at("prefill") == 4,
         "request Engine timing exposure is incomplete");
 
-    auto observed                        = outcome;
-    observed.generated_token_ids         = {17, 151645};
-    observed.completion_tokens           = 2;
-    observed.metrics.first_output_timing = ninfer::GenerationFirstOutputTiming{
+    auto observed                      = outcome;
+    observed.generated_token_ids       = {17, 151645};
+    observed.completion_tokens         = 2;
+    observed.stats.first_output_timing = ninfer::GenerationFirstOutputTiming{
         .elapsed_seconds         = 0.312345678901234,
         .initial_binding_seconds = 0.023456789012345,
-        .engine                  = {.queue_wait_seconds             = 0.001,
-                                    .program_submit_exposed_seconds = 0.0015,
-                                    .device_wait_exposed_seconds    = 0.12,
-                                    .prefill_units                  = 3},
-        .prefill                 = {.submit_seconds = 0.002,
-                                    .wait_seconds   = 0.003,
-                                    .post_seconds   = 0.004,
-                                    .gpu_seconds    = 0.005},
-        .replay                  = {.submit_seconds = 0.006,
-                                    .wait_seconds   = 0.007,
-                                    .post_seconds   = 0.008,
-                                    .gpu_seconds    = 0.009},
-        .scheduling              = {.preemptions     = 1,
-                                    .replay_restores = 1,
-                                    .replayed_tokens = 64,
-                                    .paused_ns       = 123456789},
+        .engine                  = {.queue_wait_seconds              = 0.001,
+                                    .session_call_exposed_seconds    = 0.0015,
+                                    .scheduler_yield_exposed_seconds = 0.12,
+                                    .prefill_units                   = 3},
+        .prefill    = {.result = {2, 2000000, 1200000}, .total = {2, 9000000, 5000000}},
+        .replay     = {.result = {1, 6000000, 6000000}, .total = {1, 21000000, 21000000}},
+        .scheduling = {.preemptions     = 1,
+                       .replay_restores = 1,
+                       .replayed_tokens = 64,
+                       .paused_ns       = 123456789},
         .computed_prefill_tokens = 192,
     };
-    auto& first = *observed.metrics.first_output_timing;
+    auto& first = *observed.stats.first_output_timing;
     first.context_transfers.kv.resize(2);
     first.context_transfers.state[0] = {.bytes = 9007199254740993ULL, .seconds = 0.010};
     first.context_transfers.kv[0][1] = {.bytes = 2113536, .seconds = 0.011};
@@ -542,11 +590,10 @@ int main() {
                               Json::array({17, 151645}) &&
                           observed_done.at("result").at("completion_tokens") == 2,
                       "request diagnostics lost exact generated token IDs or schema version");
-    observed.metrics.admission = {.preferred_reused_tokens = 19057,
-                                  .source_wait_seconds     = 0.25,
-                                  .revoked_checkpoints     = 1,
-                                  .fallback_reason =
-                                      ninfer::AdmissionFallbackReason::SourceRevoked};
+    observed.stats.admission = {.preferred_reused_tokens = 19057,
+                                .source_wait_seconds     = 0.25,
+                                .revoked_checkpoints     = 1,
+                                .fallback_reason = ninfer::AdmissionFallbackReason::SourceRevoked};
     const auto admission_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, observed));
     failures +=
@@ -598,28 +645,23 @@ int main() {
     failures += check(pausing_json.at("transition") == "pause_started" &&
                           pausing_json.at("route").is_null(),
                       "pause preparation claimed a completed Snapshot or Replay route");
-    failures += check(
-        first_json.at("elapsed_seconds") == first.elapsed_seconds &&
-            first_json.at("initial_binding_seconds") == first.initial_binding_seconds &&
-            first_json.at("computed_prefill_tokens") == 192 &&
-            first_json.at("engine").at("units").at("prefill") == 3 &&
-            first_json.at("engine").at("host_exposed_seconds").at("program_submit") == 0.0015 &&
-            first_json.at("engine").at("device_wait_exposed_seconds") == 0.12 &&
-            first_json.at("scheduling").at("replayed_tokens") == 64 &&
-            first_json.at("scheduling").at("paused_ns") == 123456789 &&
-            observed_done.at("engine_timing") == done.at("engine_timing") &&
-            observed_done.at("generation").at("scheduling") ==
-                done.at("generation").at("scheduling"),
-        "first-output snapshot lost its boundary or replaced terminal request statistics");
-    failures += check(first_json.at("prefill") == Json{{"submit_seconds", 0.002},
-                                                       {"wait_seconds", 0.003},
-                                                       {"post_seconds", 0.004},
-                                                       {"gpu_seconds", 0.005}} &&
-                          first_json.at("replay") == Json{{"submit_seconds", 0.006},
-                                                          {"wait_seconds", 0.007},
-                                                          {"post_seconds", 0.008},
-                                                          {"gpu_seconds", 0.009}},
-                      "request work timing merged replay, prefill or overlapping GPU intervals");
+    failures +=
+        check(first_json.at("elapsed_seconds") == first.elapsed_seconds &&
+                  first_json.at("initial_binding_seconds") == first.initial_binding_seconds &&
+                  first_json.at("computed_prefill_tokens") == 192 &&
+                  first_json.at("engine").at("units").at("prefill") == 3 &&
+                  first_json.at("engine").at("host_exposed_seconds").at("session_call") == 0.0015 &&
+                  first_json.at("engine").at("scheduler_yield_exposed_seconds") == 0.12 &&
+                  first_json.at("scheduling").at("replayed_tokens") == 64 &&
+                  first_json.at("scheduling").at("paused_ns") == 123456789 &&
+                  observed_done.at("engine_timing") == done.at("engine_timing") &&
+                  observed_done.at("generation").at("scheduling") ==
+                      done.at("generation").at("scheduling"),
+              "first-output snapshot lost its boundary or replaced terminal request statistics");
+    failures += check(first_json.at("prefill").at("total").at("total_ns") == 9000000 &&
+                          first_json.at("prefill").at("result").at("count") == 2 &&
+                          first_json.at("replay").at("total").at("total_ns") == 21000000,
+                      "request execution exposure merged replay and initial prefill");
     failures += check(
         first_json.at("context_transfers").at("state").at("d2h") ==
                 Json{{"images", 0},
@@ -646,6 +688,23 @@ int main() {
                      {"bytes", 0},
                      {"seconds", 0.0}},
         "first-output transfer resource, direction or integer precision changed");
+
+    ThroughputReport window;
+    window.interval_seconds                                                                 = 5;
+    window.previous.speculative_draft_tokens                                                = 100;
+    window.current.speculative_draft_tokens                                                 = 300;
+    window.previous.speculative_accepted_tokens                                             = 50;
+    window.current.speculative_accepted_tokens                                              = 110;
+    window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)].units = 2;
+    window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)].rows  = 4;
+    window.current_execution[static_cast<std::size_t>(ninfer::ExecutionKind::Decode)]
+        .exposure.total.total_ns = 20000000;
+    const auto recent            = Json::parse(format_throughput_json("serve-test", 3002, window));
+    failures += check(
+        recent["speculative"]["acceptance"] == 0.3 &&
+            recent["execution"]["decode"]["mean_seconds"] == 0.01 &&
+            recent["execution"]["prefill"]["mean_seconds"].is_null(),
+        "recent statistics must divide token deltas and batch counts, retaining missing samples");
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
     failures += check(
@@ -758,17 +817,17 @@ int main() {
     throughput.current.pressure_spill_pages               = 4;
     throughput.current.host_work                          = {
                                  .engine_boundary_ns            = 1000000,
-                                 .program_submit_ns             = 2000000,
-                                 .program_post_ns               = 3000000,
+                                 .session_call_ns               = 2000000,
+                                 .executor_poll_ns              = 3000000,
                                  .engine_commit_output_ns       = 4000000,
                                  .engine_maintenance_ns         = 5000000,
-                                 .device_wait_ns                = 300000000,
+                                 .scheduler_yield_ns            = 300000000,
                                  .decode_host_ns                = 10000000,
-                                 .decode_device_wait_ns         = 200000000,
+                                 .decode_scheduler_yield_ns     = 200000000,
                                  .prefill_host_ns               = 3000000,
-                                 .prefill_device_wait_ns        = 50000000,
+                                 .prefill_scheduler_yield_ns    = 50000000,
                                  .control_host_ns               = 2000000,
-                                 .control_device_wait_ns        = 50000000,
+                                 .control_scheduler_yield_ns    = 50000000,
                                  .prefill_units                 = 4,
                                  .control_units                 = 1,
                                  .stats_publication_ns          = 250000,
@@ -837,14 +896,14 @@ int main() {
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
                  0.015) < 1.0e-15 &&
-            std::abs(throughput_json.at("host_work").at("device_wait_seconds").get<double>() -
+            std::abs(throughput_json.at("host_work").at("scheduler_yield_seconds").get<double>() -
                      0.3) < 1.0e-15 &&
             std::abs(throughput_json.at("host_work")
                          .at("decode_host_microseconds_per_round")
                          .get<double>() -
                      1000.0) < 1.0e-12 &&
             std::abs(throughput_json.at("host_work")
-                         .at("decode_device_wait_microseconds_per_round")
+                         .at("decode_scheduler_yield_microseconds_per_round")
                          .get<double>() -
                      20000.0) < 1.0e-12 &&
             std::abs(throughput_json.at("host_work")

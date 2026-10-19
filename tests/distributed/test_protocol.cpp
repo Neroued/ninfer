@@ -145,7 +145,7 @@ void native_work() {
     contract.validate(work, request, masks);
     masks.rows[0].words.pop_back();
     rejects([&] { contract.validate(work, request, masks); });
-    q::ComputeResult result{{{1, 3, 1, {5, 6}, {23, 5}, 0, 0.125}}, {}};
+    q::ComputeResult result{{{1, 3, 1, {5, 6}, {23, 5}, 0}}};
     q::Commit commit{{{original.member, {2, 6}, 2, false, false, false}}, {}};
     contract.validate(work, q::Result{result}, commit);
     commit.rows[0].accepted = 1;
@@ -160,14 +160,25 @@ void native_work() {
     require(received_commit.rows[0].accepted == 1 && received_commit.rows[0].terminal &&
                 received_commit.rows[0].slots.destination == 6,
             "commit changed in transit");
+    q::ComputeResult prefill;
+    prefill.rows.resize(1);
+    prefill.rows[0].processed = 128;
+    wire::Encoder encoded_prefill;
+    q::encode_result(encoded_prefill, q::Result{prefill});
+    const auto prefill_bytes = std::move(encoded_prefill).take();
+    wire::Decoder prefill_input(prefill_bytes);
+    const auto received_prefill = std::get<q::ComputeResult>(q::decode_result(prefill_input));
+    prefill_input.finish();
+    require(received_prefill.rows.size() == 1 && received_prefill.rows[0].processed == 128 &&
+                received_prefill.rows[0].tokens.empty(),
+            "a non-sampling prefill result must decode without optional token payloads");
     wire::Encoder encoded_result;
     q::encode_result(encoded_result, q::Result{result});
     const auto result_bytes = std::move(encoded_result).take();
     wire::Decoder result_input(result_bytes);
     const auto received_result = std::get<q::ComputeResult>(q::decode_result(result_input));
     require(received_result.rows[0].tokens == result.rows[0].tokens &&
-                received_result.rows[0].input_tokens == result.rows[0].input_tokens &&
-                received_result.rows[0].vision_seconds == 0.125,
+                received_result.rows[0].input_tokens == result.rows[0].input_tokens,
             "result changed in transit");
 }
 
@@ -284,20 +295,43 @@ int main() {
         native_work();
         queues();
         inputs();
-        MemorySummary memory;
-        memory.workspace                             = {128, 64, 96};
-        memory.cuda_graph                            = GraphMemorySummary{42, -12, 5, -8};
-        memory.moe.emplace().fixed_experts_per_layer = {1, 7, 3};
+        RankSnapshot memory;
+        memory.rank                                             = 1;
+        memory.node                                             = 3;
+        memory.memory.workspace                                 = {64, 96, 80};
+        memory.memory.experts.emplace().fixed_experts_per_layer = {1, 7, 3};
+        RankMemoryBudget budget;
+        budget.graphs = GraphMemorySummary{42, -12, 5, -8};
         wire::Encoder out;
         runtime::protocol::encode(out, memory);
+        runtime::protocol::encode(out, budget);
         const auto bytes = std::move(out).take();
         wire::Decoder in(bytes);
-        const auto report = runtime::protocol::memory_summary(in);
+        const auto report   = runtime::protocol::rank_snapshot(in);
+        const auto planning = runtime::protocol::memory_budget(in);
         in.finish();
-        require(report.workspace.peak_used_bytes == 96 &&
-                    report.cuda_graph->preparation_increment_bytes == -12 &&
-                    report.moe->fixed_experts_per_layer == std::vector<std::uint32_t>{1, 7, 3},
-                "resource report lost its values");
+        require(report.rank == 1 && report.node == 3 &&
+                    report.memory.workspace.required_peak_bytes == 96 &&
+                    planning.graphs->preparation_increment_bytes == -12 &&
+                    report.memory.experts->fixed_experts_per_layer ==
+                        std::vector<std::uint32_t>{1, 7, 3},
+                "resource observation lost rank identity, values or signed calibration");
+        RankExecutionObservation completion;
+        completion.path                                 = ExecutionPath::Graph;
+        completion.gpu                                  = {123, {}, 456, {}};
+        completion.communication_graph.calls[0]         = 37;
+        completion.communication_graph.payload_bytes[0] = 8192;
+        wire::Encoder observed;
+        runtime::protocol::encode(observed, completion);
+        const auto observed_bytes = std::move(observed).take();
+        wire::Decoder completed_input(observed_bytes);
+        const auto completed = runtime::protocol::rank_execution_observation(completed_input);
+        completed_input.finish();
+        require(completed.path == ExecutionPath::Graph && completed.gpu.result_stream_ns == 123 &&
+                    !completed.gpu.commit_stream_ns &&
+                    completed.communication_graph.calls[0] == 37 &&
+                    completed.communication_graph.payload_bytes[0] == 8192,
+                "completion observations lost GPU coverage or replayed communication work");
         std::cout << "native work, decision/commit contract and control queues passed\n";
         return 0;
     } catch (const std::exception& error) {

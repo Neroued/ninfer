@@ -52,11 +52,12 @@ void RankProgramImpl::finish_control_window() {
     if (f.control_window) {
         auto& result = f.result.rows[f.control_row];
         result.processed += f.tokens;
-        result.vision_seconds += collect_vision_timing(binding(f.rows.front().member.residency),
-                                                       f.rows.front().main_frontier + f.tokens);
+        if (auto ns = collect_vision_timing(binding(f.rows.front().member.residency),
+                                            f.rows.front().main_frontier + f.tokens))
+            f.gpu.add_vision(*ns);
         if (f.timer_started)
-            f.timing.gpu_elapsed_ns +=
-                static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5);
+            f.gpu.add_prefill(
+                static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
         f.timer_started = false;
         f.control_offset += f.tokens;
         if (f.control_offset == work.rows[f.control_row].ids.size()) {
@@ -72,9 +73,10 @@ void RankProgramImpl::finish_control_window() {
         }
     } else {
         for (std::size_t b = 0; b < work.rows.size(); ++b) {
-            f.result.rows[b].processed      = 1;
-            f.result.rows[b].vision_seconds = collect_vision_timing(
-                binding(work.rows[b].member.residency), work.rows[b].main_frontier + 1);
+            f.result.rows[b].processed = 1;
+            if (auto ns = collect_vision_timing(binding(work.rows[b].member.residency),
+                                                work.rows[b].main_frontier + 1))
+                f.gpu.add_vision(*ns);
         }
     }
     f.rows           = work.rows;
@@ -111,6 +113,7 @@ void RankProgramImpl::enqueue_control_counts() {
             f.control_offset = 0;
         }
     }
+    gpu_timer.record_result();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitControl;
 }

@@ -56,6 +56,16 @@ int main() {
             }
         }
     }
+    const auto snapshot = engine.snapshot();
+    if (snapshot.scoring.completed_jobs != 3 || snapshot.scoring.scored_tokens != 3584 ||
+        snapshot.scoring.active_jobs != 0 || snapshot.runtime.generated_tokens != 0 ||
+        snapshot.executions[static_cast<std::size_t>(ninfer::ExecutionKind::Score)].units < 3 ||
+        snapshot.executions[static_cast<std::size_t>(ninfer::ExecutionKind::Score)].input_tokens !=
+            4608) {
+        std::cerr
+            << "scoring observations mixed target scoring with generation or missed retirement\n";
+        return 1;
+    }
     std::cout << "OK causal_score_real\n";
     return 0;
 }

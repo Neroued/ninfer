@@ -72,9 +72,11 @@ public:
 
     void drain() { implementation.drain(); }
 
-    [[nodiscard]] MemorySummary memory_summary() const { return implementation.memory_summary(); }
+    [[nodiscard]] RankMemoryUsage observe_resources() const {
+        return implementation.observe_resources();
+    }
 
-    void reset_memory_peaks() noexcept { implementation.reset_memory_peaks(); }
+    void reset_measurement_peaks() noexcept { implementation.reset_measurement_peaks(); }
 
     q35::detail::RankProgramImpl implementation;
     std::function<void(const runtime::ExecutionRequest<q35::ExecutionTypes>&)> submitted;
@@ -276,7 +278,8 @@ private:
             if (const auto* request = std::get_if<runtime::DecisionRequest>(&event->result)) {
                 if (!decision) throw std::logic_error("unexpected constrained decision request");
                 session_.supply(event->ticket, decision(*request));
-            } else if (!std::holds_alternative<runtime::DecisionConsumed>(event->result)) {
+            } else if (!std::holds_alternative<runtime::DecisionConsumed>(event->result) &&
+                       !std::holds_alternative<runtime::ExecutionComplete>(event->result)) {
                 if (!event->members.empty()) members_[event->ticket.id] = event->members;
                 events_.push_back(std::move(*event));
             }

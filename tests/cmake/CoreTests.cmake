@@ -83,7 +83,7 @@ set_tests_properties(
 
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)

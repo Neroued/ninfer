@@ -271,60 +271,61 @@ std::vector<qb::TestResult> sample_results() {
     pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
     pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1},
                {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1}};
-    pp.workspace_peak_bytes           = 5ULL * 1024ULL * 1024ULL * 1024ULL;
-    pp.workspace_allocator_peak_bytes = 4ULL * 1024ULL * 1024ULL;
+    pp.max_rank_workspace_peak_bytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
-    tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
-    tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
+    tg.max_rank_workspace_peak_bytes = 1024ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
 }
 
 qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                   = "RTX 5090";
-    env.cuda_runtime_version       = "13.1";
-    env.cuda_driver_version        = "590.1";
-    env.device_id                  = 0;
-    env.artifact_path              = "model.ninfer";
-    env.artifact_file_size_bytes   = 17500000000ULL;
-    env.load                       = {.architecture         = "Qwen3_5ForCausalLM",
-                                      .model_name           = "qwen3.6-27b",
-                                      .prefill_signature    = "groupwise-int",
-                                      .load_seconds         = 2.5,
-                                      .upload_seconds       = 2.0,
-                                      .artifact_bytes_read  = 17500000000ULL,
-                                      .host_to_device_bytes = 17400000000ULL,
-                                      .peak_staging_bytes   = 134217728ULL,
-                                      .device_object_count  = 1118,
-                                      .host_object_count    = 6};
-    env.memory.device              = 0;
-    env.memory.device_budget_bytes = 32ULL * 1024 * 1024 * 1024;
-    env.memory.max_context         = 4096;
-    env.memory.kv_capacity         = 8192;
-    env.memory.kv_cache            = ninfer::KvCacheStorage::Int8Group64;
-    env.memory.weights             = {17400000000ULL, 17400000000ULL, 17400000000ULL};
-    env.memory.sequence            = {2000000000ULL, 1900000000ULL, 1900000000ULL};
-    env.memory.workspace           = {100000000ULL, 0, 0};
-
-    env.memory.vision_workspace = ninfer::VisionWorkspaceMemorySummary{
-        .aggregate_prompt_tokens = 4096,
-        .max_item_tokens         = 4096,
-        .general_capacity_bytes  = 75000000ULL,
-        .encode_peak_bytes       = 90000000ULL,
-        .handoff_offset_bytes    = 75000000ULL,
-        .handoff_capacity_bytes  = 25000000ULL,
-        .handoff_active_bytes    = 0,
-        .handoff_peak_bytes      = 20000000ULL,
+    env.gpu_name                 = "RTX 5090";
+    env.cuda_runtime_version     = "13.1";
+    env.cuda_driver_version      = "590.1";
+    env.device_id                = 0;
+    env.artifact_path            = "model.ninfer";
+    env.artifact_file_size_bytes = 17500000000ULL;
+    env.startup.load             = {.architecture           = "Qwen3_5ForCausalLM",
+                                    .model_name             = "qwen3.6-27b",
+                                    .prefill_signature      = "groupwise-int",
+                                    .load_seconds           = 2.5,
+                                    .upload_seconds         = 2.0,
+                                    .artifact_bytes_read    = 17500000000ULL,
+                                    .host_to_device_bytes   = 17400000000ULL,
+                                    .max_rank_staging_bytes = 134217728ULL,
+                                    .device_object_count    = 1118,
+                                    .host_object_count      = 6};
+    env.description.ranks.push_back({});
+    env.description.max_context = 4096;
+    env.description.kv_capacity = 8192;
+    env.description.kv_cache    = ninfer::KvCacheStorage::Int8Group64;
+    env.snapshot.ranks.resize(1);
+    env.startup.ranks.resize(1);
+    auto& memory                               = env.snapshot.ranks[0].memory;
+    auto& budget                               = env.startup.ranks[0];
+    budget.limit_bytes                         = 32ULL * 1024 * 1024 * 1024;
+    memory.allocations.device_weights_bytes    = 17400000000ULL;
+    memory.allocations.persistent_device_bytes = 2000000000ULL;
+    memory.allocations.workspace_device_bytes  = 100000000ULL;
+    memory.vision                              = ninfer::VisionWorkspaceMemorySummary{
+                                     .aggregate_prompt_tokens = 4096,
+                                     .max_item_tokens         = 4096,
+                                     .general_capacity_bytes  = 75000000ULL,
+                                     .encode_required_bytes   = 90000000ULL,
+                                     .handoff_offset_bytes    = 75000000ULL,
+                                     .handoff_capacity_bytes  = 25000000ULL,
+                                     .handoff_active_bytes    = 0,
+                                     .handoff_peak_bytes      = 20000000ULL,
     };
-    env.memory.cuda_graph = ninfer::GraphMemorySummary{150000000ULL, 170000000, 149999900, -100};
-    env.memory.startup_retained_bytes = -200;
-    env.memory.kv_payload_bytes       = 123456ULL;
+    budget.graphs           = ninfer::GraphMemorySummary{150000000ULL, 170000000, 149999900, -100};
+    budget.retained_bytes   = -200;
+    memory.kv_payload_bytes = 123456ULL;
 
-    env.memory.moe = ninfer::MoeMemorySummary{
+    memory.experts = ninfer::MoeMemorySummary{
         .cache_bytes              = 4096,
         .fixed_bytes              = 2048,
         .window_bytes             = 2048,
@@ -367,7 +368,7 @@ int test_report_contract() {
     }
 
     failures += expect(report.at("schema_version") == 24, "report schema v24");
-    const auto& moe = report.at("memory").at("moe");
+    const auto& moe = report.at("resources").at("ranks").at(0).at("resources").at("experts");
     failures += expect(moe.at("used_bytes") == 4096 && moe.at("target_bytes") == 4096 &&
                            moe.at("ready_bytes") == 3072 && moe.at("prefetched_bytes") == 1024 &&
                            moe.at("fixed_bytes") == 2048 && moe.at("window_bytes") == 2048 &&
@@ -385,25 +386,62 @@ int test_report_contract() {
         expect(report.at("load").at("prefill_signature") == "groupwise-int", "load weights id");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
-    failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
-    failures += expect(report.at("memory").at("device_budget_bytes") == 32ULL * 1024 * 1024 * 1024,
+    failures += expect(report.at("config").at("kv_cache") == "int8-group64", "memory KV");
+    failures += expect(report.at("resources").at("ranks").at(0).at("budget").at("limit_bytes") ==
+                           32ULL * 1024 * 1024 * 1024,
                        "effective Device budget");
-    failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
-    failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
+    failures += expect(report.at("resources")
+                               .at("ranks")
+                               .at(0)
+                               .at("resources")
+                               .at("allocations")
+                               .at("workspace_device_bytes") == 100000000ULL,
                        "workspace capacity");
-    failures += expect(
-        report.at("memory").at("vision_workspace").at("general_capacity_bytes") == 75000000ULL &&
-            report.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 25000000ULL,
-        "Vision workspace layout");
-    failures += expect(report.at("memory").at("cuda_graph_rebuild_estimate_bytes") == 150000000ULL,
+    failures += expect(report.at("resources")
+                                   .at("ranks")
+                                   .at(0)
+                                   .at("resources")
+                                   .at("vision_workspace")
+                                   .at("general_capacity_bytes") == 75000000ULL &&
+                           report.at("resources")
+                                   .at("ranks")
+                                   .at(0)
+                                   .at("resources")
+                                   .at("vision_workspace")
+                                   .at("handoff_capacity_bytes") == 25000000ULL,
+                       "Vision workspace layout");
+    failures += expect(report.at("resources")
+                               .at("ranks")
+                               .at(0)
+                               .at("budget")
+                               .at("graph_calibration")
+                               .at("rebuild_estimate_bytes") == 150000000ULL,
                        "CUDA Graph rebuild estimate");
+    failures += expect(
+        report.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("preparation_increment_bytes") == 170000000 &&
+            report.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("calibration_increment_bytes") == 149999900 &&
+            report.at("resources")
+                    .at("ranks")
+                    .at(0)
+                    .at("budget")
+                    .at("graph_calibration")
+                    .at("calibration_retained_bytes") == -100 &&
+            report.at("resources").at("ranks").at(0).at("budget").at("retained_bytes") == -200,
+        "signed Graph calibration and startup deltas");
     failures +=
-        expect(report.at("memory").at("cuda_graph_prepare_increment_bytes") == 170000000 &&
-                   report.at("memory").at("cuda_graph_calibration_increment_bytes") == 149999900 &&
-                   report.at("memory").at("cuda_graph_calibration_retained_bytes") == -100 &&
-                   report.at("memory").at("startup_retained_bytes") == -200,
-               "signed Graph calibration and startup deltas");
-    failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
+        expect(report.at("resources").at("ranks").at(0).at("resources").at("kv_payload_bytes") ==
+                   123456ULL,
+               "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
@@ -413,10 +451,8 @@ int test_report_contract() {
         expect(pp.at("kind") == "pp" && pp.at("requested_output_tokens") == 1, "pp request shape");
     failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0, "pp throughput");
     failures += expect(pp.at("decode_output_tok_s_mean").is_null(), "pp decode is null");
-    failures += expect(pp.at("workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
+    failures += expect(pp.at("max_rank_workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
                        "pp workspace peak");
-    failures += expect(pp.at("workspace_allocator_peak_bytes") == 4ULL * 1024ULL * 1024ULL,
-                       "pp allocator workspace peak");
 
     const Json& tg = report.at("tests").at(1);
     failures +=
@@ -455,10 +491,10 @@ int test_human_and_csv_reports() {
         expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
 
-    auto csv_env            = env;
-    csv_env.load.model_name = "trained, \"custom\"";
-    csv_env.artifact_path   = "/weights/user,model.ninfer";
-    const std::string csv   = qb::format_csv(csv_env, results);
+    auto csv_env                    = env;
+    csv_env.startup.load.model_name = "trained, \"custom\"";
+    csv_env.artifact_path           = "/weights/user,model.ninfer";
+    const std::string csv           = qb::format_csv(csv_env, results);
     failures += expect(csv.find("\"trained, \"\"custom\"\"\"") != std::string::npos &&
                            csv.find("\"/weights/user,model.ninfer\"") != std::string::npos,
                        "CSV preserves and escapes the actual training instance");
@@ -466,10 +502,9 @@ int test_human_and_csv_reports() {
                        "CSV identity columns");
     for (const std::string_view field :
          {"model_name", "artifact_path", "proposal_head", "kv_payload_bytes",
-          "load_host_to_device_bytes", "workspace_general_capacity_bytes",
-          "vision_handoff_capacity_bytes", "cuda_graph_rebuild_estimate_bytes",
-          "workspace_peak_bytes", "workspace_allocator_peak_bytes", "spec_acceptance_rate",
-          "decode_output_tok_s_mean", "decode_engine_tok_s_mean", "total_seconds_mean"}) {
+          "load_host_to_device_bytes", "workspace_capacity_bytes", "max_rank_workspace_peak_bytes",
+          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
+          "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

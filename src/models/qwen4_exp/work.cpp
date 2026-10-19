@@ -4,6 +4,33 @@
 #include <type_traits>
 
 namespace ninfer::models::qwen4_exp {
+ExecutionWork ExecutionTypes::describe_work(const Work& work) {
+    ExecutionWork result;
+    std::visit(
+        [&](const auto& op) {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, ForwardWork>) {
+                result.kind = op.kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
+                              : op.kind == ForwardKind::Replay  ? ExecutionKind::Replay
+                              : op.kind == ForwardKind::Control ? ExecutionKind::Control
+                                                                : ExecutionKind::Decode;
+                result.rows = op.rows.size();
+                for (const auto& row : op.rows) result.input_tokens += row.ids.size();
+                result.scheduled_positions = result.input_tokens;
+            } else if constexpr (std::is_same_v<T, MtpWork>) {
+                result.kind = ExecutionKind::Decode;
+                result.rows = result.input_tokens = op.rows.size();
+                for (const auto extent : op.draft_extents) result.scheduled_positions += extent + 1;
+            } else if constexpr (std::is_same_v<T, ScoreWork>) {
+                result.kind         = ExecutionKind::Score;
+                result.rows         = 1;
+                result.input_tokens = result.scheduled_positions = op.row.ids.size();
+            }
+        },
+        work.operation);
+    return result;
+}
+
 namespace {
 bool same_member(const runtime::ExecutionMember& a, const runtime::ExecutionMember& b) {
     return a.sequence == b.sequence && a.residency == b.residency;

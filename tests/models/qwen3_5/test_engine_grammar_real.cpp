@@ -72,7 +72,7 @@ void choice_and_regex(ninfer::Engine& engine, unsigned concurrency, bool specula
                     : std::regex_match(result.content, pattern),
                 "choice/regex produced content outside its language");
         if (speculative)
-            require(result.speculative.rounds > 0, "choice/regex bypassed speculation");
+            require(result.stats.speculative.rounds > 0, "choice/regex bypassed speculation");
     }
     const std::string literal_bytes = " 你好 \"a|b\\c\"\n";
     auto exact                      = choice;
@@ -186,17 +186,19 @@ int main(int argc, char** argv) {
             require(result.finish_reason == ninfer::FinishReason::StopToken,
                     "grammar did not finish through EOS");
             if (backend != "none")
-                require(result.speculative.rounds > 0, "constraint bypassed speculative backend");
-            std::cout << "literal temp=" << temperature << " reuse=" << result.reused_prompt_tokens
-                      << " prepare_ms=" << result.timings.prepare_seconds * 1000
-                      << " decode_ms=" << result.timings.decode_seconds * 1000 << '\n';
+                require(result.stats.speculative.rounds > 0,
+                        "constraint bypassed speculative backend");
+            std::cout << "literal temp=" << temperature
+                      << " reuse=" << result.stats.reused_prompt_tokens
+                      << " prepare_ms=" << result.stats.timings.prepare_seconds * 1000
+                      << " decode_ms=" << result.stats.timings.decode_seconds * 1000 << '\n';
         }
 
         auto thinking                      = literal(answer);
         thinking.execution.thinking.budget = 2;
         auto thought = engine.generate(engine.prepare(prompt(true)), thinking);
-        require(thought.content == answer && thought.thinking.applied &&
-                    thought.thinking.injected_tokens > 0,
+        require(thought.content == answer && thought.stats.thinking.applied &&
+                    thought.stats.thinking.injected_tokens > 0,
                 "thinking control broke constrained content");
 
         auto continued = prompt();
@@ -256,7 +258,7 @@ int main(int argc, char** argv) {
         seed.execution.requested_output_tokens = 1;
         (void)engine.generate(engine.prepare_tokens(raw_prompt), seed);
         const auto hit = engine.generate(engine.prepare_tokens(raw_prompt), literal("no"));
-        require(hit.content == "no" && hit.reused_prompt_tokens == raw_prompt.size(),
+        require(hit.content == "no" && hit.stats.reused_prompt_tokens == raw_prompt.size(),
                 "exact prefix hit reused grammar state or bypassed first-token mask");
         auto raw = engine.generate(engine.prepare_tokens(engine.tokenize_text("Answer: ")),
                                    literal(answer));
@@ -354,7 +356,7 @@ int main(int argc, char** argv) {
         changed.constraint = ninfer::OutputConstraint::json_schema(R"({"const":{"changed":true}})");
         const auto changed_result = engine.generate(engine.prepare(prompt()), changed);
         record({{"const", {{"changed", true}}}}, changed_result);
-        require(changed_result.reused_prompt_tokens > 0,
+        require(changed_result.stats.reused_prompt_tokens > 0,
                 "schema switch did not exercise prefix reuse");
 
         std::vector<ninfer::GenerationHandle> json_batch;

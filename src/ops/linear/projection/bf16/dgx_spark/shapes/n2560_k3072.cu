@@ -15,10 +15,6 @@ using Hot128 = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<32, 32, 128, 16, 8, 3, 1, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
     3072>;
-using Hot256 = Bf16ScheduleInstance<
-    Bf16A16MmaSchedule<32, 32, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
-                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
-    3072>;
 using HotTma = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 16, 3, 2>, 3072>;
 using Bulk   = Bf16ScheduleInstance<
       Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::Grouped, 12, 3>, 3072>;
@@ -46,7 +42,6 @@ Bf16Launch select_bf16_n2560_k3072(std::int32_t tokens) {
     if (tokens <= 16) return launch_bf16_sliced_k_mma<Sliced>;
     if (tokens <= 32) return launch_bf16_sliced_k_mma<Medium>;
     if (tokens <= 64) return launch_bf16_mma<Hot128>;
-    if (tokens <= 96) return launch_bf16_mma<Hot256>;
     if (tokens <= 128) return launch_bf16_tma_mma<HotTma>;
     if (tokens >= 4096) return warp_store<Large>;
     if ((tokens > 256 && tokens <= 576) || (tokens > 896 && tokens <= 1152))

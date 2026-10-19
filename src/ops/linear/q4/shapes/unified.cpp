@@ -147,4 +147,15 @@ Q4Launch select_q4_n4304_k1152_unified(std::int32_t tokens) {
     return launch_q4_a16_mma_r64_t128;
 }
 
+Q4Launch select_q4_n4352_k1152_unified(std::int32_t tokens) {
+    if (tokens > 131072 || tokens % 4 != 0)
+        throw std::invalid_argument("q4 linear: T must be a multiple of 4 in [4,131072]");
+    if (tokens <= 16) return launch_q4_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 32) return launch_q4_a16_sliced_r16_t32_w4_s2;
+    if (tokens <= 64) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    if (tokens <= 96) return launch_q4_a16_mma_r32_t32_k128_s2_a2;
+    if (tokens <= 384) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    return launch_q4_a16_mma_r64_t128;
+}
+
 } // namespace ninfer::ops::detail

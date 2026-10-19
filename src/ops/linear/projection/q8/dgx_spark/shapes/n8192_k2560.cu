@@ -10,7 +10,9 @@ template <class Base>
 struct Q8N8192K2560Schedule : Base {};
 
 using Gemv    = Q8A16GemvSchedule<4, 2, 2, 2560, 4>;
-using Small8  = Q8A16SlicedKMmaSchedule<8, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+using Small8  = Q8A16SlicedKMmaSchedule<8, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                        Q8ActivationStage::PaddedZero, 2560>;
+using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
 using Small24 = Q8A16SlicedKMmaSchedule<24, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
@@ -49,6 +51,7 @@ void tma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream
 Q8Launch select_q8_n8192_k2560(std::int32_t tokens) {
     if (tokens == 1) return gemv<Gemv>;
     if (tokens <= 8) return sliced<Small8>;
+    if (tokens <= 16) return sliced<Small16>;
     if (tokens <= 24) return sliced<Small24>;
     if (tokens <= 40) return sliced<Small40>;
     if (tokens <= 96) return tma<Hot32>;

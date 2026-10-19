@@ -858,7 +858,7 @@ int main(int argc, char** argv) {
     for (int t : {17,  31,  32,  33,  63,  64,   65,   127,  128,  129, 255,
                   256, 257, 511, 512, 513, 1023, 1024, 1025, 2048, 4096})
         for (bool alias : {false, true}) split(5120, 1024, 1024, 3072, t, alias, false, 10000U + t);
-    for (int t : {1, 6, 16, 33, 257, 512, 4096})
+    for (int t : {1, 2, 6, 16, 33, 257, 512, 4096})
         for (bool alias : {false, true})
             split(5120, 1024, 1024, 3072, t, alias, false, 11000U + t, true);
     for (int t : {16, 33, 257}) split(5120, 1024, 1024, 3072, t, false, true, 12000U + t);

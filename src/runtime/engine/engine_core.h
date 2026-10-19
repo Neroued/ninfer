@@ -223,6 +223,7 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
+            request->decode_by_batch.resize(max_concurrency_);
         } catch (...) {
             release_reserved_capacity();
             throw;

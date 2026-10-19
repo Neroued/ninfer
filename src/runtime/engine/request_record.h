@@ -230,6 +230,7 @@ struct RequestRecord {
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
     RequestExecutionStatistics executions;
+    std::vector<ExecutionExposure> decode_by_batch;
     std::array<DurationCounter, 4> max_rank_gpu{};
     std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;

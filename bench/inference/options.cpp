@@ -93,8 +93,10 @@ benchmark:
   --profile-measured  CUDA profiler range around one measured run; requires --repetitions 1.
 
 Each run starts with the same inputs and sampling seeds; runtime caches stay warm.
-Preparation is outside the measured run. Prefix reuse defaults off; explicit configuration wins.
-Decode step latency covers one native batch execution, not one output token.
+Before each decode run, the first C-1 inputs complete ordinary one-token requests.
+Preparation is outside timing and profiler ranges. Prefix reuse defaults on for decode,
+with native extra state capacity; prefill-only defaults off. Explicit configuration wins.
+Decode latency is grouped by actual batch size; a batch with no samples is reported as such.
 Result/resolution/retirement and Host times use existing Engine observations.
 For external profiling, use nsys --capture-range=cudaProfilerApi with --profile-measured.
 )";

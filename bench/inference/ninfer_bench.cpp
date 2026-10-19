@@ -47,6 +47,15 @@ private:
 bench::Repetition run(Engine& engine, const bench::Options& options,
                       const std::vector<PromptInput>& inputs,
                       std::span<const RequestOptions> requests, bool measured) {
+    if (options.launch.generation.max_tokens > 1) {
+        for (std::size_t row = 0; row + 1 < requests.size(); ++row) {
+            auto prompt  = engine.prepare(inputs[inputs.size() == 1 ? 0 : row]);
+            auto prefill = requests[row];
+            prefill.execution.requested_output_tokens = 1;
+            auto handle = engine.submit(std::move(prompt), std::move(prefill));
+            (void)handle.wait();
+        }
+    }
     std::vector<PreparedPrompt> prompts;
     std::vector<GenerationHandle> handles;
     bench::Repetition repetition;

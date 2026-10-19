@@ -330,6 +330,14 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
     auto& engine                  = launch.engine;
     auto& generation              = launch.generation;
     auto& sampling                = generation.sampling;
+    if (entry == EntryPoint::Bench) {
+        const auto& limit = assignment(merged, Field::MaxTokens);
+        if (limit && std::holds_alternative<std::uint64_t>(limit->value) &&
+            std::get<std::uint64_t>(limit->value) == 1) {
+            engine.context_cache.enabled           = false;
+            engine.context_cache.extra_state_slots = 0;
+        }
+    }
     launch.provenance.config_path = command.config_path;
     launch.provenance.argv        = std::move(command.argv);
     engine.deployment             = std::move(file.deployment);
@@ -580,8 +588,10 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
 LaunchOptions default_launch_options(EntryPoint entry) {
     LaunchOptions options;
     if (entry != EntryPoint::Serve) {
-        options.engine.context_cache.enabled             = false;
-        options.engine.context_cache.extra_state_slots   = 0;
+        if (entry == EntryPoint::Cli) {
+            options.engine.context_cache.enabled           = false;
+            options.engine.context_cache.extra_state_slots = 0;
+        }
         options.engine.context_cache.host_capacity_bytes = 0;
         options.generation.sampling.seed                 = 0;
     } else

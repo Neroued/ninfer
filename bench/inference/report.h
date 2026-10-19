@@ -13,7 +13,8 @@ struct Repetition {
 };
 
 // Execution durations are global batch observations; request exposures provide window maxima.
-[[nodiscard]] nlohmann::json summarize(std::span<const Repetition> repetitions);
+[[nodiscard]] nlohmann::json summarize(std::span<const Repetition> repetitions,
+                                       std::uint32_t target_batch);
 [[nodiscard]] nlohmann::json
 make_report(const Options& options, const EngineDescription& description,
             const StartupReport& startup, const EngineSnapshot& initial,

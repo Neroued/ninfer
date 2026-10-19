@@ -523,6 +523,9 @@ template <class Instance>
             const auto kind = static_cast<std::size_t>(complete->sample.work.kind);
             for (const auto& request : flight->requests) {
                 request->executions[kind].observe(complete->sample.latency);
+                if (complete->sample.work.kind == ExecutionKind::Decode)
+                    request->decode_by_batch[flight->requests.size() - 1].observe(
+                        complete->sample.latency);
                 accumulate_gpu(request->max_rank_gpu, complete->sample.max_rank_gpu);
                 request->pending_execution.reset();
             }

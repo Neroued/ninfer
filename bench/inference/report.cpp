@@ -55,6 +55,30 @@ Json duration(const DurationCounter& value, bool has_request_maximum) {
              value.count && has_request_maximum ? Json(value.maximum_ns * 1e-6) : Json(nullptr)}};
 }
 
+Json decode_batches(std::vector<ExecutionExposure> exposures, std::uint32_t target_batch) {
+    Json result = Json::array();
+    for (std::size_t i = 0; i < exposures.size(); ++i) {
+        auto& exposure   = exposures[i];
+        const auto batch = i + 1;
+        if (!exposure.total.count && batch != target_batch) continue;
+        // Every member recorded the same batch step. A complete cohort contains B copies.
+        for (auto member : {&ExecutionExposure::result, &ExecutionExposure::resolution,
+                            &ExecutionExposure::retirement, &ExecutionExposure::total}) {
+            auto& counter = exposure.*member;
+            counter.count /= batch;
+            counter.total_ns /= batch;
+        }
+        result.push_back({{"batch", batch},
+                          {"target", batch == target_batch},
+                          {"steps", exposure.total.count},
+                          {"result", duration(exposure.result, true)},
+                          {"resolution", duration(exposure.resolution, true)},
+                          {"retirement", duration(exposure.retirement, true)},
+                          {"total", duration(exposure.total, true)}});
+    }
+    return result;
+}
+
 const char* finish_name(FinishReason value) {
     switch (value) {
     case FinishReason::None:
@@ -124,12 +148,13 @@ std::string number(const Json& value, int precision = 3) {
 
 } // namespace
 
-Json summarize(std::span<const Repetition> repetitions) {
+Json summarize(std::span<const Repetition> repetitions, std::uint32_t target_batch) {
     ExecutionStatistics execution{};
+    std::vector<ExecutionExposure> decode(target_batch);
     RuntimeHostWorkStats host{};
     SpeculativeStats spec;
     double wall_seconds  = 0;
-    std::uint64_t prompt = 0, computed = 0, reused = 0, output = 0, decode_tokens = 0, requests = 0;
+    std::uint64_t prompt = 0, computed = 0, output = 0, decode_tokens = 0, requests = 0;
     for (const auto& repetition : repetitions) {
         wall_seconds += repetition.wall_seconds;
         const auto& before = repetition.before;
@@ -153,10 +178,15 @@ Json summarize(std::span<const Repetition> repetitions) {
         for (const auto& request : repetition.requests) {
             prompt += request.prompt.prompt_tokens;
             computed += request.stats.computed_prefill_tokens;
-            reused += request.stats.reused_prompt_tokens;
             output += request.generated_token_ids.size();
             for (std::size_t i = 0; i < execution.size(); ++i)
                 observe_maxima(execution[i].exposure, request.stats.executions[i]);
+            const auto& batches = request.stats.decode_by_batch;
+            decode.resize(std::max(decode.size(), batches.size()));
+            for (std::size_t i = 0; i < batches.size(); ++i) {
+                add_exposure(decode[i], {}, batches[i]);
+                observe_maxima(decode[i], batches[i]);
+            }
             const auto& s = request.stats.speculative;
             spec.rounds += s.rounds;
             spec.drafted_tokens += s.drafted_tokens;
@@ -174,7 +204,6 @@ Json summarize(std::span<const Repetition> repetitions) {
              {"wall_seconds", wall_seconds},
              {"prompt_tokens", prompt},
              {"computed_prefill_tokens", computed},
-             {"reused_prompt_tokens", reused},
              {"output_tokens", output},
              {"committed_decode_tokens", decode_tokens},
              {"output_tokens_per_wall_second", throughput(output, wall_seconds)}};
@@ -184,7 +213,6 @@ Json summarize(std::span<const Repetition> repetitions) {
         out["executions"][kExecutions[i]] = {
             {"units", e.units},
             {"rows", e.rows},
-            {"mean_batch", ratio(e.rows, e.units)},
             {"input_tokens", e.input_tokens},
             {"scheduled_positions", e.scheduled_positions},
             {"result", duration(e.exposure.result, has_request_maximum)},
@@ -200,6 +228,7 @@ Json summarize(std::span<const Repetition> repetitions) {
         decode_tokens,
         product::seconds(
             execution[static_cast<std::size_t>(ExecutionKind::Decode)].exposure.total.total_ns));
+    out["decode_by_batch"] = decode_batches(std::move(decode), target_batch);
     for (const auto& field : kHostFields) out["host_ns"][field.name] = host.*field.member;
     out["speculative"] = {{"request_rounds", spec.rounds},
                           {"drafted_tokens", spec.drafted_tokens},
@@ -225,7 +254,7 @@ Json make_report(const Options& options, const EngineDescription& description,
                   {"warmup", options.warmup},
                   {"repetitions", options.repetitions},
                   {"profile_measured", options.profile_measured}}},
-                {"summary", summarize(repetitions)},
+                {"summary", summarize(repetitions, options.concurrency)},
                 {"inputs", Json::array()},
                 {"repetitions", Json::array()}};
     for (const auto& item : config.items)
@@ -241,7 +270,7 @@ Json make_report(const Options& options, const EngineDescription& description,
     }
     for (std::size_t i = 0; i < repetitions.size(); ++i) {
         const auto& repetition = repetitions[i];
-        auto entry             = summarize(repetitions.subspan(i, 1));
+        auto entry             = summarize(repetitions.subspan(i, 1), options.concurrency);
         entry["repetition"]    = i + 1;
         entry["requests"]      = Json::array();
         entry["ranks"]         = Json::array();
@@ -252,7 +281,6 @@ Json make_report(const Options& options, const EngineDescription& description,
                 {{"row", row},
                  {"prompt_tokens", r.prompt.prompt_tokens},
                  {"computed_prefill_tokens", r.stats.computed_prefill_tokens},
-                 {"reused_prompt_tokens", r.stats.reused_prompt_tokens},
                  {"output_tokens", r.generated_token_ids.size()},
                  {"finish_reason", finish_name(r.finish_reason)},
                  {"prepare_seconds", t.prepare_seconds},
@@ -278,87 +306,85 @@ Json make_report(const Options& options, const EngineDescription& description,
 std::string format_report(const Json& report, OutputFormat format) {
     if (format == OutputFormat::Json) return report.dump(2) + '\n';
     std::ostringstream out;
-    const bool csv = format == OutputFormat::Csv;
-    if (csv)
-        out << "repetition,prefill_tokens,prefill_units,prefill_mean_ms,prefill_max_ms,prefill_tok_"
-               "s,decode_steps,decode_mean_ms,decode_max_ms,mean_batch,output_tokens,wall_s\n";
-    else {
-        out << "ninfer_bench  requests=" << report["benchmark"]["concurrency"]
-            << "  warmup=" << report["benchmark"]["warmup"]
-            << "  repetitions=" << report["benchmark"]["repetitions"] << '\n'
-            << "run    prefill tokens/units   mean/max ms      tok/s   decode steps   mean/max ms  "
-               "   mean B   output   wall s\n";
-    }
-    const auto row = [&](const std::string& label, const Json& value) {
-        const auto& p = value["executions"]["prefill"];
-        const auto& d = value["executions"]["decode"];
-        if (csv) {
-            const Json values[] = {value["computed_prefill_tokens"],
-                                   p["units"],
-                                   p["total"]["mean_ms"],
-                                   p["total"]["max_ms"],
-                                   value["prefill_tokens_per_second"],
-                                   d["units"],
-                                   d["total"]["mean_ms"],
-                                   d["total"]["max_ms"],
-                                   d["mean_batch"],
-                                   value["output_tokens"],
-                                   value["wall_seconds"]};
-            out << label;
-            for (const auto& v : values) out << ',' << (v.is_null() ? "" : v.dump());
-            out << '\n';
-        } else {
-            out << std::left << std::setw(7) << label << std::right << std::setw(8)
-                << value["computed_prefill_tokens"].get<std::uint64_t>() << '/' << std::setw(5)
-                << p["units"].get<std::uint64_t>() << "  " << std::setw(7)
-                << number(p["total"]["mean_ms"]) << '/' << std::setw(7)
-                << number(p["total"]["max_ms"]) << std::setw(11)
-                << number(value["prefill_tokens_per_second"], 1) << std::setw(10)
-                << d["units"].get<std::uint64_t>() << "  " << std::setw(8)
-                << number(d["total"]["mean_ms"]) << '/' << std::setw(8)
-                << number(d["total"]["max_ms"]) << std::setw(10) << number(d["mean_batch"], 2)
-                << std::setw(9) << value["output_tokens"].get<std::uint64_t>() << std::setw(9)
-                << number(value["wall_seconds"]) << '\n';
-        }
+    const auto each_run = [&](auto&& emit) {
+        for (const auto& rep : report["repetitions"])
+            emit(std::to_string(rep["repetition"].get<std::uint32_t>()), rep);
+        emit("all", report["summary"]);
     };
-    for (const auto& rep : report["repetitions"])
-        row(std::to_string(rep["repetition"].get<std::uint32_t>()), rep);
-    row("all", report["summary"]);
-    if (!csv) {
-        const auto& summary = report["summary"];
-        const auto& d       = summary["executions"]["decode"];
-        out << "\nDecode observed stages (mean ms): result=" << number(d["result"]["mean_ms"])
-            << "  resolution=" << number(d["resolution"]["mean_ms"])
-            << "  retirement=" << number(d["retirement"]["mean_ms"]) << '\n'
-            << "Host per decode step (ms): "
-            << number(ratio(summary["host_ns"]["decode_host"].get<double>() * 1e-6,
-                            d["units"].get<std::uint64_t>()))
-            << "  scheduler yield: "
-            << number(ratio(summary["host_ns"]["decode_scheduler_yield"].get<double>() * 1e-6,
-                            d["units"].get<std::uint64_t>()))
-            << '\n'
-            << "Speculative tokens: drafted=" << summary["speculative"]["drafted_tokens"]
-            << "  accepted=" << summary["speculative"]["accepted_tokens"]
-            << "  committed=" << summary["speculative"]["committed_draft_tokens"]
-            << "  acceptance=" << number(summary["speculative"]["acceptance"])
-            << "  fallback steps=" << summary["speculative"]["fallback_steps"] << '\n'
-            << "Prompt tokens: " << summary["prompt_tokens"]
-            << "  reused: " << summary["reused_prompt_tokens"]
-            << "  end-to-end output tok/s: " << number(summary["output_tokens_per_wall_second"], 1)
-            << '\n'
-            << "Prefill units include native finalization. Host/GPU intervals overlap execution "
-               "latency.\n";
-        for (const auto& rep : report["repetitions"]) {
-            for (const auto& r : rep["requests"])
-                out << "run " << rep["repetition"] << " row " << r["row"]
-                    << ": prompt=" << r["prompt_tokens"] << " output=" << r["output_tokens"]
-                    << " finish=" << r["finish_reason"].get<std::string>() << '\n';
-            for (const auto& rank : rep["ranks"])
-                out << "run " << rep["repetition"] << " rank " << rank["rank"]
-                    << ": workspace peak=" << rank["workspace_peak_bytes"] << " B"
-                    << "  expert upload=" << number(rank["expert_upload_bytes"], 0)
-                    << " B  PLE upload=" << number(rank["ple_upload_bytes"], 0) << " B\n";
+    if (format == OutputFormat::Csv) {
+        out << "repetition,phase,batch,target,units,mean_ms,max_ms,result_mean_ms,"
+               "resolution_mean_ms,retirement_mean_ms,prefill_tokens,prefill_tok_s\n";
+        const auto row = [&](const std::string& run, const std::string& phase,
+                             const std::vector<Json>& values) {
+            out << run << ',' << phase;
+            for (const auto& value : values) out << ',' << (value.is_null() ? "" : value.dump());
+            out << '\n';
+        };
+        each_run([&](const std::string& run, const Json& value) {
+            const auto& p = value["executions"]["prefill"];
+            row(run, "prefill",
+                {nullptr, nullptr, p["units"], p["total"]["mean_ms"], p["total"]["max_ms"],
+                 p["result"]["mean_ms"], p["resolution"]["mean_ms"], p["retirement"]["mean_ms"],
+                 value["computed_prefill_tokens"], value["prefill_tokens_per_second"]});
+            for (const auto& d : value["decode_by_batch"])
+                row(run, "decode",
+                    {d["batch"], d["target"], d["steps"], d["total"]["mean_ms"],
+                     d["total"]["max_ms"], d["result"]["mean_ms"], d["resolution"]["mean_ms"],
+                     d["retirement"]["mean_ms"], nullptr, nullptr});
+        });
+        return out.str();
+    }
+
+    out << "ninfer_bench  requests=" << report["benchmark"]["concurrency"]
+        << "  warmup=" << report["benchmark"]["warmup"]
+        << "  repetitions=" << report["benchmark"]["repetitions"] << '\n'
+        << "Prefill\n"
+        << "run       tokens   units     mean ms      max ms       tok/s\n";
+    each_run([&](const std::string& run, const Json& value) {
+        const auto& p = value["executions"]["prefill"];
+        out << std::left << std::setw(7) << run << std::right << std::setw(9)
+            << value["computed_prefill_tokens"].get<std::uint64_t>() << std::setw(8)
+            << p["units"].get<std::uint64_t>() << std::setw(12) << number(p["total"]["mean_ms"])
+            << std::setw(12) << number(p["total"]["max_ms"]) << std::setw(12)
+            << number(value["prefill_tokens_per_second"], 1) << '\n';
+    });
+    out << "\nDecode by actual batch\n"
+        << "run     batch  target   steps     mean ms      max ms   result ms  resolve ms   retire "
+           "ms\n";
+    each_run([&](const std::string& run, const Json& value) {
+        for (const auto& d : value["decode_by_batch"]) {
+            out << std::left << std::setw(7) << run << std::right << std::setw(6)
+                << d["batch"].get<std::uint32_t>() << std::setw(8)
+                << (d["target"].get<bool>() ? "yes" : "") << std::setw(8)
+                << d["steps"].get<std::uint64_t>() << std::setw(12) << number(d["total"]["mean_ms"])
+                << std::setw(12) << number(d["total"]["max_ms"]) << std::setw(12)
+                << number(d["result"]["mean_ms"]) << std::setw(12)
+                << number(d["resolution"]["mean_ms"]) << std::setw(12)
+                << number(d["retirement"]["mean_ms"]);
+            if (d["steps"] == 0) out << "  no samples";
+            out << '\n';
         }
+    });
+    const auto& summary = report["summary"];
+    out << "\nSpeculative tokens: drafted=" << summary["speculative"]["drafted_tokens"]
+        << "  accepted=" << summary["speculative"]["accepted_tokens"]
+        << "  committed=" << summary["speculative"]["committed_draft_tokens"]
+        << "  acceptance=" << number(summary["speculative"]["acceptance"])
+        << "  fallback steps=" << summary["speculative"]["fallback_steps"] << '\n'
+        << "Prompt tokens: " << summary["prompt_tokens"]
+        << "  output tokens: " << summary["output_tokens"]
+        << "  measured wall: " << number(summary["wall_seconds"]) << " s\n"
+        << "Prefill units include native finalization. Preparation is outside measurement.\n";
+    for (const auto& rep : report["repetitions"]) {
+        for (const auto& r : rep["requests"])
+            out << "run " << rep["repetition"] << " row " << r["row"]
+                << ": prompt=" << r["prompt_tokens"] << " output=" << r["output_tokens"]
+                << " finish=" << r["finish_reason"].get<std::string>() << '\n';
+        for (const auto& rank : rep["ranks"])
+            out << "run " << rep["repetition"] << " rank " << rank["rank"]
+                << ": workspace peak=" << rank["workspace_peak_bytes"] << " B"
+                << "  expert upload=" << number(rank["expert_upload_bytes"], 0)
+                << " B  PLE upload=" << number(rank["ple_upload_bytes"], 0) << " B\n";
     }
     return out.str();
 }

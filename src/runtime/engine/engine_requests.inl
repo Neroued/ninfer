@@ -373,6 +373,7 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
         result.stats.prefix_reuse_path    = request->begin->prefix_reuse_path;
     }
     result.stats.executions             = request->executions;
+    result.stats.decode_by_batch        = std::move(request->decode_by_batch);
     result.stats.max_rank_gpu           = request->max_rank_gpu;
     result.stats.timings.vision_seconds = request->max_rank_gpu[3].total_ns * 1.0e-9;
     const auto work_seconds             = [&](ExecutionKind kind) {

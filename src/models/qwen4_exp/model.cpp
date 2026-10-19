@@ -11,4 +11,11 @@ ModelShard::ModelShard(std::shared_ptr<const ModelDefinition> definition,
 
 ModelShard::~ModelShard() = default;
 
+std::size_t ModelShard::metadata_bytes() const {
+    const auto* table = std::get_if<DevicePleTable>(&ple_);
+    auto bytes        = table ? table->decode.size() : 0;
+    for (const auto& bank : local_banks_) bytes += bank.bytes();
+    return bytes;
+}
+
 } // namespace ninfer::models::qwen4_exp

@@ -21,17 +21,6 @@
 
 namespace ninfer::runtime::detail {
 
-inline std::size_t device_budget(std::size_t available) {
-    const char* value = std::getenv("NINFER_VRAM_BUDGET_MIB");
-    if (!value) return available;
-    const std::string_view text(value);
-    std::uint64_t mib = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), mib);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !mib ||
-        mib > std::numeric_limits<std::size_t>::max() / (1024ULL * 1024))
-        throw std::invalid_argument("NINFER_VRAM_BUDGET_MIB requires a positive MiB integer");
-    return std::min(available, static_cast<std::size_t>(mib * 1024 * 1024));
-}
 
 template <class Plan>
 struct CalibratedPlan {

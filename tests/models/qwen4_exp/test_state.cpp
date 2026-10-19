@@ -26,7 +26,7 @@ q4::Config config(bool mtp) {
 
 void image(DeviceContext& device, bool mtp) {
     LayoutBuilder b;
-    const auto layout = q4::plan_state_image(b, config(mtp), 2);
+    const auto layout = q4::plan_state_image(b, config(mtp), config(mtp).text.gdn, 2);
     DeviceBuffer backing(device.device(), b.finish());
     q4::StateViews state(backing.span(), layout);
     PinnedHostBuffer expected(state.storage().image_bytes()),

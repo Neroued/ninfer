@@ -16,11 +16,13 @@ struct StateLayout {
     LinearAttentionStateLayout gdn;
     QsaTailLayout main_qsa;
     StateField ple_history, sample_hidden;
+    std::optional<StateField> ple_tokens;
     std::optional<StateField> conditioning;
     std::optional<QsaTailLayout> mtp_qsa;
 };
 
-[[nodiscard]] StateLayout plan_state_image(LayoutBuilder&, const Config&, std::int32_t slots);
+[[nodiscard]] StateLayout plan_state_image(LayoutBuilder&, const Config&, const GdnConfig&,
+                                           std::int32_t slots, bool device_ple = false);
 
 class StateViews {
 public:

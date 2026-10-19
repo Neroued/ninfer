@@ -68,8 +68,8 @@ void TextRun::mixer(std::uint32_t i) {
                     cuda_);
     }
     if (const auto* g = std::get_if<GdnParameters>(&p.mixer)) {
-        gdn(roots_.input, config.gdn, *g, batch_, execution_.states.gdn(), state.state_index,
-            update_, config.norm_epsilon, roots_.output, arena, cuda_);
+        gdn(roots_.input, parameters_.profile->local.gdn, *g, batch_, execution_.states.gdn(),
+            state.state_index, update_, config.norm_epsilon, roots_.output, arena, cuda_);
     } else {
         ops::QsaRawRecordWriteView records;
         if (!std::holds_alternative<SequenceSlots>(update_)) {
@@ -83,7 +83,7 @@ void TextRun::mixer(std::uint32_t i) {
                                ? std::nullopt
                                : std::optional{execution_.states.main_tail(
                                      state.state_index, batch_.destination_slots)};
-        qsa(roots_.input, config.qsa, std::get<QsaParameters>(p.mixer), batch_,
+        qsa(roots_.input, parameters_.profile->local.qsa, std::get<QsaParameters>(p.mixer), batch_,
             execution_.states.main_tail(state.state_index, batch_.source_slots), after,
             execution_.cache.layer(state.state_index), records, roots_.output, arena, cuda_);
     }

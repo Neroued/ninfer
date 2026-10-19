@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/model.h"
+#include "models/qwen4_exp/parallel/weights.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -14,6 +15,12 @@ public:
     ResolvedLoadPlan& operator=(const ResolvedLoadPlan&)     = delete;
 
     [[nodiscard]] const ModelDefinition& definition() const { return *definition_; }
+
+    [[nodiscard]] const RankPlan& rank_plan() const { return rank_; }
+
+    [[nodiscard]] std::span<const BoundWeight> weight_data() const {
+        return descriptions_.empty() ? definition_->weight_data() : descriptions_;
+    }
 
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const {
         return materialization_;
@@ -30,6 +37,9 @@ private:
                                          std::shared_ptr<const ModelDefinition>, Device,
                                          std::optional<Device>,
                                          std::shared_ptr<const ple::disk::Table>);
+    friend ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,
+                                              std::shared_ptr<const ModelDefinition>, RankPlan,
+                                              Device);
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
     ResolvedLoadPlan(const artifact::Reader&, std::shared_ptr<const ModelDefinition>,
@@ -40,6 +50,10 @@ private:
     artifact::MaterializationPlan materialization_;
     std::vector<Device> devices_, bank_devices_;
     std::shared_ptr<const ple::disk::Table> ple_;
+    RankPlan rank_;
+    std::optional<WeightSelection> selection_;
+    std::vector<WeightParent> parents_;
+    std::vector<BoundWeight> descriptions_;
 };
 
 [[nodiscard]] ResolvedLoadPlan resolve_load(const artifact::Reader&,
@@ -48,5 +62,8 @@ private:
                                             std::shared_ptr<const ple::disk::Table> table = {});
 [[nodiscard]] std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                             const StartupObserver* = nullptr);
+[[nodiscard]] ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,
+                                                 std::shared_ptr<const ModelDefinition>, RankPlan,
+                                                 Device);
 
 } // namespace ninfer::models::qwen4_exp

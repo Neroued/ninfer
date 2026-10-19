@@ -28,13 +28,6 @@ void outside_capture(CudaExecutionView execution) {
     }
 }
 
-ExpertMatrixEntryLayout add_matrix(LayoutBuilder& builder, const WeightBankLayout& matrix) {
-    const auto add = [&](const WeightBankPlane& plane) {
-        return plane.expert_bytes ? builder.add(plane.expert_bytes, 16, "expert plane")
-                                  : LayoutRegion{};
-    };
-    return {add(matrix.codes), add(matrix.high), add(matrix.scales)};
-}
 
 } // namespace
 
@@ -57,8 +50,8 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankCacheSpe
         layout.count    = bank.gate_up.region.count;
         layout.resident = bank.resident;
         LayoutBuilder entry;
-        layout.gate_up     = add_matrix(entry, bank.gate_up);
-        layout.down        = add_matrix(entry, bank.down);
+        layout.gate_up     = plan_expert_matrix(entry, bank.gate_up);
+        layout.down        = plan_expert_matrix(entry, bank.down);
         layout.entry_bytes = entry.finish(256, "expert entry");
         for (const auto* matrix : {&bank.gate_up, &bank.down}) {
             layout.payload_bytes += matrix->codes.expert_bytes + matrix->high.expert_bytes +

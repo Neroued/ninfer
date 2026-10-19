@@ -77,9 +77,9 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
                                     : working.slice(2, (step - 1) % 2, 1).view({channels, batch});
     auto next           = working.slice(2, step % 2, 1).view({channels, batch});
     auto sample         = packed_tensor(frame.sample, {hidden, batch});
-    execution::mtp_forward(parameters.profile->config.text, *parameters.mtp, previous, call, before,
-                           after, resources.mtp->layer(0), {sample, next}, resources.workspace,
-                           cuda);
+    execution::mtp_forward(parameters.profile->config.text, parameters.profile->local.qsa,
+                           *parameters.mtp, previous, call, before, after, resources.mtp->layer(0),
+                           {sample, next}, resources.workspace, cuda);
     auto logits = packed_tensor(*buffers.logits,
                                 {dimension(parameters.profile->config.text.vocabulary), batch});
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
@@ -145,7 +145,8 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
                 indices};
         }
     }
-    execution::mtp_history(parameters.profile->config.text, *parameters.mtp, aligned, metadata,
+    execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
+                           *parameters.mtp, aligned, metadata,
                            resources.states->mtp_tail(metadata.source_slots),
                            resources.states->mtp_tail(metadata.destination_slots),
                            resources.mtp->layer(0), visual, resources.workspace, cuda);

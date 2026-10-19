@@ -120,6 +120,8 @@ struct CopyRange {
     std::uint64_t object_offset  = 0;
     std::uint64_t divisor_offset = 0;
     std::span<std::byte> divisors;
+    std::uint64_t pattern_offset = 0, row_bytes = 0, rows = 1;
+    std::uint64_t source_stride = 0, destination_stride = 0;
 };
 
 struct ReadSpan {
@@ -131,11 +133,13 @@ struct ReadSpan {
 
 std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
     std::vector<ReadSpan> spans;
+    bool overlaps          = false;
+    std::uint64_t furthest = 0;
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         const auto& range = ranges[i];
-        if (i && ranges[i - 1].file == range.file && ranges[i - 1].end > range.begin) {
-            throw ArtifactError("tensor source ranges overlap");
-        }
+        if (!i || ranges[i - 1].file != range.file) furthest = 0;
+        overlaps |= range.begin < furthest;
+        furthest         = std::max(furthest, range.end);
         const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
         if (spans.empty() || spans.back().file != range.file ||
             begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
@@ -147,6 +151,7 @@ std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
 
     // Host-only payloads can be filled in place. Keep shared boundary pages and CPU/GPU
     // fanout in staging so every file byte is read once and GPU uploads remain asynchronous.
+    if (overlaps) return spans;
     std::vector<ReadSpan> reads;
     std::size_t next_range = 0;
     for (const auto& span : spans) {
@@ -154,11 +159,11 @@ std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
         while (next_range < ranges.size() && ranges[next_range].file == span.file &&
                ranges[next_range].begin < span.end) {
             const auto& range = ranges[next_range++];
-            if (!range.host || range.device) continue;
+            if (!range.host || range.device || range.rows != 1) continue;
             const auto begin = align_up(range.begin, kPayloadAlignment, "Host direct range");
             const auto end   = range.end / kPayloadAlignment * kPayloadAlignment;
             if (begin >= end) continue;
-            auto* destination = range.host + begin - range.begin;
+            auto* destination = range.host + range.pattern_offset + begin - range.begin;
             if (reinterpret_cast<std::uintptr_t>(destination) % kPayloadAlignment) continue;
             if (cursor < begin) reads.push_back({span.file, cursor, begin});
             reads.push_back({span.file, begin, end, destination});
@@ -184,11 +189,14 @@ void validate_divisors(std::span<float> values, const std::string& name) {
 MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&& other) noexcept {
     if (this != &other) {
         host_registration_ = {};
-        objects_.clear();
+        resources_.clear();
+        tensors_.clear();
         host_storage_      = std::move(other.host_storage_);
         host_registration_ = std::move(other.host_registration_);
         device_storage_    = std::move(other.device_storage_);
-        objects_           = std::move(other.objects_);
+        resources_         = std::move(other.resources_);
+        tensors_           = std::move(other.tensors_);
+        object_storage_    = std::move(other.object_storage_);
         stats_             = other.stats_;
     }
     return *this;
@@ -206,26 +214,37 @@ CudaHostView MaterializedArtifact::host_transfer_view(ObjectHandle handle) const
 
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
     if (!has_device(handle)) { throw ArtifactError("object has no device weight backing"); }
-    return *objects_[handle.index].device;
+    return *tensors_[object_storage_[handle.index]->index].device;
+}
+
+const WeightParent& MaterializedArtifact::parent(StorageId id, Device device) const {
+    const auto& tensor = tensors_.at(id.index);
+    const auto& value  = device == Device::cpu() ? tensor.host : tensor.device;
+    if (!value || value->device != device)
+        throw ArtifactError("tensor has no backing on requested device");
+    return *value;
 }
 
 const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || !objects_[handle.index].host) {
+    if (handle.index >= object_storage_.size() || !object_storage_[handle.index])
         throw ArtifactError("object has no Host weight backing");
-    }
-    return *objects_[handle.index].host;
+    return parent(*object_storage_[handle.index], Device::cpu());
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
-    if (handle.index >= objects_.size()) { throw ArtifactError("object has no Host backing"); }
-    const auto& object = objects_[handle.index];
-    if (object.host) { return {object.host->data, object.host->geometry.bytes}; }
-    if (!object.host_data.empty()) { return object.host_data; }
+    if (handle.index >= resources_.size()) { throw ArtifactError("object has no Host backing"); }
+    const auto& bytes = resources_[handle.index];
+    if (object_storage_[handle.index]) {
+        const auto& tensor = tensors_[object_storage_[handle.index]->index];
+        if (tensor.host) return {tensor.host->data, tensor.host->geometry.bytes};
+    }
+    if (!bytes.empty()) { return bytes; }
     throw ArtifactError("object has no retained Host bytes");
 }
 
 bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
-    return handle.index < objects_.size() && objects_[handle.index].device.has_value();
+    return handle.index < object_storage_.size() && object_storage_[handle.index] &&
+           tensors_[object_storage_[handle.index]->index].device.has_value();
 }
 
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
@@ -250,13 +269,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (const auto* placements :
          {&plan.device_objects, &plan.ordinary_host_objects, &plan.registered_host_objects}) {
         for (const auto& placement : *placements) {
-            total = checked_add(total, placement.region.bytes, "materialized payload bytes");
+            for (const auto& copy : plan.tensors.at(placement.storage.index).copies)
+                total = checked_add(total, checked_mul(copy.bytes, copy.count, "copy payload"),
+                                    "materialized payload bytes");
         }
     }
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
                             total);
     MaterializedArtifact out;
-    out.objects_.resize(plan.object_count);
+    out.resources_.resize(plan.object_count);
+    out.tensors_.resize(plan.tensors.size());
+    out.object_storage_              = plan.objects;
     out.stats_.file_bytes            = reader.file_bytes();
     out.stats_.read_bytes            = plan.resources.read_bytes;
     out.stats_.owned_value_bytes     = plan.resources.owned_value_bytes;
@@ -282,33 +305,42 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (auto& resource : plan.resources.objects) {
         reader.validate_object(resource.object);
         const auto& object = reader.directory().object(resource.object);
-        auto& storage      = out.objects_.at(resource.object.index);
-        if (std::holds_alternative<TensorObject>(object) || !storage.host_data.empty() ||
+        auto& storage      = out.resources_.at(resource.object.index);
+        if (std::holds_alternative<TensorObject>(object) || !storage.empty() ||
             resource.data.size() != object_bytes(object)) {
             throw ArtifactError("invalid prepared resource");
         }
         out.stats_.retained_host_bytes += resource.data.size();
-        storage.host_data = std::move(resource.data);
+        storage = std::move(resource.data);
     }
     const auto place = [&](const std::vector<TensorPlacement>& placements, MemorySpan backing,
                            bool on_device, std::size_t alignment = 1) {
         LayoutBuilder layout;
         for (const auto& placement : placements) {
-            const auto& g       = reader.geometry(placement.object);
-            const auto expected = on_device
-                                      ? layout.add(g.bytes, g.alignment, "weight placement")
-                                      : plan_host_tensor_region(layout, reader, placement.object);
-            const auto& region  = placement.region;
+            const auto& tensor = plan.tensors.at(placement.storage.index);
+            const auto& g      = tensor.geometry;
+            const auto expected =
+                !on_device && tensor.whole_object
+                    ? plan_host_tensor_region(layout, reader, *tensor.whole_object)
+                    : layout.add(g.bytes, g.alignment, "weight placement");
+            const auto& region = placement.region;
             if (region.offset != expected.offset || region.bytes != expected.bytes ||
                 region.alignment != expected.alignment) {
                 throw ArtifactError("weight placement differs from its encoded geometry");
             }
-            auto& object = out.objects_.at(placement.object.index);
+            auto& object = out.tensors_.at(placement.storage.index);
             auto& parent = on_device ? object.device : object.host;
             if (parent) { throw ArtifactError("duplicate tensor placement"); }
             const auto bytes = region.bind(backing);
             parent = WeightParent{g, bytes.device, static_cast<const std::byte*>(bytes.data), {}};
             if (!on_device) { out.stats_.retained_host_bytes += g.bytes; }
+            if (!tensor.whole_object) {
+                if (on_device)
+                    check_cuda(cudaMemsetAsync(bytes.data, 0, bytes.bytes, stream),
+                               "initialize encoded padding");
+                else
+                    std::memset(bytes.data, 0, bytes.bytes);
+            }
         }
         if (layout.finish(alignment) != backing.bytes) {
             throw ArtifactError("weight backing capacity differs from placements");
@@ -321,22 +353,33 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
           false);
     place(plan.device_objects, out.device_storage_.span(), true);
     std::vector<CopyRange> ranges;
-    for (std::size_t i = 0; i < out.objects_.size(); ++i) {
-        auto& object = out.objects_[i];
-        if (!object.host && !object.device) { continue; }
-        const auto& descriptor = reader.directory().tensor({i});
-        const auto& geometry   = reader.geometry({i});
-        object.weight_divisors.resize(geometry.divisor_count);
+    for (std::size_t i = 0; i < out.tensors_.size(); ++i) {
+        auto& object       = out.tensors_[i];
+        const auto& tensor = plan.tensors[i];
+        object.weight_divisors.resize(tensor.geometry.divisor_count);
         const auto divisors = std::as_writable_bytes(std::span(object.weight_divisors));
-        for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
-            const auto address = [&](const std::optional<WeightParent>& parent) {
-                return parent ? const_cast<std::byte*>(parent->data) + segment.destination_offset
-                              : nullptr;
-            };
-            ranges.push_back({segment.file_index, segment.file_offset,
-                              checked_add(segment.file_offset, segment.bytes, "copy range"),
-                              address(object.host), address(object.device),
-                              segment.destination_offset, geometry.divisor_offset, divisors});
+        for (const auto& copy : tensor.copies) {
+            const auto& source = reader.directory().tensor(copy.object);
+            if (!copy.count || !copy.bytes) throw ArtifactError("empty encoded copy");
+            const auto extent =
+                checked_add(checked_mul(copy.count - 1, copy.source_stride, "encoded copy extent"),
+                            copy.bytes, "encoded copy extent");
+            if (copy.source > source.bytes || extent > source.bytes - copy.source ||
+                copy.destination > tensor.geometry.bytes ||
+                checked_add(checked_mul(copy.count - 1, copy.destination_stride, "copy extent"),
+                            copy.bytes, "copy extent") > tensor.geometry.bytes - copy.destination)
+                throw ArtifactError("encoded copy exceeds backing");
+            for (const auto& segment : reader.segments(source.offset + copy.source, extent)) {
+                const auto address = [&](const std::optional<WeightParent>& parent) {
+                    return parent ? const_cast<std::byte*>(parent->data) + copy.destination
+                                  : nullptr;
+                };
+                ranges.push_back(
+                    {segment.file_index, segment.file_offset, segment.file_offset + segment.bytes,
+                     address(object.host), address(object.device), copy.destination,
+                     tensor.geometry.divisor_offset, divisors, segment.destination_offset,
+                     copy.bytes, copy.count, copy.source_stride, copy.destination_stride});
+            }
         }
     }
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
@@ -400,39 +443,76 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
             const auto chunk_end  = checked_add(source, received, "read block end");
             bool uploaded         = false;
-            while (next_range < ranges.size() && ranges[next_range].file == span.file &&
-                   ranges[next_range].begin < chunk_end) {
-                const auto& range = ranges[next_range];
-                const auto begin  = std::max(source, range.begin);
-                const auto end    = std::min(chunk_end, range.end);
-                if (begin < end) {
-                    const auto* bytes = destination + begin - source;
+            while (next_range < ranges.size() &&
+                   (ranges[next_range].file < span.file ||
+                    (ranges[next_range].file == span.file && ranges[next_range].end <= source)))
+                ++next_range;
+            for (auto index = next_range;
+                 index < ranges.size() && ranges[index].file == span.file &&
+                 ranges[index].begin < chunk_end;
+                 ++index) {
+                const auto& range = ranges[index];
+                const auto begin  = std::max(source, range.begin),
+                           end    = std::min(chunk_end, range.end);
+                if (begin >= end) continue;
+                const auto first_byte = range.pattern_offset + begin - range.begin;
+                const auto last_byte  = range.pattern_offset + end - range.begin;
+                auto row              = range.rows == 1 ? 0 : first_byte / range.source_stride;
+                while (row < range.rows) {
+                    const auto row_begin = row * range.source_stride;
+                    if (row_begin >= last_byte) break;
+                    const auto first = std::max(first_byte, row_begin);
+                    const auto last  = std::min(last_byte, row_begin + range.row_bytes);
+                    if (first >= last) {
+                        ++row;
+                        continue;
+                    }
+                    auto count = std::uint64_t{1};
+                    if (range.rows > 1 && first == row_begin && last == row_begin + range.row_bytes)
+                        count = std::min(range.rows - row,
+                                         1 + (last_byte - row_begin - range.row_bytes) /
+                                                 range.source_stride);
+                    const auto offset = row * range.destination_stride + first - row_begin;
+                    const auto* bytes = destination + begin - source + first - first_byte;
+                    const auto width  = last - first;
                     if (!range.divisors.empty()) {
-                        const auto object_begin = range.object_offset + begin - range.begin;
-                        const auto first        = std::max(object_begin, range.divisor_offset);
-                        const auto last         = std::min(object_begin + end - begin,
-                                                           range.divisor_offset + range.divisors.size());
-                        if (first < last) {
-                            std::memcpy(range.divisors.data() + first - range.divisor_offset,
-                                        bytes + first - object_begin, last - first);
+                        for (std::uint64_t n = 0; n < count; ++n) {
+                            const auto object_begin =
+                                range.object_offset + offset + n * range.destination_stride;
+                            const auto a = std::max(object_begin, range.divisor_offset);
+                            const auto b = std::min(object_begin + width,
+                                                    range.divisor_offset + range.divisors.size());
+                            if (a < b)
+                                std::memcpy(range.divisors.data() + a - range.divisor_offset,
+                                            bytes + n * range.source_stride + a - object_begin,
+                                            b - a);
                         }
                     }
                     if (range.host) {
-                        auto* target = range.host + begin - range.begin;
-                        if (target != bytes) std::memcpy(target, bytes, end - begin);
-                        copied = checked_add(copied, end - begin, "materialized payload bytes");
+                        for (std::uint64_t n = 0; n < count; ++n) {
+                            auto* target      = range.host + offset + n * range.destination_stride;
+                            const auto* input = bytes + n * range.source_stride;
+                            if (target != input) std::memcpy(target, input, width);
+                        }
+                        copied += width * count;
                     }
                     if (range.device) {
-                        check_cuda(cudaMemcpyAsync(range.device + begin - range.begin, bytes,
-                                                   end - begin, cudaMemcpyHostToDevice, stream),
-                                   "upload weight bytes");
+                        if (count == 1)
+                            check_cuda(cudaMemcpyAsync(range.device + offset, bytes, width,
+                                                       cudaMemcpyHostToDevice, stream),
+                                       "upload weight bytes");
+                        else
+                            check_cuda(cudaMemcpy2DAsync(range.device + offset,
+                                                         range.destination_stride, bytes,
+                                                         range.source_stride, width, count,
+                                                         cudaMemcpyHostToDevice, stream),
+                                       "upload weight rows");
                         uploaded = true;
-                        copied   = checked_add(copied, end - begin, "materialized payload bytes");
-                        uploaded_bytes = checked_add(uploaded_bytes, end - begin, "H2D bytes");
+                        copied += width * count;
+                        uploaded_bytes += width * count;
                     }
+                    row += count;
                 }
-                if (range.end > chunk_end) { break; }
-                ++next_range;
             }
             if (uploaded) {
                 check_cuda(cudaEventRecord(slot->event, stream),
@@ -443,13 +523,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
     }
     if (cuda) { completion.finish(); }
-    if (copied != total || next_range != ranges.size()) {
-        throw ArtifactError("incomplete tensor materialization");
-    }
-    for (std::size_t i = 0; i < out.objects_.size(); ++i) {
-        auto& object = out.objects_[i];
+    if (copied != total) { throw ArtifactError("incomplete tensor materialization"); }
+    for (std::size_t i = 0; i < out.tensors_.size(); ++i) {
+        auto& object = out.tensors_[i];
         if (!object.host && !object.device) { continue; }
-        validate_divisors(object.weight_divisors, reader.directory().tensor({i}).id);
+        validate_divisors(object.weight_divisors, "materialized tensor " + std::to_string(i));
         if (object.host) { object.host->weight_divisors = object.weight_divisors; }
         if (object.device) { object.device->weight_divisors = object.weight_divisors; }
     }

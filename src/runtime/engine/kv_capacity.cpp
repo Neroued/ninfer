@@ -47,6 +47,31 @@ std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
 
 } // namespace
 
+std::vector<KvCapacityResolution>
+resolve_group_kv_capacity(const KvCapacityPolicy& policy,
+                          std::span<const RankCapacityOffer> offers) {
+    if (offers.empty()) throw std::invalid_argument("capacity negotiation requires owners");
+    std::uint32_t pages = UINT32_MAX;
+    const auto tokens   = offers.front().curve.primary_page_tokens;
+    for (const auto& offer : offers) {
+        if (offer.curve.primary_page_tokens != tokens)
+            throw std::invalid_argument("capacity owners disagree on logical page extent");
+        pages = std::min(
+            pages,
+            resolve_kv_capacity(policy, offer.curve, offer.available_bytes).primary_page_groups);
+    }
+    std::vector<KvCapacityResolution> result;
+    for (const auto& offer : offers) {
+        const auto resolved = offer.curve.resolved_tokens(pages);
+        auto local = resolve_kv_capacity(KvCapacityPolicy::explicit_capacity(resolved), offer.curve,
+                                         offer.available_bytes);
+        local.mode = policy.mode;
+        local.automatic_headroom_bytes = policy.automatic_headroom_bytes;
+        result.push_back(local);
+    }
+    return result;
+}
+
 std::size_t SequenceCapacityCurve::reservation_bytes(std::uint32_t primary_page_groups) const {
     validate_curve(*this);
     if (primary_page_groups < minimum_primary_page_groups ||

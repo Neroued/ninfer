@@ -15,7 +15,8 @@
 
 namespace ninfer::test {
 void materialization_cuda_errors(DeviceContext& device);
-}
+void encoded_slice_checks(std::optional<CudaExecutionView>);
+} // namespace ninfer::test
 
 namespace {
 
@@ -200,7 +201,8 @@ void failure_and_host_only(DeviceContext& device) {
     Binder binder(reader);
     const auto resource = binder.resource("text", "tokenizer.json");
     auto backing =
-        materialize(reader, plan_materialization(reader, {}, std::move(binder).finish()));
+        materialize(reader, plan_materialization(reader, std::span<const PlacementRequest>{},
+                                                 std::move(binder).finish()));
     require(backing.stats().device_capacity_bytes == 0 && backing.stats().h2d_bytes == 0 &&
                 backing.host_bytes(resource).size() == 5,
             "Host-only demand allocated device weights");
@@ -239,15 +241,16 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
         if (writer_fixture) { requests.push_back({reader.find("nvfp4"), Device::cpu()}); }
         auto plan = plan_materialization(reader, requests, std::move(binder).finish());
         for (const auto& placement : plan.device_objects) {
-            auto bytes = reader.read_object(placement.object);
-            if (writer_fixture && reader.directory().tensor(placement.object).id == "matrix") {
+            const auto object = plan.tensors.at(placement.storage.index).whole_object.value();
+            auto bytes        = reader.read_object(object);
+            if (writer_fixture && reader.directory().tensor(object).id == "matrix") {
                 require(bytes.size() == 130 * 130 * 2, "Python writer changed tensor dimensions");
                 for (std::size_t i = 0; i < bytes.size(); ++i) {
                     require(bytes[i] == std::byte((i * 37 + 11) % 251),
                             "C++ reading differs from known Python writer input bytes");
                 }
             }
-            expected.emplace(placement.object.index, std::move(bytes));
+            expected.emplace(object.index, std::move(bytes));
         }
         storage.emplace(materialize(reader, std::move(plan), device.transfer_view()));
         if (writer_fixture) {
@@ -351,6 +354,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--cpu-only") {
             cpu_materialization();
+            ninfer::test::encoded_slice_checks({});
             std::cout << "CPU-only tensor and resource materialization passed\n";
             return 0;
         }
@@ -371,6 +375,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("expected [--artifact|--writer-fixture PATH]");
         }
         materialization(device);
+        ninfer::test::encoded_slice_checks(device.transfer_view());
         registered_materialization(device);
         failure_and_host_only(device);
         ninfer::test::materialization_cuda_errors(device);

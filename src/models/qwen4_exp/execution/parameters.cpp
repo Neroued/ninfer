@@ -73,10 +73,15 @@ public:
         out.moe.bank                = m.bank;
         out.moe.activation_divisors = profile.moe.activation_divisors;
         out.moe.control             = linear({m.router, m.shared_score}).weight;
-        out.moe.shared   = {linear({m.shared_gate, m.shared_up}), linear({m.shared_down})};
-        const auto& bank = model_.expert_banks()[m.bank.index];
-        if (bank.gate_up.parent->device.type() == DeviceType::CUDA)
-            out.moe.resident = device_expert_bank(bank.gate_up, bank.down);
+        out.moe.shared = {linear({m.shared_gate, m.shared_up}), linear({m.shared_down})};
+        if (const auto* bank = model_.resident_experts(m.bank)) {
+            out.moe.resident = bank->view();
+            out.moe.subset   = {ops::ExpertSubsetKind::MaskOnes, bank->mask()};
+        } else {
+            const auto& source = model_.expert_banks()[m.bank.index];
+            if (source.gate_up.parent->device.type() == DeviceType::CUDA)
+                out.moe.resident = device_expert_bank(source.gate_up, source.down);
+        }
         return out;
     }
 private:

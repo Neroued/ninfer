@@ -2,6 +2,7 @@
 #include "runtime/engine/startup_memory.h"
 
 #include <iostream>
+#include <array>
 #include <stdexcept>
 
 namespace {
@@ -36,6 +37,21 @@ int main() {
         ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(50), curve, 10000);
     failures += check(capped.primary_page_groups == 6 && capped.resolved_tokens == 384,
                       "automatic KV capacity exceeded or missed the target maximum");
+
+    const std::array offers{ninfer::runtime::RankCapacityOffer{curve, 2000},
+                            ninfer::runtime::RankCapacityOffer{{64, 2, 6, 1500, 256}, 2100}};
+    const auto common =
+        ninfer::runtime::resolve_group_kv_capacity(ninfer::KvCapacityPolicy::automatic(0), offers);
+    failures += check(common[0].primary_page_groups == 4 && common[1].primary_page_groups == 4 &&
+                          common[0].runtime_reservation_bytes == 1256 &&
+                          common[1].runtime_reservation_bytes == 2012,
+                      "group capacity did not preserve common pages and local byte costs");
+    bool group_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_group_kv_capacity(
+            ninfer::KvCapacityPolicy::explicit_capacity(320), offers);
+    } catch (const std::invalid_argument&) { group_rejected = true; }
+    failures += check(group_rejected, "group capacity silently reduced an explicit request");
 
     const auto explicit_capacity = ninfer::runtime::resolve_kv_capacity(
         ninfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200);

@@ -2,12 +2,13 @@
 add_library(ninfer_model_loading STATIC
   registry.cpp
   common/bindings.cpp
+  common/parallel.cpp
   common/weights.cpp
   common/moe/weights.cpp
   qwen4_exp/ple/parameters.cpp
   qwen4_exp/ple/disk/table.cpp)
 ninfer_internal_includes(ninfer_model_loading)
-target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops)
+target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops ninfer_deployment)
 
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC

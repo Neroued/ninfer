@@ -12,6 +12,8 @@ class Reader;
 
 namespace ninfer::models::qwen4_exp::ple {
 
+enum class Placement { Disk, Device };
+
 inline constexpr std::uint32_t kHeads             = 16;
 inline constexpr std::uint32_t kRowElements       = 160;
 inline constexpr std::uint32_t kEmbeddingElements = kHeads * kRowElements;

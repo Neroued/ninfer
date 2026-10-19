@@ -21,6 +21,28 @@ struct BankDescription {
     MatrixSource gate_up, down;
 };
 
+struct ResidentExpertEntry {
+    std::uint32_t expert;
+    const WeightParent* gate_up;
+    const WeightParent* down;
+};
+
+// Owns immutable global-ID metadata; payloads are borrowed from final local weight storage.
+class ResidentExpertBank {
+public:
+    ResidentExpertBank(std::span<const ResidentExpertEntry>, std::uint32_t global_count, Device);
+
+    [[nodiscard]] const ExpertBankDeviceView& view() const { return view_; }
+
+    [[nodiscard]] const Tensor& mask() const { return mask_; }
+
+    [[nodiscard]] std::size_t bytes() const { return metadata_.size(); }
+private:
+    DeviceBuffer metadata_;
+    ExpertBankDeviceView view_;
+    Tensor mask_;
+};
+
 // Logical expert order must form affine gate/up and down banks in the stored parents.
 [[nodiscard]] BankDescription describe_bank(const artifact::Reader&,
                                             std::span<const ExpertBinding>);

@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/planning.h"
+#include "models/qwen4_exp/parallel/plan.h"
 #include "core/platform.h"
 #include "models/common/context/storage.h"
 #include "ninfer/ops/sampling.h"
@@ -14,15 +15,18 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
     PersistentLayout out;
     const auto slots = std::uint64_t(o.max_concurrency) + o.context_cache.extra_state_slots.value();
     if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
-    out.state = plan_state_image(b, p.config, slots);
-    out.main  = plan_qsa_cache(b, p.config.text.qsa, p.config.text.qsa_layers, o.max_context, pages,
+    out.state = plan_state_image(b, p.config, p.local.gdn, slots,
+                                 p.ple_placement == ple::Placement::Device);
+    out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context, pages,
                                o.max_concurrency, o.kv_cache);
     if (p.mtp)
         out.mtp =
-            plan_qsa_cache(b, p.config.text.qsa, 1, o.max_context,
+            plan_qsa_cache(b, p.local.qsa, 1, o.max_context,
                            pages + o.max_concurrency * ((o.speculative.draft_tokens + 63) / 64),
                            o.max_concurrency, o.kv_cache);
-    out.buffers = plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens);
+    out.buffers = plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
+                               p.local.vocabulary, p.local.rank, p.local.size,
+                               p.ple_placement == ple::Placement::Device);
     out.bytes   = b.finish(256);
     return out;
 }
@@ -93,10 +97,18 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
                                                device.multiprocessor_count(), schedule);
     out.ple.max_positions =
         std::max(o.prefill_chunk, o.max_concurrency * (o.speculative.draft_tokens + 1));
-    out.ple_upload         = ple::UploadSlots::memory(out.ple.max_positions, 2);
-    out.ple_prepare_bytes  = ple::disk::PrepareService::memory_bytes(table, out.ple, 2);
-    out.host_context_bytes = context::host_context_capacity(
-        o.context_cache.host_capacity_bytes, out.persistent.state.images.image_stride);
+    if (out.profile->ple_placement == ple::Placement::Disk) {
+        out.ple_upload        = ple::UploadSlots::memory(out.ple.max_positions, 2);
+        out.ple_prepare_bytes = ple::disk::PrepareService::memory_bytes(table, out.ple, 2);
+    }
+    if (out.profile->local.size > 1 && o.context_cache.host_capacity_bytes.value_or(0)) {
+        throw std::invalid_argument("Qwen4Exp distributed context uses device-resident storage");
+    }
+    out.host_context_bytes =
+        out.profile->local.size > 1
+            ? 0
+            : context::host_context_capacity(o.context_cache.host_capacity_bytes,
+                                             out.persistent.state.images.image_stride);
     // Keep all per-call metadata in the pinned ingress as well as input IDs/positions.
     out.pinned_io_bytes = out.persistent.buffers.batch.accepted_columns.region.offset +
                           out.persistent.buffers.batch.accepted_columns.region.bytes -
@@ -214,6 +226,20 @@ ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> pr
     plan.capacity.resolved_tokens           = o.max_concurrency * 64;
     plan.capacity.runtime_reservation_bytes = plan.device_reservation_bytes();
     return plan;
+}
+
+runtime::SequenceCapacityCurve
+describe_execution_capacity(std::shared_ptr<const execution::ModelProfile> profile,
+                            const EngineOptions& supplied, DeviceContext& device) {
+    const auto o = options(*profile, supplied);
+    if (profile->local.size == 1)
+        throw std::invalid_argument("resident rank capacity requires partitioned execution");
+    const auto logical = (o.max_context + 63) / 64;
+    const auto minimum = std::max(logical, o.max_concurrency);
+    const auto base    = physical_plan(profile, {}, o, device, minimum, nullptr);
+    const auto next    = persistent(*profile, o, minimum + 1).bytes;
+    return {64, minimum, logical * o.max_concurrency, base.device_reservation_bytes(),
+            next - base.persistent.bytes};
 }
 
 } // namespace ninfer::models::qwen4_exp

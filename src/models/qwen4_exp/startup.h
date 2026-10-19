@@ -51,6 +51,8 @@ private:
     std::shared_ptr<const ple::disk::Table> table_;
 };
 
+[[nodiscard]] qwen::Frontend create_frontend(const ModelDefinition&, const EngineOptions&);
+
 [[nodiscard]] std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters&,
                                                                ExecutionPlan&&, DeviceContext&,
                                                                const StartupObserver&);

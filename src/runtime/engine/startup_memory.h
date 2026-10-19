@@ -4,6 +4,8 @@
 
 namespace ninfer::runtime {
 
+[[nodiscard]] std::size_t device_budget(std::size_t available);
+
 // Startup has one Device owner. Snapshots are taken with its transfers and work settled.
 // Re-read after destroying a candidate: retained driver storage is already charged.
 // Headroom cushions planning; the Host reservation must remain after initialization.

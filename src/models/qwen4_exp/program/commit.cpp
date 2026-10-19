@@ -101,9 +101,9 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
         }
         const auto call = mtp_inputs(frame.history, rows, k, {inputs.data(), rows.size()});
         auto rebuilt    = mtp_working_tail(1, batch);
-        execution::mtp_history(parameters.profile->config.text, *parameters.mtp, aligned, call,
-                               tail, rebuilt, resources.mtp->layer(0), {}, resources.workspace,
-                               cuda);
+        execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
+                               *parameters.mtp, aligned, call, tail, rebuilt,
+                               resources.mtp->layer(0), {}, resources.workspace, cuda);
         tail = rebuilt;
     }
     const auto destination = resources.states->mtp_tail(metadata.destination_slots);

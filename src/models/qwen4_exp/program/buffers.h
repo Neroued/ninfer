@@ -45,10 +45,14 @@ struct BufferLayout {
     std::optional<GdnReplayRecordLayout> gdn_records;
     std::optional<MtpBufferLayout> mtp;
     std::optional<TensorRegion> logits;
+    std::optional<TensorRegion> ple_embedding, gathered_logits;
+    std::optional<LayoutRegion> vocabulary_candidates;
     std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 
 [[nodiscard]] BufferLayout plan_buffers(LayoutBuilder&, const Config&, const EngineOptions&,
-                                        std::uint32_t chunk, std::uint32_t public_tokens);
+                                        std::uint32_t chunk, std::uint32_t public_tokens,
+                                        const GdnConfig&, std::uint32_t local_vocabulary,
+                                        std::uint32_t rank, std::uint32_t ranks, bool device_ple);
 } // namespace ninfer::models::qwen4_exp

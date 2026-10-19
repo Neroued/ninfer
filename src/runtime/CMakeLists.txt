@@ -28,8 +28,10 @@ target_link_libraries(ninfer_engine PRIVATE
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_ENABLE_DISTRIBUTED)
-  add_library(ninfer_runtime_distributed STATIC executor/protocol.cpp executor/resources.cpp)
+  add_library(ninfer_runtime_distributed STATIC executor/protocol.cpp executor/resources.cpp
+    executor/preparation.cpp)
   ninfer_internal_includes(ninfer_runtime_distributed)
-  target_link_libraries(ninfer_runtime_distributed PUBLIC ninfer_distributed_control)
+  target_link_libraries(ninfer_runtime_distributed PUBLIC ninfer_distributed_control ninfer_runtime_support)
+  target_sources(ninfer_engine PRIVATE engine/worker.cpp)
   target_link_libraries(ninfer_engine PRIVATE ninfer_runtime_distributed)
 endif()

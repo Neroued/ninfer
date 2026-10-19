@@ -53,12 +53,15 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
                                    plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
                                                     : moe::ResourcePurpose::Execution);
     }
-    ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
-    ple_prepare = std::make_unique<ple::disk::PrepareService>(
-        p.model.ple_table(), p.profile->config.text.ple.eos, plan.ple, ple_upload->host_slots());
-    if (ple_prepare->memory_bytes() != plan.ple_prepare_bytes ||
-        ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
-        throw std::logic_error("PLE allocated capacity differs from the execution plan");
+    if (const auto* table =
+            std::get_if<std::shared_ptr<const ple::disk::Table>>(&p.model.ple_table())) {
+        ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
+        ple_prepare = std::make_unique<ple::disk::PrepareService>(
+            **table, p.profile->config.text.ple.eos, plan.ple, ple_upload->host_slots());
+        if (ple_prepare->memory_bytes() != plan.ple_prepare_bytes ||
+            ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
+            throw std::logic_error("PLE allocated capacity differs from the execution plan");
+    }
     states->storage().clear_all(device.execution_view());
     if (plan.persistent.buffers.mtp) {
         const auto& region = plan.persistent.buffers.mtp->row_indices;

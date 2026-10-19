@@ -75,7 +75,7 @@ void check_placement(const q35::ResolvedLoadPlan& plan) {
         std::set<std::size_t> parents;
         std::uint64_t end = 0;
         for (const auto& item : objects) {
-            require(parents.insert(item.object.index).second,
+            require(parents.insert(item.storage.index).second,
                     "parent was planned twice at one location");
             require(item.region.offset >= end && item.region.offset % item.region.alignment == 0,
                     "weight placement overlaps or is unaligned");
@@ -312,8 +312,9 @@ int main(int argc, char** argv) {
             parents.insert(parents.end(), placement.registered_host_objects.begin(),
                            placement.registered_host_objects.end());
             for (const auto& item : parents) {
-                const auto& object   = reader.directory().tensor(item.object);
-                const auto& geometry = reader.geometry(item.object);
+                const auto& object = reader.directory().tensor(
+                    placement.tensors.at(item.storage.index).whole_object.value());
+                const auto& geometry = placement.tensors.at(item.storage.index).geometry;
 
                 const auto size = std::min<std::uint64_t>(64, object.bytes);
                 std::set<std::uint64_t> offsets{0, (object.bytes - size) / 2, object.bytes - size};

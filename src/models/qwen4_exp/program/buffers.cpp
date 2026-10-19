@@ -5,7 +5,9 @@
 
 namespace ninfer::models::qwen4_exp {
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
-                          std::uint32_t chunk, std::uint32_t public_tokens) {
+                          std::uint32_t chunk, std::uint32_t public_tokens, const GdnConfig& gdn,
+                          std::uint32_t local_vocabulary, std::uint32_t rank, std::uint32_t ranks,
+                          bool device_ple) {
     const auto hidden = dimension(c.text.hidden), channels = dimension(c.text.residual_width());
     const auto index_key = dimension(c.text.qsa.index_key_width());
     const auto batch     = static_cast<std::int32_t>(o.max_concurrency);
@@ -48,9 +50,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
             tensor(DType::BF16, {channels, width, batch}, "pending conditioning");
         out.gdn_records = plan_gdn_replay_records(
             b, {static_cast<std::int32_t>(c.text.gdn_layers), batch, width,
-                dimension(c.text.gdn.conv_channels()), dimension(c.text.gdn.key_heads),
-                dimension(c.text.gdn.value_heads), dimension(c.text.gdn.key_dim),
-                dimension(c.text.gdn.value_dim)});
+                dimension(gdn.conv_channels()), dimension(gdn.key_heads),
+                dimension(gdn.value_heads), dimension(gdn.key_dim), dimension(gdn.value_dim)});
         auto& mtp           = out.mtp.emplace();
         const auto metadata = [&](std::int32_t n, bool visual) {
             MtpBatchLayout out;
@@ -92,10 +93,21 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         mtp.token_counts     = tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch},
                                       "MTP provisional token counts");
     }
+    if (device_ple)
+        out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},
+                                   "PLE lookup and merge");
+    if (ranks > 1) {
+        out.vocabulary_candidates =
+            b.add(std::size_t(width) * batch * ranks * sizeof(std::uint64_t), 256,
+                  "vocabulary candidates");
+        if (rank == 0)
+            out.gathered_logits = tensor(DType::BF16, {dimension(c.text.vocabulary), width * batch},
+                                         "global sampling logits");
+    }
     const bool scoring = o.purpose == EnginePurpose::CausalScoring;
     if (!scoring) {
         out.logits =
-            tensor(DType::BF16, {static_cast<std::int32_t>(c.text.vocabulary), width * batch},
+            tensor(DType::BF16, {static_cast<std::int32_t>(local_vocabulary), width * batch},
                    "head logits");
         out.sampled_ids   = tensor(DType::I32, {width, batch}, "generated IDs");
         out.output_counts = rows();

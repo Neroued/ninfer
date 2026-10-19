@@ -42,15 +42,15 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         {
             auto scope = a.scope();
             if (const auto* g = std::get_if<GdnProfile>(&layer.mixer)) {
-                (void)workspace::gdn(a, p.config.text.gdn, columns, prefill);
+                (void)workspace::gdn(a, p.local.gdn, columns, prefill);
                 scratch(
                     ops::gdn_control_proj_workspace_capacity_bytes(g->control, minimum, columns));
                 if (prefill) {
                     scratch(ops::linear_split_workspace_capacity_bytes(g->input, g->input_rows,
                                                                        first, last));
                     scratch(ops::gated_delta_net_workspace_capacity_bytes(
-                        dimension(p.config.text.gdn.key_heads),
-                        dimension(p.config.text.gdn.value_heads), first, last));
+                        dimension(p.local.gdn.key_heads), dimension(p.local.gdn.value_heads), first,
+                        last));
                 } else if (last == 1) {
                     scratch(ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                         g->input, batch, 1, 1));
@@ -61,19 +61,21 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 scratch(linear(g->output, minimum, columns));
             } else {
                 const auto& q = std::get<QsaProfile>(layer.mixer);
-                (void)workspace::qsa(a, p.config.text.qsa, columns, prefill || mtp);
+                (void)workspace::qsa(a, p.local.qsa, columns, prefill || mtp);
                 scratch(qsa_projection_workspace_bytes(q, minimum, columns));
                 scratch(ops::qsa_indexer_workspace_capacity_bytes(first, last, batch,
                                                                   {options.max_context}));
                 scratch(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                    options.kv_cache, dimension(p.config.text.qsa.query_heads),
-                    dimension(p.config.text.qsa.kv_heads), first, last, batch,
-                    {options.max_context}, sm_count));
+                    options.kv_cache, dimension(p.local.qsa.query_heads),
+                    dimension(p.local.qsa.kv_heads), first, last, batch, {options.max_context},
+                    sm_count));
                 scratch(linear(q.output, minimum, columns));
             }
         }
         scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, minimum, columns));
-        scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns));
+        scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
+                                     p.local.size > 1 ? ops::ExpertSubsetKind::MaskOnes
+                                                      : ops::ExpertSubsetKind::All));
         if (!mtp && offload) {
             scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns));
         }
@@ -120,7 +122,7 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
     }
     if (o.purpose == EnginePurpose::CausalScoring) {
         WorkspaceLayoutBuilder a;
-        (void)workspace::score(a, p.config.text.vocabulary, head_columns);
+        (void)workspace::score(a, p.local.vocabulary, head_columns);
         (void)a.alloc_bytes(out.finish);
         out.finish = a.peak_bytes();
     }

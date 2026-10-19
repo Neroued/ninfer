@@ -2,10 +2,19 @@
 
 #include "models/qwen4_exp/definition.h"
 #include "models/qwen4_exp/ple/disk/table.h"
+#include "models/qwen4_exp/parallel/plan.h"
+#include "ninfer/ops/ple.h"
 
 namespace ninfer::models::qwen4_exp {
 
 class ResolvedLoadPlan;
+
+struct DevicePleTable {
+    DeviceBuffer decode;
+    std::vector<ops::Nf4EmbeddingShard> shards;
+};
+
+using PleTable = std::variant<std::shared_ptr<const ple::disk::Table>, DevicePleTable>;
 
 // Local immutable weight storage. Borrowers finish before its backing is released.
 class ModelShard {
@@ -28,7 +37,15 @@ public:
         return backing_.stats();
     }
 
-    [[nodiscard]] const ple::disk::Table& ple_table() const { return *ple_; }
+    [[nodiscard]] const PleTable& ple_table() const { return ple_; }
+
+    [[nodiscard]] const RankPlan& rank_plan() const { return rank_; }
+
+    [[nodiscard]] const moe::ResidentExpertBank* resident_experts(ExpertBankId id) const {
+        return local_banks_.empty() ? nullptr : &local_banks_.at(id.index);
+    }
+
+    [[nodiscard]] std::size_t metadata_bytes() const;
 
 private:
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
@@ -39,9 +56,12 @@ private:
 
     std::shared_ptr<const ModelDefinition> definition_;
     artifact::MaterializedArtifact backing_;
-    std::shared_ptr<const ple::disk::Table> ple_;
+    PleTable ple_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
+    RankPlan rank_;
+    std::vector<WeightParent> local_parents_;
+    std::vector<moe::ResidentExpertBank> local_banks_;
 };
 
 } // namespace ninfer::models::qwen4_exp

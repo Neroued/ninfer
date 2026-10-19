@@ -8,8 +8,6 @@
 
 namespace ninfer::ops::detail::moe_complete {
 
-inline constexpr int kSliceTokens = 4096;
-
 namespace kernel = moe_cuda;
 using kernel::routing::RouterAlgorithm;
 
@@ -23,6 +21,13 @@ struct Plan {
 struct ShapePolicy {
     Plan (*select)(int tokens, int shared_intermediate, ExpertSubsetKind subset);
     std::span<const int> allocation_boundaries;
+    int masked_slice_tokens = 4096;
+
+    int slice_tokens(ExpertSubsetKind subset) const {
+        return subset == ExpertSubsetKind::MaskOnes || subset == ExpertSubsetKind::MaskZeros
+                   ? masked_slice_tokens
+                   : 4096;
+    }
 };
 
 const ShapePolicy& shape_dispatch(const MoeProfile& profile);

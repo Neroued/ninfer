@@ -2,9 +2,50 @@
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/compute.cuh"
 
 #include <algorithm>
+#include <climits>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::nvfp4 {
 namespace {
+
+template <int Columns, class Function>
+void with_nvfp4_tuning(Nvfp4Pipeline pipeline, Nvfp4CachePolicy cache, Function&& function) {
+    const auto memory = [&]<int RequestedStages, int RequestedK>() {
+        // Keep one complete stage within the Spark shared-memory budget. Wider
+        // column tiles trade pipeline depth for accumulator and activation reuse.
+        constexpr int k           = RequestedK;
+        constexpr int stage_bytes = (128 + Columns) * k * 9 / 16;
+        constexpr int limit       = (96 * 1024 - Columns * 4) / stage_bytes;
+        constexpr int stages      = RequestedStages < limit ? RequestedStages : limit;
+        static_assert(stages >= 1);
+        switch (static_cast<int>(cache) & 12) {
+        case 0:
+            function.template operator()<stages, k, 0>();
+            break;
+        case 4:
+            function.template operator()<stages, k, 4>();
+            break;
+        case 12:
+            function.template operator()<stages, k, 12>();
+            break;
+        default:
+            throw std::logic_error("invalid NVFP4 MoE cache policy");
+        }
+    };
+    switch (pipeline) {
+    case Nvfp4Pipeline::K128:
+        memory.template operator()<2, 128>();
+        break;
+    case Nvfp4Pipeline::K256Deep:
+        memory.template operator()<3, 256>();
+        break;
+    case Nvfp4Pipeline::K512:
+        memory.template operator()<1, 512>();
+        break;
+    default:
+        throw std::logic_error("invalid NVFP4 MoE pipeline");
+    }
+}
+
 __global__ void quantize_input(const __nv_bfloat16* x, std::uint8_t* codes, std::uint8_t* scales,
                                float divisor, int tokens, int* counts, float* routed_sum,
                                bool clear_counts) {
@@ -23,32 +64,64 @@ __global__ void quantize_input(const __nv_bfloat16* x, std::uint8_t* codes, std:
     }
 }
 
-template <bool Gate, int Columns, bool Atomic = false>
+template <bool Gate, int Columns, bool Atomic, int Stages, int KStep, int Eviction,
+          bool CachedExpertMajor = false>
 void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
-                const Storage& s, const Plan& plan, CudaExecutionView execution) {
-    using S               = Schedule<Columns, Gate>;
+                const Storage& s, const Plan& plan, CudaExecutionView execution,
+                int minimum_expert_count = 0, int maximum_expert_count = 0x7fffffff) {
+    using S               = Schedule<Columns, Gate, Stages, KStep, Eviction>;
     constexpr int rows    = Gate ? kIntermediate : kHidden;
     const int job_columns = plan.job_columns();
     const int subtiles    = job_columns / Columns;
     const int max_jobs    = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
     const int blocks      = std::min(max_jobs * (rows / S::rows),
                                      execution.multiprocessor_count() * plan.queued_ctas_per_sm);
-    grouped_mma<Columns, Gate, Atomic><<<blocks, S::threads, 0, execution.stream()>>>(
+    constexpr auto kernel =
+        grouped_mma<Columns, Gate, Atomic, Stages, KStep, Eviction, CachedExpertMajor>;
+    constexpr int bytes = sizeof(TileStorage<S>) > 48 * 1024 ? sizeof(TileStorage<S>) : 0;
+    if constexpr (bytes) {
+        static const auto status =
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        CUDA_CHECK(status);
+    }
+    kernel<<<blocks, S::threads, bytes, execution.stream()>>>(
         Gate ? s.input_codes : s.product_codes,
         static_cast<const std::uint8_t*>(Gate ? s.input_scales : s.product_scales),
         Gate ? experts.bank.gate_up : experts.bank.down,
         Gate ? *experts.activation_divisors.gate_up : *experts.activation_divisors.down,
         *experts.activation_divisors.down, s.groups, s.product_codes,
         static_cast<std::uint8_t*>(s.product_scales), s.contributions,
-        static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles);
+        static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles,
+        plan.nvfp4.down_row_window, static_cast<int>(plan.nvfp4.cache), minimum_expert_count,
+        maximum_expert_count);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Gate, class Function>
+template <bool Gate, int Columns, bool Atomic = false>
+void launch_tuned_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
+                      const Storage& s, const Plan& plan, CudaExecutionView execution,
+                      int minimum_expert_count = 0, int maximum_expert_count = 0x7fffffff) {
+    if (plan.nvfp4.pipeline == Nvfp4Pipeline::K128 &&
+        plan.nvfp4.cache == Nvfp4CachePolicy::Cached && (Gate || plan.nvfp4.down_row_window == 0)) {
+        launch_mma<Gate, Columns, Atomic, 2, 128, 0, true>(
+            x, experts, routes, s, plan, execution, minimum_expert_count, maximum_expert_count);
+        return;
+    }
+    with_nvfp4_tuning<Columns>(
+        plan.nvfp4.pipeline, plan.nvfp4.cache, [&]<int Stages, int KStep, int Eviction>() {
+            launch_mma<Gate, Columns, Atomic, Stages, KStep, Eviction>(
+                x, experts, routes, s, plan, execution, minimum_expert_count, maximum_expert_count);
+        });
+}
+
+template <class Function>
 void with_columns(int columns, Function&& function) {
     switch (columns) {
     case 8:
         function.template operator()<8>();
+        break;
+    case 16:
+        function.template operator()<16>();
         break;
     case 32:
         function.template operator()<32>();
@@ -77,25 +150,48 @@ void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const Stora
 
 void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                     const Plan& plan, const Storage& s, CudaExecutionView execution) {
-    with_columns<true>(plan.gate_columns, [&]<int C>() {
-        launch_mma<true, C>(x, experts, routes, s, plan, execution);
-    });
+    const int limit  = plan.dense.gate_columns ? plan.small_expert_limit : INT_MAX;
+    const auto phase = [&]<bool Gate>() {
+        const auto project = [&](const Plan& tuning, int first, int last) {
+            with_columns(Gate ? tuning.gate_columns : tuning.down_columns, [&]<int C>() {
+                const auto launch = [&]<bool Atomic>() {
+                    launch_tuned_mma<Gate, C, Atomic>(x, experts, routes, s, tuning, execution,
+                                                      first, last);
+                };
+                if constexpr (Gate) {
+                    launch.template operator()<false>();
+                } else if constexpr (C == 128) {
+                    if (!plan.atomic_output)
+                        throw std::logic_error("NVFP4 down128 requires atomic output");
+                    launch.template operator()<true>();
+                } else if (plan.atomic_output) {
+                    launch.template operator()<true>();
+                } else {
+                    launch.template operator()<false>();
+                }
+            });
+        };
+        const auto load_class = [&](const Nvfp4LoadSchedule& schedule, int first, int last) {
+            auto tuning               = plan;
+            tuning.group_columns      = plan.job_columns();
+            tuning.gate_columns       = schedule.gate_columns;
+            tuning.down_columns       = schedule.down_columns;
+            tuning.nvfp4              = schedule.tuning;
+            tuning.queued_ctas_per_sm = schedule.queued_ctas_per_sm;
+            project(tuning, first, last);
+        };
+        project(plan, 0, limit);
+        if (plan.medium.gate_columns) load_class(plan.medium, limit, plan.medium.max_load);
+        if (plan.dense.gate_columns)
+            load_class(plan.dense, plan.medium.gate_columns ? plan.medium.max_load : limit,
+                       INT_MAX);
+    };
+    phase.template operator()<true>();
     if (plan.column_major_down) {
         launch_column_jobs(s.groups, x.ne[1], plan.job_columns(), plan.preserve_balanced_down,
                            execution);
     }
-    with_columns<false>(plan.down_columns, [&]<int C>() {
-        if constexpr (C == 128) {
-            if (!plan.atomic_output) {
-                throw std::logic_error("NVFP4 down128 requires atomic output");
-            }
-            launch_mma<false, C, true>(x, experts, routes, s, plan, execution);
-        } else if (plan.atomic_output) {
-            launch_mma<false, C, true>(x, experts, routes, s, plan, execution);
-        } else {
-            launch_mma<false, C>(x, experts, routes, s, plan, execution);
-        }
-    });
+    phase.template operator()<false>();
 }
 
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
@@ -110,7 +206,7 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
         s.vector_activation);
     CUDA_CHECK(cudaGetLastError());
     const auto down = [&](auto output) {
-        vector_down<4><<<dim3(kHidden / 4, x.ne[1]), kTopK * 32, 0, stream>>>(
+        vector_down<8, 2><<<dim3(kHidden / 8, x.ne[1]), 2 * 32, 0, stream>>>(
             s.vector_activation, experts.bank.down, ids, coefficients, subset.kind, mask, output);
         CUDA_CHECK(cudaGetLastError());
     };

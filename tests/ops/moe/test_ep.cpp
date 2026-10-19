@@ -119,8 +119,12 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
         // Change route, mask and global-ID index contents under the captured envelope.
         w.publish(replay == 1 ? 1 : 0, replay == 2);
         routes = make_routes(w, m, c.distribution.c_str(), c.hits);
-        if (c.distribution == "jobs2" || c.distribution == "jobs3") {
-            const int limit = c.distribution == "jobs2" ? 256 : 257;
+        if (c.distribution == "jobs2" || c.distribution == "jobs3" ||
+            c.distribution.starts_with("count")) {
+            const int limit = c.distribution.starts_with("count")
+                                  ? std::stoi(c.distribution.substr(5))
+                              : c.distribution == "jobs2" ? 256
+                                                          : 257;
             for (int t = 0; t < m; ++t)
                 for (int j = 0; j < K; ++j)
                     routes.ids[std::size_t(t) * K + j] =
@@ -233,6 +237,18 @@ int main(int argc, char** argv) {
                         add(m, "all");
                     if (fp8)
                         for (int m : {3071, 3072, 3073}) add(m, "all");
+                    if (!fp8) {
+                        for (int m : {769, 2049}) add(m, "all");
+                        add(8193, "independent", -1, true);
+                        for (auto [tokens, count] : {std::pair{128, 17},
+                                                     {512, 33},
+                                                     {512, 129},
+                                                     {2048, 65},
+                                                     {8192, 128},
+                                                     {8192, 513}})
+                            add(tokens, "count" + std::to_string(count), -1, true);
+                        add(8193, "mixed", -1, true, true);
+                    }
                     for (int m : {8, 128, 4096}) {
                         add(m, "zero");
                         add(m, "skew");

@@ -16,6 +16,7 @@ struct Options {
     std::string distribution = "mixed", placement = "contiguous", side = "0", format = "nvfp4";
     std::string operation   = "routed";
     int shared_intermediate = 320;
+    int hits                = -1;
 };
 
 Options parse(int argc, char** argv) {
@@ -26,8 +27,9 @@ Options parse(int argc, char** argv) {
             std::cout << "512 logical experts, 256 physical payloads, global TopK10.\n"
                          "--format nvfp4|fp8 --tokens T[,T...]\n"
                          "--operation routed|routed-shared|complete|decomposed\n"
-                         "--shared-intermediate 320|640 --distribution zero|all|mixed|skew|sweep\n"
-                         "--placement contiguous|interleaved|both --side 0|1|both\n";
+                         "--shared-intermediate 320|640 --distribution "
+                         "zero|all|mixed|independent|skew|sweep\n"
+                         "--hits 0..10 --placement contiguous|interleaved|both --side 0|1|both\n";
             bm::help();
             std::exit(0);
         }
@@ -45,6 +47,8 @@ Options parse(int argc, char** argv) {
             o.distribution = v;
         else if (flag == "--placement")
             o.placement = v;
+        else if (flag == "--hits")
+            o.hits = bm::integer(v, 0, 10);
         else if (flag == "--side")
             o.side = v;
         else
@@ -55,7 +59,8 @@ Options parse(int argc, char** argv) {
          o.operation != "decomposed") ||
         (o.shared_intermediate != 320 && o.shared_intermediate != 640) ||
         (o.distribution != "zero" && o.distribution != "all" && o.distribution != "mixed" &&
-         o.distribution != "skew" && o.distribution != "sweep") ||
+         o.distribution != "independent" && o.distribution != "skew" &&
+         o.distribution != "sweep") ||
         (o.placement != "contiguous" && o.placement != "interleaved" && o.placement != "both") ||
         (o.side != "0" && o.side != "1" && o.side != "both"))
         throw std::invalid_argument("invalid EP options");
@@ -113,11 +118,12 @@ int main(int argc, char** argv) try {
             full.routed = weights.experts();
             const ops::MoeProfile profile{weights.profile(), ops::swiglu_profile(full.shared)};
             const auto distributions =
-                o.distribution == "sweep" ? std::vector<std::string>{"zero", "all", "mixed", "skew"}
-                                          : std::vector<std::string>{o.distribution};
+                o.distribution == "sweep"
+                    ? std::vector<std::string>{"zero", "all", "mixed", "independent", "skew"}
+                    : std::vector<std::string>{o.distribution};
             for (const auto& distribution : distributions) {
                 for (int m : o.tokens) {
-                    auto routes = ep::make_routes(weights, m, distribution.c_str());
+                    auto routes = ep::make_routes(weights, m, distribution.c_str(), o.hits);
                     auto input  = make_bf16(std::size_t(ep::H) * m, 871, -.7F, .7F);
                     std::vector<std::uint16_t> values(std::size_t(ep::H) * m);
                     input.copy_to_host(values.data(), input.size());

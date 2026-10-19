@@ -59,7 +59,7 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
     if (shared) { detail::validate_shared_profile(*shared, profile.ffn.hidden); }
     const int shared_intermediate = shared ? shared->intermediate : 0;
     return detail::interval_capacity(
-        first, last, shape.allocation_boundaries, impl::kSliceTokens, [&](int tokens) {
+        first, last, shape.allocation_boundaries, shape.slice_tokens(subset), [&](int tokens) {
             WorkspaceLayoutBuilder layout;
             (void)allocate(layout, shape.select(profile.ffn, tokens, shared_intermediate), tokens,
                            subset, shared_intermediate,
@@ -96,9 +96,10 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         return;
     }
     const int shared_intermediate = shared_profile ? shared_profile->intermediate : 0;
-    for (std::int64_t start = 0; start < tokens; start += impl::kSliceTokens) {
+    const int slice               = shape.slice_tokens(subset.kind);
+    for (std::int64_t start = 0; start < tokens; start += slice) {
         const int offset = static_cast<int>(start);
-        const int count  = std::min(tokens - offset, impl::kSliceTokens);
+        const int count  = std::min(tokens - offset, slice);
         const auto input = x.slice(1, offset, count);
         auto output      = destination.slice(1, offset, count);
         const ExpertRoutes selection =

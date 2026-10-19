@@ -584,6 +584,10 @@ void add_shared320_cases(OpSuite& suite, bool fp8) {
         add(tokens, ExpertSubsetKind::None, true, DType::BF16, MoeEpilogue::Write);
     }
     add(512, ExpertSubsetKind::All, true, DType::BF16, MoeEpilogue::Write);
+    if (!fp8) {
+        add(8193, ExpertSubsetKind::MaskZeros, true, DType::BF16, MoeEpilogue::AddResidual);
+        add(8193, ExpertSubsetKind::MaskOnes, false, DType::FP32, MoeEpilogue::Write);
+    }
     add(128, ExpertSubsetKind::None, false, DType::BF16, MoeEpilogue::Write);
     add(4096, ExpertSubsetKind::None, false, DType::BF16, MoeEpilogue::AddResidual);
     catalogue.push_back({"moe/" + format + "/shared_i320/profile_mismatch", {{"format", format}}});

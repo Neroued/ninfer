@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops {
 enum class Cache { ca, cg };
@@ -48,6 +49,20 @@ __device__ __forceinline__ uint4 streaming_load(const uint4* input) {
 
 __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+}
+
+__device__ __forceinline__ std::uint64_t l2_streaming_policy() {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.L2::evict_unchanged.b64 %0, 1.0;"
+                 : "=l"(policy));
+    return policy;
+}
+
+__device__ __forceinline__ std::uint64_t l2_retained_policy() {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.L2::evict_unchanged.b64 %0, 1.0;"
+                 : "=l"(policy));
+    return policy;
 }
 
 // Permute eight-element vectors within each 64-element row sector.

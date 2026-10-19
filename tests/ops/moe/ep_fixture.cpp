@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <tuple>
 #include <string>
@@ -292,17 +293,34 @@ Routes make_routes(const Weights& w, int tokens, const char* distribution, int f
     result.coefficients.resize(result.ids.size());
     result.per_expert.assign(E, 0);
     const std::string kind = distribution;
+    std::mt19937 rng(1729);
+    std::array<int, E> pool;
     for (int t = 0; t < tokens; ++t) {
+        if (kind == "independent") {
+            std::iota(pool.begin(), pool.end(), 0);
+            if (fixed_hits < 0) {
+                std::shuffle(pool.begin(), pool.end(), rng);
+            } else {
+                std::shuffle(pool.begin(), pool.begin() + Local, rng);
+                std::shuffle(pool.begin() + Local, pool.end(), rng);
+            }
+        }
         const int hits  = fixed_hits >= 0                   ? fixed_hits
                           : kind == "zero"                  ? 0
                           : kind == "all" || kind == "skew" ? K
                                                             : (t * 7 + 3) % 11;
         int actual_hits = 0;
         for (int j = 0; j < K; ++j) {
-            const bool local                   = j < hits;
-            const int ordinal                  = kind == "skew" ? j : (t * 13 + j * 97) % Local;
-            const int e                        = local ? w.local_id(ordinal) : w.remote_id(ordinal);
-            result.ids[std::size_t(t) * K + j] = e;
+            int e;
+            if (kind == "independent") {
+                e = fixed_hits < 0 ? pool[j]
+                    : j < hits     ? w.local_id(pool[j])
+                                   : w.remote_id(pool[Local + j - hits] - Local);
+            } else {
+                const int ordinal = kind == "skew" ? j : (t * 13 + j * 97) % Local;
+                e                 = j < hits ? w.local_id(ordinal) : w.remote_id(ordinal);
+            }
+            result.ids[std::size_t(t) * K + j]          = e;
             result.coefficients[std::size_t(t) * K + j] = .01F * (j + 1) + .003F * (t % 3);
             if (w.active(e)) {
                 ++result.per_expert[e];

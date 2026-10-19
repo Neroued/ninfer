@@ -64,7 +64,7 @@ std::size_t topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& p
     detail::validate_interval(first, last);
     detail::validate_subset_kind(subset);
     return detail::interval_capacity(
-        first, last, shape.allocation_boundaries, impl::kSliceTokens, [&](int tokens) {
+        first, last, shape.allocation_boundaries, shape.slice_tokens(subset), [&](int tokens) {
             WorkspaceLayoutBuilder layout;
             (void)allocate(layout, shape.select(tokens, profile.shared.intermediate, subset),
                            tokens, profile, subset);
@@ -92,9 +92,10 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
                                       profile, subset.kind, mode, tokens, tokens));
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxSwiGLUMoe, nvtx::Category::Moe, tokens);
-    for (std::int64_t start = 0; start < tokens; start += impl::kSliceTokens) {
+    const int slice = shape.slice_tokens(subset.kind);
+    for (std::int64_t start = 0; start < tokens; start += slice) {
         const int offset   = static_cast<int>(start);
-        const int count    = std::min(tokens - offset, impl::kSliceTokens);
+        const int count    = std::min(tokens - offset, slice);
         const auto plan    = shape.select(count, profile.shared.intermediate, subset.kind);
         const auto input   = x.slice(1, offset, count);
         auto output        = destination.slice(1, offset, count);

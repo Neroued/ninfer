@@ -9,9 +9,35 @@ inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
 
 enum class SharedAlgorithm { Vector, Mma };
 
+enum class Nvfp4Pipeline { K128, K256Deep, K512 };
+
+// Low bits bypass L1 for weight/input codes; high bits request L2 eviction
+// priorities for streaming weights and reused activations. Scales stay cached.
+enum class Nvfp4CachePolicy {
+    Cached           = 0,
+    BypassWeightL1   = 1,
+    BypassL1         = 3,
+    StreamingWeights = 5,
+    StreamingAll     = 7,
+    RetainInputs     = 13,
+};
+
+struct Nvfp4Tuning {
+    Nvfp4Pipeline pipeline = Nvfp4Pipeline::K128;
+    Nvfp4CachePolicy cache = Nvfp4CachePolicy::Cached;
+    int down_row_window    = 0;
+};
+
+struct Nvfp4LoadSchedule {
+    int gate_columns = 0, down_columns = 0;
+    int max_load = 0x7fffffff;
+    Nvfp4Tuning tuning;
+    int queued_ctas_per_sm = 6;
+};
+
 struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
-    // belonging to one expert. Public entries split total M into slices <= 4096.
+    // belonging to one expert. The entry policy owns the maximum slice size.
     QType format     = QType::NVFP4;
     int gate_columns = 0, down_columns = 0;
     bool vector                = false;
@@ -28,7 +54,14 @@ struct Plan {
     int shared_columns     = 32;
     int queued_ctas_per_sm = 0;
 
-    int job_columns() const { return gate_columns > down_columns ? gate_columns : down_columns; }
+    Nvfp4Tuning nvfp4;
+    int group_columns = 0, small_expert_limit = 0;
+    Nvfp4LoadSchedule medium, dense;
+
+    int job_columns() const {
+        const int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        return columns > group_columns ? columns : group_columns;
+    }
 };
 
 struct Groups {
@@ -40,6 +73,7 @@ struct Groups {
     int* jobs;
     int* assignments;
     int* inverse;
+    int* load_range;
 };
 
 struct Storage {

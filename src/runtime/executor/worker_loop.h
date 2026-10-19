@@ -36,6 +36,23 @@ private:
         while (commands_.size() < 64) {
             auto message = connection_.poll();
             if (!message) break;
+            if (message->epoch != connection_.bootstrap().epoch)
+                throw std::logic_error("worker received a stale epoch");
+            if (message->kind == distributed::wire::Kind::InputBegin ||
+                message->kind == distributed::wire::Kind::InputChunk ||
+                message->kind == distributed::wire::Kind::InputEnd ||
+                message->kind == distributed::wire::Kind::InputRelease) {
+                if constexpr (requires { codec_.receive_input(message->kind, message->payload); }) {
+                    if (auto ready = codec_.receive_input(message->kind, message->payload)) {
+                        distributed::wire::Encoder out;
+                        out.u64(*ready);
+                        connection_.send(distributed::wire::Kind::InputReady,
+                                         std::move(out).take());
+                    }
+                } else
+                    throw std::logic_error("execution codec has no input resources");
+                continue;
+            }
             if (message->kind == distributed::wire::Kind::MemoryQuery) {
                 distributed::wire::Decoder query(message->payload);
                 const auto id    = query.u64();

@@ -30,7 +30,8 @@ std::vector<wire::Bytes> exchange(distributed::ExecutionGroup& group,
         wire::Message{wire::Kind::Enter, group.epoch(), std::move(out).take()});
     std::vector<distributed::OutgoingMessage> messages;
     for (const auto& rank : group.topology().ranks) messages.push_back({rank.rank, message});
-    require(group.transport().try_send(messages, true), "preparation queue is full");
+    require(group.transport().try_send(messages, distributed::Traffic::Continuation),
+            "preparation queue is full");
     std::vector<wire::Bytes> responses(messages.size());
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
     for (std::size_t n = 0; n < responses.size();) {

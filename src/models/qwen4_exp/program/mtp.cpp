@@ -63,11 +63,11 @@ ops::QsaTailStateView RankProgramImpl::mtp_working_tail(std::uint32_t slot, std:
     return resources.mtp_working_tail(slot, batch);
 }
 
-void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible) {
+execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t batch,
+                                             std::uint32_t visible) {
     const auto& buffers = resources.plan.persistent.buffers;
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
-    const auto hidden   = dimension(parameters.profile->config.text.hidden);
     const auto call     = resources.mtp_batch(frame.draft_steps[step], 1, batch, visible);
     const auto before   = step == 0 ? resources.states->mtp_tail(call.source_slots)
                                     : mtp_working_tail(step == 1 ? 0 : 1 + (step - 2) % 2, batch);
@@ -75,16 +75,41 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
     auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
     const auto previous = step == 0 ? packed_tensor(frame.base_conditioning, {channels, batch})
                                     : working.slice(2, (step - 1) % 2, 1).view({channels, batch});
+    return execution::MtpRun(parameters.profile->config.text, parameters.profile->local.qsa,
+                             *parameters.mtp, previous, call, before, after,
+                             resources.mtp->layer(0), resources.workspace, cuda,
+                             parallel ? &*parallel : nullptr);
+}
+
+void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+                                    const DecodeGraphDefinition* mixer, DecodeGraphChild* child) {
+    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& frame   = *buffers.mtp;
+    const auto channels = dimension(parameters.profile->config.text.residual_width());
+    const auto hidden   = dimension(parameters.profile->config.text.hidden);
+    auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
     auto next           = working.slice(2, step % 2, 1).view({channels, batch});
     auto sample         = packed_tensor(frame.sample, {hidden, batch});
-    execution::mtp_forward(parameters.profile->config.text, parameters.profile->local.qsa,
-                           *parameters.mtp, previous, call, before, after, resources.mtp->layer(0),
-                           {sample, next}, resources.workspace, cuda);
-    auto logits = packed_tensor(*buffers.logits,
-                                {dimension(parameters.profile->config.text.vocabulary), batch});
+    {
+        auto run = draft_run(step, batch, visible);
+        run.stem();
+        if (mixer)
+            *child = mixer->append_to(cuda.stream());
+        else
+            run.local_mixer();
+        run.finish_mixer();
+        run.feed_forward();
+        run.finish({sample, next});
+    }
+    auto logits =
+        packed_tensor(*buffers.logits, {dimension(parameters.profile->local.vocabulary), batch});
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
     auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
-    ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
+    if (parallel)
+        vocabulary_draft(logits, ids,
+                         device_tensor(frame.draft_steps[step].valid_columns).slice(0, 0, batch));
+    else
+        ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
 }
 
 void RankProgramImpl::save_draft(std::uint32_t step, std::int32_t batch) {
@@ -162,6 +187,14 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
 }
 
 void RankProgramImpl::accept_forward(std::int32_t batch) {
+    if (parallel) {
+        vocabulary_accept(
+            batch, std::all_of(compute->rows.begin(), compute->rows.end(),
+                               [](const auto& row) { return !(row.sampling.temperature > 0); })
+                       ? 1
+                       : 20);
+        return;
+    }
     const auto& buffers   = resources.plan.persistent.buffers;
     const auto& frame     = *buffers.mtp;
     const auto width      = shape.draft_tokens + 1;
@@ -189,11 +222,6 @@ void RankProgramImpl::accept_forward(std::int32_t batch) {
     }
 }
 
-
-} // namespace ninfer::models::qwen4_exp::detail
-
-namespace ninfer::models::qwen4_exp::detail {
-
 void RankProgramImpl::prepare_mtp() {
     auto& f             = *compute;
     const auto& work    = std::get<MtpWork>(f.request.work.operation);
@@ -209,8 +237,10 @@ void RankProgramImpl::prepare_mtp() {
                       row.ple_raw_tail},
                      row.ids};
     }
-    f.ple = ple.try_begin(f.request.ticket, width, {inputs.data(), f.rows.size()});
-    if (!f.ple) return;
+    if (host_ple) {
+        f.ple = host_ple->try_begin(f.request.ticket, width, {inputs.data(), f.rows.size()});
+        if (!f.ple) return;
+    }
     f.verify.emplace();
     auto& round = *f.verify;
     round.width = width;
@@ -251,26 +281,37 @@ void RankProgramImpl::prepare_mtp() {
                                   : std::span<const TokenId>{}};
         calls.push_back(
             mtp_inputs(frame.draft_steps[step], f.rows, 1, {step_inputs.data(), f.rows.size()}));
+        f.draft_visible.push_back(calls.back().max_visible_tokens);
+    }
+    if (device_graphs) {
+        prepare_main();
+        return;
     }
     {
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
-        if (graphs)
+        if (graphs && host_ple)
             graphs->draft(batch, calls, *f.ple, round.extents);
         else {
             for (std::uint32_t step = 0; step < steps; ++step) {
                 draft_forward(step, batch, calls[step].max_visible_tokens);
                 save_draft(step, batch);
                 auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
-                ple.append_device(*f.ple, ids, round.extents, step);
-                ple.progress();
+                if (host_ple) {
+                    host_ple->append_device(*f.ple, ids, round.extents, step);
+                    host_ple->progress();
+                }
             }
         }
     }
     std::array<std::uint32_t, kMaximumConcurrency> valid;
     for (int b = 0; b < batch; ++b) valid[b] = round.extents[b] + 1;
-    ple.seal(*f.ple, {valid.data(), f.rows.size()});
+    if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
     ops::prepare_verify_ids(row_tensor(frame.anchors), drafts, row_tensor(frame.extents),
                             f.batch.ids, cuda);
+    if (!host_ple) {
+        copy_verify_inputs(batch, false);
+        prepare_device_ple(f.batch);
+    }
     prepare_main();
 }
 

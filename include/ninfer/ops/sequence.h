@@ -6,6 +6,19 @@
 
 namespace ninfer::ops {
 
+// Shift an adopted prefix to pair its next token with the preceding position. For A=prefix[b],
+// 0<=A<=W, n=max(A-1,0), shifted_ids[j,b]=ids[j+1,b], shifted_positions[j,b]=positions[j,b]
+// and shifted_rope[j,axis,b]=rope[j,axis,b] for j<n. Remaining output columns copy input column
+// zero. Writes lengths[b]=n, last_columns[b]=A-1, active_columns[b]=(A>0 ? 0 : -1). Input
+// IDs/positions are contiguous I32 [W,B], RoPE [W,3,B], prefix [B]; outputs have width W-1, with
+// contiguous I32 [B] metadata. W>=2, B=1..8. Outputs are mutually disjoint and disjoint from
+// inputs. Copies integers exactly, has no persistent effect or workspace, and reads live device
+// metadata during Graph replay.
+void prepare_shifted_prefix(const Tensor& ids, const Tensor& positions, const Tensor& rope,
+                            const Tensor& prefix, Tensor& shifted_ids, Tensor& shifted_positions,
+                            Tensor& shifted_rope, Tensor& lengths, Tensor& last_columns,
+                            Tensor& active_columns, CudaExecutionView execution);
+
 /**
  *   For row b and 0<=j<=K:
  *     verify_ids[j,b] = anchors[b]                         when j=0

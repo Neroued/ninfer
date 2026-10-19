@@ -51,6 +51,16 @@ void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Te
 void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
                                CudaExecutionView execution);
 
+// For columns[b]>=0, destination[:,slots[b]]=source[:,columns[b],b]; -1 preserves the
+// destination and reads no source or slot. Source is contiguous BF16 or I32 [D,T,B],
+// columns/slots are contiguous I32 [B], B=1..8, and destination has the same dtype [D,S]
+// with contiguous features and an explicit non-overlapping column stride. Live columns
+// and slots are in range and destination slots are distinct. Inputs and destination are
+// disjoint. Copies represented bits exactly, preserves all unselected storage, owns no
+// workspace, and consumes current Device selectors under Graph replay.
+void scatter_batch_columns(const Tensor& source, const Tensor& columns, const Tensor& slots,
+                           Tensor& destination, CudaExecutionView execution);
+
 /**
  * ids[i] = id_map[ids[i]]. The nonempty I32 ids vector is contiguous and updated in place.
  * id_map is a distinct device I32 array [count]; input ids lie in [0,count).

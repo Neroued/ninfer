@@ -6,6 +6,7 @@
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
 #include "models/common/moe/schedule.h"
+#include "models/qwen4_exp/parallel/execution.h"
 
 namespace ninfer::models::qwen4_exp::execution {
 
@@ -15,6 +16,7 @@ struct TextExecution {
     const QsaCache& cache;
     moe::Schedule* experts = nullptr;
     Tensor qsa_raw_records, qsa_coordinate_records, ple_records;
+    ParallelExecution* parallel = nullptr;
 };
 
 // Activations stay live across the Host PLE handoff. All borrowed views follow the Program's
@@ -28,6 +30,8 @@ public:
     void stem(std::optional<VisualEmbeddingView> = {});
     [[nodiscard]] bool advance_layer(std::uint32_t layer);
     void mixer(std::uint32_t layer);
+    void local_mixer(std::uint32_t layer);
+    void finish_mixer(std::uint32_t layer);
     void resident_moe(std::uint32_t layer);
     void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);

@@ -167,6 +167,16 @@ ExecutionCodec::merge_memory(const distributed::ExecutionTopology& topology,
         total.workspace_logical_peak_bytes += r.workspace_logical_peak_bytes;
         total.startup_retained_bytes += r.startup_retained_bytes;
         total.kv_payload_bytes += r.kv_payload_bytes;
+        if (r.cuda_graph) {
+            if (!total.cuda_graph) total.cuda_graph.emplace();
+            total.cuda_graph->rebuild_estimate_bytes += r.cuda_graph->rebuild_estimate_bytes;
+            total.cuda_graph->preparation_increment_bytes +=
+                r.cuda_graph->preparation_increment_bytes;
+            total.cuda_graph->calibration_increment_bytes +=
+                r.cuda_graph->calibration_increment_bytes;
+            total.cuda_graph->calibration_retained_bytes +=
+                r.cuda_graph->calibration_retained_bytes;
+        }
         if (r.vision_workspace && !total.vision_workspace) {
             total.vision_workspace = r.vision_workspace;
         } else if (r.vision_workspace) {

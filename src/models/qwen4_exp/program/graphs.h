@@ -5,12 +5,28 @@
 namespace ninfer::models::qwen4_exp::detail {
 class RankProgramImpl;
 
+[[nodiscard]] std::vector<std::uint32_t> decode_context_bounds(std::uint32_t capacity);
+
+class GraphInputs {
+public:
+    explicit GraphInputs(RankProgramImpl& p) : owner_(p) {}
+
+    ~GraphInputs();
+    void prepare();
+    void batch(execution::BatchView, std::uint32_t visible);
+
+private:
+    RankProgramImpl& owner_;
+    std::vector<std::int32_t> slots_;
+    std::array<PinnedHostBuffer, 2> mappings_;
+};
+
 enum class MainGraph { Control, Ordinary, Verify };
 
 class Graphs {
 public:
     explicit Graphs(RankProgramImpl&);
-    void prepare();
+    void prepare(GraphInputs&);
     [[nodiscard]] TextGraph& main(std::uint32_t batch, MainGraph, std::uint32_t visible);
     void draft(std::uint32_t batch, std::span<const execution::BatchView>, ple::Ticket,
                std::span<const std::uint32_t> extents);

@@ -1,4 +1,5 @@
 target_sources(ninfer_model_execution PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/parallel/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/startup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/workspace.cpp"
@@ -12,6 +13,8 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/session/planning.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/buffers.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ple_pipeline.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/device_ple.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/vocabulary.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/control.cpp"
@@ -19,6 +22,7 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/text_graph.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/device_graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graph_preparation.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/commit.cpp"
@@ -28,6 +32,8 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/resources.cpp")
 
 if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_execution PRIVATE "${CMAKE_CURRENT_LIST_DIR}/parallel/startup.cpp")
+  target_compile_definitions(ninfer_model_execution PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
   target_sources(ninfer_model_execution PRIVATE "${CMAKE_CURRENT_LIST_DIR}/parallel/preparation.cpp")
   target_link_libraries(ninfer_model_execution PRIVATE ninfer_runtime_distributed)
 endif()

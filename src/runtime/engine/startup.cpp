@@ -3,6 +3,10 @@
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen4_exp/startup.h"
+#if NINFER_ENABLE_DISTRIBUTED
+#    include "runtime/engine/distributed_startup.inl"
+#    include "models/qwen4_exp/parallel/startup.h"
+#endif
 
 #include <atomic>
 #include <limits>
@@ -108,6 +112,14 @@ ConstructedModel construct_model(EngineOptions& options) {
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
     case models::Architecture::Qwen4Exp: {
+#if NINFER_ENABLE_DISTRIBUTED
+        if (options.deployment && options.deployment->ranks.size() > 1) {
+            auto built = detail::build_distributed_model<models::qwen4_exp::ParallelStartup>(
+                reader, options, start);
+            return {std::move(built.instance), std::move(built.load),
+                    std::move(built.context_cost)};
+        }
+#endif
         auto built = detail::build_local_model<models::qwen4_exp::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
     }

@@ -28,16 +28,26 @@ void RankProgramImpl::score_next() {
     }
     const auto n = std::min<std::size_t>(1024, work.targets.size() - f.score_at);
     auto scope   = resources.workspace.scope();
-    auto buffers = execution::workspace::score(resources.workspace,
-                                               parameters.profile->config.text.vocabulary, n);
-    auto* host   = static_cast<TokenId*>(resources.compute_aux().data);
+    auto buffers =
+        execution::workspace::score(resources.workspace, parameters.profile->local.vocabulary, n);
+    auto* host = static_cast<TokenId*>(resources.compute_aux().data);
     std::copy_n(work.targets.begin() + f.score_at, n, host);
     copy_bytes_async({buffers.targets.data, n * sizeof(TokenId), cuda.device()},
                      {host, n * sizeof(TokenId), Device::cpu(), true}, cuda);
     execution::project_head(f.sample.slice(1, work.first_target_column + f.score_at, n),
                             parameters.text.head, buffers.logits, resources.workspace, cuda);
-    ops::target_logprobs(buffers.logits, buffers.targets, parameters.profile->public_tokens,
-                         buffers.logprobs, cuda);
+    if (parallel) {
+        auto stats    = resources.workspace.alloc(DType::FP32, {3, static_cast<int>(n)});
+        auto gathered = resources.workspace.alloc(
+            DType::FP32, {3, static_cast<int>(n), dimension(parallel->size())});
+        ops::vocabulary_logprob_stats(
+            buffers.logits, buffers.targets, parameters.profile->local.vocabulary_begin,
+            parameters.profile->public_tokens, stats, resources.workspace, cuda);
+        parallel->gather(stats, gathered, cuda);
+        ops::target_logprobs_from_stats(gathered, buffers.logprobs, cuda);
+    } else
+        ops::target_logprobs(buffers.logits, buffers.targets, parameters.profile->public_tokens,
+                             buffers.logprobs, cuda);
     copy_bytes_async(resources.egress().subspan(0, n * sizeof(float)),
                      {buffers.logprobs.data, n * sizeof(float), cuda.device()}, cuda);
     f.score_count = n;

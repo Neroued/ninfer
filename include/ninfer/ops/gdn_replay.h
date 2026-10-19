@@ -54,6 +54,13 @@ public:
 
     void execute(std::span<const GdnReplayFoldRow> rows, CudaExecutionView execution) const;
 
+    // Device I32 [B] metadata, 1<=B<=record_capacity. Selectors and commit lengths obey
+    // the same row semantics as the Host overload, including strict zero-row no-op.
+    // Metadata is contiguous, disjoint from record/state storage, and preserved. Replay
+    // consumes its current values; the caller guarantees valid selectors and write separation.
+    void execute(const Tensor& source_slots, const Tensor& destination_slots,
+                 const Tensor& commit_columns, CudaExecutionView execution) const;
+
 private:
     GdnReplayRecords records_;
     LinearAttentionStateAllLayersView states_;

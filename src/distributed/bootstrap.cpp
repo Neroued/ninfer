@@ -42,7 +42,7 @@ void send(Transport& transport, std::uint64_t epoch, std::span<const RankId> ran
     auto message = std::make_shared<wire::Message>(wire::Message{kind, epoch, std::move(payload)});
     std::vector<OutgoingMessage> messages;
     for (auto rank : ranks) messages.push_back({rank, message});
-    if (!transport.try_send(messages, true))
+    if (!transport.try_send(messages, Traffic::Continuation))
         throw std::runtime_error("control continuation capacity exhausted");
 }
 
@@ -338,7 +338,7 @@ WorkerConnection::~WorkerConnection() {
 void WorkerConnection::send(wire::Kind kind, wire::Bytes payload, bool continuation) {
     const std::array messages{OutgoingMessage{0, std::make_shared<wire::Message>(wire::Message{
                                                      kind, bootstrap_.epoch, std::move(payload)})}};
-    if (!transport_->try_send(messages, continuation))
+    if (!transport_->try_send(messages, continuation ? Traffic::Continuation : Traffic::Work))
         throw std::runtime_error("worker continuation capacity exhausted");
 }
 

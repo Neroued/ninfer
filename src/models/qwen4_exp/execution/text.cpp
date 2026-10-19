@@ -58,6 +58,11 @@ bool TextRun::advance_layer(std::uint32_t i) {
 }
 
 void TextRun::mixer(std::uint32_t i) {
+    local_mixer(i);
+    finish_mixer(i);
+}
+
+void TextRun::local_mixer(std::uint32_t i) {
     const auto& config = parameters_.profile->config.text;
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
@@ -87,6 +92,13 @@ void TextRun::mixer(std::uint32_t i) {
             execution_.states.main_tail(state.state_index, batch_.source_slots), after,
             execution_.cache.layer(state.state_index), records, roots_.output, arena, cuda_);
     }
+}
+
+void TextRun::finish_mixer(std::uint32_t i) {
+    const auto& config = parameters_.profile->config.text;
+    const auto& p      = parameters_.text.layers[i];
+    auto& arena        = execution_.workspace;
+    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, p.moe_hc.norm,
                          config.norm_epsilon, roots_.residual, roots_.normalized, cuda_);
     {
@@ -107,6 +119,7 @@ void TextRun::gpu_moe(const moe::GpuCall& call) {
 }
 
 void TextRun::combine(std::uint32_t i) {
+    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
     const auto& config = parameters_.profile->config.text;
     if (i + 1 == config.ple.layer) {
         ops::hc_combine(roots_.residual, roots_.output, roots_.injection, roots_.residual, cuda_);

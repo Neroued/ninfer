@@ -5,6 +5,7 @@
 #include "models/qwen4_exp/program/ple_pipeline.h"
 #include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/execution/text.h"
+#include "models/qwen4_exp/execution/mtp.h"
 #include "models/common/qwen/vision/prefill.h"
 #include "ninfer/ops/sampling.h"
 
@@ -12,11 +13,16 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
+class DeviceGraphs;
+
 struct ResidentBinding {
     runtime::ExecutionMember member;
     std::shared_ptr<const qwen::VisionExecutionInput> vision_input;
     std::unique_ptr<qwen::VisionPrefillExecution> vision;
     double observed_vision_seconds = 0;
+    bool distributed_vision_ready  = false;
+    std::vector<std::uint32_t> feature_offsets;
+    std::optional<CudaEventTimer> vision_timer;
 };
 
 struct MtpInputRow {
@@ -61,6 +67,8 @@ struct ComputeFrame {
     std::optional<runtime::DecisionInput> decision;
     bool decision_requested = false, sequence = false;
     bool first_sample = false, timer_started = false;
+    bool graph_decided = false, graph_main = false;
+    std::vector<std::uint32_t> draft_visible;
     std::uint32_t tokens = 0, visible = 0, layer = 0;
     std::uint32_t score_at = 0, score_count = 0;
     std::vector<float> logprobs;
@@ -81,7 +89,7 @@ struct ContextFrame {
 class RankProgramImpl {
 public:
     RankProgramImpl(const execution::Parameters&, ExecutionPlan, DeviceContext&,
-                    const StartupObserver& observer = {});
+                    const StartupObserver& observer = {}, ParallelBinding = {});
     ~RankProgramImpl();
 
     void initialize_graphs();
@@ -101,6 +109,8 @@ public:
     void prepare_forward();
     void prepare_mtp();
     void prepare_main();
+    void prepare_device_ple(const execution::BatchView&);
+    [[nodiscard]] Tensor device_embedding(std::int32_t tokens, std::int32_t batch);
     void after_main();
     void prepare_decision();
     void finish_result();
@@ -116,10 +126,19 @@ public:
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
                    const Tensor& conditioning, std::optional<execution::VisualEmbeddingView>);
     void commit_verify(const Commit&);
-    void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible);
+    void finish_verify(std::int32_t batch, bool rebuild_history);
+    [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
+                                              std::uint32_t visible);
+    void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+                       const DecodeGraphDefinition* = nullptr, DecodeGraphChild* = nullptr);
     void save_draft(std::uint32_t step, std::int32_t batch);
     void sample_forward(std::int32_t batch, bool first_token);
     void accept_forward(std::int32_t batch);
+    void vocabulary_sample(std::int32_t batch, bool first_token, std::int32_t candidates);
+    void vocabulary_draft(const Tensor& logits, Tensor& ids, const Tensor& valid);
+    void vocabulary_accept(std::int32_t batch, std::int32_t candidates);
+    void copy_sample_result(std::int32_t batch, bool verify);
+    void copy_verify_inputs(std::int32_t batch, bool capture);
     [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<const WorkRow>,
                                                   std::uint32_t tokens,
                                                   std::span<const MtpInputRow>);
@@ -130,6 +149,8 @@ public:
     [[nodiscard]] ResidentBinding& binding(runtime::ResidencyId);
     [[nodiscard]] std::optional<execution::VisualEmbeddingView>
     prepare_vision(ResidentBinding&, std::uint32_t begin, std::uint32_t tokens);
+    [[nodiscard]] qwen::VisionChunk prepare_parallel_vision(ResidentBinding&, std::uint32_t begin,
+                                                            std::uint32_t tokens);
     double collect_vision_timing(ResidentBinding&, std::uint32_t committed_frontier);
     void retire_vision(ResidentBinding&) noexcept;
     [[nodiscard]] std::size_t active_vision_bytes() const noexcept;
@@ -139,10 +160,14 @@ public:
     const execution::Parameters& parameters;
     DeviceContext& device;
     CudaExecutionView cuda;
+    std::optional<ParallelExecution> parallel;
     Resources resources;
-    PlePipeline ple;
+    std::unique_ptr<PlePipeline> host_ple;
+    CudaCompletionEvent ple_inputs, ple_ready, draft_copied;
+    PinnedHostBuffer draft_output;
     const ExecutionShape& shape;
     std::unique_ptr<Graphs> graphs;
+    std::unique_ptr<DeviceGraphs> device_graphs;
     std::optional<GraphMemorySummary> graph_memory;
     CudaEventTimer prefill_timer;
     CudaCompletionEvent compute_done, context_done;

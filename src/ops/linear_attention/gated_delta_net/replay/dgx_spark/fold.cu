@@ -2,17 +2,18 @@
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/fold_io.cuh"
 #include "ops/linear_attention/gated_delta_net/kernels/recurrent_subgroup.cuh"
-#include <type_traits>
 #include "core/device.h"
+
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
-template <class Geometry, bool Staged>
-__global__
-__launch_bounds__(128, 2) void fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+template <class Geometry, bool Staged, class Rows>
+__global__ void __launch_bounds__(128, 2)
+    fold_kernel(const __grid_constant__ FoldAccess<Geometry, Rows> access) {
     const auto coord = access.coordinates();
     const int valid  = access.active_columns(coord);
     if (!valid) return;
@@ -33,12 +34,11 @@ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
-template <class Geometry>
+template <class Geometry, class Rows>
 void launch_replay_fold_fixed(const GdnReplayRecords& records,
-                              LinearAttentionStateAllLayersView states,
-                              const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                              cudaStream_t stream) {
-    const FoldAccess<Geometry> access{
+                              LinearAttentionStateAllLayersView states, const Rows& rows,
+                              std::int32_t active_rows, cudaStream_t stream) {
+    const FoldAccess<Geometry, Rows> access{
         static_cast<const __nv_bfloat16*>(records.key.data),
         static_cast<const __nv_bfloat16*>(records.value.data),
         reinterpret_cast<const uint2*>(records.gate.data),
@@ -59,22 +59,22 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
     const dim3 block(common::kWarpSize, kNumWarps, 1);
     const auto launch = [&]<bool Staged>() {
         constexpr auto shared = Staged ? sizeof(subgroup::Window<16>) : 0;
-        fold_kernel<Geometry, Staged><<<grid, block, shared, stream>>>(access);
+        fold_kernel<Geometry, Staged, Rows><<<grid, block, shared, stream>>>(access);
         CUDA_CHECK(cudaGetLastError());
     };
     if constexpr (Geometry::kQkHeads == 8) {
         // Amortize prefetch for longer local single-row prefixes.
-        if (active_rows == 1 && rows.row[0].commit_columns >= 9)
-            return launch.template operator()<true>();
+        auto columns = records.spec.width;
+        if constexpr (std::is_same_v<Rows, GdnReplayFoldKernelRows>)
+            columns = rows.row[0].commit_columns;
+        if (active_rows == 1 && columns >= 9) return launch.template operator()<true>();
     }
     launch.template operator()<false>();
 }
 
-} // namespace
-
-void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
-                        const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                        cudaStream_t stream) {
+template <class Rows>
+void dispatch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                          const Rows& rows, std::int32_t active_rows, cudaStream_t stream) {
     switch (select_fold_geometry(records.spec)) {
     case FoldGeometryId::Layers48Heads48:
         return launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows,
@@ -89,6 +89,20 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
         return launch_replay_fold_fixed<FoldGeometry36x24>(records, states, rows, active_rows,
                                                            stream);
     }
+}
+
+} // namespace
+
+void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                        cudaStream_t stream) {
+    dispatch_replay_fold(records, states, rows, active_rows, stream);
+}
+
+void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        const GdnReplayFoldDeviceRows& rows, std::int32_t active_rows,
+                        cudaStream_t stream) {
+    dispatch_replay_fold(records, states, rows, active_rows, stream);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

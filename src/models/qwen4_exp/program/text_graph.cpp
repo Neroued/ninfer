@@ -48,7 +48,7 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
         auto& profile = graph.profiles.emplace_back();
         for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
             if (!std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer)) continue;
-            profile.emplace_back().capture(cuda.stream(), [&] { run.mixer(i); });
+            profile.emplace_back().capture(cuda.stream(), [&] { run.local_mixer(i); });
         }
         workspace_bytes_[graph.profiles.size() - 1] = workspace.peak_used();
     }
@@ -67,9 +67,10 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
         for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
             if (i == p.profile->config.text.ple.layer)
                 graph.ple_node = graph.ple[0].append_to(cuda.stream());
-            if (std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer))
+            if (std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer)) {
                 graph.mixers.push_back(graph.profiles.front()[mixer++].append_to(cuda.stream()));
-            else
+                run.finish_mixer(i);
+            } else
                 run.mixer(i);
             run.resident_moe(i);
             run.combine(i);

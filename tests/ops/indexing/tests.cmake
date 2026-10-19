@@ -5,4 +5,5 @@ ninfer_add_op_test(ninfer_indexing_test
           "${CMAKE_CURRENT_LIST_DIR}/position.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/features.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/gather_remap.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/scatter_columns.cpp"
   LIBRARIES ninfer_ops)

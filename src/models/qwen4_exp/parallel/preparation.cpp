@@ -1,10 +1,20 @@
 #include "models/qwen4_exp/parallel/preparation.h"
 
+#include <algorithm>
+
 namespace ninfer::models::qwen4_exp {
 
 RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const std::byte> payload,
-                                 const distributed::RankIdentity& identity, DeviceContext& device)
+                                 const distributed::RankIdentity& identity, DeviceContext& device,
+                                 const distributed::ExecutionTopology& topology,
+                                 distributed::CommunicationContext& communication)
     : device_(device) {
+    const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
+                                   [](const auto& r) { return r.role == "tensor"; });
+    if (role == topology.roles.end())
+        throw std::invalid_argument("Qwen4Exp tensor group is absent");
+    const auto& group = topology.group(role->group);
+    binding_          = {&communication.group(group.id), group.index(topology.output_rank)};
     distributed::wire::Decoder in(payload);
     auto request = decode_rank_load(in);
     in.finish();
@@ -16,10 +26,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
     options_                = std::move(request.options);
     host_reservation_bytes_ = request.host_reservation_bytes;
-    if (options_.use_cuda_graph)
-        throw std::invalid_argument(
-            "Qwen4Exp distributed preparation currently uses eager execution");
-    auto definition = read_definition(reader, models::load_options(options_));
+    auto definition         = read_definition(reader, models::load_options(options_));
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
     profile_ =
@@ -40,25 +47,55 @@ void RankPreparation::materialize() {
 }
 
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {
-    const auto& model = *instance_->model;
-    const auto& s     = model.storage_stats();
-    return {.capacity          = {curve_, available},
-            .weight_bytes      = s.device_capacity_bytes + model.metadata_bytes(),
-            .host_weight_bytes = s.host_capacity_bytes,
-            .staging_bytes     = s.peak_staging_bytes,
-            .read_bytes        = s.read_bytes,
-            .upload_bytes      = s.h2d_bytes,
-            .load_seconds      = s.upload_seconds};
+    const auto& model  = *instance_->model;
+    const auto& s      = model.storage_stats();
+    const auto reserve = graph_memory_.rebuild_estimate_bytes;
+    return {.capacity             = {curve_, available > reserve ? available - reserve : 0},
+            .weight_bytes         = s.device_capacity_bytes + model.metadata_bytes(),
+            .host_weight_bytes    = s.host_capacity_bytes,
+            .staging_bytes        = s.peak_staging_bytes,
+            .read_bytes           = s.read_bytes,
+            .upload_bytes         = s.h2d_bytes,
+            .load_seconds         = s.upload_seconds,
+            .device_objects       = s.device_object_count,
+            .host_objects         = s.host_object_count,
+            .preparation_required = options_.use_cuda_graph};
 }
+
+void RankPreparation::prepare_probe() {
+    if (!options_.use_cuda_graph) return;
+    auto plan = plan_graph_probe(profile_, {}, options_, device_, {});
+    probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
+                                              options_.startup_observer, binding_);
+}
+
+void RankPreparation::calibrate() {
+    if (!probe_) return;
+    const auto before = device_memory_snapshot(device_.device());
+    probe_->prepare_execution();
+    const auto ready = device_memory_snapshot(device_.device());
+    probe_->release_execution();
+    const auto released                       = device_memory_snapshot(device_.device());
+    graph_memory_.calibration_increment_bytes = device_memory_growth(before, ready);
+    graph_memory_.calibration_retained_bytes  = device_memory_growth(before, released);
+    graph_memory_.rebuild_estimate_bytes =
+        std::max<std::int64_t>(0, device_memory_growth(released, ready));
+    probe_.reset();
+    device_.synchronize();
+}
+
+void RankPreparation::prepare_execution() { instance_->program->prepare_execution(); }
 
 void RankPreparation::prepare(std::uint32_t pages, std::size_t available) {
     if (instance_->program) throw std::logic_error("Qwen4Exp rank Program is already prepared");
     auto options        = options_;
     options.kv_capacity = KvCapacityPolicy::explicit_capacity(curve_.resolved_tokens(pages));
-    auto plan           = plan_execution(profile_, {}, options, device_, available);
+    const auto reserve  = graph_memory_.rebuild_estimate_bytes;
+    auto plan           = plan_execution(profile_, {}, options, device_,
+                               available > reserve ? available - reserve : 0);
     if (!plan) throw DeviceAllocationError("rank runtime capacity exceeds available memory");
-    instance_->program = std::make_unique<RankProgram>(instance_->parameters, std::move(*plan),
-                                                       device_, options_.startup_observer);
+    instance_->program = std::make_unique<RankProgram>(
+        instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_);
 }
 
 void RankPreparation::release_program() {
@@ -68,7 +105,14 @@ void RankPreparation::release_program() {
 
 RankExecutionDescription RankPreparation::describe() const {
     const auto& program = *instance_->program;
-    return {program.session_plan(), program.capacity(), program.memory_summary()};
+    RankExecutionDescription result{program.session_plan(), program.capacity(),
+                                    program.memory_summary()};
+    if (result.memory.cuda_graph) {
+        const auto increment     = result.memory.cuda_graph->preparation_increment_bytes;
+        result.memory.cuda_graph = graph_memory_;
+        result.memory.cuda_graph->preparation_increment_bytes = increment;
+    }
+    return result;
 }
 
 ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topology) const {

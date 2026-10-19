@@ -217,7 +217,7 @@ struct Transport::Impl {
         std::shared_ptr<const wire::Message> message;
         wire::Bytes header;
         std::size_t position = 0;
-        bool continuation    = false;
+        Traffic traffic      = Traffic::Work;
     };
 
     struct Peer {
@@ -263,7 +263,10 @@ struct Transport::Impl {
     void complete(const Write& write) {
         std::lock_guard lock(mutex);
         const auto n = write.header.size() + write.message->payload.size();
-        if (write.continuation) {
+        if (write.traffic == Traffic::Input) {
+            input_bytes -= n;
+            --input_count;
+        } else if (write.traffic == Traffic::Continuation) {
             continuation_bytes -= n;
             --continuation_count;
         } else {
@@ -306,9 +309,10 @@ struct Transport::Impl {
                     throw std::runtime_error("incoming control message exceeds its capacity");
                 {
                     std::lock_guard lock(mutex);
-                    if (incoming_count >= limits.queued_messages + limits.continuation_messages ||
-                        h.bytes >
-                            limits.queued_bytes + limits.continuation_bytes - incoming_bytes) {
+                    if (incoming_count >= limits.queued_messages + limits.continuation_messages +
+                                              limits.input_messages ||
+                        h.bytes > limits.queued_bytes + limits.continuation_bytes +
+                                      limits.input_bytes - incoming_bytes) {
                         peer.blocked = true;
                         return;
                     }
@@ -360,7 +364,13 @@ struct Transport::Impl {
                         const auto it =
                             std::find_if(peers.begin(), peers.end(),
                                          [&](const auto& peer) { return peer.rank == p.peer; });
-                        it->writes.push_back(std::move(p.write));
+                        auto position = it->writes.end();
+                        if (p.write.traffic != Traffic::Input)
+                            position = std::find_if(
+                                it->writes.begin(), it->writes.end(), [](const auto& w) {
+                                    return w.traffic == Traffic::Input && w.position == 0;
+                                });
+                        it->writes.insert(position, std::move(p.write));
                     }
                     pending.clear();
                 }
@@ -410,6 +420,7 @@ struct Transport::Impl {
     std::deque<Pending> pending;
     std::deque<IncomingMessage> incoming;
     std::size_t queued_bytes = 0, queued_count = 0, continuation_bytes = 0, continuation_count = 0;
+    std::size_t input_bytes = 0, input_count = 0;
     std::size_t incoming_bytes = 0, incoming_count = 0;
     bool started = false, closed = false;
     std::string error;
@@ -434,7 +445,7 @@ void Transport::start() {
         [](void* p, std::uint32_t) noexcept { static_cast<Impl*>(p)->loop(); }, impl_.get());
 }
 
-bool Transport::try_send(std::span<const OutgoingMessage> messages, bool continuation) {
+bool Transport::try_send(std::span<const OutgoingMessage> messages, Traffic traffic) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     if (p.closed)
@@ -450,16 +461,24 @@ bool Transport::try_send(std::span<const OutgoingMessage> messages, bool continu
         if (n > SIZE_MAX - bytes) throw std::overflow_error("control batch size overflow");
         bytes += n;
     }
-    auto& used_bytes     = continuation ? p.continuation_bytes : p.queued_bytes;
-    auto& used_count     = continuation ? p.continuation_count : p.queued_count;
-    const auto max_bytes = continuation ? p.limits.continuation_bytes : p.limits.queued_bytes;
-    const auto max_count = continuation ? p.limits.continuation_messages : p.limits.queued_messages;
+    auto& used_bytes     = traffic == Traffic::Input          ? p.input_bytes
+                           : traffic == Traffic::Continuation ? p.continuation_bytes
+                                                              : p.queued_bytes;
+    auto& used_count     = traffic == Traffic::Input          ? p.input_count
+                           : traffic == Traffic::Continuation ? p.continuation_count
+                                                              : p.queued_count;
+    const auto max_bytes = traffic == Traffic::Input          ? p.limits.input_bytes
+                           : traffic == Traffic::Continuation ? p.limits.continuation_bytes
+                                                              : p.limits.queued_bytes;
+    const auto max_count = traffic == Traffic::Input          ? p.limits.input_messages
+                           : traffic == Traffic::Continuation ? p.limits.continuation_messages
+                                                              : p.limits.queued_messages;
     if (bytes > max_bytes - used_bytes || messages.size() > max_count - used_count) return false;
     const auto original_size = p.pending.size();
     try {
         for (const auto& item : messages)
             p.pending.push_back(
-                {item.peer, {item.message, wire::encode_header(*item.message), 0, continuation}});
+                {item.peer, {item.message, wire::encode_header(*item.message), 0, traffic}});
     } catch (...) {
         while (p.pending.size() != original_size) p.pending.pop_back();
         throw;
@@ -489,7 +508,7 @@ std::string Transport::failure() const {
 
 bool Transport::sending() const {
     std::lock_guard lock(impl_->mutex);
-    return impl_->queued_count || impl_->continuation_count;
+    return impl_->queued_count || impl_->continuation_count || impl_->input_count;
 }
 
 void Transport::close() noexcept { impl_->stop(); }

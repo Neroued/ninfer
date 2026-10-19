@@ -35,6 +35,12 @@ struct alignas(16) GdnReplayFoldKernelRows {
     GdnReplayFoldKernelRow row[8];
 };
 
+struct GdnReplayFoldDeviceRows {
+    const std::int32_t* sources;
+    const std::int32_t* destinations;
+    const std::int32_t* columns;
+};
+
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
@@ -44,5 +50,7 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
+void launch_replay_fold(const GdnReplayRecords&, LinearAttentionStateAllLayersView,
+                        const GdnReplayFoldDeviceRows&, std::int32_t active_rows, cudaStream_t);
 
 } // namespace ninfer::ops::detail::gated_delta_net

@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/program/internal.h"
+#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/startup.h"
 #include "core/transfer.h"
 #include "core/nvtx.h"
@@ -8,9 +9,8 @@
 #include <thread>
 
 namespace ninfer::models::qwen4_exp::detail {
-namespace {
 
-std::vector<std::uint32_t> context_bounds(std::uint32_t capacity) {
+std::vector<std::uint32_t> decode_context_bounds(std::uint32_t capacity) {
     std::vector<std::uint32_t> out;
     for (const auto bound : {128U, 512U, 2048U, 8192U, 32768U, 131072U}) {
         if (bound >= capacity) break;
@@ -20,105 +20,100 @@ std::vector<std::uint32_t> context_bounds(std::uint32_t capacity) {
     return out;
 }
 
+namespace {
 void write_i32(const Tensor& target, std::span<const std::int32_t> values, CudaExecutionView cuda) {
     copy_bytes({target.data, target.bytes(), cuda.device()},
                {values.data(), values.size_bytes(), Device::cpu()}, cuda);
 }
 
-// Preparation precedes Session binding. One physical page per row is repeated across the
-// context envelope; mappings and images are private to this preparation lifetime.
-class CaptureInputs {
-public:
-    explicit CaptureInputs(RankProgramImpl& owner) : p_(owner) {}
-
-    void prepare() {
-        auto& r = p_.resources;
-        if (r.states->storage().slot_count() < static_cast<std::int32_t>(p_.shape.max_concurrency))
-            throw std::logic_error("Graph preparation requires one StateImage per row");
-        for (std::uint32_t b = 0; b < p_.shape.max_concurrency; ++b) {
-            slots_.push_back(static_cast<std::int32_t>(b));
-            r.states->storage().clear(slots_.back(), p_.cuda);
-        }
-        for (std::uint32_t pool = 0; pool < r.pool_count(); ++pool) {
-            auto& cache  = r.pool(pool);
-            auto& pages  = cache.pages();
-            auto& tables = cache.tables();
-            if (pages.capacity_pages() < p_.shape.max_concurrency ||
-                tables.row_count() < static_cast<std::int32_t>(p_.shape.max_concurrency))
-                throw std::logic_error("Graph preparation requires one KV page and table per row");
-            const auto capacity  = tables.logical_page_capacity();
-            const auto row_bytes = static_cast<std::size_t>(capacity) * sizeof(std::int32_t);
-            mappings_[pool]      = PinnedHostBuffer(row_bytes * p_.shape.max_concurrency);
-            for (std::uint32_t b = 0; b < p_.shape.max_concurrency; ++b) {
-                const auto page = static_cast<std::int32_t>(b);
-                pages.zero_pages({&page, 1}, p_.cuda);
-                const auto staging = mappings_[pool].span().subspan(b * row_bytes, row_bytes);
-                auto* indices      = static_cast<std::int32_t*>(staging.data);
-                std::fill_n(indices, capacity, page);
-                tables.publish(page, 0, {indices, capacity}, staging, p_.cuda);
-            }
-        }
-        for (std::uint32_t slot = 0; slot < 2; ++slot) {
-            auto embedding = r.ple_upload->device_slot(slot, r.plan.ple.max_positions, 1);
-            CUDA_CHECK(cudaMemsetAsync(embedding.data, 0, embedding.bytes(), p_.cuda.stream()));
-        }
-        const auto& buffers = r.plan.persistent.buffers;
-        if (buffers.mtp) {
-            for (const auto* region :
-                 {&buffers.mtp->base_conditioning, &buffers.mtp->hidden, &buffers.mtp->tail_keys,
-                  &buffers.mtp->tail_coordinates, &buffers.mtp->drafts, &buffers.mtp->extents,
-                  &buffers.mtp->anchors, &buffers.mtp->frontiers}) {
-                const auto value = r.tensor(*region);
-                CUDA_CHECK(cudaMemsetAsync(value.data, 0, value.bytes(), p_.cuda.stream()));
-            }
-        }
-        std::vector<ops::SamplingConfig> configs(p_.shape.max_concurrency);
-        for (auto& config : configs) config.temperature = 0;
-        const auto target = r.tensor(*buffers.sampling);
-        copy_bytes({target.data, target.bytes(), p_.cuda.device()},
-                   {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()}, p_.cuda);
-    }
-
-    ~CaptureInputs() {
-        // prepare() reports execution failures; unwinding still drains the staging readers.
-        (void)cudaStreamSynchronize(p_.cuda.stream());
-    }
-
-    void batch(execution::BatchView call, std::uint32_t visible) {
-        const auto t = call.tokens, b = call.batch;
-        const auto valid = std::min<std::uint32_t>(t, visible);
-        const auto base  = visible - valid;
-        std::vector<std::int32_t> ids(t * b, p_.parameters.profile->config.text.ple.eos);
-        std::vector<std::int32_t> positions(t * b), rope(t * b * 3), rows(b), bases(b, base);
-        for (int row = 0; row < b; ++row) {
-            rows[row] = row;
-            for (int j = 0; j < t; ++j) {
-                const auto position    = base + std::min<std::uint32_t>(j, valid - 1);
-                positions[j + t * row] = position;
-                for (int axis = 0; axis < 3; ++axis) rope[j + t * (axis + 3 * row)] = position;
-            }
-        }
-        write_i32(call.ids, ids, p_.cuda);
-        write_i32(call.positions, positions, p_.cuda);
-        write_i32(call.rope_positions, rope, p_.cuda);
-        write_i32(call.source_slots, std::span(slots_).first(b), p_.cuda);
-        write_i32(call.destination_slots, std::span(slots_).first(b), p_.cuda);
-        write_i32(call.table_rows, rows, p_.cuda);
-        write_i32(call.base_positions, bases, p_.cuda);
-        std::vector<std::int32_t> counts(b, valid), offsets(b, 0);
-        write_i32(call.valid_columns, counts, p_.cuda);
-        write_i32(call.record_offsets, offsets, p_.cuda);
-    }
-
-private:
-    RankProgramImpl& p_;
-    std::vector<std::int32_t> slots_;
-    std::array<PinnedHostBuffer, 2> mappings_;
-};
 } // namespace
 
+void GraphInputs::prepare() {
+    auto& r = owner_.resources;
+    if (r.states->storage().slot_count() < static_cast<std::int32_t>(owner_.shape.max_concurrency))
+        throw std::logic_error("Graph preparation requires one StateImage per row");
+    for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b) {
+        slots_.push_back(static_cast<std::int32_t>(b));
+        r.states->storage().clear(slots_.back(), owner_.cuda);
+    }
+    for (std::uint32_t pool = 0; pool < r.pool_count(); ++pool) {
+        auto& cache  = r.pool(pool);
+        auto& pages  = cache.pages();
+        auto& tables = cache.tables();
+        if (pages.capacity_pages() < owner_.shape.max_concurrency ||
+            tables.row_count() < static_cast<std::int32_t>(owner_.shape.max_concurrency))
+            throw std::logic_error("Graph preparation requires one KV page and table per row");
+        const auto capacity  = tables.logical_page_capacity();
+        const auto row_bytes = static_cast<std::size_t>(capacity) * sizeof(std::int32_t);
+        mappings_[pool]      = PinnedHostBuffer(row_bytes * owner_.shape.max_concurrency);
+        for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b) {
+            const auto page = static_cast<std::int32_t>(b);
+            pages.zero_pages({&page, 1}, owner_.cuda);
+            const auto staging = mappings_[pool].span().subspan(b * row_bytes, row_bytes);
+            auto* indices      = static_cast<std::int32_t*>(staging.data);
+            std::fill_n(indices, capacity, page);
+            tables.publish(page, 0, {indices, capacity}, staging, owner_.cuda);
+        }
+    }
+    for (std::uint32_t slot = 0; r.ple_upload && slot < 2; ++slot) {
+        auto embedding = r.ple_upload->device_slot(slot, r.plan.ple.max_positions, 1);
+        CUDA_CHECK(cudaMemsetAsync(embedding.data, 0, embedding.bytes(), owner_.cuda.stream()));
+    }
+    const auto& buffers = r.plan.persistent.buffers;
+    if (buffers.mtp) {
+        for (const auto* region :
+             {&buffers.mtp->base_conditioning, &buffers.mtp->hidden, &buffers.mtp->tail_keys,
+              &buffers.mtp->tail_coordinates, &buffers.mtp->drafts, &buffers.mtp->extents,
+              &buffers.mtp->anchors, &buffers.mtp->frontiers}) {
+            const auto value = r.tensor(*region);
+            CUDA_CHECK(cudaMemsetAsync(value.data, 0, value.bytes(), owner_.cuda.stream()));
+        }
+    }
+    std::vector<ops::SamplingConfig> configs(owner_.shape.max_concurrency);
+    for (auto& config : configs) config.temperature = 0;
+    const auto target = r.tensor(*buffers.sampling);
+    copy_bytes({target.data, target.bytes(), owner_.cuda.device()},
+               {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()}, owner_.cuda);
+}
+
+GraphInputs::~GraphInputs() {
+    // prepare() reports execution failures; unwinding still drains the staging readers.
+    (void)cudaStreamSynchronize(owner_.cuda.stream());
+}
+
+void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
+    const auto t = call.tokens, b = call.batch;
+    const auto valid = std::min<std::uint32_t>(t, visible);
+    const auto base  = visible - valid;
+    std::vector<std::int32_t> ids(t * b, owner_.parameters.profile->config.text.ple.eos);
+    std::vector<std::int32_t> positions(t * b), rope(t * b * 3), rows(b), bases(b, base);
+    for (int row = 0; row < b; ++row) {
+        rows[row] = row;
+        for (int j = 0; j < t; ++j) {
+            const auto position    = base + std::min<std::uint32_t>(j, valid - 1);
+            positions[j + t * row] = position;
+            for (int axis = 0; axis < 3; ++axis) rope[j + t * (axis + 3 * row)] = position;
+        }
+    }
+    write_i32(call.ids, ids, owner_.cuda);
+    write_i32(call.positions, positions, owner_.cuda);
+    write_i32(call.rope_positions, rope, owner_.cuda);
+    write_i32(call.source_slots, std::span(slots_).first(b), owner_.cuda);
+    write_i32(call.destination_slots, std::span(slots_).first(b), owner_.cuda);
+    write_i32(call.table_rows, rows, owner_.cuda);
+    write_i32(call.base_positions, bases, owner_.cuda);
+    std::vector<std::int32_t> counts(b, valid), offsets(b, 0);
+    write_i32(call.valid_columns, counts, owner_.cuda);
+    write_i32(call.record_offsets, offsets, owner_.cuda);
+    const auto& io = owner_.resources.plan.persistent.buffers.batch;
+    write_i32(owner_.resources.packed(io.raw_tail, {2, b}),
+              std::vector<std::int32_t>(2 * b, owner_.parameters.profile->config.text.ple.eos),
+              owner_.cuda);
+    write_i32(owner_.resources.tensor(io.row_indices).slice(0, 0, b), rows, owner_.cuda);
+}
+
 Graphs::Graphs(RankProgramImpl& owner)
-    : owner_(owner), bounds_(context_bounds(owner.shape.max_context)) {}
+    : owner_(owner), bounds_(decode_context_bounds(owner.shape.max_context)) {}
 
 TextGraph& Graphs::main(Batch& graph, MainGraph kind) {
     switch (kind) {
@@ -155,7 +150,8 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, MainGraph kind) {
                                              r.experts.get(),
                                              r.tensor(buffers.main_qsa.keys),
                                              r.tensor(buffers.main_qsa.coordinates),
-                                             r.tensor(buffers.ple_records)};
+                                             r.tensor(buffers.ple_records),
+                                             p.parallel ? &*p.parallel : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
     const std::array ple{r.ple_upload->binding(0, tokens, batch),
@@ -206,8 +202,8 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
         const auto& frame = *p.resources.plan.persistent.buffers.mtp;
         const auto ids    = p.device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
         for (std::uint32_t slot = 0; slot < 2; ++slot)
-            call.handoffs[slot].capture(p.cuda.stream(),
-                                        [&] { p.ple.capture_append(slot, ids, step, p.cuda); });
+            call.handoffs[slot].capture(
+                p.cuda.stream(), [&] { p.host_ple->capture_append(slot, ids, step, p.cuda); });
     }
     graph.chains.resize(p.shape.draft_tokens);
     CudaCompletionEvent fork(p.device), join(p.device);
@@ -245,13 +241,11 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
     }
 }
 
-void Graphs::prepare() {
+void Graphs::prepare(GraphInputs& inputs) {
     auto& p = owner_;
     auto& r = p.resources;
     std::optional<moe::Schedule::Preparation> preparation;
     if (r.experts) preparation.emplace(*r.experts);
-    CaptureInputs inputs(p);
-    inputs.prepare();
     batches_.resize(p.shape.max_concurrency);
     for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
         auto& graph = batches_[batch - 1];
@@ -314,7 +308,7 @@ void Graphs::draft(std::uint32_t batch, std::span<const execution::BatchView> ca
     chain.slot = ticket.slot;
     chain.graph.executable.launch(owner_.cuda.stream());
     for (std::uint32_t step = 0; step < calls.size(); ++step)
-        owner_.ple.append_submitted(ticket, extents, step);
+        owner_.host_ple->append_submitted(ticket, extents, step);
 }
 
 void Graphs::sample(std::uint32_t batch) {
@@ -331,8 +325,15 @@ void RankProgramImpl::initialize_graphs() {
     if (!shape.cuda_graph) return;
     nvtx::ScopedRange range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
     const auto before = device_memory_snapshot(cuda.device());
-    graphs            = std::make_unique<Graphs>(*this);
-    graphs->prepare();
+    GraphInputs inputs(*this);
+    inputs.prepare();
+    if (host_ple) {
+        graphs = std::make_unique<Graphs>(*this);
+        graphs->prepare(inputs);
+    } else {
+        device_graphs = std::make_unique<DeviceGraphs>(*this);
+        device_graphs->prepare(inputs);
+    }
     graph_memory.emplace();
     graph_memory->preparation_increment_bytes =
         device_memory_growth(before, device_memory_snapshot(cuda.device()));
@@ -343,6 +344,7 @@ void RankProgramImpl::initialize_graphs() {
 void RankProgramImpl::release_graphs() {
     resources.synchronize();
     graphs.reset();
+    device_graphs.reset();
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

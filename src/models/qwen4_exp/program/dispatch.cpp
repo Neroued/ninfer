@@ -51,12 +51,18 @@ void RankProgramImpl::advance_compute() {
             break;
         case ComputePhase::AwaitPle: {
             request_decision();
-            const auto embedding = ple.try_consume(*f.ple);
+            if (!host_ple) {
+                ple_ready.wait(cuda.stream());
+                f.run->consume_ple(device_embedding(f.tokens, f.rows.size()));
+                f.phase = ComputePhase::Suffix;
+                break;
+            }
+            const auto embedding = host_ple->try_consume(*f.ple);
             if (!embedding) return;
             request_decision();
             if (f.verify) {
                 for (std::size_t b = 0; b < f.rows.size(); ++b) {
-                    const auto input = ple.input(*f.ple, b);
+                    const auto input = host_ple->input(*f.ple, b);
                     std::copy(input.begin(), input.end(), f.verify->inputs.begin() + b * f.tokens);
                 }
             }
@@ -72,7 +78,7 @@ void RankProgramImpl::advance_compute() {
                 f.run->consume_ple(embedding->values);
                 embedding->consumed.record(cuda.stream());
             }
-            ple.consumer_submitted(*f.ple);
+            host_ple->consumer_submitted(*f.ple);
             if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
                 forward && forward->prefetch) {
                 const auto& next = *forward->prefetch;
@@ -80,7 +86,7 @@ void RankProgramImpl::advance_compute() {
                                            next.member.sequence.generation, next.frontier,
                                            next.raw_tail},
                                           next.ids};
-                ple.prefetch(next.ids.size(), {&input, 1});
+                host_ple->prefetch(next.ids.size(), {&input, 1});
             }
             f.phase =
                 f.graph && f.graph->resident() ? ComputePhase::AfterMain : ComputePhase::Suffix;
@@ -95,7 +101,7 @@ void RankProgramImpl::advance_compute() {
                 const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
                 if (f.verify || (forward && forward->sample == SampleKind::NextToken))
                     logits = packed_tensor(*resources.plan.persistent.buffers.logits,
-                                           {dimension(parameters.profile->config.text.vocabulary),
+                                           {dimension(parameters.profile->local.vocabulary),
                                             static_cast<int>(f.tokens),
                                             static_cast<int>(f.rows.size())});
                 f.run->finish({f.sample, f.conditioning}, logits);
@@ -148,7 +154,7 @@ void RankProgramImpl::advance_compute() {
         case ComputePhase::PendingCommit:
             return;
         case ComputePhase::Retiring:
-            if (!compute_done.ready() || !ple.retired(f.request.ticket)) return;
+            if (!compute_done.ready() || (host_ple && !host_ple->retired(f.request.ticket))) return;
             retire_compute();
             return;
         }
@@ -159,10 +165,14 @@ void RankProgramImpl::finish_result() {
     auto& f      = *compute;
     auto& result = f.result;
     result.rows.resize(f.rows.size());
-    const auto& buffers          = resources.plan.persistent.buffers;
-    const auto* ids              = static_cast<const TokenId*>(resources.egress().data);
-    const auto* forward          = std::get_if<ForwardWork>(&f.request.work.operation);
-    const bool sampled           = f.verify || (forward && forward->sample != SampleKind::None);
+    const auto& buffers = resources.plan.persistent.buffers;
+    const auto* ids     = static_cast<const TokenId*>(resources.egress().data);
+    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+    const bool sampled  = f.verify || (forward && forward->sample != SampleKind::None);
+    if (f.verify && !host_ple) {
+        const auto* input = static_cast<const TokenId*>(draft_output.data());
+        std::copy_n(input, f.verify->inputs.size(), f.verify->inputs.begin());
+    }
     const std::int32_t* counts   = nullptr;
     const std::int32_t* accepted = nullptr;
     if (f.verify) {
@@ -210,7 +220,21 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     if (!compute || compute->request.ticket != ticket)
         throw std::logic_error("Qwen4Exp commit refers to an inactive execution");
     auto& f = *compute;
-    if (f.verify) commit_verify(commit);
+    if (f.verify)
+        commit_verify(commit);
+    else if (parallel && !std::holds_alternative<ScoreWork>(f.request.work.operation)) {
+        const auto& io   = resources.plan.persistent.buffers;
+        const auto& work = std::get<ForwardWork>(f.request.work.operation);
+        if (work.sample != SampleKind::None)
+            for (std::size_t b = 0; b < commit.rows.size(); ++b) {
+                if (!commit.rows[b].accepted) continue;
+                auto id = packed_tensor(*io.sampled_ids, {static_cast<int>(commit.rows.size())})
+                              .slice(0, b, 1);
+                auto counts = device_tensor(*io.token_counts)
+                                  .slice(1, commit.rows[b].member.residency.lane.value, 1);
+                ops::increment_token_counts(id, counts, cuda);
+            }
+    }
     resources.compute_actions->submit(commit.actions);
     compute_done.record(cuda.stream());
     f.retirement = command;
@@ -233,7 +257,7 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
     });
     auto& f      = *compute;
     f.retirement = command;
-    ple.cancel(ticket);
+    if (host_ple) host_ple->cancel(ticket);
     if (f.graph) f.graph->cancel();
     if (resources.experts) resources.experts->cancel();
     f.run.reset();
@@ -250,7 +274,7 @@ void RankProgramImpl::retire_compute() {
 }
 
 std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgramImpl::poll() {
-    ple.progress();
+    if (host_ple) host_ple->progress();
     advance_context();
     advance_compute();
     if (events.empty()) return {};
@@ -270,12 +294,13 @@ void RankProgramImpl::drain() {
         }
     };
     if (compute) {
-        attempt([&] { ple.cancel(compute->request.ticket); });
+        if (host_ple) attempt([&] { host_ple->cancel(compute->request.ticket); });
         if (compute->graph) attempt([&] { compute->graph->cancel(); });
     }
     if (resources.experts) attempt([&] { resources.experts->cancel(); });
-    attempt([&] { ple.drain(); });
+    if (host_ple) attempt([&] { host_ple->drain(); });
     attempt([&] { resources.synchronize(); });
+    if (parallel) attempt([&] { parallel->synchronize(); });
     compute.reset();
     context.reset();
     events.clear();

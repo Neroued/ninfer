@@ -4,4 +4,5 @@ ninfer_add_op_test(ninfer_sequence_test
           "${CMAKE_CURRENT_LIST_DIR}/masked_block.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/autoregressive_round.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/verify.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/shifted_prefix.cpp"
   LIBRARIES ninfer_ops)

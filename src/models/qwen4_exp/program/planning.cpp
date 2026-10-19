@@ -15,8 +15,7 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
     PersistentLayout out;
     const auto slots = std::uint64_t(o.max_concurrency) + o.context_cache.extra_state_slots.value();
     if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
-    out.state = plan_state_image(b, p.config, p.local.gdn, slots,
-                                 p.ple_placement == ple::Placement::Device);
+    out.state = plan_state_image(b, p.config, p.local.gdn, slots);
     out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context, pages,
                                o.max_concurrency, o.kv_cache);
     if (p.mtp)
@@ -24,10 +23,10 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
             plan_qsa_cache(b, p.local.qsa, 1, o.max_context,
                            pages + o.max_concurrency * ((o.speculative.draft_tokens + 63) / 64),
                            o.max_concurrency, o.kv_cache);
-    out.buffers = plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
-                               p.local.vocabulary, p.local.rank, p.local.size,
-                               p.ple_placement == ple::Placement::Device);
-    out.bytes   = b.finish(256);
+    out.buffers =
+        plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
+                     p.local.vocabulary, p.local.size, p.ple_placement == ple::Placement::Device);
+    out.bytes = b.finish(256);
     return out;
 }
 
@@ -110,13 +109,16 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
             : context::host_context_capacity(o.context_cache.host_capacity_bytes,
                                              out.persistent.state.images.image_stride);
     // Keep all per-call metadata in the pinned ingress as well as input IDs/positions.
-    out.pinned_io_bytes = out.persistent.buffers.batch.accepted_columns.region.offset +
-                          out.persistent.buffers.batch.accepted_columns.region.bytes -
+    out.pinned_io_bytes = out.persistent.buffers.batch.count_slots.region.offset +
+                          out.persistent.buffers.batch.count_slots.region.bytes -
                           out.persistent.buffers.batch.ids.region.offset;
     if (out.persistent.buffers.mtp)
         out.pinned_mtp_bytes =
             out.persistent.buffers.mtp->ingress.bytes +
             2ULL * o.speculative.draft_tokens * o.max_concurrency * sizeof(TokenId);
+    if (out.persistent.buffers.mtp && out.profile->ple_placement == ple::Placement::Device)
+        out.pinned_draft_bytes =
+            (o.speculative.draft_tokens + 1) * o.max_concurrency * sizeof(TokenId);
     if (out.persistent.buffers.sampled_ids) {
         out.pinned_sampling_bytes =
             o.max_concurrency *
@@ -160,7 +162,7 @@ std::size_t ExecutionPlan::pinned_context_counts_bytes() const {
 }
 
 std::size_t ExecutionPlan::device_reservation_bytes() const {
-    const auto host = ple_prepare_bytes + ple_upload.ordinary_host_bytes +
+    const auto host = pinned_draft_bytes + ple_prepare_bytes + ple_upload.ordinary_host_bytes +
                       ple_upload.pinned_host_bytes + pinned_io_bytes + pinned_output_bytes +
                       pinned_sampling_bytes + pinned_mtp_bytes + pinned_context_bytes() +
                       pinned_aux_bytes() + pinned_context_counts_bytes();

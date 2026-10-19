@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/internal.h"
+#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/startup.h"
 
 #include <algorithm>
@@ -24,10 +25,17 @@ void check_table(context::TableRow row, std::uint32_t pool, const QsaCache& cach
 } // namespace
 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan plan,
-                                 DeviceContext& d, const StartupObserver& observer)
+                                 DeviceContext& d, const StartupObserver& observer,
+                                 ParallelBinding binding)
     : parameters(p), device(d), cuda(d.execution_view()),
-      resources(p, std::move(plan), d, observer), ple(resources, d), shape(resources.plan.shape),
-      prefill_timer(d), compute_done(d), context_done(d) {}
+      resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
+      draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
+      prefill_timer(d), compute_done(d), context_done(d) {
+    if (binding.group) parallel.emplace(binding, d);
+    if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
+        throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
+    if (resources.ple_prepare) host_ple = std::make_unique<PlePipeline>(resources, d);
+}
 
 RankProgramImpl::~RankProgramImpl() {
     try {
@@ -35,6 +43,7 @@ RankProgramImpl::~RankProgramImpl() {
     } catch (const std::logic_error&) { std::terminate(); } catch (...) {
     }
     graphs.reset();
+    device_graphs.reset();
     for (auto& resident : bindings)
         if (resident) retire_vision(*resident);
 }
@@ -49,9 +58,6 @@ ResidentBinding& RankProgramImpl::binding(runtime::ResidencyId residency) {
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
-    if (parameters.model.rank_plan().size > 1 &&
-        !std::holds_alternative<ContextWork>(work.operation))
-        throw std::invalid_argument("Qwen4Exp parallel forward is not implemented");
     WorkContract{shape, parameters.profile->config.text.vocabulary,
                  parameters.profile->public_tokens, bool(parameters.mtp), bool(parameters.vision)}
         .validate(work, kind);
@@ -143,6 +149,7 @@ bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
 void RankProgramImpl::reset_memory_peaks() noexcept {
     resources.workspace.reset_peak();
     if (graphs) graphs->reset_workspace_peak();
+    if (device_graphs) device_graphs->reset_workspace_peak();
     vision_handoff_peak_bytes = active_vision_bytes();
     vision_workspace_peak_bytes =
         vision_handoff_peak_bytes
@@ -170,7 +177,8 @@ MemorySummary RankProgramImpl::memory_summary() const {
                       : resources.workspace.used();
     out.workspace = {plan.workspace.bytes, active_workspace,
                      std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
-                               graphs ? graphs->workspace_peak() : 0})};
+                               graphs ? graphs->workspace_peak() : 0,
+                               device_graphs ? device_graphs->workspace_peak() : 0})};
     if (plan.workspace.vision) {
         const auto& vision   = *plan.workspace.vision;
         out.vision_workspace = VisionWorkspaceMemorySummary{
@@ -224,15 +232,16 @@ MemorySummary RankProgramImpl::memory_summary() const {
 
 namespace ninfer::models::qwen4_exp {
 RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan plan,
-                         DeviceContext& device, const StartupObserver& observer)
-    : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device,
-                                                      observer)) {
-    if (impl_->shape.cuda_graph) {
-        StartupPhaseScope phase(observer, StartupPhase::CudaGraphPrepare);
-        impl_->initialize_graphs();
-        phase.complete();
-    }
+                         DeviceContext& device, const StartupObserver& observer,
+                         ParallelBinding binding)
+    : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device, observer,
+                                                      binding)) {}
+
+void RankProgram::prepare_execution() {
+    if (impl_->shape.cuda_graph) { impl_->initialize_graphs(); }
 }
+
+void RankProgram::release_execution() { impl_->release_graphs(); }
 
 RankProgram::~RankProgram() = default;
 

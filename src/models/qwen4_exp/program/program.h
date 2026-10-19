@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/program/planning.h"
 #include "models/qwen4_exp/session/planning.h"
 #include "models/qwen4_exp/work.h"
+#include "models/qwen4_exp/parallel/execution.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace execution {
@@ -18,13 +19,15 @@ class RankProgramImpl;
 class RankProgram {
 public:
     RankProgram(const execution::Parameters&, ExecutionPlan, DeviceContext&,
-                const StartupObserver& observer = {});
+                const StartupObserver& observer = {}, ParallelBinding = {});
     ~RankProgram();
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;
 
     [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;
     [[nodiscard]] SessionPlan session_plan() const;
+    void prepare_execution();
+    void release_execution();
     [[nodiscard]] std::vector<context::KVTransferProfile> context_transfer_profiles() const;
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);

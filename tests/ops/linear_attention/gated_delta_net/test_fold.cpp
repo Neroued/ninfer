@@ -85,7 +85,7 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false, bool captured = false) {
+             bool distinct_destination = false, bool captured = false, bool device_rows = false) {
     const int kQkHeads                           = profile.value_heads == 24 ? 8 : 16;
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
@@ -374,6 +374,18 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
+    auto device_sources      = to_device(source_slots);
+    auto device_destinations = to_device(destination_slots);
+    auto device_commits      = to_device(commits);
+    const Tensor source_metadata(device_sources.span(), DType::I32, {rows});
+    const Tensor destination_metadata(device_destinations.span(), DType::I32, {rows});
+    const Tensor commit_metadata(device_commits.span(), DType::I32, {rows});
+    const auto execute = [&](CudaExecutionView cuda) {
+        if (device_rows)
+            fold_plan.execute(source_metadata, destination_metadata, commit_metadata, cuda);
+        else
+            fold_plan.execute(fold_rows, cuda);
+    };
     if (captured || (width == 16 && rows == 8)) {
         cuda_synchronize();
         DeviceBuffer original(ninfer::test::cuda_environment().context.device(), state_bytes);
@@ -382,9 +394,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         DeviceContext context;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
-        definition.capture(context.stream(),
-                           [&] { fold_plan.execute(fold_rows, context.execution_view()); });
+        if (device_rows) device_commits.fill(0);
+        definition.capture(context.stream(), [&] { execute(context.execution_view()); });
         graph.instantiate(definition);
+        if (device_rows)
+            device_commits.copy_from_host(commits.data(), commits.size() * sizeof(int));
         // Host row descriptors are captured by value. Mutating them after capture must
         // not alter the graph's accepted prefixes. GPU state remains a live operand.
         for (auto& row : fold_rows) row.commit_columns = 0;
@@ -397,7 +411,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             context.synchronize();
         }
     } else {
-        fold_plan.execute(fold_rows, ninfer::test::cuda_environment().default_execution);
+        execute(ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
     }
 
@@ -829,6 +843,19 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (int prefix : {3, 11})
+        suite.add("gdn_fold/device/l36/h24/w16/a" + std::to_string(prefix), [=] {
+            return run_case({36, 24, 5120}, 16, 1, {prefix}, 5101U, true, true, true);
+        });
+    for (const FoldProfile profile :
+         {FoldProfile{48, 48, 10240}, {30, 32, 8192}, {36, 48, 10240}, {36, 24, 5120}})
+        for (bool captured : {false, true}) {
+            const auto id = "gdn_fold/device/l" + std::to_string(profile.layers) + "/h" +
+                            std::to_string(profile.value_heads) + (captured ? "/graph" : "/eager");
+            suite.add(id, [=] {
+                return run_case(profile, 6, 4, {0, 1, 3, 6}, 5100U, captured, captured, true);
+            });
+        }
     const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
                          unsigned seed, bool distinct = false, bool captured = false) {
         std::string id = std::string(p.value_heads == 24 ? "gdn_fold_local/l" : "gdn_fold/l") +

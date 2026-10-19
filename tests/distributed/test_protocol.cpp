@@ -2,6 +2,7 @@
 #include "models/common/qwen/vision/control.h"
 #include "models/qwen4_exp/wire.h"
 #include "runtime/executor/protocol.h"
+#include "runtime/executor/input.h"
 
 #include <sys/socket.h>
 
@@ -185,7 +186,8 @@ void queues() {
     const std::array normal{dist::OutgoingMessage{1, message(wire::Kind::Submit, 256)}};
     const std::array continuation{dist::OutgoingMessage{1, message(wire::Kind::Discard, 16)}};
     require(source.try_send(normal) && !source.try_send(normal), "normal queue has no bound");
-    require(source.try_send(continuation, true), "normal input consumed continuation capacity");
+    require(source.try_send(continuation, ninfer::distributed::Traffic::Continuation),
+            "normal input consumed continuation capacity");
     source.start();
     target.start();
     std::size_t received = 0;
@@ -208,12 +210,80 @@ void queues() {
         std::this_thread::yield();
     }
 }
+
+void inputs() {
+    int sockets[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+            "input socketpair failed");
+    dist::TransportLimits limits;
+    limits.input_bytes    = (256ULL << 10) + 128;
+    limits.input_messages = 1;
+    dist::Transport source(limits), target(limits);
+    source.add(1, dist::Socket(sockets[0]));
+    target.add(0, dist::Socket(sockets[1]));
+    auto data = std::make_shared<wire::Bytes>(600ULL << 10);
+    for (std::size_t i = 0; i < data->size(); ++i) (*data)[i] = std::byte(i % 251);
+    const auto expected                    = *data;
+    std::weak_ptr<const wire::Bytes> owner = data;
+    runtime::InputTransfers transfers;
+    const auto keys = transfers.begin({{1, 7, {std::byte{19}}, {*data}, data}});
+    data.reset();
+    require(!owner.expired() && !transfers.ready(keys), "input owner was released before upload");
+    transfers.progress(source, 11);
+    const auto control =
+        std::make_shared<wire::Message>(wire::Message{wire::Kind::Commit, 11, {std::byte{23}}});
+    const dist::OutgoingMessage message{1, control};
+    require(source.try_send({&message, 1}, dist::Traffic::Continuation),
+            "bulk input consumed continuation capacity");
+    source.start();
+    target.start();
+    wire::Bytes received;
+    bool began = false, ended = false, control_received = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!ended) {
+        require(std::chrono::steady_clock::now() < until, "bounded input transfer stalled");
+        transfers.progress(source, 11);
+        auto value = target.poll();
+        if (!value) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (value->message.kind == wire::Kind::Commit) {
+            require(!began, "queued bulk input blocked a control continuation");
+            control_received = true;
+            continue;
+        }
+        wire::Decoder in(value->message.payload);
+        require(in.u64() == 7, "input identity changed");
+        if (value->message.kind == wire::Kind::InputBegin) {
+            const auto metadata = in.bytes();
+            require(!began && metadata.size() == 1 && metadata[0] == std::byte{19},
+                    "input metadata changed");
+            began = true;
+        } else if (value->message.kind == wire::Kind::InputChunk) {
+            require(began && in.u64() == 0 && in.u64() == received.size(),
+                    "input chunk ordering changed");
+            const auto bytes = in.bytes();
+            received.insert(received.end(), bytes.begin(), bytes.end());
+        } else {
+            require(value->message.kind == wire::Kind::InputEnd && received == expected,
+                    "input was sealed without its complete payload");
+            ended = true;
+        }
+        in.finish();
+    }
+    require(control_received && !transfers.ready(keys), "input bypassed receiver readiness");
+    transfers.complete(1, 7);
+    require(transfers.ready(keys) && owner.expired(), "ready input retained its source payload");
+    transfers.release(7);
+}
 } // namespace
 
 int main() {
     try {
         native_work();
         queues();
+        inputs();
         MemorySummary memory;
         memory.workspace                             = {128, 64, 96};
         memory.cuda_graph                            = GraphMemorySummary{42, -12, 5, -8};

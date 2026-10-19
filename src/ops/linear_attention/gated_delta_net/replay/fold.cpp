@@ -162,4 +162,37 @@ void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows,
         records_, states_, packed, static_cast<std::int32_t>(rows.size()), execution.stream());
 }
 
+void GdnReplayFoldPlan::execute(const Tensor& source_slots, const Tensor& destination_slots,
+                                const Tensor& commit_columns, CudaExecutionView execution) const {
+    constexpr const char* op = "gdn_replay_fold";
+    common::operand::device(records_.conv.device, execution.device(), op, "state/records");
+    const auto batch = source_slots.ne[0];
+    if (batch < 1 || batch > records_.spec.record_capacity)
+        throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
+    for (const auto* input : {&source_slots, &destination_slots, &commit_columns}) {
+        common::operand::tensor(*input, DType::I32, {batch}, 4, op, "row metadata",
+                                execution.device());
+        const auto range = common::operand::range(*input, op);
+        for (const auto* record : {&records_.conv, &records_.key, &records_.value, &records_.gate})
+            if (common::operand::overlaps(range, common::operand::range(*record, op)))
+                throw std::invalid_argument("gdn_replay_fold: metadata overlaps records");
+        for (int layer = 0; layer < records_.spec.layers; ++layer)
+            if (common::operand::overlaps(
+                    layer_blocks(states_.conv_layer0, states_.conv_layer_stride_bytes, layer, op),
+                    range) ||
+                common::operand::overlaps(layer_blocks(states_.recurrent_layer0,
+                                                       states_.recurrent_layer_stride_bytes, layer,
+                                                       op),
+                                          range))
+                throw std::invalid_argument("gdn_replay_fold: metadata overlaps state");
+    }
+    detail::gated_delta_net::launch_replay_fold(
+        records_, states_,
+        detail::gated_delta_net::GdnReplayFoldDeviceRows{
+            static_cast<const std::int32_t*>(source_slots.data),
+            static_cast<const std::int32_t*>(destination_slots.data),
+            static_cast<const std::int32_t*>(commit_columns.data)},
+        batch, execution.stream());
+}
+
 } // namespace ninfer::ops

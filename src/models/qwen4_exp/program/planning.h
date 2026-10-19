@@ -33,6 +33,7 @@ struct ExecutionPlan {
     std::size_t pinned_io_bytes       = 0;
     std::size_t pinned_sampling_bytes = 0;
     std::size_t pinned_mtp_bytes      = 0;
+    std::size_t pinned_draft_bytes    = 0;
     runtime::KvCapacityResolution capacity;
     bool graph_probe = false;
 

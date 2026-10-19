@@ -54,7 +54,8 @@ public:
 
     [[nodiscard]] static Tensor bind_output(MemorySpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
-    // Enqueue encoding and return its workspace extent, including the output handoff.
+    // Output names bind_output() or disjoint Device BF16 storage. Enqueue encoding and
+    // return its workspace extent; an external output is owned and budgeted by the caller.
     [[nodiscard]] std::size_t encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
                                      const VisionWorkspacePlan& plan) const;
 

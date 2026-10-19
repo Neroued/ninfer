@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/internal.h"
+#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/transfer.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/indexing.h"
@@ -49,6 +50,10 @@ void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t t
         host(io.base_positions)[b]    = row.main_frontier;
         host(io.record_offsets)[b]    = 0;
         host(io.accepted_columns)[b]  = frame.verify ? valid - 1 : valid;
+        host(io.raw_tail)[2 * b]      = row.ple_raw_tail[0];
+        host(io.raw_tail)[2 * b + 1]  = row.ple_raw_tail[1];
+        host(io.row_indices)[b]       = b;
+        host(io.count_slots)[b]       = row.member.residency.lane.value;
         for (std::uint32_t j = 0; j < tokens; ++j) {
             const auto offset            = std::min<std::size_t>(j, valid - 1);
             host(io.ids)[j + tokens * b] = row.ids[std::min<std::size_t>(j, row.ids.size() - 1)];
@@ -69,7 +74,7 @@ void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t t
     upload(io.ids, tokens * batch * sizeof(TokenId));
     upload(io.positions, tokens * batch * sizeof(std::int32_t));
     upload(io.rope_positions, tokens * batch * 3 * sizeof(std::int32_t));
-    upload(io.valid_columns, io.accepted_columns.region.offset + io.accepted_columns.region.bytes -
+    upload(io.valid_columns, io.count_slots.region.offset + io.count_slots.region.bytes -
                                  io.valid_columns.region.offset);
     frame.batch = resources.main_batch(tokens, batch, frame.visible);
 }
@@ -97,9 +102,12 @@ void RankProgramImpl::prepare_forward() {
                       row.ple_raw_tail},
                      row.ids};
     }
-    f.ple = ple.try_require(f.request.ticket, f.tokens, {inputs.data(), f.rows.size()});
-    if (!f.ple) return;
+    if (host_ple) {
+        f.ple = host_ple->try_require(f.request.ticket, f.tokens, {inputs.data(), f.rows.size()});
+        if (!f.ple) return;
+    }
     upload_main(f.rows, f.tokens);
+    if (!host_ple && (!device_graphs || f.sequence)) prepare_device_ple(f.batch);
     prepare_main();
     request_decision();
 }
@@ -145,20 +153,44 @@ void RankProgramImpl::prepare_main() {
         prefill_timer.start();
         f.timer_started = true;
     }
+    if (device_graphs && !f.sequence) {
+        const auto* forward    = std::get_if<ForwardWork>(&f.request.work.operation);
+        const bool control     = forward && forward->sample == SampleKind::None;
+        const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
+                                             [](const auto& row) { return row.constrained; });
+        const bool greedy      = std::all_of(f.rows.begin(), f.rows.end(), [](const auto& row) {
+            return !(row.sampling.temperature > 0);
+        });
+        const auto mode        = control       ? DeviceRound::Control
+                                 : constrained ? DeviceRound::Compute
+                                 : greedy      ? DeviceRound::Greedy
+                                               : DeviceRound::Sample;
+        f.graph_decided        = !control && !constrained;
+        if (f.graph_decided) {
+            request_decision();
+            install_sampling(f.verify.has_value());
+        }
+        device_graphs->replay(batch, mode, f.draft_visible, f.visible);
+        if (!f.graph_decided) request_decision();
+        f.graph_main = true;
+        f.phase      = ComputePhase::AfterMain;
+        return;
+    }
     const execution::TextExecution execution{resources.workspace,
                                              *resources.states,
                                              *resources.main,
                                              resources.experts.get(),
                                              device_tensor(layout.main_qsa.keys),
                                              device_tensor(layout.main_qsa.coordinates),
-                                             device_tensor(layout.ple_records)};
+                                             device_tensor(layout.ple_records),
+                                             parallel ? &*parallel : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (f.verify)
         update.emplace<execution::VerifyRecords>(*resources.gdn_records);
     else if (f.sequence)
         update = execution::SequenceSlots{f.rows[0].slots.source, f.rows[0].slots.destination};
     f.run = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
-    if (graphs && !f.sequence) {
+    if (graphs && host_ple && !f.sequence) {
         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
         const auto kind     = f.verify                                   ? MainGraph::Verify
                               : forward->sample == SampleKind::NextToken ? MainGraph::Ordinary
@@ -203,6 +235,11 @@ void RankProgramImpl::after_main() {
         }
     }
     if (f.timer_started) prefill_timer.record_stop();
+    if (f.graph_decided) {
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation)) {
         if (forward->sample == SampleKind::None) {
             compute_done.record(cuda.stream());
@@ -218,10 +255,19 @@ void RankProgramImpl::after_main() {
 }
 
 void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
+    if (parallel) {
+        vocabulary_sample(
+            batch, first_token,
+            std::all_of(compute->rows.begin(), compute->rows.end(),
+                        [](const auto& row) { return !(row.sampling.temperature > 0); })
+                ? 1
+                : 20);
+        return;
+    }
     const auto& io = resources.plan.persistent.buffers;
     auto logits    = device_tensor(*io.logits).slice(1, 0, batch);
     auto configs   = device_tensor(*io.sampling);
-    auto positions = device_tensor(io.batch.base_positions).slice(0, 0, batch);
+    auto positions = device_tensor(io.batch.sampling_positions).slice(0, 0, batch);
     auto sampled   = device_tensor(*io.sampled_ids)
                        .view({static_cast<std::int32_t>(device_tensor(*io.sampled_ids).numel())})
                        .slice(0, 0, batch);
@@ -238,7 +284,14 @@ void RankProgramImpl::request_decision() {
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     if (forward && forward->sample == SampleKind::None) return;
     if (std::holds_alternative<ScoreWork>(f.request.work.operation)) return;
-    if (f.verify && (!f.ple || !ple.input_ready(*f.ple))) return;
+    if (std::none_of(f.rows.begin(), f.rows.end(),
+                     [](const auto& row) { return row.constrained; })) {
+        f.decision_requested = true;
+        f.decision.emplace();
+        return;
+    }
+    if (f.verify && host_ple && (!f.ple || !host_ple->input_ready(*f.ple))) return;
+    if (f.verify && !host_ple && !draft_copied.ready()) return;
     runtime::DecisionRequest request;
     request.vocabulary = parameters.profile->public_tokens;
     for (std::uint32_t b = 0; b < f.rows.size(); ++b) {
@@ -246,7 +299,12 @@ void RankProgramImpl::request_decision() {
         runtime::DecisionRequest::Row row;
         row.member = b;
         if (f.verify) {
-            const auto input = ple.input(*f.ple, b);
+            const auto input =
+                host_ple
+                    ? host_ple->input(*f.ple, b)
+                    : std::span<const TokenId>(static_cast<const TokenId*>(draft_output.data()) +
+                                                   b * f.verify->width,
+                                               f.verify->extents[b] + 1);
             row.drafts.assign(input.begin() + 1, input.end());
         }
         request.rows.push_back(std::move(row));
@@ -273,7 +331,7 @@ void RankProgramImpl::install_sampling(bool speculative) {
         configs[b] = sampling_config(f.rows[b].sampling);
         auto counts =
             device_tensor(*buffers.token_counts).slice(1, f.rows[b].member.residency.lane.value, 1);
-        if (speculative) {
+        if (speculative && !parallel) {
             if (configs[b].presence_penalty || configs[b].frequency_penalty) {
                 auto provisional = device_tensor(buffers.mtp->token_counts).slice(1, b, 1);
                 copy_bytes_async({provisional.data, provisional.bytes(), cuda.device()},
@@ -299,13 +357,20 @@ void RankProgramImpl::install_sampling(bool speculative) {
         }
         positions[b] = f.rows[b].sampling_position;
     }
+    if (!speculative && f.first_sample && parallel) {
+        auto target = device_tensor(buffers.batch.accepted_columns).slice(0, 0, batch);
+        auto* host  = static_cast<std::int32_t*>(host_tensor(buffers.batch.accepted_columns).data);
+        std::fill_n(host, batch, 1);
+        copy_bytes_async({target.data, target.bytes(), cuda.device()},
+                         {host, target.bytes(), Device::cpu(), true}, cuda);
+    }
     if (!consumed.rows.empty()) events.emplace_back(std::move(consumed));
     auto target = device_tensor(*buffers.sampling);
     copy_bytes_async({target.data, batch * sizeof(*configs), cuda.device()},
                      {configs, batch * sizeof(*configs), Device::cpu(), true}, cuda);
     {
         auto target_positions =
-            device_tensor(speculative ? buffers.mtp->frontiers : buffers.batch.base_positions)
+            device_tensor(speculative ? buffers.mtp->frontiers : buffers.batch.sampling_positions)
                 .slice(0, 0, batch);
         copy_bytes_async({target_positions.data, batch * 4, cuda.device()},
                          {positions, batch * 4, Device::cpu(), true}, cuda);
@@ -319,8 +384,17 @@ void RankProgramImpl::prepare_decision() {
     install_sampling(f.verify.has_value());
     const auto& buffers = resources.plan.persistent.buffers;
     const auto batch    = f.rows.size();
+    if (device_graphs && f.graph_main) {
+        const bool greedy = std::all_of(f.rows.begin(), f.rows.end(), [](const auto& row) {
+            return !(row.sampling.temperature > 0);
+        });
+        device_graphs->decide(batch, f.verify.has_value(), greedy ? 1 : 20);
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     if (f.verify) {
-        if (graphs)
+        if (graphs && host_ple)
             graphs->accept(batch);
         else
             accept_forward(batch);
@@ -336,7 +410,7 @@ void RankProgramImpl::prepare_decision() {
             execution::project_head(sample, parameters.text.head, logits, resources.workspace,
                                     cuda);
         }
-        if (graphs && !f.first_sample)
+        if (graphs && host_ple && !f.first_sample)
             graphs->sample(batch);
         else
             sample_forward(batch, f.first_sample);
@@ -346,6 +420,29 @@ void RankProgramImpl::prepare_decision() {
     }
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitResult;
+}
+
+void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
+    const auto& io   = resources.plan.persistent.buffers;
+    const auto begin = io.sampled_ids->region.offset;
+    const auto bytes =
+        verify ? io.accepted_drafts->region.offset + io.accepted_drafts->region.bytes - begin
+               : std::size_t(batch) * sizeof(TokenId);
+    copy_bytes_async(resources.egress().subspan(0, bytes),
+                     resources.persistent().subspan(begin, bytes), cuda);
+}
+
+void RankProgramImpl::copy_verify_inputs(std::int32_t batch, bool capture) {
+    const auto ids      = resources.main_batch(shape.draft_tokens + 1, batch, 1).ids;
+    const auto transfer = resources.ple_transfer();
+    ple_inputs.record(cuda.stream());
+    ple_inputs.wait(transfer.stream());
+    copy_bytes_async(draft_output.span().subspan(0, ids.bytes()),
+                     {ids.data, ids.bytes(), cuda.device()}, transfer);
+    if (capture)
+        draft_copied.record_external(transfer.stream());
+    else
+        draft_copied.record(transfer.stream());
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

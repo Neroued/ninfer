@@ -7,6 +7,8 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_accept.h"
+#include "ninfer/ops/vocabulary.h"
+#include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
 
@@ -111,6 +113,9 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
                                   : o.max_concurrency * (o.speculative.draft_tokens + 1);
     out.finish              = linear(p.text.head, 1, head_columns);
     if (o.purpose == EnginePurpose::Generation) {
+        if (p.local.size > 1)
+            out.finish = std::max(out.finish, ops::vocabulary_candidates_workspace_capacity_bytes(
+                                                  p.local.vocabulary, head_columns, 20));
         out.finish =
             std::max(out.finish,
                      ops::sampling_workspace_capacity_bytes(p.public_tokens, 1, o.max_concurrency));
@@ -123,6 +128,14 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
     if (o.purpose == EnginePurpose::CausalScoring) {
         WorkspaceLayoutBuilder a;
         (void)workspace::score(a, p.local.vocabulary, head_columns);
+        if (p.local.size > 1) {
+            (void)a.alloc(DType::FP32, {3, static_cast<int>(head_columns)});
+            (void)a.alloc(DType::FP32,
+                          {3, static_cast<int>(head_columns), dimension(p.local.size)});
+            out.finish =
+                std::max(out.finish, ops::vocabulary_logprob_stats_workspace_capacity_bytes(
+                                         p.local.vocabulary, head_columns));
+        }
         (void)a.alloc_bytes(out.finish);
         out.finish = a.peak_bytes();
     }

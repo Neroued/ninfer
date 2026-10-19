@@ -14,6 +14,7 @@ struct BatchLayout {
     std::optional<TensorRegion> visual_indices;
     TensorRegion valid_columns, source_slots, destination_slots, main_tables;
     TensorRegion base_positions, record_offsets, accepted_columns;
+    TensorRegion raw_tail, row_indices, count_slots, sampling_positions;
     std::uint32_t max_positions;
 };
 
@@ -32,6 +33,7 @@ struct MtpBufferLayout {
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
     TensorRegion tail_keys, tail_coordinates, row_indices;
     TensorRegion drafts, extents, anchors, frontiers, target_tokens, token_counts;
+    TensorRegion last_columns, active_columns;
 };
 
 struct BufferLayout {
@@ -45,8 +47,9 @@ struct BufferLayout {
     std::optional<GdnReplayRecordLayout> gdn_records;
     std::optional<MtpBufferLayout> mtp;
     std::optional<TensorRegion> logits;
-    std::optional<TensorRegion> ple_embedding, gathered_logits;
-    std::optional<LayoutRegion> vocabulary_candidates;
+    std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
+    std::optional<TensorRegion> proposal_sampling;
+    std::optional<TensorRegion> vision_features;
     std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
@@ -54,5 +57,5 @@ struct BufferLayout {
 [[nodiscard]] BufferLayout plan_buffers(LayoutBuilder&, const Config&, const EngineOptions&,
                                         std::uint32_t chunk, std::uint32_t public_tokens,
                                         const GdnConfig&, std::uint32_t local_vocabulary,
-                                        std::uint32_t rank, std::uint32_t ranks, bool device_ple);
+                                        std::uint32_t ranks, bool device_ple);
 } // namespace ninfer::models::qwen4_exp

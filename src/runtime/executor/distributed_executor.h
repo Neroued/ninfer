@@ -3,6 +3,7 @@
 #include "distributed/bootstrap.h"
 #include "runtime/executor/executor.h"
 #include "runtime/executor/protocol.h"
+#include "runtime/executor/input.h"
 
 #include <algorithm>
 #include <deque>
@@ -32,7 +33,8 @@ public:
         if (!closed_) group_->fail("distributed executor released with live execution");
     }
 
-    void bind_to_current_thread() override { owner_ = std::this_thread::get_id(); }
+    // Coordinator calls are serialized by the Engine. CUDA affinity belongs to remote workers.
+    void bind_to_current_thread() override {}
 
     [[nodiscard]] SessionEpoch epoch() const noexcept override { return {group_->epoch()}; }
 
@@ -50,24 +52,21 @@ public:
         auto scope = codec_.scope(work, group_->topology());
         scope.validate(group_->topology());
         ExecutionTicket id{epoch(), next_execution_ + 1, reservation.frame()};
-        protocol::Envelope envelope{id, {next_command_ + 1}, group_->topology().plan, scope};
-        auto messages = encode(envelope, distributed::wire::Kind::Submit,
-                               [&](auto& out, auto rank) { codec_.encode_work(out, work, rank); });
         Flight prepared;
-        prepared.ticket  = id;
-        prepared.command = envelope.command;
-        prepared.scope   = std::move(scope);
+        prepared.ticket = id;
+        prepared.scope  = std::move(scope);
+        if constexpr (requires { codec_.prepare_inputs(work, group_->topology()); })
+            prepared.inputs = inputs_.begin(codec_.prepare_inputs(work, group_->topology()));
         prepared.work.emplace(std::move(work));
-        prepared.phase = Phase::Running;
+        prepared.phase = Phase::Inputs;
         prepared.retired.resize(group_->topology().ranks.size());
         prepared.context_results.resize(group_->topology().ranks.size());
         prepared.consumed.resize(group_->topology().ranks.size());
         (void)pool_.accept(std::move(reservation));
         slot(id.frame) = std::move(prepared);
         ++next_execution_;
-        ++next_command_;
         try {
-            send(messages, false);
+            progress_inputs();
         } catch (const std::exception& e) { fail(e.what()); }
         return id;
     }
@@ -118,6 +117,10 @@ public:
         require_available();
         auto& flight = find(id);
         if (flight.phase == Phase::Discarding || flight.phase == Phase::Retiring) return;
+        if (flight.phase == Phase::Inputs) {
+            flight.cancel_requested = true;
+            return;
+        }
         protocol::Envelope envelope{id, {next_command_ + 1}, group_->topology().plan, flight.scope};
         auto messages  = encode(envelope, distributed::wire::Kind::Discard, [](auto&, auto) {});
         flight.command = envelope.command;
@@ -146,6 +149,12 @@ public:
                 if (message.epoch != epoch().value)
                     throw std::logic_error("stale rank event epoch");
                 distributed::wire::Decoder in(message.payload);
+                if (message.kind == distributed::wire::Kind::InputReady) {
+                    const auto id = in.u64();
+                    in.finish();
+                    inputs_.complete(incoming->peer, id);
+                    continue;
+                }
                 if (message.kind == distributed::wire::Kind::Failed) {
                     auto detail = in.string();
                     in.finish();
@@ -182,6 +191,7 @@ public:
                 in.finish();
                 consume(incoming->peer, std::move(event));
             }
+            progress_inputs();
             group_->check_processes();
         } catch (const std::exception& e) {
             fail(e.what());
@@ -196,6 +206,7 @@ public:
     void flush() override {
         if (!failed_ && !closed_) {
             try {
+                progress_inputs();
                 group_->check_processes();
             } catch (const std::exception& e) { fail(e.what()); }
         }
@@ -258,7 +269,7 @@ public:
     }
 
 private:
-    enum class Phase { Empty, Running, Decision, Result, Retiring, Discarding };
+    enum class Phase { Empty, Inputs, Running, Decision, Result, Retiring, Discarding };
 
     struct Flight {
         ExecutionTicket ticket;
@@ -271,7 +282,9 @@ private:
         std::vector<std::optional<Result>> context_results;
         std::vector<std::optional<DecisionConsumed>> consumed;
         std::vector<bool> retired;
+        std::vector<InputTransfers::Key> inputs;
         bool supplied = false, consumed_published = false, result_published = false;
+        bool cancel_requested = false;
     };
 
     [[nodiscard]] Flight& slot(FrameId frame) {
@@ -287,8 +300,42 @@ private:
 
     void require_available() const {
         if (closed_ || failed_) throw std::runtime_error("distributed executor is unavailable");
-        if (owner_ != std::thread::id{} && owner_ != std::this_thread::get_id())
-            throw std::logic_error("distributed executor used from another thread");
+    }
+
+    void progress_inputs() {
+        inputs_.progress(group_->transport(), epoch().value);
+        for (auto* flights : {&compute_, &context_})
+            for (auto& flight : *flights) {
+                if (flight.phase != Phase::Inputs || !inputs_.ready(flight.inputs)) continue;
+                protocol::Envelope envelope{
+                    flight.ticket, {next_command_ + 1}, group_->topology().plan, flight.scope};
+                auto messages =
+                    encode(envelope, distributed::wire::Kind::Submit, [&](auto& out, auto rank) {
+                        codec_.encode_work(out, *flight.work, rank);
+                    });
+                send(messages, false);
+                flight.command = envelope.command;
+                flight.phase   = Phase::Running;
+                ++next_command_;
+                if (flight.cancel_requested) discard(flight.ticket);
+            }
+    }
+
+    void retire_inputs(const Work& work) {
+        if constexpr (requires { codec_.retire_inputs(work); }) {
+            for (const auto& release : codec_.retire_inputs(work)) {
+                distributed::wire::Encoder out;
+                out.u64(release.id);
+                auto message = std::make_shared<const distributed::wire::Message>(
+                    distributed::wire::Message{distributed::wire::Kind::InputRelease, epoch().value,
+                                               std::move(out).take()});
+                std::vector<distributed::OutgoingMessage> requests;
+                for (const auto& rank : group_->topology().ranks)
+                    requests.push_back({rank.rank, message});
+                send(requests, true);
+                inputs_.release(release.id);
+            }
+        }
     }
 
     void validate_control_capacity() const {
@@ -381,7 +428,9 @@ private:
     }
 
     void send(std::span<const distributed::OutgoingMessage> messages, bool continuation) {
-        if (!group_->transport().try_send(messages, continuation))
+        if (!group_->transport().try_send(messages, continuation
+                                                        ? distributed::Traffic::Continuation
+                                                        : distributed::Traffic::Work))
             throw std::logic_error("execution exceeded its reserved control capacity");
     }
 
@@ -460,6 +509,7 @@ private:
                             if (f.ticket.frame.kind == FrameKind::Context && !f.result_published)
                                 throw std::logic_error("context retired before publication");
                             events_.emplace_back(DeviceRetired{f.ticket, f.command});
+                            retire_inputs(*f.work);
                             pool_.retire(f.ticket.frame);
                             f = {};
                         }
@@ -472,6 +522,7 @@ private:
     std::unique_ptr<distributed::ExecutionGroup> group_;
     ExecutionPool pool_;
     Codec codec_;
+    InputTransfers inputs_;
     std::vector<Flight> compute_, context_;
 
     struct Progress {
@@ -482,7 +533,6 @@ private:
     std::vector<std::optional<MemorySummary>> memory_reports_;
     std::deque<Event> events_;
     std::optional<ExecutionFailed> failure_;
-    std::thread::id owner_;
     std::uint64_t next_execution_ = 0, next_command_ = 0;
     std::uint64_t memory_query_ = 0;
     bool failed_ = false, closed_ = false;

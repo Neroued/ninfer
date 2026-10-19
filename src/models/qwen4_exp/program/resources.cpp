@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/program/resources.h"
 #include "core/startup.h"
 #include "core/transfer.h"
+#include "ninfer/ops/sampling.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -74,6 +75,13 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     if (const auto& counts = plan.persistent.buffers.token_counts)
         CUDA_CHECK(
             cudaMemsetAsync(counts->bind(backing).data, 0, counts->region.bytes, device.stream()));
+    if (const auto& raw = plan.persistent.buffers.proposal_sampling) {
+        std::vector<ops::SamplingConfig> configs(plan.shape.max_concurrency);
+        for (auto& config : configs) config.temperature = 0;
+        copy_bytes(raw->region.bind(backing),
+                   {configs.data(), configs.size() * sizeof(configs.front()), Device::cpu()},
+                   device.execution_view());
+    }
     device.synchronize();
 }
 

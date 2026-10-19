@@ -8,9 +8,9 @@
 
 namespace ninfer::models::qwen4_exp::execution {
 namespace {
-void stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditioning,
-          const BatchView& batch, std::optional<VisualEmbeddingView> visual,
-          workspace::Roots& roots, MemoryArena& arena, CudaExecutionView cuda) {
+void mtp_stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditioning,
+              const BatchView& batch, std::optional<VisualEmbeddingView> visual,
+              workspace::Roots& roots, MemoryArena& arena, CudaExecutionView cuda) {
     const auto m = batch.tokens * batch.batch;
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     auto scope = arena.scope();
@@ -42,32 +42,63 @@ void mix(const Tensor& normalized, const HcParameters& p, workspace::Roots& root
 }
 } // namespace
 
+MtpRun::MtpRun(const TextConfig& config, const QsaConfig& qsa, const MtpParameters& parameters,
+               const Tensor& conditioning, BatchView batch, ops::QsaTailStateView before,
+               ops::QsaTailStateView after, ops::QsaCacheView cache, MemoryArena& arena,
+               CudaExecutionView cuda, ParallelExecution* parallel)
+    : config_(config), qsa_(qsa), parameters_(parameters), conditioning_(conditioning),
+      batch_(batch), before_(before), after_(after), cache_(cache), arena_(arena), cuda_(cuda),
+      parallel_(parallel), scope_(arena.scope()),
+      roots_(workspace::roots(arena, config, batch.tokens * batch.batch)) {}
+
+void MtpRun::stem() {
+    mtp_stem(config_, parameters_, conditioning_, batch_, {}, roots_, arena_, cuda_);
+}
+
+void MtpRun::local_mixer() {
+    mix(roots_.normalized, parameters_.layer.attention_hc, roots_, arena_, cuda_);
+    qsa(roots_.input, qsa_, std::get<QsaParameters>(parameters_.layer.mixer), batch_, before_,
+        after_, cache_, {}, roots_.output, arena_, cuda_);
+}
+
+void MtpRun::finish_mixer() {
+    if (parallel_) parallel_->sum(roots_.output, cuda_);
+    ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,
+                         parameters_.layer.moe_hc.norm, config_.norm_epsilon, roots_.residual,
+                         roots_.normalized, cuda_);
+    mix(roots_.normalized, parameters_.layer.moe_hc, roots_, arena_, cuda_);
+}
+
+void MtpRun::feed_forward() {
+    {
+        auto scratch = arena_.scope();
+        moe::execute(roots_.input, parameters_.layer.moe, parameters_.layer.moe.resident,
+                     ops::MoeEpilogue::Write, roots_.output, arena_, cuda_);
+    }
+    if (parallel_) parallel_->sum(roots_.output, cuda_);
+    ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,
+                         parameters_.final_hc.norm, config_.norm_epsilon, roots_.residual,
+                         roots_.normalized, cuda_);
+}
+
+void MtpRun::finish(TextOutputs output) {
+    copy_bytes_async({output.conditioning.data, roots_.residual.bytes(), cuda_.device()},
+                     {roots_.residual.data, roots_.residual.bytes(), cuda_.device()}, cuda_);
+    auto sample = output.sample.view({dimension(config_.hidden), batch_.tokens * batch_.batch});
+    ops::hc_mix(roots_.normalized, parameters_.final_hc.mix, arena_, sample, cuda_);
+}
+
 void mtp_forward(const TextConfig& c, const QsaConfig& qsa_config, const MtpParameters& p,
                  const Tensor& conditioning, const BatchView& batch,
                  const ops::QsaTailStateView& before, ops::QsaTailStateView after,
                  ops::QsaCacheView cache, TextOutputs output, MemoryArena& arena,
-                 CudaExecutionView cuda) {
-    const auto m = batch.tokens * batch.batch;
-    auto scope   = arena.scope();
-    auto roots   = workspace::roots(arena, c, m);
-    stem(c, p, conditioning, batch, {}, roots, arena, cuda);
-    mix(roots.normalized, p.layer.attention_hc, roots, arena, cuda);
-    qsa(roots.input, qsa_config, std::get<QsaParameters>(p.layer.mixer), batch, before, after,
-        cache, {}, roots.output, arena, cuda);
-    ops::hc_combine_norm(roots.residual, roots.output, roots.injection, p.layer.moe_hc.norm,
-                         c.norm_epsilon, roots.residual, roots.normalized, cuda);
-    mix(roots.normalized, p.layer.moe_hc, roots, arena, cuda);
-    {
-        auto scratch = arena.scope();
-        moe::execute(roots.input, p.layer.moe, p.layer.moe.resident, ops::MoeEpilogue::Write,
-                     roots.output, arena, cuda);
-    }
-    ops::hc_combine_norm(roots.residual, roots.output, roots.injection, p.final_hc.norm,
-                         c.norm_epsilon, roots.residual, roots.normalized, cuda);
-    copy_bytes_async({output.conditioning.data, roots.residual.bytes(), cuda.device()},
-                     {roots.residual.data, roots.residual.bytes(), cuda.device()}, cuda);
-    auto sample = output.sample.view({dimension(c.hidden), m});
-    ops::hc_mix(roots.normalized, p.final_hc.mix, arena, sample, cuda);
+                 CudaExecutionView cuda, ParallelExecution* parallel) {
+    MtpRun run(c, qsa_config, p, conditioning, batch, before, after, cache, arena, cuda, parallel);
+    run.stem();
+    run.local_mixer();
+    run.finish_mixer();
+    run.feed_forward();
+    run.finish(output);
 }
 
 void mtp_history(const TextConfig& c, const QsaConfig& qsa_config, const MtpParameters& p,
@@ -77,7 +108,7 @@ void mtp_history(const TextConfig& c, const QsaConfig& qsa_config, const MtpPara
                  MemoryArena& arena, CudaExecutionView cuda) {
     auto scope = arena.scope();
     auto roots = workspace::roots(arena, c, batch.tokens * batch.batch);
-    stem(c, p, conditioning, batch, visual, roots, arena, cuda);
+    mtp_stem(c, p, conditioning, batch, visual, roots, arena, cuda);
     mix(roots.normalized, p.layer.attention_hc, roots, arena, cuda);
     qsa_history(roots.input, qsa_config, std::get<QsaParameters>(p.layer.mixer), batch, before,
                 after, cache, arena, cuda);

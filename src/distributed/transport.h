@@ -50,7 +50,11 @@ struct TransportLimits {
     std::size_t queued_messages       = 64;
     std::size_t continuation_bytes    = 16ULL << 20;
     std::size_t continuation_messages = 64;
+    std::size_t input_bytes           = 8ULL << 20;
+    std::size_t input_messages        = 16;
 };
+
+enum class Traffic { Work, Continuation, Input };
 
 struct OutgoingMessage {
     RankId peer;
@@ -73,7 +77,7 @@ public:
     void add(RankId peer, Socket);
     void start();
     // Takes all messages atomically or none. Continuations use dedicated queue headroom.
-    [[nodiscard]] bool try_send(std::span<const OutgoingMessage>, bool continuation = false);
+    [[nodiscard]] bool try_send(std::span<const OutgoingMessage>, Traffic = Traffic::Work);
     [[nodiscard]] std::optional<IncomingMessage> poll();
     [[nodiscard]] std::string failure() const;
     [[nodiscard]] bool sending() const;

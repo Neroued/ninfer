@@ -2,7 +2,7 @@
 
 namespace ninfer::models::qwen4_exp {
 StateLayout plan_state_image(LayoutBuilder& backing, const Config& config, const GdnConfig& gdn,
-                             std::int32_t slots, bool device_ple) {
+                             std::int32_t slots) {
     const auto& c = config.text;
     StateImageBuilder b;
     StateLayout out;
@@ -21,8 +21,6 @@ StateLayout plan_state_image(LayoutBuilder& backing, const Config& config, const
     out.ple_history =
         b.add(DType::BF16, {dimension(c.residual_width()), dimension(c.ple.history_columns())}, 1,
               "PLE history");
-    if (device_ple)
-        out.ple_tokens = b.add(DType::I32, {dimension(c.ple.ngram_size - 1)}, 1, "PLE token tail");
     out.sample_hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main sample hidden");
     if (config.mtp) {
         out.conditioning =

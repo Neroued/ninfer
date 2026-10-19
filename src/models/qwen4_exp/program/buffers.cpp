@@ -1,13 +1,13 @@
 #include "models/qwen4_exp/program/buffers.h"
 #include "ninfer/ops/sampling.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
                           std::uint32_t chunk, std::uint32_t public_tokens, const GdnConfig& gdn,
-                          std::uint32_t local_vocabulary, std::uint32_t rank, std::uint32_t ranks,
-                          bool device_ple) {
+                          std::uint32_t local_vocabulary, std::uint32_t ranks, bool device_ple) {
     const auto hidden = dimension(c.text.hidden), channels = dimension(c.text.residual_width());
     const auto index_key = dimension(c.text.qsa.index_key_width());
     const auto batch     = static_cast<std::int32_t>(o.max_concurrency);
@@ -22,14 +22,18 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.batch.rope_positions = tensor(DType::I32, {positions, 3}, "input RoPE coordinates");
     if (c.vision)
         out.batch.visual_indices = tensor(DType::I32, {positions}, "visual embedding indices");
-    out.batch.valid_columns     = rows();
-    out.batch.source_slots      = rows();
-    out.batch.destination_slots = rows();
-    out.batch.main_tables       = rows();
-    out.batch.base_positions    = rows();
-    out.batch.record_offsets    = rows();
-    out.batch.accepted_columns  = rows();
-    out.batch.max_positions     = positions;
+    out.batch.valid_columns      = rows();
+    out.batch.source_slots       = rows();
+    out.batch.destination_slots  = rows();
+    out.batch.main_tables        = rows();
+    out.batch.base_positions     = rows();
+    out.batch.record_offsets     = rows();
+    out.batch.accepted_columns   = rows();
+    out.batch.raw_tail           = tensor(DType::I32, {2, batch}, "PLE input token tail");
+    out.batch.row_indices        = rows();
+    out.batch.count_slots        = rows();
+    out.batch.sampling_positions = rows();
+    out.batch.max_positions      = positions;
     out.prefill_sample =
         tensor(DType::BF16, {hidden, static_cast<std::int32_t>(chunk)}, "prefill sample");
     out.pending_sample = tensor(DType::BF16, {hidden, width, batch}, "pending sample");
@@ -89,6 +93,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         mtp.extents          = rows();
         mtp.anchors          = rows();
         mtp.frontiers        = rows();
+        mtp.last_columns     = rows();
+        mtp.active_columns   = rows();
         mtp.target_tokens    = tensor(DType::I32, {width, batch}, "MTP target argmax");
         mtp.token_counts     = tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch},
                                       "MTP provisional token counts");
@@ -97,12 +103,20 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},
                                    "PLE lookup and merge");
     if (ranks > 1) {
-        out.vocabulary_candidates =
-            b.add(std::size_t(width) * batch * ranks * sizeof(std::uint64_t), 256,
-                  "vocabulary candidates");
-        if (rank == 0)
-            out.gathered_logits = tensor(DType::BF16, {dimension(c.text.vocabulary), width * batch},
-                                         "global sampling logits");
+        if (c.vision)
+            out.vision_features = tensor(DType::BF16,
+                                         {hidden,
+                                          dimension(std::min<std::uint64_t>(
+                                              o.max_context, qwen::kMaximumPromptVisionTokens)),
+                                          batch},
+                                         "resident visual features");
+        out.vocabulary_local =
+            tensor(DType::I64, {20, width, batch}, "local vocabulary candidates");
+        out.vocabulary_gathered = tensor(DType::I64, {20, width, batch, dimension(ranks)},
+                                         "gathered vocabulary candidates");
+        out.proposal_sampling =
+            tensor(DType::I32, {static_cast<std::int32_t>(sizeof(ops::SamplingConfig) / 4), batch},
+                   "draft greedy config");
     }
     const bool scoring = o.purpose == EnginePurpose::CausalScoring;
     if (!scoring) {

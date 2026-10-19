@@ -314,8 +314,13 @@ std::size_t VisionContext::encode(const VisionItemView& item, Tensor& output, Me
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
     }
     const Tensor planned_output = bind_output(backing, plan, tokens64);
-    if (output.data != planned_output.data || output.bytes() != planned_output.bytes()) {
-        throw std::invalid_argument("Vision output does not name the planned handoff region");
+    const auto output_begin     = reinterpret_cast<std::uintptr_t>(output.data);
+    const auto backing_begin    = reinterpret_cast<std::uintptr_t>(backing.data);
+    if (output.device != execution_.device() ||
+        (output.data != planned_output.data && output_begin < backing_begin + backing.bytes &&
+         backing_begin < output_begin + output.bytes())) {
+        throw std::invalid_argument(
+            "Vision output must name its handoff or disjoint device storage");
     }
     const VisionWorkspaceLayout layout = build_workspace_layout(
         config_, parameters_, patches64, tokens64, plan.handoff_offset_bytes);

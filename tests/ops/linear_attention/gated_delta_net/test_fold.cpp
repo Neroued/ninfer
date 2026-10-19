@@ -85,7 +85,7 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false) {
+             bool distinct_destination = false, bool captured = false) {
     const int kQkHeads                           = profile.value_heads == 24 ? 8 : 16;
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
@@ -374,7 +374,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-    if (width == 16 && rows == 8) {
+    if (captured || (width == 16 && rows == 8)) {
         cuda_synchronize();
         DeviceBuffer original(ninfer::test::cuda_environment().context.device(), state_bytes);
         cuda_check(cudaMemcpy(original.data(), state_base, state_bytes, cudaMemcpyDeviceToDevice),
@@ -830,14 +830,15 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 int main(int argc, char** argv) {
     OpSuite suite;
     const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
-                         unsigned seed, bool distinct = false) {
+                         unsigned seed, bool distinct = false, bool captured = false) {
         std::string id = std::string(p.value_heads == 24 ? "gdn_fold_local/l" : "gdn_fold/l") +
                          std::to_string(p.layers) + "/h" + std::to_string(p.value_heads) + "/w" +
                          std::to_string(width) + "/b" + std::to_string(batch) +
                          (distinct ? "/disjoint" : "/alias") + "/commits";
         for (int c : commits) id += "_" + std::to_string(c);
-        suite.add(id, [=] { return run_case(p, width, batch, commits, seed, distinct); },
-                  {{"execution", width == 16 && batch == 8 ? "graph" : "eager"}});
+        if (captured) id += "/graph";
+        suite.add(id, [=] { return run_case(p, width, batch, commits, seed, distinct, captured); },
+                  {{"execution", captured || (width == 16 && batch == 8) ? "graph" : "eager"}});
     };
     add({48, 48, 10240}, 2, 1, {2}, 1801U, true);
     add({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
@@ -875,6 +876,11 @@ int main(int argc, char** argv) {
         std::vector<int> commits(8);
         for (int b = 0; b < 8; ++b) commits[b] = first + b;
         add({36, 24, 5120}, 16, 8, commits, 4400U + first, true);
+    }
+    for (bool distinct : {false, true}) {
+        for (int commit : {8, 9, 10})
+            add({36, 24, 5120}, 16, 1, {commit}, 4500U + commit, distinct, commit == 9);
+        for (int width : {9, 10}) add({36, 24, 5120}, width, 1, {width}, 4600U + width, distinct);
     }
 #if NINFER_TARGET_SPARK
     suite.add("gdn_fold_local/record_rounds/q8", [] { return run_record_fold_rounds(true, true); },

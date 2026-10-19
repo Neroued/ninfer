@@ -18,8 +18,8 @@ __launch_bounds__(128, 2) void fold_kernel(const __grid_constant__ FoldAccess<Ge
     if (!valid) return;
     if constexpr (Staged) {
         extern __shared__ __align__(16) char backing[];
-        subgroup::run<16, true, subgroup::Mode::Fold, true>(access, coord, valid,
-            reinterpret_cast<subgroup::Window<16>*>(backing));
+        subgroup::run<16, true, subgroup::Mode::Fold, true>(
+            access, coord, valid, reinterpret_cast<subgroup::Window<16>*>(backing));
     } else {
         subgroup::run<16, true, subgroup::Mode::Fold, false>(
             access, coord, valid, static_cast<subgroup::Window<1>*>(nullptr));
@@ -63,9 +63,8 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         CUDA_CHECK(cudaGetLastError());
     };
     if constexpr (Geometry::kQkHeads == 8) {
-        // Prefetch improves the full 16-step local single-row fold. Other row/extent
-        // combinations retain direct record reads to avoid larger-batch regressions.
-        if (active_rows == 1 && rows.row[0].commit_columns == 16)
+        // Amortize prefetch for longer local single-row prefixes.
+        if (active_rows == 1 && rows.row[0].commit_columns >= 9)
             return launch.template operator()<true>();
     }
     launch.template operator()<false>();

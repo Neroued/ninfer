@@ -199,16 +199,20 @@ inline void report_reduction_stats(std::string_view label, std::int64_t count,
                                    const ReductionCriterion& criterion) {
     if (!error_stats_enabled()) return;
     const double gross_limit = gross_error_limit(stats, criterion);
+    const double rms_limit   = reduction_rms_limit(stats, criterion);
     std::printf("OP_ERROR_STATS kind=reduction count=%lld rel_l2=%.17g rel_l2_limit=%.17g "
                 "rel_l2_ratio=%.17g rmse=%.17g reference_rms=%.17g max_abs=%.17g "
                 "max_reference=%.17g gross_limit=%.17g gross_abs_limit=%.17g "
-                "gross_rel_limit=%.17g gross_ratio=%.17g non_finite=%lld case=%.*s\n",
+                "gross_rel_limit=%.17g gross_ratio=%.17g rms_abs_limit=%.17g "
+                "rms_limit=%.17g rms_ratio=%.17g non_finite=%lld case=%.*s\n",
                 static_cast<long long>(count), stats.relative_l2, criterion.relative_l2,
                 error_limit_ratio(stats.relative_l2, criterion.relative_l2),
                 stats.root_mean_squared_error, stats.reference_root_mean_square,
                 stats.maximum_absolute_error, stats.maximum_absolute_reference, gross_limit,
                 criterion.gross_absolute, criterion.gross_relative_to_max_reference,
                 error_limit_ratio(stats.maximum_absolute_error, gross_limit),
+                criterion.absolute_rms, rms_limit,
+                error_limit_ratio(stats.root_mean_squared_error, rms_limit),
                 static_cast<long long>(stats.first_non_finite >= 0), static_cast<int>(label.size()),
                 label.data());
 }

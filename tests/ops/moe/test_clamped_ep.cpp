@@ -8,9 +8,6 @@
 
 namespace ninfer::test::clamped_ep {
 namespace {
-constexpr ReductionCriterion kA8{.08, 1e-7, .12};
-constexpr ReductionCriterion kA4{.25, 1e-6, .35};
-
 struct Case {
     int tokens;
     std::string distribution;

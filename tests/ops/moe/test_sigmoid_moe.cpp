@@ -14,7 +14,6 @@ namespace {
 namespace ep    = clamped_ep;
 namespace ip    = input_projection;
 constexpr int H = 4096, I = 1024, E = 288, K = 8;
-constexpr ReductionCriterion kA4{.25, 1e-6, .35}, kA8{.08, 1e-7, .12};
 
 struct Case {
     int m, hits = 4;
@@ -74,7 +73,7 @@ struct Fixture {
         : bank(cuda_environment().context.device(), placement, side, eight), router(control(rec)),
           gu(shared(false, rec)), dn(shared(true, rec)), bits(3 * H),
           shared_ref(gu.host, dn.host, bits, rec == 5 ? 3 : 10), fp8(eight), recipe(rec) {
-        if (rec >= 0 && rec <= 4) bank.clamp_probe(rec, rec > 0 && rec < 4);
+        if (rec >= 0 && rec <= 4) bank.clamp_probe(rec);
         for (int p = 0; p < 3; ++p) {
             auto& v = patterns[p];
             v.resize(H);
@@ -201,7 +200,7 @@ int run(Fixture& f, const Case& c) {
         const auto label = "whole/" + std::string(f.fp8 ? "fp8" : "nvfp4") + "/M" +
                            std::to_string(c.m) + "/hits" + std::to_string(c.hits) + "/recipe" +
                            std::to_string(f.recipe) + "/phase" + std::to_string(phase);
-        failures += verify_reduction(label, actual, reference, f.fp8 ? kA8 : kA4) +
+        failures += verify_reduction(label, actual, reference, f.fp8 ? ep::kA8 : ep::kA4) +
                     input.verify_guards(label) + output.verify_guards(label) +
                     scratch.verify_guards(label) + f.bank.verify_controls();
         if (ws.used() != 256 || ws.peak_used() > cap + 256) {
@@ -383,7 +382,8 @@ int main(int argc, char** argv) {
                           else {
                               for (int t : {1, 2, 4, 8, 16, 17, 65, 128, 129, 257, 512, 2048, 4097})
                                   failed += run(f, {t, recipe == 5 ? 0 : 8});
-                              failed += run(f, {129, recipe == 5 ? 0 : 8, true});
+                              for (int t : {1, 2, 129})
+                                  failed += run(f, {t, recipe == 5 ? 0 : 8, true});
                           }
                           return failed + f.verify();
                       },

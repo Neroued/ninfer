@@ -236,7 +236,7 @@ void Weights::set_limit(float limit) {
     impl_->cache.clear();
 }
 
-void Weights::clamp_probe(int recipe, bool norm_anchor) {
+void Weights::clamp_probe(int recipe) {
     auto& f = *impl_;
     f.probe = true;
     f.limit = recipe == 3 ? 3 : 10;
@@ -278,16 +278,10 @@ void Weights::clamp_probe(int recipe, bool norm_anchor) {
                     cell(2 * I - 1, H - 1,
                          f.fp8 ? (recipe == 2 ? 0xda : 0x5a) : (recipe == 2 ? 15 : 7), 0x5a);
                 }
-                if (norm_anchor) {
-                    cell(I - 2, H - 1, f.fp8 ? 0x38 : 2, 0x4c);
-                    cell(2 * I - 2, H - 1, f.fp8 ? 0x38 : 2, 0x4c);
-                }
             } else
                 for (int r = 0; r < H; ++r) {
                     if (r % 13)
                         cell(r, I - 1, f.fp8 ? (r % 2 ? 0xb8 : 0x38) : (r % 2 ? 10 : 2), 0x44);
-                    else if (norm_anchor)
-                        cell(r, I - 2, f.fp8 ? 0x38 : 2, 0x44);
                 }
             CUDA_CHECK(
                 cudaMemcpy(static_cast<std::byte*>(m->storage.data()) + Guard + slot * m->stride,

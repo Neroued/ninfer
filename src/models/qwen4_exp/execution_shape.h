@@ -10,6 +10,8 @@ struct ExecutionShape {
     EnginePurpose purpose;
     bool context_cache = false;
     bool cuda_graph    = false;
+
+    bool operator==(const ExecutionShape&) const = default;
 };
 
 } // namespace ninfer::models::qwen4_exp

@@ -55,6 +55,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             } else if (row.mtp_table.valid() || row.mtp_frontier)
                 throw std::invalid_argument("Qwen4Exp work refers to an absent MTP history");
             if (row.main_frontier > shape.max_context ||
+                row.count_tokens.size() > shape.max_context ||
                 row.ids.size() > shape.max_context - row.main_frontier ||
                 (!row.rope_positions.empty() && row.rope_positions.size() != 3 * row.ids.size()))
                 throw std::invalid_argument("Qwen4Exp input window exceeds its shape");
@@ -184,6 +185,9 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     }
                     if (binding.vision && !vision)
                         throw std::invalid_argument("Qwen4Exp Vision resources were not prepared");
+                    if (binding.generated.size() > shape.max_context)
+                        throw std::invalid_argument(
+                            "Qwen4Exp generated history exceeds its context");
                     tokens(binding.generated, public_tokens);
                 }
             }

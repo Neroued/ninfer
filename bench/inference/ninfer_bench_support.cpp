@@ -765,7 +765,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"host_object_count\": " << env.load.host_object_count << "\n"
         << "  },\n"
         << "  \"memory\": {\n"
-        << "    \"device\": " << env.memory.device << ",\n"
+        << "    \"device\": " << (env.memory.device ? std::to_string(*env.memory.device) : "null")
+        << ",\n"
         << "    \"device_budget_bytes\": " << env.memory.device_budget_bytes << ",\n"
         << "    \"max_context\": " << env.memory.max_context << ",\n"
         << "    \"kv_capacity_mode\": \""

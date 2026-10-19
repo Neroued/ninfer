@@ -13,10 +13,6 @@ namespace ninfer::models::qwen4_exp {
 class Session;
 class ModelDefinition;
 
-namespace execution {
-class Parameters;
-}
-
 namespace detail {
 class SessionImpl;
 struct RequestPlan;

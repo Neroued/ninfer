@@ -12,7 +12,7 @@ std::uint32_t count(std::uint64_t value) {
 } // namespace
 
 SessionPlan plan_session(const ExecutionPlan& execution) {
-    SessionPlan plan{execution.profile, execution.shape};
+    SessionPlan plan{execution.shape};
     const auto image_bytes   = execution.persistent.state.images.image_stride;
     const auto slots         = execution.persistent.state.images.slot_count;
     const auto logical       = count(slots + execution.host_context_bytes / image_bytes);

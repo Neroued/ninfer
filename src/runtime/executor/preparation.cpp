@@ -119,26 +119,50 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                 broadcast(group, wire::Kind::Enter, std::move(out).take());
             };
             enter(PreparationAction::Allocate);
-            auto ready   = receive(group, wire::Kind::Ready, timeout);
-            bool success = true;
+            auto allocated = receive(group, wire::Kind::Allocated, timeout);
+            bool success   = true;
             result.layouts.clear();
-            for (const auto& bytes : ready) {
+            for (const auto& bytes : allocated) {
                 wire::Decoder in(bytes);
                 if (in.u64() != group.topology().plan || in.u32() != attempt)
                     throw std::runtime_error(
-                        "rank readiness belongs to another preparation attempt");
+                        "rank allocation belongs to another preparation attempt");
                 const auto accepted = in.boolean();
                 success &= accepted;
                 const auto layout = in.bytes();
                 result.layouts.emplace_back(layout.begin(), layout.end());
                 in.finish();
             }
-            if (success) return result;
+            if (success) {
+                result.attempt = attempt;
+                return result;
+            }
             if (attempt == 1)
                 throw std::runtime_error("rank resources do not fit the common capacity");
             enter(PreparationAction::Release);
         }
         throw std::logic_error("preparation attempt exhausted");
+    } catch (const std::exception& error) {
+        group.fail(error.what());
+        throw;
+    }
+}
+
+void activate_execution_group(dist::ExecutionGroup& group, const GroupPreparation& prepared,
+                              std::chrono::milliseconds timeout) {
+    try {
+        wire::Encoder out;
+        out.u64(group.topology().plan);
+        out.u32(prepared.attempt);
+        out.u8(static_cast<std::uint8_t>(PreparationAction::Activate));
+        out.u32(prepared.pages);
+        broadcast(group, wire::Kind::Enter, std::move(out).take());
+        for (const auto& bytes : receive(group, wire::Kind::Ready, timeout)) {
+            wire::Decoder in(bytes);
+            if (in.u64() != group.topology().plan || in.u32() != prepared.attempt)
+                throw std::runtime_error("rank readiness belongs to another preparation attempt");
+            in.finish();
+        }
     } catch (const std::exception& error) {
         group.fail(error.what());
         throw;

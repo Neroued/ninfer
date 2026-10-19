@@ -7,8 +7,7 @@ namespace ninfer::models::qwen4_exp::detail {
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
       directory(plan.context), checkpoints(plan.context.state.logical_capacity * 8ULL) {
-    if (!definition || !plan.profile)
-        throw std::invalid_argument("invalid Qwen4Exp session definition");
+    if (!definition) throw std::invalid_argument("invalid Qwen4Exp session definition");
     releases.reserve(shape.max_concurrency);
     for (std::uint16_t i = 0; i < pool_count(); ++i) {
         const auto& spec = plan.context.pools[i];

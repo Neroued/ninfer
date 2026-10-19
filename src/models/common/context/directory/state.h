@@ -49,6 +49,8 @@ struct StateDirectorySpec {
     std::uint32_t logical_capacity = 0;
     std::uint32_t device_slots     = 0;
     std::size_t image_bytes        = 0;
+
+    bool operator==(const StateDirectorySpec&) const = default;
 };
 
 struct StateTransferDescription {

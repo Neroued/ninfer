@@ -1,40 +1,41 @@
 #pragma once
 
 #include "models/qwen4_exp/load.h"
-#include "models/qwen4_exp/program/resources.h"
+#include "models/qwen4_exp/parallel/codec.h"
+#include "models/qwen4_exp/runtime_types.h"
+#include "runtime/executor/preparation.h"
+#include "runtime/executor/rank_worker.h"
 
 namespace ninfer::models::qwen4_exp {
 
-struct RankResourceLayout {
-    std::uint64_t state_bytes = 0, workspace_bytes = 0, device_bytes = 0, physical_bytes = 0;
-    std::uint32_t state_slots = 0, main_pages = 0, mtp_pages = 0;
-    std::uint32_t gdn_key_heads = 0, gdn_value_heads = 0, qsa_query_heads = 0, qsa_kv_heads = 0;
-    std::uint32_t vocabulary_begin = 0, vocabulary = 0, ple_shards = 0;
-};
-
-// Owns immutable rank data once; mutable resources can be rebuilt at a new common capacity.
+// The source Reader is borrowed until materialize() returns. The same stable instance owns
+// weights, Parameters and the final Program through preparation and execution.
 class RankPreparation {
 public:
-    RankPreparation(ResolvedLoadPlan, EngineOptions, DeviceContext&);
+    using Types    = RuntimeTypes;
+    using Instance = runtime::RankModelInstance<Types>;
 
-    [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const { return curve_; }
+    RankPreparation(const artifact::Reader&, std::span<const std::byte>,
+                    const distributed::RankIdentity&, DeviceContext&);
 
-    [[nodiscard]] const ModelShard& model() const { return *model_; }
-
-    [[nodiscard]] const Resources& resources() const { return *resources_; }
-
-    [[nodiscard]] RankResourceLayout layout() const;
+    [[nodiscard]] runtime::PreparationMemory memory() const;
+    void materialize();
+    [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
 
     void prepare(std::uint32_t pages, std::size_t available_bytes);
-    void release_resources();
+    void release_program();
+    [[nodiscard]] RankExecutionDescription describe() const;
+    [[nodiscard]] ExecutionCodec codec(const distributed::ExecutionTopology&) const;
+    [[nodiscard]] std::unique_ptr<Instance> finish() &&;
+
 private:
     EngineOptions options_;
     DeviceContext& device_;
+    std::size_t host_reservation_bytes_ = 0;
+    std::optional<ResolvedLoadPlan> load_;
     std::shared_ptr<const execution::ModelProfile> profile_;
     runtime::SequenceCapacityCurve curve_;
-    std::unique_ptr<ModelShard> model_;
-    std::unique_ptr<execution::Parameters> parameters_;
-    std::unique_ptr<Resources> resources_;
+    std::unique_ptr<Instance> instance_;
 };
 
 } // namespace ninfer::models::qwen4_exp

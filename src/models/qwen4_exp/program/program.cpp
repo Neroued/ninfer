@@ -49,6 +49,9 @@ ResidentBinding& RankProgramImpl::binding(runtime::ResidencyId residency) {
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
+    if (parameters.model.rank_plan().size > 1 &&
+        !std::holds_alternative<ContextWork>(work.operation))
+        throw std::invalid_argument("Qwen4Exp parallel forward is not implemented");
     WorkContract{shape, parameters.profile->config.text.vocabulary,
                  parameters.profile->public_tokens, bool(parameters.mtp), bool(parameters.vision)}
         .validate(work, kind);
@@ -234,6 +237,13 @@ RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan 
 RankProgram::~RankProgram() = default;
 
 runtime::ExecutionCapacity RankProgram::capacity() const noexcept { return {1, 1}; }
+
+SessionPlan RankProgram::session_plan() const {
+    auto plan = plan_session(impl_->resources.plan);
+    for (std::uint32_t i = 0; i < impl_->resources.pool_count(); ++i)
+        plan.context.pools[i].transfer = impl_->resources.pool(i).pages().transfer_profile();
+    return plan;
+}
 
 void RankProgram::validate_work(const Work& work, runtime::FrameKind kind) const {
     impl_->validate_work(work, kind);

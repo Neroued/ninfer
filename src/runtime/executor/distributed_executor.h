@@ -294,7 +294,7 @@ private:
     void validate_control_capacity() const {
         const auto b       = codec_.control_budget();
         const auto& limits = group_->transport().limits();
-        for (auto bytes : {b.work, b.decision, b.commit, b.event, b.report})
+        for (auto bytes : {b.compute_work, b.context_work, b.decision, b.commit, b.event, b.report})
             if (!bytes || bytes > limits.message_bytes)
                 throw std::invalid_argument(
                     "prepared execution message exceeds transport capacity");
@@ -313,7 +313,8 @@ private:
         };
         auto normal       = limits.queued_bytes / ranks;
         auto continuation = limits.continuation_bytes / ranks;
-        reserve(normal, framed(b.work), compute + context);
+        reserve(normal, framed(b.compute_work), compute);
+        reserve(normal, framed(b.context_work), context);
         reserve(continuation, framed(b.decision), compute);
         reserve(continuation, framed(b.commit), compute);
         reserve(continuation, framed(b.event), compute * 6 + context * 3);
@@ -367,7 +368,7 @@ private:
             const auto budget = codec_.control_budget();
             const auto limit =
                 kind == distributed::wire::Kind::Submit
-                    ? budget.work
+                    ? budget.work(envelope.ticket.frame.kind)
                     : (kind == distributed::wire::Kind::Supply ? budget.decision : budget.commit);
             if (payload.size() > limit)
                 throw std::invalid_argument(

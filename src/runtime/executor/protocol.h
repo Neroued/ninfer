@@ -9,7 +9,11 @@ void encode(distributed::wire::Encoder&, const MemorySummary&);
 
 // Payload ceilings include the envelope. The prepared model supplies these from its frame shape.
 struct ControlBudget {
-    std::size_t work, decision, commit, event, report;
+    std::size_t compute_work, context_work, decision, commit, event, report;
+
+    [[nodiscard]] std::size_t work(FrameKind kind) const noexcept {
+        return kind == FrameKind::Compute ? compute_work : context_work;
+    }
 };
 
 struct Scope {

@@ -1,5 +1,4 @@
 target_sources(ninfer_model_execution PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/parallel/preparation.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/startup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/workspace.cpp"
@@ -27,3 +26,8 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/scoring.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/resources.cpp")
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_execution PRIVATE "${CMAKE_CURRENT_LIST_DIR}/parallel/preparation.cpp")
+  target_link_libraries(ninfer_model_execution PRIVATE ninfer_runtime_distributed)
+endif()

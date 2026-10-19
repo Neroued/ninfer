@@ -60,7 +60,7 @@ void require(bool condition, const char* message) {
 
 struct Codec {
     rt::protocol::ControlBudget control_budget() const noexcept {
-        return {4096, 4096, 1024, 4096, 65536};
+        return {4096, 4096, 4096, 1024, 4096, 65536};
     }
 
     void validate_work(const Work& w, rt::FrameKind kind) const {

@@ -105,9 +105,7 @@ void Decoder::finish() const {
 
 Bytes encode_header(const Message& message) {
     Encoder out;
-    out.u32(0x3246494e);
-    out.u16(kVersion);
-    out.u16(static_cast<std::uint16_t>(message.kind));
+    out.u32(static_cast<std::uint32_t>(message.kind));
     out.u64(message.epoch);
     out.u64(message.payload.size());
     return std::move(out).take();
@@ -115,9 +113,7 @@ Bytes encode_header(const Message& message) {
 
 Header decode_header(std::span<const std::byte> data) {
     Decoder in(data);
-    if (in.u32() != 0x3246494e || in.u16() != kVersion)
-        throw std::invalid_argument("distributed protocol identity mismatch");
-    Header out{static_cast<Kind>(in.u16()), in.u64(), in.u64()};
+    Header out{static_cast<Kind>(in.u32()), in.u64(), in.u64()};
     in.finish();
     return out;
 }

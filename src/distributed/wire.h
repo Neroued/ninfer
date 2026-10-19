@@ -11,10 +11,9 @@
 namespace ninfer::distributed::wire {
 
 using Bytes                               = std::vector<std::byte>;
-inline constexpr std::uint16_t kVersion   = 1;
-inline constexpr std::size_t kHeaderBytes = 24;
+inline constexpr std::size_t kHeaderBytes = 20;
 
-enum class Kind : std::uint16_t {
+enum class Kind : std::uint32_t {
     Join = 1,
     Topology,
     GroupId,
@@ -22,6 +21,7 @@ enum class Kind : std::uint16_t {
     Prepare,
     Prepared,
     Enter,
+    Allocated,
     Ready,
     Shutdown,
     Stopped,

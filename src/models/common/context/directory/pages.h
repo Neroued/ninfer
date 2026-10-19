@@ -21,6 +21,8 @@ struct KVTransferProfile {
     // Entry min(run pages, size - 1); the final entry covers all longer runs.
     std::vector<std::uint32_t> host_operations;
 
+    bool operator==(const KVTransferProfile&) const = default;
+
     [[nodiscard]] TransferWork host_transfer_run_work(std::uint32_t pages) const;
     [[nodiscard]] TransferWork device_copy_work(std::uint32_t pages) const;
 };

@@ -1,11 +1,17 @@
 #pragma once
 
 #include "models/qwen4_exp/parallel/plan.h"
+#include "models/qwen4_exp/session/planning.h"
 #include "distributed/wire.h"
+#include "runtime/executor/contract.h"
 
 namespace ninfer::models::qwen4_exp {
 
-struct RankResourceLayout;
+struct RankExecutionDescription {
+    SessionPlan session;
+    runtime::ExecutionCapacity capacity;
+    MemorySummary memory;
+};
 
 struct RankLoadRequest {
     artifact::ArtifactId artifact;
@@ -17,7 +23,7 @@ struct RankLoadRequest {
 void encode_rank_load(distributed::wire::Encoder&, const RankLoadRequest&);
 [[nodiscard]] RankLoadRequest decode_rank_load(distributed::wire::Decoder&);
 
-void encode_rank_layout(distributed::wire::Encoder&, const RankResourceLayout&);
-[[nodiscard]] RankResourceLayout decode_rank_layout(distributed::wire::Decoder&);
+void encode(distributed::wire::Encoder&, const RankExecutionDescription&);
+[[nodiscard]] RankExecutionDescription decode_rank_execution(distributed::wire::Decoder&);
 
 } // namespace ninfer::models::qwen4_exp

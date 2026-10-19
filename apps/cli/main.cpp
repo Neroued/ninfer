@@ -205,7 +205,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         memory.runtime_reservation_bytes +
         memory.cuda_graph.value_or(ninfer::GraphMemorySummary{}).rebuild_estimate_bytes +
         static_cast<std::size_t>(std::max<std::int64_t>(0, memory.startup_retained_bytes));
-    print_metric("device", std::to_string(memory.device));
+    if (memory.device) print_metric("device", std::to_string(*memory.device));
     print_metric("max context", std::to_string(memory.max_context));
     print_metric("prefill chunk", std::to_string(memory.prefill_chunk));
     print_metric("device budget", format_bytes(memory.device_budget_bytes));

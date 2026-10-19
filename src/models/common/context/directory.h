@@ -19,6 +19,8 @@ struct KVDirectorySpec {
     std::uint32_t table_rows    = 0;
     KVPageGeometry geometry;
     KVTransferProfile transfer;
+
+    bool operator==(const KVDirectorySpec&) const = default;
 };
 
 struct HostDirectorySpec {
@@ -26,12 +28,16 @@ struct HostDirectorySpec {
     std::size_t bytes          = 0;
     std::size_t minimum_bytes  = 256;
     std::uint32_t extent_count = 0;
+
+    bool operator==(const HostDirectorySpec&) const = default;
 };
 
 struct ContextDirectorySpec {
     StateDirectorySpec state;
     HostDirectorySpec host;
     std::vector<KVDirectorySpec> pools;
+
+    bool operator==(const ContextDirectorySpec&) const = default;
 };
 
 class KVPoolDirectory {

@@ -26,7 +26,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.reused                  = operation.frontier;
         sequence.resume_phase            = Phase::Prefill;
         sequence.timings.prepare_seconds = operation.request->prompt.prepare.seconds;
-        if (plan.profile->mtp) {
+        if (definition->options().mtp()) {
             sequence.speculative.backend      = SpeculativeBackend::Mtp;
             sequence.speculative.enabled      = true;
             sequence.speculative.draft_window = shape.draft_tokens;
@@ -49,12 +49,12 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
             checkpoints.at(*operation.source).snapshot.continuation().metadata;
         sequence.continuation.metadata.rope_delta = sequence.request->prompt.rope_delta;
     } else {
-        const auto eos                 = plan.profile->config.text.ple.eos;
-        sequence.continuation.metadata = {0,
-                                          sequence.request->prompt.rope_delta,
-                                          {eos, eos},
-                                          plan.profile->mtp ? std::optional<std::uint32_t>{0}
-                                                            : std::nullopt};
+        const auto eos                 = definition->config().text.ple.eos;
+        sequence.continuation.metadata = {
+            0,
+            sequence.request->prompt.rope_delta,
+            {eos, eos},
+            definition->options().mtp() ? std::optional<std::uint32_t>{0} : std::nullopt};
     }
     while (sequence.next_capture < sequence.request->captures.size() &&
            sequence.request->captures[sequence.next_capture].frontier <= operation.frontier)

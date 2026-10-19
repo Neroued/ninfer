@@ -1,5 +1,5 @@
 #include "models/qwen4_exp/parallel/wire.h"
-#include "models/qwen4_exp/parallel/preparation.h"
+#include "runtime/executor/protocol.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -131,19 +131,85 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     return request;
 }
 
-void encode_rank_layout(Encoder& out, const RankResourceLayout& r) {
-    out.u64(r.state_bytes);
-    out.u64(r.workspace_bytes);
-    out.u64(r.device_bytes);
-    out.u64(r.physical_bytes);
-    for (auto n :
-         {r.state_slots, r.main_pages, r.mtp_pages, r.gdn_key_heads, r.gdn_value_heads,
-          r.qsa_query_heads, r.qsa_kv_heads, r.vocabulary_begin, r.vocabulary, r.ple_shards})
-        out.u32(n);
+void encode(Encoder& out, const RankExecutionDescription& r) {
+    const auto& p = r.session;
+    const auto& s = p.shape;
+    for (auto n : {s.max_context, s.max_concurrency, s.prefill_chunk, s.draft_tokens}) out.u32(n);
+    out.u8(static_cast<std::uint8_t>(s.kv_storage));
+    out.u8(static_cast<std::uint8_t>(s.purpose));
+    out.boolean(s.context_cache);
+    out.boolean(s.cuda_graph);
+    const auto& c = p.context;
+    out.u32(c.state.logical_capacity);
+    out.u32(c.state.device_slots);
+    out.u64(c.state.image_bytes);
+    out.u32(c.host.pool_id);
+    out.u64(c.host.bytes);
+    out.u64(c.host.minimum_bytes);
+    out.u32(c.host.extent_count);
+    out.u64(c.pools.size());
+    for (const auto& pool : c.pools) {
+        for (auto n : {pool.pool_id, pool.device_pages, pool.logical_pages, pool.histories,
+                       pool.page_capacity, pool.table_rows})
+            out.u32(n);
+        const auto& g = pool.geometry;
+        out.u32(g.page_tokens);
+        out.u8(static_cast<std::uint8_t>(g.device_plane_order));
+        out.u64(g.planes.size());
+        for (const auto& plane : g.planes) {
+            out.u8(static_cast<std::uint8_t>(plane.dtype));
+            out.i32(plane.leading_extent);
+            out.i32(plane.head_extent);
+            out.u64(plane.alignment);
+            out.u32(plane.tokens_per_row);
+        }
+        out.u64(pool.transfer.page_payload_bytes);
+        out.u32(pool.transfer.device_copy_operations);
+        out.u64(pool.transfer.host_operations.size());
+        for (auto n : pool.transfer.host_operations) out.u32(n);
+    }
+    out.u64(p.vision_max_merged_tokens);
+    out.u32(r.capacity.compute_frames);
+    out.u32(r.capacity.context_frames);
+    runtime::protocol::encode(out, r.memory);
 }
 
-RankResourceLayout decode_rank_layout(Decoder& in) {
-    return {in.u64(), in.u64(), in.u64(), in.u64(), in.u32(), in.u32(), in.u32(),
-            in.u32(), in.u32(), in.u32(), in.u32(), in.u32(), in.u32(), in.u32()};
+RankExecutionDescription decode_rank_execution(Decoder& in) {
+    RankExecutionDescription r;
+    auto& p = r.session;
+    p.shape = {in.u32(),
+               in.u32(),
+               in.u32(),
+               in.u32(),
+               static_cast<KvCacheStorage>(in.u8()),
+               static_cast<EnginePurpose>(in.u8()),
+               in.boolean(),
+               in.boolean()};
+    auto& c = p.context;
+    c.state = {in.u32(), in.u32(), in.u64()};
+    c.host  = {in.u32(), in.u64(), in.u64(), in.u32()};
+    c.pools.resize(in.count(57));
+    for (auto& pool : c.pools) {
+        pool.pool_id         = in.u32();
+        pool.device_pages    = in.u32();
+        pool.logical_pages   = in.u32();
+        pool.histories       = in.u32();
+        pool.page_capacity   = in.u32();
+        pool.table_rows      = in.u32();
+        auto& g              = pool.geometry;
+        g.page_tokens        = in.u32();
+        g.device_plane_order = static_cast<PagedKVPlaneOrder>(in.u8());
+        g.planes.resize(in.count(21));
+        for (auto& plane : g.planes)
+            plane = {static_cast<DType>(in.u8()), in.i32(), in.i32(), in.u64(), in.u32()};
+        pool.transfer.page_payload_bytes     = in.u64();
+        pool.transfer.device_copy_operations = in.u32();
+        pool.transfer.host_operations.resize(in.count(4));
+        for (auto& n : pool.transfer.host_operations) n = in.u32();
+    }
+    p.vision_max_merged_tokens = in.u64();
+    r.capacity                 = {in.u32(), in.u32()};
+    r.memory                   = runtime::protocol::memory_summary(in);
+    return r;
 }
 } // namespace ninfer::models::qwen4_exp

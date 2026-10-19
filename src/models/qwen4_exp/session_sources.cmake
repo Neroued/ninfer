@@ -12,6 +12,7 @@ target_sources(ninfer_model_control PRIVATE
 
 if(NINFER_ENABLE_DISTRIBUTED)
   target_sources(ninfer_model_control PRIVATE "${CMAKE_CURRENT_LIST_DIR}/wire.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/parallel/wire.cpp")
-  target_link_libraries(ninfer_model_control PRIVATE ninfer_distributed_wire)
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/wire.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/codec.cpp")
+  target_link_libraries(ninfer_model_control PRIVATE ninfer_runtime_distributed)
 endif()

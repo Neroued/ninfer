@@ -1009,7 +1009,8 @@ struct GraphMemorySummary {
 };
 
 struct MemorySummary {
-    int device                      = 0;
+    // Present for one device; execution-group byte totals retain separate per-rank reports.
+    std::optional<int> device;
     std::uint32_t max_context       = 0;
     std::uint32_t prefill_chunk     = 0;
     std::size_t device_budget_bytes = 0;

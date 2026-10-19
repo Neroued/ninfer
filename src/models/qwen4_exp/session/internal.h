@@ -3,7 +3,6 @@
 #include "models/qwen4_exp/session/session.h"
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
-#include "models/qwen4_exp/execution/profile.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/vision/control.h"

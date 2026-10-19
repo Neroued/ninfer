@@ -247,7 +247,7 @@ CommitResult Session::commit(PendingBatch&& batch,
         auto& s              = p.sequence(tx.members[b]);
         const auto& decision = decisions[b];
         auto& row            = result.rows[b];
-        if (batch.decode_ && p.plan.profile->mtp) {
+        if (batch.decode_ && p.definition->options().mtp()) {
             auto& stats         = s.speculative;
             const auto drafted  = tx.result->rows[b].drafts;
             const auto accepted = std::min<std::size_t>(decision.accepted_tokens,

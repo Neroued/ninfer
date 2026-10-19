@@ -27,7 +27,7 @@ std::shared_ptr<const Identity> capture_identity(const Sequence& s) {
 
 std::shared_ptr<const qwen::VisionExecutionInput>
 SessionImpl::plan_vision(const qwen::PreparedPromptData& prompt) const {
-    if (!plan.profile->vision || !definition->config().vision)
+    if (!definition->options().vision || !definition->config().vision)
         throw std::invalid_argument("Vision is disabled for this Engine");
     const auto& config    = *definition->config().vision;
     auto input            = std::make_shared<qwen::VisionExecutionInput>();
@@ -90,7 +90,7 @@ RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
         throw std::invalid_argument("prepared prompt media payload is incomplete");
     if (input.has_media()) plan->vision = p.plan_vision(input);
     for (const auto id : input.token_ids)
-        if (id < 0 || std::uint32_t(id) >= p.plan.profile->public_tokens)
+        if (id < 0 || std::uint32_t(id) >= p.definition->resources().public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
     std::uint32_t previous = 0;
     for (const auto f : input.identity.rewrite_execution_frontiers) {

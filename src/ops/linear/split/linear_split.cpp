@@ -11,7 +11,8 @@ void execute(const Tensor& x, split::Weights weights, std::span<const Tensor> ou
              MemoryArena* workspace, CudaExecutionView execution) {
     const auto& shape = split::select_split_shape(
         {linear_profile({weights.first, weights.policy}),
-         weights.second ? std::optional{linear_profile({*weights.second})} : std::nullopt});
+         weights.second ? std::optional{linear_profile({*weights.second})} : std::nullopt},
+        outputs);
     split::validate_operands(x, weights, outputs, shape, execution);
     const auto bytes = shape.capacity ? shape.capacity(weights.policy, x.ne[1], x.ne[1]) : 0;
     if (!bytes) {
@@ -44,8 +45,7 @@ void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor>
 std::size_t linear_split_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                   std::span<const std::int32_t> output_rows,
                                                   std::int32_t first, std::int32_t last) {
-    const auto& shape = split::select_split_shape(weights);
-    split::validate_segments(output_rows, shape);
+    const auto& shape = split::select_split_shape(weights, output_rows);
     split::validate_interval(first, last);
     return shape.capacity ? shape.capacity(weights.first.policy, first, last) : 0;
 }

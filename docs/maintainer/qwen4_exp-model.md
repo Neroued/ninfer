@@ -213,7 +213,7 @@ Native Tensor 第 0 维连续；`M=T*B`，`column=t+T*b`。
 | Main QSA Q/gate | 12 / 0 | `[12288,2560]` | Q8 | Q 6144、gate 6144 |
 | Main QSA KV/index | 12 / 0 | `[1664,2560]` | BF16 | K 512、V 512、index-Q 512、index-K 128 |
 | Main QSA output | 12 / 0 | `[2560,6144]` | Q8 | 原行序 |
-| MTP QSA input | 0 / 1 | `[13952,2560]` | BF16 | Q 6144、K 512、gate 6144、V 512、index-Q 512、index-K 128 |
+| MTP QSA input | 0 / 1 | `[13952,2560]` | BF16 | K 512、V 512、index-K 128、Q 6144、gate 6144、index-Q 512 |
 | MTP QSA output | 0 / 1 | `[2560,6144]` | BF16 | 原行序 |
 | Block HC down/inject | 96 / 2 | `[324,10240]` | BF16 | down 320、injection 4 |
 | Final HC down | 1 / 1 | `[320,10240]` | BF16 | 全部 down |
@@ -228,6 +228,10 @@ Native Tensor 第 0 维连续；`M=T*B`，`column=t+T*b`。
 | Optimized MTP head | 0 / 可选 1 | `[248320,2560]` | Q4 | 完整 vocabulary 顺序 |
 
 Main QSA 的两个 input parents 精度不同；MTP 六段投影合为一个 BF16 parent。
+MTP 的 K/V/index-K 位于前 1152 行，可直接形成 `[1152,2560]` 的连续权重 view；
+完整投影与三段投影共享同一份权重。TP2 按相同角色顺序组装本地 parent：
+K 256、V 256、index-K 128、Q 3072、gate 3072、index-Q 512，
+完整矩阵为 `[7296,2560]`，连续前缀为 `[640,2560]`。
 MoE control 为前 513 行，shared GU 为后 1280 行，可作零拷贝 views。
 持久合并不强制一次投影调用；LinearSplit 可以直接产出独立连续的激活分段。
 

@@ -22,9 +22,9 @@ void prepare(const Tensor& input, const QsaConfig& c, const QsaParameters& p,
             const std::array qg{buffers.query.view({qw, m}), buffers.gate.view({qw, m})};
             ops::linear_split(input, main->query_gate, qg, arena, cuda);
         } else {
-            const std::array all{buffers.query.view({qw, m}),       buffers.key.view({kw, m}),
-                                 buffers.gate.view({qw, m}),        buffers.value.view({kw, m}),
-                                 buffers.index_query.view({iq, m}), buffers.index_key};
+            const std::array all{buffers.key.view({kw, m}),  buffers.value.view({kw, m}),
+                                 buffers.index_key,          buffers.query.view({qw, m}),
+                                 buffers.gate.view({qw, m}), buffers.index_query.view({iq, m})};
             ops::linear_split(input, std::get<LinearParameters>(p.input), all, arena, cuda);
         }
     }

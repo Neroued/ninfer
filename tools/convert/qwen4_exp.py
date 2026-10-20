@@ -320,7 +320,7 @@ class Builder:
                 p + "attention/" + role, s + "self_attn." + field + ".weight", (n,)
             )
         groups = (
-            [("query", "key", "output_gate", "value", "index_query", "index_key")]
+            [("key", "value", "index_key", "query", "output_gate", "index_query")]
             if mtp
             else [
                 ("query", "output_gate"),

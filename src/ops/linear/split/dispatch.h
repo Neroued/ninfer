@@ -21,6 +21,7 @@ template <int... Rows>
 inline constexpr std::array kSplitRows{Rows...};
 
 extern const SplitShape kBf16SplitN1152K2560, kBf16SplitN7296K2560;
+extern const SplitShape kBf16SplitN1152K2560ThreeOutput, kBf16SplitN640K2560;
 extern const SplitShape kBf16SplitN288K4096, kBf16SplitN1664K2560, kBf16SplitN13952K2560,
     kBf16SplitN14336K5120;
 extern const SplitShape kQ8SplitN12288K2560, kQ8SplitN16384K2560, kQ8SplitN9216K2048;
@@ -31,5 +32,7 @@ extern const SplitShape kQ4Q5SplitN7168N7168K5120, kQ4Q5SplitN4096N12288K5120;
 extern const SplitShape kFp8SplitN14336K5120, kFp8SplitN16384K5120;
 extern const SplitShape kNvfp4SplitN14336K5120, kNvfp4SplitN16384K5120;
 
-const SplitShape& select_split_shape(ProjectionProfile weights);
+const SplitShape& select_split_shape(ProjectionProfile weights,
+                                     std::span<const std::int32_t> output_rows);
+const SplitShape& select_split_shape(ProjectionProfile weights, std::span<const Tensor> outputs);
 } // namespace ninfer::ops::detail::linear_split

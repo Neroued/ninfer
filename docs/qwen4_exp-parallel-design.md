@@ -46,7 +46,7 @@ PLE 表分片见第 7 节，完整计算与 Graph 组织见第 10 节。
 | Main QSA Q/gate | `[6144,2560]`，Q/gate 各 3072 |
 | Main QSA KV/index | `[1152,2560]`，K/V 各 256、index-Q 512、index-K 128 |
 | Main/MTP QSA output | `[2560,3072]`，保留各自原有表示 |
-| MTP QSA joint input | `[7296,2560]`，保留完整 index-Q/index-K |
+| MTP QSA joint input | `[7296,2560]`，保留完整 index-Q/index-K；按[持久布局](maintainer/qwen4_exp-model.md#4-合并矩阵与持久布局)组装，K/V/index-K 共享连续前缀 |
 | Router / shared score | `[512,2560]` / `[1,2560]`，复制 |
 | Shared GU / down | `[640,2560]` / `[2560,320]` |
 | 合并 router/score/shared GU | 若保留一次投影，为 `[1153,2560]` |

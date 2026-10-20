@@ -5,7 +5,7 @@
 
 namespace ninfer::bench::qsa {
 
-enum class Projection { QueryGate, KeyValueIndex, Joint };
+enum class Projection { QueryGate, KeyValueIndex, Joint, KeyValueIndexKey };
 
 inline const char* name(Projection p) {
     switch (p) {
@@ -14,7 +14,9 @@ inline const char* name(Projection p) {
     case Projection::KeyValueIndex:
         return "kv-index";
     case Projection::Joint:
-        return "qkgv-index";
+        return "joint";
+    case Projection::KeyValueIndexKey:
+        return "kv-index-key";
     }
     throw std::invalid_argument("invalid QSA projection");
 }
@@ -26,7 +28,9 @@ inline std::vector<int> segments(Projection p, int kv_heads) {
     case Projection::KeyValueIndex:
         return {256 * kv_heads, 256 * kv_heads, 512, 128};
     case Projection::Joint:
-        return {3072 * kv_heads, 256 * kv_heads, 3072 * kv_heads, 256 * kv_heads, 512, 128};
+        return {256 * kv_heads, 256 * kv_heads, 128, 3072 * kv_heads, 3072 * kv_heads, 512};
+    case Projection::KeyValueIndexKey:
+        return {256 * kv_heads, 256 * kv_heads, 128};
     }
     throw std::invalid_argument("invalid QSA projection");
 }
@@ -83,7 +87,7 @@ inline Options parse_options(int argc, char** argv) {
             std::cout << "QSA Op benchmark\n"
                          "  --op input-proj|tail-extract|prepare|indexer|sparse-gqa (default "
                          "input-proj)\n"
-                         "  --projection qg|kv-index|qkgv-index|all\n"
+                         "  --projection qg|kv-index|joint|kv-index-key|all\n"
                          "  --kv-heads 1|2 (input projection/prepare/sparse GQA, default 2)\n"
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
@@ -178,15 +182,17 @@ inline Options parse_options(int argc, char** argv) {
         } else if (flag == "--projection") {
             if (value == "all")
                 o.projections = {Projection::QueryGate, Projection::KeyValueIndex,
-                                 Projection::Joint};
+                                 Projection::Joint, Projection::KeyValueIndexKey};
             else if (value == "qg")
                 o.projections = {Projection::QueryGate};
             else if (value == "kv-index")
                 o.projections = {Projection::KeyValueIndex};
-            else if (value == "qkgv-index")
+            else if (value == "joint")
                 o.projections = {Projection::Joint};
+            else if (value == "kv-index-key")
+                o.projections = {Projection::KeyValueIndexKey};
             else
-                throw std::invalid_argument("projection: qg|kv-index|qkgv-index|all");
+                throw std::invalid_argument("projection: qg|kv-index|joint|kv-index-key|all");
         } else if (flag == "--tokens" || flag == "--sweep") {
             if (token_options) throw std::invalid_argument("specify one token list or sweep");
             token_options = true;

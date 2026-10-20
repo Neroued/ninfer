@@ -43,7 +43,7 @@ auto select_route(int tokens, const Routes& routes) {
 void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,
                   cudaStream_t stream) {
     const auto& weight = weights.first;
-    using Output       = LinearBf16SegmentedOutput<6144, 512, 6144, 512, 512, 128>;
+    using Output       = LinearBf16SegmentedOutput<512, 512, 128, 6144, 6144, 512>;
     const Output output{
         {static_cast<__nv_bfloat16*>(out[0].data), static_cast<__nv_bfloat16*>(out[1].data),
          static_cast<__nv_bfloat16*>(out[2].data), static_cast<__nv_bfloat16*>(out[3].data),
@@ -52,7 +52,7 @@ void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out,
 }
 } // namespace
 
-const SplitShape kBf16SplitN13952K2560{13952, 2560, kSplitRows<6144, 512, 6144, 512, 512, 128>,
+const SplitShape kBf16SplitN13952K2560{13952, 2560, kSplitRows<512, 512, 128, 6144, 6144, 512>,
                                        launch_split};
 
 } // namespace ninfer::ops::detail::linear_split

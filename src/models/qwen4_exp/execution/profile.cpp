@@ -51,11 +51,11 @@ public:
         } else {
             const auto& q = std::get<QsaWeights>(w.mixer);
             QsaProfile profile;
-            profile.output_rows = {rows(q.query), rows(q.key),         rows(q.gate),
-                                   rows(q.value), rows(q.index_query), rows(q.index_key)};
+            profile.output_rows = {rows(q.key),   rows(q.value), rows(q.index_key),
+                                   rows(q.query), rows(q.gate),  rows(q.index_query)};
             if (mtp)
                 profile.input =
-                    linear({q.query, q.key, q.gate, q.value, q.index_query, q.index_key});
+                    linear({q.key, q.value, q.index_key, q.query, q.gate, q.index_query});
             else
                 profile.input = MainQsaProjectionProfile{
                     linear({q.query, q.gate}),

@@ -1137,10 +1137,14 @@ Stateful projection/convolution remains in `ninfer_gdn_input_proj_bench`.
 
 `ninfer_qsa_bench --op input-proj` (the default) measures public A16 `linear_split()` on the three
 QSA projection geometries alongside the corresponding contiguous-output `linear()` calls.
-`--projection qg|kv-index|qkgv-index|all` selects Q8 `[12288,2560]`,
+`--projection qg|kv-index|joint` selects Q8 `[12288,2560]`,
 BF16 `[1664,2560]`, or BF16 `[13952,2560]`. `--entry split|linear|both` selects the public entries;
 `both` reuses identical weights, inputs, and total output storage and alternates entry order by round.
 The split entry writes each contiguous segment directly and uses zero global workspace.
+`--projection kv-index-key --entry split` measures the three-output BF16 prefix `[1152,2560]`.
+`--kv-heads 1` selects the TP2 geometries, including joint `[7296,2560]` and prefix
+`[640,2560]`, on Spark. `--projection all --entry split` includes all four projections.
+The joint output order is K, V, index-K, Q, gate, index-Q.
 
 Timing uses `op_measurement.cuh`: Graph body and eager latency, cold/warm cache, Host submission,
 and actual Graph kernel count. Cold measurements evict 256 MiB before timing. CSV rows include the
@@ -1148,7 +1152,7 @@ projection and round; fixture creation is outside timing.
 
 ```bash
 cmake --build build/rtx5090-dev -j --target ninfer_qsa_bench
-./build/rtx5090-dev/bench/ninfer_qsa_bench --projection all --entry both --sweep 1:128 \
+./build/rtx5090-dev/bench/ninfer_qsa_bench --projection all --entry split --sweep 1:128 \
   --rounds 3 --warmup 10 --repeat 100 --execution graph --cache both \
   --csv-out .agent-tmp/qsa/qsa_small.csv
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --tokens 256,512,1024,2048,4096 \

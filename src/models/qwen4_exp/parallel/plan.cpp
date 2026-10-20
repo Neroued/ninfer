@@ -75,12 +75,12 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
         } else {
             const auto& q = std::get<QsaWeights>(b.mixer);
             if (mtp)
-                rows({{q.query, true},
-                      {q.key, true},
-                      {q.gate, true},
+                rows({{q.key, true},
                       {q.value, true},
-                      {q.index_query, false},
-                      {q.index_key, false}});
+                      {q.index_key, false},
+                      {q.query, true},
+                      {q.gate, true},
+                      {q.index_query, false}});
             else {
                 rows({{q.query, true}, {q.gate, true}});
                 rows(

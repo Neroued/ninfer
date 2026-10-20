@@ -113,7 +113,9 @@ Verify records 包含卷积前最新 history 列、卷积/SiLU 后且 L2 norm �
 ### 3.2 QSA
 
 Main 的 Q8 Q/gate parent 与 BF16 KV/index parent 分别调用 LinearSplit；
-MTP 使用一个 BF16 joint parent。投影直接产出连续分段，随后依次调用：
+MTP 使用一个 BF16 joint parent，按 K、V、index-K、Q、gate、index-Q 输出连续分段。
+权重行序与可借用的前缀 view 见[模型权重布局](qwen4_exp-model.md#4-合并矩阵与持久布局)。
+完整 QSA 投影后依次调用：
 
 | 阶段 | 交接 |
 |---|---|

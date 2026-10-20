@@ -66,11 +66,14 @@ def test_qsa_q_gate_rows_and_gdn_conv_axes():
     model = Model({"text": {"config": cfg}})
     builder = Builder(model, store, cfg)
     builder.qsa("text/", "")
+    builder.qsa("mtp/", "", mtp=True)
     builder.gdn("text/", "")
     query = model.parameters["text/attention/query"].source.values().reshape(-1, 2)
     gate = model.parameters["text/attention/output_gate"].source.values().reshape(-1, 2)
     assert query[:, 0].tolist() == [0, 2, 8, 10, 16, 18]
     assert gate[:, 0].tolist() == [4, 6, 12, 14, 20, 22]
+    mtp_order = ("key", "value", "index_key", "query", "output_gate", "index_query")
+    assert tuple("mtp/attention/" + role for role in mtp_order) in model.packing_groups
     conv = model.parameters["text/gdn/convolution"].source.values().reshape(4, 8)
     assert torch.equal(conv, store.tensors["linear_attn.conv1d.weight"][:, 0, :].T)
     assert model.parameters["text/gdn/a_log"].direct_format == "fp32"

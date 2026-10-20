@@ -52,7 +52,7 @@ public:
             const auto& q = std::get<QsaWeights>(w.mixer);
             QsaParameters p;
             if (mtp)
-                p.input = linear({q.query, q.key, q.gate, q.value, q.index_query, q.index_key});
+                p.input = linear({q.key, q.value, q.index_key, q.query, q.gate, q.index_query});
             else
                 p.input = MainQsaProjection{linear({q.query, q.gate}),
                                             linear({q.key, q.value, q.index_query, q.index_key})};

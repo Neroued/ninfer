@@ -563,11 +563,6 @@ int test_strict_structure_and_active_tool_set() {
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
                                "missing parameter close was repaired");
 
-    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
-    failures +=
-        check_rejected(duplicate, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
-                       "duplicate parameter was silently overwritten");
-
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
     failures +=
         check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
@@ -752,10 +747,33 @@ int test_free_tool_continuation() {
 
 } // namespace
 
+int test_duplicate_parameter_keeps_last_value() {
+    int failures = 0;
+    const fi::ToolCallOutputContract contract =
+        contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(duplicate, 64, contract);
+
+    failures += check(parsed.is_tool_call_response, "duplicate parameter still fell back to text");
+    failures += check(parsed.content.empty(), "duplicate parameter left prose behind");
+    failures += check(parsed.tool_calls.size() == 1, "duplicate parameter did not yield one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls.front().arguments_json == R"({"value":"second"})",
+                          "duplicate parameter did not keep the last value");
+    }
+    failures += check(parsed.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::None,
+                      "duplicate parameter still reported a fallback reason");
+    failures += check(parsed.diagnostics.duplicate_parameters_repaired == 1,
+                      "duplicate parameter repair was not recorded in diagnostics");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_free_tool_continuation();
     failures += test_untyped_parameters();
+    failures += test_duplicate_parameter_keeps_last_value();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();

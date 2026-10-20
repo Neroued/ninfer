@@ -356,7 +356,6 @@ struct GeneratedToolCall {
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
-    DuplicateParameter,
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
@@ -369,8 +368,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "none";
     case ToolCallParseFallbackReason::MalformedStructure:
         return "malformed_structure";
-    case ToolCallParseFallbackReason::DuplicateParameter:
-        return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
     case ToolCallParseFallbackReason::UndeclaredTool:
@@ -382,11 +379,12 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
-    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    bool marker_seen                              = false;
+    std::uint32_t structured_call_count           = 0;
+    std::uint32_t empty_arguments_omitted         = 0;
+    std::uint32_t schema_mismatch_arguments       = 0;
+    std::uint32_t duplicate_parameters_repaired   = 0;
+    ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;

@@ -13,9 +13,10 @@ from typing import Any
 
 from ..config import ConfigError, JobConfig
 from ..events import EventSink, RunEvent
-from ..result import DatasetResult, ResultCounts
+from ..result import DatasetResult, ResultCounts, _atomic_json
 from ..secrets import ResolvedTarget
 from .base import BackendDependencyError, BackendRun, RunContext, WorkPlan
+from .evalscope_records import prepare_resume, summarize_records
 
 _DATASET_COUNTS = {
     "aime25": {"default": 30},
@@ -97,6 +98,7 @@ class EvalScopeBackend:
         "underscore_to_dot",
         "serpapi_api_key_env",
         "allow_network_downloads",
+        "seed",
     }
 
     def validate(
@@ -217,6 +219,8 @@ class EvalScopeBackend:
             raise RuntimeError("EvalScope is not installed")
         from evalscope import TaskConfig, run_task
 
+        if context.resume:
+            prepare_resume(context.job_dir)
         task_dict = self._task_dict(context)
         task_path = context.job_dir / "evalscope-task.json"
         safe_task = dict(task_dict)
@@ -265,7 +269,6 @@ class EvalScopeBackend:
         report = self._find_report_file(context.job_dir, context.job.dataset)
         if report:
             artifacts.append(report)
-        self._apply_sample_retention(context.job_dir, context.sample_retention)
         events.emit(
             RunEvent(
                 kind="phase",
@@ -307,7 +310,6 @@ class EvalScopeBackend:
             generation.setdefault(
                 "extra_headers", context.target.config.request.headers
             )
-        seed = generation.get("seed", 42)
         task: dict[str, Any] = {
             "model": context.target.config.model,
             "model_id": context.target.config.model,
@@ -320,7 +322,7 @@ class EvalScopeBackend:
             "generation_config": generation,
             "limit": job.limit,
             "repeats": job.repeats,
-            "seed": seed,
+            "seed": args.get("seed", 42),
             "judge_strategy": args.get("judge_strategy", "auto"),
             "judge_model_args": args.get("judge_model_args", {}),
             "collect_perf": bool(args.get("collect_perf", True)),
@@ -347,6 +349,7 @@ class EvalScopeBackend:
     ) -> None:
         path = context.job_dir / "progress.json"
         last: tuple[Any, ...] | None = None
+        last_emit = 0.0
         while not stop.wait(0.5):
             if context.cancel_event.is_set():
                 return
@@ -359,9 +362,11 @@ class EvalScopeBackend:
                     data.get("total_count"),
                     data.get("status"),
                 )
-                if key == last:
+                now = time.monotonic()
+                if key == last and now - last_emit < 30:
                     continue
                 last = key
+                last_emit = now
                 events.emit(
                     RunEvent(
                         kind="progress",
@@ -435,28 +440,49 @@ class EvalScopeBackend:
             artifacts.append(
                 str(report_path.relative_to(context.job_dir.parent.parent))
             )
-        failed = self._prediction_failures(context.job_dir)
-        return DatasetResult(
+        diagnostics, questions = summarize_records(context.job_dir)
+        diagnostics["repeats"] = context.job.repeats
+        if questions:
+            sample_summary = context.job_dir / "sample-summary.json"
+            _atomic_json(sample_summary, questions)
+            artifacts.append(
+                str(sample_summary.relative_to(context.job_dir.parent.parent))
+            )
+        failed = diagnostics["failed"]
+        planned = context.plan.total
+        progress_path = context.job_dir / "progress.json"
+        if progress_path.exists():
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            planned = progress.get("total_count") or planned
+        complete = not failed and num > 0 and (planned is None or num == planned)
+        status = "completed" if complete else ("partial" if num > failed else "failed")
+        result = DatasetResult(
             job_id=context.job.id,
             backend=self.name,
             dataset=context.job.dataset,
-            status="completed",
+            status=status,
             primary_metric=primary,
             metrics=metrics,
             counts=ResultCounts(
-                planned=context.plan.total,
+                planned=planned,
                 completed=num,
                 scored=num,
                 failed=failed,
             ),
             duration_seconds=run.duration_seconds,
             artifacts=artifacts,
+            error=(
+                None
+                if complete
+                else f"scored={num}, planned={planned}, failed={failed}"
+            ),
+            diagnostics=diagnostics,
         )
+        self._apply_sample_retention(context.job_dir, context.sample_retention)
+        return result
 
     @staticmethod
-    def _named_metrics(
-        report: dict[str, Any], names: set[str]
-    ) -> dict[str, float]:
+    def _named_metrics(report: dict[str, Any], names: set[str]) -> dict[str, float]:
         values: dict[str, float] = {}
         for metric in report.get("metrics", []):
             name = str(metric.get("name", "")).lower()
@@ -495,7 +521,9 @@ class EvalScopeBackend:
                     value = subset.get("score")
                     if not name or count <= 0 or not isinstance(value, (int, float)):
                         continue
-                    subset_scores[name] = subset_scores.get(name, 0.0) + float(value) * count
+                    subset_scores[name] = (
+                        subset_scores.get(name, 0.0) + float(value) * count
+                    )
                     subset_counts[name] = subset_counts.get(name, 0) + count
         if total == 0:
             return 0.0, 0, {}
@@ -505,40 +533,6 @@ class EvalScopeBackend:
             if subset_counts[name] > 0
         }
         return weighted_score / total, total, breakdown
-
-    @staticmethod
-    def _prediction_failures(job_dir: Path) -> int:
-        """Count EvalScope records that wrapped an inference exception as output.
-
-        BFCL catches provider errors and serializes them into an assistant message,
-        so its report still counts the sample and the outer task still succeeds.
-        Audit the retained predictions to keep those infrastructure failures visible
-        in the normalized result instead of silently treating them as model mistakes.
-        """
-        failures = 0
-        for path in (job_dir / "predictions").glob("**/*.jsonl"):
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    record = json.loads(line)
-                    output = record.get("model_output") or {}
-                    if output.get("error") is not None:
-                        failures += 1
-                        continue
-                    choices = output.get("choices") or []
-                    content = choices[0]["message"]["content"] if choices else None
-                    wrapped = json.loads(content) if isinstance(content, str) else None
-                    if (
-                        isinstance(wrapped, dict)
-                        and {
-                            "error",
-                            "error_message",
-                        }
-                        <= wrapped.keys()
-                    ):
-                        failures += 1
-                except (json.JSONDecodeError, KeyError, TypeError, OSError):
-                    continue
-        return failures
 
     def _report_dict(self, context: RunContext, raw: Any) -> dict[str, Any]:
         if isinstance(raw, dict):
@@ -610,25 +604,32 @@ class EvalScopeBackend:
                 shutil.rmtree(root)
                 continue
             for path in root.rglob("*.jsonl"):
-                kept: list[str] = []
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        kept.append(line)
-                        continue
-                    encoded = json.dumps(record, ensure_ascii=False).lower()
-                    if any(
-                        marker in encoded
-                        for marker in (
-                            '"error"',
-                            "error_message",
-                            "traceback",
-                            "exception",
-                        )
-                    ):
-                        kept.append(line)
-                if kept:
-                    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                tmp = path.with_suffix(".jsonl.tmp")
+                retained = False
+                with path.open(encoding="utf-8") as source, tmp.open(
+                    "w", encoding="utf-8"
+                ) as kept:
+                    for line in source:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            keep = True
+                        else:
+                            encoded = json.dumps(record, ensure_ascii=False).lower()
+                            keep = any(
+                                marker in encoded
+                                for marker in (
+                                    '"error"',
+                                    "error_message",
+                                    "traceback",
+                                    "exception",
+                                )
+                            )
+                        if keep:
+                            kept.write(line)
+                            retained = True
+                if retained:
+                    tmp.replace(path)
                 else:
                     path.unlink()
+                    tmp.unlink()

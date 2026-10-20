@@ -25,7 +25,7 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["results"][0]["counts"]["planned"], 30)
             self.assertIn(
-                "| aime25 | mock | aime25 |", (root / "summary.md").read_text()
+                "| aime25 | completed | accuracy |", (root / "summary.md").read_text()
             )
 
 

@@ -36,7 +36,7 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
                                                     const EngineOptions& options,
                                                     WeightPlacement placement,
                                                     std::size_t available) const {
-    using runtime::resolve_kv_capacity;
+    using runtime::resolve_context_capacity;
     const bool host_experts = placement == WeightPlacement::HostExperts;
     if (host_experts && !offload_) return {};
     auto trial       = options;
@@ -55,17 +55,24 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
             ? static_cast<std::uint32_t>((std::uint64_t(policy.explicit_tokens) + page_tokens - 1) /
                                          page_tokens)
             : curve.minimum_primary_page_groups;
-    if (curve.reservation_bytes(pages) > available) return std::nullopt;
+    const auto slots = std::uint64_t(options.max_concurrency) +
+                       options.context_cache.extra_state_slots.value_or(0);
+    if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
+    if (curve.reservation_bytes({pages, static_cast<std::uint32_t>(slots)}) > available)
+        return std::nullopt;
     if (!host_experts) {
-        auto resolution = resolve_kv_capacity(policy, curve, available);
-        return ExecutionPlan{std::move(planner).finalize(resolution.primary_page_groups),
-                             resolution,
-                             placement,
-                             chunk,
-                             {}};
+        auto resolution = resolve_context_capacity(policy, options.context_cache, curve, available);
+        return ExecutionPlan{
+            std::move(planner).finalize(resolution.capacity()), resolution, placement, chunk, {}};
     }
-    auto limited          = KvCapacityPolicy::explicit_capacity(curve.resolved_tokens(pages));
-    auto base             = resolve_kv_capacity(limited, curve, available);
+    auto limited       = KvCapacityPolicy::explicit_capacity(curve.resolved_tokens(pages));
+    auto initial_cache = options.context_cache;
+    if (!initial_cache.extra_state_slots)
+        initial_cache.extra_state_slots = initial_cache.enabled ? options.max_concurrency : 0;
+    if (curve.reservation_bytes(
+            {pages, options.max_concurrency + *initial_cache.extra_state_slots}) > available)
+        return std::nullopt;
+    auto base             = resolve_context_capacity(limited, initial_cache, curve, available);
     const auto max_tokens = static_cast<std::int32_t>(
         std::max(std::min(chunk, options.max_context),
                  options.max_concurrency * (options.speculative.draft_tokens + 1)));
@@ -73,10 +80,11 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
                                  options.moe.cpu_workers);
     if (!moe) return std::nullopt;
     auto final = make_sequence_planner(profile, device, trial, moe);
-    if (final.capacity_curve().reservation_bytes(pages) > available) return std::nullopt;
-    auto resolution = resolve_kv_capacity(limited, final.capacity_curve(), available);
+    if (final.capacity_curve().reservation_bytes(base.capacity()) > available) return std::nullopt;
+    auto resolution =
+        resolve_context_capacity(limited, options.context_cache, final.capacity_curve(), available);
     resolution.mode = policy.mode;
-    return ExecutionPlan{std::move(final).finalize(resolution.primary_page_groups),
+    return ExecutionPlan{std::move(final).finalize(resolution.capacity()),
                          resolution,
                          placement,
                          chunk,

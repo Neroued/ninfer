@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_capacity.h"
 #include "runtime/executor/executor.h"
 
 #include <memory>
@@ -9,7 +9,7 @@
 namespace ninfer::runtime {
 
 struct StartupMemorySummary {
-    KvCapacityResolution kv_capacity_resolution;
+    ContextCapacityResolution context_capacity;
     std::size_t device_budget_bytes = 0;
     std::optional<GraphMemorySummary> cuda_graph;
     std::int64_t startup_retained_bytes = 0;

@@ -23,7 +23,7 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
         });
     std::optional<typename Types::PreparedSession> session;
     auto prepared = prepare_execution_group(*group, setup.requests(options), options.kv_capacity,
-                                            std::chrono::minutes(30),
+                                            options.context_cache, std::chrono::minutes(30),
                                             {[&](auto descriptions) {
                                                  setup.resolve(descriptions, options);
                                                  session.emplace(setup.session());
@@ -38,11 +38,12 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     executor->bind_to_current_thread();
     StartupMemorySummary memory;
     memory.rank_budgets          = setup.memory_budgets();
-    auto& capacity               = memory.kv_capacity_resolution;
+    auto& capacity               = memory.context_capacity;
     capacity.mode                = options.kv_capacity.mode;
-    capacity.primary_page_groups = prepared.pages;
-    capacity.resolved_tokens =
-        prepared.reports.front().capacity.curve.resolved_tokens(prepared.pages);
+    capacity.device_state_slots  = prepared.capacity.device_state_slots;
+    capacity.primary_page_groups = prepared.capacity.primary_page_groups;
+    capacity.resolved_tokens     = prepared.reports.front().capacity.curve.resolved_tokens(
+        prepared.capacity.primary_page_groups);
     capacity.maximum_primary_page_groups =
         prepared.reports.front().capacity.curve.maximum_primary_page_groups;
     LoadSummary load;

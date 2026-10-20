@@ -24,15 +24,6 @@ const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcep
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 
-std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
-    std::vector<std::uint32_t> frontiers;
-    if (impl_) {
-        frontiers.reserve(impl_->capture_groups.size());
-        for (const auto& group : impl_->capture_groups) { frontiers.push_back(group.frontier); }
-    }
-    return frontiers;
-}
-
 std::optional<PrefixShortlistKey>
 RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
     if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
@@ -129,6 +120,13 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
     return impl_->recovery_index.evaluate(advertised);
 }
 
+std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+
+std::vector<runtime::ContextTransferRequirement>
+Session::checkpoint_restore_requirements(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
+}
+
 bool Session::valid_checkpoint(CheckpointHandle h) const noexcept {
     return impl_->valid_checkpoint(h);
 }
@@ -178,13 +176,29 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
 
 bool Session::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
 
+std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
+    std::vector<std::uint32_t> result;
+    for (const auto& point : impl_->requests[impl_->lane(h)].capture_groups)
+        result.push_back(point.frontier);
+    return result;
+}
+
+bool Session::capture_is_shared(SequenceHandle h) const {
+    const auto& request = impl_->requests[impl_->lane(h)];
+    if (request.next_capture >= request.capture_groups.size()) return false;
+    const auto& roles = request.capture_groups[request.next_capture].roles;
+    return roles.size() == 1 && roles.front() == runtime::CheckpointRole::SharedPrefix;
+}
+
 bool Session::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
 
 std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
     return impl_->prepare_capture(h);
 }
 
-void Session::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
+void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
+    impl_->skip_capture(h, reason);
+}
 
 bool Session::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
 

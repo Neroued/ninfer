@@ -26,7 +26,7 @@ public:
     void prepare_execution();
     [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
 
-    void prepare(std::uint32_t pages, std::size_t available_bytes);
+    void prepare(runtime::ContextCapacity capacity, std::size_t available_bytes);
     void release_program();
     [[nodiscard]] RankExecutionDescription describe() const;
     [[nodiscard]] ExecutionCodec codec(const distributed::ExecutionTopology&) const;
@@ -37,9 +37,10 @@ private:
     DeviceContext& device_;
     ParallelBinding binding_;
     std::size_t host_reservation_bytes_ = 0;
+    bool control_owner_                 = false;
     std::optional<ResolvedLoadPlan> load_;
     std::shared_ptr<const execution::ModelProfile> profile_;
-    runtime::SequenceCapacityCurve curve_;
+    runtime::ContextCapacityCurve curve_;
     std::unique_ptr<Instance> instance_;
     std::unique_ptr<RankProgram> probe_;
     GraphMemorySummary graph_memory_;

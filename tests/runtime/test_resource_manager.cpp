@@ -43,8 +43,6 @@ struct Base {
     Advice advice;
     std::vector<std::uint32_t> captures;
 
-    [[nodiscard]] const auto& capture_frontiers() const { return captures; }
-
     [[nodiscard]] Summary summary() const { return {static_cast<std::uint32_t>(tokens.size())}; }
 
     [[nodiscard]] const Advice& context_cache() const { return advice; }
@@ -84,7 +82,8 @@ struct Program {
         std::array<std::uint32_t, 2> other_pool_pages{};
         std::optional<std::uint32_t> demotion_page_limit;
         std::optional<std::size_t> demotion_bytes;
-        Role role = Role::SharedPrefix;
+        Role role                                = Role::SharedPrefix;
+        ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
     };
 
     struct HostBlock {
@@ -96,6 +95,7 @@ struct Program {
         std::uint32_t frontier;
         Role role;
         bool leased;
+        ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
     };
 
     struct Summary {
@@ -186,10 +186,18 @@ struct Program {
         return result;
     }
 
+    std::size_t checkpoint_capacity() const { return contents.size(); }
+
+    std::vector<ninfer::runtime::ContextTransferRequirement>
+    checkpoint_restore_requirements(Handle h) const {
+        return inspect_source(Base{contents[h.index].tokens}, h)->transfers;
+    }
+
     [[nodiscard]] Metadata checkpoint_metadata(Handle handle) const {
         const auto& content = contents.at(handle.index);
         require(content.alive, "cache queried a released checkpoint");
-        return {static_cast<std::uint32_t>(content.tokens.size()), content.role, content.leased};
+        return {static_cast<std::uint32_t>(content.tokens.size()), content.role, content.leased,
+                content.origin};
     }
 
     [[nodiscard]] Summary checkpoint_summary(Handle handle) const {
@@ -661,15 +669,15 @@ void test_candidates_keep_all_frontiers_and_independent_contents() {
     const auto shallow    = f.program.add({1, 2});
     const auto middle     = f.program.add({1, 2, 3, 4}, {f.program.host_block(16)});
     const auto deep       = f.program.add({1, 2, 3, 4, 5, 6});
-    const auto recomputed = f.program.add({1, 2, 3, 4, 5, 6});
+    const auto recomputed = f.program.add({1, 2, 3, 4, 5, 6}, {}, Role::Continuation);
     f.publish(shallow);
     f.publish(middle);
     f.publish(deep);
     f.publish(recomputed);
     const Base base{.tokens = {1, 2, 3, 4, 5, 6, 7}};
     const auto all = f.cache.candidates(f.program, base);
-    require(all.size() == 5 && all[0].source.checkpoint == deep &&
-                all[1].source.checkpoint == recomputed && all[2].source.checkpoint == middle &&
+    require(all.size() == 5 && all[0].source.checkpoint == recomputed &&
+                all[1].source.checkpoint == deep && all[2].source.checkpoint == middle &&
                 all[3].source.checkpoint == shallow && !all[4].source.checkpoint,
             "source selection discarded a shallower tier peer or independent state");
     const auto bounded = f.cache.candidates(f.program, base, 3);
@@ -679,6 +687,48 @@ void test_candidates_keep_all_frontiers_and_independent_contents() {
     const auto surviving = f.cache.candidates(f.program, base);
     require(surviving.front().source.checkpoint == recomputed,
             "removing one same-key checkpoint erased its surviving index peer");
+}
+
+void test_shared_publication_deduplicates_complete_snapshots() {
+    Fixture f(128);
+    const auto first  = f.program.add({1, 2, 3});
+    const auto second = f.program.add({1, 2, 3});
+    f.publish(first);
+    f.publish(second);
+    require(f.program.valid_checkpoint(first) && !f.program.valid_checkpoint(second),
+            "concurrent publication retained two identical public recovery points");
+    const Base request{.tokens = {1, 2, 3, 4}};
+    const auto semantic = ninfer::runtime::CheckpointOrigin::Semantic;
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3, semantic) &&
+                !f.cache.retain_shared_checkpoint(f.program, request, 2, semantic),
+            "shared capture lookup accepted a position without a complete state");
+    require(f.cache.candidates(f.program, request).size() == 2,
+            "duplicate shared publication left an extra source");
+}
+
+void test_intermediate_capture_preserves_semantic_history() {
+    using Origin = ninfer::runtime::CheckpointOrigin;
+    for (const auto origin : {Origin::Semantic, Origin::Intermediate}) {
+        Fixture f(0);
+        const auto semantic                       = f.program.add({1, 2, 3});
+        f.program.contents[semantic.index].origin = origin;
+        f.publish(semantic);
+        if (origin == Origin::Intermediate)
+            require(f.cache.retain_shared_checkpoint(f.program, Base{.tokens = {1, 2, 3, 4}}, 3,
+                                                     Origin::Semantic),
+                    "semantic capture could not retain an existing intermediate snapshot");
+        const Base request{.tokens = {100, 101, 102, 103}};
+        const auto admission =
+            f.cache.capture_admission(f.program, 0, request, 4, false, Origin::Intermediate);
+        auto cursor = f.cache.begin_reclaim(f.program, admission);
+        require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+                        ninfer::runtime::ReclaimProgress::Blocked &&
+                    f.program.valid_checkpoint(semantic),
+                "cold intermediate capture displaced a semantic shared prefix");
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed,
+                "semantic retention prevented required execution");
+    }
 }
 
 void test_private_continuation_advances_with_adoption_heat() {
@@ -1470,12 +1520,12 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     const auto permission = [&] {
         return f.cache.capture_admission(f.program, 0, incoming, 2, false);
     };
-    f.cache.observe_committed(incoming, 7, 0, 1);
+    f.cache.observe_committed(incoming, 7, 0, 1, incoming.captures);
     require(!permission().priority.reused, "work before a finite candidate created demand");
-    f.cache.observe_committed(incoming, 7, 1, 3);
-    f.cache.observe_committed(incoming, 7, 0, 3);
+    f.cache.observe_committed(incoming, 7, 1, 3, incoming.captures);
+    f.cache.observe_committed(incoming, 7, 0, 3, incoming.captures);
     require(!permission().priority.reused, "same-request repeated observation created reuse");
-    f.cache.observe_committed(incoming, 8, 0, 3);
+    f.cache.observe_committed(incoming, 8, 0, 3, incoming.captures);
     const auto admission = permission();
     require(admission.priority.reused, "two completed requests failed to qualify new demand");
     auto cursor = f.cache.begin_reclaim(f.program, admission);
@@ -1575,8 +1625,8 @@ void test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallba
     f.publish(old);
     f.use_shared(old);
     const Base incoming{.tokens = tokens(1000), .captures = {1000}};
-    f.cache.observe_committed(incoming, 100, 32, 1000);
-    f.cache.observe_committed(incoming, 101, 32, 1000);
+    f.cache.observe_committed(incoming, 100, 32, 1000, incoming.captures);
+    f.cache.observe_committed(incoming, 101, 32, 1000, incoming.captures);
     const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
     const auto replaced  = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
@@ -1660,10 +1710,10 @@ void test_adjacent_kv_demotions_share_one_submission() {
 
 void test_kv_demotion_batch_stops_at_an_intervening_delete() {
     Fixture f(64);
-    const auto first                               = f.program.add(tokens(100));
-    const auto removable                           = f.program.add(tokens(50, 1000));
-    const auto later                               = f.program.add(tokens(100, 2000));
-    const auto survivor                            = f.program.add(tokens(50, 1000));
+    const auto first     = f.program.add(tokens(100));
+    const auto removable = f.program.add(tokens(50, 1000));
+    const auto later     = f.program.add(tokens(100, 2000));
+    const auto survivor  = f.program.add(tokens(50, 1000), {}, Role::Continuation);
     f.program.contents[first.index].demotion_bytes = 4;
     f.program.contents[later.index].demotion_bytes = 4;
     f.program.contents[survivor.index].leased      = true;
@@ -1681,9 +1731,9 @@ void test_kv_demotion_batch_stops_at_an_intervening_delete() {
 void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
     for (const bool reject_transfer : {false, true}) {
         Fixture f(64);
-        const auto first                                 = f.program.add(tokens(100));
-        const auto second                                = f.program.add(tokens(100, 1000));
-        const auto survivor                              = f.program.add(tokens(100));
+        const auto first    = f.program.add(tokens(100));
+        const auto second   = f.program.add(tokens(100, 1000));
+        const auto survivor = f.program.add(tokens(100), {}, Role::Continuation);
         f.program.contents[first.index].demotion_bytes   = 4;
         f.program.contents[second.index].demotion_bytes  = 4;
         f.program.contents[first.index].demotion_blocked = reject_transfer;
@@ -1713,10 +1763,10 @@ void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
 
 void test_partially_covered_delete_still_stops_a_kv_batch() {
     Fixture f(64);
-    const auto first                                    = f.program.add(tokens(100));
-    const auto second                                   = f.program.add(tokens(100, 1000));
-    const auto survivor                                 = f.program.add(tokens(100));
-    f.program.contents[first.index].main_pages          = 2;
+    const auto first                           = f.program.add(tokens(100));
+    const auto second                          = f.program.add(tokens(100, 1000));
+    const auto survivor                        = f.program.add(tokens(100), {}, Role::Continuation);
+    f.program.contents[first.index].main_pages = 2;
     f.program.contents[first.index].demotion_page_limit = 1;
     f.program.contents[first.index].demotion_bytes      = 4;
     f.program.contents[second.index].demotion_bytes     = 4;
@@ -2067,6 +2117,8 @@ void test_independent_host_candidates_reuse_scores() {
 
 int main() {
     try {
+        test_shared_publication_deduplicates_complete_snapshots();
+        test_intermediate_capture_preserves_semantic_history();
         test_host_selection_against_full_rescoring();
         test_independent_host_candidates_reuse_scores();
         test_demotion_competes_with_its_actual_host_recovery_loss();

@@ -5,6 +5,13 @@
 
 namespace ninfer::models::qwen4_exp {
 
+std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+
+std::vector<runtime::ContextTransferRequirement>
+Session::checkpoint_restore_requirements(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
+}
+
 bool Session::valid_checkpoint(CheckpointHandle h) const noexcept {
     return impl_->checkpoints.valid(h);
 }
@@ -16,7 +23,7 @@ bool Session::release_checkpoint(CheckpointHandle h) noexcept {
 CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
     const auto& p = *impl_;
     const auto& c = p.checkpoints.at(h);
-    return {c.frontier(), c.role, p.checkpoints[h.index].pins != 0};
+    return {c.frontier(), c.role, p.checkpoints[h.index].pins != 0, c.origin};
 }
 
 PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
@@ -72,48 +79,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         const auto& states = p.directory.states();
         out.consume_source = consume && p.checkpoints[h->index].pins == 0 &&
                              states.checkpoint_references(image) == 1 && !states.source_pins(image);
-        if (!states.device_resident(image))
-            out.transfers.push_back(context::state_transfer_requirement(
-                {p.directory.states().image_bytes(), 1},
-                runtime::ContextTransferDirection::HostToDevice));
-        for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool) {
-            const auto& storage     = p.directory.pool(pool);
-            const auto& prefix      = c.snapshot.prefix(pool);
-            std::uint32_t missing   = 0;
-            std::uint32_t run_pages = 0;
-            std::optional<context::HostPageReplica> previous;
-            TransferWork work;
-            const auto finish_run = [&] {
-                if (!run_pages) return;
-                const auto run = storage.pages().host_transfer_run_work(run_pages);
-                work.payload_bytes += run.payload_bytes;
-                if (run.copy_operations > UINT32_MAX - work.copy_operations)
-                    throw std::overflow_error("Qwen4Exp restore operation count exceeds uint32");
-                work.copy_operations += run.copy_operations;
-                run_pages = 0;
-            };
-            for (std::uint32_t i = 0; i < (prefix.frontier() + 63) / 64; ++i) {
-                const auto page = storage.histories().logical_page(prefix.history(), i);
-                if (storage.pages().device_covers(page,
-                                                  std::min(64U, prefix.frontier() - i * 64))) {
-                    finish_run();
-                    previous.reset();
-                    continue;
-                }
-                const auto& replica = storage.pages().host_replica(page);
-                if (previous && (replica.extent != previous->extent ||
-                                 replica.page_offset != previous->page_offset + 1))
-                    finish_run();
-                ++missing;
-                ++run_pages;
-                previous = replica;
-            }
-            finish_run();
-            if (missing)
-                out.transfers.push_back(context::kv_transfer_requirement(
-                    {runtime::KvPoolId{pool}}, runtime::ContextTransferDirection::HostToDevice,
-                    missing, work));
-        }
+        out.transfers = c.snapshot.restore_requirements(p.directory);
     }
     for (const auto point : carried)
         if ((!h || point != *h || !out.consume_source) && checkpoint_matches(point, base) &&
@@ -352,21 +318,18 @@ ContextProgress detail::SessionImpl::complete_context() {
             auto& s = *p.sequences[tx->lane];
             result.captured_checkpoints.reserve(tx->reservation->records.size());
             for (const auto& [record, role] : tx->reservation->records) {
-                p.checkpoints.publish(record, {*tx->snapshot, role});
+                p.checkpoints.publish(record,
+                                      {*tx->snapshot, role, s.captures[s.next_capture].origin});
                 result.captured_checkpoints.push_back(record);
             }
-            auto& destination = migration.state_destination();
-            if (states.device_resident(destination.image())) {
-                (void)destination.begin_write(s.continuation.image);
-                s.write_destination = destination.release();
-                ++result.operations.state_forks;
-            } else {
-                states.split_device_replica_identity(s.continuation.image, destination.image());
-                states.complete_initialization(destination.image());
-                s.continuation.image = destination.release();
-            }
+            const auto writer    = context::adopt_capture_writer(states, s.continuation.image,
+                                                                 migration.state_destination());
+            s.continuation.image = writer.image;
+            s.write_destination  = writer.write_destination;
+            result.operations.state_forks += writer.write_destination.valid();
             tx->reservation->records.clear();
             s.capture_pending = false;
+            s.last_saved      = s.captures[s.next_capture].frontier;
             ++s.next_capture;
         } else if (auto* tx = std::get_if<detail::PauseOperation>(&operation.action)) {
             result.request_speculative = tx->paused->sequence->speculative;

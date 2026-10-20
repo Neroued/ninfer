@@ -33,6 +33,11 @@ class RecoveryIndex {
 public:
     static constexpr auto none = std::numeric_limits<std::uint32_t>::max();
 
+    [[nodiscard]] static std::size_t metadata_bytes(std::size_t capacity) {
+        return sizeof(RecoveryIndex) +
+               capacity * (sizeof(Slot) + sizeof(Node) + sizeof(std::uint32_t));
+    }
+
     struct Work {
         std::uint64_t synchronizations  = 0;
         std::uint64_t shortlist_queries = 0;

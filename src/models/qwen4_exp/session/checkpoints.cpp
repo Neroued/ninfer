@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/session/internal.h"
 
+#include "runtime/engine/context_cache/capture_policy.h"
+
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp::detail {
@@ -42,17 +44,38 @@ std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
     if (!s.permit || !s.request->summary.publish_continuation) return {};
     if (s.recovery_peak) {
         s.capture.reset();
-        while (s.next_capture < s.request->captures.size() &&
-               s.request->captures[s.next_capture].frontier <= s.permitted_frontier)
+        while (s.next_capture < s.captures.size() &&
+               s.captures[s.next_capture].frontier <= s.permitted_frontier)
             ++s.next_capture;
         return {};
     }
-    if (s.capture) return CapturePreparation{s.request->captures[s.next_capture].frontier, true};
-    while (s.next_capture < s.request->captures.size() &&
-           s.request->captures[s.next_capture].frontier <= s.continuation.metadata.main_frontier)
+    if (s.capture)
+        return CapturePreparation{.frontier = s.captures[s.next_capture].frontier,
+                                  .reserved = true,
+                                  .origin   = s.captures[s.next_capture].origin};
+    while (s.next_capture < s.captures.size() &&
+           s.captures[s.next_capture].frontier <= s.continuation.metadata.main_frontier)
         ++s.next_capture;
-    if (s.next_capture == s.request->captures.size()) return {};
-    const auto& point = s.request->captures[s.next_capture];
+    const auto begin   = s.continuation.metadata.main_frontier;
+    const auto& advice = s.request->prompt.context_cache;
+    if (s.phase == detail::Phase::Prefill && advice.automatic_checkpoints &&
+        s.permitted_frontier > s.last_intermediate_attempt) {
+        const auto next = s.next_capture < s.captures.size()
+                              ? std::optional{s.captures[s.next_capture].frontier}
+                              : std::nullopt;
+        const auto point =
+            runtime::intermediate_capture(begin, s.permitted_frontier, s.last_saved, next,
+                                          advice.semantic_boundaries, p.plan.checkpoint_interval);
+        if (point && s.request->can_checkpoint(*point)) {
+            s.captures.insert(s.captures.begin() + s.next_capture,
+                              {*point,
+                               {runtime::CheckpointRole::SharedPrefix},
+                               runtime::CheckpointOrigin::Intermediate});
+            s.last_intermediate_attempt = s.permitted_frontier;
+        }
+    }
+    if (s.next_capture == s.captures.size()) return {};
+    const auto& point = s.captures[s.next_capture];
     if (point.frontier > s.permitted_frontier) return {};
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
@@ -60,36 +83,51 @@ std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
-        if (!record) return CapturePreparation{point.frontier, false};
+        if (!record) return CapturePreparation{.frontier = point.frontier, .origin = point.origin};
         ticket->records.emplace_back(*record, role);
     }
-    auto destination = ticket->states->reserve_destination();
-    if (!destination && p.directory.host_allocation().capacity_bytes()) {
-        ticket->host = p.directory.host_allocation().allocate(p.directory.states().image_bytes());
-        if (ticket->host) destination = ticket->states->reserve_logical_destination();
-    }
+    auto destination = context::reserve_capture_destination(
+        *ticket->states, p.directory.host_allocation(), ticket->host);
     if (!destination)
-        return CapturePreparation{
-            point.frontier, false, {.state_slots = 1}, p.directory.states().image_bytes()};
+        return CapturePreparation{point.frontier,
+                                  false,
+                                  {.state_slots = 1},
+                                  p.directory.states().image_bytes(),
+                                  point.origin};
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
-    return CapturePreparation{point.frontier, true};
+    return CapturePreparation{.frontier = point.frontier, .reserved = true, .origin = point.origin};
+}
+
+std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
+    std::vector<std::uint32_t> result;
+    for (const auto& point : impl_->sequence(h).captures) result.push_back(point.frontier);
+    return result;
+}
+
+bool Session::capture_is_shared(SequenceHandle h) const {
+    const auto& s = impl_->sequence(h);
+    if (s.next_capture >= s.captures.size()) return false;
+    const auto& roles = s.captures[s.next_capture].roles;
+    return roles.size() == 1 && roles.front() == runtime::CheckpointRole::SharedPrefix;
 }
 
 bool Session::capture_is_input(SequenceHandle h) const {
     const auto& s = impl_->sequence(h);
-    if (s.next_capture >= s.request->captures.size()) return false;
-    const auto& point = s.request->captures[s.next_capture];
+    if (s.next_capture >= s.captures.size()) return false;
+    const auto& point = s.captures[s.next_capture];
     return (s.capture_pending || (s.permit && point.frontier <= s.permitted_frontier)) &&
            std::find(point.roles.begin(), point.roles.end(),
                      runtime::CheckpointRole::InputReplay) != point.roles.end();
 }
 
-void Session::skip_capture(SequenceHandle h) {
+void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
     auto& s = impl_->sequence(h);
     s.capture.reset();
     s.capture_pending = false;
-    if (s.next_capture < s.request->captures.size()) ++s.next_capture;
+    if (reason == runtime::CaptureSkip::Retained && s.next_capture < s.captures.size())
+        s.last_saved = s.captures[s.next_capture].frontier;
+    if (s.next_capture < s.captures.size()) ++s.next_capture;
 }
 
 bool Session::reclaim_capture_reservation(ContextResources shortage) {
@@ -127,16 +165,10 @@ bool Session::start_capture(SequenceHandle h) {
                 s.histories[pool].handle(), pool == 0
                                                 ? s.continuation.metadata.main_frontier
                                                 : s.continuation.metadata.mtp_frontier.value()));
-        p.directory.states().freeze(s.continuation.image);
+        context::prepare_capture_state(migration, p.directory.states(), s.continuation.image,
+                                       reservation.host);
         tx.snapshot.emplace(p.directory.states(), s.continuation, std::move(prefixes),
                             s.request->identity);
-        if (reservation.host) {
-            auto copy = p.directory.states().reserve_device_to_host(s.continuation.image,
-                                                                    std::move(*reservation.host));
-            reservation.host.reset();
-            if (!copy) throw std::logic_error("capture lost its Host reservation");
-            migration.add_state_copy(std::move(*copy), true);
-        }
         p.submit_context();
     } catch (...) {
         p.cancel_operation();

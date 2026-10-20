@@ -49,12 +49,14 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         const auto after_weights = device_memory_snapshot(device.device());
         std::uint32_t attempt    = 0;
         std::size_t correction   = 0;
-        const auto report        = [&] {
+        ContextCapacityCurve capacity_curve;
+        const auto report = [&] {
             const auto available = budget.available(device_memory_snapshot(device.device()));
             wire::Encoder out;
             out.u64(topology.plan);
             out.u32(attempt);
-            auto value = preparing->report(available > correction ? available - correction : 0);
+            auto value     = preparing->report(available > correction ? available - correction : 0);
+            capacity_curve = value.capacity.curve;
             value.hardware_class = context_cost_hardware_class(
                 device.properties().name, device.properties().major, device.properties().minor);
             value.cuda_sync_mode           = device.sync_mode();
@@ -64,10 +66,11 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         };
         report();
         bool entered = false, accepted = false;
-        std::uint32_t allocated_pages = 0;
+        ContextCapacity allocated_capacity;
         DeviceMemorySnapshot allocation_snapshot{};
-        std::size_t opaque_growth = 0;
-        const auto describe       = [&] {
+        std::size_t opaque_growth             = 0;
+        std::size_t control_reservation_bytes = 0;
+        const auto describe                   = [&] {
             auto result                                 = preparing->describe();
             const auto after                            = device_memory_snapshot(device.device());
             auto& observation                           = result.observation;
@@ -91,7 +94,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             result.budget.retained_bytes =
                 budget.retained(allocation_snapshot, requirement.weight_bytes);
             const auto planned =
-                result.budget.runtime_reservation_bytes +
+                result.budget.runtime_reservation_bytes + control_reservation_bytes +
                 (result.budget.graphs ? result.budget.graphs->rebuild_estimate_bytes : 0);
             const auto observed = device_memory_growth(allocation_snapshot, after);
             opaque_growth = observed > static_cast<std::int64_t>(planned) ? observed - planned : 0;
@@ -121,7 +124,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             if (command.u64() != topology.plan || command.u32() != attempt)
                 throw std::logic_error("rank preparation attempt differs");
             const auto action = static_cast<PreparationAction>(command.u8());
-            const auto pages  = command.u32();
+            const ContextCapacity capacity{command.u32(), command.u32()};
             command.finish();
             if (action == PreparationAction::PrepareProbe) {
                 bool success = true;
@@ -157,7 +160,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
                 continue;
             }
             if (action == PreparationAction::Activate) {
-                if (!accepted || pages != allocated_pages)
+                if (!accepted || capacity != allocated_capacity)
                     throw std::logic_error("rank activation has no accepted allocation");
                 auto codec = preparing->codec(topology);
                 instance   = std::move(*preparing).finish();
@@ -175,13 +178,13 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
                 return;
             }
             if (action == PreparationAction::CheckMemory) {
-                if (!entered || pages != allocated_pages)
+                if (!entered || capacity != allocated_capacity)
                     throw std::logic_error("rank memory check has no allocation");
                 allocated(describe());
                 continue;
             }
             if (action == PreparationAction::PrepareExecution) {
-                if (!accepted || pages != allocated_pages)
+                if (!accepted || capacity != allocated_capacity)
                     throw std::logic_error("rank execution preparation has no accepted allocation");
                 preparing->prepare_execution();
                 allocated(describe());
@@ -189,17 +192,18 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             }
             if (action != PreparationAction::Allocate || entered)
                 throw std::logic_error("rank allocation is already entered");
-            const auto before    = device_memory_snapshot(device.device());
-            allocation_snapshot  = before;
-            opaque_growth        = 0;
-            const auto available = budget.available(before);
+            const auto before         = device_memory_snapshot(device.device());
+            allocation_snapshot       = before;
+            opaque_growth             = 0;
+            const auto available      = budget.available(before);
+            control_reservation_bytes = capacity_curve.control_bytes(capacity);
             wire::Bytes description;
             try {
-                preparing->prepare(pages, available > correction ? available - correction : 0);
+                preparing->prepare(capacity, available > correction ? available - correction : 0);
                 description = describe();
             } catch (const DeviceAllocationError&) { accepted = false; }
-            entered         = true;
-            allocated_pages = pages;
+            entered            = true;
+            allocated_capacity = capacity;
             allocated(std::move(description));
         }
     } catch (const std::exception& error) {

@@ -65,12 +65,6 @@ const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcep
     return plan_->prompt.context_cache;
 }
 
-std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
-    std::vector<std::uint32_t> out;
-    for (const auto& c : plan_->captures) out.push_back(c.frontier);
-    return out;
-}
-
 std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
     if (!plan_->reuse || !plan_->can_checkpoint(f) || f > plan_->summary.prompt_tokens) return {};
     return detail::key(*plan_->identity, f);

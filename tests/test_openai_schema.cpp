@@ -196,6 +196,8 @@ int test_prompt_cache_boundaries() {
         body["messages"].push_back(Json{{"role", role}, {"content", "complete message"}});
         const auto prepared = prompt(parse(body).generation);
         const auto& markers = prepared.context_cache.markers;
+        failures += check(prepared.context_cache.allow_engine_automatic_shared_prefixes,
+                          "default OpenAI policy suppressed structural prefix candidates");
         failures += check(
             markers.size() == 1 && markers[0].location == Location::MessagePartBoundary &&
                 markers[0].after_message_count == 2 && markers[0].after_message_part_count == 1 &&
@@ -208,6 +210,8 @@ int test_prompt_cache_boundaries() {
         {Json{{"type", "text"}, {"text", "first"}}, Json{{"type", "text"}, {"text", "second"}}});
     multipart["prompt_cache_options"] = Json{{"mode", "implicit"}};
     const auto requested              = prompt(parse(multipart).generation);
+    failures += check(requested.context_cache.allow_engine_automatic_shared_prefixes,
+                      "implicit policy suppressed structural prefix candidates");
     failures +=
         check(requested.context_cache.markers.size() == 1 &&
                   requested.context_cache.markers[0].location == Location::MessagePartBoundary &&

@@ -55,6 +55,11 @@ void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& 
     out.u32(c.maximum_primary_page_groups);
     out.u64(c.minimum_device_reservation_bytes);
     out.u64(c.bytes_per_additional_primary_page_group);
+    out.u32(c.minimum_state_slots);
+    out.u64(c.bytes_per_additional_state_slot);
+    out.u64(c.minimum_control_bytes);
+    out.u64(c.control_bytes_per_page_group);
+    out.u64(c.control_bytes_per_state_slot);
     out.u64(r.capacity.available_bytes);
     out.u64(r.weight_bytes);
     out.u64(r.host_weight_bytes);
@@ -72,7 +77,8 @@ void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& 
 
 RankPreparationReport decode_preparation_report(wire::Decoder& in) {
     RankPreparationReport r;
-    r.capacity.curve           = {in.u32(), in.u32(), in.u32(), in.u64(), in.u64()};
+    r.capacity.curve           = {in.u32(), in.u32(), in.u32(), in.u64(), in.u64(),
+                                  in.u32(), in.u64(), in.u64(), in.u64(), in.u64()};
     r.capacity.available_bytes = in.u64();
     r.weight_bytes             = in.u64();
     r.host_weight_bytes        = in.u64();
@@ -91,11 +97,13 @@ RankPreparationReport decode_preparation_report(wire::Decoder& in) {
 
 GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                                          std::span<const wire::Bytes> payloads,
-                                         const KvCapacityPolicy& policy,
+                                         KvCapacityPolicy policy, ContextCacheOptions cache,
                                          std::chrono::milliseconds timeout,
                                          ControlPreparation control) {
     if (payloads.size() != group.topology().ranks.size())
         throw std::invalid_argument("preparation payload count differs from rank count");
+    // Each rank's StartupMemoryBudget has already reserved its headroom.
+    policy.automatic_headroom_bytes = 0;
     try {
         std::vector<dist::OutgoingMessage> requests;
         for (const auto& rank : group.topology().ranks) {
@@ -115,7 +123,8 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                 out.u64(group.topology().plan);
                 out.u32(attempt);
                 out.u8(static_cast<std::uint8_t>(action));
-                out.u32(result.pages);
+                out.u32(result.capacity.primary_page_groups);
+                out.u32(result.capacity.device_state_slots);
                 broadcast(group, wire::Kind::Enter, std::move(out).take());
             };
             const auto reports = [&] {
@@ -157,8 +166,8 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
             }
             std::vector<RankCapacityOffer> offers;
             for (const auto& report : result.reports) offers.push_back(report.capacity);
-            const auto capacities = resolve_group_kv_capacity(policy, offers);
-            result.pages          = capacities.front().primary_page_groups;
+            const auto capacities = resolve_group_context_capacity(policy, cache, offers);
+            result.capacity       = capacities.front().capacity();
             enter(PreparationAction::Allocate);
             bool success = allocated(true);
             if (success) {
@@ -193,7 +202,8 @@ void activate_execution_group(dist::ExecutionGroup& group, const GroupPreparatio
         out.u64(group.topology().plan);
         out.u32(prepared.attempt);
         out.u8(static_cast<std::uint8_t>(PreparationAction::Activate));
-        out.u32(prepared.pages);
+        out.u32(prepared.capacity.primary_page_groups);
+        out.u32(prepared.capacity.device_state_slots);
         broadcast(group, wire::Kind::Enter, std::move(out).take());
         for (const auto& bytes : receive(group, wire::Kind::Ready, timeout)) {
             wire::Decoder in(bytes);

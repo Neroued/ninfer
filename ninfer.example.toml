@@ -22,7 +22,8 @@ pending_timeout = "30s" # Queue timeout before execution, not a total generation
 
 [context_cache]
 prefix_reuse = "default" # CLI: false; serve: true. Also accepts true/false.
-extra_state_slots = "default" # CLI: 0; serve: max_concurrency. Also accepts a nonnegative integer.
+extra_state_slots = "default" # CLI: 0; serve: auto. Also accepts auto or a nonnegative integer.
+checkpoint_interval = 8192 # Target spacing; semantic boundaries and execution windows determine actual positions.
 host_capacity = "default" # CLI/Spark: 0; RTX 5090 serve: 8 GiB + 8 native StateImages.
 # Explicit capacities accept "8GiB", "0B", or integer bytes; excludes CPU experts and PLE.
 cost_presets = "" # Optional context-cost JSON path; empty uses existing defaults.

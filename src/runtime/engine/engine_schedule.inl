@@ -29,6 +29,13 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         (void)resources_.recycle_input(*instance_.session, request->continuation_owner);
     }
     while (const auto capture = instance_.session->prepare_capture(*request->sequence)) {
+        if (instance_.session->capture_is_shared(*request->sequence) &&
+            resources_.retain_shared_checkpoint(*instance_.session, *request->base_plan,
+                                                capture->frontier, capture->origin)) {
+            instance_.session->skip_capture(*request->sequence, CaptureSkip::Retained);
+            decision.reset();
+            continue;
+        }
         if (capture->reserved) {
             decision.reset();
             return true;
@@ -37,7 +44,8 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         const auto admission = resources_.capture_admission(
             *instance_.session, request->continuation_owner, *request->base_plan, capture->frontier,
             instance_.session->capture_is_input(*request->sequence) &&
-                !capture->shortage.first_kv_deficit());
+                !capture->shortage.first_kv_deficit(),
+            capture->origin);
         if (!decision || decision->frontier != capture->frontier) {
             decision.emplace(
                 CaptureDecision{*request->sequence, capture->frontier,

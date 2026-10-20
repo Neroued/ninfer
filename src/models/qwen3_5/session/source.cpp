@@ -137,60 +137,22 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             : context::HistoryBindingDemand{};
     candidate.move_history =
         main_binding.reuse_history && (!backend_kv_histories || backend_binding.reuse_history);
-    if (!state_store->device_resident(record.continuation().image)) {
-        candidate.transfers.push_back(context::state_transfer_requirement(
-            plan.state_transfer, runtime::ContextTransferDirection::HostToDevice));
-    } else if (candidate.state_action != StateBindingAction::Move &&
-               candidate.state_action != StateBindingAction::Split &&
-               candidate.state_action != StateBindingAction::BackupSplit &&
-               is_masked_draft_backend(speculative_backend)) {
+    const auto restores = record.snapshot.restore_requirements(directory);
+    candidate.transfers.insert(candidate.transfers.end(), restores.begin(), restores.end());
+    if (state_store->device_resident(record.continuation().image) &&
+        candidate.state_action == StateBindingAction::Fork &&
+        is_masked_draft_backend(speculative_backend))
         candidate.transfers.push_back(context::state_transfer_requirement(
             plan.dflash_local_transfer.value(), runtime::ContextTransferDirection::DeviceToDevice));
-    }
-    const auto scan = [&](const context::HistoryDirectory& histories,
-                          const context::PageDirectory& pages, context::HistoryId address,
-                          std::uint32_t frontier, runtime::ContextTransferResource resource,
-                          std::uint32_t tail_copies) {
-        const auto count      = context::kv_pages_for_frontier(frontier);
-        const auto& transfer  = pages.transfer_profile();
-        std::uint32_t missing = 0, run_pages = 0;
-        TransferWork restore_work;
-        const auto finish_run = [&] {
-            const auto work = transfer.host_transfer_run_work(run_pages);
-            restore_work.payload_bytes += work.payload_bytes;
-            restore_work.copy_operations += work.copy_operations;
-            run_pages = 0;
-        };
-        std::optional<context::HostPageReplica> previous;
-        for (std::uint32_t index = 0; index < count; ++index) {
-            const auto page = histories.logical_page(address, index);
-            if (pages.device_resident(page)) { continue; }
-            const auto replica = pages.host_replica(page);
-            if (previous && (previous->extent != replica.extent ||
-                             previous->page_offset + 1 != replica.page_offset)) {
-                finish_run();
-            }
-            previous = replica;
-            ++run_pages;
-            ++missing;
-        }
-        if (missing) {
-            finish_run();
+    const auto tail = [&](const context::PageDirectory& pages, runtime::KvPoolId pool,
+                          std::uint32_t copies) {
+        if (copies)
             candidate.transfers.push_back(context::kv_transfer_requirement(
-                resource, runtime::ContextTransferDirection::HostToDevice, missing, restore_work));
-        }
-        if (tail_copies) {
-            candidate.transfers.push_back(context::kv_transfer_requirement(
-                resource, runtime::ContextTransferDirection::DeviceToDevice, 1,
-                transfer.device_copy_work(1)));
-        }
+                {pool}, runtime::ContextTransferDirection::DeviceToDevice, copies,
+                pages.transfer_profile().device_copy_work(copies)));
     };
-    scan(*text_kv_histories, *text_kv_pages, record.history().text, record.frontier(),
-         runtime::ContextTransferResource{kTextKvPool}, main_binding.tail_copies);
-    if (record.history().backend) {
-        scan(*backend_kv_histories, *backend_kv_pages, *record.history().backend, backend_frontier,
-             runtime::ContextTransferResource{kBackendKvPool}, backend_binding.tail_copies);
-    }
+    tail(*text_kv_pages, kTextKvPool, main_binding.tail_copies);
+    if (backend_kv_pages) tail(*backend_kv_pages, kBackendKvPool, backend_binding.tail_copies);
     return candidate;
 }
 } // namespace ninfer::models::qwen3_5::detail

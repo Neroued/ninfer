@@ -19,6 +19,7 @@ struct RankLoadRequest {
     RankPlan rank;
     EngineOptions options;
     std::size_t host_reservation_bytes = 0;
+    bool control_owner                 = false;
 };
 
 void encode_rank_load(distributed::wire::Encoder&, const RankLoadRequest&);

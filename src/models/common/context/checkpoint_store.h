@@ -71,6 +71,10 @@ public:
 
     explicit CheckpointStore(std::size_t capacity = 0) : slots_(capacity) {}
 
+    [[nodiscard]] static std::size_t metadata_bytes(std::size_t capacity) {
+        return sizeof(CheckpointStore) + capacity * sizeof(Slot);
+    }
+
     CheckpointStore(const CheckpointStore&)            = delete;
     CheckpointStore& operator=(const CheckpointStore&) = delete;
 

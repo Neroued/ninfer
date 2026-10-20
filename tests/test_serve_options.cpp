@@ -55,17 +55,37 @@ void test_resources_and_units() {
         require(parsed.launch.engine.context_cache.host_capacity_bytes == bytes,
                 "capacity lost exact bytes");
     }
-    const auto controls = parse(
-        {"ninfer-serve", "--pending-timeout", "1.25s", "model.ninfer", "--stats-interval", "0ms",
-         "--media-cache-capacity", "0B", "--max-request-size", "1.5MiB", "--extra-state-slots", "0",
-         "--max-concurrency", "4", "--media-preprocess-threads", "auto", "--kv-capacity", "auto"});
+    const auto controls = parse({"ninfer-serve",
+                                 "--pending-timeout",
+                                 "1.25s",
+                                 "model.ninfer",
+                                 "--stats-interval",
+                                 "0ms",
+                                 "--media-cache-capacity",
+                                 "0B",
+                                 "--max-request-size",
+                                 "1.5MiB",
+                                 "--extra-state-slots",
+                                 "0",
+                                 "--max-concurrency",
+                                 "4",
+                                 "--media-preprocess-threads",
+                                 "auto",
+                                 "--kv-capacity",
+                                 "auto",
+                                 "--checkpoint-interval",
+                                 "16384"});
     require(controls.launch.engine.pending_timeout_ms == 1250 &&
                 controls.launch.logging.stats_interval_ms == 0 &&
                 controls.max_request_bytes == 1572864 &&
                 controls.launch.engine.context_cache.extra_state_slots == 0 &&
+                controls.launch.engine.context_cache.checkpoint_interval == 16384 &&
                 controls.launch.engine.media_cache_bytes == 0 &&
                 controls.launch.engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
             "unit, zero or automatic controls changed");
+    require(!parse({"ninfer-serve", "model.ninfer", "--extra-state-slots", "auto"})
+                 .launch.engine.context_cache.extra_state_slots,
+            "automatic state capacity was resolved before planning");
     for (const auto& suffix :
          std::vector<std::vector<std::string>>{{"--host-cache-capacity", "18446744073709551616B"},
                                                {"--host-cache-capacity", "0.1B"},
@@ -75,6 +95,7 @@ void test_resources_and_units() {
                                                {"--pending-timeout", "4294967296ms"},
                                                {"--media-live-capacity", "0B"},
                                                {"--max-concurrency", "9"},
+                                               {"--checkpoint-interval", "0"},
                                                {"--port", "65536"},
                                                {"--top-k", "21"},
                                                {"--media-preprocess-threads", "0"}}) {

@@ -73,10 +73,13 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.boolean(o.use_cuda_graph);
     out.boolean(o.observability.gpu_timing);
     out.boolean(o.context_cache.enabled);
-    out.u32(o.context_cache.extra_state_slots.value_or(o.max_concurrency));
+    out.boolean(o.context_cache.extra_state_slots.has_value());
+    if (o.context_cache.extra_state_slots) out.u32(*o.context_cache.extra_state_slots);
+    out.u32(o.context_cache.checkpoint_interval);
     out.u64(o.context_cache.host_capacity_bytes.value_or(0));
     out.u64(std::max(kDefaultKvCapacityHeadroomBytes, o.kv_capacity.automatic_headroom_bytes));
     out.u64(request.host_reservation_bytes);
+    out.boolean(request.control_owner);
 }
 
 RankLoadRequest decode_rank_load(Decoder& in) {
@@ -113,23 +116,25 @@ RankLoadRequest decode_rank_load(Decoder& in) {
         bank.resize(in.count(4));
         for (auto& e : bank) e = in.u32();
     }
-    auto& o                             = request.options;
-    o.purpose                           = static_cast<EnginePurpose>(in.u8());
-    o.max_context                       = in.u32();
-    o.max_concurrency                   = in.u32();
-    o.prefill_chunk                     = in.u32();
-    o.kv_cache                          = static_cast<KvCacheStorage>(in.u8());
-    o.speculative.backend               = static_cast<SpeculativeBackend>(in.u8());
-    o.speculative.draft_tokens          = in.u32();
-    o.speculative.proposal_head         = static_cast<ProposalHead>(in.u8());
-    o.enable_vision                     = in.boolean();
-    o.use_cuda_graph                    = in.boolean();
-    o.observability.gpu_timing          = in.boolean();
-    o.context_cache.enabled             = in.boolean();
-    o.context_cache.extra_state_slots   = in.u32();
+    auto& o                     = request.options;
+    o.purpose                   = static_cast<EnginePurpose>(in.u8());
+    o.max_context               = in.u32();
+    o.max_concurrency           = in.u32();
+    o.prefill_chunk             = in.u32();
+    o.kv_cache                  = static_cast<KvCacheStorage>(in.u8());
+    o.speculative.backend       = static_cast<SpeculativeBackend>(in.u8());
+    o.speculative.draft_tokens  = in.u32();
+    o.speculative.proposal_head = static_cast<ProposalHead>(in.u8());
+    o.enable_vision             = in.boolean();
+    o.use_cuda_graph            = in.boolean();
+    o.observability.gpu_timing  = in.boolean();
+    o.context_cache.enabled     = in.boolean();
+    if (in.boolean()) o.context_cache.extra_state_slots = in.u32();
+    o.context_cache.checkpoint_interval = in.u32();
     o.context_cache.host_capacity_bytes = in.u64();
     o.kv_capacity                       = KvCapacityPolicy::automatic(in.u64());
     request.host_reservation_bytes      = in.u64();
+    request.control_owner               = in.boolean();
     return request;
 }
 
@@ -172,6 +177,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
         for (auto n : pool.transfer.host_operations) out.u32(n);
     }
     out.u64(p.vision_max_merged_tokens);
+    out.u32(p.checkpoint_interval);
     out.u32(r.capacity.compute_frames);
     out.u32(r.capacity.context_frames);
     runtime::protocol::encode(out, r.budget);
@@ -213,6 +219,7 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
         for (auto& n : pool.transfer.host_operations) n = in.u32();
     }
     p.vision_max_merged_tokens = in.u64();
+    p.checkpoint_interval      = in.u32();
     r.capacity                 = {in.u32(), in.u32()};
     r.budget                   = runtime::protocol::memory_budget(in);
     r.observation              = runtime::protocol::rank_snapshot(in);

@@ -124,6 +124,12 @@ public:
     PageDirectory(PageAllocator& allocator, std::uint32_t logical_capacity, KVPageGeometry geometry,
                   KVTransferProfile transfer = {});
 
+    [[nodiscard]] static std::size_t metadata_bytes(std::uint32_t logical, std::uint32_t device) {
+        return sizeof(PageDirectory) +
+               std::size_t(logical) * (sizeof(Page) + sizeof(std::uint32_t)) +
+               std::size_t(device) * sizeof(PageLease);
+    }
+
     PageDirectory(const PageDirectory&)            = delete;
     PageDirectory& operator=(const PageDirectory&) = delete;
     PageDirectory(PageDirectory&&)                 = delete;

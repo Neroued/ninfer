@@ -412,7 +412,13 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
             engine.context_cache.enabled = boolean();
             break;
         case Field::ExtraStateSlots:
-            engine.context_cache.extra_state_slots = u32();
+            if (std::holds_alternative<std::string>(value))
+                engine.context_cache.extra_state_slots.reset();
+            else
+                engine.context_cache.extra_state_slots = u32();
+            break;
+        case Field::CheckpointInterval:
+            engine.context_cache.checkpoint_interval = u32();
             break;
         case Field::HostCapacity:
             engine.context_cache.host_capacity_bytes = u64();

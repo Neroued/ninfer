@@ -567,20 +567,14 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
-    const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
-    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("maximum Main KV page count exceeds uint32");
-    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
         if (options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
-            throw std::invalid_argument(
-                "kv_capacity is outside the usable range for max_context and max_concurrency");
+        if (requested_pages < minimum_pages) {
+            throw std::invalid_argument("kv_capacity cannot cover the required execution pages");
         }
         break;
     }
@@ -694,22 +688,21 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
-    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("maximum Main KV page count exceeds uint32");
-    }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    const auto maximum_pages          = static_cast<std::uint32_t>(INT32_MAX / kPagedKVPageSize);
+    inputs.context_cache.extra_state_slots = 0;
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
-    planner->curve   = runtime::SequenceCapacityCurve{
+    planner->curve   = runtime::ContextCapacityCurve{
           .primary_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_primary_page_groups             = minimum_pages,
           .maximum_primary_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes        = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_primary_page_group = 0,
+          .minimum_state_slots                     = inputs.max_concurrency,
+          .bytes_per_additional_state_slot =
+            planner->minimum->persistent.state_images.images.image_stride,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
@@ -735,20 +728,23 @@ make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile> profile, De
 
 std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups) {
+                            runtime::ContextCapacity capacity) {
     if (planner == nullptr || planner->minimum == nullptr) {
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
-    const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
+    const std::size_t expected = planner->curve.reservation_bytes(capacity);
     std::unique_ptr<SequencePlanImpl> plan;
-    if (main_page_groups == planner->curve.minimum_primary_page_groups) {
+    if (capacity.primary_page_groups == planner->curve.minimum_primary_page_groups &&
+        capacity.device_state_slots == planner->curve.minimum_state_slots) {
         plan = std::move(planner->minimum);
     } else {
-        plan = build_sequence_candidate(planner->inputs, main_page_groups);
+        planner->inputs.context_cache.extra_state_slots =
+            capacity.device_state_slots - planner->inputs.max_concurrency;
+        plan = build_sequence_candidate(planner->inputs, capacity.primary_page_groups);
     }
     if (plan->device_reservation_bytes != expected) {
         throw std::logic_error(
-            "Qwen3.5 physical sequence layout is not affine in Main KV page capacity");
+            "Qwen3.5 physical sequence layout is not affine in context capacity");
     }
     return plan;
 }

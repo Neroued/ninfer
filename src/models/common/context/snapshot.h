@@ -2,7 +2,10 @@
 
 #include "models/common/context/directory/history.h"
 #include "models/common/context/directory/state.h"
+#include "models/common/context/directory.h"
+#include "models/common/context/work.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -74,6 +77,52 @@ public:
     }
 
     [[nodiscard]] std::span<const HistoryPrefix> prefixes() const noexcept { return prefixes_; }
+
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+    restore_requirements(const ContextDirectory& directory) const {
+        std::vector<runtime::ContextTransferRequirement> result;
+        if (!states_->device_resident(continuation_.image))
+            result.push_back(state_transfer_requirement(
+                {states_->image_bytes(), 1}, runtime::ContextTransferDirection::HostToDevice));
+        for (const auto& prefix : prefixes_) {
+            const auto pool       = prefix.history().pool_id;
+            const auto& storage   = directory.pool(pool);
+            std::uint32_t missing = 0, run_pages = 0;
+            TransferWork work;
+            std::optional<HostPageReplica> previous;
+            const auto finish = [&] {
+                if (!run_pages) return;
+                const auto run = storage.pages().host_transfer_run_work(run_pages);
+                work.payload_bytes += run.payload_bytes;
+                if (run.copy_operations > UINT32_MAX - work.copy_operations)
+                    throw std::overflow_error("checkpoint restore operation count exceeds uint32");
+                work.copy_operations += run.copy_operations;
+                run_pages = 0;
+            };
+            for (std::uint32_t i = 0; i < kv_pages_for_frontier(prefix.frontier()); ++i) {
+                const auto page = storage.histories().logical_page(prefix.history(), i);
+                if (storage.pages().device_covers(page,
+                                                  std::min(64U, prefix.frontier() - i * 64))) {
+                    finish();
+                    previous.reset();
+                    continue;
+                }
+                const auto replica = storage.pages().host_replica(page);
+                if (previous && (replica.extent != previous->extent ||
+                                 replica.page_offset != previous->page_offset + 1))
+                    finish();
+                previous = replica;
+                ++missing;
+                ++run_pages;
+            }
+            finish();
+            if (missing)
+                result.push_back(kv_transfer_requirement(
+                    {runtime::KvPoolId{static_cast<std::uint16_t>(pool)}},
+                    runtime::ContextTransferDirection::HostToDevice, missing, work));
+        }
+        return result;
+    }
 
     [[nodiscard]] StateId take_mutable_image() {
         if (!states_) throw std::logic_error("snapshot image already consumed");

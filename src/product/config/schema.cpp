@@ -36,7 +36,9 @@ constexpr FieldSpec kFields[] = {
     {Field::PrefixReuse, "context_cache.prefix_reuse", "--prefix-reuse", "--no-prefix-reuse", "",
      "Cross-request history reuse; also accepts =default."},
     {Field::ExtraStateSlots, "context_cache.extra_state_slots", "--extra-state-slots", "",
-     "N|default", "Extra complete StateImages beyond active lanes."},
+     "N|auto|default", "Extra complete StateImages beyond active lanes; auto sizes with KV."},
+    {Field::CheckpointInterval, "context_cache.checkpoint_interval", "--checkpoint-interval", "",
+     "N", "Target token spacing for intermediate prefill checkpoints (8192)."},
     {Field::HostCapacity, "context_cache.host_capacity", "--host-cache-capacity", "",
      "SIZE|default", "Shared Host State/KV and in-flight capacity; 0B disables backing.",
      Scope::Common, ConfigurationUnit::Bytes},
@@ -311,11 +313,14 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::Device:
         return integer(value, command_line, 0, std::numeric_limits<int>::max());
     case Field::MaxContext:
+    case Field::CheckpointInterval:
     case Field::MaxPendingRequests:
     case Field::MaxTokens:
     case Field::ThinkingBudget:
         return integer(value, command_line, 1, kU32Max);
     case Field::ExtraStateSlots:
+        if (is("auto")) return std::string("auto");
+        return integer(value, command_line, 0, kU32Max);
     case Field::DraftTokens:
         return integer(value, command_line, 0, kU32Max);
     case Field::MaxConcurrency:

@@ -51,14 +51,14 @@ SequencePlanner& SequencePlanner::operator=(SequencePlanner&&) noexcept = defaul
 
 SequencePlanner::~SequencePlanner() = default;
 
-const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
-    static const runtime::SequenceCapacityCurve empty;
+const runtime::ContextCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
+    static const runtime::ContextCapacityCurve empty;
     return impl_ != nullptr ? impl_->curve : empty;
 }
 
-SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
+SequencePlan SequencePlanner::finalize(runtime::ContextCapacity capacity) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));
+    return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), capacity));
 }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,

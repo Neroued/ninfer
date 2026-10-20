@@ -96,7 +96,7 @@ void SessionImpl::finish_result(ComputeResult result) {
         progress.processed_prompt_tokens = tx.result->rows[0].processed;
         progress.complete                = false;
         progress.capture_ready =
-            s.capture && s.request->captures[s.next_capture].frontier == completed[0].main_frontier;
+            s.capture && s.captures[s.next_capture].frontier == completed[0].main_frontier;
 
         tx.event.emplace(SessionEvent{tx.ticket, tx.members, std::move(progress)});
     } else if (tx.kind == Kind::Replay) {
@@ -120,8 +120,8 @@ void SessionImpl::finish_result(ComputeResult result) {
         auto& s = sequence(tx.members[b]);
         adopt_commit(s, completed[b], tx.result->rows[b].processed != 0, retain_recovery);
         if (tx.kind == Kind::Prefill)
-            s.capture_pending = s.capture && s.request->captures[s.next_capture].frontier ==
-                                                 completed[b].main_frontier;
+            s.capture_pending =
+                s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
         if (tx.kind == Kind::Control) append_identity(s, tx.rows[b].count_tokens, tx.splits[b]);
         if (tx.kind == Kind::Replay && s.continuation.metadata.main_frontier == s.replay_target)
             s.phase = s.resume_phase;
@@ -252,8 +252,8 @@ CommitResult Session::commit(PendingBatch&& batch,
                                tx.result->rows[b].processed != 0,
                            false);
             if (tx.kind == detail::ComputeTransaction::Kind::Prefill)
-                s.capture_pending = s.capture && s.request->captures[s.next_capture].frontier ==
-                                                     completed[b].main_frontier;
+                s.capture_pending =
+                    s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
             const auto tokens =
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
             detail::append_identity(s, tokens, decision.prefix_execution_split_after);

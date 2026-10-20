@@ -260,7 +260,8 @@ void EngineCore<Instance>::resolve_prefill_progress(
     request->computed_prompt_tokens += progress.processed_prompt_tokens;
     if (!request->cancelled.load(std::memory_order_acquire)) {
         resources_.observe_committed(*request->base_plan, request->id, computed_begin,
-                                     computed_begin + progress.processed_prompt_tokens);
+                                     computed_begin + progress.processed_prompt_tokens,
+                                     instance_.session->capture_frontiers(*request->sequence));
     }
     if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
         throw std::logic_error("completed prefill did not reach the admitted prompt frontier");

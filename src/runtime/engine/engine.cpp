@@ -203,7 +203,7 @@ private:
                 const auto usage                        = instance->session->physical_usage();
                 description.device_state_capacity       = usage.capacity.state_slots;
                 description.host_context_capacity_bytes = usage.capacity.host_bytes;
-                description.kv_capacity = instance->kv_capacity_resolution.resolved_tokens;
+                description.kv_capacity = instance->context_capacity.resolved_tokens;
                 startup.ranks           = instance->rank_budgets;
                 for (const auto& pool : instance->session->kv_pools())
                     description.kv_pools.push_back(

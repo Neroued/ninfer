@@ -84,6 +84,13 @@ private:
 class PageAllocator {
 public:
     PageAllocator(std::uint32_t pool_id, std::uint32_t capacity_pages);
+
+    [[nodiscard]] static std::size_t metadata_bytes(std::uint32_t pages) {
+        return sizeof(PageAllocator) +
+               std::size_t(pages) * (sizeof(FreeRun) + sizeof(std::uint32_t)) +
+               ((std::size_t(pages) + 63) / 64) * 8;
+    }
+
     PageAllocator(const PageAllocator&)            = delete;
     PageAllocator& operator=(const PageAllocator&) = delete;
     PageAllocator(PageAllocator&&)                 = delete;

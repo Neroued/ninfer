@@ -408,6 +408,16 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
     }
 
     PreparedContextCache out;
+    out.automatic_checkpoints = hints.allow_engine_automatic_shared_prefixes;
+    if (out.automatic_checkpoints) {
+        for (const auto boundary : message_boundaries)
+            if (boundary && *boundary && exact_vision_frontier(*boundary, vision_items))
+                out.semantic_boundaries.push_back(*boundary);
+        std::sort(out.semantic_boundaries.begin(), out.semantic_boundaries.end());
+        out.semantic_boundaries.erase(
+            std::unique(out.semantic_boundaries.begin(), out.semantic_boundaries.end()),
+            out.semantic_boundaries.end());
+    }
     if (hints.session_key) {
         if (hints.session_key->empty() || hints.session_key->size() > kPreparedSessionKeyCapacity) {
             throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");

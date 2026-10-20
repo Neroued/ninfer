@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_capacity.h"
 #include "runtime/observability/snapshot.h"
 
 #include <condition_variable>

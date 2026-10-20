@@ -6,21 +6,26 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
     auto binding   = std::make_unique<Sequence>();
     auto& sequence = *binding;
     if (operation.resume) {
-        const auto& previous  = *operation.resume->state_->sequence;
-        sequence.id           = previous.id;
-        sequence.epoch        = previous.epoch;
-        sequence.request      = previous.request;
-        sequence.identity     = previous.identity;
-        sequence.reused       = previous.reused;
-        sequence.resume_phase = previous.phase;
-        sequence.next_capture = previous.next_capture;
-        sequence.speculative  = previous.speculative;
+        const auto& previous               = *operation.resume->state_->sequence;
+        sequence.id                        = previous.id;
+        sequence.epoch                     = previous.epoch;
+        sequence.request                   = previous.request;
+        sequence.identity                  = previous.identity;
+        sequence.reused                    = previous.reused;
+        sequence.resume_phase              = previous.phase;
+        sequence.next_capture              = previous.next_capture;
+        sequence.captures                  = previous.captures;
+        sequence.last_saved                = previous.last_saved;
+        sequence.last_intermediate_attempt = previous.last_intermediate_attempt;
+        sequence.speculative               = previous.speculative;
     } else {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;
         sequence.request      = operation.request;
         sequence.identity     = *operation.request->identity;
         sequence.reused       = operation.frontier;
+        sequence.captures     = operation.request->captures;
+        sequence.last_saved   = operation.frontier;
         sequence.resume_phase = Phase::Prefill;
         if (definition->options().mtp()) {
             sequence.speculative.backend      = SpeculativeBackend::Mtp;
@@ -52,8 +57,8 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
             {eos, eos},
             definition->options().mtp() ? std::optional<std::uint32_t>{0} : std::nullopt};
     }
-    while (sequence.next_capture < sequence.request->captures.size() &&
-           sequence.request->captures[sequence.next_capture].frontier <= operation.frontier)
+    while (sequence.next_capture < sequence.captures.size() &&
+           sequence.captures[sequence.next_capture].frontier <= operation.frontier)
         ++sequence.next_capture;
 
     const auto generated = std::span<const TokenId>(sequence.identity.tokens)

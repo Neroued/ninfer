@@ -87,9 +87,53 @@ ContextDirectory::ContextDirectory(ContextDirectorySpec spec)
 
 KVPoolDirectory& ContextDirectory::pool(std::uint32_t id) { return *pools_.at(id); }
 
+std::size_t ContextDirectory::metadata_bytes(const ContextDirectorySpec& spec) {
+    auto bytes = sizeof(ContextDirectory) - sizeof(StateDirectory) +
+                 StateDirectory::metadata_bytes(spec.state);
+    for (const auto& pool : spec.pools)
+        bytes +=
+            sizeof(std::unique_ptr<KVPoolDirectory>) +
+            PageAllocator::metadata_bytes(pool.device_pages) +
+            PageDirectory::metadata_bytes(pool.logical_pages, pool.device_pages) +
+            HistoryDirectory::metadata_bytes(pool.histories, pool.table_rows, pool.page_capacity);
+    return bytes;
+}
+
 const KVPoolDirectory& ContextDirectory::pool(std::uint32_t id) const { return *pools_.at(id); }
 
 ContextTransaction ContextDirectory::begin_transaction() { return ContextTransaction(*this); }
+
+std::optional<StateId> reserve_capture_destination(StateDirectory& states, HostAllocator& host,
+                                                   std::optional<HostAllocation>& backing) {
+    if (auto destination = states.reserve_destination()) return destination;
+    backing = host.allocate(states.image_bytes());
+    if (!backing) return {};
+    auto destination = states.reserve_logical_destination();
+    if (!destination) backing.reset();
+    return destination;
+}
+
+void prepare_capture_state(ContextTransaction& transaction, StateDirectory& states, StateId source,
+                           std::optional<HostAllocation>& backing) {
+    states.freeze(source);
+    if (backing) {
+        auto transfer = states.reserve_device_to_host(source, std::move(*backing));
+        backing.reset();
+        if (!transfer) throw std::logic_error("capture lost its reserved Host state space");
+        transaction.add_state_copy(std::move(*transfer), true);
+    }
+}
+
+CaptureWriter adopt_capture_writer(StateDirectory& states, StateId source,
+                                   StateDirectory::Destination& destination) {
+    if (states.device_resident(destination.image())) {
+        (void)destination.begin_write(source);
+        return {source, destination.release()};
+    }
+    states.split_device_replica_identity(source, destination.image());
+    states.complete_initialization(destination.image());
+    return {destination.release(), {}};
+}
 
 ContextTransaction::ContextTransaction(ContextDirectory& directory) : directory_(&directory) {}
 

@@ -26,12 +26,13 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
     options_                = std::move(request.options);
     host_reservation_bytes_ = request.host_reservation_bytes;
+    control_owner_          = request.control_owner;
     auto definition         = read_definition(reader, models::load_options(options_));
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
     profile_ =
         execution::describe_model(load_->definition(), load_->weight_data(), load_->rank_plan());
-    curve_ = describe_execution_capacity(profile_, options_, device_);
+    curve_ = describe_execution_capacity(profile_, options_, device_, control_owner_);
 }
 
 runtime::PreparationMemory RankPreparation::memory() const {
@@ -86,13 +87,15 @@ void RankPreparation::calibrate() {
 
 void RankPreparation::prepare_execution() { instance_->program->prepare_execution(); }
 
-void RankPreparation::prepare(std::uint32_t pages, std::size_t available) {
+void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t available) {
     if (instance_->program) throw std::logic_error("Qwen4Exp rank Program is already prepared");
-    auto options        = options_;
-    options.kv_capacity = KvCapacityPolicy::explicit_capacity(curve_.resolved_tokens(pages));
-    const auto reserve  = graph_memory_.rebuild_estimate_bytes;
-    auto plan           = plan_execution(profile_, {}, options, device_,
-                               available > reserve ? available - reserve : 0);
+    auto options = options_;
+    options.kv_capacity =
+        KvCapacityPolicy::explicit_capacity(curve_.resolved_tokens(capacity.primary_page_groups));
+    options.context_cache.extra_state_slots = capacity.device_state_slots - options.max_concurrency;
+    const auto reserve                      = graph_memory_.rebuild_estimate_bytes;
+    auto plan                               = plan_execution(profile_, {}, options, device_,
+                               available > reserve ? available - reserve : 0, {}, control_owner_);
     if (!plan) throw DeviceAllocationError("rank runtime capacity exceeds available memory");
     instance_->program = std::make_unique<RankProgram>(
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_);

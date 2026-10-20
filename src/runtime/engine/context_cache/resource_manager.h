@@ -43,6 +43,7 @@ public:
         std::uint32_t frontier = 0;
         std::optional<Handle> checkpoint;
         std::vector<Handle> sources;
+        CheckpointOrigin origin = CheckpointOrigin::Semantic;
     };
 
     struct ReclaimCursor {
@@ -345,15 +346,39 @@ public:
             return;
         }
         if (summary.role == CheckpointRole::SharedPrefix) {
-            if (std::none_of(shared_.begin(), shared_.end(),
-                             [&](const auto& entry) { return entry.handle == handle; })) {
-                shared_.push_back(
-                    {.handle   = handle,
-                     .ordinal  = ++ordinal_,
-                     .priority = demand_priority(session.checkpoint_key(handle, summary.frontier)),
-                     .retained_at = ++clock_});
+            for (auto& entry : shared_) {
+                if (entry.handle == handle) return;
+                const auto prior = session.checkpoint_metadata(entry.handle);
+                if (prior.frontier != summary.frontier ||
+                    session.checkpoint_key(entry.handle, prior.frontier) !=
+                        session.checkpoint_key(handle, summary.frontier))
+                    continue;
+                auto identities = session.evaluate_recovery({});
+                if (!identities.prefix(entry.handle, handle)) continue;
+                if (summary.origin == CheckpointOrigin::Semantic)
+                    entry.origin = CheckpointOrigin::Semantic;
+                const auto cost = [&](Handle h) {
+                    return price_context_transfer_requirements(
+                        costs_, session.checkpoint_restore_requirements(h));
+                };
+                if (prior.leased || cost(entry.handle) <= cost(handle)) {
+                    release_unreferenced(session, handle);
+                    return;
+                }
+                const auto old = entry.handle;
+                entry.handle   = handle;
                 index_.insert(session, handle, summary.frontier);
+                release_unreferenced(session, old);
+                balance_reused(session);
+                return;
             }
+            shared_.push_back(
+                {.handle      = handle,
+                 .ordinal     = ++ordinal_,
+                 .priority    = demand_priority(session.checkpoint_key(handle, summary.frontier)),
+                 .retained_at = ++clock_,
+                 .origin      = summary.origin});
+            index_.insert(session, handle, summary.frontier);
         } else {
             auto* owner = find_owner(token);
             if (!owner) {
@@ -393,6 +418,22 @@ public:
             }
         }
         balance_reused(session);
+    }
+
+    [[nodiscard]] bool retain_shared_checkpoint(Session& session, const Base& base,
+                                                std::uint32_t frontier, CheckpointOrigin origin) {
+        prune(session);
+        const auto key = base.prefix_shortlist_key(frontier);
+        if (!key) return false;
+        for (auto& entry : shared_) {
+            if (session.checkpoint_metadata(entry.handle).frontier == frontier &&
+                session.checkpoint_key(entry.handle, frontier) == *key &&
+                session.inspect_source(base, entry.handle, false, {}, {})) {
+                if (origin == CheckpointOrigin::Semantic) entry.origin = origin;
+                return true;
+            }
+        }
+        return false;
     }
 
     void finish(Session& session, OwnerToken token, const Base& base,
@@ -457,9 +498,9 @@ public:
     // prefill ranges. Replay and preparation never call this; one candidate is crossed at
     // most once by a request, including when other requests commit between its chunks.
     void observe_committed(const Base& base, std::uint64_t request_id, std::uint32_t begin,
-                           std::uint32_t end) {
+                           std::uint32_t end, std::span<const std::uint32_t> frontiers) {
         if (!enabled_ || begin >= end) { return; }
-        for (const auto frontier : base.capture_frontiers()) {
+        for (const auto frontier : frontiers) {
             if (frontier <= begin || frontier > end) { continue; }
             const auto key = base.prefix_shortlist_key(frontier);
             if (!key) { continue; }
@@ -467,15 +508,20 @@ public:
         }
     }
 
-    [[nodiscard]] Admission capture_admission(Session&, OwnerToken owner, const Base& base,
-                                              std::uint32_t frontier,
-                                              bool inherit_private = true) const {
+    [[nodiscard]] Admission
+    capture_admission(Session&, OwnerToken owner, const Base& base, std::uint32_t frontier,
+                      bool inherit_private    = true,
+                      CheckpointOrigin origin = CheckpointOrigin::Semantic) const {
         const auto demand = demand_priority(base.prefix_shortlist_key(frontier));
         // A recurrent continuation's heat can rank its owner, but a new optional point
         // has not itself demonstrated repeat demand. Its added coverage remains bounded.
         auto priority = demand;
         if (!demand.reused && inherit_private) { priority = retention(owner); }
-        return {.priority = priority, .demand = demand, .base = &base, .frontier = frontier};
+        return {.priority = priority,
+                .demand   = demand,
+                .base     = &base,
+                .frontier = frontier,
+                .origin   = origin};
     }
 
     [[nodiscard]] ReclaimCursor begin_reclaim(Session& session,
@@ -795,7 +841,7 @@ private:
             found->observed_at = clock_;
             return;
         }
-        if (demand_.size() == kDemandCapacity) {
+        if (demand_.size() >= demand_capacity_) {
             const auto oldest =
                 std::min_element(demand_.begin(), demand_.end(), [](const auto& a, const auto& b) {
                     return a.observed_at < b.observed_at;
@@ -833,6 +879,7 @@ private:
         std::uint64_t ordinal;
         CacheRetentionPriority priority;
         std::uint64_t retained_at;
+        CheckpointOrigin origin = CheckpointOrigin::Semantic;
     };
 
     static bool contains(std::span<const Handle> handles, Handle handle) {
@@ -922,6 +969,7 @@ private:
     }
 
     void prune(Session& session) {
+        demand_capacity_ = std::max<std::size_t>(256, session.checkpoint_capacity() * 2);
         std::vector<Handle> stale;
         const auto inspect = [&](Handle handle) {
             if (!session.valid_checkpoint(handle) && !contains(stale, handle)) {
@@ -1267,6 +1315,13 @@ private:
                               bool preserving = false) const {
         if (!preserving && !may_revoke(removed, cursor.rights)) { return false; }
         if (!admission) { return true; }
+        if (!preserving && admission->origin == CheckpointOrigin::Intermediate &&
+            !admission->demand.reused &&
+            std::any_of(shared_.begin(), shared_.end(), [&](const auto& entry) {
+                return entry.origin == CheckpointOrigin::Semantic &&
+                       contains(removed, entry.handle);
+            }))
+            return false;
         const auto loss = preserving ? 0 : action_loss(session, removed, facts, evaluation);
         if (!admits_limits(facts.priority, loss, *admission, cursor)) return false;
         if (admission->demand.reused) { return true; }
@@ -1615,7 +1670,7 @@ private:
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
-    static constexpr std::size_t kDemandCapacity = 256;
+    std::size_t demand_capacity_ = 256;
     std::vector<Demand> demand_;
     std::uint64_t clock_   = 0;
     std::uint64_t ordinal_ = 0;

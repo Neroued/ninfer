@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/parallel/startup.h"
 #include "runtime/observability/snapshot.h"
 
+#include <algorithm>
+
 namespace ninfer::models::qwen4_exp {
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
@@ -14,12 +16,17 @@ qwen::Frontend ParallelStartup::frontend(const EngineOptions& options) const {
 std::vector<distributed::wire::Bytes>
 ParallelStartup::requests(const EngineOptions& options) const {
     std::vector<distributed::wire::Bytes> payloads;
+    const auto control =
+        std::find_if(parallel_.ranks.begin(), parallel_.ranks.end(), [&](const auto& r) {
+            return parallel_.topology.rank(r.rank).node == options.deployment->coordinator_node;
+        });
     for (const auto& rank : parallel_.ranks) {
         distributed::wire::Encoder out;
         const auto node  = parallel_.topology.rank(rank.rank).node;
         const auto media = options.enable_vision ? options.media_live_bytes : 0;
         encode_rank_load(out, {definition_->artifact_id(), rank, options,
-                               media + (node == options.deployment->coordinator_node ? media : 0)});
+                               media + (node == options.deployment->coordinator_node ? media : 0),
+                               control != parallel_.ranks.end() && control->rank == rank.rank});
         payloads.push_back(std::move(out).take());
     }
     return payloads;
@@ -36,6 +43,8 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Bytes> descript
     plan_                                     = plan_group_execution(parallel_, ranks_);
     options.prefill_chunk                     = plan_.session.shape.prefill_chunk;
     options.context_cache.host_capacity_bytes = plan_.session.context.host.bytes;
+    options.context_cache.extra_state_slots =
+        plan_.session.context.state.device_slots - options.max_concurrency;
 }
 
 PreparedSession ParallelStartup::session() const {

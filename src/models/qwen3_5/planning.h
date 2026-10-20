@@ -104,8 +104,8 @@ public:
     SequencePlanner(const SequencePlanner&)            = delete;
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
-    [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
-    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
+    [[nodiscard]] const runtime::ContextCapacityCurve& capacity_curve() const noexcept;
+    [[nodiscard]] SequencePlan finalize(runtime::ContextCapacity capacity) &&;
 
 private:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl>) noexcept;

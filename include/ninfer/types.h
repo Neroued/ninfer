@@ -113,13 +113,15 @@ struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
     bool enabled = true;
-    // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
+    // Extra Device StateImage slots beyond active execution. nullopt selects joint KV/state sizing.
     std::optional<std::uint32_t> extra_state_slots;
     // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations.
     // RTX 5090 defaults to 8 GiB plus eight model StateImages; DGX Spark resolves this to zero.
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
+    // Target spacing for optional intermediate prefill checkpoints.
+    std::uint32_t checkpoint_interval = 8192;
 };
 
 struct ContextCostOptions {

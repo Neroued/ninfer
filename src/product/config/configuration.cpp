@@ -157,7 +157,10 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             value = e.context_cache.enabled;
             break;
         case Field::ExtraStateSlots:
-            value = std::uint64_t{e.context_cache.extra_state_slots.value_or(e.max_concurrency)};
+            value = optional_value(e.context_cache.extra_state_slots, "auto");
+            break;
+        case Field::CheckpointInterval:
+            value = std::uint64_t{e.context_cache.checkpoint_interval};
             break;
         case Field::HostCapacity:
             value = optional_value(e.context_cache.host_capacity_bytes, "default (target/model)");

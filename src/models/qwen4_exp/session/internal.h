@@ -16,6 +16,7 @@ using Continuation = context::Continuation<ContinuationMetadata>;
 struct CapturePoint {
     std::uint32_t frontier;
     std::vector<runtime::CheckpointRole> roles;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 };
 
 struct Identity {
@@ -42,6 +43,7 @@ using Snapshot = context::ContextSnapshot<ContinuationMetadata, Identity>;
 struct Checkpoint {
     Snapshot snapshot;
     runtime::CheckpointRole role;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
@@ -81,6 +83,8 @@ struct Sequence {
     std::optional<ExecutionUnit> permit;
     std::uint32_t permitted_frontier = 0;
     std::size_t next_capture         = 0;
+    std::vector<CapturePoint> captures;
+    std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
     std::unique_ptr<CaptureReservation> capture;
     bool capture_pending = false;
     SpeculativeStats speculative;

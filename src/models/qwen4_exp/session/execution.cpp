@@ -36,7 +36,7 @@ std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle ha
         throw std::logic_error("prefill has no executable unit");
     const auto frontier = s.continuation.metadata.main_frontier;
     const auto end      = p.window_end(s, frontier, s.request->summary.prompt_tokens);
-    const bool capture  = s.capture && s.request->captures[s.next_capture].frontier == end;
+    const bool capture  = s.capture && s.captures[s.next_capture].frontier == end;
     const bool sample   = end == s.request->summary.prompt_tokens && !capture;
     auto reservation    = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};

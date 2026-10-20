@@ -177,6 +177,15 @@ public:
     HistoryDirectory(PageDirectory& pages, std::uint32_t row_count, std::uint32_t history_capacity,
                      std::uint32_t page_capacity, HostDirectory* host = nullptr);
     ~HistoryDirectory();
+
+    [[nodiscard]] static std::size_t metadata_bytes(std::uint32_t histories, std::uint32_t rows,
+                                                    std::uint32_t page_capacity) {
+        return sizeof(HistoryDirectory) +
+               std::size_t(histories) * (sizeof(History) + sizeof(std::uint32_t)) +
+               std::size_t(rows) * sizeof(std::uint32_t) + ((std::size_t(rows) + 63) / 64) * 8 +
+               std::size_t(page_capacity) * (sizeof(PageSlot) + sizeof(PageId));
+    }
+
     HistoryDirectory(const HistoryDirectory&)            = delete;
     HistoryDirectory& operator=(const HistoryDirectory&) = delete;
 

@@ -67,7 +67,6 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const qwen::PreparedContextCache& context_cache() const noexcept;
-    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
 
@@ -81,9 +80,10 @@ private:
 using CheckpointHandle = context::CheckpointHandle;
 
 struct CheckpointMetadata {
-    std::uint32_t frontier       = 0;
-    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    bool leased                  = false;
+    std::uint32_t frontier           = 0;
+    runtime::CheckpointRole role     = runtime::CheckpointRole::Continuation;
+    bool leased                      = false;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 };
 
 struct CheckpointSummary {
@@ -274,7 +274,8 @@ struct CapturePreparation {
     std::uint32_t frontier = 0;
     bool reserved          = false;
     ContextResources shortage;
-    std::size_t host_bytes = 0;
+    std::size_t host_bytes           = 0;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
 
@@ -345,6 +346,9 @@ public:
     // Borrows this Session's index; checkpoint publication or retirement invalidates the view.
     [[nodiscard]] context::RecoveryEvaluation<>
     evaluate_recovery(std::span<const CheckpointHandle> advertised) const;
+    [[nodiscard]] std::size_t checkpoint_capacity() const noexcept;
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+        checkpoint_restore_requirements(CheckpointHandle) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState& paused) noexcept;
@@ -367,8 +371,11 @@ public:
                   std::uint32_t resume_tokens   = 1);
     [[nodiscard]] bool start_capture(SequenceHandle sequence);
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
+    [[nodiscard]] bool capture_is_shared(SequenceHandle) const;
+    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
-    void skip_capture(SequenceHandle sequence);
+    void skip_capture(SequenceHandle sequence,
+                      runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     // Finite physical actions, each including every optional holder needed for its release.
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
                                                   std::span<const CheckpointHandle> excluded,

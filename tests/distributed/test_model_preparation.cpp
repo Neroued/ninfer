@@ -25,7 +25,8 @@ std::vector<wire::Bytes> exchange(distributed::ExecutionGroup& group,
     out.u64(group.topology().plan);
     out.u32(prepared.attempt);
     out.u8(static_cast<std::uint8_t>(action));
-    out.u32(prepared.pages);
+    out.u32(prepared.capacity.primary_page_groups);
+    out.u32(prepared.capacity.device_state_slots);
     const auto message = std::make_shared<const wire::Message>(
         wire::Message{wire::Kind::Enter, group.epoch(), std::move(out).take()});
     std::vector<distributed::OutgoingMessage> messages;
@@ -200,8 +201,8 @@ int main(int argc, char** argv) {
             deployment, parallel.topology, [](auto rank, std::string_view text) {
                 std::cerr << "[rank " << rank << "] " << text << '\n';
             });
-        auto prepared = rt::prepare_execution_group(*group, payloads, options.kv_capacity,
-                                                    std::chrono::minutes(15));
+        auto prepared = rt::prepare_execution_group(
+            *group, payloads, options.kv_capacity, options.context_cache, std::chrono::minutes(15));
         rebuild(*group, prepared);
         std::vector<q4::RankExecutionDescription> descriptions;
         for (std::size_t i = 0; i < prepared.layouts.size(); ++i) {
@@ -209,7 +210,8 @@ int main(int argc, char** argv) {
             auto d = q4::decode_rank_execution(in);
             in.finish();
             require(d.session.context.pools.size() == 2 &&
-                        d.session.context.pools[0].device_pages == prepared.pages &&
+                        d.session.context.pools[0].device_pages ==
+                            prepared.capacity.primary_page_groups &&
                         d.capacity.compute_frames && d.capacity.context_frames &&
                         !prepared.reports[i].host_weight_bytes,
                     "prepared execution resources differ from the native plan");
@@ -217,7 +219,8 @@ int main(int argc, char** argv) {
                       << " runtime=" << d.budget.runtime_reservation_bytes
                       << " state=" << d.session.context.state.image_bytes
                       << " slots=" << d.session.context.state.device_slots
-                      << " pages=" << prepared.pages << " attempt=" << prepared.attempt
+                      << " pages=" << prepared.capacity.primary_page_groups
+                      << " attempt=" << prepared.attempt
                       << " read=" << prepared.reports[i].read_bytes
                       << " upload=" << prepared.reports[i].upload_bytes << std::endl;
             descriptions.push_back(std::move(d));

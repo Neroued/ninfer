@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_capacity.h"
 
 namespace ninfer::models {
 
@@ -14,7 +14,7 @@ struct WeightCandidate {
 template <class SequencePlan, class Preparation>
 struct ExecutionPlan {
     SequencePlan sequence;
-    runtime::KvCapacityResolution capacity;
+    runtime::ContextCapacityResolution capacity;
     WeightPlacement placement;
     std::uint32_t chunk;
     Preparation preparation;

@@ -111,12 +111,16 @@ public:
         device_       = device.get();
         auto instance = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(
             std::make_unique<SharedModel>(SharedModel{std::move(model)}), profile);
-        auto planner        = q35::make_sequence_planner(profile, *device, options);
-        auto plan           = std::move(planner).finalize(page_groups);
+        auto planner = q35::make_sequence_planner(profile, *device, options);
+        auto plan    = std::move(planner).finalize(
+            {page_groups,
+                options.max_concurrency + options.context_cache.extra_state_slots.value_or(0)});
         session_plan        = q35::plan_session(plan);
         auto native_planner = q35::detail::make_sequence_planner_impl(profile, *device, options);
-        auto native_plan =
-            q35::detail::finalize_sequence_plan_impl(std::move(native_planner), page_groups);
+        auto native_plan    = q35::detail::finalize_sequence_plan_impl(
+            std::move(native_planner),
+            {page_groups,
+                options.max_concurrency + options.context_cache.extra_state_slots.value_or(0)});
         instance->program =
             std::make_unique<ObservedRank>(instance->parameters, *native_plan, *device);
         observed_             = instance->program.get();

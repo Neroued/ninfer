@@ -18,6 +18,8 @@ struct KVPageGeometry;
 namespace ninfer::runtime {
 
 enum class CheckpointRole : std::uint8_t { InputReplay, LongAnchor, SharedPrefix, Continuation };
+enum class CheckpointOrigin : std::uint8_t { Semantic, Intermediate };
+enum class CaptureSkip : std::uint8_t { Unavailable, Retained };
 
 struct KvPoolId {
     std::uint16_t index                                           = 0;
@@ -160,18 +162,33 @@ struct ContextOperationCounts {
     std::uint64_t partial_tail_cow_pages = 0;
 };
 
-struct SequenceCapacityCurve {
+struct ContextCapacity {
+    std::uint32_t primary_page_groups = 0;
+    std::uint32_t device_state_slots  = 0;
+
+    friend bool operator==(ContextCapacity, ContextCapacity) = default;
+};
+
+struct ContextCapacityCurve {
     std::uint32_t primary_page_tokens                   = 0;
     std::uint32_t minimum_primary_page_groups           = 0;
     std::uint32_t maximum_primary_page_groups           = 0;
     std::size_t minimum_device_reservation_bytes        = 0;
     std::size_t bytes_per_additional_primary_page_group = 0;
+    std::uint32_t minimum_state_slots                   = 0;
+    std::size_t bytes_per_additional_state_slot         = 0;
+    // Coordinator metadata charged to a shared physical-memory owner. Dynamic request
+    // contents and allocator rounding remain covered by startup headroom.
+    std::size_t minimum_control_bytes        = 0;
+    std::size_t control_bytes_per_page_group = 0;
+    std::size_t control_bytes_per_state_slot = 0;
 
-    [[nodiscard]] std::size_t reservation_bytes(std::uint32_t primary_page_groups) const;
+    [[nodiscard]] std::size_t reservation_bytes(ContextCapacity capacity) const;
+    [[nodiscard]] std::size_t control_bytes(ContextCapacity capacity) const;
     [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t primary_page_groups) const;
 };
 
-struct KvCapacityResolution {
+struct ContextCapacityResolution {
     KvCapacityMode mode                                 = KvCapacityMode::Explicit;
     std::uint32_t primary_page_groups                   = 0;
     std::uint32_t maximum_primary_page_groups           = 0;
@@ -183,6 +200,12 @@ struct KvCapacityResolution {
     std::size_t available_after_startup_bytes           = 0;
     std::size_t automatic_headroom_bytes                = 0;
     std::size_t planned_slack_bytes                     = 0;
+    std::uint32_t device_state_slots                    = 0;
+    std::size_t control_reservation_bytes               = 0;
+
+    [[nodiscard]] ContextCapacity capacity() const noexcept {
+        return {primary_page_groups, device_state_slots};
+    }
 };
 
 } // namespace ninfer::runtime

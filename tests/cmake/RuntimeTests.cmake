@@ -10,8 +10,8 @@ ninfer_add_test(ninfer_resource_manager_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 
-ninfer_add_test(ninfer_kv_capacity_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_kv_capacity.cpp"
+ninfer_add_test(ninfer_context_capacity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_capacity.cpp"
   LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_sampling_defaults_test

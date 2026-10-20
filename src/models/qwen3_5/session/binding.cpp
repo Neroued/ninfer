@@ -11,8 +11,10 @@ namespace ninfer::models::qwen3_5::detail {
 void SessionImpl::initialize_captures(RequestControl& request, std::uint32_t from,
                                       std::uint32_t through) {
     request.capture_groups.clear();
-    request.next_capture    = 0;
-    request.capture_pending = false;
+    request.last_saved                = from;
+    request.last_intermediate_attempt = from;
+    request.next_capture              = 0;
+    request.capture_pending           = false;
     for (const auto& group : request.base->capture_groups) {
         if (group.frontier > from && group.frontier <= through) {
             request.capture_groups.push_back(group);

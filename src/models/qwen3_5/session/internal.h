@@ -31,6 +31,7 @@ struct CaptureGroup {
     PrefixShortlistKey key;
     std::uint32_t frontier = 0;
     std::vector<runtime::CheckpointRole> roles;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 };
 
 struct RequestBasePlanImpl {
@@ -129,7 +130,8 @@ struct RequestControl {
     bool publish_continuation   = true;
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
-    bool capture_pending     = false;
+    std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
+    bool capture_pending = false;
 
     struct Prefill {
         qwen::PreparedPromptData prompt;
@@ -151,6 +153,7 @@ struct CheckpointState {
     Snapshot snapshot;
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
     PrefixShortlistKey key;
+    runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 
     [[nodiscard]] const Continuation& continuation() const noexcept {
         return snapshot.continuation();
@@ -309,7 +312,8 @@ public:
     [[nodiscard]] bool start_capture(SequenceHandle sequence);
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
-    void skip_capture(SequenceHandle sequence);
+    void skip_capture(SequenceHandle sequence,
+                      runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     // Finite physical actions, each including every optional holder needed for its release.
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
                                                   std::span<const CheckpointHandle> excluded,

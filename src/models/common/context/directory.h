@@ -64,10 +64,15 @@ private:
 
 class ContextTransaction;
 
+// A capture keeps the old image immutable and obtains the next writer's destination.
+[[nodiscard]] std::optional<StateId> reserve_capture_destination(StateDirectory&, HostAllocator&,
+                                                                 std::optional<HostAllocation>&);
+
 // Owns the sole logical allocation and reference bookkeeping for one model session.
 class ContextDirectory {
 public:
     explicit ContextDirectory(ContextDirectorySpec spec);
+    [[nodiscard]] static std::size_t metadata_bytes(const ContextDirectorySpec&);
     ContextDirectory(const ContextDirectory&)            = delete;
     ContextDirectory& operator=(const ContextDirectory&) = delete;
 
@@ -204,5 +209,16 @@ private:
     std::vector<PendingGrowth> growth_;
     std::vector<PendingCommit> commits_;
 };
+
+void prepare_capture_state(ContextTransaction&, StateDirectory&, StateId source,
+                           std::optional<HostAllocation>&);
+
+struct CaptureWriter {
+    StateId image;
+    StateId write_destination;
+};
+
+[[nodiscard]] CaptureWriter adopt_capture_writer(StateDirectory&, StateId source,
+                                                 StateDirectory::Destination&);
 
 } // namespace ninfer::models::context

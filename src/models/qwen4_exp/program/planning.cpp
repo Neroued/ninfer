@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/program/planning.h"
 #include "models/qwen4_exp/parallel/plan.h"
+#include "models/qwen4_exp/session/planning.h"
 #include "core/platform.h"
 #include "models/common/context/storage.h"
 #include "ninfer/ops/sampling.h"
@@ -10,10 +11,9 @@
 namespace ninfer::models::qwen4_exp {
 namespace {
 PersistentLayout persistent(const execution::ModelProfile& p, const EngineOptions& o,
-                            std::uint32_t pages) {
+                            std::uint32_t pages, std::uint32_t slots) {
     LayoutBuilder b;
     PersistentLayout out;
-    const auto slots = std::uint64_t(o.max_concurrency) + o.context_cache.extra_state_slots.value();
     if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
     out.state = plan_state_image(b, p.config, p.local.gdn, slots);
     out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context, pages,
@@ -78,14 +78,13 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
     if (o.prefill_chunk % 128)
         throw std::invalid_argument("prefill chunk must be a multiple of 128");
     o.prefill_chunk = std::min(o.prefill_chunk, o.max_context);
-    o.context_cache.extra_state_slots =
-        o.context_cache.extra_state_slots.value_or(o.max_concurrency);
     return o;
 }
 
 ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profile,
                             ple::disk::TableGeometry table, const EngineOptions& o,
-                            DeviceContext& device, std::uint32_t pages, const moe::Plan* schedule) {
+                            DeviceContext& device, std::uint32_t pages, std::uint32_t slots,
+                            const moe::Plan* schedule) {
     ExecutionPlan out;
     out.profile    = std::move(profile);
     out.shape      = {o.max_context,
@@ -97,7 +96,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
                       o.context_cache.enabled,
                       o.use_cuda_graph,
                       o.observability.gpu_timing};
-    out.persistent = persistent(*out.profile, o, pages);
+    out.persistent = persistent(*out.profile, o, pages, slots);
     out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                device.multiprocessor_count(), schedule);
     out.ple.max_positions =
@@ -175,50 +174,81 @@ std::size_t ExecutionPlan::device_reservation_bytes() const {
     return device_bytes() + ((NINFER_SHARED_PHYSICAL_MEMORY != 0) ? host : 0);
 }
 
+namespace {
+runtime::ContextCapacityCurve capacity_curve(const ExecutionPlan& base, const EngineOptions& o,
+                                             bool control_owner) {
+    const auto pages = base.persistent.main.pages.spec.page_group_count;
+    const auto next  = persistent(*base.profile, o, pages + 1, o.max_concurrency).bytes;
+    runtime::ContextCapacityCurve curve{64,
+                                        pages,
+                                        UINT32_MAX / 64,
+                                        base.device_reservation_bytes(),
+                                        next - base.persistent.bytes,
+                                        o.max_concurrency,
+                                        base.persistent.state.images.image_stride};
+    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0) {
+        if (!control_owner) return curve;
+        curve.minimum_control_bytes = session_metadata_bytes(base);
+        auto adjacent               = base;
+        adjacent.persistent         = persistent(*base.profile, o, pages + 1, o.max_concurrency);
+        curve.control_bytes_per_page_group =
+            session_metadata_bytes(adjacent) - curve.minimum_control_bytes;
+        adjacent.persistent = persistent(*base.profile, o, pages, o.max_concurrency + 1);
+        curve.control_bytes_per_state_slot =
+            session_metadata_bytes(adjacent) - curve.minimum_control_bytes;
+    }
+    return curve;
+}
+} // namespace
+
 std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
                                             ple::disk::TableGeometry table,
                                             const EngineOptions& supplied, DeviceContext& device,
                                             std::size_t available,
-                                            std::shared_ptr<const moe::Plan> prototype) {
+                                            std::shared_ptr<const moe::Plan> prototype,
+                                            bool control_owner) {
     if (!profile) throw std::invalid_argument("execution planning requires a model profile");
-    ExecutionPlan out;
-    out.profile                     = std::move(profile);
-    const auto o                    = options(*out.profile, supplied);
-    const auto logical_pages        = (o.max_context + 63) / 64;
-    const auto minimum_pages        = std::max(logical_pages, o.max_concurrency);
-    const auto maximum_pages        = logical_pages * o.max_concurrency;
-    auto policy                     = o.kv_capacity;
+    const auto o       = options(*profile, supplied);
+    const auto minimum = std::max((o.max_context + 63) / 64, o.max_concurrency);
+    auto out    = physical_plan(std::move(profile), table, o, device, minimum, o.max_concurrency,
+                                prototype.get());
+    auto curve  = capacity_curve(out, o, control_owner);
+    auto policy = o.kv_capacity;
     policy.automatic_headroom_bytes = 0;
-    auto pages                      = minimum_pages;
-    if (policy.mode == KvCapacityMode::Explicit) {
-        if (policy.explicit_tokens < o.max_context ||
-            std::uint64_t(policy.explicit_tokens) > std::uint64_t(maximum_pages) * 64)
-            throw std::invalid_argument("KV capacity is outside the usable context range");
-        pages = (policy.explicit_tokens + 63) / 64;
-        if (pages < minimum_pages)
-            throw std::invalid_argument("KV capacity cannot cover active lanes");
-    } else if (policy.mode != KvCapacityMode::Automatic || policy.explicit_tokens)
-        throw std::invalid_argument("invalid KV capacity policy");
-    out             = physical_plan(out.profile, table, o, device, pages, prototype.get());
-    const auto base = out.device_reservation_bytes();
-    if (base > available) return {};
+    auto cache                      = o.context_cache;
     if (prototype) {
-        out.moe = prototype->resolve(available - base, out.ple.max_positions, o.moe.cpu_workers);
+        // Preserve the existing expert-cache budget order. Its base context contains the
+        // requested KV and a small state working set; remaining bytes go to the expert plan.
+        const auto pages = policy.mode == KvCapacityMode::Explicit
+                               ? 1U + (policy.explicit_tokens - 1U) / 64
+                               : minimum;
+        auto base_cache  = cache;
+        if (!base_cache.extra_state_slots)
+            base_cache.extra_state_slots = cache.enabled ? o.max_concurrency : 0;
+        const auto slots = std::uint64_t(o.max_concurrency) + *base_cache.extra_state_slots;
+        if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
+        const auto bytes = curve.reservation_bytes({pages, static_cast<std::uint32_t>(slots)});
+        if (bytes > available) return {};
+        out.moe = prototype->resolve(available - bytes, out.ple.max_positions, o.moe.cpu_workers);
         if (!out.moe) return {};
+        curve.minimum_device_reservation_bytes += out.moe->description().device_bytes;
+        policy = KvCapacityPolicy::explicit_capacity(curve.resolved_tokens(pages));
     }
-    const auto minimum  = persistent(*out.profile, o, minimum_pages).bytes;
-    const auto adjacent = persistent(*out.profile, o, minimum_pages + 1).bytes;
-    runtime::SequenceCapacityCurve curve{
-        64, minimum_pages, maximum_pages,
-        out.device_reservation_bytes() - out.persistent.bytes + minimum, adjacent - minimum};
-    if (out.moe) {
-        out.capacity = runtime::resolve_kv_capacity(KvCapacityPolicy::explicit_capacity(pages * 64),
-                                                    curve, available);
-        out.capacity.mode = policy.mode;
-    } else {
-        out.capacity   = runtime::resolve_kv_capacity(policy, curve, available);
-        out.persistent = persistent(*out.profile, o, out.capacity.primary_page_groups);
-    }
+    const auto minimum_states =
+        std::uint64_t(o.max_concurrency) + cache.extra_state_slots.value_or(0);
+    if (minimum_states > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
+    const auto required_pages =
+        policy.mode == KvCapacityMode::Explicit ? 1U + (policy.explicit_tokens - 1U) / 64 : minimum;
+    const runtime::ContextCapacity required{required_pages,
+                                            static_cast<std::uint32_t>(minimum_states)};
+    const auto required_bytes = curve.reservation_bytes(required);
+    if (required_bytes > available || curve.control_bytes(required) > available - required_bytes)
+        return {};
+    out.capacity            = runtime::resolve_context_capacity(policy, cache, curve, available);
+    out.capacity.mode       = o.kv_capacity.mode;
+    out.persistent          = persistent(*out.profile, o, out.capacity.primary_page_groups,
+                                         out.capacity.device_state_slots);
+    out.checkpoint_interval = cache.checkpoint_interval;
     return out;
 }
 
@@ -227,27 +257,27 @@ ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> pr
                                DeviceContext& device, std::shared_ptr<const moe::Plan> schedule) {
     auto o                              = options(*profile, supplied);
     o.context_cache.host_capacity_bytes = 0;
-    auto plan =
-        physical_plan(std::move(profile), table, o, device, o.max_concurrency, schedule.get());
-    plan.moe                                = std::move(schedule);
-    plan.graph_probe                        = true;
+    auto plan        = physical_plan(std::move(profile), table, o, device, o.max_concurrency,
+                                     o.max_concurrency, schedule.get());
+    plan.moe         = std::move(schedule);
+    plan.graph_probe = true;
+    plan.capacity.primary_page_groups       = o.max_concurrency;
+    plan.capacity.device_state_slots        = o.max_concurrency;
     plan.capacity.resolved_tokens           = o.max_concurrency * 64;
     plan.capacity.runtime_reservation_bytes = plan.device_reservation_bytes();
     return plan;
 }
 
-runtime::SequenceCapacityCurve
+runtime::ContextCapacityCurve
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile> profile,
-                            const EngineOptions& supplied, DeviceContext& device) {
+                            const EngineOptions& supplied, DeviceContext& device,
+                            bool control_owner) {
     const auto o = options(*profile, supplied);
     if (profile->local.size == 1)
         throw std::invalid_argument("resident rank capacity requires partitioned execution");
-    const auto logical = (o.max_context + 63) / 64;
-    const auto minimum = std::max(logical, o.max_concurrency);
-    const auto base    = physical_plan(profile, {}, o, device, minimum, nullptr);
-    const auto next    = persistent(*profile, o, minimum + 1).bytes;
-    return {64, minimum, logical * o.max_concurrency, base.device_reservation_bytes(),
-            next - base.persistent.bytes};
+    const auto minimum = std::max((o.max_context + 63) / 64, o.max_concurrency);
+    const auto base    = physical_plan(profile, {}, o, device, minimum, o.max_concurrency, nullptr);
+    return capacity_curve(base, o, control_owner);
 }
 
 } // namespace ninfer::models::qwen4_exp

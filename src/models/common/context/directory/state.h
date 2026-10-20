@@ -149,6 +149,13 @@ public:
     };
 
     StateDirectory(StateDirectorySpec spec, HostAllocator* host);
+
+    [[nodiscard]] static std::size_t metadata_bytes(StateDirectorySpec spec) {
+        return sizeof(StateDirectory) +
+               std::size_t(spec.logical_capacity) * (sizeof(Object) + sizeof(std::uint32_t)) +
+               std::size_t(spec.device_slots) * sizeof(std::int32_t);
+    }
+
     StateDirectory(const StateDirectory&)            = delete;
     StateDirectory& operator=(const StateDirectory&) = delete;
     StateDirectory(StateDirectory&&)                 = delete;

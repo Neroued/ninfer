@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/session/planning.h"
 #include "models/qwen4_exp/program/planning.h"
+#include "models/qwen4_exp/session/internal.h"
 
 #include <algorithm>
 
@@ -13,6 +14,7 @@ std::uint32_t count(std::uint64_t value) {
 
 SessionPlan plan_session(const ExecutionPlan& execution) {
     SessionPlan plan{execution.shape};
+    plan.checkpoint_interval = execution.checkpoint_interval;
     const auto image_bytes   = execution.persistent.state.images.image_stride;
     const auto slots         = execution.persistent.state.images.slot_count;
     const auto logical       = count(slots + execution.host_context_bytes / image_bytes);
@@ -40,6 +42,14 @@ SessionPlan plan_session(const ExecutionPlan& execution) {
     if (execution.workspace.vision)
         plan.vision_max_merged_tokens = execution.workspace.vision->max_merged_tokens;
     return plan;
+}
+
+std::size_t session_metadata_bytes(const ExecutionPlan& execution) {
+    const auto plan    = plan_session(execution);
+    const auto records = std::size_t(plan.context.state.logical_capacity) * 8;
+    return context::ContextDirectory::metadata_bytes(plan.context) +
+           detail::Checkpoints::metadata_bytes(records) +
+           context::RecoveryIndex<>::metadata_bytes(records);
 }
 
 } // namespace ninfer::models::qwen4_exp

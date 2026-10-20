@@ -132,7 +132,8 @@ CheckpointMetadata SessionImpl::checkpoint_metadata(CheckpointHandle handle) con
     return {.frontier = record.frontier(),
             .role     = record.role,
             .leased   = checkpoints[handle.index].pins != 0 ||
-                      state_store->source_pins(record.continuation().image) != 0};
+                      state_store->source_pins(record.continuation().image) != 0,
+            .origin = record.origin};
 }
 
 CheckpointSummary SessionImpl::checkpoint_summary(CheckpointHandle handle) const {

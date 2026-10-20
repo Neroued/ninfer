@@ -126,7 +126,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.speculative.draft_tokens          = 3;
     options.speculative.proposal_head         = ProposalHead::Full;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters.profile, device, options);
-    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2 * pages);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(
+        std::move(planner),
+        {2 * pages, options.max_concurrency + *options.context_cache.extra_state_slots});
     qwen::Resources resources(device, plan->persistent, plan->workspace);
 
     constexpr std::int32_t source_slot = 0, other_slot = 1, destination_slot = 2;

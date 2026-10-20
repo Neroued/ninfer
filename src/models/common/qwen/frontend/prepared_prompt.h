@@ -116,6 +116,8 @@ struct PreparedCacheOpportunity {
 struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     std::vector<PreparedCacheOpportunity> opportunities;
+    std::vector<std::uint32_t> semantic_boundaries;
+    bool automatic_checkpoints = true;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };

@@ -116,12 +116,14 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
             device.synchronize();
             ready = device_memory_snapshot(device.device());
             if (budget.fits(*ready)) {
-                options.prefill_chunk                                  = startup.chunk;
-                options.context_cache.host_capacity_bytes              = host_bytes;
-                memory.kv_capacity_resolution                          = startup.capacity;
-                memory.kv_capacity_resolution.automatic_headroom_bytes = budget.headroom();
-                memory.device_budget_bytes                             = budget.limit();
-                memory.startup_retained_bytes                          = retained;
+                options.prefill_chunk                     = startup.chunk;
+                options.context_cache.host_capacity_bytes = host_bytes;
+                options.context_cache.extra_state_slots =
+                    startup.capacity.device_state_slots - options.max_concurrency;
+                memory.context_capacity                          = startup.capacity;
+                memory.context_capacity.automatic_headroom_bytes = budget.headroom();
+                memory.device_budget_bytes                       = budget.limit();
+                memory.startup_retained_bytes                    = retained;
                 memory.cuda_graph = instance.program->graph_memory_observation();
                 if (memory.cuda_graph) {
                     plan.graph.preparation_increment_bytes =
@@ -149,9 +151,11 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                                            static_cast<std::int64_t>(explicit_bytes)
                                      : 0;
         const auto control_rebuild =
-            ready ? static_cast<std::size_t>(std::max<std::int64_t>(
-                        0, device_memory_growth(after_control_cleanup, *ready)))
-                  : 0;
+            ready
+                ? static_cast<std::size_t>(std::max<std::int64_t>(
+                      0, device_memory_growth(after_control_cleanup, *ready) -
+                             static_cast<std::int64_t>(startup.capacity.control_reservation_bytes)))
+                : 0;
         const auto reserve =
             std::max(plan.graph.rebuild_estimate_bytes,
                      static_cast<std::size_t>(std::max<std::int64_t>(0, recovered)));
@@ -281,8 +285,8 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
         if (!candidate)
             throw std::invalid_argument("Device budget cannot hold model execution resources");
     }
-    memory.kv_capacity_resolution.available_after_weights_bytes = available_after_weights;
-    memory.kv_capacity_resolution.available_after_startup_bytes =
+    memory.context_capacity.available_after_weights_bytes = available_after_weights;
+    memory.context_capacity.available_after_startup_bytes =
         device_memory_snapshot(device.device()).available_bytes();
     const auto signature =
         setup.prefill_signature(calibrated->startup.preparation, options.prefill_chunk);
@@ -308,7 +312,7 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     summary.host_object_count   = stats.host_object_count + definition_stats.host_object_count;
     summary.context_cost        = std::move(context_cost.summary);
     summary.cuda_sync_mode      = device.sync_mode();
-    const auto& capacity        = memory.kv_capacity_resolution;
+    const auto& capacity        = memory.context_capacity;
     memory.rank_budgets.push_back(
         {memory.device_budget_bytes, capacity.runtime_reservation_bytes,
          capacity.minimum_runtime_reservation_bytes,

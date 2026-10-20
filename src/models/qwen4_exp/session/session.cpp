@@ -143,8 +143,8 @@ std::uint32_t SessionImpl::window_end(const Sequence& s, std::uint32_t begin,
             end = std::min(end, frontier);
             break;
         }
-    if (s.capture && s.next_capture < s.request->captures.size())
-        end = std::min(end, s.request->captures[s.next_capture].frontier);
+    if (s.capture && s.next_capture < s.captures.size())
+        end = std::min(end, s.captures[s.next_capture].frontier);
     if (s.request->vision && begin < s.request->summary.prompt_tokens)
         end = s.request->vision->plan.window_end(begin,
                                                  std::min(end, s.request->summary.prompt_tokens));

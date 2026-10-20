@@ -85,12 +85,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
-    cache.extra_state_slots         = cache.extra_state_slots.value_or(concurrency);
     const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.extra_state_slots;
+        static_cast<std::uint64_t>(concurrency) + cache.extra_state_slots.value_or(0);
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
     }
+    if (!cache.checkpoint_interval)
+        throw std::invalid_argument("checkpoint interval must be positive");
     return options;
 }
 

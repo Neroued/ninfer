@@ -356,7 +356,6 @@ struct GeneratedToolCall {
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
-    DuplicateParameter,
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
@@ -369,8 +368,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "none";
     case ToolCallParseFallbackReason::MalformedStructure:
         return "malformed_structure";
-    case ToolCallParseFallbackReason::DuplicateParameter:
-        return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
     case ToolCallParseFallbackReason::UndeclaredTool:

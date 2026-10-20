@@ -673,24 +673,36 @@ int main() {
 
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
-          .marker_seen               = true,
-          .structured_call_count     = 0,
-          .empty_arguments_omitted   = 0,
-          .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .marker_seen                   = true,
+          .structured_call_count         = 0,
+          .empty_arguments_omitted       = 0,
+          .schema_mismatch_arguments     = 0,
+          .duplicate_parameters_repaired = 2,
+          .fallback_reason               = ninfer::ToolCallParseFallbackReason::MalformedStructure,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
     failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                              "duplicate_parameter",
+                              "malformed_structure" &&
+                          fallback_done.at("result")
+                                  .at("tool_call_parse")
+                                  .at("duplicate_parameters_repaired") == 2,
                       "tool-call text fallback diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+            fallback_warning->message == "req#7 tool markup returned as text | malformed structure",
         "tool-call text fallback warning is absent or exposes raw content");
+
+    GenerationOutcome snippet_outcome = fallback_outcome;
+    snippet_outcome.text              = "plain reasoning <tool_call><legacy>";
+    const std::optional<OperationalRecord> snippet_warning =
+        render_tool_call_fallback(context, snippet_outcome);
+    failures += check(snippet_warning &&
+                          snippet_warning->message.ends_with(" | <tool_call><legacy>"),
+                      "tool-call text fallback warning is missing the markup snippet");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

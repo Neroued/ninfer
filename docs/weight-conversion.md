@@ -30,6 +30,23 @@ Source-weight conversion requires a Python 3.11 environment with PyTorch and Num
 by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
 local checkpoint directories.
 
+CPU conversion is serial by default (`--workers 1`). To prepare independent weight objects in
+parallel, use `--device cpu --workers 2` (or another positive worker count):
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe qwen3_8_27b \
+  --device cpu --workers 2 \
+  --out models/qwen3_8_27b_cpu.ninfer
+```
+
+Parallel conversion publishes objects in their original order. Each in-flight output uses up to
+8 MiB of RAM for staging; larger objects are staged in temporary files in the output directory.
+Allow additional free disk space for up to `2 * workers` in-flight objects (potentially several
+GiB for large vocabulary weights). `--rows-per-chunk` limits conversion input/output chunks, not
+the size of each staged object. CUDA conversion requires `--workers 1`.
+
 For Qwen3.6-27B floating-point source weights:
 
 ```bash

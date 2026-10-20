@@ -1,4 +1,5 @@
 #include "ops/gated_residual/mix/launch.h"
+#include "gemv.h"
 #include "ops/common/host/launch.h"
 #include "ops/gated_residual/mix/kernel/output.cuh"
 #include "ops/gated_residual/mix/kernel/up_mma_mix.cuh"
@@ -28,10 +29,6 @@ using SplitSchedule =
     Bf16A16MmaSchedule<Rows, Tokens, K, 16, 8, 3, MinBlocks, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
 
-using DownGemv = Bf16ScheduleInstance<
-    Bf16A16GemvSchedule<2, 1, 1, 16, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
-                        Bf16PhaseOrder::Sequential, 1, 1, 4, 2>,
-    kResidualWidth>;
 using DownSimt = Bf16ScheduleInstance<
     Bf16A16SimtSchedule<8, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::DirectStream,
                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>,
@@ -53,7 +50,7 @@ void down(Operands o, Down schedule, Scratch scratch, cudaStream_t stream) {
                                        scratch.partials.bytes};
     switch (schedule) {
     case Down::Gemv:
-        launch_bf16_a16_gemv<DownGemv>(p, output, identity, stream);
+        gemv_down(Form, o, scratch, stream);
         break;
     case Down::Simt:
         launch_bf16_a16_simt<DownSimt>(p, output, identity, stream);
@@ -160,6 +157,9 @@ void launch(Kind kind, Operands o, Plan p, Scratch scratch, CudaExecutionView ex
     else
         down<Kind::Final>(o, p.down, scratch, execution.stream());
     switch (p.up) {
+    case Up::Gemv:
+        gemv_up(o, scratch, execution.stream());
+        break;
     case Up::Folded16x16:
         folded_up<16, 16>(o, scratch, execution.stream());
         break;

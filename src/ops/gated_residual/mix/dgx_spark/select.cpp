@@ -17,9 +17,9 @@ constexpr int kLast = std::numeric_limits<int>::max();
 
 // Direct variants share one activation allocation; their wave counts differ.
 constexpr std::array block_routes{
-    Route{1, 1, {Down::Gemv, Up::Folded16x16}},
-    Route{2, 3, {Down::Simt, Up::Folded16x16}},
-    Route{4, 4, {Down::Simt4, Up::Folded16x16}},
+    Route{1, 1, {Down::Gemv, Up::Gemv}},
+    Route{2, 2, {Down::Simt, Up::Folded16x16}},
+    Route{3, 4, {Down::Simt4, Up::Folded16x16}},
     Route{5, 24, {Down::Split8x16, Up::Folded16x16}},
     Route{25, 32, {Down::Split8x16, Up::TmaFolded16x64}},
     Route{33, 64, {Down::Split8x32, Up::TmaFolded16x64}},
@@ -37,7 +37,7 @@ constexpr std::array block_routes{
 };
 
 constexpr std::array final_routes{
-    Route{1, 1, {Down::Gemv, Up::Folded16x16}},
+    Route{1, 1, {Down::Gemv, Up::Gemv}},
     Route{2, 2, {Down::Simt, Up::Folded16x16}},
     Route{3, 4, {Down::Simt4, Up::Folded16x16}},
     Route{5, 24, {Down::Split8x16, Up::Folded16x16}},

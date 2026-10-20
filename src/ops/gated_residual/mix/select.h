@@ -20,6 +20,7 @@ enum class Down {
     Direct128S2
 };
 enum class Up {
+    Gemv,
     Folded16x16,
     Folded32x32,
     TmaFolded16x64,

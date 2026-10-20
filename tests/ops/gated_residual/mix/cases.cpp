@@ -61,12 +61,12 @@ void add_mix_cases(OpSuite& suite) {
                 for (int m : {23, 24, 25, 575, 576, 577, 895, 896, 897, 1023, 1025, 1215, 1216,
                               1217, 2047, 2049, 4095, 4096, 4097})
                     cases.push_back({m});
-                cases.push_back({4096, true});
+                for (int m : {1, 2, 3, 4096}) cases.push_back({m, true});
                 cases.push_back({56, true});
                 cases.push_back({385, true});
                 cases.push_back({0});
             } else {
-                cases.push_back({3});
+                for (int m : {1, 3}) cases.push_back({m});
                 if (pattern == mix::Pattern::RowMapping)
                     for (int m : {65, 385, 769}) cases.push_back({m});
             }

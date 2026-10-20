@@ -54,8 +54,8 @@ __device__ __forceinline__ void normalize(float (&x)[kStateDim / Lanes]) {
     }
 }
 
-// A subgroup owns consecutive state rows and coalesced four-key segments. Update, Record and
-// Fold share the transition arithmetic so replay preserves the one-token state trajectory.
+// A subgroup owns consecutive state rows and coalesced four-key segments. Keep its transition
+// arithmetic aligned with replay fold's exact snapshot contract.
 template <int Lanes, bool Normalize, Mode Behavior, bool Prefetch, int Capacity, class Access>
 __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates original, int valid,
                                     Window<Capacity>* sm) {

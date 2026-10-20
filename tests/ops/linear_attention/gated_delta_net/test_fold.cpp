@@ -85,7 +85,8 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false, bool captured = false, bool device_rows = false) {
+             bool distinct_destination = false, bool captured = false, bool device_rows = false,
+             std::int32_t record_capacity = kRecordCapacity) {
     const int kQkHeads                           = profile.value_heads == 24 ? 8 : 16;
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
@@ -100,7 +101,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
 
     const GdnReplayRecordSpec record_spec{
         .layers          = profile.layers,
-        .record_capacity = kRecordCapacity,
+        .record_capacity = record_capacity,
         .width           = width,
         .conv_channels   = profile.conv_channels,
         .qk_heads        = kQkHeads,
@@ -128,7 +129,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         for (std::int32_t row = 0; row < rows; ++row) {
             const std::int32_t commit = commits[static_cast<std::size_t>(row)];
             const std::int64_t record_outer =
-                static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                static_cast<std::int64_t>(layer) * record_capacity + row;
             for (std::int32_t token = 0; token < (commit == 0 ? 0 : width); ++token) {
                 const std::int64_t column = record_outer * width + token;
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
@@ -232,7 +233,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 std::fill(expected.begin(), expected.end(), 0);
             if (commit > 0) {
                 const std::int64_t record_outer =
-                    static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                    static_cast<std::int64_t>(layer) * record_capacity + row;
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
                     const auto record_value = [&](std::int32_t token) {
                         return conv_records[static_cast<std::size_t>(
@@ -322,7 +323,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             std::vector<float> g_host(static_cast<std::size_t>(profile.value_heads) * width);
             std::vector<float> beta_host(static_cast<std::size_t>(profile.value_heads) * width);
             const std::int64_t record_outer =
-                static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                static_cast<std::int64_t>(layer) * record_capacity + row;
             for (std::int32_t token = 0; token < width; ++token) {
                 for (std::int32_t head = 0; head < profile.value_heads; ++head) {
                     const std::size_t source = static_cast<std::size_t>(
@@ -389,9 +390,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     if (captured || (width == 16 && rows == 8)) {
         cuda_synchronize();
         DeviceBuffer original(ninfer::test::cuda_environment().context.device(), state_bytes);
-        cuda_check(cudaMemcpy(original.data(), state_base, state_bytes, cudaMemcpyDeviceToDevice),
-                   "save graph initial state");
         DeviceContext context;
+        cuda_check(cudaMemcpyAsync(original.data(), state_base, state_bytes,
+                                   cudaMemcpyDeviceToDevice, context.stream()),
+                   "save graph initial state");
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
         if (device_rows) device_commits.fill(0);
@@ -857,14 +859,20 @@ int main(int argc, char** argv) {
             });
         }
     const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
-                         unsigned seed, bool distinct = false, bool captured = false) {
+                         unsigned seed, bool distinct = false, bool captured = false,
+                         int capacity = kRecordCapacity) {
         std::string id = std::string(p.value_heads == 24 ? "gdn_fold_local/l" : "gdn_fold/l") +
                          std::to_string(p.layers) + "/h" + std::to_string(p.value_heads) + "/w" +
                          std::to_string(width) + "/b" + std::to_string(batch) +
                          (distinct ? "/disjoint" : "/alias") + "/commits";
         for (int c : commits) id += "_" + std::to_string(c);
         if (captured) id += "/graph";
-        suite.add(id, [=] { return run_case(p, width, batch, commits, seed, distinct, captured); },
+        if (capacity != kRecordCapacity) id += "/capacity_" + std::to_string(capacity);
+        suite.add(id,
+                  [=] {
+                      return run_case(p, width, batch, commits, seed, distinct, captured, false,
+                                      capacity);
+                  },
                   {{"execution", captured || (width == 16 && batch == 8) ? "graph" : "eager"}});
     };
     add({48, 48, 10240}, 2, 1, {2}, 1801U, true);
@@ -884,6 +892,18 @@ int main(int argc, char** argv) {
     add({36, 48, 10240}, 16, 8, {8, 9, 10, 11, 12, 13, 14, 15}, 1877U);
     add({36, 48, 10240}, 16, 1, {16}, 1879U, true);
     add({36, 48, 10240}, 16, 1, {0}, 1881U, true);
+    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 0}, 1883U, true);
+    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 1}, 1885U, true);
+    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 16}, 1887U, true);
+    add({30, 32, 8192}, 2, 3, {0, 1, 2}, 1889U);
+    add({30, 32, 8192}, 2, 1, {1}, 1891U, false, false, 1);
+    add({36, 48, 10240}, 5, 3, {0, 1, 5}, 1893U, false, false, 3);
+    for (const FoldProfile profile : {FoldProfile{36, 48, 10240}, {36, 24, 5120}})
+        suite.add("gdn_fold/device/l36/h" + std::to_string(profile.value_heads) + "/sparse/graph",
+                  [=] { return run_case(profile, 16, 4, {0, 0, 0, 16}, 5200U, true, true, true); });
+    suite.add("gdn_fold/device/l36/h48/zero/graph", [] {
+        return run_case({36, 48, 10240}, 4, 4, {0, 0, 0, 0}, 5201U, true, true, true);
+    });
     suite.add("gdn_fold/record_rounds/q4_q5", [] { return run_record_fold_rounds(); },
               {{"format", "q4_q5"}});
     suite.add("gdn_fold/record_rounds/q8", [] { return run_record_fold_rounds(true); },

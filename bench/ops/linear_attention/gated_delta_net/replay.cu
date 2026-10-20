@@ -10,7 +10,8 @@ int main(int argc, char** argv) {
         measurement::hardware();
         auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
-        measurement::Csv csv(options.timing.csv_out, gdn::Traffic::columns);
+        measurement::Csv csv(options.timing.csv_out,
+                             std::string(gdn::Traffic::columns) + ",row_metadata");
         for (int t : options.tokens) {
             measurement::Row row;
             row.op            = options.op;
@@ -25,10 +26,12 @@ int main(int argc, char** argv) {
                      measurement::selections(options.timing.execution, "graph", "eager"))
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
-                        const auto r =
-                            measurement::measure(launch, restore, flush, device.execution_view(),
-                                                    options.timing, execution, cache, traffic.active_rows == 0);
-                        csv.write(row, r, execution, cache, traffic.csv(r.gpu.median_us));
+                        const auto r = measurement::measure(
+                            launch, restore, flush, device.execution_view(), options.timing,
+                            execution, cache, traffic.active_rows == 0);
+                        csv.write(row, r, execution, cache,
+                                     traffic.csv(r.gpu.median_us) + ',' +
+                                         (options.op == "fold" ? options.row_metadata : "none"));
                     }
             };
             if (options.op == "fold") {
@@ -38,15 +41,34 @@ int main(int argc, char** argv) {
                 std::vector<ops::GdnReplayFoldRow> rows;
                 for (int b = 0; b < options.batch; ++b)
                     rows.push_back({slots[b], slots[b], counts[b]});
+                const bool on_device = options.row_metadata == "device";
+                auto selected =
+                    on_device
+                        ? measurement::make_i32(std::vector<int>(slots, slots + options.batch))
+                        : DeviceBuffer{};
+                auto prefixes = on_device ? measurement::make_i32(counts) : DeviceBuffer{};
+                Tensor selectors, commits;
+                if (on_device) {
+                    selectors = Tensor(selected.span(), DType::I32, {options.batch});
+                    commits   = Tensor(prefixes.span(), DType::I32, {options.batch});
+                }
                 row.commits = gdn_replay::csv_extent(options.commits);
-                run([&](CudaExecutionView cuda) { f.fold_plan().execute(rows, cuda); },
+                run(
+                    [&](CudaExecutionView cuda) {
+                        if (on_device)
+                            f.fold_plan().execute(selectors, selectors, commits, cuda);
+                        else
+                            f.fold_plan().execute(rows, cuda);
+                    },
                     [&](CudaExecutionView cuda) { f.restore(cuda); },
-                    gdn::fold_traffic(options.profile.layers, options.profile.qk_heads, options.profile.value_heads,
-                                      options.profile.conv_channels, counts));
+                    gdn::fold_traffic(options.profile.layers, options.profile.qk_heads,
+                                      options.profile.value_heads, options.profile.conv_channels,
+                                      counts));
             } else {
-                auto valid         = gdn_replay::extents(options.valid, t, options.batch, false);
-                const auto traffic = gdn::record_traffic(options.profile.qk_heads, options.profile.value_heads, t, valid,
-                                                         options.valid != "dense");
+                auto valid = gdn_replay::extents(options.valid, t, options.batch, false);
+                const auto traffic =
+                    gdn::record_traffic(options.profile.qk_heads, options.profile.value_heads, t,
+                                        valid, options.valid != "dense");
                 if (options.valid == "dense") valid.clear();
                 gdn_replay::RecordFixture f(options.profile, t, options.batch, valid);
                 row.valid = gdn_replay::csv_extent(options.valid);

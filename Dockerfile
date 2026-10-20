@@ -16,6 +16,11 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# libcuda.so.1 (CUDA Driver API) is provided by the host GPU driver and is absent
+# in the build image. Link against the toolkit's linker stub (same soname) so
+# driver symbols resolve at build time; the runtime dependency stays libcuda.so.1.
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1
+
 WORKDIR /src
 COPY . .
 
@@ -42,6 +47,7 @@ RUN apt-get update \
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /build/lib/*.so /usr/local/lib/
 
 WORKDIR /workspace
 EXPOSE 8080

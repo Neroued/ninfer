@@ -30,8 +30,9 @@ On RTX 5090, this recipe uses registered Host experts with GPU caching and strea
 about 63.3 GiB of Host expert backing plus runtime and system memory. On DGX Spark, use
 `build/dgx-spark-release/apps/ninfer`; selected weights reside on the GPU without a Host expert copy. PLE reads its
 NF4 rows from the artifact on disk. Add `--vision` for image/video messages. Native MTP supports
-`--spec mtp --draft-tokens 1..5` with either Text or Vision, using the full shared BF16 head;
-omit `--proposal-head optimized`. MTP's own experts remain on GPU. Serving uses the same execution path;
+`--spec mtp --draft-tokens 1..5` with either Text or Vision. The default shares the main BF16 head;
+`--proposal-head optimized` selects the additional full-vocabulary Q4 head when included during
+[conversion](weight-conversion.md). MTP's own experts remain on GPU. Serving uses the same execution path;
 offline causal scoring remains text-only without speculative decoding. Use `--no-cuda-graph`
 to select eager decode; prefill and Vision encode use the same eager path in both modes.
 The [Qwen4Exp execution reference](maintainer/qwen4_exp-execution.md) records the complete support
@@ -39,7 +40,7 @@ scope, state handling and resource limits.
 
 ```bash
 ./build/rtx5090-release/apps/ninfer out/qwen3_8_flash_next.ninfer \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 3 --proposal-head optimized \
   --max-context 32768 --prefill-chunk 4096 --kv-dtype fp8 \
   --prompt "Explain how sparse attention works." --max-tokens 256
 ```
@@ -259,8 +260,8 @@ may be combined with `--vision`.
 `--proposal-head optimized` selects the optimized proposal head when the architecture and artifact provide it,
 and requires a selected backend.
 
-Flash Next supports native MTP with the full head only; it does not support `--proposal-head optimized`,
-DFlash or DFlash2.
+Flash Next supports native MTP with the shared BF16 head or an optimized full-vocabulary Q4 head.
+It does not support DFlash or DFlash2.
 
 ```bash
 ./build/rtx5090-release/apps/ninfer models/qwen3_6_35b_a3b.ninfer \

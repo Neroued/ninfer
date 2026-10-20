@@ -49,4 +49,10 @@ def fp8_block_source(
         decoded = words.codes.view(torch.float8_e4m3fn).float() * scales
         return decoded.reshape(-1)[begin - first * k : end - first * k]
 
-    return LogicalSource(shape, f"{store.path}:{prefix} (block FP8)", values, encoded)
+    return LogicalSource(
+        shape,
+        f"{store.path}:{prefix} (block FP8)",
+        values,
+        encoded,
+        encoded_format="fp8_e4m3fn_block128x128_bf16",
+    )

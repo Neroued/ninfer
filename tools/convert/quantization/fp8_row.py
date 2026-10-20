@@ -114,6 +114,23 @@ def quantize_bf16_rows(weight: torch.Tensor) -> RowScaledFp8Words:
         raise TypeError("FP8 quantization source must be a rank-two BF16 tensor")
     if any(dim <= 0 for dim in weight.shape):
         raise ValueError("FP8 quantization source dimensions must be positive")
+    if weight.is_cuda:
+        values = weight.detach().float()
+        maximum = values.abs().amax(dim=1)
+        zero = maximum == 0
+        scales = (maximum.double() / 448.0).float().bfloat16()
+        scales = torch.where((scales == 0) & ~zero, 2.0**-133, scales)
+        reciprocal = torch.where(~zero, scales.double().reciprocal().float(), 0.0)
+        # FP32 multiplication is the same single rounding as the host's exact
+        # FP64 product of two FP32 operands followed by its FP32 cast.
+        normalized = values * reciprocal[:, None]
+        if not bool(torch.isfinite(normalized).all()):
+            raise ValueError("FP8 quantization source or normalization is not finite")
+        codes = (
+            normalized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+        codes[zero] = 0
+        return RowScaledFp8Words(codes, scales)
     host = weight.detach().to(device="cpu", dtype=torch.float32).numpy()
     code_words, scale_words = _quantize_host_rows(host)
     codes = torch.from_numpy(code_words.copy())

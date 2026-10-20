@@ -19,6 +19,7 @@ from tools.artifact.formats import (
 )
 from tools.artifact.schema import ACTIVATION_POLICIES, TensorSpec
 from .methods import (
+    SOURCE_CACHE_BYTES,
     AuxiliaryValue,
     MethodInput,
     PrepareRequest,
@@ -356,7 +357,14 @@ class Recipe:
         self.aliases[parameter] = target
         self.selections[parameter] = list(self.selections[target])
 
-    def prepare(self, *, device="cuda", rows_per_chunk=512) -> PreparedRecipe:
+    def prepare(
+        self,
+        *,
+        device="cuda",
+        rows_per_chunk=None,
+        source_cache_bytes=SOURCE_CACHE_BYTES,
+        reader=None,
+    ) -> PreparedRecipe:
         weights = []
         fragments = {name: [] for name in self.selections}
         auxiliary_values = dict(self.auxiliary_overrides)
@@ -428,13 +436,15 @@ class Recipe:
                 for (name, _), source in zip(items, sources)
             )
             request = PrepareRequest(
-                spec,
-                inputs,
-                self.policies,
-                selection.parameters,
-                device,
-                rows_per_chunk,
-                self.auxiliary_overrides,
+                target=spec,
+                inputs=inputs,
+                policies=self.policies,
+                parameters=selection.parameters,
+                device=device,
+                rows_per_chunk=rows_per_chunk,
+                auxiliary_overrides=self.auxiliary_overrides,
+                source_cache_bytes=source_cache_bytes,
+                reader=reader,
             )
             try:
                 prepared = selection.method(request)

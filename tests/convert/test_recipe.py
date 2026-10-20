@@ -236,10 +236,31 @@ def _encoded_source(name, divisor, shift=0):
                 "nvfp4", codes[begin:end], scales[begin:end], word
             ),
             lambda: word,
+            encoded_format="nvfp4",
         ),
         codes,
         scales,
     )
+
+
+def test_encoded_preparation_does_not_read_weight_rows():
+    def payload(*args):
+        raise AssertionError("preparation must use source metadata")
+
+    model = Model({"text": {"config": {}}})
+    source = LogicalSource(
+        (128, 64),
+        "encoded",
+        payload,
+        payload,
+        lambda: struct.pack("<f", 2.0),
+        encoded_format="nvfp4",
+    )
+    model.add(Parameter("w", source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("w", format="nvfp4", method=import_encoded)
+    prepared = recipe.prepare(device="cpu")
+    assert prepared.weights[0].spec.shape == source.shape
 
 
 def test_nvfp4_encoded_only_import_streams_complete_parent_tiles(tmp_path):

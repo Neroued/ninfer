@@ -101,19 +101,34 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
     return out;
 }
 
-MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main) {
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main,
+                    ProposalHead proposal_head) {
     MtpWeights out;
     out.embedding = b.parameter("mtp/token_embedding", {c.vocabulary, c.hidden}, {}, QType::BF16);
-    out.head      = b.parameter("mtp/output_head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"});
-    for (const auto pair :
-         {std::pair{out.embedding, main.embedding}, std::pair{out.head, main.head}}) {
-        const auto& a      = b.at(pair.first).reference.binding.parts;
-        const auto& target = b.at(pair.second).reference.binding.parts;
+    const auto shared = [&](const artifact::ParameterReference& parameter, WeightId target_id) {
+        const auto& a      = parameter.binding.parts;
+        const auto& target = b.at(target_id).reference.binding.parts;
         if (!std::equal(a.begin(), a.end(), target.begin(), target.end(),
                         [](const auto& x, const auto& y) {
                             return x.object == y.object && x.begin == y.begin && x.end == y.end;
                         }))
             throw artifact::ArtifactError("Qwen4Exp MTP embedding/head must share Main storage");
+    };
+    shared(b.at(out.embedding).reference, main.embedding);
+    shared(b.binder.parameter("mtp/output_head", {c.vocabulary, c.hidden}), main.head);
+    switch (proposal_head) {
+    case ProposalHead::Full:
+        out.head = b.parameter("mtp/output_head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"});
+        break;
+    case ProposalHead::Optimized: {
+        const auto& proposal = b.binder.reader().directory().component("text").proposal;
+        if (!proposal || proposal->indexed)
+            throw artifact::ArtifactError("Qwen4Exp requires a full-vocabulary proposal head");
+        out.head = b.parameter("proposal/head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"});
+        break;
+    }
+    default:
+        throw artifact::ArtifactError("invalid Qwen4Exp proposal head selection");
     }
     out.embedding_norm = b.direct("mtp/pre_fc_embedding_norm", {c.hidden});
     out.hidden_norm    = b.direct("mtp/pre_fc_hidden_norm", {c.residual_width()});

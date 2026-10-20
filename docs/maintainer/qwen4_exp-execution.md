@@ -15,6 +15,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 | 并发与上下文 | 启动固定 1–8 路 resident lanes；本实例最大上下文 262144，实际容量由启动预算决定 |
 | Vision | 图像、视频、多媒体消息；共享 Vision 编码器、MRoPE 和跨 Text chunk 特征交接 |
 | 原生 MTP | draft 数 1–5，支持 Text/Vision、1–8 路、采样 penalty 和约束输出 |
+| MTP head | 默认共享 Main BF16 head；可选完整词表 Q4 optimized head，支持单机及 TP2 |
 | CUDA Graph | resident Main 整图、MTP draft chain、独立采样/接受图、无 head 的单列 control 图；expert offload 保留分段交接 |
 | KV 存储 | BF16、INT8-G64、FP8-row256、NVFP4-G16、K8V4；index keys 固定 BF16 |
 | 上下文复用 | 完整 StateImage 与 Main/MTP 页组、Device 前缀命中、Snapshot/Replay；5090 还提供 Host 副本 |
@@ -25,8 +26,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 
 当前限制：
 
-- Speculative backend 仅支持原生 MTP，使用完整共享 BF16 head；不支持 DFlash、DFlash2
-  或 indexed proposal head，因此不使用 `--proposal-head optimized`。
+- Speculative backend 仅支持原生 MTP；不支持 DFlash、DFlash2 或 indexed proposal head。
 - Offload 模式保留完整 Host expert 来源。GPU 缓存没有请求自适应排序或 decode 动态换入；
   小批量缺失 expert 由 CPU 计算，没有按需换入 GPU 计算的第三条分工路径。
 - PLE 当前只有磁盘准备路径，没有整表 RAM/GPU lookup。
@@ -230,7 +230,14 @@ GPU 数学见 [PLE 合同](../../include/ninfer/ops/ple.h)。
 MTP draft 数 K 在启动时固定为 1–5；物理 target 窗口 T=K+1。
 各行按剩余输出/上下文预算缩短有效长度；混合 batch 保持这一物理窗口，
 整批都无法再产生 draft 时走 ordinary。
-Draft 使用完整共享 head 的 argmax；target 验收支持请求的 greedy 或 sampling 配置，
+Draft 在完整词表上做 argmax。`--proposal-head full` 共享 Main BF16 head；
+`--proposal-head optimized` 加载并绑定产物的独立 Q4 head，以 BF16 激活执行 A16 Linear。
+每次 draft head 的列数是 B，正常 K 步 draft 调用 K 次。TP2 按词表分片计算，
+沿用设备侧全局候选选择；Eager 和 CUDA Graph 使用同一绑定。
+Workspace 规划包含所选 draft head 的实际需求，权重在启动时完成物化。
+权重布局与容量见[模型与权重](qwen4_exp-model.md#33-optimized-mtp-head)。
+
+Target 仍使用 Main head，验收支持请求的 greedy 或 sampling 配置，
 并处理 penalty 与约束 mask。验收数学由
 [SpeculativeAccept](../../include/ninfer/ops/speculative_accept.h)维护。
 
@@ -429,7 +436,7 @@ PLE cache 和进程内存分别计费；registered 范围不是另一份专家�
 | Main/MTP 物理执行与采用 | [execution](../../src/models/qwen4_exp/program/execution.cpp)、[mtp](../../src/models/qwen4_exp/program/mtp.cpp)、[commit](../../src/models/qwen4_exp/program/commit.cpp) |
 | 请求事务、页组与 checkpoint | [session](../../src/models/qwen4_exp/session/)、[directory](../../src/models/common/context/directory.h) |
 | StateImage 与本地上下文执行 | [state](../../src/models/qwen4_exp/state/)、[context](../../src/models/qwen4_exp/program/context.cpp) |
-| 静态 expert 排序 | [expert_priority](../../src/models/qwen4_exp/program/expert_priority.cpp) |
+| 静态 expert 排序 | [expert_priority](../../src/models/qwen4_exp/parallel/expert_priority.cpp) |
 
 [Tests](../../tests/README.md)维护 Op 数学、状态语义、PLE 和模型加载测试入口；
 [Benchmarks](../../bench/README.md)维护局部与完整 Engine 测量。

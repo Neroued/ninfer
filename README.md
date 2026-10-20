@@ -253,9 +253,10 @@ image/video Vision prompts, plus CPU/GPU MoE expert offload with CUDA Graph deco
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
 and either full or optimized proposal heads.
 
-Qwen3.8-Flash-Next uses CPU/GPU Main experts, disk-backed NF4 PLE and segmented CUDA Graph.
-Its native MTP uses the full shared head; DFlash/DFlash2 and optimized proposal heads are not
-supported for this architecture. See the [CLI commands](docs/cli.md),
+Qwen3.8-Flash-Next supports Main expert offload, NF4 PLE and CUDA Graph decode.
+Its native MTP supports the shared BF16 head or an additional full-vocabulary Q4 head selected by
+`--proposal-head optimized`; DFlash/DFlash2 are unsupported for this architecture.
+See the [CLI commands](docs/cli.md),
 [conversion recipe](docs/weight-conversion.md) and
 [current support reference](docs/maintainer/qwen4_exp-execution.md).
 

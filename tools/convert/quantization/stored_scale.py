@@ -87,7 +87,7 @@ def quantize_stored_scale(
     d = struct.unpack("<f", divisor)[0]
     n, k = weight.shape
     target = torch.device(device)
-    values = weight.detach().to(device=target, dtype=torch.float32).contiguous()
+    values = weight.detach().to(device=target).float().contiguous()
     if not bool(torch.isfinite(values).all()):
         raise ValueError("stored-scale source contains NaN or infinity")
     if target.type == "cuda":

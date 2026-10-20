@@ -112,6 +112,7 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
                                   ? std::min(chunk, 1024U)
                                   : o.max_concurrency * (o.speculative.draft_tokens + 1);
     out.finish              = linear(p.text.head, 1, head_columns);
+    if (p.mtp) out.finish = std::max(out.finish, linear(p.mtp->head, 1, o.max_concurrency));
     if (o.purpose == EnginePurpose::Generation) {
         if (p.local.size > 1)
             out.finish = std::max(out.finish, ops::vocabulary_candidates_workspace_capacity_bytes(

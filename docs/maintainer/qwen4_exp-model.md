@@ -32,7 +32,7 @@ Binding 描述实际权重，Parameters/Ops 决定可执行表示与 shape；rec
 | PLE heads / embedding | 2-gram、3-gram 各 8 heads；16 行 × 160 维，拼成 2560 维 |
 | PLE table | 128 个 `[2500012,160]` shards，共 320001536 行 |
 | PLE convolution | 10240 通道，4 taps、dilation=3，九列历史 |
-| MTP | 一个独立 HC/QSA/MoE 层，无 PLE；共享 Main embedding/head |
+| MTP | 一个独立 HC/QSA/MoE 层，无 PLE；共享 Main embedding，默认共享 Main head，可选独立量化 draft head |
 | Vision blocks | 27 层，hidden=1152，16 heads × 72，MLP intermediate=4304 |
 | Vision patch / merger | patch `[3,2,16,16]`；2×2 merge，4608→4608→2560 |
 | RoPE | theta=10000000；Main 与 indexer 都旋转前 64 维；interleaved MRoPE sections `[11,11,10]` |
@@ -108,8 +108,8 @@ h_init[s] = W_fc_hidden * v[s] + e
 
 Hidden norm 沿完整 10240 维归约，随后同一个 fc_hidden 独立作用于四条 streams。
 第一步使用 Main conditioning，后续 draft step 使用前一步 MTP 的 pre-final-mixer
-residual。MTP 的 QSA/MoE 层及 final HC mixer 产生下一组 conditioning 和 sample，
-head 与 Main 共享。
+residual。MTP 的 QSA/MoE 层及 final HC mixer 产生下一组 conditioning 和 sample。
+Draft 默认使用 Main head，也可选择第 3.3 节的独立量化 head；target 仍使用 Main head。
 
 Vision 将 Conv3d patch 按 C/T/H/W 展平为 1536 维。Blocks 使用非因果 attention、
 LayerNorm 和 `gelu_pytorch_tanh` MLP；merger 在 2×2 合并前做 LayerNorm，
@@ -131,7 +131,8 @@ LayerNorm 和 `gelu_pytorch_tanh` MLP；merger 在 2×2 合并前做 LayerNorm�
 | HC、QSA K/V/indexer、PLE 投影、router/shared FFN | 原 BF16 words | `A16Only` |
 | GDN AB、convolution、norm，其他 norm/bias | 原 BF16 words | 各 Op 数学 |
 | GDN A_log / dt_bias | 源 BF16 精确展开为 FP32，各 `[48]` | 保留原始含义 |
-| Token embedding / LM head | 两份独立 BF16 对象 | lookup / A16 head；MTP 共享 |
+| Token embedding / Main LM head | 两份独立 BF16 对象 | lookup / A16 head；MTP 默认共享 |
+| Optimized MTP head，可选 | BF16 Main head 源转 Q4 G64/FP16 scale，完整词表 | `A16Only` |
 | PLE table | BF16 源转 `nf4_g16_e4m3fn` | 精确解码为 BF16 lookup 输出 |
 | MTP routed experts | NVIDIA E4M3FN codes，128×128 块 BF16 multiplier | `AllowA8` |
 | MTP 其他独有参数、全部 Vision | 原 BF16 words | 投影 `A16Only` |
@@ -183,6 +184,21 @@ MTP `fp8_e4m3fn_block128x128_bf16` 重建为 E4M3FN code × BF16 block scale。
 Gate/up 各自保留原 scale，640 行边界与 128 行块对齐。A8 按每 token 的 K128 分组
 动态量化，scale 为 FP32；每个 K128 dot 分别缩放后累加，没有静态 activation divisor。
 
+### 3.3 Optimized MTP head
+
+转换时 `--proposal` 从 Main BF16 head 源生成独立 `proposal/head`，使用
+`grouped_absmax`、`q4_g64_fp16` 和 `row_split_k128_v1`。它保留全部
+`[248320,2560]` 物理行及原 vocabulary ID 顺序，不裁剪词表、不创建 `proposal/token_ids`；
+目录声明 `text.proposal.domain="full"`。`mtp/final_hidden` Use 的 policy 为 `A16Only`。
+
+Main BF16 head 和 `mtp/output_head` 的共享绑定保留。启动选择 optimized 时，
+MTP 改为绑定 `proposal/head`，target 验收和 ordinary decode 继续使用 Main head。
+两份 head 采用相同的词表 TP 分区：TP2 下每 rank 各持有 `[124160,2560]` 的本地部分，
+沿用全局 token ID 和候选汇合，不需要 token remap。
+
+这是附加的 draft 表示；关闭 optimized head 时不加载其对象。
+启动选项和执行流程见[执行与状态](qwen4_exp-execution.md#5-mtp-的生成与采用)。
+
 ## 4. 合并矩阵与持久布局
 
 逻辑矩阵写作 `W[N,K]`；N 是输出行，K 是输入特征，区间均为半开区间。
@@ -208,7 +224,8 @@ Native Tensor 第 0 维连续；`M=T*B`，`column=t+T*b`。
 | Routed GU bank | 48 / 1 | `[512,1280,2560]` | Main NVFP4 / MTP block-FP8 | expert-major，每 expert 内 gate 640、up 640 |
 | Routed down bank | 48 / 1 | `[512,2560,640]` | Main NVFP4 / MTP block-FP8 | expert-major |
 | MTP fc_embedding / fc_hidden | 0 / 各 1 | `[2560,2560]` | BF16 | 独立权重；分别处理 M / 4M 列 |
-| LM head | 一份，MTP 共享 | `[248320,2560]` | BF16 | vocabulary 顺序 |
+| Main LM head | 一份，MTP 默认共享 | `[248320,2560]` | BF16 | vocabulary 顺序 |
+| Optimized MTP head | 0 / 可选 1 | `[248320,2560]` | Q4 | 完整 vocabulary 顺序 |
 
 Main QSA 的两个 input parents 精度不同；MTP 六段投影合为一个 BF16 parent。
 MoE control 为前 513 行，shared GU 为后 1280 行，可作零拷贝 views。
@@ -314,12 +331,16 @@ Scale words 的有效域为 `0x00..0x7e`；零结果保留 codebook 的符号。
 | MTP experts | 2516889600 | 2.344036 | 启用时 GPU |
 | MTP 其他独有权重 | 181136896 | 0.168697 | 启用时 GPU |
 | Activation divisors 与 PLE hash controls | 664 | — | 只读控制值 |
-| 合计 | **108089298552** | **100.666004** | — |
+| 不含 optimized head 合计 | **108089298552** | **100.666004** | — |
+| Optimized MTP head，可选 | 337715200 | 0.314522 | 启用时 GPU；TP2 每 rank 一半 |
+| 含 optimized head 合计 | **108427013752** | **100.980526** | — |
 
 Text-only 权重及控制值约 97.317072 GiB。全部组件在 offload 模式的固定 GPU 权重约
 10.257616 GiB，另计 Main expert cache；resident 模式的 GPU 权重约 73.539049 GiB。
 两种模式均另计 StateImage、KV、workspace、Graph 和 staging。
 未启用的 Vision/MTP 不 materialize；共享 embedding/head 不重复计费。
+启用 optimized head 在上述 GPU 权重之外增加约 322.07 MiB；
+TP2 每 rank 增加约 161.04 MiB。
 
 Offload 模式的 Host backing 包含已缓存到 GPU 的 experts，eviction 无需写回；resident
 模式直接绑定 GPU bank，不保留 Host expert 副本。PLE 启动只读目录、控制值和 divisors，不整体加载表。

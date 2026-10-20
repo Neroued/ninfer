@@ -514,6 +514,11 @@ std::string join_labels(const std::vector<std::string>& labels) {
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
+    if (point.qtype == QType::Q4_G64_FP16 && point.k == 2560 &&
+        (point.n == 248320 || point.n == 124160) && point.t > 1) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
     const bool nvfp4_problem =
         (point.n == 12288 && point.k == 4096) || (point.n == 4096 && point.k == 6144) ||
         (point.k == 5120 && (point.n == 14336 || point.n == 16384 || point.n == 34816)) ||
@@ -568,8 +573,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     if (point.qtype == QType::BF16 &&
         (((point.n == 1152 || point.n == 7296 || point.n == 640) && point.k == 2560 &&
           point.t >= 2) ||
-         (point.n == 2560 && point.k == 320) ||
-         (point.n == 4096 && point.k == 128) ||
+         (point.n == 2560 && point.k == 320) || (point.n == 4096 && point.k == 128) ||
          (point.n == 288 && point.k == 4096 && point.t >= 2) ||
          (point.n == 2048 && point.k == 4096 && point.t >= 2) ||
          (point.n == 4096 && point.k == 1024 && point.t >= 2) ||

@@ -1,4 +1,4 @@
-"""The existing frequency shortlist algorithm, using the final tokenizer resources."""
+"""Quantized proposal heads with full or frequency-selected vocabulary domains."""
 
 from __future__ import annotations
 
@@ -46,22 +46,14 @@ def add_proposal(
     recipe: Recipe,
     *,
     ranking: str | Path = DEFAULT_RANKING,
-    rows: int = 131072,
+    rows: int | None = 131072,
     source=None,
     format="q4_g64_fp16",
 ) -> None:
+    """Keep every physical vocabulary row when rows is None; otherwise select a shortlist."""
     model = recipe.model
     if "proposal/head" in model.parameters:
         raise ValueError("proposal head already configured")
-    vocab = model.config["vocab_size"]
-    ranking = Path(ranking)
-    if ranking.stat().st_size == 0 or ranking.stat().st_size % (vocab * 8):
-        raise ValueError("ranking must contain complete int64 vocabulary rows")
-    total = np.fromfile(ranking, dtype="<i8", count=vocab)
-    selected = select_shortlist(
-        total[: model.token_count], rows, model.special_token_ids
-    )
-    ids = torch.from_numpy(selected).to(torch.int32)
     if source is None:
         selections = recipe.selections["text/output_head"]
         if len(selections) != 1:
@@ -69,34 +61,53 @@ def add_proposal(
                 "provide a proposal source when the main head uses split sources"
             )
         source = selections[0].source
-    head = gather_source(source, ids)
+    ids = None
+    if rows is not None:
+        vocab = model.config["vocab_size"]
+        ranking = Path(ranking)
+        if ranking.stat().st_size == 0 or ranking.stat().st_size % (vocab * 8):
+            raise ValueError("ranking must contain complete int64 vocabulary rows")
+        total = np.fromfile(ranking, dtype="<i8", count=vocab)
+        selected = select_shortlist(
+            total[: model.token_count], rows, model.special_token_ids
+        )
+        ids = torch.from_numpy(selected).to(torch.int32)
+    head = source if ids is None else gather_source(source, ids)
     inputs = tuple(
         component + "/final_hidden"
         for component in ("mtp", "dflash", "dflash2")
         if component in model.components
     )
-    model.components["text"]["proposal"] = {"domain": "indexed", "rows": rows}
+    model.components["text"]["proposal"] = (
+        {"domain": "full"} if ids is None else {"domain": "indexed", "rows": rows}
+    )
     model.add(
         Parameter(
             "proposal/head", head.shape, head, inputs=inputs, residency="proposal"
         )
     )
-    model.add(
-        Parameter(
-            "proposal/token_ids",
-            (rows,),
-            array_source(ids, f"shortlist({ranking})"),
-            direct_format="int32",
-            residency="proposal",
-        )
-    )
     recipe.add_parameter("proposal/head")
-    recipe.add_parameter("proposal/token_ids")
-    recipe.assign("proposal/head", format=format, method="grouped_absmax")
+    recipe.assign(
+        "proposal/head",
+        format=format,
+        method="grouped_absmax",
+        activation_policy="A16Only",
+    )
+    if ids is not None:
+        model.add(
+            Parameter(
+                "proposal/token_ids",
+                (rows,),
+                array_source(ids, f"shortlist({ranking})"),
+                direct_format="int32",
+                residency="proposal",
+            )
+        )
+        recipe.add_parameter("proposal/token_ids")
 
 
 def add_official_proposal(
-    recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072
+    recipe: Recipe, *, ranking=DEFAULT_RANKING, rows: int | None = 131072
 ) -> None:
     add_proposal(
         recipe,

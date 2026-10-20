@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+import pytest
 import torch
 
 from tools.artifact.codecs.row_split import (
@@ -79,3 +81,29 @@ def test_nonzero_scale_underflow_uses_smallest_fp16_subnormal() -> None:
     weight[0, 0] = torch.finfo(torch.float32).tiny
     quantized = quantize_matrix(weight, "q4_g64_fp16", device="cpu")
     assert int(quantized.scales.view(torch.int16)[0, 0]) == 1
+
+
+@pytest.mark.parametrize("bits,group", [(4, 64), (5, 64), (6, 64), (8, 32)])
+def test_cuda_grouped_scales_and_codes_match_exact_rounding(bits, group):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    qmax = (1 << (bits - 1)) - 1
+    maxima = torch.arange(0x7F80, dtype=torch.int16).view(torch.bfloat16).float()
+    maxima = maxima[maxima <= 65504 * qmax].numpy()
+    values = maxima[:, None] * np.linspace(-1, 1, group, dtype=np.float32)[None, :]
+    scales = (maxima.astype(np.float64) / qmax).astype(np.float32).astype(np.float16)
+    scales[(scales == 0) & (maxima > 0)] = np.float16(2.0**-24)
+    reciprocal = np.zeros_like(maxima)
+    positive = scales > 0
+    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(
+        np.float32
+    )
+    qmin = -127 if bits == 8 else -qmax - 1
+    codes = np.clip(np.rint(values * reciprocal[:, None]), qmin, qmax).astype(np.int8)
+    encoded = quantize_matrix(
+        torch.from_numpy(values), f"q{bits}_g{group}_fp16", device="cuda"
+    )
+    assert torch.equal(encoded.scales[:, 0].cpu(), torch.from_numpy(scales))
+    assert torch.equal(encoded.codes[:, 0].cpu(), torch.from_numpy(codes))
+    assert torch.count_nonzero(encoded.scales[:, 1:]) == 0
+    assert torch.count_nonzero(encoded.codes[:, 1:]) == 0

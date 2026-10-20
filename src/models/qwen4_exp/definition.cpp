@@ -69,7 +69,8 @@ std::shared_ptr<const ModelDefinition> read_definition(const artifact::Reader& r
     Bindings b(binder);
     const auto& c     = out->config.text;
     out->weights.text = loading::bind_text(b, c);
-    if (out->config.mtp) out->weights.mtp = loading::bind_mtp(b, c, out->weights.text);
+    if (out->config.mtp)
+        out->weights.mtp = loading::bind_mtp(b, c, out->weights.text, options.proposal_head);
     if (out->config.vision)
         out->weights.vision = qwen::bind_vision(b, *out->config.vision, c.hidden);
     const auto table =

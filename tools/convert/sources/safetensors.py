@@ -146,12 +146,12 @@ class SafetensorsSource:
         count = (end - begin) * word_bytes
         fd = self._file(info.file)
         offset = info.offset + begin * word_bytes
-        raw = os.pread(fd, count, offset)
-        if len(raw) != count:
+        raw = bytearray(count)
+        if os.preadv(fd, [raw], offset) != count:
             raise ValueError(f"{name}: short source read")
         self.bytes_read += count
         discard_cached_pages(fd, offset, count)
-        return torch.frombuffer(bytearray(raw), dtype=dtype)
+        return torch.frombuffer(raw, dtype=dtype)
 
     def close(self) -> None:
         while self._fds:

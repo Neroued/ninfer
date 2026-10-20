@@ -20,6 +20,14 @@ constexpr Invocation graph(std::int32_t t) {
 }
 
 void q4_a16_conformance(Suite& suite) {
+    const std::array vocabulary_calls{
+        convenience(1), graph(4), a16(8),     graph(9), a16(16),  a16(17),   a16(32),   a16(33),
+        a16(64),        a16(65),  graph(128), a16(129), a16(512), a16(1024), a16(2048), a16(4096)};
+    for (const int n : {124160, 248320}) {
+        add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::TokenBlocks, make_q4_g64_fp16_weight,
+                  {n, 2560, 211U, Comparison::Sampled, false, vocabulary_calls});
+        add_workspace_cases(suite, QType::Q4_G64_FP16, n, 2560);
+    }
 
     const std::array kN1024K5120{
         convenience(1), graph(2), a16(3),  graph(4),  a16(5),    a16(7),    graph(8), a16(9),

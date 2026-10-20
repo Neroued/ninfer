@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 
+import pytest
 from safetensors.torch import save_file
 import torch
 
@@ -18,7 +19,10 @@ from tools.convert.recipe import Recipe
 from tools.convert.sources.safetensors import SafetensorsSource, tensor_source
 
 
-def test_fp8_quantization_zero_rows_ties_and_signed_zero() -> None:
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_fp8_quantization_zero_rows_ties_and_signed_zero(device) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
     source = torch.tensor(
         (
             (0.0, -0.0, 0.0, -0.0, 0.0),
@@ -27,7 +31,7 @@ def test_fp8_quantization_zero_rows_ties_and_signed_zero() -> None:
         ),
         dtype=torch.bfloat16,
     )
-    quantized = fp8_row.quantize_bf16_rows(source)
+    quantized = fp8_row.quantize_bf16_rows(source.to(device))
     assert quantized.scales.view(torch.int16).tolist() == [0x0000, 0x3F80, 0x3B12]
     assert quantized.codes[0].tolist() == [0, 0, 0, 0, 0]
     assert quantized.codes[1].tolist() == [0x7E, 0x38, 0x3A, 0xB8, 0xBA]
@@ -35,11 +39,16 @@ def test_fp8_quantization_zero_rows_ties_and_signed_zero() -> None:
 
     payload = encode_fp8_row_scaled(quantized.codes, quantized.scales, source.shape)
     codes, scales = decode_fp8_row_scaled_words(payload, source.shape)
-    assert torch.equal(codes, quantized.codes)
-    assert torch.equal(scales.view(torch.int16), quantized.scales.view(torch.int16))
+    assert torch.equal(codes, quantized.codes.cpu())
+    assert torch.equal(
+        scales.view(torch.int16), quantized.scales.cpu().view(torch.int16)
+    )
 
 
-def test_streamed_fp8_conversion_matches_known_words(tmp_path) -> None:
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_streamed_fp8_conversion_matches_known_words(tmp_path, device) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
     name = "model.language_model.embed_tokens.weight"
     source = torch.tensor(
         [
@@ -69,9 +78,23 @@ def test_streamed_fp8_conversion_matches_known_words(tmp_path) -> None:
             "embedding", format="fp8_e4m3fn_row_bf16", method="fp8_row_maxabs"
         )
         path = tmp_path / "embedding.ninfer"
-        convert(model, recipe, path, device="cpu", rows_per_chunk=2)
+        convert(model, recipe, path, device=device, rows_per_chunk=2)
     with Artifact(path) as artifact:
         object_id = artifact.directory.bindings["embedding"]["object"]
         codes = bytes([0x7E, 0x38, 0xBA, 0, 0, 0, 0, 0, 0x7E, 0xFE, 0x76, 0xF6])
         expected = codes + bytes(244) + struct.pack("<3H", 0x3F80, 0, 0x3B92)
         assert artifact.read_object(object_id) == expected
+
+
+def test_cuda_fp8_matches_host_reference_over_bf16_words():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    values[~torch.isfinite(values)] = 0
+    values = values.reshape(256, 256).T.contiguous()
+    codes, scales = fp8_row._quantize_host_rows(values.float().numpy())
+    actual = fp8_row.quantize_bf16_rows(values.cuda())
+    assert torch.equal(actual.codes.cpu(), torch.from_numpy(codes))
+    assert torch.equal(
+        actual.scales.cpu().view(torch.int16), torch.from_numpy(scales.view("int16"))
+    )

@@ -62,6 +62,21 @@ ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path, ReadMode mode) : p
                 if (!probe) throw std::bad_alloc();
                 (void)read_direct(0, {static_cast<std::byte*>(probe.get()), 4096});
             }
+            if (view_.offset_alignment > 4096 && view_.bytes >= 8192) {
+                // Filesystems such as ZFS with recordsize above 4 KiB report a DIO
+                // offset alignment above the 4 KiB unit the artifact layout
+                // guarantees, while the kernel still accepts page-aligned direct
+                // I/O. Probe a 4 KiB unit at a page offset not aligned to the
+                // reported value and relax validation to the 4 KiB unit when the
+                // kernel accepts it.
+                const std::size_t probe_alignment =
+                    std::max<std::size_t>(4096, view_.memory_alignment);
+                std::unique_ptr<void, decltype(&std::free)> probe(
+                    std::aligned_alloc(probe_alignment, probe_alignment), &std::free);
+                if (!probe) throw std::bad_alloc();
+                if (::pread(view_.descriptor, probe.get(), 4096, 4096) == 4096)
+                    view_.offset_alignment = 4096;
+            }
         }
     } catch (...) {
         ::close(view_.descriptor);

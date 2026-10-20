@@ -7,7 +7,7 @@ namespace ninfer::ops::detail::qsa {
 
 inline constexpr int kIndexerMaxVisibleTokens = 262144;
 inline constexpr int kIndexerMaxBlocks        = kIndexerMaxVisibleTokens / 4;
-inline constexpr int kIndexerMaxWindowQueries = 64;
+inline constexpr int kIndexerMaxWindowQueries = 128;
 inline constexpr int kIndexerSelected         = 512;
 inline constexpr int kIndexerKeyTile          = 64;
 

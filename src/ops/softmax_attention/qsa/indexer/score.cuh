@@ -16,7 +16,7 @@ __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexe
     constexpr int KeyGroups = QueryTile > 16 ? 1 : 16 / QueryTile;
     constexpr int WarpKeys  = kIndexerKeyTile / KeyGroups;
     constexpr int NTiles    = WarpKeys / 8;
-    __shared__ IndexerJobs jobs;
+    __shared__ IndexerJobs<> jobs;
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     auto* qs = shared;
     auto* ks = qs + QueryTile * 4 * 128;

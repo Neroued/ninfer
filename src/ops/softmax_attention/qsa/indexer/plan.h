@@ -8,26 +8,29 @@
 
 namespace ninfer::ops::detail::qsa {
 
-inline constexpr int kIndexerWindowQueries = 64;
-inline constexpr int kIndexerPartition     = 4096;
-static_assert(kIndexerWindowQueries <= kIndexerMaxWindowQueries);
+inline constexpr int kIndexerPartition = 4096;
 
 struct IndexerPlan {
     int window_tokens, columns, partitions;
 };
 
+int select_indexer_window_tokens(int tokens, int batch);
+
 inline IndexerPlan select_indexer_plan(int tokens, int batch, std::uint32_t visible_tokens) {
     const int blocks = visible_tokens / 4;
-    return {std::min(tokens, kIndexerWindowQueries / batch),
+    return {select_indexer_window_tokens(tokens, batch),
             (blocks + kIndexerKeyTile - 1) / kIndexerKeyTile * kIndexerKeyTile,
             (blocks + kIndexerPartition - 1) / kIndexerPartition};
 }
 
+enum class IndexerScore { Mma, Simt16, Simt8 };
+
 struct IndexerWindowPlan {
     int query_tile, score_workers, select_workers;
-    int stages         = 1;
-    bool simt          = false;
-    bool compact_radix = false;
+    int stages             = 1;
+    IndexerScore score     = IndexerScore::Mma;
+    bool reverse_selection = false;
+    bool retain_keys       = false;
 };
 
 IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, int sms);

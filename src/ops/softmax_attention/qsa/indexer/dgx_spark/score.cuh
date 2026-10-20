@@ -52,13 +52,13 @@ struct ScoreWorkMap {
     }
 };
 
-template <int Tile, bool Vector, int Stages>
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
 __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipeline_kernel(
     const __grid_constant__ IndexerArguments a) {
     constexpr int Threads = Tile > 16 ? Tile * 8 : 128, KeyGroups = Tile > 16 ? 1 : 16 / Tile,
                   WarpKeys = 64 / KeyGroups, NT = WarpKeys / 8;
     if (a.columns <= kIndexerSelected) return;
-    static_assert(Tile >= 4 && Tile <= 64 && (Tile & (Tile - 1)) == 0);
+    static_assert(Tile >= 4 && Tile <= 128 && (Tile & (Tile - 1)) == 0);
     static_assert(Stages == 1 || Stages == 2);
     __shared__ ScoreWorkMap jobs;
     extern __shared__ __align__(16) __nv_bfloat16 pipe_keys[];
@@ -74,9 +74,13 @@ __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipe
             auto* out = dst + row * 128 + (d ^ ((row & 7) << 3));
             if (g0 + row < jobs.length[group]) {
                 const auto* in = a.key(b, g0 + row) + d;
-                if constexpr (Vector)
-                    common::cp_async<16, Cache::cg>(out, in);
-                else {
+                if constexpr (Vector) {
+                    if constexpr (RetainKeys)
+                        common::cp_async_cache_hint<Cache::cg>(out, in, 16,
+                                                                common::l2_retained_policy());
+                    else
+                        common::cp_async<16, Cache::cg>(out, in);
+                } else {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) out[j] = in[j];
                 }

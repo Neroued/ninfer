@@ -3,9 +3,10 @@
 #include "ops/softmax_attention/qsa/indexer/arguments.h"
 
 namespace ninfer::ops::detail::qsa {
+template <int Capacity = 64>
 struct IndexerJobs {
-    int visible[kIndexerMaxWindowQueries];
-    int prefix[kIndexerMaxWindowQueries + 1];
+    int visible[Capacity];
+    int prefix[Capacity + 1];
     int groups;
 
     __device__ int tile_visible(const IndexerArguments& a, int b, int first, int tile) const {
@@ -28,7 +29,7 @@ struct IndexerJobs {
             const int count   = per_row * a.batch;
             int carry         = 0;
 #pragma unroll
-            for (int half = 0; half < 2; ++half) {
+            for (int half = 0; half < Capacity / 32; ++half) {
                 const int g = tid + half * 32;
                 const int n =
                     g < count ? tile_visible(a, g / per_row, (g % per_row) * QueryTile, QueryTile)

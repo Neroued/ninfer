@@ -165,7 +165,7 @@ int graph_update(DeviceContext& device) {
     MemoryArena workspace(scratch.span());
     DecodeGraphExecutable graph;
     int failures = 0;
-    for (std::uint32_t bound : {0u, 2051u, 2052u, 8192u, 32768u, 262144u, 2051u}) {
+    for (std::uint32_t bound : {0u, 2051u, 2052u, 8192u, 32768u, 65540u, 131076u, 262144u, 2051u}) {
         f.history                     = std::max(1u, bound);
         f.envelope.max_visible_tokens = bound;
         f.reset(0, bound == 0);
@@ -301,6 +301,9 @@ int main(int argc, char** argv) {
         add(t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
     for (int b = 2; b <= 8; ++b) add(64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
     for (int t : {128, 1024, 2048, 4096}) add(t, 1, 262144, 0, Pattern::Dyadic);
+    add(129, 1, 131076, 0, Pattern::Dense, true, 131076);
+    add(65, 4, 65540, 0, Pattern::NearBoundary, true, 65540);
+    add(2, 1, 262144, 0, Pattern::Dense, true);
     for (auto pattern :
          {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {
         add(1, 1, 262144, 0, pattern);

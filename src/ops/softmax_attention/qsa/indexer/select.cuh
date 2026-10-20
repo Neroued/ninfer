@@ -132,14 +132,17 @@ __device__ void indexer_select_512(std::uint64_t (&keys)[Items], int count,
         if (keys[j] >= threshold) store(rank++, keys[j]);
 }
 
-template <int Partition, int Bits = 8, int Copies = 8, int MinBlocks = 1>
+template <int Partition, int Bits = 8, int Copies = 8, int MinBlocks = 1, int MaxQueries = 64,
+          bool Reverse = false>
 __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_kernel(
     const __grid_constant__ IndexerArguments a) {
     if (a.columns <= kIndexerSelected) return;
-    __shared__ IndexerJobs jobs;
+    __shared__ IndexerJobs<MaxQueries> jobs;
     __shared__ IndexerRadixStorage<Bits, Copies> radix;
     if (!jobs.build<1, Partition>(a)) return;
-    for (int job = blockIdx.x; job < jobs.prefix[jobs.groups]; job += gridDim.x) {
+    const int total = jobs.prefix[jobs.groups];
+    for (int step = blockIdx.x; step < total; step += gridDim.x) {
+        const int job  = Reverse ? total - 1 - step : step;
         const int slot = jobs.group_for(job), part = job - jobs.prefix[slot];
         const int first = part * Partition;
         const int count = min(Partition, jobs.visible[slot] - first);
@@ -160,7 +163,8 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_kernel(
     }
 }
 
-template <int Partition, int Bits = 8, int Copies = 8>
+template <int Partition, int Bits = 8, int Copies = 8,
+          int MaxPartitions = kIndexerMaxBlocks / Partition>
 __global__
 __launch_bounds__(256) void indexer_finish_kernel(const __grid_constant__ IndexerArguments a) {
     __shared__ IndexerRadixStorage<Bits, Copies> radix;
@@ -176,7 +180,7 @@ __launch_bounds__(256) void indexer_finish_kernel(const __grid_constant__ Indexe
     const int count =
         (parts - 1) * kIndexerSelected + min(kIndexerSelected, visible - (parts - 1) * Partition);
     const auto* input   = a.candidates + std::int64_t(slot) * a.partitions * kIndexerSelected;
-    constexpr int Items = (kIndexerMaxBlocks / Partition) * kIndexerSelected / 256;
+    constexpr int Items = MaxPartitions * kIndexerSelected / 256;
     std::uint64_t keys[Items];
 #pragma unroll
     for (int j = 0; j < Items; ++j) {

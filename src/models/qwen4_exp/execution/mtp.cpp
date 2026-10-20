@@ -9,8 +9,8 @@
 namespace ninfer::models::qwen4_exp::execution {
 namespace {
 void mtp_stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditioning,
-              const BatchView& batch, std::optional<VisualEmbeddingView> visual,
-              workspace::Roots& roots, MemoryArena& arena, CudaExecutionView cuda) {
+              const BatchView& batch, std::optional<VisualEmbeddingView> visual, Tensor& residual,
+              Tensor& normalized, MemoryArena& arena, CudaExecutionView cuda) {
     const auto m = batch.tokens * batch.batch;
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     auto scope = arena.scope();
@@ -26,13 +26,13 @@ void mtp_stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditi
                     p.fc_embedding.policy, arena, cuda);
     }
     {
-        auto scratch  = arena.scope();
-        auto residual = roots.residual.view({h, streams * m});
-        ops::linear(b.normalized_hidden.view({h, streams * m}), p.fc_hidden.weight, residual,
+        auto scratch   = arena.scope();
+        auto projected = residual.view({h, streams * m});
+        ops::linear(b.normalized_hidden.view({h, streams * m}), p.fc_hidden.weight, projected,
                     p.fc_hidden.policy, arena, cuda);
     }
-    ops::hc_combine_norm(roots.residual, b.projected_embedding, p.layer.attention_hc.norm,
-                         c.norm_epsilon, roots.residual, roots.normalized, cuda);
+    ops::hc_combine_norm(residual, b.projected_embedding, p.layer.attention_hc.norm, c.norm_epsilon,
+                         residual, normalized, cuda);
 }
 
 void mix(const Tensor& normalized, const HcParameters& p, workspace::Roots& roots,
@@ -52,7 +52,8 @@ MtpRun::MtpRun(const TextConfig& config, const QsaConfig& qsa, const MtpParamete
       roots_(workspace::roots(arena, config, batch.tokens * batch.batch)) {}
 
 void MtpRun::stem() {
-    mtp_stem(config_, parameters_, conditioning_, batch_, {}, roots_, arena_, cuda_);
+    mtp_stem(config_, parameters_, conditioning_, batch_, {}, roots_.residual, roots_.normalized,
+             arena_, cuda_);
 }
 
 void MtpRun::local_mixer() {
@@ -107,11 +108,14 @@ void mtp_history(const TextConfig& c, const QsaConfig& qsa_config, const MtpPara
                  ops::QsaCacheView cache, std::optional<VisualEmbeddingView> visual,
                  MemoryArena& arena, CudaExecutionView cuda) {
     auto scope = arena.scope();
-    auto roots = workspace::roots(arena, c, batch.tokens * batch.batch);
-    mtp_stem(c, p, conditioning, batch, visual, roots, arena, cuda);
-    mix(roots.normalized, p.layer.attention_hc, roots, arena, cuda);
-    qsa_history(roots.input, qsa_config, std::get<QsaParameters>(p.layer.mixer), batch, before,
-                after, cache, arena, cuda);
+    auto roots = workspace::history_roots(arena, c, batch.tokens * batch.batch);
+    mtp_stem(c, p, conditioning, batch, visual, roots.residual, roots.normalized, arena, cuda);
+    {
+        auto scratch = arena.scope();
+        ops::hc_mix(roots.normalized, p.history.mix, arena, roots.input, cuda);
+    }
+    qsa_history(roots.input, qsa_config, p.history.attention, batch, before, after, cache, arena,
+                cuda);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

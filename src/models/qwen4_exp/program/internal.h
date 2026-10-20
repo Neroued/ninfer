@@ -128,7 +128,7 @@ public:
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
                    const Tensor& conditioning, std::optional<execution::VisualEmbeddingView>);
     void commit_verify(const Commit&);
-    void finish_verify(std::int32_t batch, bool rebuild_history);
+    void execute_mtp_commit(std::int32_t batch, bool rebuild_history);
     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
                                               std::uint32_t visible);
     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
@@ -172,6 +172,7 @@ public:
     const ExecutionShape& shape;
     std::unique_ptr<Graphs> graphs;
     std::unique_ptr<DeviceGraphs> device_graphs;
+    std::unique_ptr<MtpCommitGraphs> commit_graphs;
     std::optional<GraphMemorySummary> graph_memory;
     std::size_t workspace_lifetime_peak = 0;
     CudaEventTimer prefill_timer;

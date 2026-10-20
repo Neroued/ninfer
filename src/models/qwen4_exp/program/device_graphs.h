@@ -15,7 +15,6 @@ public:
     void replay(std::uint32_t batch, DeviceRound, std::span<const std::uint32_t> draft_visible,
                 std::uint32_t main_visible);
     void decide(std::uint32_t batch, bool verify, std::int32_t candidates);
-    void finish(std::uint32_t batch, bool rebuild_history);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
 
@@ -36,7 +35,6 @@ private:
         std::vector<std::vector<DecodeGraphDefinition>> drafts;
         std::vector<std::array<Round, 4>> rounds;
         std::array<GraphSegment, 4> decisions;
-        std::array<GraphSegment, 2> finish;
     };
 
     [[nodiscard]] execution::TextRun main_run(std::uint32_t batch, bool verify,

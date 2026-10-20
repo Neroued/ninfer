@@ -83,22 +83,25 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
 }
 
 inline Metrics prepare_metrics(int tokens, int axes, int kv_heads, std::span<const int> bases,
-                               std::span<const int> lengths, std::uint64_t kv_token_bytes) {
+                               std::span<const int> lengths, std::uint64_t kv_token_bytes,
+                               bool queries = true) {
     Metrics m;
-    m.read_bytes           = lengths.size() * sizeof(std::int32_t);
-    m.write_bytes          = std::uint64_t(tokens) * lengths.size() * (3072 * kv_heads + 512) * 2;
-    std::uint64_t complete = 0;
+    m.read_bytes              = lengths.size() * sizeof(std::int32_t);
+    const auto query_elements = queries ? 3072 * kv_heads + 512 : 0;
+    m.write_bytes             = std::uint64_t(tokens) * lengths.size() * query_elements * 2;
+    std::uint64_t complete    = 0;
     for (std::size_t b = 0; b < lengths.size(); ++b) {
         const int n = lengths[b], first = bases[b];
         if (!n) continue;
         m.live_queries += n;
         const int blocks = (first + n) / 4 - first / 4;
         complete += blocks;
-        m.read_bytes += std::uint64_t(n) * ((3584 * kv_heads + 512 + 128) * 2 + 4 * (axes + 1));
+        m.read_bytes +=
+            std::uint64_t(n) * ((query_elements + 512 * kv_heads + 128) * 2 + 4 * (axes + 1));
         m.read_bytes += 8 + 4ULL * ((first + n - 1) / 64 - first / 64 + 1);
         if (blocks && first % 4) m.read_bytes += 256ULL * (first % 4) + 12 + 4;
     }
-    if (m.live_queries) m.read_bytes += (256 + 256 + 128) * 2;
+    if (m.live_queries) m.read_bytes += (256 + (queries ? 256 + 128 : 0)) * 2;
     if (complete) m.read_bytes += 128 * 2;
     m.kv_write     = m.live_queries * kv_token_bytes;
     m.index_write  = complete * 128 * 2;

@@ -51,10 +51,17 @@ struct TextProfile {
     ops::LinearProfile ple, head;
 };
 
+struct MtpHistoryProfile {
+    ops::HcFinalMixProfile mix;
+    ops::LinearProfile input;
+    std::array<std::int32_t, 3> output_rows;
+};
+
 struct MtpProfile {
     ops::LinearProfile fc_embedding, fc_hidden, head;
     BlockProfile layer;
     ops::HcFinalMixProfile final_hc;
+    MtpHistoryProfile history;
 };
 
 // Immutable, address-free descriptions of the selected actual representations.

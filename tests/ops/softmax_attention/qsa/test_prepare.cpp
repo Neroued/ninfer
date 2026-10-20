@@ -25,7 +25,7 @@ struct Ideal {
 };
 
 Ideal oracle(const std::vector<double>& raw, const Buffer<std::uint16_t>& weight,
-             std::array<int, 3> rho, const ops::QsaPrepareParameters& params) {
+             std::array<int, 3> rho, const ops::QsaKvPrepareParameters& params) {
     const int d = raw.size();
     double sum  = 0;
     for (double x : raw) sum += x * x;
@@ -69,8 +69,12 @@ struct Error {
 };
 
 int verify(Fixture& f, const std::string& label) {
-    const auto actual_q  = from_device<std::uint16_t>(f.query_output.data, f.q.host.size());
-    const auto actual_iq = from_device<std::uint16_t>(f.iq_output.data, f.iq.host.size());
+    const auto actual_q  = f.kv_only
+                               ? std::vector<std::uint16_t>{}
+                               : from_device<std::uint16_t>(f.query_output.data, f.q.host.size());
+    const auto actual_iq = f.kv_only
+                               ? std::vector<std::uint16_t>{}
+                               : from_device<std::uint16_t>(f.iq_output.data, f.iq.host.size());
     const auto actual_k = f.keys.download(), actual_ks = f.key_scales.download();
     const auto actual_ik = f.compressed.download();
     auto expected_k = f.keys.host, expected_v = f.values.host;
@@ -87,7 +91,7 @@ int verify(Fixture& f, const std::string& label) {
     const auto ideal_head = [&](const auto& input, int h, int t, int b, const auto& weight) {
         std::vector<double> raw(input.view.ne[0]);
         for (int c = 0; c < input.view.ne[0]; ++c) raw[c] = bf16_to_f32(input.at(c, h, t, b));
-        return oracle(raw, weight, coordinates(t, b), f.parameters);
+        return oracle(raw, weight, coordinates(t, b), f.parameters.kv);
     };
     const auto head = [&](const auto& input, int h, int t, int b, const auto& weight,
                           const auto& actual, std::size_t offset, Error& error) {
@@ -99,6 +103,7 @@ int verify(Fixture& f, const std::string& label) {
         const int n = f.valid.at(b), base = f.bases[b];
         for (int t = 0; t < f.T; ++t) {
             if (t >= n) {
+                if (f.kv_only) continue;
                 for (int h = 0; h < f.query_heads; ++h)
                     for (int c = 0; c < 256; ++c) failures += actual_q[f.q.index(c, h, t, b)] != 0;
                 for (int h = 0; h < 4; ++h)
@@ -106,10 +111,12 @@ int verify(Fixture& f, const std::string& label) {
                         failures += actual_iq[f.iq.index(c, h, t, b)] != 0;
                 continue;
             }
-            for (int h = 0; h < f.query_heads; ++h)
-                head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error);
-            for (int h = 0; h < 4; ++h)
-                head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
+            if (!f.kv_only) {
+                for (int h = 0; h < f.query_heads; ++h)
+                    head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error);
+                for (int h = 0; h < 4; ++h)
+                    head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
+            }
             const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
             for (int h = 0; h < f.kv_heads; ++h) {
                 const auto ideal = ideal_head(f.k, h, t, b, f.wk);
@@ -187,7 +194,7 @@ int verify(Fixture& f, const std::string& label) {
                 for (const auto& token : pending) sum += token[c];
                 pooled[c] = bf16_to_f32(f32_to_bf16(float(sum / 4)));
             }
-            const auto ideal = oracle(pooled, f.wik, first, f.parameters);
+            const auto ideal = oracle(pooled, f.wik, first, f.parameters.kv);
             const int g = (base + t) / 4, page = f.tables.at(g / 16, f.table_rows.at(b));
             for (int c = 0; c < 128; ++c) {
                 const auto idx = f.compressed.index(c, g % 16, 0, page);
@@ -206,8 +213,8 @@ int verify(Fixture& f, const std::string& label) {
     failures += verify_exact("V scales", f.value_scales.download(), expected_vs);
     failures += verify_exact("raw records", f.records.download(), expected_raw);
     failures += verify_exact("coordinate records", f.record_rope.download(), expected_rope);
-    if (!(f.alias & 1)) failures += f.q.preserved("raw Q");
-    if (!(f.alias & 2)) failures += f.iq.preserved("raw IQ");
+    if (f.kv_only || !(f.alias & 1)) failures += f.q.preserved("raw Q");
+    if (f.kv_only || !(f.alias & 2)) failures += f.iq.preserved("raw IQ");
     for (auto* x : {&f.k, &f.v, &f.ik, &f.wq, &f.wk, &f.wiq, &f.wik, &f.tail})
         failures += x->preserved("input");
     for (auto* x : {&f.first, &f.positions, &f.rope, &f.valid, &f.table_rows, &f.slots, &f.offsets,
@@ -218,24 +225,27 @@ int verify(Fixture& f, const std::string& label) {
     for (auto* x : {&f.keys, &f.values, &f.key_scales, &f.value_scales})
         failures += x->guards(label);
     failures += f.record_rope.device->verify_guards(label);
+    if (f.kv_only)
+        failures += f.out_q.preserved("unused Q output") + f.out_iq.preserved("unused IQ output");
     if (failures) std::cerr << label << ": " << failures << " failures\n";
     return failures;
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
-        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2) {
+        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2, bool kv_only = false) {
     Fixture f(t, b, axes, alias, layout, capacity, storage, kv_heads);
+    f.kv_only = kv_only;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
     for (int phase = 0; phase < 3; ++phase) {
         f.reset(phase, phase == 1);
         if (phase == 1) {
-            f.parameters.rms_epsilon = 2e-5F;
-            f.parameters.rope_theta  = 500000;
+            f.parameters.kv.rms_epsilon = 2e-5F;
+            f.parameters.kv.rope_theta  = 500000;
         } else {
-            f.parameters.rms_epsilon = 1e-6F;
-            f.parameters.rope_theta  = 1e7F;
+            f.parameters.kv.rms_epsilon = 1e-6F;
+            f.parameters.kv.rope_theta  = 1e7F;
         }
         if (phase == 0) {
             definition.capture(device.stream(), [&] { f.launch(device.execution_view()); });
@@ -256,8 +266,9 @@ int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, in
 }
 
 int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                 int kv_heads = 2) {
+                 int kv_heads = 2, bool kv_only = false) {
     Fixture f(4, 1, 3, 0, 2, 0, storage, kv_heads);
+    f.kv_only     = kv_only;
     f.base_origin = 6;
     f.reset(0, true);
     f.launch(device.execution_view());
@@ -295,8 +306,9 @@ int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage:
 }
 
 int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-             int kv_heads = 2) {
+             int kv_heads = 2, bool kv_only = false) {
     Fixture f(9, 1, 3, 3, 2, 0, storage, kv_heads);
+    f.kv_only     = kv_only;
     f.base_origin = 63;
     f.reset(0, true);
     f.launch(device.execution_view());
@@ -328,8 +340,13 @@ int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFl
             for (int t = 0; t < n; ++t) coords[t + n * a] = f.rope.at(offset + t, a, 0);
         auto rope    = to_device_i32(coords);
         Tensor q_out = p.query, iq_out = p.index_query;
-        ops::qsa_prepare(p, f.parameters, batch, Tensor(rope.span(), DType::I32, {n, 3, 1}),
-                         f.before, f.cache, f.write, q_out, iq_out, device.execution_view());
+        if (kv_only)
+            ops::qsa_prepare_kv({p.key, p.value, p.index_key}, f.parameters.kv, batch,
+                                Tensor(rope.span(), DType::I32, {n, 3, 1}), f.before, f.cache,
+                                f.write, device.execution_view());
+        else
+            ops::qsa_prepare(p, f.parameters, batch, Tensor(rope.span(), DType::I32, {n, 3, 1}),
+                             f.before, f.cache, f.write, q_out, iq_out, device.execution_view());
         const int frontier = 63 + offset;
         base.copy_from_host(&frontier, 4);
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -360,7 +377,7 @@ int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFl
 int numerical_edges(DeviceContext& device, bool wide_phase) {
     Fixture f(wide_phase ? 5 : 2048, 1, 3, 3, 0);
     f.reset(2, true);
-    f.parameters.rope_theta = wide_phase ? 0.5F : 1e7F;
+    f.parameters.kv.rope_theta = wide_phase ? 0.5F : 1e7F;
     for (int c = 0; c < 256; ++c) {
         f.q.at(c, 0, 0, 0) = 0;
         f.q.at(c, 1, 0, 0) = f32_to_bf16((c % 3 - 1) * 1e20F);
@@ -374,7 +391,7 @@ int numerical_edges(DeviceContext& device, bool wide_phase) {
 
 int epsilon_range(DeviceContext& device) {
     Fixture f(1, 1, 1);
-    f.parameters.rms_epsilon = std::numeric_limits<float>::max();
+    f.parameters.kv.rms_epsilon = std::numeric_limits<float>::max();
     for (int c = 0; c < 256; ++c) f.q.at(c, 0, 0, 0) = f32_to_bf16(1e18F);
     f.q.upload();
     f.launch(device.execution_view());
@@ -409,7 +426,7 @@ int norm_alignment_and_phase(DeviceContext& device,
             f.parameters.index_query_norm = shifted ? wiq.view.slice(0, 1, 128) : f.wiq.view;
             for (float theta : {1e7F, 0.5F}) {
                 f.reset(2, true);
-                f.parameters.rope_theta = theta;
+                f.parameters.kv.rope_theta = theta;
                 f.launch(device.execution_view());
                 device.synchronize();
                 failures += verify(f, "norm alignment/phase domain");
@@ -492,18 +509,19 @@ int validation(DeviceContext& device) {
     auto q              = f.query_output;
     f.query_output.data = static_cast<std::byte*>(f.q.view.data) + 16;
     failures += rejects("partial Q alias", [&] { f.launch(device.execution_view()); });
-    f.query_output           = q;
-    f.parameters.rms_epsilon = 0;
+    f.query_output              = q;
+    f.parameters.kv.rms_epsilon = 0;
     failures += rejects("zero epsilon", [&] { f.launch(device.execution_view()); });
     return failures;
 }
 
-int exact_key_encoding(DeviceContext& device, KvCacheStorage storage) {
+int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
     Fixture f(16, 1, 1, 3, 1, 0, storage);
+    f.kv_only     = kv_only;
     f.base_origin = 64;
     f.reset(0, true);
-    f.parameters.rms_epsilon = 3;
-    f.exact_key              = true;
+    f.parameters.kv.rms_epsilon = 3;
+    f.exact_key                 = true;
     // |Kraw|=1 and epsilon=3 give an exact inverse RMS of 1/2. Zero RoPE coordinates
     // leave dyadic 0.5*(1+w) values that are FP32-exact but generally not BF16-exact.
     for (int c = 0; c < 256; ++c) f.wk.at(c) = f32_to_bf16(((c * 37 + 17) % 127 - 63) / 512.0F);
@@ -541,8 +559,9 @@ int exact_key_encoding(DeviceContext& device, KvCacheStorage storage) {
     return failures;
 }
 
-int scale_edges(DeviceContext& device, KvCacheStorage storage) {
+int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
     Fixture f(8, 1, 1, 0, 1, 0, storage);
+    f.kv_only = kv_only;
     constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
     constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
     for (int t = 0; t < f.T; ++t)
@@ -664,6 +683,40 @@ int main(int argc, char** argv) {
                                                   KvCacheStorage::BFloat16, 1);
               },
               {{"format", "bf16"}});
+
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        const std::string prefix = std::string("qsa_prepare_kv/") + kv_cache_storage_name(storage);
+        for (int heads : {1, 2})
+            for (auto [t, b] : {std::pair{1, 1}, {9, 4}, {65, 1}, {257, 1}})
+                suite.add(prefix + "/h" + std::to_string(heads) + "/t" + std::to_string(t),
+                          [=] {
+                              return run(cuda_environment().context, t, b, b == 1 ? 1 : 3, 0,
+                                         b == 1 ? 1 : 2, b == 1 ? 0 : 5, storage, heads, true);
+                          },
+                          {{"format", kv_cache_storage_name(storage)}, {"suite", "kv"}});
+        suite.add(prefix + "/continuation",
+                  [=] { return continuation(cuda_environment().context, storage, 1, true); },
+                  {{"format", kv_cache_storage_name(storage)}, {"suite", "kv"}});
+        suite.add(prefix + "/chunking",
+                  [=] { return chunking(cuda_environment().context, storage, 2, true); },
+                  {{"format", kv_cache_storage_name(storage)}, {"suite", "kv"}});
+        if (storage != KvCacheStorage::BFloat16) {
+            suite.add(prefix + "/key_encoding",
+                      [=] { return exact_key_encoding(cuda_environment().context, storage, true); },
+                      {{"format", kv_cache_storage_name(storage)}, {"suite", "kv"}});
+            suite.add(prefix + "/scale_edges",
+                      [=] { return scale_edges(cuda_environment().context, storage, true); },
+                      {{"format", kv_cache_storage_name(storage)}, {"suite", "kv"}});
+        }
+    }
+    suite.add("qsa_prepare_kv/bf16/prefill",
+              [] {
+                  return run(cuda_environment().context, 4096, 1, 3, 0, 0, 0,
+                             KvCacheStorage::BFloat16, 2, true);
+              },
+              {{"format", "bf16"}, {"suite", "kv"}});
 
     return suite.main(argc, argv);
 }

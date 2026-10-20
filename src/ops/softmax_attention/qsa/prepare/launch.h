@@ -10,4 +10,10 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                     CudaExecutionView execution);
 
+void launch_prepare_kv(const QsaKvProjectionView& projected,
+                       const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
+                       const Tensor& rope_positions, const QsaTailStateView& before,
+                       QsaCacheView cache, QsaRawRecordWriteView records,
+                       CudaExecutionView execution);
+
 } // namespace ninfer::ops::detail::qsa

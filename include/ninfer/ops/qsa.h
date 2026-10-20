@@ -39,16 +39,26 @@ struct QsaProjectionView {
     Tensor index_key;   // BF16 [128,T,B], raw projection.
 };
 
-struct QsaPrepareParameters {
-    Tensor query_norm;       // BF16 [256], offset weights: gain = 1 + FP32(weight).
-    Tensor key_norm;         // BF16 [256].
-    Tensor index_query_norm; // BF16 [128].
-    Tensor index_key_norm;   // BF16 [128].
+struct QsaKvProjectionView {
+    Tensor key;       // BF16 [256,Hkv,T,B].
+    Tensor value;     // BF16 [256,Hkv,T,B].
+    Tensor index_key; // BF16 [128,T,B], raw projection.
+};
+
+struct QsaKvPrepareParameters {
+    Tensor key_norm;       // BF16 [256], offset weights: gain = 1 + FP32(weight).
+    Tensor index_key_norm; // BF16 [128].
     float rms_epsilon        = 1e-6F;
     float rope_theta         = 1e7F;
     std::uint32_t rotary_dim = 64;
     std::array<std::uint32_t, 3> rope_sections{11, 11, 10};
     bool rope_interleaved = true;
+};
+
+struct QsaPrepareParameters {
+    QsaKvPrepareParameters kv;
+    Tensor query_norm;       // BF16 [256], offset weights.
+    Tensor index_query_norm; // BF16 [128].
 };
 
 struct QsaIndexCacheView {
@@ -271,6 +281,24 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
                  const QsaBatchView& batch, const Tensor& rope_positions,
                  const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
                  Tensor& query, Tensor& index_query, CudaExecutionView execution);
+
+/**
+ * The K/V, compressed index-key and raw-record effects of qsa_prepare, with no query
+ * inputs or outputs. K normalization/RoPE, V encoding, four-token index-key pooling,
+ * its BF16 mean boundary, and cross-call tail/coordinate selection follow that contract.
+ *
+ * T/B/Hkv come from projected.key; projections follow QsaKvProjectionView. Parameters,
+ * metadata, all five cache encodings, tail and records have the same domain and alias
+ * requirements as qsa_prepare. Only live columns and newly completed index blocks are
+ * written; inert columns read no projections, positions, state or table selectors.
+ * Inputs and untouched storage are preserved. No frontier or tail state is published.
+ * Zero global scratch and no hidden allocation; Graph replay consumes current Device
+ * metadata. The caller owns allocation, readiness, tail extraction and acceptance.
+ */
+void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPrepareParameters& parameters,
+                    const QsaBatchView& batch, const Tensor& rope_positions,
+                    const QsaTailStateView& before, QsaCacheView cache,
+                    QsaRawRecordWriteView records, CudaExecutionView execution);
 
 /**
  * Op: qsa_tail_extract

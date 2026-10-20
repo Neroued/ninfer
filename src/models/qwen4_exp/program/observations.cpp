@@ -9,7 +9,8 @@ RankExecutionObservation RankProgramImpl::retirement_observation() const noexcep
     RankExecutionObservation out;
     const auto peak = std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
                                 graphs ? graphs->workspace_peak() : 0,
-                                device_graphs ? device_graphs->workspace_peak() : 0});
+                                device_graphs ? device_graphs->workspace_peak() : 0,
+                                commit_graphs ? commit_graphs->workspace_peak() : 0});
     out.expert_upload_bytes    = resources.experts ? resources.experts->uploaded_bytes() : 0;
     out.ple_upload_bytes       = resources.ple_upload ? resources.ple_upload->uploaded_bytes() : 0;
     out.workspace_peak_bytes   = std::max(workspace_lifetime_peak, peak);
@@ -44,7 +45,8 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     const auto active_vision = active_vision_bytes();
     const auto peak = std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
                                 graphs ? graphs->workspace_peak() : 0,
-                                device_graphs ? device_graphs->workspace_peak() : 0});
+                                device_graphs ? device_graphs->workspace_peak() : 0,
+                                commit_graphs ? commit_graphs->workspace_peak() : 0});
     out.workspace   = {resources.workspace.used(), std::max(workspace_lifetime_peak, peak), peak};
     for (std::uint32_t i = 0; i < resources.pool_count(); ++i) {
         const auto& pool = resources.pool(i).pages();
@@ -109,13 +111,14 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
 }
 
 void RankProgramImpl::reset_measurement_peaks() noexcept {
-    workspace_lifetime_peak =
-        std::max({workspace_lifetime_peak, resources.workspace.peak_used(),
-                  vision_workspace_peak_bytes, graphs ? graphs->workspace_peak() : 0,
-                  device_graphs ? device_graphs->workspace_peak() : 0});
+    workspace_lifetime_peak = std::max(
+        {workspace_lifetime_peak, resources.workspace.peak_used(), vision_workspace_peak_bytes,
+         graphs ? graphs->workspace_peak() : 0, device_graphs ? device_graphs->workspace_peak() : 0,
+         commit_graphs ? commit_graphs->workspace_peak() : 0});
     resources.workspace.reset_peak();
     if (graphs) graphs->reset_workspace_peak();
     if (device_graphs) device_graphs->reset_workspace_peak();
+    if (commit_graphs) commit_graphs->reset_workspace_peak();
     vision_handoff_peak_bytes = active_vision_bytes();
     vision_workspace_peak_bytes =
         vision_handoff_peak_bytes && !resources.plan.persistent.buffers.vision_features

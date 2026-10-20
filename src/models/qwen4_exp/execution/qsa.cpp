@@ -83,14 +83,28 @@ void qsa(const Tensor& input, const QsaConfig& c, const QsaParameters& p, const 
     if (after) extract(before, *after, records, batch, cuda);
 }
 
-void qsa_history(const Tensor& input, const QsaConfig& c, const QsaParameters& p,
+void qsa_history(const Tensor& input, const QsaConfig& c, const QsaHistoryParameters& p,
                  const BatchView& batch, const ops::QsaTailStateView& before,
                  ops::QsaTailStateView after, ops::QsaCacheView cache, MemoryArena& arena,
                  CudaExecutionView cuda) {
     auto scope   = arena.scope();
-    auto buffers = workspace::qsa(arena, c, batch.tokens * batch.batch, true);
-    ops::QsaRawRecordWriteView records;
-    prepare(input, c, p, batch, before, cache, buffers, records, arena, cuda);
+    const auto t = batch.tokens, b = batch.batch, m = t * b;
+    const auto d = dimension(c.head_dim), kh = dimension(c.kv_heads);
+    const auto kw = dimension(c.kv_width()), ik = dimension(c.index_key_width());
+    auto buffers = workspace::qsa_history(arena, c, m);
+    {
+        auto scratch = arena.scope();
+        const std::array outputs{buffers.key.view({kw, m}), buffers.value.view({kw, m}),
+                                 buffers.index_key};
+        ops::linear_split(input, p.input, outputs, arena, cuda);
+    }
+    const ops::QsaRawRecordWriteView records{buffers.raw_records.view({ik, t, b}),
+                                             buffers.coordinate_records.view({3, t, b}),
+                                             batch.record_offsets};
+    ops::qsa_prepare_kv({buffers.key.view({d, kh, t, b}), buffers.value.view({d, kh, t, b}),
+                         buffers.index_key.view({ik, t, b})},
+                        p.prepare, {batch.positions, batch.valid_columns, batch.table_rows},
+                        batch.rope_positions, before, cache, records, cuda);
     extract(before, after, records, batch, cuda);
 }
 

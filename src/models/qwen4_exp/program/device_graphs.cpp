@@ -22,7 +22,7 @@ execution::TextRun DeviceGraphs::main_run(std::uint32_t batch, bool verify, std:
                                        r.tensor(io.main_qsa.keys),
                                        r.tensor(io.main_qsa.coordinates),
                                        r.tensor(io.ple_records),
-                                       &*p.parallel};
+                                       p.parallel ? &*p.parallel : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
     return execution::TextRun(p.parameters, execution, r.main_batch(tokens, batch, visible), update,
@@ -171,12 +171,6 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
                     p.parallel ? &*p.parallel : nullptr);
             }
     }
-    if (drafts)
-        for (std::uint32_t b = 1; b <= p.shape.max_concurrency; ++b)
-            for (int rebuild = 0; rebuild < 2; ++rebuild)
-                batches_[b - 1].finish[rebuild].prepare(
-                    p.cuda, [&] { p.finish_verify(b, rebuild); },
-                    p.parallel ? &*p.parallel : nullptr);
     workspace_peak_ = r.workspace.peak_used();
 }
 
@@ -209,11 +203,6 @@ void DeviceGraphs::replay(std::uint32_t batch, DeviceRound mode,
 
 void DeviceGraphs::decide(std::uint32_t batch, bool verify, std::int32_t candidates) {
     batches_.at(batch - 1).decisions[verify * 2 + (candidates == 20)].launch(
-        owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
-}
-
-void DeviceGraphs::finish(std::uint32_t batch, bool rebuild_history) {
-    batches_.at(batch - 1).finish[rebuild_history].launch(
         owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
 }
 

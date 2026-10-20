@@ -109,7 +109,7 @@ struct Fixture {
     int T, B, A, alias, R, pages_per_row, kv_heads, query_heads;
     KvCacheStorage storage;
     CacheEncoding encoding;
-    bool exact_key  = false;
+    bool exact_key = false, kv_only = false;
     int base_origin = 60;
     Buffer<std::uint16_t> q, k, v, iq, ik, out_q, out_iq, wq, wk, wiq, wik;
     Buffer<std::uint16_t> tail, records, compressed;
@@ -150,7 +150,7 @@ struct Fixture {
           table_rows(DType::I32, {B}), slots(DType::I32, {B}), offsets(DType::I32, {B}),
           tables(DType::I32, {(T + 256 + 63) / 64, B + 1}, layout != 0), bases(B) {
         projected  = {q.view, k.view, v.view, iq.view, ik.view};
-        parameters = {wq.view, wk.view, wiq.view, wik.view};
+        parameters = {{wk.view, wik.view}, wq.view, wiq.view};
         batch      = {positions.view, valid.view, table_rows.view};
         before     = {tail.view, first.view, slots.view};
         write      = {records.view, record_rope.view, offsets.view};
@@ -242,8 +242,12 @@ struct Fixture {
     }
 
     void launch(CudaExecutionView execution) {
-        ops::qsa_prepare(projected, parameters, batch, rope.view, before, cache, write,
-                         query_output, iq_output, execution);
+        if (kv_only)
+            ops::qsa_prepare_kv({projected.key, projected.value, projected.index_key},
+                                parameters.kv, batch, rope.view, before, cache, write, execution);
+        else
+            ops::qsa_prepare(projected, parameters, batch, rope.view, before, cache, write,
+                             query_output, iq_output, execution);
     }
 };
 

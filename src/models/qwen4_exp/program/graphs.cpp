@@ -321,6 +321,37 @@ void Graphs::accept(std::uint32_t batch) {
     batches_.at(batch - 1).accept.executable.launch(owner_.cuda.stream());
 }
 
+void MtpCommitGraphs::prepare(GraphInputs& inputs) {
+    auto& p          = owner_;
+    auto& r          = p.resources;
+    const auto& io   = r.plan.persistent.buffers;
+    const auto width = p.shape.draft_tokens + 1;
+    batches_.resize(p.shape.max_concurrency);
+    for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
+        inputs.batch(r.main_batch(width, batch, p.shape.max_context), p.shape.max_context);
+        inputs.batch(r.mtp_batch(io.mtp->draft_steps[0], 1, batch, p.shape.max_context),
+                     p.shape.max_context);
+        std::vector<std::int32_t> slots(batch);
+        for (std::uint32_t b = 0; b < batch; ++b) slots[b] = b;
+        write_i32(r.tensor(io.batch.count_slots).slice(0, 0, batch), slots, p.cuda);
+        for (int rebuild = 0; rebuild < 2; ++rebuild) {
+            write_i32(r.tensor(io.batch.accepted_columns).slice(0, 0, batch),
+                      std::vector<std::int32_t>(batch, rebuild ? width : 1), p.cuda);
+            r.workspace.reset_peak();
+            auto& variant = batches_[batch - 1][rebuild];
+            variant.graph.prepare(p.cuda, [&] { p.execute_mtp_commit(batch, rebuild); });
+            variant.workspace_bytes = r.workspace.peak_used();
+        }
+    }
+    r.workspace.reset_peak();
+}
+
+void MtpCommitGraphs::replay(std::uint32_t batch, bool rebuild_history) {
+    auto& variant   = batches_.at(batch - 1)[rebuild_history];
+    workspace_peak_ = std::max(workspace_peak_, variant.workspace_bytes);
+    variant.graph.launch(owner_.cuda);
+}
+
 void RankProgramImpl::initialize_graphs() {
     if (!shape.cuda_graph) return;
     nvtx::ScopedRange range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
@@ -334,6 +365,10 @@ void RankProgramImpl::initialize_graphs() {
         device_graphs = std::make_unique<DeviceGraphs>(*this);
         device_graphs->prepare(inputs);
     }
+    if (parameters.mtp && shape.draft_tokens) {
+        commit_graphs = std::make_unique<MtpCommitGraphs>(*this);
+        commit_graphs->prepare(inputs);
+    }
     graph_memory.emplace();
     graph_memory->preparation_increment_bytes =
         device_memory_growth(before, device_memory_snapshot(cuda.device()));
@@ -345,6 +380,7 @@ void RankProgramImpl::release_graphs() {
     resources.synchronize();
     graphs.reset();
     device_graphs.reset();
+    commit_graphs.reset();
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

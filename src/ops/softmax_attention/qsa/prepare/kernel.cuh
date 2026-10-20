@@ -44,11 +44,11 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
     for (int j = 0; j < 4; ++j) out[lane + 32 * j] = __float2bfloat16_rn(pooled[j]);
 }
 
-template <int KvHeads>
+template <int KvHeads, bool Queries>
 struct PrepareGeometry {
     static constexpr int warps       = 4;
-    static constexpr int query_heads = 12 * KvHeads;
-    static constexpr int key_task    = query_heads + 4;
+    static constexpr int query_heads = Queries ? 12 * KvHeads : 0;
+    static constexpr int key_task    = Queries ? query_heads + 4 : 0;
     static constexpr int raw_task    = key_task + KvHeads;
     static constexpr int groups      = (raw_task + 1 + warps - 1) / warps;
 };
@@ -57,10 +57,10 @@ struct PrepareGeometry {
 // Compression reads immutable projections/tail, never records.
 // A carried block retains its first token's three axes even when current coordinates use A=1.
 template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool TokenMajor,
-          int KvHeads>
+          int KvHeads, bool Queries>
 __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ PrepareArguments a) {
-    using Geometry = PrepareGeometry<KvHeads>;
-    const int t = TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x;
+    using Geometry = PrepareGeometry<KvHeads, Queries>;
+    const int t    = TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x;
     const int b = blockIdx.y, lane = threadIdx.x % 32;
     const int group = TokenMajor ? blockIdx.x % Geometry::groups : blockIdx.z;
     const int task  = group * Geometry::warps + threadIdx.x / 32;
@@ -71,22 +71,29 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
         coefficients[lane] =
             prepare_sincos<BoundedPhase>(a.frequency[lane], coordinate(a, t, b, lane % 3));
     __syncthreads();
-    if (task < Geometry::query_heads) {
-        const auto offset = (m * Geometry::query_heads + task) * 256;
-        vector_head<256, VectorWeights>(a.q + offset, a.wq, a.out_q + offset, a.epsilon,
-                                        coefficients, lane, live);
-    } else if (task < Geometry::key_task) {
-        const auto offset = (m * 4 + task - Geometry::query_heads) * 128;
-        vector_head<128, VectorWeights>(a.iq + offset, a.wiq, a.out_iq + offset, a.epsilon,
-                                        coefficients, lane, live);
-    } else if (live && task < Geometry::raw_task) {
+    if constexpr (Queries) {
+        if (task < Geometry::query_heads) {
+            const auto offset = (m * Geometry::query_heads + task) * 256;
+            vector_head<256, VectorWeights>(a.q + offset, a.wq, a.out_q + offset, a.epsilon,
+                                            coefficients, lane, live);
+            return;
+        }
+        if (task < Geometry::key_task) {
+            const auto offset = (m * 4 + task - Geometry::query_heads) * 128;
+            vector_head<128, VectorWeights>(a.iq + offset, a.wiq, a.out_iq + offset, a.epsilon,
+                                            coefficients, lane, live);
+            return;
+        }
+    }
+    if (live && task < Geometry::raw_task) {
         if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
                       Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             __shared__ float scratch[KvHeads][256];
-            prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane, coefficients[lane],
-                                         scratch[task - Geometry::key_task]);
+            prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
+                                         coefficients[lane], scratch[task - Geometry::key_task]);
         } else {
-            prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane, coefficients[lane]);
+            prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
+                                         coefficients[lane]);
         }
     } else if (live && task == Geometry::raw_task) {
         prepare_raw<BoundedPhase>(a, t, b, lane, m);

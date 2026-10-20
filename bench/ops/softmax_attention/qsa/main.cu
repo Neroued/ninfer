@@ -46,17 +46,18 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
     for (int tokens : options.tokens) {
         qsa::PrepareFixture fixture(options, tokens);
         measurement::Row row;
-        row.op             = "qsa_prepare";
+        row.op             = fixture.kv_only ? "qsa_prepare_kv" : "qsa_prepare";
         row.format         = qsa::name(options.storage);
         row.tokens         = tokens;
         row.batch          = options.batch;
         row.valid          = qsa::csv_list(fixture.counts);
-        row.qk_heads       = 12 * options.kv_heads;
+        row.qk_heads       = fixture.kv_only ? 0 : 12 * options.kv_heads;
         row.value_heads    = options.kv_heads;
         const auto metrics = qsa::prepare_metrics(
             tokens, options.axes, options.kv_heads, fixture.bases, fixture.counts,
             options.kv_heads *
-                paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head());
+                paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head(),
+            !fixture.kv_only);
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -181,7 +182,7 @@ int main(int argc, char** argv) {
             measure_tail(options, device, flush);
             return 0;
         }
-        if (options.op == "prepare") {
+        if (options.op == "prepare" || options.op == "prepare-kv") {
             measure_prepare(options, device, flush);
             return 0;
         }

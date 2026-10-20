@@ -36,6 +36,16 @@ struct QsaParameters {
     LinearParameters output;
 };
 
+struct QsaHistoryParameters {
+    LinearParameters input;
+    ops::QsaKvPrepareParameters prepare;
+};
+
+struct MtpHistoryParameters {
+    ops::HcFinalMixWeights mix;
+    QsaHistoryParameters attention;
+};
+
 struct BlockParameters {
     HcParameters attention_hc, moe_hc;
     std::variant<GdnParameters, QsaParameters> mixer;
@@ -62,6 +72,7 @@ struct MtpParameters {
     Tensor embedding_norm, hidden_norm;
     BlockParameters layer;
     FinalHcParameters final_hc;
+    MtpHistoryParameters history;
 };
 
 class Parameters {

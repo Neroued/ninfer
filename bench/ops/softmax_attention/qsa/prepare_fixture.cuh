@@ -45,21 +45,27 @@ struct PrepareFixture {
     ops::QsaRawRecordWriteView records;
     ops::QsaCacheView cache;
     Tensor rho, query, index_query;
+    bool kv_only;
 
     PrepareFixture(const Options& o, int tokens)
-        : q(make_bf16(std::size_t(3072 * o.kv_heads) * tokens * o.batch, 101)),
+        : q(o.op == "prepare-kv"
+                ? DeviceBuffer{}
+                : make_bf16(std::size_t(3072 * o.kv_heads) * tokens * o.batch, 101)),
           k(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 103)),
           v(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 107)),
-          iq(make_bf16(std::size_t(512) * tokens * o.batch, 109)),
-          ik(make_bf16(std::size_t(128) * tokens * o.batch, 113)), wq(make_bf16(256, 127)),
-          wk(make_bf16(256, 131)), wiq(make_bf16(128, 137)), wik(make_bf16(128, 139)),
+          iq(o.op == "prepare-kv" ? DeviceBuffer{}
+                                  : make_bf16(std::size_t(512) * tokens * o.batch, 109)),
+          ik(make_bf16(std::size_t(128) * tokens * o.batch, 113)),
+          wq(o.op == "prepare-kv" ? DeviceBuffer{} : make_bf16(256, 127)), wk(make_bf16(256, 131)),
+          wiq(o.op == "prepare-kv" ? DeviceBuffer{} : make_bf16(128, 137)),
+          wik(make_bf16(128, 139)),
           out_q(ninfer::bench::device_context().device(), o.inplace ? 0 : q.size()),
           out_iq(ninfer::bench::device_context().device(), o.inplace ? 0 : iq.size()),
           before_raw(128, 3, o.batch, DType::BF16, o.layout),
           record_raw(128, tokens, o.batch, DType::BF16, o.layout),
           before_rope(3, o.batch, 1, DType::I32, o.layout, true),
-          record_rope(3, tokens, o.batch, DType::I32, o.layout),
-          bases(broadcast(o.bases, o.batch)) {
+          record_rope(3, tokens, o.batch, DType::I32, o.layout), bases(broadcast(o.bases, o.batch)),
+          kv_only(o.op == "prepare-kv") {
         const int B = o.batch, A = o.axes;
         counts            = o.valid == "dense" ? std::vector<int>(B, tokens)
                                                : broadcast(measurement::integers(o.valid, 0), B);
@@ -113,26 +119,30 @@ struct PrepareFixture {
         const auto v_scales = allocate_plane(value_scales, schema.value.scale_dtype,
                                              schema.value.scale_leading_extent);
         index_keys          = make_zeros(std::size_t(pages) * 128 * 16 * 2);
-        projected           = {Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
-                               Tensor(k.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
-                               Tensor(v.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
-                               Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
-                               Tensor(ik.span(), DType::BF16, {128, tokens, B})};
-        parameters = {Tensor(wq.span(), DType::BF16, {256}), Tensor(wk.span(), DType::BF16, {256}),
-                      Tensor(wiq.span(), DType::BF16, {128}),
-                      Tensor(wik.span(), DType::BF16, {128})};
-        batch      = {Tensor(positions.span(), DType::I32, {tokens, B}),
-                      Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
-        before     = {before_raw.view, before_rope.view, Tensor(slots.span(), DType::I32, {B})};
-        records    = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
+        projected           = {kv_only ? Tensor{}
+                                       : Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
+                     Tensor(k.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
+                     Tensor(v.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
+                     kv_only ? Tensor{} : Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
+                     Tensor(ik.span(), DType::BF16, {128, tokens, B})};
+        parameters = {
+            {Tensor(wk.span(), DType::BF16, {256}), Tensor(wik.span(), DType::BF16, {128})},
+            kv_only ? Tensor{} : Tensor(wq.span(), DType::BF16, {256}),
+            kv_only ? Tensor{} : Tensor(wiq.span(), DType::BF16, {128})};
+        batch   = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                   Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
+        before  = {before_raw.view, before_rope.view, Tensor(slots.span(), DType::I32, {B})};
+        records = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
         Tensor block_tables(tables.span(), DType::I32, {logical, B});
         cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, o.kv_heads, o.storage},
                  {Tensor(index_keys.span(), DType::BF16, {128, 16, 1, pages}), block_tables}};
         rho   = Tensor(rope.span(), DType::I32, {tokens, A, B});
-        query = o.inplace ? projected.query
-                          : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
-        index_query = o.inplace ? projected.index_query
-                                : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});
+        query = kv_only     ? Tensor{}
+                : o.inplace ? projected.query
+                            : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
+        index_query = kv_only     ? Tensor{}
+                      : o.inplace ? projected.index_query
+                                  : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});
         if (o.inplace) {
             saved_q  = std::make_unique<SavedBuffer>(q);
             saved_iq = std::make_unique<SavedBuffer>(iq);
@@ -147,8 +157,12 @@ struct PrepareFixture {
     }
 
     void launch(CudaExecutionView execution) {
-        ops::qsa_prepare(projected, parameters, batch, rho, before, cache, records, query,
-                         index_query, execution);
+        if (kv_only)
+            ops::qsa_prepare_kv({projected.key, projected.value, projected.index_key},
+                                parameters.kv, batch, rho, before, cache, records, execution);
+        else
+            ops::qsa_prepare(projected, parameters, batch, rho, before, cache, records, query,
+                             index_query, execution);
     }
 };
 

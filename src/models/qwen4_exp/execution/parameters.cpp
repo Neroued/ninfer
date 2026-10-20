@@ -35,6 +35,19 @@ public:
         return {hc_norm(w.norm), {linear({w.down}).weight, linear({w.up}).weight}};
     }
 
+    ops::QsaKvPrepareParameters kv_prepare(const QsaWeights& q) const {
+        const auto& c = profile_.config.text;
+        return {tensor(q.key_norm),    tensor(q.index_key_norm), c.norm_epsilon,
+                c.qsa.rope_theta,      c.qsa.rotary_dim,         c.qsa.rope_sections,
+                c.qsa.rope_interleaved};
+    }
+
+    MtpHistoryParameters history(const BlockWeights& w) const {
+        const auto& q = std::get<QsaWeights>(w.mixer);
+        return {{linear({w.attention_hc.down}).weight, linear({w.attention_hc.up}).weight},
+                {linear({q.key, q.value, q.index_key}), kv_prepare(q)}};
+    }
+
     BlockParameters block(const BlockWeights& w, const BlockProfile& profile, bool mtp) const {
         BlockParameters out;
         out.attention_hc = hc(w.attention_hc);
@@ -56,15 +69,7 @@ public:
             else
                 p.input = MainQsaProjection{linear({q.query, q.gate}),
                                             linear({q.key, q.value, q.index_query, q.index_key})};
-            p.prepare = {tensor(q.query_norm),
-                         tensor(q.key_norm),
-                         tensor(q.index_query_norm),
-                         tensor(q.index_key_norm),
-                         profile_.config.text.norm_epsilon,
-                         profile_.config.text.qsa.rope_theta,
-                         profile_.config.text.qsa.rotary_dim,
-                         profile_.config.text.qsa.rope_sections,
-                         profile_.config.text.qsa.rope_interleaved};
+            p.prepare = {kv_prepare(q), tensor(q.query_norm), tensor(q.index_query_norm)};
             p.output  = linear({q.output});
             out.mixer = std::move(p);
         }
@@ -114,7 +119,8 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
                          p.tensor(m.embedding_norm),
                          p.tensor(m.hidden_norm),
                          p.block(m.layer, this->profile->mtp.value().layer, true),
-                         p.final_hc(m.final_hc)};
+                         p.final_hc(m.final_hc),
+                         p.history(m.layer)};
     }
     if (w.vision) vision = qwen::prepare_vision(model.weight_data(), *w.vision);
 }

@@ -92,6 +92,32 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         scratch(linear(p.text.head, minimum, columns));
     return a.peak_bytes();
 }
+
+std::size_t history(const ModelProfile& p, int first, int last, int batch) {
+    WorkspaceLayoutBuilder a;
+    const auto columns = last * batch, minimum = first * batch;
+    const auto& mtp = *p.mtp;
+    (void)workspace::history_roots(a, p.config.text, columns);
+    const auto scratch = [&](std::size_t bytes) {
+        auto scope = a.scope();
+        (void)a.alloc_bytes(bytes);
+    };
+    {
+        auto scope = a.scope();
+        (void)workspace::mtp_stem(a, p.config.text, columns);
+        scratch(linear(mtp.fc_embedding, minimum, columns));
+        scratch(linear(mtp.fc_hidden, dimension(std::uint64_t(p.config.text.hc.streams) * minimum),
+                       dimension(std::uint64_t(p.config.text.hc.streams) * columns)));
+    }
+    scratch(ops::hc_mix_workspace_capacity_bytes(mtp.history.mix, minimum, columns));
+    {
+        auto scope = a.scope();
+        (void)workspace::qsa_history(a, p.local.qsa, columns);
+        scratch(ops::linear_split_workspace_capacity_bytes(
+            {mtp.history.input, {}}, mtp.history.output_rows, minimum, columns));
+    }
+    return a.peak_bytes();
+}
 } // namespace
 
 WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std::uint32_t chunk,
@@ -101,13 +127,13 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
     for (std::uint32_t b = 1; b <= o.max_concurrency; ++b) {
         out.ordinary = std::max(out.ordinary, body(p, o, 1, 1, b, false, false, sm_count, offload));
         if (p.mtp) {
-            out.verify = std::max(out.verify, body(p, o, 2, o.speculative.draft_tokens + 1, b,
-                                                   false, false, sm_count, offload));
-            out.mtp    = std::max(out.mtp, body(p, o, 1, o.speculative.draft_tokens + 1, b, false,
-                                                true, sm_count, nullptr));
+            out.verify  = std::max(out.verify, body(p, o, 2, o.speculative.draft_tokens + 1, b,
+                                                    false, false, sm_count, offload));
+            out.mtp     = std::max(out.mtp, body(p, o, 1, 1, b, false, true, sm_count, nullptr));
+            out.history = std::max(out.history, history(p, 1, o.speculative.draft_tokens, b));
         }
     }
-    if (p.mtp) out.mtp = std::max(out.mtp, body(p, o, 1, chunk, 1, true, true, sm_count, nullptr));
+    if (p.mtp) out.history = std::max(out.history, history(p, 1, chunk, 1));
     const auto head_columns = o.purpose == EnginePurpose::CausalScoring
                                   ? std::min(chunk, 1024U)
                                   : o.max_concurrency * (o.speculative.draft_tokens + 1);
@@ -140,8 +166,9 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
         (void)a.alloc_bytes(out.finish);
         out.finish = a.peak_bytes();
     }
-    out.general_bytes = std::max({out.prefill, out.ordinary, out.verify, out.mtp, out.finish});
-    out.bytes         = out.general_bytes;
+    out.general_bytes =
+        std::max({out.prefill, out.ordinary, out.verify, out.mtp, out.history, out.finish});
+    out.bytes = out.general_bytes;
     if (p.vision) {
         out.vision = qwen::VisionContext::plan_workspace(
             *p.config.vision, *p.vision,

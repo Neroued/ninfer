@@ -7,7 +7,7 @@
 
 namespace ninfer::models::qwen4_exp::execution {
 struct WorkspacePlan {
-    std::size_t prefill = 0, ordinary = 0, verify = 0, mtp = 0, finish = 0;
+    std::size_t prefill = 0, ordinary = 0, verify = 0, mtp = 0, history = 0, finish = 0;
     std::size_t general_bytes = 0, bytes = 0;
     std::optional<qwen::VisionWorkspacePlan> vision;
 };
@@ -28,6 +28,17 @@ Roots roots(Arena& a, const TextConfig& c, std::int32_t m) {
     return {a.alloc(DType::BF16, {h, streams, m}), a.alloc(DType::BF16, {h, streams, m}),
             a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {h, m}),
             a.alloc(DType::FP32, {streams, m})};
+}
+
+struct HistoryRoots {
+    Tensor residual, normalized, input;
+};
+
+template <class Arena>
+HistoryRoots history_roots(Arena& a, const TextConfig& c, std::int32_t m) {
+    const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
+    return {a.alloc(DType::BF16, {h, streams, m}), a.alloc(DType::BF16, {h, streams, m}),
+            a.alloc(DType::BF16, {h, m})};
 }
 
 struct GdnBuffers {
@@ -71,6 +82,19 @@ QsaBuffers qsa(Arena& a, const QsaConfig& c, std::int32_t m, bool prefill) {
             a.alloc(DType::BF16, {d, qh, m}),
             prefill ? a.alloc(DType::BF16, {ik, m}) : Tensor{},
             prefill ? a.alloc(DType::I32, {3, m}) : Tensor{}};
+}
+
+struct QsaHistoryBuffers {
+    Tensor key, value, index_key, raw_records, coordinate_records;
+};
+
+template <class Arena>
+QsaHistoryBuffers qsa_history(Arena& a, const QsaConfig& c, std::int32_t m) {
+    const auto d = dimension(c.head_dim), kh = dimension(c.kv_heads);
+    const auto ik = dimension(c.index_key_width());
+    return {a.alloc(DType::BF16, {d, kh, m}), a.alloc(DType::BF16, {d, kh, m}),
+            a.alloc(DType::BF16, {ik, m}), a.alloc(DType::BF16, {ik, m}),
+            a.alloc(DType::I32, {3, m})};
 }
 
 struct PleBuffers {

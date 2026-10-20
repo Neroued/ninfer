@@ -44,6 +44,7 @@ RankProgramImpl::~RankProgramImpl() {
     }
     graphs.reset();
     device_graphs.reset();
+    commit_graphs.reset();
     for (auto& resident : bindings)
         if (resident) retire_vision(*resident);
 }

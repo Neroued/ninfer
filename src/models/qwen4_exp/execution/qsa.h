@@ -10,8 +10,8 @@ void qsa(const Tensor& input, const QsaConfig& c, const QsaParameters&, const Ba
          ops::QsaCacheView, ops::QsaRawRecordWriteView records, Tensor& output, MemoryArena&,
          CudaExecutionView);
 
-void qsa_history(const Tensor& input, const QsaConfig&, const QsaParameters&, const BatchView&,
-                 const ops::QsaTailStateView& before, ops::QsaTailStateView after,
+void qsa_history(const Tensor& input, const QsaConfig&, const QsaHistoryParameters&,
+                 const BatchView&, const ops::QsaTailStateView& before, ops::QsaTailStateView after,
                  ops::QsaCacheView, MemoryArena&, CudaExecutionView);
 
 } // namespace ninfer::models::qwen4_exp::execution

@@ -68,4 +68,26 @@ private:
     std::size_t workspace_peak_ = 0;
 };
 
+class MtpCommitGraphs {
+public:
+    explicit MtpCommitGraphs(RankProgramImpl& owner) : owner_(owner) {}
+
+    void prepare(GraphInputs&);
+    void replay(std::uint32_t batch, bool rebuild_history);
+
+    [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
+
+    void reset_workspace_peak() { workspace_peak_ = 0; }
+
+private:
+    struct Variant {
+        GraphSegment graph;
+        std::size_t workspace_bytes = 0;
+    };
+
+    RankProgramImpl& owner_;
+    std::vector<std::array<Variant, 2>> batches_;
+    std::size_t workspace_peak_ = 0;
+};
+
 } // namespace ninfer::models::qwen4_exp::detail

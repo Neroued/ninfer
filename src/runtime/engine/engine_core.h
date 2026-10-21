@@ -8,6 +8,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
+#include "runtime/engine/context_cache/prefix_table.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
@@ -281,6 +282,69 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
+    }
+
+    // On-demand prefix-cache inspection. Reads the live checkpoints under the execution lock;
+    // no data moves and no request state changes.
+    [[nodiscard]] PrefixCacheTable build_prefix_table() {
+        std::scoped_lock lock(execution_mutex_);
+        const auto live = live_prefix_checkpoints();
+        return build_prefix_entries(live.records, live.device_page_bytes,
+                                    live.state_image_bytes);
+    }
+
+    // Releases the requested prefixes on demand. Refuses entirely (busy) while any request is
+    // pending, resident, or materializing, any request is paused, or a context operation is in
+    // flight; leased and missing prefixes are skipped. max_bytes bounds the release (0 means
+    // unbounded).
+    [[nodiscard]] PrefixCacheEvictResult evict_prefixes(std::span<const PrefixCacheKey> selection,
+                                                        std::uint64_t max_bytes) {
+        std::scoped_lock lock(execution_mutex_);
+        if (!execution_idle_for_prefix_eviction()) {
+            return PrefixCacheEvictResult{.busy = true};
+        }
+        const auto live = live_prefix_checkpoints();
+        const auto plan =
+            plan_prefix_evictions(live.records, selection, max_bytes, live.device_page_bytes,
+                                  live.state_image_bytes);
+        PrefixCacheEvictResult out;
+        for (const auto& key_plan : plan.keys) {
+            using Action = PrefixEvictionPlan::KeyPlan::Action;
+            if (key_plan.action == Action::Leased) {
+                out.skipped.push_back(
+                    {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::Leased});
+                continue;
+            }
+            if (key_plan.action == Action::NotFound) {
+                out.skipped.push_back(
+                    {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::NotFound});
+                continue;
+            }
+            std::uint64_t freed = 0;
+            bool released = false, blocked = false;
+            for (const std::size_t record : key_plan.records) {
+                const auto bytes = record_evictable_bytes(live.records[record],
+                                                          live.device_page_bytes,
+                                                          live.state_image_bytes);
+                if (!resources_.erase(*instance_.program, live.handles[record])) {
+                    blocked = true;
+                    break;
+                }
+                released = true;
+                freed                = saturating_add(freed, bytes);
+                out.total_freed_bytes = saturating_add(out.total_freed_bytes, bytes);
+            }
+            if (released) { out.evicted.push_back({.key = key_plan.key, .freed_bytes = freed}); }
+            if (blocked) {
+                out.skipped.push_back(
+                    {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::NotEvictable});
+            }
+        }
+        // /metrics and the admin capacity block read the PUBLISHED snapshot. Refresh it so the
+        // policy sidecar (which triggers on host_context_used_bytes) sees the release on its
+        // next poll instead of re-evicting against stale high utilization.
+        if (!out.evicted.empty()) { publish_runtime_stats(); }
+        return out;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -1386,6 +1450,63 @@ private:
     [[nodiscard]] bool resident_empty() const noexcept {
         return !materializing_ &&
                std::all_of(slots_.begin(), slots_.end(), [](const auto& p) { return !p; });
+    }
+
+    struct LivePrefixCheckpoints {
+        std::vector<PrefixCheckpointRecord> records;
+        std::vector<Checkpoint> handles;
+        std::vector<std::size_t> device_page_bytes;
+        std::size_t state_image_bytes = 0;
+    };
+
+    // Under execution_mutex_: walks the live checkpoints in reclaim order and normalizes each
+    // checkpoint summary for the prefix table and on-demand releases.
+    [[nodiscard]] LivePrefixCheckpoints live_prefix_checkpoints() {
+        const auto cursor = resources_.begin_reclaim(*instance_.program);
+        LivePrefixCheckpoints live;
+        const auto pools = instance_.program->kv_pools();
+        live.state_image_bytes = instance_.program->state_image_bytes();
+        live.device_page_bytes.reserve(pools.size());
+        for (const auto& pool : pools) { live.device_page_bytes.push_back(pool.device_page_bytes); }
+        live.records.reserve(cursor.victims.size());
+        live.handles.reserve(cursor.victims.size());
+        for (const auto& victim : cursor.victims) {
+            if (!instance_.program->valid_checkpoint(victim.handle)) { continue; }
+            const auto summary = instance_.program->checkpoint_summary(victim.handle);
+            const auto& resources = summary.evictable_resources;
+            PrefixCheckpointRecord record;
+            record.key = {summary.key.digests[0], summary.key.digests[1], summary.key.frontier,
+                          summary.key.identity_tag};
+            record.leased      = summary.leased;
+            record.state_slots = resources.state_slots;
+            for (std::size_t pool = 0;
+                 pool < std::min(record.kv_page_groups.size(), resources.kv_page_groups.size());
+                 ++pool) {
+                record.kv_page_groups[pool] = resources.kv_page_groups[pool];
+            }
+            record.host_bytes = resources.host_bytes;
+            // The reclaim cursor already carries priority_for(handle) for every victim
+            // (reclaim_order, resource_manager.h); reuse it instead of re-scanning owners.
+            record.reused       = victim.priority.reused;
+            record.last_demand  = victim.priority.last_demand;
+            live.records.push_back(record);
+            live.handles.push_back(victim.handle);
+        }
+        return live;
+    }
+
+    // Under execution_mutex_ (plus queue_mutex_ for the pending queue, in the established
+    // execution -> queue order): the idle gate for on-demand prefix releases, mirroring the
+    // worker loop's idle predicate. On-demand releases never compete with in-flight requests,
+    // including requests still queued for admission.
+    [[nodiscard]] bool execution_idle_for_prefix_eviction() const {
+        bool pending = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending = !pending_.empty();
+        }
+        return prefix_cache_idle(pending, resident_empty(), !paused_.empty(),
+                                 instance_.program->has_context_operation());
     }
 
     [[nodiscard]] bool has_older_resident(std::uint64_t ticket) const noexcept {

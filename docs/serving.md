@@ -923,6 +923,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+| `--enable-admin-cache` | register the `/admin/cache/prefixes` inspection and eviction admin routes | off |
 
 Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
 and optional transfer or prefill entries from `--context-cost-presets FILE`. Prefill entries match
@@ -930,6 +931,23 @@ the hardware and a signature derived from the actual Text/Vision configuration, 
 A new representation without a matching measurement uses generic prefill coefficients. A malformed
 file aborts startup; the operational context-cost record and JSONL `server_start` identify the
 selected source.
+
+`--enable-admin-cache` registers two Bearer-gated admin routes for the resident prefix cache;
+without the flag both paths answer `404`.
+
+- `GET /admin/cache/prefixes` builds the table on demand under the execution lock. The response
+  carries a capacity block (host-context capacity and occupancy, occupied device KV page groups
+  per pool, device StateImage slot usage and capacity — the same sources as `/metrics`) and one
+  entry per resident prefix: stable key (decimal-string digests), token frontier, evictable
+  resources (page groups per pool, host bytes, state slots, total bytes), leased flag,
+  checkpoint count, and per-prefix demand evidence: `reused` (any checkpoint of the prefix has
+  had repeat demand) and `last_demand` (latest logical demand tick, a monotonic counter, not a
+  wall-clock time).
+- `POST /admin/cache/prefixes/evict` accepts `{"prefixes":[...],"mode":"release","max_bytes":N}`
+  and releases the requested prefixes while the engine is idle. A non-idle engine answers
+  `{"status":"busy","retry_after_s":5}` without releasing anything; leased, missing, and
+  non-erasable prefixes are reported in `skipped` with a reason. The engine re-validates every
+  safety property under the execution lock, so a stale caller cannot corrupt the cache.
 
 Engine selects sampling defaults from the loaded architecture and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for

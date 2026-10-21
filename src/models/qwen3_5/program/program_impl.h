@@ -349,6 +349,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const;
     void reset_memory_peaks() noexcept;
 

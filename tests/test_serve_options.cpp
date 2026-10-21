@@ -34,6 +34,8 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(!defaults.enable_admin_cache,
+                      "admin cache routes are not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),
@@ -381,6 +383,9 @@ int main() {
                       "serve help omits --default-thinking-budget");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--enable-admin-cache") != std::string::npos,
+              "serve help omits --enable-admin-cache");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

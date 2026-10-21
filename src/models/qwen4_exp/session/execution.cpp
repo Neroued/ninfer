@@ -35,10 +35,11 @@ std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle ha
     if (s.phase != detail::Phase::Prefill || !s.permit || s.capture_pending)
         throw std::logic_error("prefill has no executable unit");
     const auto frontier = s.continuation.metadata.main_frontier;
-    const auto end      = p.window_end(s, frontier, s.request->summary.prompt_tokens);
-    const bool capture  = s.capture && s.captures[s.next_capture].frontier == end;
-    const bool sample   = end == s.request->summary.prompt_tokens && !capture;
-    auto reservation    = p.executor->try_reserve(runtime::FrameKind::Compute);
+    const auto end =
+        p.window_end(s, frontier, std::min(s.permitted_frontier, s.request->summary.prompt_tokens));
+    const bool capture = s.capture && s.captures[s.next_capture].frontier == end;
+    const bool sample  = end == s.request->summary.prompt_tokens && !capture;
+    auto reservation   = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Prefill, p.directory);
     auto& tx  = *p.compute;
@@ -69,7 +70,7 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
     if (s.phase != detail::Phase::Replay || !s.permit || s.capture_pending)
         throw std::logic_error("replay has no executable unit");
     const auto begin = s.continuation.metadata.main_frontier;
-    const auto end   = p.window_end(s, begin, s.replay_target);
+    const auto end   = p.window_end(s, begin, std::min(s.permitted_frontier, s.replay_target));
     if (end <= begin) throw std::logic_error("replay has no missing input window");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};

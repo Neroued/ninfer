@@ -4,8 +4,8 @@
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "ninfer/engine.h"
-#include "serve/request.h"
 #include "product/config/options.h"
+#include "serve/request.h"
 
 #include <chrono>
 #include <cstddef>
@@ -14,7 +14,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {

@@ -30,9 +30,9 @@ the weights again.
 
 The Engine builds natively on Linux: x86-64/`sm_120a` for RTX 5090, or AArch64/`sm_121a`
 for DGX Spark. Both require a CUDA toolkit supporting the selected architecture,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), `hwloc >= 2.5`, `liburing >= 2.5`,
-and `libcurl >= 7.85`.
+CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, libjpeg development headers,
+FFmpeg development libraries (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`),
+`hwloc >= 2.5`, `liburing >= 2.5`, and `libcurl >= 7.85`.
 CUDA 13.4 is the validated development toolkit; CMake does not impose a CUDA version floor.
 RTX 5090 supports resident and CPU expert offload execution. DGX Spark uses resident GPU
 weights and Device context storage; Flash Next Text/Vision/MTP shares the same model implementation.

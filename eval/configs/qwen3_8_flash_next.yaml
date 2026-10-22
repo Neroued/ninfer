@@ -41,7 +41,7 @@ suites:
         backend: evalscope
         dataset: aime26
         target: qwen38fn
-        repeats: 32
+        repeats: 3
         generation: *generation
         backend_args: *backend
 

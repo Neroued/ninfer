@@ -433,6 +433,7 @@ class JSONSchemaConverter {
   int32_t AddSubGrammar(const Grammar& grammar);
 
   int32_t WhitespaceExpression();
+  int32_t LiteralExpression(const std::string& json_value);
   int32_t FormattingExpression(const std::string& expression);
   int32_t NextSeparatorExpression(bool is_end = false);
   int32_t KeyPatternExpression();

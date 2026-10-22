@@ -1,6 +1,7 @@
 #include "text/grammar.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -101,6 +102,91 @@ void dense_length_masks() {
     }
 }
 
+void whitespace_contracts(ninfer::text::GrammarCompiler& compiler) {
+    const auto object = Constraint::json_object();
+    for (const std::string text :
+         {" \t\r\n{ \n}\t", "{\n  \"x\" \t: [1, true, {\"s\": \" a \\t b \"}]\n}",
+          "{\"x\": \"ok\", \"y\": 2}"})
+        check(accepts(compiler, object, text), "JSON object rejected structural whitespace");
+    check(accepts(compiler, object, "{" + std::string(80, ' ') + "}"),
+          "JSON whitespace has an arbitrary length limit");
+    for (const std::string text : {" \t\n", "[]", "{} {}", "{\"x\":1,}", "{\"x\":t rue}",
+                                   "{\"x\":1 2}", "{\v\"x\":1}", "{\"x\":\"a\nb\"}"})
+        check(!accepts(compiler, object, text), "JSON whitespace relaxed its value language");
+
+    const Json value{{"status", "ok"}, {"items", Json::array({1, 2})}};
+    const auto schema = Constraint::json_schema(R"({"type":"object","properties":{
+        "status":{"const":"ok"},"items":{"type":"array","items":{"type":"integer"}}},
+        "required":["status","items"],"additionalProperties":false})");
+    check(accepts(compiler, schema, "\n" + value.dump(4) + "\r\n"),
+          "JSON Schema rejected formatted output");
+    for (const std::string text :
+         {R"({"status":"bad","items":[]})", R"({"status":"ok"})",
+          R"({"status":"ok","items":["1"]})", R"({"status":"ok","items":[],"extra":0})"})
+        check(!accepts(compiler, schema, text), "formatted JSON weakened schema assertions");
+
+    const Json fixed{{"text", " a,:[{}] \"quoted\" \\ end "},
+                     {"n", 9223372036854775807LL},
+                     {"values", Json::array({true, nullptr, Json::object(), Json::array()})}};
+    for (const auto& literal : std::vector<Json>{fixed, Json::array({fixed, 3})}) {
+        const auto constraint = Constraint::json_schema(Json{{"const", literal}}.dump());
+        check(accepts(compiler, constraint, literal.dump()) &&
+                  accepts(compiler, constraint, " \n" + literal.dump(4) + "\t"),
+              "fixed JSON containers rejected structural whitespace or changed a leaf");
+        auto changed = literal;
+        if (changed.is_object())
+            changed["text"] = "different";
+        else
+            changed[1] = 4;
+        check(!accepts(compiler, constraint, changed.dump(4)),
+              "formatted const admitted another value");
+    }
+    const auto enumeration = Constraint::json_schema(
+        Json{{"enum", Json::array({fixed, Json::object(), Json::array(), " exact "})}}.dump());
+    check(accepts(compiler, enumeration, fixed.dump(2)) &&
+              accepts(compiler, enumeration, "{\n\t}") && accepts(compiler, enumeration, "[ \n]") &&
+              accepts(compiler, enumeration, R"(" exact ")") &&
+              !accepts(compiler, enumeration, R"("exact")"),
+          "formatted enum changed its fixed values");
+}
+
+void whitespace_token_masks() {
+    const std::vector<std::string> vocabulary{
+        "\t{\n", "\"status\" \t", ":\r\n", "\"ok\"\n}\n", "\"bad\"", "\n", ""};
+    constexpr int eos = 6;
+    ninfer::text::GrammarCompiler compiler(vocabulary, {eos}, 4 * 1024 * 1024);
+    const auto constraint = Constraint::json_schema(R"({"type":"object",
+        "properties":{"status":{"const":"ok"}},"required":["status"],
+        "additionalProperties":false})");
+    auto session          = compiler.compile(constraint, {}, {});
+    const std::array<std::int32_t, 4> drafts{0, 1, 2, 3};
+    const std::array<std::uint32_t, 5> expected{(1u << 0) | (1u << 5), (1u << 1) | (1u << 5),
+                                                (1u << 2) | (1u << 5), (1u << 3) | (1u << 5),
+                                                (1u << eos) | (1u << 5)};
+    std::array<std::uint32_t, 5> lookahead{};
+    check(session->masks(drafts, lookahead) == 0 && lookahead == expected,
+          "JSON mask rejected a token spanning whitespace and punctuation");
+    std::array<std::uint32_t, 1> words{};
+    check(session->masks({}, words) == 0 && words[0] == expected[0],
+          "JSON lookahead changed the committed prefix");
+    session->accept(drafts);
+    session->discard();
+    check(session->masks({}, words) == 0 && words[0] == expected[0],
+          "JSON discard changed whitespace state");
+    session->accept(drafts);
+    session->confirm();
+    check(session->masks({}, words) == 0 && words[0] == expected.back(),
+          "formatted JSON did not allow EOS after a complete value");
+
+    const auto prefix = vocabulary[0] + vocabulary[1] + vocabulary[2];
+    for (const auto& close : {std::string{}, std::string{"</think>\n\n"}}) {
+        const auto continuation = close.empty() ? prefix : "thinking" + close + prefix;
+        auto continued          = compiler.compile(constraint, close, continuation);
+        check(continued->masks({}, words) == 0 && words[0] == expected[3],
+              "JSON continuation or reasoning framing lost structural whitespace");
+    }
+}
+
 void contracts(ninfer::text::GrammarCompiler& compiler) {
     auto object = Constraint::json_object();
     for (const std::string text : {"{}", R"({"x":[1,true,null,{"y":"你好"}]})"})
@@ -161,6 +247,8 @@ int main(int argc, char** argv) {
             contracts(compiler);
             length_boundaries(compiler);
             dense_length_masks();
+            whitespace_contracts(compiler);
+            whitespace_token_masks();
             std::cout << "JSON/schema CPU contracts passed\n";
         }
         return 0;

@@ -3178,11 +3178,76 @@ int32_t JSONSchemaConverter::GenerateAny(const AnySpec& spec, const std::string&
   );
 }
 
+int32_t JSONSchemaConverter::LiteralExpression(const std::string& json_value) {
+  if (!any_whitespace_ || (json_value.front() != '{' && json_value.front() != '[')) {
+    return ByteString(json_value);
+  }
+  std::vector<int32_t> sequence;
+  std::string literal;
+  bool quoted = false, escaped = false;
+  const auto whitespace = WhitespaceExpression();
+  const auto flush = [&] {
+    if (!literal.empty()) {
+      sequence.push_back(ByteString(literal));
+      literal.clear();
+    }
+  };
+  const auto append_whitespace = [&] {
+    flush();
+    if (sequence.empty() || sequence.back() != whitespace) sequence.push_back(whitespace);
+  };
+  // Split only structural punctuation; keep string escapes and numeric spelling verbatim.
+  for (char c : json_value) {
+    if (quoted) {
+      literal += c;
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        quoted = false;
+      }
+      continue;
+    }
+    switch (c) {
+      case '"':
+        quoted = true;
+        literal += c;
+        break;
+      case '{':
+      case '[':
+        literal += c;
+        append_whitespace();
+        break;
+      case '}':
+      case ']':
+        append_whitespace();
+        literal += c;
+        break;
+      case ',':
+      case ':':
+        append_whitespace();
+        literal += c;
+        append_whitespace();
+        break;
+      case ' ':
+      case '\t':
+      case '\r':
+      case '\n':
+        break;
+      default:
+        literal += c;
+    }
+  }
+  flush();
+  return Sequence(sequence);
+}
+
 int32_t JSONSchemaConverter::GenerateConst(const ConstSpec& spec, const std::string& rule_name) {
   if (!IsAllowedJSONLiteral(spec.json_value)) {
     return Unsatisfiable();
   }
-  return ByteString(spec.json_value);
+  return LiteralExpression(spec.json_value);
 }
 
 int32_t JSONSchemaConverter::GenerateEnum(const EnumSpec& spec, const std::string& rule_name) {
@@ -3192,7 +3257,7 @@ int32_t JSONSchemaConverter::GenerateEnum(const EnumSpec& spec, const std::strin
   values.reserve(spec.json_values.size());
   for (const auto& value : spec.json_values) {
     if (IsAllowedJSONLiteral(value)) {
-      values.push_back(ByteString(value));
+      values.push_back(LiteralExpression(value));
     }
   }
   if (values.empty()) {

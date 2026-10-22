@@ -407,9 +407,11 @@ xgrammar::Grammar build_json_grammar(const OutputConstraint& constraint) {
         else
             throw RequestError(Kind::InvalidJsonSchema,
                                "expected JSON object or schema constraint");
-        return xgrammar::Grammar::FromJSONSchema(source, false, std::nullopt,
-                                                 std::pair<std::string, std::string>{",", ":"},
-                                                 false, std::nullopt, false, false);
+        auto grammar = xgrammar::Grammar::FromJSONSchema(
+            source, true, std::nullopt, std::pair<std::string, std::string>{",", ":"}, false,
+            std::nullopt, false, false);
+        auto whitespace = xgrammar::Grammar::FromEBNF(R"(root ::= [ \t\r\n]*)");
+        return xgrammar::Grammar::Concat({whitespace, grammar, whitespace});
     } catch (const xgrammar::JSONSchemaCompileError& error) {
         const auto kind = error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema
                               ? Kind::UnsupportedJsonSchema

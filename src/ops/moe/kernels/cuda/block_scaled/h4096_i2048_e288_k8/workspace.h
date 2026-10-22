@@ -41,7 +41,8 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed) {
         g.job_experts      = integers(max_jobs);
         g.job_columns      = integers(max_jobs);
         g.jobs             = integers(2);
-        g.assignments      = integers(assignments);
+        if (plan.dense.gate_columns) g.load_range = integers(2);
+        g.assignments = integers(assignments);
         if (!plan.atomic_output) { g.inverse = integers(assignments); }
     }
     return out;

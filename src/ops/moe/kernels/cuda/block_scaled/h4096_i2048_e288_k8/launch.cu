@@ -1,3 +1,4 @@
+#include "ops/moe/kernels/cuda/block_scaled/grouping.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/nvfp4/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/output.cuh"
@@ -49,7 +50,8 @@ __global__ void scan_assignments(Groups g, int columns, bool density) {
     __shared__ int scan[kExperts], maxima[(kExperts + 31) / 32];
     const int e     = threadIdx.x;
     const int count = g.counts[e];
-    scan[e]         = count;
+    publish_load_range<kExperts>(g.load_range, count);
+    scan[e] = count;
     __syncthreads();
 #pragma unroll
     for (int delta = 1; delta < kExperts; delta *= 2) {
@@ -108,7 +110,8 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     }
     __syncthreads();
     const int count = counts[tid];
-    scan[tid]       = count;
+    publish_load_range<kExperts>(g.load_range, count);
+    scan[tid] = count;
     __syncthreads();
 #pragma unroll
     for (int delta = 1; delta < kExperts; delta *= 2) {

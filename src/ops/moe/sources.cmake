@@ -42,8 +42,8 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/nvfp4/dgx_spark/shapes/h4096_i2048_e288_k8/dispatch.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/fp8/dgx_spark/shapes/h4096_i2048_e288_k8/dispatch.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/h4096_i2048_e288_k8/launch.cu"
-    "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/h4096_i2048_e288_k8/nvfp4/dgx_spark/launch.cu"
     "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/dgx_spark/launch.cu")
+  include("${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/h4096_i2048_e288_k8/nvfp4/dgx_spark/sources.cmake")
   target_sources(ninfer_ops_non_rdc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4_tma.cu")
 endif()

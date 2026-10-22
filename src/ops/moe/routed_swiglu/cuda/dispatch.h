@@ -24,12 +24,13 @@ struct ShapePolicy {
     // A zero shared width denotes an absent shared term.
     Plan (*select)(const SwiGLUProfile&, int tokens, int shared_intermediate);
     std::span<const int> allocation_boundaries;
+    int all_slice_tokens    = 4096;
     int masked_slice_tokens = 4096;
 
     int slice_tokens(ExpertSubsetKind subset) const {
         return subset == ExpertSubsetKind::MaskOnes || subset == ExpertSubsetKind::MaskZeros
                    ? masked_slice_tokens
-                   : 4096;
+                   : all_slice_tokens;
     }
 
     bool scaled_shared = true;

@@ -14,6 +14,7 @@ struct Case {
     int hits   = -1;
     bool graph = false;
     bool fp32  = false;
+    bool all   = false;
 };
 
 int run(Weights& w, CudaExecutionView execution, const Case& c,
@@ -21,8 +22,9 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     const int m                  = c.tokens;
     const auto dtype             = c.fp32 ? DType::FP32 : DType::BF16;
     const std::size_t cell_bytes = c.fp32 ? 4 : 2;
-    const bool fp8 = w.profile().ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16;
-    auto routes    = make_routes(w, m, c.distribution.c_str(), c.hits);
+    const bool fp8    = w.profile().ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16;
+    const auto subset = c.all ? ops::ExpertSubset{ops::ExpertSubsetKind::All, {}} : w.subset();
+    auto routes       = make_routes(w, m, c.distribution.c_str(), c.hits);
     std::vector<float> input(std::size_t(m) * H);
     for (int t = 0; t < m; ++t)
         std::copy(patterns[t % 3].begin(), patterns[t % 3].end(),
@@ -32,10 +34,10 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     Tensor x(dx.span(), DType::BF16, {H, m});
     ops::ExpertRoutes selected{Tensor(di.span(), DType::I32, {K, m}),
                                Tensor(da.span(), DType::FP32, {K, m})};
-    const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
-        w.profile(), w.subset().kind, dtype, ops::MoeEpilogue::Write, m, m);
-    const auto bound = ops::routed_swiglu_workspace_capacity_bytes(
-        w.profile(), w.subset().kind, dtype, ops::MoeEpilogue::Write, 1, m);
+    const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(w.profile(), subset.kind, dtype,
+                                                                   ops::MoeEpilogue::Write, m, m);
+    const auto bound = ops::routed_swiglu_workspace_capacity_bytes(w.profile(), subset.kind, dtype,
+                                                                   ops::MoeEpilogue::Write, 1, m);
     if (bytes > bound) throw std::runtime_error("EP interval capacity smaller than exact capacity");
     GuardedDeviceBuffer scratch(bytes + 256), result(input.size() * cell_bytes);
     MemoryArena arena(scratch.span());
@@ -43,8 +45,8 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     cuda_check(cudaMemset(scratch.data(), 0x5a, 256), "EP prefix");
     Tensor y(result.span(), dtype, {H, m});
     auto invoke = [&] {
-        ops::routed_swiglu(x, w.profile(), w.experts(), selected, w.subset(),
-                           ops::MoeEpilogue::Write, y, arena, execution);
+        ops::routed_swiglu(x, w.profile(), w.experts(), selected, subset, ops::MoeEpilogue::Write,
+                           y, arena, execution);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -65,6 +67,28 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
                     routes.ids[std::size_t(t) * K + j] =
                         j == 0 ? (t < limit ? w.local_id(0) : w.remote_id(0))
                                : w.local_id(1 + (t * 13 + j * 97) % (Local - 1));
+        }
+        if (c.distribution == "load-bands" || c.distribution == "broad-loads") {
+            // Distinct global routes cross load bands while addresses and the Graph stay fixed.
+            static constexpr int bands[3][K]{{16, 17, 32, 33, 64, 65, 128, 129},
+                                             {32, 33, 64, 65, 128, 129, 512, 513},
+                                             {0, 1, 16, 17, 256, 257, 512, 513}};
+            static constexpr int broad[3][K]{{64, 128, 128, 128, 128, 128, 128, 512},
+                                             {65, 129, 129, 129, 129, 129, 129, 513},
+                                             {64, 64, 64, 64, 513, 513, 513, 513}};
+            const auto& counts = c.distribution == "load-bands" ? bands[replay] : broad[replay];
+            for (int t = 0; t < m; ++t)
+                for (int j = 0; j < K; ++j)
+                    routes.ids[std::size_t(t) * K + j] =
+                        t < counts[j] ? w.local_id(j) : w.remote_id(j);
+        }
+        if (c.distribution == "slice-tail") {
+            static constexpr int counts[K]{16, 17, 128, 129, 256, 257, 512, 513};
+            for (int t = 0; t < m; ++t)
+                for (int j = 0; j < K; ++j)
+                    routes.ids[std::size_t(t) * K + j] =
+                        c.all || t < counts[j] || (t == m - 1 && j == 0) ? w.local_id(j)
+                                                                         : w.remote_id(j);
         }
         if (replay == 1) {
             for (int t = 0; t < m; ++t) {
@@ -97,7 +121,7 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
             for (int j = 0; j < K; ++j) {
                 const auto a = std::size_t(t) * K + j;
                 const int e  = routes.ids[a];
-                if (!w.active(e)) continue;
+                if (!c.all && !w.active(e)) continue;
                 ++hits;
                 const auto& v = w.oracle(t % 3, e, patterns[t % 3]);
                 for (int h = 0; h < H; ++h)
@@ -166,21 +190,27 @@ int metadata(bool fp8) {
                                                               ops::MoeEpilogue::Write, 1, 4097);
         });
     }
-    for (auto [first, last] : std::array<std::pair<int, int>, 9>{{{1, 17},
-                                                                  {16, 17},
-                                                                  {64, 65},
-                                                                  {127, 129},
-                                                                  {255, 257},
-                                                                  {511, 513},
-                                                                  {1023, 1025},
-                                                                  {2047, 2049},
-                                                                  {4095, 4097}}}) {
-        const auto bound = ops::routed_swiglu_workspace_capacity_bytes(
-            p, w.subset().kind, DType::BF16, ops::MoeEpilogue::Write, first, last);
-        for (int t = first; t <= last; ++t)
-            if (ops::routed_swiglu_workspace_capacity_bytes(p, w.subset().kind, DType::BF16,
-                                                            ops::MoeEpilogue::Write, t, t) > bound)
-                ++failures;
+    for (auto [first, last] : std::array<std::pair<int, int>, 13>{{{1, 17},
+                                                                   {16, 17},
+                                                                   {64, 65},
+                                                                   {127, 129},
+                                                                   {255, 257},
+                                                                   {511, 513},
+                                                                   {767, 769},
+                                                                   {1023, 1025},
+                                                                   {1535, 1537},
+                                                                   {2047, 2049},
+                                                                   {3071, 3073},
+                                                                   {4095, 4097},
+                                                                   {8191, 8193}}}) {
+        for (auto subset : {w.subset().kind, ops::ExpertSubsetKind::All}) {
+            const auto bound = ops::routed_swiglu_workspace_capacity_bytes(
+                p, subset, DType::BF16, ops::MoeEpilogue::Write, first, last);
+            for (int t = first; t <= last; ++t)
+                if (ops::routed_swiglu_workspace_capacity_bytes(
+                        p, subset, DType::BF16, ops::MoeEpilogue::Write, t, t) > bound)
+                    ++failures;
+        }
     }
     rejected([&] {
         (void)ops::routed_swiglu_workspace_capacity_bytes(p, w.subset().kind, DType::BF16,
@@ -267,18 +297,25 @@ int main(int argc, char** argv) {
                 std::vector<Case> cases;
                 std::vector<OpCase> catalogue;
                 const auto add = [&](int t, const char* dist, int hits = -1, bool graph = false,
-                                     bool fp32 = false) {
+                                     bool fp32 = false, bool all = false) {
                     const std::string id =
                         "clamped-ep/" + format + "/p" + std::to_string(int(placement)) + "/side" +
                         std::to_string(side) + "/T" + std::to_string(t) + "/" + dist + "/h" +
                         std::to_string(hits) + (graph ? "/graph" : "/eager");
-                    cases.push_back({t, dist, hits, graph, fp32});
+                    cases.push_back({t, dist, hits, graph, fp32, all});
                     catalogue.push_back(
-                        {id + (fp32 ? "/fp32" : ""),
+                        {id + (fp32 ? "/fp32" : "") + (all ? "/all" : ""),
                          {{"format", format}, {"execution", graph ? "graph" : "eager"}}});
                 };
                 for (int hits = 0; hits <= K; ++hits) add(1, "mixed", hits);
                 if (primary) {
+                    if (!fp8) {
+                        add(128, "load-bands", -1, true);
+                        add(1024, "load-bands", -1, true);
+                        add(4096, "broad-loads", -1, true);
+                        add(8193, "slice-tail", -1, true);
+                        add(8193, "slice-tail", -1, true, false, true);
+                    }
                     for (int t : {2, 3, 6, 8, 16, 17, 32, 33, 64, 65, 96, 127, 128})
                         add(t, "mixed");
                     for (int t : {129, 191,  192,  193,  255,  256,  257,  384,  511,  512,

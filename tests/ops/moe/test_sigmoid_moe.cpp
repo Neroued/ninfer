@@ -339,8 +339,12 @@ int main(int argc, char** argv) {
                     for (int t : {1,   2,   4,   6,   8,   16,   17,   32,   64,   65,  128,
                                   129, 256, 257, 512, 513, 1024, 2048, 2049, 4096, 4097})
                         cases.push_back({t, 4, true});
-                    for (int hits = 0; hits <= 8; ++hits)
+                    if (!fp8) cases.push_back({8193, 4, true});
+                    for (int hits = 0; hits <= 8; ++hits) {
+                        // The ordinary mixed cases already cover four local hits.
+                        if (hits == 4) continue;
                         for (int t : {1, 8, 128, 4097}) cases.push_back({t, hits});
+                    }
                     for (int t : {1, 8, 17, 128, 512, 4097}) cases.push_back({t, 0, true, true});
                 } else
                     for (int t : {1, 2, 4, 8, 17, 65, 129, 257, 512, 4097}) {
@@ -348,11 +352,13 @@ int main(int argc, char** argv) {
                         cases.push_back({t, 4, true});
                     }
                 std::vector<OpCase> catalogue;
-                for (std::size_t i = 0; i < cases.size(); ++i)
-                    catalogue.push_back({"whole/" + format + "/place" +
-                                             std::to_string(int(placement)) + "/side" +
-                                             std::to_string(side) + "/" + std::to_string(i),
-                                         {{"format", format}}});
+                for (const auto& c : cases)
+                    catalogue.push_back(
+                        {"whole/" + format + "/place" + std::to_string(int(placement)) + "/side" +
+                             std::to_string(side) + "/T" + std::to_string(c.m) + "/h" +
+                             std::to_string(c.hits) + (c.none ? "/none/" : "/mask/") +
+                             (c.graph ? "graph" : "eager"),
+                         {{"format", format}, {"execution", c.graph ? "graph" : "eager"}}});
                 suite.add(std::move(catalogue), [=](auto selected) {
                     std::cerr << "Qualify whole " << format << " placement=" << int(placement)
                               << " side=" << side << " selected=" << selected.size() << "\n";
@@ -387,7 +393,7 @@ int main(int argc, char** argv) {
                           }
                           return failed + f.verify();
                       },
-                      {{"format", format}});
+                      {{"format", format}, {"execution", "graph"}});
     }
 #endif
     return suite.main(argc, argv);

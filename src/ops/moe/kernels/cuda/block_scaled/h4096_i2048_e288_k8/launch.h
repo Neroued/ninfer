@@ -1,14 +1,17 @@
 #pragma once
 
 #include "ninfer/ops/moe.h"
+#include "ops/moe/kernels/cuda/block_scaled/nvfp4/schedule.h"
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
 
 inline constexpr int kHidden = 4096, kIntermediate = 2048, kExperts = 288, kTopK = 8;
 
+enum class ExpertLoadRegime { All, ExcludeBroad, OnlyBroad, DenseWhenBroad };
+
 struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
-    // belonging to one expert. Public entries split total M into slices <= 4096.
+    // belonging to one expert. The entry policy owns the maximum slice size.
     QType format     = QType::NVFP4;
     int gate_columns = 0, down_columns = 0;
     bool vector                = false;
@@ -22,7 +25,15 @@ struct Plan {
     int queued_ctas_per_sm = 6;
     float clamp_limit      = 0;
 
-    int job_columns() const { return gate_columns > down_columns ? gate_columns : down_columns; }
+    Nvfp4Tuning nvfp4;
+    int group_columns = 0, small_expert_limit = 0;
+    Nvfp4LoadSchedule medium, dense, broad;
+    int broad_short_limit = 0, broad_long_limit = 0;
+
+    int job_columns() const {
+        const int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        return columns > group_columns ? columns : group_columns;
+    }
 };
 
 struct Groups {
@@ -34,6 +45,7 @@ struct Groups {
     int* jobs;
     int* assignments;
     int* inverse;
+    int* load_range;
 };
 
 struct Storage {

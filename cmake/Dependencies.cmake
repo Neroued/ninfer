@@ -18,6 +18,7 @@ target_include_directories(ninfer::json INTERFACE
   ${PROJECT_SOURCE_DIR}/third_party)
 
 if(NINFER_BUILD_ENGINE)
+  find_package(JPEG REQUIRED)
   pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavformat libavcodec libavutil libswscale)
   add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)

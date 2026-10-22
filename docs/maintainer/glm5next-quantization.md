@@ -17,7 +17,8 @@
 /home/neroued/models/GLM-5.3-Flash/nvidia-nvfp4
 ```
 
-以这份 checkpoint 为唯一权重起点，只增加 KDA 大投影与 MTP routed experts 两项量化：
+以这份 checkpoint 为唯一权重起点。KDA 大投影、Main/MTP MLA O 与 shared FFN
+采用 Q8 A16，MTP routed experts 采用 block-FP8，另生成完整词表的 Q4 draft head：
 
 | 部分 | 目标持久表示 | 计算许可或保留内容 |
 |---|---|---|
@@ -26,14 +27,17 @@
 | 34 层 KDA 的 Q/K/V/O | `q8_g32_fp16`，由源 BF16 转换 | `A16Only`；只量化这四个大投影 |
 | KDA beta、两组低秩 gate 投影、output norm | 原 BF16 | 投影 `A16Only`，不额外量化 |
 | KDA convolution、A_log、dt_bias | 原 FP32 | 保留源 words 与控制含义 |
-| Main/MTP MLA 与 Indexer 权重 | 原 BF16 | 投影保持 A16；Indexer head coefficients、点积累加和 score 归约保持 FP32 |
-| Main/MTP shared experts | 原 BF16 | `A16Only` |
+| Main/MTP MLA O | `q8_g32_fp16`，由源 BF16 转换 | `A16Only`；仅量化 `o_proj` |
+| Main/MTP MLA 其余权重与 Indexer | 原 BF16 | Q_a/Q_b/KV_a/U_K/U_V、Indexer 全部保留；投影保持 A16，Indexer head coefficients、点积累加和 score 归约保持 FP32 |
+| Main/MTP shared experts 的 gate/up/down | `q8_g32_fp16`，由源 BF16 转换 | `A16Only`；GU 合并，down 独立 |
 | Main/MTP router | 原 BF16 weight、FP32 correction bias | FP32 logits 与原 route 数学 |
 | mHC、Text/MTP norms | 原 BF16 | mHC 系数、norm、混合的 FP32 精度及 BF16 residual 边界见第 5 节；其他 norm 按模型数学和第 4 节 |
 | MTP routed experts | `fp8_e4m3fn_block128x128_bf16`，由源 BF16 转换 | `AllowA8` |
-| MTP stem、embedding、LM head、全部 Vision | 原 BF16 | 保留源权重，投影 `A16Only` |
+| MTP stem、embedding、Main LM head、全部 Vision | 原 BF16 | 保留源权重，投影 `A16Only` |
+| Optimized draft head | `q4_g64_fp16`，直接由源 BF16 LM head 转换 | `A16Only`；完整词表，不裁剪；按配置加载并供 draft 使用 |
 
-Cache 与计算政策及精确 codec 见第 3 节，与上表的静态权重量化分开。Main MLA Q_b/O、shared experts 不加入额外量化范围。
+Main head 保持 BF16；未启用 optimized draft head 时，MTP 使用 Main head。
+Cache 与计算政策及精确 codec 见第 3 节，与上表的静态权重量化分开。
 
 ## 2. 静态权重编码与导入
 
@@ -58,13 +62,16 @@ w_ninfer = E2M1(code) * E4M3(scale) / d_w
 相同。前三层 dense MLP 的 gate/up 两类 scalar 也分别一致。因此 GU 可以在不修改
 这些校准值的情况下沿输出行合并。
 
-### 2.2 KDA Q8 与 MTP block-FP8
+### 2.2 Q8 投影与 MTP block-FP8
 
-KDA Q/K/V/O 沿 K 每 32 个值使用一个 FP16 scale，转换采用现有 `grouped_absmax`
-数值规则；每个逻辑权重占 1 B code＋`2/32` B scale。输入 activation 保持 A16，
-量化后的权重进入既定 KDA 公式，不改变 convolution、gate 或 recurrent state 类型。
+KDA Q/K/V/O、Main/MTP MLA O、shared gate/up/down 沿 K 每 32 个值使用一个
+FP16 scale，转换采用现有 `grouped_absmax` 数值规则；每个逻辑权重占
+1 B code＋`2/32` B scale。输入 activation 保持 A16，
+不增加 A8/A4 激活量化。每行的 K 分组独立，GU 沿 N 合并保持各行 codes/scales；
+TP 的 K 切点保持 G32 对齐。量化后的权重进入既定公式，不改变 KDA convolution、
+gate、recurrent state 或 FFN clamp 的含义与类型。
 
-MTP 的 GU/down 使用 128×128 块 E4M3FN codes 与 BF16 multiplier：
+MTP routed experts 的 GU/down 使用 128×128 块 E4M3FN codes 与 BF16 multiplier：
 
 ```text
 w_hat[e,n,k] = FP32(E4M3FN(code[e,n,k]) * BF16(scale[e,n/128,k/128]))
@@ -98,6 +105,16 @@ scale** 的 FP32 reciprocal 编码；保留先算 reciprocal、再乘 weight 的
 
 这一方法仅使用源权重，无需激活校准数据；运行时动态 A8 量化保持前述 K128 约定。
 编码表示和 permission 的语义不随 converter 的实现进度变化。
+
+### 2.3 Optimized draft head
+
+从源 BF16 `lm_head.weight[154880,4096]` 直接生成额外的 `q4_g64_fp16` 矩阵，
+采用通用 `grouped_absmax`、K64 分组和 FP16 scales，计算许可为 `A16Only`。
+保留完整词表及原 token ID 顺序，不经过其他量化表示再次编码。
+Main head、embedding 和 proposal head 是独立权重对象；Main/MTP 共享 embedding。
+
+额外 head 作为可选 proposal 绑定，启用对应配置时加载。其输入是 MTP final norm
+后的 hidden，不重复执行 norm。词表 TP 分片由并行计划决定，格式不改变输出决策语义。
 
 ## 3. MLA／Indexer cache 与计算政策
 
@@ -224,8 +241,26 @@ BF16 落点。允许保留 FP32 中间量以融合计算，不能将矩阵操作
 
 cache_operand 按第 3.3 节产生，BF16 存储则直接使用存储值。FP8 的当前 token
 同样经过实际 encoder/decoder，不从未编码的临时 latent 走旁路。Attention scale
-固定为 1/16，不因 512 维 latent 改成 `1/sqrt(512)`。O projection 消费 BF16 heads。
+固定为 1/16，不因 512 维 latent 改成 `1/sqrt(512)`。O projection 消费 BF16 heads，
+使用 Q8-G32 权重和 A16 计算；Q_b、U_K/U_V 与 Indexer 的 BF16 政策不变。
 空选择集合的写域和精确零规则由消费者接口规定。
+
+### 4.4 MTP 与 Vision 的融合边界
+
+MTP 的 embedding/conditioning 分别做 FP32 direct-gamma RMSNorm，再输出 BF16
+拼接向量；embedding 禁用列的对应分量为正零。Stem 消费这份实际 BF16 输入。
+MTP 与 Vision 的普通 residual 为 `r=RN_BF16(FP32(x)+FP32(branch))`；融合的
+后续 RMSNorm 消费实际 r，不能使用未舍入的 sum 替代已发布的 BF16 residual。
+
+Vision 的带 bias projection 先在 FP32 accumulator 上加 bias，再写 BF16。
+融合 GU 在 FP32 projection/bias 后做 clamp、SiLU 和乘积，最终写 BF16 product，
+内部 gate/up 没有额外 BF16 落点。Q/K head RMSNorm 与 2D RoPE 以 FP32 组合，
+在旋转出口写 BF16，不为独立 norm 调用添加中间 BF16 舍入。
+
+Merger 的独立 projection、LayerNorm、Exact GELU 及 FFN 输入使用实际 BF16
+公共出口。以上是 NInfer 的表示边界，不要求与参考后端的拆分或融合中间值逐位一致。
+接口、alias 与模型组合见 [MTP](../designs/glm5next/mtp.md) 和
+[Vision](../designs/glm5next/vision.md)。
 
 ## 5. mHC 数值边界
 
@@ -297,35 +332,40 @@ X_next_math → RN_BF16 → X_next
 
 源容量由已核对 checkpoint 的 33 个 safetensors 文件头逐 tensor 统计，共 147661 个 tensors；
 与源 index 的 `total_size=204419110596` B 一致；两台来源的模型/量化配置相同。
-下表是全模型的 tensor payload，单位 GiB；不含文件头、对象对齐、runtime、分片复制
-或额外模型权重。目标列是按已选格式计算的估算，尚非实际 artifact 大小。
+下表是全模型的 tensor payload，单位 GiB；目标列包含额外 Q4 draft head，
+不含文件头、对象对齐、runtime 或分片复制。目标列是按已选格式计算的估算，
+尚非实际 artifact 大小。
 
 | 部分 | NVIDIA 来源 | 选定表示后的估算 |
 |---|---:|---:|
 | Main routed experts | 159.469020 | 159.469020 |
 | Main dense MLP | 0.237305 | 0.237305 |
 | Main KDA | 8.729325 | 4.744950 |
-| Main MLA＋Indexer | 2.559384 | 2.559384 |
-| Main shared experts | 1.968750 | 1.968750 |
+| Main MLA＋Indexer | 2.559384 | 1.914853 |
+| Main shared experts | 1.968750 | 1.045898 |
 | Main router | 0.092330 | 0.092330 |
 | Main mHC＋norm | 0.066617 | 0.066617 |
 | Embedding＋LM head | 2.363281 | 2.363281 |
 | MTP routed experts | 13.500000 | 6.750824 |
-| MTP 其他独有权重 | 0.344283 | 0.344283 |
+| MTP 其他独有权重 | 0.344283 | 0.263716 |
 | Vision | 1.049837 | 1.049837 |
-| **合计** | **190.380132** | **179.646581** |
+| Optimized draft head | — | 0.313873 |
+| **合计** | **190.380132** | **178.312505** |
 
 KDA 的 Q/K/V/O 原载荷恰为 8.5 GiB，Q8-G32 后 4.515625 GiB，减少 3.984375 GiB。
 MTP experts 共 7247757312 个权重，block-FP8 codes＋BF16 scales 为
-7248642048 B，减少 6.749176 GiB。两项共减少约 **10.733551 GiB**。
+7248642048 B，减少 6.749176 GiB。Main/MTP 共 12 个 MLA O 从 BF16 改为 Q8，
+减少 0.703125 GiB；43 个 shared FFN 减少 0.944824 GiB。额外 Q4 head 增加
+0.313873 GiB，最终载荷估算为 **191461594820 B**。
 
-不启用 MTP 时应扣除其 experts 与其他独有权重；embedding/head 不重复扣除。
+不启用 MTP 时应扣除其 experts、其他独有权重和仅供 draft 使用的 proposal head；
+未启用 optimized draft head 时不加载该额外 head。Embedding/Main head 不重复扣除。
 不启用 Vision 时扣除独立 Vision 权重。双机每 rank 的权重容量还取决于实际分片与复制
 计划，不能直接以总量除二作为最终驻留预算。
 
 NVIDIA 模型卡中量化 shared experts 的措辞与实际配置不符，所链接 recipe 中「MTP
-未导出」的注释也不符合这份本地 checkpoint。本文采用实际 tensors：shared 为 BF16，
-完整 MTP 权重存在且原 experts 为 BF16。
+未导出」的注释也不符合这份本地 checkpoint。本文采用实际 tensors：源 shared 为
+BF16，完整 MTP 权重存在且原 experts 为 BF16。
 
 ## 7. 来源与通用合同
 

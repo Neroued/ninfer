@@ -1,195 +1,348 @@
-# KDA ReplaySSM 实现设计
+# KDA 输入准备、递推与 ReplaySSM 设计
 
-性质：待落地的 record/fold 接口与组合设计，首个实例为双 Spark GLM5Next。
-决策、实现状态和任务范围见[设计索引](README.md)。模型转移与历史依赖见
-[模型参考](../../maintainer/glm5next-model.md#3-kda)，表示和精度见
-[数值政策](../../maintainer/glm5next-quantization.md#4-投影控制量与-latent-attention-边界)。
+本文定义 GLM5Next 的 KDA 计算链、状态布局和目标 C++ 接口。输入准备参考现有
+GDN projection/conv，状态使用现有 `LinearAttentionState` 和 `StateImage`，接受前缀
+采用 ReplaySSM。新增接口尚待实现，现有 KDA 递推、Linear 和输出 norm 按下文复用。
 
-本设计与[现有 GDN ReplaySSM](../../maintainer/replayssm-gdn.md)对齐状态管理：verify 从只读基准状态
-产生输出和 records，最终接受长度确定后，在本轮内完成 fold。提交后的 recurrent state
-始终代表最新接受前沿，不保留跨轮待 fold 的已提交 log。
+模型数学与数值政策分别以[模型定义](../../maintainer/glm5next-model.md#3-kda)、
+[量化方案](../../maintainer/glm5next-quantization.md#41-kda-与-ffn)为准。
+状态接口参考 [GDN 输入准备](../../../include/ninfer/ops/gdn_input_proj.h)、
+[GDN 递推](../../../include/ninfer/ops/gated_delta_net.h)和
+[GDN ReplaySSM](../../../include/ninfer/ops/gdn_replay.h)。
 
-计算输入保持[现有 KDA 数学接口](../../../include/ninfer/ops/kimi_delta_attention.h)的约定：
-调用者仍传 BF16 raw forget/beta logits、FP32 A_log/dt_bias 和 lower_bound；gate 在
-KDA 内部生成。对齐 GDN 不改变这个边界，也不要求调用者准备 FP32 gate tensors。
-现有通用入口用于算法和性能验证，其分派不作为生产约束。Ordinary decode、verify
-record 和 fold 使用 recurrent 状态转移；decode 不走 chunked。长 prefill 的算法选择
-不在本文中收敛。
+## 1. 计算流程与职责
 
-## 1. 分工与持久状态
+首个实例为双 Spark：Main 的 34 个 KDA 层，每 rank 持有 32 个完整 heads，
+`Dk=Dv=128`，Q/K/V 各 4096 channels，卷积通道总数 `C=12288`。
+这些数值是模型实例和已准备 Op profile 的参数；状态容器不按模型名称判断几何。
 
-| 层次 | 责任 |
+输入 x 为分支 input norm 后的 BF16 `[4096,T,B]`。整个本地 KDA 分支为：
+
+```text
+x ── Q8 QKV projection + FP32 four-tap convolution + SiLU ── q, k, v
+  └─ BF16 control split ── beta_raw, f_a, g_a
+                           f_a ── BF16 f_b projection ── forget_raw
+                           g_a ── BF16 g_b projection ── output_gate_raw
+
+q, k, v, forget_raw, beta_raw, A_log, dt_bias, source recurrent state
+  ── KDA recurrence ── o
+  ── sigmoid_gated_rmsnorm(o, gamma, output_gate_raw)
+  ── Q8 O projection ── local output [4096,T,B]
+```
+
+控制投影使用已有纯 Linear/split：`[288,4096]` 输出 `[beta32;f_a128;g_a128]`，
+f_b/g_b 各 `[4096,128]`，消费各自的低秩输入。Q/K/V 无复制 view 为
+`[128,32,T,B]`；forget/output gate 同样 view 为 `[128,32,T,B]`。
+Output norm 复用 `sigmoid_gated_rmsnorm()`，gamma 为共享的 BF16 `[128]`、
+epsilon 为 `1e-5`；O 使用 Q8 `[4096,4096]`。输出不在本地加入 residual。
+
+| 所有者 | 职责 |
 |---|---|
-| Core | StateImage 字段、record planes 的布局和非 owning views |
-| KDA input Op | QKV projection/conv/SiLU 以及实际 conv history records |
-| KDA recurrence Op | 内部 gate 生成、recurrent 输出和 transition records |
-| KDA fold Op | 从指定 source 重放接受前缀，写 destination 的 recurrent/conv 状态 |
-| RankProgram | 持有 frame/records、prepared plans、CUDA Graph 和物理执行依赖 |
-| ModelSession | 选择源和目的、最终采用长度、前沿、checkpoint 与跨 rank 提交 |
+| Core | StateImage 字段、records 的布局计算、绑定和非 owning views |
+| 输入准备 Op | QKV projection/conv/SiLU、最终 conv history 或 conv records |
+| KDA recurrence Op | Q/K normalization、内部 gate、递推/readout、transition records |
+| KDA fold Op | 从 source 重放指定前缀，写 destination 的 recurrent/conv state |
+| RankProgram | frame、workspace、records、prepared fold plan、Op 顺序与 Graph |
+| ModelSession | source/destination 的使用权限、最终采用长度、frontier 和 checkpoint |
 
-沿用 [LinearAttentionState](../../../src/core/linear_attention_state.h) 和
-[StateImage](../../../src/core/state_image.h)。每层包含：
+Op 的状态写入是物理效果；完整模型状态的采用由 Session 在执行依赖满足后完成。
 
-- FP32 recurrent `[Dk,Dv,Hv,Slots]`，逻辑为 `S[value,key]`，key 轴连续；
-- BF16 conv history `[C,3,Slots]`，列顺序为最旧到最新；
-- layer stride 与 slot stride 显式给出，不能假设不同字段或层紧邻。
+## 2. 持久状态与递推输入
 
-一个 checkpoint 保存已 fold 的这两项状态及完整模型所需的其他字段和历史前缀。
-Records 属于未退役执行 frame，不进入长期 checkpoint，也不进入 growing KV pool。
-Active image、不可变 checkpoint 和正在写入的目的 image 仍由现有目录分别管理。
+### 2.1 持久状态
 
-## 2. 计算输入、输出与数学
+复用 [LinearAttentionState](../../../src/core/linear_attention_state.h)：
 
-### 2.1 保留的计算边界
-
-下表给出 verify 的 batched 视图；ordinary batch update 使用 `T=1`。
-Native Tensor 的第 0 维连续，`Hq` 表示 query/key heads，`Hv` 表示 value heads。
-
-| 操作数 | 类型与形状 | 含义 |
+| 字段 | 单层 native Tensor | 含义 |
 |---|---|---|
-| q、k | BF16 `[128,Hq,T,B]` | conv/SiLU 后、L2 normalization 前 |
-| v | BF16 `[128,Hv,T,B]` | conv/SiLU 后的 value |
-| g | BF16 `[128,Hv,T,B]` | raw forget projection logits，不是 log-decay |
-| beta | BF16 `[Hv,T,B]` | raw beta logits，不是 sigmoid 后的系数 |
-| A_log | FP32 `[Hv]` | 每个 value head 的固定参数 |
-| dt_bias | FP32 `[128,Hv]` | 每个 head/key channel 的固定参数 |
-| lower_bound | FP32 scalar | 有限且属于 `[-5,0]`；GLM 使用 -5 |
+| recurrent | FP32 `[128,128,Hv,Slots]` | 逻辑 `S[value,key]`，key 轴连续 |
+| conv | BF16 `[C,3,Slots]` | 最近三列卷积前投影，最旧到最新，channels 为 `[Q;K;V]` |
+
+每个 slot 的内层数据连续；slot stride 由 Tensor 给出。All-layer view 的 conv 和
+recurrent layer strides 独立，按现有 StateImage field 布局读取。
+初始 image 的这两个字段置零，初始化和存储寿命由现有 context/state 机制负责。
+
+Checkpoint 保存已采用的 recurrent/conv 字段。Records 属于本轮执行 frame；本轮
+完成 fold 后，持久 state 已代表最新采用前沿，不保留跨轮待 fold 的已提交 records。
+
+### 2.2 递推操作数
+
+以下为 batched 视图；单序列入口省略 B，单列 update 使用 T=1。
+
+| 参数 | 类型与形状 | 含义 |
+|---|---|---|
+| q / k | BF16 `[128,Hq,T,B]` | convolution/SiLU 后、L2 normalization 前 |
+| v | BF16 `[128,Hv,T,B]` | convolution/SiLU 后的 value |
+| g | BF16 `[128,Hv,T,B]` | raw forget logits，即模型公式中的 f |
+| beta | BF16 `[Hv,T,B]` | raw beta logits |
+| A_log | FP32 `[Hv]` | 每 head 的 decay 参数 |
+| dt_bias | FP32 `[128,Hv]` | 每 head、每 key channel 的 bias |
+| lower_bound | FP32 scalar | 有限且在 `[-5,0]`，本模型为 -5 |
 | scale | FP32 scalar | `1/sqrt(128)` |
-| states | FP32 `[128,128,Hv,Slots]` | 完整 state pool 的本层视图 |
 | out | BF16 `[128,Hv,T,B]` | 更新 state 后的 scaled query readout |
 
-`Hq>=1`、`Hv>=Hq`、`Hv%Hq==0`；value head h 使用
-`qh=floor(h/(Hv/Hq))` 的 q/k。首个生产 profile 为 `Hq=Hv=32`。
-输出不含后续 gated RMSNorm、output gate 或 O projection。
+沿用现有 KDA 的 `Hq>=1`、`Hv>=Hq`、`Hv%Hq==0`；value head h 使用
+`qh=floor(h/(Hv/Hq))`。当前实例 Hq=Hv=32。
 
-### 2.2 数学输入与实际 records
+Q/K 在 KDA 内部按 epsilon=`1e-6` 做 L2 normalization。Gate 同样在内部形成：
 
-第 2.1 节的 q/k 是 L2 normalization 前的 BF16 值，g/beta 是 raw logits；
-按[模型 KDA 数学](../../maintainer/glm5next-model.md#3-kda)完成内部归一化、gate
-和 state 转移。接口中的 lower_bound 代替模型实例值 -5，head 映射与 scale 使用
-第 2.1 节的显式参数。Decay 在 prediction 内逐 key channel 生效，不能作为一个
-scalar 移到整个归约之外。完整公式不在此重复维护。
+```text
+log_decay[c,h,t,b] = lower_bound * sigmoid(exp(A_log[h]) * (g[c,h,t,b] + dt_bias[c,h]))
+beta_value[h,t,b] = sigmoid(beta[h,t,b])
+```
 
-两处记号的对应关系是：接口 g 对应模型的 forget logit f，接口 beta 对应 `W_b*x`；
-record.log_decay 对应模型公式中已激活的 g，record.beta 对应其 sigmoid 后的 beta。
+State 按逐 key channel 的 decay、prediction、delta、rank-one update 顺序更新，
+再产生 readout。运行和发布的 state 都是 FP32。Record 保存上述实际 FP32 gate
+words；fold 从 log_decay 重新计算 alpha 的 exp，使用与 update/record 相同的转移。
 
-Verify 在内部形成 log_decay/beta_value 时，将实际用于转移的 FP32 words 写入
-records。Fold 消费这些 words，不再运行 sigmoid、A_log 或 dt_bias 计算；从
-log_decay 到 alpha 的 exp 仍属于 recurrent 转移，并与 verify 保持一致。
-这项内部记录不会把外部 g/beta 的 BF16 输入改成 FP32，也不增加投影输入精度。
+这里没有把 gate 生成移到外部投影，也没有给 recurrent 输入增加一个 gate 量化边界。
+输出 norm 和 O projection 不属于 state transition。
 
 ## 3. 几何、行身份与 record 布局
 
-### 3.1 域与身份
+### 3.1 几何与有效范围
 
-- `L`：本 rank 的 KDA 层数，首个 profile 为 34；按 Main 中 KDA 层出现顺序编号。
-- `C=2*Hq*128+Hv*128`：Q/K/V conv channels；首个 profile 为 12288。
-- `R=record_capacity`：一个 frame 预留的物理 record 行容量，范围 1..8。
-- `B`：本次活动行数，`1<=B<=R`，不同于 StateImage slot 数。
-- `T=width`：本次 prepared 布局的物理窗口宽度，正整数。
-- `n[b]`：verify 的有效列数，`1<=n[b]<=T`；空 valid_columns 表示 `n[b]=T`。
-- `m[b]`：最终提交列数，`0<=m[b]<=n[b]`。
+- L：本地 KDA 层数，当前为 34，按 Main 中 KDA 层的出现顺序编号。
+- `C=2*Hq*Dk+Hv*Dv`，当前为 12288；计算入口的 Dk/Dv 为 128。
+- R：frame 的 record 行容量，1..8；B：本次活动行数，`1<=B<=R`。
+- T：物理窗口宽度，任意正整数，受 Tensor 和已分配容量约束。
+- n[b]：本次有效前缀长度，`1<=n[b]<=T`；空 `valid_columns` 表示各行均为 T。
+- m[b]：最终采用的输入列数，`0<=m[b]<=n[b]`。
 
-不把短窗口 kernel 的优化范围定义为 T 的语义上限。实际窗口由启动配置与已准备
-容量限定。每个执行 variant 绑定自己的 T/record 布局；短行通过有效列数表达，
-不把固定 T 的内存直接重解释成更短 T。
+第零维连续，token/batch 展平为 `column=t+T*b`。Record row、StateImage slot 和
+request 身份分别表达；一轮 record 到 fold 完成期间，physical row 顺序保持不变。
+实际 T/B 是本轮产生 records 时的形状，不能把 backing 直接重解释成更短的窗口。
+所有 state selectors 使用对应池的绝对 slot，值在 `[0,Slots)`；B 与 Slots 无须相等。
 
-Records 不拥有 sequence、frontier 或 slot policy。ModelSession/RankProgram 在 frame
-中保存原始 physical row 到 sequence、source image/version 的映射。Record 产生后
-直到 fold 退役，不能重新压缩 batch、改变行顺序、覆盖源内容或重用 records。
+### 3.2 五个 planes
 
-### 3.2 五个独立 planes
-
-| Plane | 完整分配形状 | 单层有效 B 行视图 | 内容 |
+| Plane | 完整分配形状 | 单层 B 行视图 | 内容 |
 |---|---|---|---|
-| conv | BF16 `[C,T,L*R]` | `[C,T,B]` | 每步最新的 Q/K/V history 列 |
-| key | BF16 `[128,Hq,T,L*R]` | `[128,Hq,T,B]` | L2 norm 前的实际 key words |
-| value | BF16 `[128,Hv,T,L*R]` | `[128,Hv,T,B]` | 实际 value words |
-| log_decay | FP32 `[128,Hv,T,L*R]` | `[128,Hv,T,B]` | 内部生成的逐 channel log-decay |
+| conv | BF16 `[C,T,L*R]` | `[C,T,B]` | 每步最新的卷积前 Q/K/V history words |
+| key | BF16 `[Dk,Hq,T,L*R]` | `[Dk,Hq,T,B]` | normalization 前的实际 key words |
+| value | BF16 `[Dv,Hv,T,L*R]` | `[Dv,Hv,T,B]` | 实际 value words |
+| log_decay | FP32 `[Dk,Hv,T,L*R]` | `[Dk,Hv,T,B]` | 内部逐 channel log-decay |
 | beta | FP32 `[Hv,T,L*R]` | `[Hv,T,B]` | 内部 sigmoid 后的 beta |
 
-统一外层索引为 `outer=layer*R+b`。五个 planes 各自连续、256 B 起始对齐、互不重叠；
-规划检查 extent/byte size 溢出，寻址的乘积使用足够宽的整数。`layer(l,B)` 选择
-`[l*R,l*R+B)` 的行；不能把 stride 中的 R 替换成当前 B。
+外层索引统一为 `outer=layer*R+b`，各 plane 连续、起点 256 B 对齐、互不重叠。
+`layer(l,B)` 选择 `[l*R,l*R+B)`，stride 中使用容量 R，不使用活动 B。
+Log-decay 与 beta 分开保存，beta 不沿 128 个 channels 重复。
 
-沿用 GDN 的容器结构，新增 `KdaReplayRecordSpec`、`KdaReplayRecordLayout`、
-`KdaReplayRecordLayer`、`KdaReplayRecords` 和 `plan_kda_replay_records`。Spec 字段
-与 GDN 同形：layers、record_capacity、width、conv_channels、qk_heads、value_heads、
-key_dim、value_dim；KDA 的两个 state dimensions 均为 128。
+### 3.3 Core 接口
 
-`KdaReplayRecordLayer` 持有上述五个 Tensor。Recurrence 的 record 子视图只有后四个
-planes；conv 由输入准备 Op 生产。GDN 的 `[2,Hv,T,B]` scalar gate plane 不扩展成
-多义布局；KDA 的 log_decay 与 beta 分开，保持 128-channel 行连续，不重复存 beta。
-GDN 公开合同不因新增 KDA 而改动。
-
-## 4. Conv record 生产
-
-接口与 `gdn_input_proj_conv_record` 对应，保留 KDA 的投影/卷积特点：
+新增 `core/kda_replay_records.h`，沿用 GDN records 的布局和绑定方式：
 
 ```cpp
+namespace ninfer {
+
+struct KdaReplayRecordSpec {
+    std::int32_t layers = 0;
+    std::int32_t record_capacity = 0;
+    std::int32_t width = 0;
+    std::int32_t conv_channels = 0;
+    std::int32_t qk_heads = 0;
+    std::int32_t value_heads = 0;
+    std::int32_t key_dim = 0;
+    std::int32_t value_dim = 0;
+};
+
+struct KdaReplayRecordLayout {
+    KdaReplayRecordSpec spec;
+    TensorRegion conv, key, value, log_decay, beta;
+
+    [[nodiscard]] std::size_t payload_bytes() const noexcept;
+};
+
+[[nodiscard]] KdaReplayRecordLayout plan_kda_replay_records(
+    LayoutBuilder& builder, const KdaReplayRecordSpec& spec);
+
+struct KdaReplayRecordLayer {
+    Tensor conv, key, value, log_decay, beta;
+};
+
+struct KdaReplayRecords {
+    Tensor conv, key, value, log_decay, beta;
+    KdaReplayRecordSpec spec;
+
+    KdaReplayRecords() = default;
+    KdaReplayRecords(MemorySpan backing, const KdaReplayRecordLayout& layout);
+
+    [[nodiscard]] KdaReplayRecordLayer layer(std::int32_t layer,
+                                            std::int32_t rows) const;
+};
+
+} // namespace ninfer
+```
+
+Planner 使用 `LayoutBuilder` 计算五个 TensorRegion，检查物理形状、字节数与 extent
+溢出；不申请内存。`payload_bytes()` 是五个 plane 的有效载荷之和，包含 alignment
+的 frame 容量使用 builder 的最终结果。绑定对象借用 backing，不保存有效长度、
+source slot、frontier 或采用策略。计算支持域由消费这些 views 的 Op 验证。
+
+## 4. 输入 projection/conv
+
+### 4.1 权重与计算
+
+首个 profile 是 Q8-G32/FP16、A16Only 的单个 parent `[12288,4096]`，行序为
+`[Q4096;K4096;V4096]`。x 为 BF16 `[4096,T,B]`，三个输出各为 BF16 `[4096,T,B]`。
+
+Convolution weight 为 FP32 native `[C,4]`，channel 连续，四个 taps 顺序为
+`t-3,t-2,t-1,t`。Artifact 逻辑 shape 为 `[4,C]`。各源 `[8192,1,4]` 保值转置为
+`destination[tap,channel]=source[channel,0,tap]`；加载时按本地 heads 组合 Q/K/V
+channels，执行时直接使用该布局。
+
+令 `p=concat(Wq*x,Wk*x,Wv*x)`，将源 history 的三列与当前窗口 p 按时间衔接，
+逐 channel 做四 tap causal convolution，再做 SiLU。Q 的 history 同样保留，
+即使 recurrent replay 不需要 query。
+
+Projection、conv、SiLU 是完整计算。当前窗口的私有 projected values 不增加强制
+BF16 舍入；Q/K/V 输出和对外发布的 history/conv_record 为 BF16。
+因此普通 Linear 的 BF16 输出不是此融合 Op 的内部必经缓冲。
+
+### 4.2 两种出口
+
+声明位于 `include/ninfer/ops/kda_input_proj.h`，使用已有
+`SingleProjectionWeight` / `LinearProfile` 表达单 parent 及 activation permission：
+
+```cpp
+namespace ninfer::ops {
+
 struct KdaConvOutputs {
     Tensor query, key, value;
 };
 
 struct KdaConvSourceState {
     Tensor history;      // Read-only BF16 [C,3,Slots].
-    Tensor source_slots; // Device I32 [B], absolute source slots.
+    Tensor source_slots; // Device I32 [B].
 };
 
+struct KdaConvUpdateState {
+    Tensor history;           // BF16 [C,3,Slots], source and destination pool.
+    Tensor source_slots;      // Device I32 [B].
+    Tensor destination_slots; // Device I32 [B].
+};
+
+void kda_input_proj_conv_update(
+    const Tensor& x, const SingleProjectionWeight& qkv,
+    const Tensor& conv_weight, KdaConvUpdateState state,
+    const Tensor& valid_columns, KdaConvOutputs outputs,
+    MemoryArena& workspace, CudaExecutionView execution);
+
 void kda_input_proj_conv_record(
-    const Tensor& x, const ProjectionWeights& weights,
+    const Tensor& x, const SingleProjectionWeight& qkv,
     const Tensor& conv_weight, KdaConvSourceState state,
     const Tensor& valid_columns, KdaConvOutputs outputs,
     Tensor& conv_record, MemoryArena& workspace,
     CudaExecutionView execution);
 
-std::size_t kda_input_proj_conv_record_workspace_capacity_bytes(
-    const ProjectionProfile& weights, std::int32_t batch,
+[[nodiscard]] std::size_t kda_input_proj_conv_update_workspace_capacity_bytes(
+    const LinearProfile& qkv, std::int32_t batch,
     std::int32_t min_tokens, std::int32_t max_tokens);
+
+[[nodiscard]] std::size_t kda_input_proj_conv_record_workspace_capacity_bytes(
+    const LinearProfile& qkv, std::int32_t batch,
+    std::int32_t min_tokens, std::int32_t max_tokens);
+
+} // namespace ninfer::ops
 ```
 
-首个 profile 消费 BF16 x `[4096,T,B]`、A16Only Q8-G32/FP16 QKV parent
-`[12288,4096]`，行顺序为 `[Q4096,K4096,V4096]`。Conv weight 为 FP32 `[C,4]`，
-四 tap 顺序为 `t-3,t-2,t-1,t`。Q/K/V 的 BF16 输出各为 `[4096,T,B]`，可无复制
-view 为 recurrence 的 `[128,32,T,B]`。KDA output gate 属于另一分支，不在此输出 Z。
+两个入口均支持 B=1..8、T 为正；`valid_columns` 为空或为 Device I32 `[B]`。
+输出行为如下：
 
-数学为 `p=concat(Wq*x,Wk*x,Wv*x)`，将旧三列 history 与本窗口 p 拼接，逐 channel
-做四 tap causal convolution 和 SiLU，分成 Q/K/V。历史不足由请求初始化时补零。
-Conv 不消费未来列。输入准备和 recurrence 使用同一 physical row、有效长度与源 image。
+| 出口 | history 效果 | records | Q/K/V |
+|---|---|---|---|
+| update | 读取 source，向 destination 写 n[b] 步之后的最终三列 | 不要求 records | 有效前缀完整写入，无效后缀为 BF16 +0 |
+| record | source history 始终只读 | 写 BF16 `[C,T,B]` 的有效前缀，无效后缀不变 | 同上 |
 
-数值与 effects：
+`conv_record[:,t,b]` 是该次物理执行在位置 t 会发布的最新 BF16 history 列。
+Update 的最终 history 等于 `tail_3(source_history || conv_record[0:n[b]])`，其中
+conv_record 指同次计算对应的 words，不要求 update 实际物化它。
+在相同源、权重、输入、物理 T/B 下，update/record 的有效 Q/K/V 和对应 history
+words 按同一计算实现保持逐 bit 一致。
 
-- Projection、conv、SiLU 是完整组合；published history 和 Q/K/V 为 BF16。
-  不因需要 conv_record 而强制物化私有 BF16 projection 中间量。
-- conv_record 为 BF16 `[C,T,B]`，保存同一物理执行各步实际会发布的最新 history 列。
-  Record 不可由缩短 T、改变 B 或重跑 projection 得到。
-- 源 history 始终只读；有效 outputs/records 被完整写入。无效 Q/K/V 后缀写精确 +0，
-  无效 record 后缀不变。
-- Projection 可以处理全部安全的 `M=T*B` 列；调用者提供完整物理输入。只有有效前缀
-  参与 conv/history 语义，不把 padding 变成历史。
-- History 各 slot 内 `[C,3]` 连续，slot 起点至少 16 B 对齐、stride 显式给出。
-  其余 Tensor 连续且至少 16 B 对齐；I32 selectors 至少 4 B 对齐。
-- 所有输入、输出、records、selectors、权重 parents 和调用 scratch 互不重叠。
-  Source slots 的值属于 `[0,Slots)`；不同只读行可以读取同一个源。
-- Workspace 由 caller arena 提供；capacity query 覆盖完整组合及指定 T 区间。
-  算子没有持久 allocation，不决定 history 的采用或发布。
+Update 的 source/destination selectors 可为相同 Tensor，单行允许原位更新。
+各行 destinations 互异，不能覆盖其他行的 source。实现须在覆盖原位 history 前
+完成所有依赖旧三列的读取；长窗口并行计算也遵循此规则。
+不同只读 rows 可以使用同一 source。Record 不写任何 state slot。
 
-Conv history 与同一完整物理 T/B 执行的逐位置 history reference 按 words 比较。
-该 reference 可以是测试/测量中的 snapshot instrumentation，不要求生产保存 conv
-trajectory。普通 T=1 输入准备的 source/destination history 更新需遵守同样的最新列
-定义，其完整融合清单与 KDA 其他输入准备一起安排。
+x 的全部物理列需可读且为有效有限输入，投影可以计算 padding 列；只有 n[b] 的
+前缀参加卷积/history 语义。两个入口都不对外暴露每个位置的完整 history snapshots。
 
-Query 不进入 recurrent replay record，但 Q 的卷积前列必须进入 conv_record，供
-后续 Q convolution 续接。FP32 conv weights 不参与 fold，fold 只做 history words 提取。
+### 4.3 存储与容量
 
-## 5. Recurrent record 接口
+History slot 内 `[C,3]` 连续，slot stride 显式；slot 起点至少 16 B 对齐。
+x、Q/K/V、conv_record、conv weight 连续且至少 16 B 对齐，selectors 至少 4 B 对齐。
+QKV 使用原生 Q8 codes/scales 对齐要求。History 的实际数据块与所有非 state
+operands 和当前 scratch disjoint。输出和 records 彼此 disjoint，与输入、权重、
+metadata 和 scratch disjoint；只读 metadata 可以共享 backing。
+
+Capacity query 只使用无地址 profile、batch 和闭区间 `[min_tokens,max_tokens]`，
+覆盖完整 projection/conv 及所有合法有效长度。调用使用 caller arena，结束后恢复
+cursor；先前的 arena allocations 可以保存 operands。合法无 scratch 路线返回零。
+
+## 5. 递推执行接口
+
+### 5.1 单序列完整更新
+
+保留 `include/ninfer/ops/kimi_delta_attention.h` 的现有单序列接口，用于完整窗口
+执行和长 prefill。其显式 source/destination 形式为：
 
 ```cpp
+namespace ninfer::ops {
+
+[[nodiscard]] std::size_t kimi_delta_attention_workspace_capacity_bytes(
+    std::int32_t qk_heads, std::int32_t value_heads,
+    std::int32_t min_tokens, std::int32_t max_tokens);
+
+void kimi_delta_attention(
+    const Tensor& q, const Tensor& k, const Tensor& v,
+    const Tensor& g, const Tensor& beta,
+    const Tensor& A_log, const Tensor& dt_bias,
+    float lower_bound, float scale, MemoryArena& workspace,
+    const Tensor& state_in, Tensor& state_out,
+    Tensor& out, CudaExecutionView execution);
+
+} // namespace ninfer::ops
+```
+
+输入使用第 2 节去掉 B 的视图，state 为连续 FP32 `[128,128,Hv]`，写出全部 T 步
+outputs 和末端 state。`state_in/state_out` 可以完全同 view 或 disjoint。现有同一
+state 参数的重载保持同样语义。长 prefill 的 recurrent/chunked 选择和 Spark 调优
+由此入口内部负责；数学参考始终是完整 KDA 转移。
+
+### 5.2 单列 state-pool update
+
+扩展现有 batch update，对齐 GDN 的独立 source/destination selectors：
+
+```cpp
+namespace ninfer::ops {
+
+void kimi_delta_attention_batch_update(
+    const Tensor& q, const Tensor& k, const Tensor& v,
+    const Tensor& g, const Tensor& beta,
+    const Tensor& A_log, const Tensor& dt_bias,
+    float lower_bound, float scale, Tensor& ssm_states,
+    const Tensor& source_state_slots, const Tensor& destination_state_slots,
+    Tensor& out, CudaExecutionView execution);
+
+} // namespace ninfer::ops
+```
+
+T=1、B=1..8；selectors 为 Device I32 `[B]`。每行从 source 做一次 recurrent 更新，
+写 destination 和 out。允许原位，各行 destinations 互异且不能覆盖其他行 source；
+只读 source 可以重复。只写 recurrent 字段，conv 由输入准备负责。该入口无全局
+workspace。实施时替换旧单 selector 签名及其 callers。
+
+### 5.3 Recurrent record
+
+```cpp
+namespace ninfer::ops {
+
 struct KdaRecurrenceRecords {
-    Tensor key;        // BF16 [128,Hq,T,B].
-    Tensor value;      // BF16 [128,Hv,T,B].
-    Tensor log_decay;  // FP32 [128,Hv,T,B], generated inside KDA.
-    Tensor beta;       // FP32 [Hv,T,B], generated inside KDA.
+    Tensor key;       // BF16 [128,Hq,T,B], before normalization.
+    Tensor value;     // BF16 [128,Hv,T,B].
+    Tensor log_decay; // FP32 [128,Hv,T,B].
+    Tensor beta;      // FP32 [Hv,T,B], after sigmoid.
 };
 
 void kimi_delta_attention_replay_record(
@@ -200,61 +353,44 @@ void kimi_delta_attention_replay_record(
     const Tensor& ssm_states, const Tensor& valid_columns,
     const Tensor& initial_state_slots, KdaRecurrenceRecords records,
     Tensor& out, CudaExecutionView execution);
+
+} // namespace ninfer::ops
 ```
 
-`g/beta` 参数严格采用第 2 节的 BF16 raw-logit 输入，不是 records 中同名含义的
-FP32 控制量。`initial_state_slots` 为 device I32 `[B]`，是绝对 source slots。
-Valid_columns 为空或为 device I32 `[B]`。
+B=1..8、T 为正；`initial_state_slots` 和非空 `valid_columns` 为 Device I32 `[B]`。
+每行从指定只读 source state 开始，按 n[b] 个有效 inputs 产生 outputs 和四个
+transition record planes。它不写任何 state slot，不保存完整 recurrent trajectory。
+有效 records 完整写入，无效后缀不变；out 的无效后缀为 BF16 +0。
 
-每行从 source state 开始，顺序执行 n[b] 次完整 recurrent 转移并产生 outputs。
-运行轨迹可以驻留寄存器/共享区，算子不写任何 state slot，也不保存逐位置 recurrent
-snapshots。Key/value records 是实际 BF16 输入 words 的 side copy；log_decay/beta
-records 是内部 gate 计算结果的 FP32 side copy，不经过额外低精度编码。
+Key/value records 保留实际输入 words；log_decay/beta records 保留内部实际 gate
+words。每个元素由唯一写者发布，state tiles 不竞争重复写同一 record。
+该入口无全局 workspace，内部轨迹与实现 scratch 不成为持久资源。
 
-有效 record 前缀必须完整覆盖；无效后缀不变，无效 out 后缀为 BF16 +0。每个有效
-record 元素由唯一写者发布，不依赖多个 state tiles 重复写相同值。不同 record rows
-可以读取同一只读源，但具有独立 outputs 和 records。
+`k` 与 `records.key`、`v` 与 `records.value` 分别允许完全同 view，其他 record
+重叠不允许。同 view 时复用既有 words，不重复拷贝。这样输入准备可直接将 K/V
+写入对应 frame record plane，再以 reshape 后的 view 供递推消费。
+该复用下，输入准备仍按 Q/K/V 合同将无效输出置零；record 入口保持后缀不变，
+指保持它被调用时的内容。
 
-State slots 内 `[128,128,Hv]` 连续，slot 起点至少 16 B 对齐；slot stride 显式给出。
-Q/K/V/g/out 和 BF16/F32 向量 records 连续且至少 16 B 对齐；beta、A_log、dt_bias、
-beta record 和 selectors 至少按其元素类型对齐。All-layer planner 使用第 3 节的更强
-plane 对齐。所有有存储的 operands 两两不重叠，包括源 state、metadata、records 与 out。
+### 5.4 共同存储要求
 
-不创建持久或调用者不可见的 Device allocation；该 recurrent record 入口不需要
-全局 workspace。调用者保证 device selectors/valid lengths 合法，wrapper 验证 dtype、
-shape、stride、alignment、device 和地址域，不为检查 device 值增加同步读取。
+Pooled state 每 slot 的 `[128,128,Hv]` 连续，slot stride 显式，起点至少 16 B 对齐。
+Q/K/V/g/out 连续且至少 16 B 对齐；beta、A_log、dt_bias 和 I32 selectors 自然对齐。
+Record vectors 至少 16 B 对齐，beta record 至少 4 B 对齐；Core planner 提供更强的
+256 B plane 对齐。
 
-## 6. Ordinary 单列更新与数值参照
+除声明的 state 原位和 K/V record 同 view 外，写入范围与所有其他 operands disjoint。
+只读 operands 可在数学与形状允许时共享 backing。Operands、metadata、workspace
+均属于 execution device。Device slot/length 的合法值由调用者保证，Op 检查公开
+metadata 和地址域；不为验证 device 值增加 Host readback。
 
-生产 ordinary update 保留全部计算参数，仅对齐 GDN 的源/目的状态选择：
+## 6. Prepared all-layer fold
 
-```cpp
-void kimi_delta_attention_batch_update(
-    const Tensor& q, const Tensor& k, const Tensor& v,
-    const Tensor& g, const Tensor& beta,
-    const Tensor& A_log, const Tensor& dt_bias,
-    float lower_bound, float scale, Tensor& ssm_states,
-    const Tensor& source_state_slots, const Tensor& destination_state_slots,
-    Tensor& out, CudaExecutionView execution);
-```
-
-这里 T=1、B=1..8，两个 selectors 均为 device I32 `[B]`。允许同一行 source=destination；
-各行 destinations 互异，且不能覆盖其他活动行的 source。Source slots 可以重复，
-前提是所有相关写入都满足上述限制。只写 destination 的 recurrent state 与本行 out；
-源/目的以外的 slots 和其他 StateImage 字段不变。Conv history 由输入准备的状态效果负责。
-其他计算输入/输出、state stride 与 alias 约束沿用第 2、5 节。
-
-该 source/destination 扩展属于状态管理对齐，不修改 raw gate 输入。现有只接受一组
-in-place selectors 的 batch 入口在实现时随其 callers 一并替换，不保留旧签名作为兼容别名。
-生产 decode 不借用实验通用入口的自动分派。
-
-Record、ordinary update 和 fold 共享同一个 KDA finite-precision transition 核心。
-以同一物理 verify 的实际 represented inputs 做逐步 ordinary recurrent reference，
-有效 outputs 必须逐 bit 一致；record 自身不发布最后的 state。
-
-## 7. Prepared all-layer fold
+声明位于 `include/ninfer/ops/kda_replay.h`，与当前 GDN 同时提供 Host 和 Device 行描述：
 
 ```cpp
+namespace ninfer::ops {
+
 struct KdaReplayFoldRow {
     std::int32_t source_state_slot;
     std::int32_t destination_state_slot;
@@ -263,204 +399,149 @@ struct KdaReplayFoldRow {
 
 class KdaReplayFoldPlan {
 public:
-    KdaReplayFoldPlan(
-        const KdaReplayRecords& records,
-        LinearAttentionStateAllLayersView states);
+    KdaReplayFoldPlan(const KdaReplayRecords& records,
+                      LinearAttentionStateAllLayersView states);
 
-    void execute(
-        std::span<const KdaReplayFoldRow> rows,
-        CudaExecutionView execution) const;
+    void execute(std::span<const KdaReplayFoldRow> rows,
+                 CudaExecutionView execution) const;
+
+    void execute(const Tensor& source_slots, const Tensor& destination_slots,
+                 const Tensor& commit_columns, CudaExecutionView execution) const;
 };
+
+} // namespace ninfer::ops
 ```
 
-构造期验证固定 records/state 的 geometry、device、alignment、地址范围、field/layer
-strides 与不重叠。每次 execute 验证 active row count、source/destination slots 和
-`0<=commit_columns<=T`。调用者另外保证 `m[b]<=n[b]`，且 source 与产生该行 records
-时的内容版本相同。Plan 借用已有稳定 backing，不拥有 allocation 或 record lifetime。
+构造时验证固定 records/state 的几何、dtype、device、strides、alignment、地址域和
+不重叠。Plan 借用稳定 backing，不分配设备存储。State 的 layers、heads、conv
+channels/width 与 records 对应；conv_width=3、Dk=Dv=128。
 
-`rows[b]` 始终对应 physical record row b；rows.size() 属于 `[1,R]`。Source/destination
-均为绝对 state slots，不要求与 b 相等。状态布局与 records 的 L、Hq/Hv、C、Dk/Dv
-匹配，conv_width=3。各层/字段必须有互不重叠的实际数据块，独立 layer strides 不能
-由某一层大小猜测。Core 规划的 field/layer/slot 起点沿用 256 B 对齐。
+`rows[b]` 对应 physical record row b，Host rows.size() 或 Device metadata 长度为
+B，`1<=B<=R`。Selectors 是绝对 slots，m 在 `[0,T]`；调用者保证 `m[b]<=n[b]`，
+且 source 内容仍是产生该行 records 的原始版本。
 
-### 7.1 正接受前缀
+All-layer state 的字段、层和 slot 起点遵循 Core 的 256 B 对齐。Device metadata
+是连续、至少 4 B 对齐的 I32 `[B]`，与 state/records disjoint，三个只读 metadata
+之间可以共享 backing。Host 形式检查行数、slot 值、m 和行间写入关系；Device
+形式检查 Tensor metadata/地址域，值与行间关系由调用者保证，不做 Host readback。
 
-对 m>0 的每行、每层，从 source recurrent state 开始：
+### 6.1 正提交与零提交
+
+对每个 m>0 的 row、每个 layer：
 
 ```text
+S = source.recurrent
 for t in [0,m):
-    k_hat = normalize(record.key[t])
+    k = normalize(record.key[t])
     alpha = exp(record.log_decay[t])
-    按第 2 节执行 decay → prediction → delta → rank-one update
+    S = KDA_transition(S, k, record.value[t], alpha, record.beta[t])
 
-destination.recurrent = 最终 FP32 state
-destination.conv = tail_3(source.conv || conv_record[0:m])
+destination.recurrent = S
+destination.conv = tail_3(source.conv || record.conv[0:m])
 ```
 
-Fold 不读取 q、raw g/beta logits、A_log、dt_bias、lower_bound、scale 或 projection
-weights，不执行 readout、sigmoid、conv、SiLU、output gated RMSNorm 或 O projection。
-它只重算 state transition 中的 key normalization、exp(log_decay)、prediction 和 update。
-Delta 必须由 fold 当前 state 重算，不能把 verify 的 state-dependent delta 当成输入。
+Fold 不读取 query、raw gate logits、权重、A_log/dt_bias，不运行 projection、
+convolution、SiLU、sigmoid 或 readout。Prediction/delta 依赖当前重放 state，
+按同一 transition 重算。
 
-Conv 更新是精确 words 提取：m=1 取旧 history 后两列和 record[0]；m=2 取旧末列及
-record[0:2]；m>=3 取 record[m-3:m]。原位更新时先保留所需旧列，再执行写入。
+Conv 更新是 words 提取：m=1 取旧末两列加 record[0]；m=2 取旧末列加 record[0:2]；
+m>=3 取 record[m-3:m]。原位时保留所需旧列之后再写。
 
-### 7.2 零提交与 alias
+m=0 是严格 no-op：不读 state/record payload，不写两个字段，即使 source 与
+目的不同也不复制。调用方继续采用原 image。Selectors 仍遵守合法范围与行间关系。
+允许单行原位 fold；destinations 互异，不能覆盖其他活动行的 source。
 
-m=0 是该行严格 no-op：不读任何 record 或 state payload，不写 recurrent 或 conv。
-即使 source!=destination，也不隐式复制旧 state。该行继续采用旧 image；若其他组合
-操作确实需要一份副本，由调用者显式安排，不将未写的 destination 视为有效新状态。
+一次调用覆盖本 rank 的全部 KDA layers，只写正提交行的目标字段。Records 只读，
+拒绝后缀不读取；无需全局 workspace，也不要求 Host 按 layer 循环提交。
 
-允许单行原位 fold。活动行 destinations 互异，且不能覆盖其他活动行的 source；
-校验方式与 GDN 一致。Records 五个 planes 均只读，彼此以及与全部 state 数据块不重叠。
-只写正提交行的 destination recurrent/conv；不触碰其他 slots、Index tails、hidden
-或 metadata。拒绝后缀不被读取。
+### 6.2 精确关系
 
-一次 fold 调用覆盖本 rank 全部 KDA layers 和 conv history，不由 Host 逐层循环提交。
-公开合同不固定 kernel 数量，也不引入临时完整 state trajectory；没有额外全局 workspace。
+Ordinary batch update、recurrent record 和 fold 共享同一有限精度 transition。
+从相同 source，使用同次 record 调用实际消费的 represented inputs：
 
-## 8. 精确提交合同
+- record 的有效输出与逐步 ordinary batch update 的输出逐 bit 一致；
+- fold(m) 的 recurrent words 与上述轨迹第 m 步逐 bit 一致；
+- conv words 与同次物理输入准备在第 m 步对应的 history 一致。
 
-记内部实际 FP32 gate words 为 d/b，record 为 `R_t=(k_raw,v,d,b)`，实现采用的有限
-精度转移为 `F_fp`。Verify 和 fold 必须满足：
+共享范围包含 key normalization、gate/exp、prediction reduction、乘加和 FP32
+state 边界。优化可改变实现，但这三个入口须作为一致的数值组合维护。
+输入投影不在接受长度 m 上重跑；更短 T/B 的另一次输入准备不是精确前缀参考。
 
-```text
-S_verify[0] = S_source
-S_verify[t+1] = F_fp(S_verify[t], R_t)
+长 prefill 的 chunked 路径按独立数学精度验收，不与 recurrent 路径要求逐 bit
+相同；它实际发布的 FP32 末端 state 可以作为下一轮 source。
 
-S_fold[0] = S_source
-S_fold[t+1] = F_fp(S_fold[t], R_t),  0<=t<m
+## 7. 执行组合与 Graph
 
-bits(S_fold[m]) == bits(S_verify[m])
-```
+| 调用场景 | 输入准备 | 核心 | 最终状态 |
+|---|---|---|---|
+| 完整 prefill 窗口 | `kda_input_proj_conv_update` | 现有单序列 `kimi_delta_attention`，内部选择 recurrent/chunked | 两项直接写目标 image |
+| Ordinary 单列 | `kda_input_proj_conv_update` | source/destination `batch_update` | 两项直接写目标 image |
+| Verify | `kda_input_proj_conv_record` | `replay_record` | 接受长度确定后 all-layer fold |
 
-Conv 同时满足同一次完整物理 record-producing block 的第 m 份 history words 相等。
-Record 前的 projection/conv 在同一个 T/B 下只执行一次。不能缩短 T/B 重新算输入，
-也不能把更短一次 forward 的结果当作该次 verify 的精确 prefix reference。
+Prefill 单序列输入使用实际有效 T；长窗口的 checkpoint 边界由调用方拆分或显式
+捕获。普通单列每个活动 row 都有一个有效 input。纯控制投影、输出 norm 和 O
+在三条路径中使用同样的数学组合。
 
-逐 bit 关系覆盖 normalization、exp、prediction reduction、乘加与 state-store 边界。
-公开合同不指定 CUDA 指令、warp/CTA 或某个 reduction tree；实现可以调整它们，
-但 decode/record/fold 必须作为一致的数值组合重新验证。不能按接受长度切换到另一套
-代数等价、却产生不同 represented state 的 fold 路径。
+Verify 的 source image 保持只读，frame 保存 physical row 到 source image/version
+的对应关系。最终 m 是采用的 verify inputs 数，包含已执行的 anchor/接受前缀，
+由模型的接受结果与发布边界给出。Fold 完成、模型其他字段也就绪之后，Session 才
+采用目标 image；records 在 fold 和所有消费者退役后复用。
 
-这一精确关系不代替数学资格。生产 recurrence 还需对独立数学 oracle 验证完整输出
-与 state。Constant-per-channel decay 可在实数域退化为 scalar GDN，但不要求两种
-Op 的不同数值实现逐 bit 相等。长 prefill 的 chunked 实现不作为 decode/verify/fold
-的数值参照；它产生的实际 FP32 末端 state 可以作为下一轮 source。
+Graph 使用规则：
 
-## 9. 提交、checkpoint、Graph 与 TP2
+- 输入准备和 record 读取当前 Device selectors/valid lengths；固定地址下可更新内容。
+- Device fold 的三个 I32 `[B]` metadata 每次 replay 读取当前值。全零 m 在 kernel
+  内跳过，不通过 Host 读取值决定是否放入 Graph。
+- Host fold 将 row descriptors 按值提交；capture 后改变 Host vector 不改变图中值。
+  全零 Host rows 可直接返回。需要每轮改变 descriptors 的图使用 Device 形式。
+- Plan、records 和 state backing 在引用它们的提交及 Graph 生命周期内保持有效。
+  T、R、几何和布局固定于相应执行 variant；同一 backing 上的下一轮写入等待旧消费者。
 
-```mermaid
-flowchart LR
-    S["Committed StateImage"] --> V["Recurrent verify + records"]
-    V --> O["Outputs / target decision"]
-    V --> R["Frame-owned records"]
-    O --> A["Final commit columns"]
-    S --> F["All-layer fold"]
-    R --> F
-    A --> F
-    F --> N["Destination recurrent + conv"]
-```
+TP2 每 rank 独立处理本地 32 heads 和 34 层，source/destination slot 编号可以不同，
+逻辑 batch 和采用长度一致。模型负责完整输出的归约和状态采用。GLM 的 MTP 层是
+MLA，不增加 MTP KDA records；这套 ReplaySSM 服务 Main 的 speculative verify。
 
-1. Session 保留 source image 的版本/读依赖，并预留必要的目的 image、pages 和 frame。
-   Retained checkpoint 不可原位覆盖；可独占写入时才允许原位采用。
-2. RankProgram 用同一 source、T/B、行顺序完成输入 records 与 recurrent records。
-   下一层正常消费本层输出，records 存活到采用结束。
-3. 后端验收与 Frontend 截断给出最终 m。它是采用的 verify 输入数；通常包含旧 anchor
-   和接受的 drafts，即 accepted_drafts+1，再受实际发布边界限制。
-4. RankProgram fold 每个正提交行，并完成模型其他 state/cache 的接受前缀采用。
-   Correction/bonus 成为下一轮 pending anchor，其输入转移不在本轮提前提交。
-5. Session 将 StateImage、各 pool coverage、输入身份及完成依赖作为同一次逻辑提交
-   采用。物理结果按依赖就绪后可消费；Op 不自行推进 frontier。
-6. Fold、其他消费者和执行依赖退役后，frame 的 records 才能重用。下一轮直接从已
-   fold 的 committed state 开始；取消的行不发布候选。
+## 8. 实现组织与复用
 
-TP2 下每台对本地 32 heads、34 层独立 record/fold，无需传输 KDA records 或 state。
-两台采用同一逻辑 batch/长度；本地物理 state slot 可以不同。模型层维护逻辑层号到
-紧凑 KDA layer ordinal 的映射。GLM MTP 没有 KDA；本 records 存储服务 Main verify，
-不另加 MTP KDA 层。MLA DP owner 的 cache/tail 由模型自己的采用操作处理。
-
-StateImage 仍按 active/checkpoint/destination 实例计费。Pause/restore 保存已 fold
-的 KDA state/conv 及模型其他必要状态；本轮暂存 records 不成为 checkpoint 依赖。
-长窗口若只产生末端 state，其他 checkpoint 边界仍需拆分执行或显式捕获，不能靠截短
-MLA cache 从较深 KDA state 倒推。
-
-Prepared plan 的 records/state backing、geometry 和 strides 保持稳定。Record 的
-device selectors/valid_columns 在 replay 时读取内容。Fold 沿用 GDN 的 Host row
-descriptors 按值捕获语义：修改 Host vector 不会改变已捕获调用；改变 descriptors
-必须重新 capture 或走既有非捕获提交路径。方案不增加为读 metadata 而进行的同步。
-多个未退役 frame 各自持有 records，互不覆盖。
-
-部署容量和 snapshot/records 成本对照集中在
-[并行资源设计](parallel.md#5-kda-records-容量与成本)；容量查询仍由本设计的完整
-record layout 和 prepared fold plan 决定，不以示例表格代替实际 sizing。
-
-## 10. 资格与性能验收
-
-### 10.1 独立数学与精确关系
-
-- 使用独立数学 oracle，从 represented BF16 inputs 和 FP32 参数计算 normalization、
-  bounded gate、key-axis decay、delta、update 和 readout。按 KDA 数学误差合同验证，
-  不以 kernel parity 或可读生成结果替代。
-- 用非均匀逐 channel decay 检查 key/value 轴，覆盖零 key、零/非零 initial state、
-  gate 饱和边界以及 constant-decay 的实数退化关系。
-- 在同一次完整物理 T/B producer 的实际 outputs/records 上取得 recurrent prefix
-  references；对每个 m 检查 fold recurrent/conv 的逐 word 一致性。
-- 覆盖 m=0/1/2/3、全接受、部分接受、混合 n/m、原位/异位、非连续 slots、共享只读源
-  向不同目的分叉，以及跨行非法覆盖的拒绝。无活动行时不调用本 Op；活动行 m=0 则
-  保留记录行并执行严格 no-op 语义。
-- 检查 valid record bits、无效 output 零、无效 record 后缀、源/非活动 slots、其他
-  StateImage fields 和记录区保护；改写拒绝后缀不能影响 committed state。
-- 将 Q8 projection＋FP32 conv 的 record producer 接入后，比较同一物理窗口的实际
-  history words；覆盖旧 history 与新 records 的三列拼接。
-- 多轮改变采用长度并逐轮核对 state/history；包括满接受、短接受、取消与恢复后的轮次。
-  资格直接覆盖生产 record/fold 路径和 Graph 调用。
-
-### 10.2 测量口径
-
-首个目标为 Spark `sm_121a`、34 层/32 heads，B=1/2/4/8；重点窗口 T=1/2/4/6/8/16，
-并检查配置允许的其他宽度。接受长度覆盖 0、短前缀和全前缀；均匀/混合行长度分列。
-这些是测量点，不是 T 的公共上限。
-
-对照为相同 represented inputs、相同 recurrent 数值轨迹的单次窗口 verify＋完整
-state snapshots/reference 采用。固定 projection/conv 计算、量化、T/B、起始 state、
-采用长度和运行条件。用于资格的逐 token Host 调用不直接当作延迟基线。
-
-分别报告输入准备/conv record、recurrent record、全层 fold 和完整 verify＋commit
-单元；同时列出临时容量、实际状态流量、Eager/Graph、分布和最差变化。样例聚合所用
-的 workloads、权重和采用长度分布在测量前固定。报告 fold 的额外计算及所有退化，
-不能用存储压缩比代替实测。
-
-本阶段是新增生产 ReplaySSM 能力。尚无 GLM 端到端或 record/fold 性能结果；完整
-Main/MTP 周期的收益由后续模型接入测量确认。
-
-## 11. 落地位置与后续边界
-
-| 内容 | 落地位置/复用 |
+| 位置 | 改动 |
 |---|---|
-| 五 plane records 的规划与 views | 新增 `src/core/kda_replay_records.*`，复用 Core Tensor/Layout |
-| 持久 state | 复用 `linear_attention_state.*`、`state_image.*` |
-| Record/update 计算合同 | `include/ninfer/ops/kimi_delta_attention.h` |
-| 全层 fold 合同 | 新增 `include/ninfer/ops/kda_replay.h` |
-| Conv record 合同 | 新增 `include/ninfer/ops/kda_input_proj.h` |
-| 生产 recurrence/record/fold | 现有 `src/ops/linear_attention/kimi_delta_attention/` family 内组织 |
-| 源/目的、frame 与采用 | GLM 原生模型执行和 Session，复用上下文目录与完成机制 |
+| `src/core/kda_replay_records.h/.cpp` | 五个 record planes 的布局、绑定、layer views |
+| `include/ninfer/ops/kda_input_proj.h` | 输入 update/record 及容量查询 |
+| `include/ninfer/ops/kimi_delta_attention.h` | source/destination batch update、新增 recurrent record；保留完整窗口入口 |
+| `include/ninfer/ops/kda_replay.h` | Host/Device all-layer fold plan |
+| `src/ops/linear_attention/kimi_delta_attention/input_conv/` | Q8 projection、FP32 conv、SiLU、history/record 输出 |
+| `src/ops/linear_attention/kimi_delta_attention/replay/` | record/fold、prepared validation、Spark 分派 |
+| 现有 KDA recurrent/chunked 实现 | 提取共同 transition，接 source/destination 与 record 输出；保持原有数学 |
 
-实施时先建立 KDA recurrence 的数学资格和共用数值核心，再接 record/fold、conv
-record 和全层组合验证；普通更新的 source/destination callers 同步完成。GDN/KDA
-可以共享行描述校验、寻址和 conv 提取等内部逻辑，但保留各自有明确 decay 含义的
-强类型 records 与入口，不通过模型名或 Tensor shape 猜测语义。
+新增内容留在 `linear_attention/kimi_delta_attention`。Projection 模板复用 Linear，
+基础数值/内存操作复用 `ops/common`；输入融合拥有自己的调优策略。StateImage、
+linear-attention state、layout builder 和 Graph 基础直接复用。KDA 的向量 decay
+record 使用自己的明确字段，不改变 GDN scalar gate plane 的含义。
 
-本文不决定 MLA/Indexer codec、MTP 接受策略、output gated norm 或整个 KDA block
-的最终融合。已有[基础 Op 清单](op-checklist.md)继续按其
-范围执行；本设计需要的 KDA 实现、验证和调优另行形成执行任务，不自动追加到旧清单。
-对应接口、records 与测试落地后，由实际 Op 头文件、Core layout 和资格测试接管；
-组合执行及状态交接接入模型后，由实际执行代码与当前执行说明接管。未落地部分继续
-保留；全部接管后删除本文，不将接口草案作为第二份长期规范。
+现有 `sigmoid_gated_rmsnorm()`、control Linear/split 和 O Linear 不再增加 KDA
+专用副本。容量、state/record 视图绑定与 compute 支持检查各由所属模块负责。
 
-参考现有合同：[GDN recurrence/record](../../../include/ninfer/ops/gated_delta_net.h)、
-[GDN input record](../../../include/ninfer/ops/gdn_input_proj.h)、
-[GDN fold](../../../include/ninfer/ops/gdn_replay.h)、
-[GDN records](../../../src/core/gdn_replay_records.h)。通用所有权与资格遵循
-[Engine 架构](../../maintainer/engine-architecture.md)、[资源与上下文缓存](../../maintainer/resource-scheduling-and-context-cache.md)
-及[Op development](../../maintainer/op-development.md)。
+## 9. 实施与验证
+
+实施顺序为 records 容器和输入 update/record、递推 source/destination 与 record、
+Host/Device all-layer fold，随后完成生产链调优。容器和算子的构建注册、现有 KDA
+callers、tests/bench 随相应接口一起更新。
+
+验证按以下几类完成，复用现有 KDA、GDN 和 core layout 的测试组织：
+
+1. Projection/conv/SiLU、gate、递推及 state 对独立数学参考；FP32 conv 权重与 tap
+   顺序、直接 gamma、逐 channel decay、padding 输出分别按合同检查。
+2. Records 的实际 words、同物理 T/B 的 update/record 一致性；K/V 同 view 与独立
+   backing 两种合法形式；固定 R 下 B<R 的跨层寻址。
+3. Fold 与逐步 recurrent state/output 的精确关系，覆盖 m=0/1/2/3/完整前缀、混合
+   接受长度、非连续 slots、原位和独立目的、显式 state strides。
+4. 固定地址的 Graph 重放改变 inputs、selectors、valid lengths 和 Device commit
+   lengths，检查未使用 record 后缀及非目标 state 字段保持不变。
+
+数值要求按公开数学确定，不随私有 kernel 改精度阈值。精确 replay 检查和完整 KDA
+数学检查分别保留。
+
+性能使用完整公共 Op：input update/record、batch update、record、all-layer fold
+以及长窗口 core 分别测量。Decode/verify 看不同 B/T/采用长度；长 prefill 独立看
+chunked 的计算与 workspace 流量。State 带宽按实际 state 读写计，record 写入和
+fold 重放另计；容量推导见[并行资源](parallel.md#5-kda-records-容量与成本)。

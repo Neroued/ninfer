@@ -5,22 +5,28 @@
 - [模型语义](../../maintainer/glm5next-model.md)：完整数学、逻辑权重、因果关系、Main/MTP/Vision 和历史依赖。
 - [量化与数值表示](../../maintainer/glm5next-quantization.md)：源表示、选定量化、精确编码、计算精度、显式舍入及权重容量。
 
+完整集成从[双 Spark 支持与优化路线](roadmap.md)开始：包含当前代码起点、G0–G7
+阶段、并行 Op 任务包和交接条件。[Linear/MoE 清单](op-checklist.md)按当前主线区分
+已有能力与待补任务，列出 `.50` 执行所需的几何、代码入口和顺序。
+
 阅读实现设计前先读相应长期参考。这里的接口名称和代码片段是待落地合同，不能
 据此宣称已有运行能力；已确认的模型／数值决策不因实现进度或文档迁移而重开。
 
 ## 1. 文档与状态
 
-以下为本地已记录状态。基础执行任务的完成证据只在对应 checklist 条目维护，
-未勾选不等于现有实现不支持，也不从本地未更新记录推断远端执行进度。
+以下区分设计与实现。既有基础 Op 成果按代码和原验证证据确认；新格式需求以
+当前清单为准，不能用已通过的 BF16 shared 结果代替 Q8 路线的验证。
 
 | 内容 | 决策状态 | 实施状态／入口 |
 |---|---|---|
 | 架构、源表示、量化与数值政策 | 已确定 | 长期参考；新量化产物尚未生成或做模型精度评测 |
 | [双 Spark 分工与资源](parallel.md) | 模块分工、owner、mHC 复制已确定 | 待通信与模型执行接入；容量为推导，暂无 GLM 双机端到端测量 |
-| [基础 Op 清单](op-checklist.md) | 已有范围固定 | 沿用原 20 个条目的状态、验证和性能证据 |
-| [KDA ReplaySSM](replayssm-kda.md) | 内部 gate、recurrent decode/verify/fold、每轮即时 fold 已确定 | 设计待实现／验收，另行下发 |
-| [Kpool Sparse MLA](kpool-sparse-mla.md) | 接口、page、codec、selection/tail 已确定 | 设计待实现／验收，另行下发 |
-| [mHC](mhc.md) | 五个入口、布局、精度、融合与复制放置已确定 | 设计待实现／验收，另行下发 |
+| [Linear/MoE 清单](op-checklist.md) | Q8 shared 完整链、MLA query/O、Q4 draft head、stem/Vision 纯矩阵与 MoE 优化迁入 | `.50` 工作区按清单逐项实施 |
+| [KDA 计算与 ReplaySSM](replayssm-kda.md) | 输入 update/record、递推 source/destination、五个 record planes、Host/Device fold 接口已明确 | 按现有 GDN 状态组织落地，待实现／验收 |
+| [Kpool Sparse MLA](kpool-sparse-mla.md) | 与 QSA 平行的 family、五个计算入口、冻结 selection、历史与 tail、容量及分阶段实现已明确 | 设计待实现／验收 |
+| [mHC](mhc.md) | 五个 C++ 入口、M 列布局、容量查询、两阶段融合与资源归属已明确 | 设计待实现／验收 |
+| [MTP](mtp.md) | 输入移位与首列 mask、stem/residual 接口、canonical history、首步采用、head 及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
+| [Vision](vision.md) | GLM processor、patch 顺序、bias/2D norm-RoPE/D64 attention、segment 分配与媒体生命周期已明确 | 输入基础、Op 扩展与模型组合待实现／验收 |
 | Converter 与模型接入 | 数值规则已定，接入未完成 | block-FP8 编码入口、GLM converter/binding 与运行路径待实现 |
 
 量化格式存在不等于转换方法存在：当前 block-FP8 converter 只有 `import_encoded`，
@@ -29,15 +35,15 @@ ReplaySSM 的调用约束。各设计的“待实现”范围与现有通用算�
 
 ## 2. 当前实施范围与待设计事项
 
-现有基础清单仅覆盖 TP2/EP2 的纯投影、无状态融合、dense/shared MLP 和 Main/MTP
-本地 MoE。KDA 状态链、MLA/Indexer、mHC 不自动追加；实现与调优需明确下发任务。
-本次文档整理不修改条目 ID、状态、profile 或验收范围，也不触发 `.50` 同步。
+当前清单覆盖 TP2/EP2 的纯投影、无状态融合、dense/shared MLP 和 Main/MTP
+本地 MoE，并补充 MLA query/O、optimized draft head、stem/Vision 的纯矩阵需求。
+KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优。
 
 仍需设计或落实的工作：
 
 - 跨模块 collective、pack/unpack、通算融合、模型 Graph 和跨 owner 前缀恢复。
-- MTP stem、embedding、Vision 的本地放置与接口；分片 logits、采样、acceptance 和 scoring 交接。
-- 完整 KDA 输入／输出融合及长 prefill 的执行选择；已定 decode/verify/fold 的 recurrent 约束保持。
+- 按 MTP/Vision 设计落实执行、媒体输入与资源交接；连接分片 logits、采样、acceptance 和 scoring。
+- KDA 输入准备、record/fold 的实现与 Spark 调优；输出复用 sigmoid gated RMSNorm，长 prefill 由完整窗口入口内部选择算法。
 - Converter、artifact binding、模型加载／Frontend／Engine 接入和完整状态组合。
 
 设计决定、实现完成和性能验证是三种不同状态。算子 kernel 完成不自动表示模型
@@ -52,7 +58,8 @@ ReplaySSM 的调用约束。各设计的“待实现”范围与现有通用算�
 | 分片、owner、通信交接与部署预算 | parallel.md |
 | 具体 Op/views、physical layout、写域、alias、融合与验收 | 对应 family 设计 |
 | 执行条目与完成证据 | op-checklist.md |
-| 跨主题进度与未决范围 | 本索引 |
+| 集成步骤、并行任务与阶段进度 | [实施路线](roadmap.md) |
+| 文档导航与既有设计范围 | 本索引 |
 
 接口表为自洽所列的 dtype/shape 应引用并满足长期语义；不在不同文档维护两份
 encoder、完整模型数学或不同精度政策。实现设计的数学组合可引用长期公式，再明确

@@ -14,6 +14,7 @@ MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制
 
 | 部分 | 固定的分工 |
 |---|---|
+| Token embedding | 完整 BF16 表在两台复制；每 rank 内 Main/MTP 共享同一对象 |
 | Main 11 层及 MTP 1 层 MLA | 按请求 DP2；Q_a/Q_b/KV_a/KV_b/O 的完整逻辑权重在两台复制；owner 计算该请求的完整 64 heads |
 | Main/MTP Indexer | 与对应 MLA 共用请求 owner；完整投影、32 个 query heads、pooling、评分与 selection 由 owner 计算 |
 | MLA/Indexer 历史 | 一个请求的完整 latent、pooled index cache 和未完成 pool tail 只在 owner 保存；Main 与 MTP 同 owner、不同 pool/frontier |
@@ -23,7 +24,9 @@ MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制
 | Main/MTP routed experts | EP2，每台 144 个完整 experts，expert 内部不再 TP；global Top8 与 route 系数保持完整语义 |
 | Router | 完整权重及控制计算复制，消费一致的 block input |
 | Main mHC | 两台复制全部权重与完整四流 residual，处理同一组物理列；完整 block 输出求和／汇集后，各自执行 post 与下一 pre |
-| Main/MTP LM head | vocabulary TP2，每台 `[77440,4096]`，Main 与 MTP 共用分片权重 |
+| Main LM head / optimized draft head | vocabulary TP2，每台各 `[77440,4096]`；Main 为 BF16，额外 draft 为 Q4 A16；未启用 optimized head 时 MTP 使用 Main head |
+| MTP stem／普通 residual／norm | 完整 BF16 stem 和 norms 复制，两台处理同一组物理列；MLA 输出汇集、MoE 局部贡献求和后进入 residual |
+| Vision | 完整 BF16 tower 复制，按独立 temporal-grid attention segment 分配任务；完整 features 在进入 Main 前按原顺序交换 |
 
 DP 的分配单位是请求。普通执行保持请求的 MLA/Indexer owner 稳定，该请求的全部
 历史由此 owner 消费；不按序列位置拆开一条历史。KDA 仍由两台共同持有分片，并
@@ -50,15 +53,44 @@ head 等非 routed-expert 权重一并复制。它的 MLA 与 KDA 使用同一�
 纯投影及本地 FFN/MoE 的 TP2/EP2 几何、P/F/M/R/E 条目由
 [基础 Op 清单](op-checklist.md)维护。KDA Q/K/V 分别按 heads 切片后按 Q/K/V 行序
 合并；BF16 beta、f_a、g_a 不混入 Q8 parent。KDA O 按对应 heads 的 K 轴切片。
-Convolution 的 channel/tap 映射与投影一致，转换时保留源 FP32 words 和时间顺序。
+Convolution 的 channel/tap 映射与投影一致，转换时保留源 FP32 words 和时间顺序，
+按 [KDA 布局](replayssm-kda.md#4-输入-projectionconv)转为每个 tap 的 channels 连续。
 
-Dense/shared 的 GU 沿 intermediate 切分，down 沿对应 K 轴切分；routed bank 每台
+Dense/shared 的 GU 沿 intermediate 切分，down 沿对应 K 轴切分；shared 的 GU/down
+均使用 Q8 A16，K 切点保持 G32 对齐。Routed bank 每台
 持有 144 个完整 experts，expert 内部不再 TP。Global ID 到本地 bank 的映射显式提供。
 量化域和 GU 合并的数值条件见数值文档，不随这些分片变化。
 
 MLA/Indexer 的 W_A/W_B 合并、U_K/U_V 因子布局与独立 O 由
 [Kpool Sparse MLA](kpool-sparse-mla.md#2-权重投影与执行链)维护；mHC 的 F 行序与
 四流布局由 [mHC 设计](mhc.md#1-权重与-tensor-布局)维护。每份物理布局只保留一个定义。
+
+### 2.1 Vision 权重的保值布局
+
+Vision 权重保留 BF16，转换期确定与输入一致的 feature 顺序：
+
+- Patch projection 展平为 `[1024,1176]`，输入 K 轴按源 `(channel,temporal,y,x)`
+  排列；processor 直接产生这一顺序的 patch，不在执行时转置权重。
+- QKV 保持 `[Q;K;V]`，GU 合并为 `[gate;up]`；对应 bias 使用相同行顺序。
+- Downsample 输入按四个 spatial patches、每个 1024 channels 连续排列，
+  `p=2*dy+dx`。将源 `[4096,1024,2,2]` 保值重排为 `[4096,4096]`：
+  `W_flat[out,p*1024+channel]=W_source[out,channel,dy,dx]`。
+  Encoder 输出按此顺序组织后直接消费，不再为 Conv2d 做完整 NCHW 转置。
+- Attention O、down、merger projection 保持独立矩阵；merger GU 同样合并 gate/up。
+
+Vision 按第 1 节复制权重、分配完整 segments；processor 直接产生上述列顺序。
+具体 Op、零拷贝 downsample view 和媒体交接见 [Vision 设计](vision.md)。
+
+### 2.2 Embedding 与 MTP stem
+
+每 rank 保存完整 BF16 embedding 1210 MiB，Main/MTP 共享；Main head 则继续按词表
+TP2 切分，两者不是同一对象。MTP stem 的 `[4096,8192]` 权重每 rank 为 64 MiB，
+输入按 `[embedding_norm;conditioning_norm]` 排列。Stem、普通 residual 与 norms
+复制计算；MLA/Indexer 仍仅在请求 owner 计算和保存历史。
+
+这使 stem 不需要独立的输入交换，并维持后续 TP/EP 的完整 hidden 输入；代价是
+相比 embedding vocabulary TP2，每 rank 增加 605 MiB 的表载荷及对应本地计算。
+MTP 的配对、历史补齐与首步采用见 [MTP 设计](mtp.md)。
 
 ## 3. 1M 上下文的持久状态容量
 
@@ -183,15 +215,15 @@ recurrent fold；fold 不重跑权重投影或 readout。
 
 ## 6. 并行方案的容量与性能判断
 
-以 MLA heads TP2、latent/Indexer 历史两台复制为对照，改为本节 DP2 会去掉一份
-重复历史，同时增加 MLA 权重复制。按已定 BF16 因子投影、不生成额外吸收矩阵计算，
-每层 Q_b/KV_b/O 合计 208 MiB，TP2 时每 rank 为 104 MiB；Main＋MTP 共增加
-1.21875 GiB/rank。若将来明确变更驻留表示，须重新计费。
+以 MLA heads TP2、latent/Indexer 历史两台复制，且 prepare/Indexer 权重保持复制
+为对照，改为本节 DP2 会去掉一份重复历史，同时增加 Q_b/KV_b/O 权重复制。
+BF16 Q_b 为 48 MiB、BF16 KV_b 因子为 32 MiB、Q8 O 为 68 MiB，每层合计
+148 MiB；TP2 时每 rank 为 74 MiB，Main＋MTP 共增加 **0.8671875 GiB/rank**。
 
 对于单个 1M 请求，Main＋MTP 的一份 growing cache 为 6.9375 GiB（FP8 MLA）或
 12.75 GiB（BF16 MLA），均包含固定的 BF16 Indexer，FP8 列包含全部 FP32 scales。
-去掉副本并扣除两台合计 2.4375 GiB 新增权重后，双机 payload 分别净减少
-4.5 / 10.3125 GiB。Owner 仍需
+去掉副本并扣除两台合计 1.734375 GiB 新增权重后，双机 payload 分别净减少
+5.203125 / 11.015625 GiB。Owner 仍需
 保存完整历史，DP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于固定
 pool 预算、临时数据与通信资源。
 
@@ -204,6 +236,19 @@ pool 预算、临时数据与通信资源。
 mHC 复制方案保持既有 TP/EP 输出交接。若把 residual 仅放在请求 owner，每个
 KDA/FFN 分支需安排输入分发和输出回收；是否有收益必须包含通信阶段共同测量。
 当前选择复制，没有实测对照证明其性能优势。
+
+### 6.1 当前量化方案的权重预算
+
+全模型编码载荷见[数值文档](../../maintainer/glm5next-quantization.md#6-权重容量)。
+按 Main/MTP/Vision 与 optimized draft head 全部启用，embedding、MTP stem 和
+Vision 权重复制，head 词表 TP2，其余使用第 1 节分工，每 rank 的权重载荷约
+**91.462 GiB**。这是已定布局的 payload 估算，不是启动实测值；其中 Vision 的
+完整载荷为每 rank 1.049837 GiB，不能再按任务分配比例削减权重预算。
+
+Main/MTP 的 12 个 O 从 BF16 改 Q8，每 rank 少 720 MiB；43 个 shared FFN 的
+TP2 分片从 BF16 改 Q8，每 rank 少 483.75 MiB。合计每 rank 少 **1.175537 GiB**。
+此预算包含 codes/scales 和额外 Q4 head，不包含 backing 对齐、KV、StateImage、
+workspace、Graph 或其他运行资源。
 
 ## 7. 接管与退出条件
 

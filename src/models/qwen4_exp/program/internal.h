@@ -236,6 +236,7 @@ public:
                                                      ContextResources shortage) const;
     [[nodiscard]] ContextDemotion describe_demotion(std::shared_ptr<const Demotion>) const;
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
     bool prepare_demotion(context::MigrationBatch&, const Demotion&);
     void cancel_operation() noexcept;
 

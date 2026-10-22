@@ -325,6 +325,8 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    // One StateImage stride in bytes; a checkpoint's state_slots x this is its state footprint.
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const;
     void reset_memory_peaks() noexcept;
 private:

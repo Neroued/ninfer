@@ -109,6 +109,10 @@ PhysicalUsageSnapshot ProgramImpl::usage() const noexcept {
     return out;
 }
 
+std::size_t ProgramImpl::state_image_bytes() const noexcept {
+    return resources.states->storage().image_bytes();
+}
+
 } // namespace ninfer::models::qwen4_exp::detail
 
 namespace ninfer::models::qwen4_exp {
@@ -125,6 +129,8 @@ std::span<const runtime::KvPoolDescriptor> Program::kv_pools() const noexcept {
 }
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
+
+std::size_t Program::state_image_bytes() const noexcept { return impl_->state_image_bytes(); }
 
 bool Program::has_context_operation() const noexcept { return bool(impl_->operation); }
 

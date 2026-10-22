@@ -3,7 +3,9 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -106,6 +108,14 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    // On-demand prefix-cache inspection: one entry per resident prefix identity, built under the
+    // execution lock. Generation Engines only; throws for a scoring core.
+    [[nodiscard]] PrefixCacheTable build_prefix_table();
+    // Releases the requested prefixes while the engine is idle; not idle yields a busy result
+    // without releasing anything. Leased, missing, and non-erasable prefixes are reported as
+    // skipped. max_bytes bounds the release (0 means unbounded).
+    [[nodiscard]] PrefixCacheEvictResult evict_prefixes(std::span<const PrefixCacheKey> selection,
+                                                        std::uint64_t max_bytes = 0);
     [[nodiscard]] bool is_available() const;
 
     void reset_memory_peaks() noexcept;

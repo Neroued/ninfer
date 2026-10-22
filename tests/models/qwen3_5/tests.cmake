@@ -26,6 +26,10 @@ ninfer_add_test(ninfer_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
   LIBRARIES ninfer_engine)
 
+ninfer_add_test(ninfer_qwen3_5_prefix_admin_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_admin_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
   LIBRARIES ninfer_engine ninfer::json)
@@ -78,6 +82,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_native_transactions_test
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
+  ninfer_qwen3_5_prefix_admin_real_test
   ninfer_qwen3_5_preemption_real_test
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test

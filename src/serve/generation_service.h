@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -127,6 +128,17 @@ public:
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+
+    // Admin prefix-cache inspection and release. The Engine builds the table on demand and
+    // enforces the idle/leased/erasable gates under the execution lock.
+    [[nodiscard]] ninfer::PrefixCacheTable prefix_cache_table() {
+        return engine_->build_prefix_table();
+    }
+
+    [[nodiscard]] ninfer::PrefixCacheEvictResult
+    evict_prefixes(std::span<const ninfer::PrefixCacheKey> selection, std::uint64_t max_bytes = 0) {
+        return engine_->evict_prefixes(selection, max_bytes);
+    }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 

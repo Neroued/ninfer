@@ -297,6 +297,8 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
+std::size_t Program::state_image_bytes() const noexcept { return impl_->state_image_bytes(); }
+
 MemorySummary Program::memory_summary() const { return impl_->memory_summary(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }

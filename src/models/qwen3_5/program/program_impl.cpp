@@ -442,6 +442,10 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
     }
 }
 
+std::size_t ProgramImpl::state_image_bytes() const noexcept {
+    return state_images->storage().image_bytes();
+}
+
 MemorySummary ProgramImpl::memory_summary() const {
     const auto& weights = parameters.model.storage_stats();
     MemorySummary out;

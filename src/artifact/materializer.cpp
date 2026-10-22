@@ -66,34 +66,49 @@ void check_cuda(cudaError_t status, const char* operation) {
 
 class Slot {
 public:
-    explicit Slot(std::size_t bytes, bool cuda) {
+    static std::size_t allocation_bytes(std::size_t bytes, std::size_t alignment, bool cuda) {
+        return cuda ? checked_add(bytes, alignment - 1, "aligned weight staging") : bytes;
+    }
+
+    Slot(std::size_t bytes, std::size_t alignment, bool cuda) {
         if (!cuda) {
-            host = HostBuffer(bytes, kPayloadAlignment);
+            host_ = HostBuffer(bytes, alignment);
+            data_ = static_cast<std::byte*>(host_.data());
             return;
         }
-        pinned = PinnedHostBuffer(bytes);
-        check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+        pinned_            = PinnedHostBuffer(allocation_bytes(bytes, alignment, cuda));
+        const auto address = reinterpret_cast<std::uintptr_t>(pinned_.data());
+        const auto padding = (alignment - address % alignment) % alignment;
+        data_              = static_cast<std::byte*>(pinned_.data()) + padding;
+        check_cuda(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming),
                    "create weight staging completion event");
     }
 
     ~Slot() {
-        if (pending) { (void)cudaEventSynchronize(event); }
-        if (event) { (void)cudaEventDestroy(event); }
+        if (pending_) { (void)cudaEventSynchronize(event_); }
+        if (event_) { (void)cudaEventDestroy(event_); }
     }
 
     void wait() {
-        if (pending) {
-            check_cuda(cudaEventSynchronize(event), "wait for weight staging transfer");
-            pending = false;
+        if (pending_) {
+            check_cuda(cudaEventSynchronize(event_), "wait for weight staging transfer");
+            pending_ = false;
         }
     }
 
-    void* data() { return event ? pinned.data() : host.data(); }
+    void record(cudaStream_t stream) {
+        check_cuda(cudaEventRecord(event_, stream), "record weight staging completion");
+        pending_ = true;
+    }
 
-    HostBuffer host;
-    PinnedHostBuffer pinned;
-    cudaEvent_t event = nullptr;
-    bool pending      = false;
+    std::byte* data() const noexcept { return data_; }
+
+private:
+    HostBuffer host_;
+    PinnedHostBuffer pinned_;
+    std::byte* data_   = nullptr;
+    cudaEvent_t event_ = nullptr;
+    bool pending_      = false;
 };
 
 // Also covers failure between a queued copy and its event record. Destruct before slots.
@@ -125,13 +140,21 @@ struct CopyRange {
 };
 
 struct ReadSpan {
-    std::size_t file            = 0;
-    std::uint64_t begin         = 0;
-    std::uint64_t end           = 0;
+    std::size_t file = 0;
+    io::DirectReadWindow window{};
     std::byte* host_destination = nullptr;
+
+    std::size_t block_bytes(io::FileView source) const {
+        const auto alignment = host_destination
+                                   ? std::max(source.offset_alignment, source.memory_alignment)
+                                   : source.offset_alignment;
+        return std::min(window.bytes, static_cast<std::size_t>(align_up(kReadBlockBytes, alignment,
+                                                                        "direct read block")));
+    }
 };
 
-std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
+std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges,
+                                 std::span<const io::FileView> files) {
     std::vector<ReadSpan> spans;
     bool overlaps          = false;
     std::uint64_t furthest = 0;
@@ -139,13 +162,17 @@ std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
         const auto& range = ranges[i];
         if (!i || ranges[i - 1].file != range.file) furthest = 0;
         overlaps |= range.begin < furthest;
-        furthest         = std::max(furthest, range.end);
-        const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
+        furthest = std::max(furthest, range.end);
+        const auto window =
+            io::direct_read_window(files[range.file], range.begin, range.end - range.begin);
         if (spans.empty() || spans.back().file != range.file ||
-            begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
-            spans.push_back({range.file, begin, range.end});
+            window.offset > spans.back().window.offset + spans.back().window.bytes) {
+            spans.push_back({range.file, window});
         } else {
-            spans.back().end = std::max(spans.back().end, range.end);
+            auto& previous   = spans.back().window;
+            const auto begin = previous.offset + previous.prefix;
+            const auto end   = std::max(previous.offset + previous.required, range.end);
+            previous         = io::direct_read_window(files[range.file], begin, end - begin);
         }
     }
 
@@ -155,21 +182,32 @@ std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
     std::vector<ReadSpan> reads;
     std::size_t next_range = 0;
     for (const auto& span : spans) {
-        auto cursor = span.begin;
+        const auto file         = files[span.file];
+        const auto required_end = span.window.offset + span.window.required;
+        auto cursor             = span.window.offset;
         while (next_range < ranges.size() && ranges[next_range].file == span.file &&
-               ranges[next_range].begin < span.end) {
+               ranges[next_range].begin < required_end) {
             const auto& range = ranges[next_range++];
             if (!range.host || range.device || range.rows != 1) continue;
-            const auto begin = align_up(range.begin, kPayloadAlignment, "Host direct range");
-            const auto end   = range.end / kPayloadAlignment * kPayloadAlignment;
+            auto begin     = align_up(range.begin, file.offset_alignment, "Host direct range");
+            const auto end = range.end / file.offset_alignment * file.offset_alignment;
             if (begin >= end) continue;
-            auto* destination = range.host + range.pattern_offset + begin - range.begin;
-            if (reinterpret_cast<std::uintptr_t>(destination) % kPayloadAlignment) continue;
-            if (cursor < begin) reads.push_back({span.file, cursor, begin});
-            reads.push_back({span.file, begin, end, destination});
+            auto* destination  = range.host + range.pattern_offset + begin - range.begin;
+            const auto address = reinterpret_cast<std::uintptr_t>(destination);
+            const auto padding =
+                (file.memory_alignment - address % file.memory_alignment) % file.memory_alignment;
+            if (padding % file.offset_alignment || padding >= end - begin) continue;
+            begin += padding;
+            destination += padding;
+            if (cursor < begin)
+                reads.push_back({span.file, io::direct_read_window(file, cursor, begin - cursor)});
+            reads.push_back(
+                {span.file, io::direct_read_window(file, begin, end - begin), destination});
             cursor = end;
         }
-        if (cursor < span.end) reads.push_back({span.file, cursor, span.end});
+        if (cursor < required_end)
+            reads.push_back(
+                {span.file, io::direct_read_window(file, cursor, required_end - cursor)});
     }
     return reads;
 }
@@ -385,34 +423,39 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
         return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
     });
-    const auto spans = plan_reads(ranges);
     std::vector<std::unique_ptr<io::ReadOnlyFile>> files(reader.directory().files.size());
-    std::uint64_t staged_bytes = 0;
-    for (const auto& span : spans) {
-        if (!files[span.file]) {
-            files[span.file] = std::make_unique<io::ReadOnlyFile>(
-                reader.open_file(span.file, io::ReadMode::Direct));
-        }
-        const auto bytes = align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes");
-        if (!span.host_destination)
-            staged_bytes = checked_add(staged_bytes, bytes, "staging bytes");
+    std::vector<io::FileView> file_views(files.size());
+    for (const auto& range : ranges) {
+        if (files[range.file]) continue;
+        files[range.file] =
+            std::make_unique<io::ReadOnlyFile>(reader.open_file(range.file, io::ReadMode::Direct));
+        file_views[range.file] = files[range.file]->view();
     }
-    const auto slot_bytes =
-        static_cast<std::size_t>(std::min<std::uint64_t>(kReadBlockBytes, staged_bytes));
+    const auto spans           = plan_reads(ranges, file_views);
+    std::uint64_t staged_bytes = 0;
+    std::size_t slot_bytes = 0, slot_alignment = 1;
+    for (const auto& span : spans) {
+        if (span.host_destination) continue;
+        const auto file = file_views[span.file];
+        staged_bytes    = checked_add(staged_bytes, span.window.bytes, "staging bytes");
+        slot_bytes      = std::max(slot_bytes, span.block_bytes(file));
+        slot_alignment  = std::max(slot_alignment, file.memory_alignment);
+    }
     std::size_t slot_count = slot_bytes ? 1 : 0;
     if (cuda && slot_bytes) {
         slot_count = static_cast<std::size_t>(
             std::min<std::uint64_t>(kMaximumSlotCount, 1 + (staged_bytes - 1) / slot_bytes));
     }
     std::vector<std::unique_ptr<Slot>> slots;
-    out.stats_.peak_staging_bytes = slot_bytes * slot_count;
+    out.stats_.peak_staging_bytes = checked_mul(
+        Slot::allocation_bytes(slot_bytes, slot_alignment, cuda), slot_count, "staging backing");
     std::optional<StartupPhaseScope> pin_phase;
     if (cuda) {
         pin_phase.emplace(observer, StartupPhase::WeightsStagingPin, StartupProgressUnit::Bytes,
                           out.stats_.peak_staging_bytes);
     }
     for (std::size_t i = 0; i < slot_count; ++i) {
-        slots.push_back(std::make_unique<Slot>(slot_bytes, cuda));
+        slots.push_back(std::make_unique<Slot>(slot_bytes, slot_alignment, cuda));
     }
     if (pin_phase) { pin_phase->complete(); }
     TransferCompletion completion{stream, cuda};
@@ -420,28 +463,26 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::uint64_t copied = 0, uploaded_bytes = 0;
     const auto start = std::chrono::steady_clock::now();
     for (const auto& span : spans) {
-        const auto block_bytes = span.host_destination ? kReadBlockBytes : slot_bytes;
-        for (auto source = span.begin; source < span.end; source += block_bytes) {
-            Slot* slot = nullptr;
-            auto* destination =
-                span.host_destination ? span.host_destination + source - span.begin : nullptr;
+        const auto block_bytes = span.block_bytes(file_views[span.file]);
+        for (std::size_t offset = 0; offset < span.window.bytes; offset += block_bytes) {
+            const auto source = span.window.offset + offset;
+            Slot* slot        = nullptr;
+            auto* destination = span.host_destination ? span.host_destination + offset : nullptr;
             if (!destination) {
                 slot = slots[next_slot++ % slot_count].get();
                 slot->wait();
-                destination = static_cast<std::byte*>(slot->data());
+                destination = slot->data();
             }
-            const auto remaining = span.end - source;
-            const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
-                block_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
+            const auto request   = std::min(block_bytes, span.window.bytes - offset);
             std::size_t received = 0;
             try {
                 received = files[span.file]->read_direct(source, {destination, request});
             } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
-            if (received < std::min<std::uint64_t>(request, remaining)) {
+            const auto chunk_end = checked_add(source, received, "read block end");
+            if (received < request && chunk_end < span.window.offset + span.window.required) {
                 throw ArtifactError("direct read ended before the required payload");
             }
             out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
-            const auto chunk_end  = checked_add(source, received, "read block end");
             bool uploaded         = false;
             while (next_range < ranges.size() &&
                    (ranges[next_range].file < span.file ||
@@ -514,11 +555,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                     row += count;
                 }
             }
-            if (uploaded) {
-                check_cuda(cudaEventRecord(slot->event, stream),
-                           "record weight staging completion");
-                slot->pending = true;
-            }
+            if (uploaded) { slot->record(stream); }
             phase.progress(copied, total);
         }
     }

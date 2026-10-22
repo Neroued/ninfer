@@ -61,13 +61,17 @@
   - 完整项目编译及 7 组 grammar、JSON 独立参考、工具组合和协议测试通过。
     原生接口复测三个复现 prompt，以及 JSON Schema 流式、固定容器值、thinking，共 6 请求全部正确完成。
     `json_object` 本身仍只约束 JSON 根对象，不保证 prompt 指定的字段和值。
-- [ ] [#404 ZFS Direct I/O 对齐与加载规划不一致](https://github.com/Neroued/ninfer/issues/404)
-  - 源码确认：文件层按 `statx` 对齐要求校验，materializer 按固定 4KiB 规划。
-  - 统一文件读取约束与物化读取窗口，覆盖 offset、size 和目标地址对齐；
-    不直接把文件系统报告的对齐要求压低至 4KiB。
-- [ ] [#372 小 pinned staging 缺少文件读取对齐保证](https://github.com/Neroued/ninfer/issues/372)
-  - 当前 Slot 直接使用 `cudaMallocHost` 返回地址，缺少显式文件读取对齐合同。
-  - 与 #404 一起处理 staging 的分配和视图，覆盖小产物加载，不全局改变所有 pinned buffer。
+- [x] [#404 ZFS Direct I/O 对齐与加载规划不一致](https://github.com/Neroued/ninfer/issues/404)
+  - 根因：materializer 固定按 4KiB 规划，而文件层按 `statx` 的实际要求校验。
+    已改为先取得各文件 FileView，再按实际要求规划、合并与分块，保留合法的 Host 原位读取。
+    编码布局和 4KiB 容器 framing 不变，不降低文件层报告的对齐要求。
+  - 修复前已通过注入 128KiB offset/length 要求复现；修复后的回归覆盖 8KiB memory、128KiB offset/length、
+    跨文件窗口合并及 EOF 尾部。未在真实 ZFS 上实测。
+- [x] [#372 小 pinned staging 缺少文件读取对齐保证](https://github.com/Neroued/ninfer/issues/372)
+  - Slot 按文件的 memory alignment 提供对齐视图；pinned 分配额外对齐余量并保留原始 owner，
+    普通 Host staging 显式对齐分配，staging 统计包含余量，不修改全局 pinned buffer 合同。
+  - 已验证故意偏移的 pinned 地址、CPU/GPU 分发，以及 event 创建/记录失败时的上传完成和资源释放。
+    完整项目编译及 artifact、I/O、PLE 相关 10 项测试通过。
 - [x] [#406 Docker 构建与运行依赖遗漏](https://github.com/Neroued/ninfer/issues/406)
   - 已在 `1e902680` 补齐 liburing/JPEG 构建与运行依赖、构建阶段 CUDA Driver stub 链接、
     运行镜像项目共享库打包，并排除 `.agent-tmp` 构建上下文。

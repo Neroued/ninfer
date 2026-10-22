@@ -124,7 +124,7 @@ std::optional<CapturePreparation> SessionImpl::prepare_capture(SequenceHandle ha
                                   .origin   = request.capture_groups[request.next_capture].origin};
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
-            result.host_bytes           = state_store->image_bytes();
+            result.host.state_images    = 1;
         }
         return result;
     }

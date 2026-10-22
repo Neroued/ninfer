@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/context/checkpoint_store.h"
+#include "models/common/context/directory/allocation.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -23,6 +24,8 @@ public:
     struct Object {
         std::vector<Handle> holders;
         Resources released;
+        std::vector<HostExtent> host_extents;
+        std::uint32_t host_pages = 0;
     };
 
     struct Work {
@@ -40,7 +43,8 @@ public:
 
     std::size_t capacity() const { return handles_.size(); }
 
-    std::uint32_t add(std::vector<Handle> holders, Resources released) {
+    std::uint32_t add(std::vector<Handle> holders, Resources released,
+                      std::vector<HostExtent> host_extents = {}, std::uint32_t host_pages = 0) {
         std::sort(holders.begin(), holders.end(), [](auto a, auto b) { return a.index < b.index; });
         holders.erase(std::unique(holders.begin(), holders.end()), holders.end());
         if (holders.empty()) throw std::logic_error("physical release has no checkpoint holders");
@@ -49,13 +53,28 @@ public:
             if (!contains(handle)) throw std::logic_error("physical release has a foreign holder");
             objects_by_handle_[handle.index].push_back(index);
         }
-        objects_.push_back({std::move(holders), released});
+        objects_.push_back({std::move(holders), released, std::move(host_extents), host_pages});
         return index;
     }
 
     const std::vector<Object>& objects() const { return objects_; }
 
     const Work& work() const { return work_; }
+
+    [[nodiscard]] std::vector<HostExtent> host_extents(std::span<const std::uint32_t> freed) const {
+        std::vector<HostExtent> result;
+        for (const auto index : freed) {
+            const auto& ranges = objects_.at(index).host_extents;
+            result.insert(result.end(), ranges.begin(), ranges.end());
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::size_t host_pages(std::span<const std::uint32_t> freed) const {
+        std::size_t count = 0;
+        for (const auto index : freed) count += objects_.at(index).host_pages;
+        return count;
+    }
 
     class Selection {
     public:

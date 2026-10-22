@@ -76,10 +76,13 @@
   - 已在 `1e902680` 补齐 liburing/JPEG 构建与运行依赖、构建阶段 CUDA Driver stub 链接、
     运行镜像项目共享库打包，并排除 `.agent-tmp` 构建上下文。
   - 按用户要求，未运行构建或运行验证。
-- [ ] [#378 Host 总空闲字节不代表实际可放置](https://github.com/Neroued/ninfer/issues/378)
-  - 当前仍存在按总空闲字节判断、实际申请连续 extent 的衔接风险。
-  - 保留迁移必须取得可落实的目标空间，避免迁移失败后释放原本要保护的 conversation。
-    先解决决策与分配合同，再考虑 #379 的 allocator 组织。
+- [x] [#378 Host 总空闲字节不代表实际可放置](https://github.com/Neroued/ninfer/issues/378)
+  - Host 写入声明完整 StateImage 与各 pool 页数；实际空闲范围和可释放范围决定放置，KV 可分散为多个 run。
+    ResourceManager、两套模型的 demotion、capture 与 pause 均使用此合同，迁移完整预留目标后才释放来源。
+  - 执行额度暂不可用时保留来源和候选受害者，不再把未启动的迁移当作删除来源的理由。
+  - 完整编译、4 项目录/回收测试、Qwen3.5 MTP/DFlash2 事务及 Qwen4Exp 真实模型迁移检查通过。
+    1.5GiB Host cache 连续服务 10 条约 8–9K 输入，新请求插入后仍复用前一条的 8859/8868 tokens。
+    未运行报告中的 200K × 9 负载；碎片本身仍由 #379 后续处理。
 - [ ] [#394 缓存满后多轮对话只命中系统前缀](https://github.com/Neroued/ninfer/issues/394)
   - 当前策略待复现：检查复用证据、可选 checkpoint 准入和回收收益是否长期阻止更深 turn closure 入驻。
   - 评论已指出简单的“第二次访问才保存”方案存在统计时序问题，不直接采用该补丁。

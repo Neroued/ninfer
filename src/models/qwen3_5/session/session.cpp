@@ -147,8 +147,9 @@ std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> check
     return impl_->host_bytes_released(checkpoints);
 }
 
-std::optional<std::size_t> Session::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
+std::optional<Session::HostRequirement>
+Session::pause_host_requirements(SequenceHandle sequence) const {
+    return impl_->pause_host_requirements(sequence);
 }
 
 std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> excluded,
@@ -200,7 +201,36 @@ void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
     impl_->skip_capture(h, reason);
 }
 
-bool Session::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
+runtime::ContextStart Session::start_demote(const ContextDemotion& plan,
+                                            std::span<const CheckpointHandle> host_victims) {
+    return impl_->start_demote(plan, host_victims);
+}
+
+bool Session::prepare_pause(SequenceHandle sequence, bool save_snapshot,
+                            std::span<const CheckpointHandle> host_victims) {
+    return impl_->prepare_pause(sequence, save_snapshot, host_victims);
+}
+
+Session::HostRequirement Session::demotion_host_requirements(const ContextDemotion& plan) const {
+    return impl_->demotion_host_requirements(plan);
+}
+
+std::size_t Session::host_write_bytes(const HostRequirement& write) const {
+    return impl_->directory.host_write_bytes(write);
+}
+
+bool Session::can_place_host(const HostRequirement& write) const {
+    return impl_->directory.plan_host(write).has_value();
+}
+
+bool Session::can_place_host(const HostRequirement& write,
+                             const context::ReleasePlan<ContextRelease, ContextResources>& releases,
+                             std::span<const std::uint32_t> freed) const {
+    return impl_->directory
+        .plan_host(write, releases.inventory->host_extents(freed),
+                   releases.inventory->host_pages(freed))
+        .has_value();
+}
 
 ContextReclaimPlan Session::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,

@@ -1,6 +1,7 @@
 #include "models/common/context/directory.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <limits>
 #include <stdexcept>
@@ -103,11 +104,94 @@ const KVPoolDirectory& ContextDirectory::pool(std::uint32_t id) const { return *
 
 ContextTransaction ContextDirectory::begin_transaction() { return ContextTransaction(*this); }
 
+HostRequirements ContextDirectory::host_requests(const HostWriteRequirements& write) const {
+    if (write.kv_pages.size() > pools_.size())
+        throw std::invalid_argument("Host write references an unknown KV pool");
+    HostRequirements requests{{states_.image_bytes(), write.state_images}};
+    for (std::size_t pool = 0; pool < write.kv_pages.size(); ++pool)
+        requests.push_back(
+            {pools_[pool]->pages().host_page_layout().page_stride, write.kv_pages[pool]});
+    return requests;
+}
+
+std::size_t ContextDirectory::host_write_bytes(const HostWriteRequirements& write) const {
+    return host_requirement_bytes(host_requests(write));
+}
+
+std::optional<HostPlacement> ContextDirectory::plan_host(const HostWriteRequirements& write,
+                                                         std::span<const HostExtent> released,
+                                                         std::size_t released_pages) const {
+    std::size_t pages = 0;
+    for (const auto count : write.kv_pages) pages += count;
+    if (!host_.can_prepare(pages, released_pages)) return {};
+    return host_allocation_.plan(host_requests(write), released);
+}
+
+std::uint32_t ContextDirectory::available_host_pages(std::uint32_t pool,
+                                                     std::uint32_t limit) const {
+    if (pool >= pools_.size()) throw std::invalid_argument("unknown Host KV pool");
+    HostWriteRequirements write;
+    write.kv_pages.resize(pools_.size());
+    std::uint32_t low = 0, high = limit;
+    while (low < high) {
+        const auto middle    = low + (std::uint64_t(high) - low + 1) / 2;
+        write.kv_pages[pool] = static_cast<std::uint32_t>(middle);
+        if (plan_host(write))
+            low = static_cast<std::uint32_t>(middle);
+        else
+            high = static_cast<std::uint32_t>(middle - 1);
+    }
+    return low;
+}
+
+HostAllocation ContextDirectory::take_host(HostReservedRun& run, std::uint32_t count) {
+    if (!count || count > run.count || !run.allocation.belongs_to(host_allocation_))
+        throw std::logic_error("Host reservation has insufficient items");
+    if (count == run.count) {
+        run.count = 0;
+        return std::move(run.allocation);
+    }
+    const auto bytes = run.allocation.bytes() / run.count * count;
+    auto pieces      = host_allocation_.split(std::move(run.allocation), bytes);
+    run.allocation   = std::move(pieces.second);
+    run.count -= count;
+    return std::move(pieces.first);
+}
+
+HostAllocation ContextDirectory::take_host_image(HostReservations& reservations) {
+    for (auto& run : reservations)
+        if (run.request == 0 && run.count) return take_host(run, 1);
+    throw std::logic_error("Host state copy has no reserved destination");
+}
+
+bool ContextTransaction::add_backups(std::uint32_t pool, std::vector<PageId> pages,
+                                     HostReservations& reservations, bool drop_device) {
+    if (pages.empty()) return true;
+    auto& storage      = directory_->pool(pool).pages();
+    std::size_t offset = 0;
+    for (auto& run : reservations) {
+        if (run.request != std::size_t(pool) + 1 || !run.count) continue;
+        const auto count =
+            static_cast<std::uint32_t>(std::min<std::size_t>(run.count, pages.size() - offset));
+        auto allocation  = directory_->take_host(run, count);
+        const auto part  = std::span(pages).subspan(offset, count);
+        auto destination = directory_->host().prepare(storage, part, std::move(allocation));
+        if (!destination) return false;
+        add_backup(pool, {part.begin(), part.end()}, std::move(*destination), drop_device);
+        offset += count;
+        if (offset == pages.size()) return true;
+    }
+    throw std::logic_error("Host page copies exceed reserved destinations");
+}
+
 std::optional<StateId> reserve_capture_destination(StateDirectory& states, HostAllocator& host,
                                                    std::optional<HostAllocation>& backing) {
     if (auto destination = states.reserve_destination()) return destination;
-    backing = host.allocate(states.image_bytes());
-    if (!backing) return {};
+    const std::array requests{HostRequest{states.image_bytes(), 1}};
+    const auto placement = host.plan(requests);
+    auto reserved        = placement ? host.reserve(*placement) : std::nullopt;
+    if (!reserved) return {};
+    backing.emplace(std::move(reserved->front().allocation));
     auto destination = states.reserve_logical_destination();
     if (!destination) backing.reset();
     return destination;

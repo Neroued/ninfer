@@ -3,6 +3,7 @@
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/host.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <span>
@@ -64,6 +65,16 @@ private:
 
 class ContextTransaction;
 
+struct HostWriteRequirements {
+    std::uint32_t state_images = 0;
+    std::vector<std::uint32_t> kv_pages;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return !state_images &&
+               std::all_of(kv_pages.begin(), kv_pages.end(), [](auto count) { return count == 0; });
+    }
+};
+
 // A capture keeps the old image immutable and obtains the next writer's destination.
 [[nodiscard]] std::optional<StateId> reserve_capture_destination(StateDirectory&, HostAllocator&,
                                                                  std::optional<HostAllocation>&);
@@ -93,9 +104,19 @@ public:
 
     [[nodiscard]] std::size_t pool_count() const noexcept { return pools_.size(); }
 
+    [[nodiscard]] std::size_t host_write_bytes(const HostWriteRequirements&) const;
+    [[nodiscard]] std::optional<HostPlacement> plan_host(const HostWriteRequirements&,
+                                                         std::span<const HostExtent> released = {},
+                                                         std::size_t released_pages = 0) const;
+    [[nodiscard]] std::uint32_t available_host_pages(std::uint32_t pool, std::uint32_t limit) const;
+    [[nodiscard]] HostAllocation take_host(HostReservedRun&, std::uint32_t count);
+    [[nodiscard]] HostAllocation take_host_image(HostReservations&);
+
     [[nodiscard]] ContextTransaction begin_transaction();
 
 private:
+    [[nodiscard]] HostRequirements host_requests(const HostWriteRequirements&) const;
+
     HostAllocator host_allocation_;
     HostDirectory host_;
     StateDirectory states_;
@@ -124,6 +145,8 @@ public:
     [[nodiscard]] const HistoryBinding* binding(std::uint32_t pool) const noexcept;
     void add_backup(std::uint32_t pool, std::vector<PageId> pages, HostPageReservation destination,
                     bool drop_device);
+    [[nodiscard]] bool add_backups(std::uint32_t pool, std::vector<PageId> pages,
+                                   HostReservations& reservations, bool drop_device);
 
     // Used by HistoryDirectory for ordinary writes, COW and ordered retirement.
     void retain(PageDirectory& pages, PageId page);

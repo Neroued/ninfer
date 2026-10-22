@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/context/checkpoint_store.h"
+#include "models/common/context/directory.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
@@ -209,7 +210,7 @@ struct CapturePreparation {
     std::uint32_t frontier = 0;
     bool reserved          = false;
     ContextResources shortage;
-    std::size_t host_bytes           = 0;
+    context::HostWriteRequirements host;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
@@ -299,7 +300,16 @@ public:
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] ContextResources snapshot_resources(const ResumeState&) const;
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const;
+    using HostRequirement = context::HostWriteRequirements;
+    [[nodiscard]] std::optional<HostRequirement> pause_host_requirements(SequenceHandle) const;
+    [[nodiscard]] bool prepare_pause(SequenceHandle, bool save_snapshot,
+                                     std::span<const CheckpointHandle> host_victims = {});
+    [[nodiscard]] HostRequirement demotion_host_requirements(const ContextDemotion&) const;
+    [[nodiscard]] std::size_t host_write_bytes(const HostRequirement&) const;
+    [[nodiscard]] bool can_place_host(const HostRequirement&) const;
+    [[nodiscard]] bool can_place_host(const HostRequirement&,
+                                      const context::ReleasePlan<ContextRelease, ContextResources>&,
+                                      std::span<const std::uint32_t> freed) const;
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,
                                                      std::optional<SequenceHandle> = {});
     [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>);
@@ -322,7 +332,8 @@ public:
     [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
         plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
                       ContextResources) const;
-    [[nodiscard]] bool start_demote(const ContextDemotion&);
+    [[nodiscard]] runtime::ContextStart
+    start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] bool start_pause(SequenceHandle, bool save);
     [[nodiscard]] bool has_context_operation() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;

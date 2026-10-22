@@ -189,6 +189,7 @@ public:
     }
 
     [[nodiscard]] const HostPageReplica& host_replica(PageId handle) const;
+    [[nodiscard]] HostExtent host_extent(PageId handle) const;
 
     [[nodiscard]] std::uint64_t content_epoch(PageId handle) const {
         return require(handle).content_epoch;

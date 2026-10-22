@@ -373,6 +373,107 @@ HostAllocator::HostAllocator(std::uint32_t pool_id, std::size_t capacity_bytes,
     free_extents_.push_back({0, capacity_bytes});
 }
 
+std::size_t host_requirement_bytes(std::span<const HostRequest> requests) {
+    std::size_t total = 0;
+    for (const auto& request : requests) {
+        if (request.count &&
+            request.item_bytes > (std::numeric_limits<std::size_t>::max() - total) / request.count)
+            throw std::overflow_error("Host requirements exceed addressable storage");
+        total += request.item_bytes * request.count;
+    }
+    return total;
+}
+
+std::optional<HostPlacement> HostAllocator::plan(std::span<const HostRequest> requests,
+                                                 std::span<const HostExtent> released) const {
+    auto free = free_extents_;
+    free.reserve(free.size() + released.size());
+    for (const auto& extent : released) {
+        if (extent.pool_id != pool_id_ || !extent.bytes || extent.offset % alignment ||
+            extent.bytes % alignment || extent.offset > capacity_bytes_ ||
+            extent.bytes > capacity_bytes_ - extent.offset)
+            throw std::invalid_argument("invalid projected Host release");
+        free.push_back({extent.offset, extent.bytes});
+    }
+    if (!released.empty()) {
+        std::sort(free.begin(), free.end(),
+                  [](const auto& a, const auto& b) { return a.offset < b.offset; });
+        std::size_t count = 0;
+        for (const auto extent : free) {
+            if (count && free[count - 1].offset + free[count - 1].bytes > extent.offset)
+                throw std::logic_error("projected Host releases overlap free storage");
+            if (count && free[count - 1].offset + free[count - 1].bytes == extent.offset)
+                free[count - 1].bytes += extent.bytes;
+            else
+                free[count++] = extent;
+        }
+        free.resize(count);
+    }
+    HostPlacement placement;
+    placement.owner_ = this;
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        const auto& request = requests[index];
+        if (!request.count) continue;
+        const auto item = allocation_bytes(request.item_bytes);
+        if (!item) return {};
+        auto left = request.count;
+        for (auto& extent : free) {
+            const auto count =
+                static_cast<std::uint32_t>(std::min<std::size_t>(left, extent.bytes / item));
+            if (!count) continue;
+            const auto bytes = item * count;
+            placement.runs_.push_back({index, count, {pool_id_, extent.offset, bytes}});
+            extent.offset += bytes;
+            extent.bytes -= bytes;
+            left -= count;
+            if (!left) break;
+        }
+        if (left) return {};
+    }
+    return placement;
+}
+
+std::optional<HostReservations> HostAllocator::reserve(const HostPlacement& placement) {
+    if (placement.owner_ != this)
+        throw std::invalid_argument("Host placement belongs to another allocator");
+    const auto find = [&](const HostExtent& extent) {
+        return std::find_if(free_extents_.begin(), free_extents_.end(), [&](const auto& free) {
+            return free.offset <= extent.offset && extent.offset - free.offset <= free.bytes &&
+                   extent.bytes <= free.bytes - (extent.offset - free.offset);
+        });
+    };
+    for (const auto& run : placement.runs_)
+        if (find(run.extent) == free_extents_.end()) return {};
+    HostReservations out;
+    out.reserve(placement.runs_.size());
+    for (const auto& run : placement.runs_) {
+        const auto index = static_cast<std::size_t>(find(run.extent) - free_extents_.begin());
+        consume_free_extent(index, run.extent.offset, run.extent.bytes);
+        occupied_bytes_ += run.extent.bytes;
+        reserved_bytes_ += run.extent.bytes;
+        peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes_);
+        ++allocation_count_;
+        out.push_back({run.request, run.count, HostAllocation(*this, run.extent)});
+    }
+    return out;
+}
+
+void HostAllocator::consume_free_extent(std::size_t index, std::size_t offset,
+                                        std::size_t bytes) noexcept {
+    const auto original = free_extents_[index];
+    const auto end      = offset + bytes;
+    if (offset == original.offset) {
+        free_extents_[index] = {end, original.bytes - bytes};
+        if (!free_extents_[index].bytes)
+            free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(index));
+    } else {
+        free_extents_[index].bytes = offset - original.offset;
+        if (end < original.offset + original.bytes)
+            free_extents_.insert(free_extents_.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                                 {end, original.offset + original.bytes - end});
+    }
+}
+
 std::size_t HostAllocator::allocation_bytes(std::size_t bytes) const noexcept {
     if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
         return 0;
@@ -398,13 +499,8 @@ std::optional<HostAllocation> HostAllocator::allocate(std::size_t bytes) noexcep
     if (rounded == 0) { return std::nullopt; }
     const auto free_index = find_free_extent(rounded);
     if (!free_index) { return std::nullopt; }
-    FreeExtent& free         = free_extents_[*free_index];
-    const std::size_t offset = free.offset;
-    free.offset += rounded;
-    free.bytes -= rounded;
-    if (free.bytes == 0) {
-        free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));
-    }
+    const std::size_t offset = free_extents_[*free_index].offset;
+    consume_free_extent(*free_index, offset, rounded);
     occupied_bytes_ += rounded;
     reserved_bytes_ += rounded;
     peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes_);

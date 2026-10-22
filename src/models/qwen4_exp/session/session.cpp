@@ -106,6 +106,7 @@ void SessionImpl::clear(Sequence& s) noexcept {
 
 void SessionImpl::cleanup() noexcept {
     if (!executor) return;
+    pause_reservation.reset();
     try {
         executor->drain();
     } catch (...) {

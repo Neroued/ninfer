@@ -212,6 +212,13 @@ struct Scoring {
 
 class SessionImpl {
 public:
+    struct PauseReservation {
+        SequenceHandle sequence;
+        bool save_snapshot;
+        context::HostPlacement placement;
+        runtime::ExecutionReservation execution;
+    };
+
     SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
     ~SessionImpl();
 
@@ -268,9 +275,12 @@ public:
     [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
         plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
                       ContextResources) const;
-    [[nodiscard]] bool start_demote(const ContextDemotion&);
+    [[nodiscard]] runtime::ContextStart
+    start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
-    bool prepare_demotion(context::ContextTransaction&, const Demotion&);
+    [[nodiscard]] context::HostWriteRequirements host_requirements(const Demotion&) const;
+    bool prepare_demotion(context::ContextTransaction&, const Demotion&,
+                          context::HostReservations&);
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
@@ -283,6 +293,7 @@ public:
     std::array<std::uint64_t, kMaximumConcurrency> epochs{};
     std::vector<runtime::KvPoolDescriptor> pools;
     std::unique_ptr<ContextOperation> operation;
+    std::optional<PauseReservation> pause_reservation;
     std::unique_ptr<ComputeTransaction> compute;
     std::unique_ptr<Scoring> scoring;
     std::deque<SessionEvent> events;

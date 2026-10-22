@@ -20,6 +20,7 @@ namespace ninfer::runtime {
 enum class CheckpointRole : std::uint8_t { InputReplay, LongAnchor, SharedPrefix, Continuation };
 enum class CheckpointOrigin : std::uint8_t { Semantic, Intermediate };
 enum class CaptureSkip : std::uint8_t { Unavailable, Retained };
+enum class ContextStart : std::uint8_t { Started, Deferred, Stale };
 
 struct KvPoolId {
     std::uint16_t index                                           = 0;

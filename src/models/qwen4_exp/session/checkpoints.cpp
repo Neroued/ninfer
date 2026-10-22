@@ -89,11 +89,8 @@ std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
     auto destination = context::reserve_capture_destination(
         *ticket->states, p.directory.host_allocation(), ticket->host);
     if (!destination)
-        return CapturePreparation{point.frontier,
-                                  false,
-                                  {.state_slots = 1},
-                                  p.directory.states().image_bytes(),
-                                  point.origin};
+        return CapturePreparation{
+            point.frontier, false, {.state_slots = 1}, {.state_images = 1}, point.origin};
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
     return CapturePreparation{.frontier = point.frontier, .reserved = true, .origin = point.origin};
@@ -177,15 +174,15 @@ bool Session::start_capture(SequenceHandle h) {
     return true;
 }
 
-std::optional<std::size_t> Session::pause_host_bytes(SequenceHandle h) const {
+std::optional<Session::HostRequirement> Session::pause_host_requirements(SequenceHandle h) const {
     const auto& p = *impl_;
     const auto& s = p.sequence(h);
     if (!s.request->can_checkpoint(s.continuation.metadata.main_frontier) ||
         !p.directory.host_allocation().capacity_bytes())
         return {};
-    std::size_t bytes = p.directory.states().host_resident(s.continuation.image)
-                            ? 0
-                            : p.directory.states().image_bytes();
+    HostRequirement write;
+    write.state_images = p.directory.states().host_resident(s.continuation.image) ? 0 : 1;
+    write.kv_pages.resize(p.directory.pool_count());
     for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool) {
         const auto& storage = p.directory.pool(pool);
         const auto frontier = pool == 0 ? s.continuation.metadata.main_frontier
@@ -194,31 +191,61 @@ std::optional<std::size_t> Session::pause_host_bytes(SequenceHandle h) const {
             const auto page = storage.histories().logical_page(s.histories[pool].handle(), i);
             if (storage.pages().active_history_references(page) <= 1 &&
                 !storage.pages().host_replica_current(page))
-                bytes += p.pools[pool].host_page_stride;
+                ++write.kv_pages[pool];
         }
     }
-    return bytes;
+    return write;
+}
+
+bool Session::prepare_pause(SequenceHandle h, bool save,
+                            std::span<const CheckpointHandle> host_victims) {
+    auto& p = *impl_;
+    if (p.operation || execution_pending(h)) return false;
+    if (p.pause_reservation) throw std::logic_error("pause preparation is already owned");
+    const auto& s = p.sequence(h);
+    if (s.phase != detail::Phase::Prefill && s.phase != detail::Phase::Replay &&
+        s.phase != detail::Phase::Active)
+        throw std::logic_error("pause requires a committed boundary");
+    const auto write = save ? pause_host_requirements(h) : std::optional(HostRequirement{});
+    if (!write) return false;
+    std::optional<context::HostPlacement> placement;
+    if (host_victims.empty()) {
+        placement = p.directory.plan_host(*write);
+    } else {
+        for (const auto victim : host_victims)
+            if (!p.checkpoints.erasable(victim)) return false;
+        const auto releases = p.plan_releases(host_victims, {}, {.host_bytes = 1});
+        auto selected       = releases.inventory->select();
+        auto probe          = selected.probe(host_victims);
+        placement =
+            p.directory.plan_host(*write, releases.inventory->host_extents(selected.freed()),
+                                  releases.inventory->host_pages(selected.freed()));
+    }
+    if (!placement) return false;
+    auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
+    if (!execution) return false;
+    p.pause_reservation.emplace(detail::SessionImpl::PauseReservation{
+        h, save, std::move(*placement), std::move(*execution)});
+    return true;
 }
 
 bool Session::start_pause(SequenceHandle h, bool save) {
     auto& p = *impl_;
     if (p.operation || execution_pending(h)) return false;
-    auto& s = p.sequence(h);
-    if (s.phase != detail::Phase::Prefill && s.phase != detail::Phase::Replay &&
-        s.phase != detail::Phase::Active)
-        throw std::logic_error("pause requires a committed boundary");
-    if (save) {
-        const auto bytes = pause_host_bytes(h);
-        if (!bytes || *bytes > p.directory.host_allocation().free_bytes()) return false;
-    }
-    auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
-    if (!execution) return false;
+    if (!p.pause_reservation && !prepare_pause(h, save)) return false;
+    if (p.pause_reservation->sequence != h || p.pause_reservation->save_snapshot != save)
+        throw std::logic_error("pause does not match its preparation");
+    auto targets = p.directory.host_allocation().reserve(p.pause_reservation->placement);
+    if (!targets) throw std::logic_error("prepared pause placement changed before reservation");
+    auto execution = std::move(p.pause_reservation->execution);
+    p.pause_reservation.reset();
+    auto& s       = p.sequence(h);
     auto paused   = std::make_unique<detail::Suspended>();
     paused->owner = &p;
     paused->frontier =
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     p.operation = std::make_unique<detail::ContextOperation>(
-        p.directory, detail::PauseOperation{s.lane, std::move(paused)}, std::move(*execution));
+        p.directory, detail::PauseOperation{s.lane, std::move(paused)}, std::move(execution));
     auto& tx        = std::get<detail::PauseOperation>(p.operation->action);
     auto& migration = p.operation->migration;
     try {
@@ -234,12 +261,8 @@ bool Session::start_pause(SequenceHandle h, bool save) {
             const auto demotion =
                 p.demotion({&*tx.paused->snapshot, 1},
                            {.state_slots = 1, .kv_page_groups = {UINT32_MAX, UINT32_MAX}});
-            if (demotion && !p.prepare_demotion(migration, *demotion)) {
-                migration.reset_plan();
-                if (!p.checkpoints.erase(*tx.paused->snapshot))
-                    throw std::logic_error("failed pause backup still has readers");
-                tx.paused->snapshot.reset();
-            }
+            if (demotion && !p.prepare_demotion(migration, *demotion, *targets))
+                throw std::logic_error("prepared pause backup lost its destination");
         }
         p.submit_context();
         return true;

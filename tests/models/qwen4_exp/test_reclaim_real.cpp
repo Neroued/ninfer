@@ -161,16 +161,18 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
 
     const auto extra = *p.checkpoints.reserve();
     p.checkpoints.publish(extra, p.checkpoints.at(deep));
-    require(!p.start_demote(*one_tail) && !batch.finish(),
+    require((p.start_demote(*one_tail, {}) != runtime::ContextStart::Started) && !batch.finish(),
             "stale quote ignored a newly published physical holder");
     require(p.checkpoints.erase(extra), "extra holder retirement failed");
     const auto pinned = one_tail->impl->pages[0].front();
     p.directory.pool(0).pages().pin_source(pinned);
-    require(!p.start_demote(*one_tail), "demotion ignored a new KV reader");
+    require((p.start_demote(*one_tail, {}) != runtime::ContextStart::Started),
+            "demotion ignored a new KV reader");
     p.directory.pool(0).pages().unpin_source(pinned);
     auto altered = *one_tail;
     ++altered.host_bytes;
-    require(!p.start_demote(altered), "demotion accepted a changed physical quote");
+    require((p.start_demote(altered, {}) != runtime::ContextStart::Started),
+            "demotion accepted a changed physical quote");
 
     const auto settle = [&] {
         require(p.operation && p.operation->ticket &&
@@ -184,16 +186,19 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     auto current = p.plan_reclaim(all, {}, {.kv_page_groups = {1}});
     require(!current.demotions.empty(), "Main demotion quote missing");
     const auto before = p.usage().occupied;
-    require(p.start_demote(current.demotions.front()), "Main demotion refused a valid quote");
+    require((p.start_demote(current.demotions.front(), {}) == runtime::ContextStart::Started),
+            "Main demotion refused a valid quote");
     settle();
     auto after = p.usage().occupied;
     require(after.kv_page_groups[0] + 1 == before.kv_page_groups[0] &&
                 after.kv_page_groups[1] == before.kv_page_groups[1] &&
                 after.state_slots == before.state_slots,
             "Main demotion changed another physical pool");
-    require(!p.start_demote(current.demotions.front()), "stale residency quote was reused");
+    require((p.start_demote(current.demotions.front(), {}) != runtime::ContextStart::Started),
+            "stale residency quote was reused");
     auto mtp = p.plan_reclaim(all, {}, {.kv_page_groups = {0, 1}});
-    require(!mtp.demotions.empty() && p.start_demote(mtp.demotions.front()),
+    require(!mtp.demotions.empty() &&
+                (p.start_demote(mtp.demotions.front(), {}) == runtime::ContextStart::Started),
             "MTP demotion missing");
     settle();
     const auto after_mtp = p.usage().occupied;
@@ -201,7 +206,8 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
                 after_mtp.kv_page_groups[0] == after.kv_page_groups[0],
             "MTP demotion used Main resources");
     auto state = p.plan_reclaim(all, {}, {.state_slots = 1});
-    require(!state.demotions.empty() && p.start_demote(state.demotions.front()),
+    require(!state.demotions.empty() &&
+                (p.start_demote(state.demotions.front(), {}) == runtime::ContextStart::Started),
             "State demotion missing");
     settle();
     const auto after_state = p.usage().occupied;

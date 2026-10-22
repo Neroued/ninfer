@@ -66,14 +66,21 @@ public:
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
+    [[nodiscard]] bool can_prepare(std::size_t pages,
+                                   std::size_t released_pages = 0) const noexcept {
+        return pages <= std::size_t(free_membership_count_) + released_pages;
+    }
+
     [[nodiscard]] std::size_t occupied_bytes() const noexcept { return occupied_bytes_; }
 
     void restrict_coverage(PageDirectory& pages, PageId page, std::uint32_t coverage);
 
     [[nodiscard]] const HostKVPageLayout& page_layout(const PageDirectory& pages) const;
+    [[nodiscard]] HostExtent page_extent(const PageDirectory& pages, PageId page) const;
 
     [[nodiscard]] std::optional<HostPageReservation> prepare(PageDirectory& pages,
-                                                             std::span<const PageId> membership);
+                                                             std::span<const PageId> membership,
+                                                             HostAllocation allocation = {});
 
     [[nodiscard]] HostPageRange writable_view(const HostPageReservation& reservation) const;
 

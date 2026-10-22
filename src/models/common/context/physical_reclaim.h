@@ -41,6 +41,8 @@ struct PhysicalReclaim {
         std::vector<StateId> states;
         std::array<std::vector<Page>, Resources::pool_capacity> pages;
         Resources released;
+        std::vector<HostExtent> host_extents;
+        std::uint32_t host_pages = 0;
     };
 
     std::vector<Group> groups;
@@ -91,8 +93,10 @@ struct PhysicalReclaim {
                     continue;
                 if (shortage.state_slots)
                     group.released.state_slots += states.device_resident(image.handle);
-                if (shortage.host_bytes && states.host_resident(image.handle))
+                if (shortage.host_bytes && states.host_resident(image.handle)) {
                     group.released.host_bytes += state_bytes;
+                    group.host_extents.push_back(states.host_extent(image.handle));
+                }
             }
         }
 
@@ -190,8 +194,11 @@ struct PhysicalReclaim {
                 if (releasable[i]) {
                     if (shortage.kv_page_groups[pool])
                         group.released.kv_page_groups[pool] += pages.device_resident(entry.handle);
-                    if (shortage.host_bytes && pages.host_resident(entry.handle))
+                    if (shortage.host_bytes && pages.host_resident(entry.handle)) {
                         group.released.host_bytes += storage.host_page_bytes;
+                        group.host_extents.push_back(pages.host_extent(entry.handle));
+                        ++group.host_pages;
+                    }
                 }
             }
         }
@@ -200,7 +207,8 @@ struct PhysicalReclaim {
             for (auto& pages : group.pages)
                 std::sort(pages.begin(), pages.end(),
                           [](const auto& a, const auto& b) { return a.position > b.position; });
-            inventory->add(group.sources, group.released);
+            inventory->add(group.sources, group.released, std::move(group.host_extents),
+                           group.host_pages);
             groups.push_back(std::move(group));
         }
     }

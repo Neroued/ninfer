@@ -51,14 +51,13 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
                 CaptureDecision{*request->sequence, capture->frontier,
                                 resources_.begin_reclaim(*instance_.session, admission)});
         }
-        const auto usage = instance_.session->physical_usage();
-        if (capture->host_bytes && capture->host_bytes <= usage.capacity.host_bytes) {
-            if (capture->host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+        if (!capture->host.empty()) {
+            if (!instance_.session->can_place_host(capture->host)) {
                 (void)instance_.session->release_redundant_host({}, request->sequence);
             }
             if (const auto victims =
-                    resources_.host_victims(*instance_.session, capture->host_bytes, std::nullopt,
-                                            {}, {}, admission, &decision->reclaim)) {
+                    resources_.host_victims(*instance_.session, capture->host, std::nullopt, {}, {},
+                                            admission, &decision->reclaim)) {
                 resources_.commit_host_victims(*instance_.session, *victims, decision->reclaim);
                 if (!victims->empty()) { scheduler_.capacity_released(); }
                 if (const auto retry = instance_.session->prepare_capture(*request->sequence);
@@ -70,7 +69,9 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         }
         const auto progress =
             resources_.reclaim(*instance_.session, capture->shortage, {}, decision->reclaim);
-        if (progress == ReclaimProgress::Transferring) { return false; }
+        if (progress == ReclaimProgress::Transferring || progress == ReclaimProgress::Deferred)
+            return false;
+        if (progress == ReclaimProgress::Retry) continue;
         if (progress == ReclaimProgress::Changed) { continue; }
         instance_.session->skip_capture(*request->sequence);
         decision.reset();
@@ -297,10 +298,8 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane) {
     if (!request || !request->sequence || instance_.session->execution_pending(*request->sequence))
         return false;
     bool save_snapshot = false;
-    if (const auto bytes = instance_.session->pause_host_bytes(*request->sequence)) {
-        const auto usage = instance_.session->physical_usage();
-        if (*bytes <= usage.capacity.host_bytes &&
-            *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+    if (const auto write = instance_.session->pause_host_requirements(*request->sequence)) {
+        if (!instance_.session->can_place_host(*write)) {
             (void)instance_.session->release_redundant_host({}, request->sequence);
         }
         std::vector<Checkpoint> later;
@@ -310,10 +309,9 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane) {
             }
         }
         if (const auto victims =
-                resources_.host_victims(*instance_.session, *bytes, std::nullopt, later)) {
+                resources_.host_victims(*instance_.session, *write, std::nullopt, later)) {
+            if (!instance_.session->prepare_pause(*request->sequence, true, *victims)) return false;
             for (const auto handle : *victims) {
-                const auto usage = instance_.session->physical_usage();
-                if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
                 if (resources_.erase(*instance_.session, handle)) { continue; }
                 const auto owner =
                     std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {

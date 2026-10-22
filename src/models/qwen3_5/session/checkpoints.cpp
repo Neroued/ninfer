@@ -216,7 +216,8 @@ std::size_t SessionImpl::host_bytes_released(std::span<const CheckpointHandle> h
     return bytes;
 }
 
-std::optional<std::size_t> SessionImpl::pause_host_bytes(SequenceHandle handle) const {
+std::optional<context::HostWriteRequirements>
+SessionImpl::pause_host_requirements(SequenceHandle handle) const {
     if (context_operation_ || execution || !valid_sequence(handle) || !host_context_arena) {
         return std::nullopt;
     }
@@ -236,35 +237,38 @@ std::optional<std::size_t> SessionImpl::pause_host_bytes(SequenceHandle handle) 
             if (item.token_begin < frontier && frontier < item.token_end) { return std::nullopt; }
         }
     }
-    std::size_t bytes =
-        state_store->host_resident(sequence.continuation.image) ? 0 : state_store->image_bytes();
+    context::HostWriteRequirements write;
+    write.state_images = state_store->host_resident(sequence.continuation.image) ? 0 : 1;
+    write.kv_pages.resize(directory.pool_count());
     const auto count = [&](const context::HistoryDirectory& histories,
                            const context::PageDirectory& pages, context::HistoryId address,
-                           std::uint32_t target) {
+                           std::uint32_t target, std::uint32_t& count) {
         const auto mapped   = histories.mapped_pages(address);
         const auto required = context::kv_pages_for_frontier(target);
-        const auto stride   = pages.host_page_layout().page_stride;
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
             const auto page = histories.logical_page(address, i);
             // Deactivation removes this request's active reference. Other resident readers
             // keep their Device replica, so those pages need no new Host allocation.
-            if (!pages.host_replica_current(page) && pages.active_history_references(page) <= 1) {
-                bytes += stride;
+            const auto columns = static_cast<std::uint32_t>(
+                std::min<std::size_t>(kPagedKVPageSize, target - i * kPagedKVPageSize));
+            if (!pages.host_covers(page, columns) && pages.active_history_references(page) <= 1) {
+                ++count;
             }
         }
         // Masked-draft normalization can append accepted features before snapshot capture.
-        if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
+        if (required > mapped) count += required - mapped;
     };
     count(*text_kv_histories, *text_kv_pages, sequence.kv->text.handle(),
-          sequence.continuation.metadata.text_kv_valid);
+          sequence.continuation.metadata.text_kv_valid, write.kv_pages[kTextKvPool.index]);
     if (sequence.kv->backend) {
         const auto backend = is_masked_draft_backend(speculative_backend)
                                  ? std::max(sequence.continuation.metadata.execution_frontier,
                                             backend_kv_valid(sequence))
                                  : backend_kv_valid(sequence);
-        count(*backend_kv_histories, *backend_kv_pages, sequence.kv->backend->handle(), backend);
+        count(*backend_kv_histories, *backend_kv_pages, sequence.kv->backend->handle(), backend,
+              write.kv_pages[kBackendKvPool.index]);
     }
-    return bytes;
+    return write;
 }
 
 std::size_t SessionImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,

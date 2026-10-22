@@ -45,12 +45,14 @@ std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& st
 }
 
 bool SessionImpl::prepare_backup(context::ContextTransaction& migration, CheckpointState& record,
-                                 bool shared_device, bool& preserve_state_device) {
+                                 bool shared_device, bool& preserve_state_device,
+                                 context::HostReservations& targets) {
     if (!host_context_arena) return false;
     preserve_state_device =
         shared_device && state_store->source_pins(record.continuation().image) != 0;
     if (!state_store->host_resident(record.continuation().image)) {
-        auto transfer = state_store->reserve_device_to_host(record.continuation().image);
+        auto transfer = state_store->reserve_device_to_host(record.continuation().image,
+                                                            directory.take_host_image(targets));
         if (!transfer) return false;
         migration.add_state_copy(std::move(*transfer), preserve_state_device);
     }
@@ -69,10 +71,7 @@ bool SessionImpl::prepare_backup(context::ContextTransaction& migration, Checkpo
             }
         }
         if (!logical.empty()) {
-            auto destination =
-                host_kv_extents ? host_kv_extents->prepare(pages, logical) : std::nullopt;
-            if (!destination) return false;
-            migration.add_backup(pool.index, std::move(logical), std::move(*destination), true);
+            if (!migration.add_backups(pool.index, std::move(logical), targets, true)) return false;
         }
         return true;
     };
@@ -80,6 +79,33 @@ bool SessionImpl::prepare_backup(context::ContextTransaction& migration, Checkpo
         return false;
     return !record.history().backend || collect(*backend_kv_histories, *backend_kv_pages,
                                                 *record.history().backend, kBackendKvPool);
+}
+
+bool SessionImpl::prepare_pause(SequenceHandle handle, bool save_snapshot,
+                                std::span<const CheckpointHandle> host_victims) {
+    if (has_context_operation() || execution || !valid_sequence(handle)) return false;
+    if (pause_reservation_) throw std::logic_error("pause preparation is already owned");
+    const auto write = save_snapshot ? pause_host_requirements(handle)
+                                     : std::optional(context::HostWriteRequirements{});
+    if (!write) return false;
+    std::optional<context::HostPlacement> placement;
+    if (host_victims.empty()) {
+        placement = directory.plan_host(*write);
+    } else {
+        for (const auto victim : host_victims)
+            if (!can_release_checkpoint(victim)) return false;
+        const auto releases = plan_releases(host_victims, {}, {.host_bytes = 1});
+        auto selected       = releases.inventory->select();
+        auto probe          = selected.probe(host_victims);
+        placement = directory.plan_host(*write, releases.inventory->host_extents(selected.freed()),
+                                        releases.inventory->host_pages(selected.freed()));
+    }
+    if (!placement) return false;
+    auto execution = executor().try_reserve(runtime::FrameKind::Context);
+    if (!execution) return false;
+    pause_reservation_.emplace(
+        PauseReservation{handle, save_snapshot, std::move(*placement), {}, std::move(*execution)});
+    return true;
 }
 
 bool SessionImpl::start_pause(SequenceHandle handle, bool save_snapshot) {
@@ -91,9 +117,13 @@ bool SessionImpl::start_pause(SequenceHandle handle, bool save_snapshot) {
     if (control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling &&
         control.lifecycle != Lifecycle::Replaying)
         throw std::logic_error("pause requires a retired committed boundary");
-    auto reservation = executor().try_reserve(runtime::FrameKind::Context);
-    if (!reservation) return false;
-    pause_reservation_.emplace(std::move(*reservation));
+    if (!pause_reservation_ && !prepare_pause(handle, save_snapshot, {})) return false;
+    if (pause_reservation_->sequence != handle ||
+        pause_reservation_->save_snapshot != save_snapshot)
+        throw std::logic_error("pause does not match its preparation");
+    auto targets = directory.host_allocation().reserve(pause_reservation_->placement);
+    if (!targets) throw std::logic_error("prepared pause placement changed before reservation");
+    pause_reservation_->targets = std::move(*targets);
     control.capture_reservation.reset();
     if (control.capture_pending) skip_capture(handle);
     control.recovery.reset();
@@ -111,6 +141,7 @@ bool SessionImpl::start_pause(SequenceHandle handle, bool save_snapshot) {
             release_units(std::span(&handle, 1));
         }
         save_snapshot = false;
+        pause_reservation_->targets.clear();
     }
     return begin_pause(handle, save_snapshot);
 }
@@ -161,17 +192,16 @@ bool SessionImpl::begin_pause(SequenceHandle handle, bool save_snapshot) {
     control.lifecycle  = Lifecycle::Pausing;
     context_operation_ = std::make_unique<PendingContext>(
         directory, PauseOperation{lane, ResumeState(std::move(saved))});
-    context_operation_->reservation = std::move(pause_reservation_);
+    auto targets = std::move(pause_reservation_->targets);
+    context_operation_->reservation.emplace(std::move(pause_reservation_->execution));
     pause_reservation_.reset();
     auto& tx        = std::get<PauseOperation>(context_operation_->action);
     auto& migration = context_operation_->transaction;
     try {
         if (tx.paused.has_snapshot()) {
             auto& snapshot = checkpoint(*tx.paused.impl_->snapshot);
-            if (!prepare_backup(migration, snapshot, true, tx.preserve_state_device)) {
-                migration.reset_plan();
-                tx.discard_snapshot = true;
-            }
+            if (!prepare_backup(migration, snapshot, true, tx.preserve_state_device, targets))
+                throw std::logic_error("prepared pause backup lost its destination");
         }
         if (pause_cancelled_) migration.cancel();
         pause_cancelled_ = false;
@@ -186,8 +216,6 @@ bool SessionImpl::begin_pause(SequenceHandle handle, bool save_snapshot) {
 }
 
 ResumeState SessionImpl::complete_pause(PauseOperation& tx) {
-    if (tx.discard_snapshot && !revoke_snapshot(tx.paused))
-        throw std::logic_error("failed pause snapshot could not be released");
     if (tx.paused.has_snapshot()) {
         const auto& record = checkpoint(*tx.paused.impl_->snapshot);
         if (!tx.preserve_state_device &&

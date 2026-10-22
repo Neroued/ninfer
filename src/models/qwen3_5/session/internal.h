@@ -237,7 +237,6 @@ struct PauseOperation {
     std::uint32_t lane;
     ResumeState paused;
     bool preserve_state_device = true;
-    bool discard_snapshot      = false;
 };
 
 struct PendingContext {
@@ -296,7 +295,12 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    [[nodiscard]] std::optional<context::HostWriteRequirements>
+        pause_host_requirements(SequenceHandle) const;
+    [[nodiscard]] bool prepare_pause(SequenceHandle, bool save_snapshot,
+                                     std::span<const CheckpointHandle> host_victims);
+    [[nodiscard]] context::HostWriteRequirements
+    demotion_host_requirements(const ContextDemotion&) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
@@ -321,7 +325,8 @@ public:
     [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
     plan_releases(std::span<const CheckpointHandle> allowed,
                   std::span<const CheckpointHandle> excluded, ContextResources shortage) const;
-    [[nodiscard]] bool start_demote(const ContextDemotion& plan);
+    [[nodiscard]] runtime::ContextStart
+    start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot);
     [[nodiscard]] bool has_context_operation() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
@@ -380,7 +385,16 @@ public:
     mutable context::RecoveryIndex<> recovery_index;
     std::unique_ptr<PendingContext> context_operation_;
     std::optional<SequenceHandle> normalizing_pause_;
-    std::optional<runtime::ExecutionReservation> pause_reservation_;
+
+    struct PauseReservation {
+        SequenceHandle sequence;
+        bool save_snapshot;
+        context::HostPlacement placement;
+        context::HostReservations targets;
+        runtime::ExecutionReservation execution;
+    };
+
+    std::optional<PauseReservation> pause_reservation_;
     bool pause_cancelled_ = false;
     std::deque<SessionEvent> events;
     std::vector<runtime::ResidencyId> releases;
@@ -479,7 +493,8 @@ public:
     void abort_context() noexcept;
     void cancel_context() noexcept;
     [[nodiscard]] bool prepare_backup(context::ContextTransaction&, CheckpointState&,
-                                      bool shared_device, bool& preserve_state_device);
+                                      bool shared_device, bool& preserve_state_device,
+                                      context::HostReservations&);
     void install_binding(BindOperation&);
     void complete_binding(BindOperation&, context::ContextTransaction&, ContextProgress&);
     void publish_capture(CaptureOperation&, context::ContextTransaction&,

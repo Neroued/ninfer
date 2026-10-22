@@ -240,6 +240,12 @@ PageSlot PageDirectory::physical(PageId handle) const {
     return page.device_replica->slot();
 }
 
+HostExtent PageDirectory::host_extent(PageId handle) const {
+    const auto& page = require(handle);
+    if (!page.host_owner) throw std::invalid_argument("KV page has no Host owner");
+    return page.host_owner->page_extent(*this, handle);
+}
+
 const HostPageReplica& PageDirectory::host_replica(PageId handle) const {
     const Page& page = require(handle);
     if (!page.host_replica) { throw std::logic_error("logical KV page has no Host replica"); }

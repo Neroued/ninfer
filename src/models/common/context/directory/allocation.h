@@ -175,6 +175,32 @@ struct HostExtent {
 
 class HostAllocator;
 
+struct HostRequest {
+    std::size_t item_bytes = 0;
+    std::uint32_t count    = 0;
+};
+
+using HostRequirements = std::vector<HostRequest>;
+
+[[nodiscard]] std::size_t host_requirement_bytes(std::span<const HostRequest> requests);
+
+// A synchronous placement quote. It owns no capacity and is revalidated on reservation.
+class HostPlacement {
+public:
+    struct Run {
+        std::size_t request = 0;
+        std::uint32_t count = 0;
+        HostExtent extent;
+    };
+
+    [[nodiscard]] std::span<const Run> runs() const noexcept { return runs_; }
+
+private:
+    const HostAllocator* owner_ = nullptr;
+    std::vector<Run> runs_;
+    friend class HostAllocator;
+};
+
 // Sole owner of one fixed byte range. Transfers retain this owner until their final consumer.
 class HostAllocation {
 public:
@@ -209,6 +235,14 @@ private:
     HostExtent extent_;
     bool reserved_ = false;
 };
+
+struct HostReservedRun {
+    std::size_t request = 0;
+    std::uint32_t count = 0;
+    HostAllocation allocation;
+};
+
+using HostReservations = std::vector<HostReservedRun>;
 
 // Assigns ranges in a separately owned, startup-fixed backing. The minimum complete geometry
 // bounds metadata and every allocation/split piece; released ranges coalesce without allocation.
@@ -250,6 +284,11 @@ public:
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<HostAllocation> allocate(std::size_t bytes) noexcept;
+    // Each item remains contiguous; a request may occupy several runs. Released extents
+    // must describe unique, actually releasable ranges in this allocator.
+    [[nodiscard]] std::optional<HostPlacement>
+    plan(std::span<const HostRequest> requests, std::span<const HostExtent> released = {}) const;
+    [[nodiscard]] std::optional<HostReservations> reserve(const HostPlacement& placement);
     [[nodiscard]] std::pair<HostAllocation, HostAllocation> split(HostAllocation&& allocation,
                                                                   std::size_t byte_offset);
 
@@ -264,6 +303,7 @@ private:
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
+    void consume_free_extent(std::size_t index, std::size_t offset, std::size_t bytes) noexcept;
     void release(HostExtent extent, bool reserved) noexcept;
 
     std::uint32_t pool_id_;

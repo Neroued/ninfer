@@ -52,7 +52,8 @@ const HostKVPageLayout& HostDirectory::page_layout(const PageDirectory& pages) c
 }
 
 std::optional<HostPageReservation> HostDirectory::prepare(PageDirectory& pages,
-                                                          std::span<const PageId> membership) {
+                                                          std::span<const PageId> membership,
+                                                          HostAllocation reserved) {
     if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
         return std::nullopt;
     }
@@ -74,16 +75,21 @@ std::optional<HostPageReservation> HostDirectory::prepare(PageDirectory& pages,
     if (layout.page_stride > std::numeric_limits<std::size_t>::max() / membership.size()) {
         return std::nullopt;
     }
-    std::optional<HostAllocation> allocation =
-        allocator_->allocate(layout.page_stride * membership.size());
-    if (!allocation) { return std::nullopt; }
+    const auto bytes = layout.page_stride * membership.size();
+    if (!reserved.valid()) {
+        auto allocation = allocator_->allocate(bytes);
+        if (!allocation) return {};
+        reserved = std::move(*allocation);
+    }
+    if (!reserved.belongs_to(*allocator_) || !reserved.reserved() || reserved.bytes() != bytes)
+        throw std::invalid_argument("Host KV reservation has incompatible geometry");
 
     const std::uint32_t descriptor = free_[--free_count_];
     Extent& extent                 = extents_[descriptor];
     if (extent.state != ExtentState::Free) { std::terminate(); }
     extent.state      = ExtentState::Reserved;
     extent.page_store = &pages;
-    extent.allocation = std::move(*allocation);
+    extent.allocation = std::move(reserved);
     occupied_bytes_ += extent.allocation.bytes();
     for (const PageId page : membership) {
         const std::uint32_t node = take_membership();
@@ -114,6 +120,17 @@ std::optional<HostPageReservation> HostDirectory::prepare(PageDirectory& pages,
     reservation.generation_ = extent.generation;
     reservation.page_store_ = &pages;
     return reservation;
+}
+
+HostExtent HostDirectory::page_extent(const PageDirectory& pages, PageId page) const {
+    const auto replica = pages.host_replica(page);
+    const auto& extent = require(replica.extent);
+    if (extent.page_store != &pages || replica.page_offset >= extent.page_count)
+        throw std::invalid_argument("Host KV page belongs to another extent");
+    auto range = extent.allocation.extent();
+    range.offset += replica.page_offset * page_layout(pages).page_stride;
+    range.bytes = page_layout(pages).page_stride;
+    return range;
 }
 
 HostPageRange HostDirectory::writable_view(const HostPageReservation& reservation) const {

@@ -68,6 +68,7 @@ struct Source {
 // The production stores have separate tests for actual allocation and transfer lifetimes.
 struct Program {
     using ContextResources = Usage;
+    using HostRequirement  = std::size_t;
 
     struct Content {
         Key tokens;
@@ -118,9 +119,10 @@ struct Program {
     std::vector<Handle> released;
     std::vector<Handle> demoted;
     std::vector<std::vector<Handle>> demotion_submissions;
-    std::uint32_t main_capacity       = 1024;
-    bool transfer_in_progress         = false;
-    bool combined_demotion_blocked    = false;
+    std::uint32_t main_capacity    = 1024;
+    bool transfer_in_progress      = false;
+    bool combined_demotion_blocked = false;
+    std::vector<Handle> placement_holders;
     std::uint64_t checkpoint_revision = 1;
     mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index;
     using ReleaseInventory = ninfer::models::context::ReleaseInventory<Usage, Handle>;
@@ -546,16 +548,49 @@ struct Program {
                    : 0;
     }
 
-    bool start_demote(const Demotion& plan) {
-        if ((combined_demotion_blocked && plan.main_parts.size() > 1) ||
-            std::any_of(plan.sources.begin(), plan.sources.end(),
-                        [&](auto handle) { return contents.at(handle.index).demotion_blocked; })) {
-            return false;
-        }
+    std::size_t demotion_host_requirements(const Demotion& plan) const { return plan.host_bytes; }
+
+    std::size_t host_write_bytes(std::size_t bytes) const { return bytes; }
+
+    bool can_place_host(std::size_t bytes) const {
         const auto usage = physical_usage();
-        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+        if (bytes && std::any_of(placement_holders.begin(), placement_holders.end(),
+                                 [&](auto h) { return valid_checkpoint(h); }))
             return false;
+        return bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes;
+    }
+
+    bool can_place_host(std::size_t bytes,
+                        const ninfer::models::context::ReleasePlan<Release, Usage, Handle>& plan,
+                        std::span<const std::uint32_t> freed) const {
+        const auto usage = physical_usage();
+        auto available   = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        for (const auto h : placement_holders) {
+            if (!bytes || !valid_checkpoint(h)) continue;
+            const auto released = std::any_of(freed.begin(), freed.end(), [&](auto index) {
+                const auto& holders = plan.inventory->objects()[index].holders;
+                return std::find(holders.begin(), holders.end(), h) != holders.end();
+            });
+            if (!released) return false;
         }
+        for (const auto index : freed)
+            available += plan.inventory->objects()[index].released.host_bytes;
+        return bytes <= available;
+    }
+
+    ninfer::runtime::ContextStart start_demote(const Demotion& plan,
+                                               std::span<const Handle> victims) {
+        using ninfer::runtime::ContextStart;
+        if (combined_demotion_blocked && plan.main_parts.size() > 1) return ContextStart::Stale;
+        if (std::any_of(plan.sources.begin(), plan.sources.end(),
+                        [&](auto handle) { return contents.at(handle.index).demotion_blocked; }))
+            return ContextStart::Deferred;
+        const auto usage = physical_usage();
+        if (plan.host_bytes >
+            usage.capacity.host_bytes - usage.occupied.host_bytes + host_bytes_released(victims))
+            return ContextStart::Stale;
+        for (const auto victim : victims)
+            require(release_checkpoint(victim), "prepared Host victim was not releasable");
         if (!plan.main_parts.empty()) {
             for (const auto& [handle, pages] : plan.main_parts) {
                 auto& content    = contents.at(handle.index);
@@ -571,7 +606,7 @@ struct Program {
             demoted.push_back(plan.handle);
         }
         demotion_submissions.push_back(plan.sources);
-        return true;
+        return ContextStart::Started;
     }
 };
 
@@ -1379,7 +1414,7 @@ void test_reclaim_cursor_keeps_host_writeback_permissions() {
             "mid-decision promotion expanded a cold writeback's Host eviction permission");
 }
 
-void test_failed_demotion_keeps_scanning_independent_history() {
+void test_deferred_demotion_keeps_sources() {
     Fixture f(64);
     const auto blocked                               = f.program.add({1});
     const auto next                                  = f.program.add({2});
@@ -1390,13 +1425,13 @@ void test_failed_demotion_keeps_scanning_independent_history() {
     f.program.contents[blocked.index].release_blocked  = true;
     f.program.contents[blocked.index].demotion_blocked = true;
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.demoted == std::vector<Handle>{next} &&
+                    ninfer::runtime::ReclaimProgress::Deferred &&
+                f.program.demoted.empty() && f.program.valid_checkpoint(next) &&
                 f.program.contents[blocked.index].alive && f.program.released.empty(),
-            "one blocked demotion prevented independent writeback or discarded its history");
+            "deferred demotion deleted a source or proceeded with an unreserved transfer");
 }
 
-void test_failed_demotion_reports_prior_host_release() {
+void test_deferred_demotion_preserves_host_victims() {
     Fixture f(16);
     const auto victim                             = f.program.add({1}, {f.program.host_block(16)});
     f.program.contents[victim.index].device_state = false;
@@ -1408,13 +1443,19 @@ void test_failed_demotion_reports_prior_host_release() {
     f.program.contents[incoming.index].release_blocked  = true;
     f.program.contents[incoming.index].demotion_blocked = true;
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Deferred &&
+                f.program.released.empty() && f.program.valid_checkpoint(victim) &&
+                f.program.contents[incoming.index].alive && f.program.demoted.empty(),
+            "deferred transfer discarded its planned Host victims");
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                ninfer::runtime::ReclaimProgress::Deferred,
+            "deferred transfer was treated as a capacity change");
+    f.program.contents[incoming.index].demotion_blocked = false;
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{victim} &&
-                f.program.contents[incoming.index].alive && f.program.demoted.empty(),
-            "failed destination allocation hid a completed Host capacity release");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                ninfer::runtime::ReclaimProgress::Blocked,
-            "unchanged failed demotion manufactured another capacity event");
+                f.program.valid_checkpoint(incoming),
+            "ready transfer could not commit its planned Host replacement");
 }
 
 Key tokens(std::uint32_t count, std::uint32_t first = 1) {
@@ -1728,7 +1769,7 @@ void test_kv_demotion_batch_stops_at_an_intervening_delete() {
             "KV transfer batching skipped an intervening lower-ranked delete");
 }
 
-void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
+void test_redundant_delete_does_not_split_or_replace_a_deferred_kv_batch() {
     for (const bool reject_transfer : {false, true}) {
         Fixture f(64);
         const auto first    = f.program.add(tokens(100));
@@ -1742,7 +1783,8 @@ void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
         f.publish(second);
         f.publish(survivor);
         require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed,
+                    (reject_transfer ? ninfer::runtime::ReclaimProgress::Deferred
+                                     : ninfer::runtime::ReclaimProgress::Changed),
                 "redundant-delete fixture failed to make legitimate reclamation progress");
         if (!reject_transfer) {
             require(f.program.demotion_submissions ==
@@ -1751,12 +1793,10 @@ void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
                         f.program.valid_checkpoint(survivor) && f.program.released.empty(),
                     "a covered delete split the transfer or erased retained checkpoint metadata");
         } else {
-            require(f.program.demotion_submissions.empty() &&
-                        f.program.released == std::vector<Handle>{first} &&
-                        f.program.valid_checkpoint(survivor) &&
+            require(f.program.demotion_submissions.empty() && f.program.released.empty() &&
+                        f.program.valid_checkpoint(first) && f.program.valid_checkpoint(survivor) &&
                         f.program.contents[second.index].main_pages == 1,
-                    "failed migration lost its original delete alternative or skipped to a later "
-                    "action");
+                    "deferred migration fell through to its delete alternative");
         }
     }
 }
@@ -2093,6 +2133,31 @@ void test_host_selection_against_full_rescoring() {
     }
 }
 
+void test_host_placement_overrides_aggregate_free_bytes() {
+    Fixture f(48);
+    (void)f.program.host_block(16, true);
+    const auto first                              = f.program.add({1}, {f.program.host_block(8)});
+    const auto second                             = f.program.add({2}, {f.program.host_block(8)});
+    const auto incoming                           = f.program.add(tokens(100, 1000));
+    f.program.contents[first.index].device_state  = false;
+    f.program.contents[second.index].device_state = false;
+    f.program.contents[incoming.index].demotion_bytes = 8;
+    f.program.placement_holders                       = {first, second};
+    f.publish(first);
+    f.publish(second);
+    f.publish(incoming);
+    const std::array excluded{second};
+    require(!f.cache.host_victims(f.program, 8, incoming, {}, excluded) &&
+                f.program.released.empty(),
+            "Host placement accepted enough aggregate bytes without a realizable destination");
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.released == std::vector<Handle>{first, second} &&
+                f.program.demoted == std::vector<Handle>{incoming} &&
+                f.program.valid_checkpoint(incoming),
+            "Host replacement stopped selecting victims before placement became feasible");
+}
+
 void test_independent_host_candidates_reuse_scores() {
     for (const auto n : {16U, 32U, 64U, 128U}) {
         Fixture f(n);
@@ -2120,12 +2185,13 @@ int main() {
         test_shared_publication_deduplicates_complete_snapshots();
         test_intermediate_capture_preserves_semantic_history();
         test_host_selection_against_full_rescoring();
+        test_host_placement_overrides_aggregate_free_bytes();
         test_independent_host_candidates_reuse_scores();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_device_candidates_share_host_inventory();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();
-        test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback();
+        test_redundant_delete_does_not_split_or_replace_a_deferred_kv_batch();
         test_partially_covered_delete_still_stops_a_kv_batch();
         test_kv_demotion_batch_preserves_host_and_outer_permission_limits();
         test_failed_kv_demotion_batch_falls_back_without_host_deletion();
@@ -2173,8 +2239,8 @@ int main() {
         test_reclaim_cursor_filters_retired_handles_and_defers_new_history();
         test_reclaim_cursor_can_demote_remaining_pages_of_the_same_history();
         test_reclaim_cursor_keeps_host_writeback_permissions();
-        test_failed_demotion_keeps_scanning_independent_history();
-        test_failed_demotion_reports_prior_host_release();
+        test_deferred_demotion_keeps_sources();
+        test_deferred_demotion_preserves_host_victims();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

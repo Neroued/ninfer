@@ -27,6 +27,7 @@ public:
     using ContextResources = typename Session::ContextResources;
     using Base             = typename Model::RequestBasePlan;
     using Handle           = typename Model::CheckpointHandle;
+    using HostRequirement  = typename Session::HostRequirement;
     using Source           = typename Model::SourceCandidate;
     using SessionKey       = typename Model::CacheSessionKey;
     using OwnerToken       = ContinuationOwnerToken;
@@ -540,7 +541,7 @@ public:
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims(Session& session, std::size_t bytes, std::optional<Handle> incoming,
+    host_victims(Session& session, const HostRequirement& write, std::optional<Handle> incoming,
                  std::span<const Handle> later_snapshots = {},
                  std::span<const Handle> excluded        = {},
                  std::optional<Admission> admission      = std::nullopt,
@@ -548,13 +549,13 @@ public:
         prune(session);
         Evaluation evaluation;
         if (decision) {
-            return host_victims_in_order(session, bytes, incoming, later_snapshots, excluded,
+            return host_victims_in_order(session, {&write}, incoming, later_snapshots, excluded,
                                          decision->admission, *decision, evaluation);
         }
         auto cursor   = reclaim_order(session);
         cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
-        return host_victims_in_order(session, bytes, incoming, later_snapshots, excluded, admission,
-                                     cursor, evaluation);
+        return host_victims_in_order(session, {&write}, incoming, later_snapshots, excluded,
+                                     admission, cursor, evaluation);
     }
 
     void commit_host_victims(Session& session, std::span<const Handle> handles,
@@ -597,8 +598,8 @@ public:
         if (shortage.host_bytes) {
             Evaluation evaluation;
             const auto victims =
-                host_victims_in_order(session, shortage.host_bytes, std::nullopt, {}, excluded,
-                                      cursor.admission, cursor, evaluation, true);
+                host_victims_in_order(session, {nullptr, shortage.host_bytes}, std::nullopt, {},
+                                      excluded, cursor.admission, cursor, evaluation);
             if (!victims) { return ReclaimProgress::Blocked; }
             commit_release(session, *victims, cursor);
             return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
@@ -611,16 +612,16 @@ public:
         struct Action {
             std::optional<Demotion> demotion;
             std::optional<Release> release;
+            HostRequirement host{};
             std::vector<Handle> host_victims;
             std::optional<Admission> preservation;
             ActionRank rank;
         };
 
-        const auto usage     = session.physical_usage();
-        const auto free_host = usage.capacity.host_bytes - usage.occupied.host_bytes;
         const bool needs_host_cleanup =
-            std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [&](const auto& plan) { return plan.host_bytes > free_host; });
+            std::any_of(plans.demotions.begin(), plans.demotions.end(), [&](const auto& plan) {
+                return !session.can_place_host(session.demotion_host_requirements(plan));
+            });
         const bool existing_host_destination =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
                         [](const auto& plan) { return plan.host_bytes == 0; });
@@ -645,8 +646,9 @@ public:
                                      plan.sources.end());
             auto preservation =
                 preservation_admission(session, plan.sources, cursor, facts.priority);
+            auto host = session.demotion_host_requirements(plan);
             auto victims =
-                host_victims_in_order(session, plan.host_bytes, preservation.checkpoint, {},
+                host_victims_in_order(session, {&host}, preservation.checkpoint, {},
                                       protected_sources, preservation, cursor, evaluation);
             if (!victims) { continue; }
             auto rank       = rank_action(session, plan.sources, facts, units, evaluation, true);
@@ -661,6 +663,7 @@ public:
                 rank.priority = host_rank.priority;
             }
             actions.push_back({.demotion     = std::move(plan),
+                               .host         = std::move(host),
                                .host_victims = std::move(*victims),
                                .preservation = std::move(preservation),
                                .rank         = rank});
@@ -706,11 +709,14 @@ public:
                         if (const auto batch = builder.finish()) {
                             auto facts = action_facts(session, batch->sources, cursor, evaluation);
                             if (admits(session, batch->sources, facts, cursor.admission, cursor,
-                                       evaluation, true) &&
-                                session.start_demote(*batch)) {
-                                return session.has_context_operation()
-                                           ? ReclaimProgress::Transferring
-                                           : ReclaimProgress::Changed;
+                                       evaluation, true)) {
+                                const auto started = session.start_demote(*batch, {});
+                                if (started == ContextStart::Started)
+                                    return session.has_context_operation()
+                                               ? ReclaimProgress::Transferring
+                                               : ReclaimProgress::Changed;
+                                if (started == ContextStart::Deferred)
+                                    return ReclaimProgress::Deferred;
                             }
                         }
                         // A combined reservation may fail without changing any replica.
@@ -722,16 +728,28 @@ public:
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
                 const auto current = host_victims_in_order(
-                    session, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation);
+                    session, {&action.host}, action.preservation->checkpoint, {}, protected_sources,
+                    action.preservation, cursor, evaluation);
                 if (!current || *current != action.host_victims) { continue; }
-                commit_release(session, action.host_victims, cursor, action.rank.loss);
-                if (session.start_demote(plan)) {
+                if (!may_revoke(action.host_victims, cursor.rights))
+                    throw std::logic_error("demotion lacks Host victim revocation rights");
+                const auto started = session.start_demote(plan, action.host_victims);
+                if (started == ContextStart::Started) {
+                    for (const auto victim : action.host_victims) {
+                        if (session.valid_checkpoint(victim))
+                            throw std::logic_error("demotion did not release its Host victims");
+                        forget(victim);
+                    }
+                    if (cursor.gain_limit)
+                        cursor.sacrificed = action.rank.loss > UINT64_MAX - cursor.sacrificed
+                                                ? UINT64_MAX
+                                                : cursor.sacrificed + action.rank.loss;
+                    prune(session);
                     return session.has_context_operation() ? ReclaimProgress::Transferring
                                                            : ReclaimProgress::Changed;
                 }
-                if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
-                continue;
+                return started == ContextStart::Deferred ? ReclaimProgress::Deferred
+                                                         : ReclaimProgress::Retry;
             }
             // Native quoted every holder required for this actual physical release.
             commit_release(session, action.release->sources, cursor, action.rank.loss);
@@ -1349,16 +1367,25 @@ private:
             loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
     }
 
+    struct HostTarget {
+        const HostRequirement* write = nullptr;
+        std::size_t shortage         = 0;
+    };
+
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims_in_order(Session& session, std::size_t bytes, std::optional<Handle> incoming,
+    host_victims_in_order(Session& session, HostTarget target, std::optional<Handle> incoming,
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
-        const auto usage    = session.physical_usage();
-        const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
-        if (!required) { return std::vector<Handle>{}; }
-        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }
+                          Evaluation& evaluation) const {
+        const auto usage = session.physical_usage();
+        const auto bytes = target.write ? session.host_write_bytes(*target.write) : target.shortage;
+        const auto free  = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        const auto required = target.write
+                                  ? std::max<std::size_t>(1, bytes > free ? bytes - free : 0)
+                                  : target.shortage;
+        if (target.write ? session.can_place_host(*target.write) : !target.shortage)
+            return std::vector<Handle>{};
+        if (target.write && bytes > usage.capacity.host_bytes) return std::nullopt;
         if (!admission && incoming) {
             admission = preservation_admission(
                 session, {&*incoming, 1}, cursor,
@@ -1523,7 +1550,8 @@ private:
         };
         ActionRank selected;
         std::size_t selected_snapshot = 0;
-        while (selection.released().host_bytes < required) {
+        while (!(target.write ? session.can_place_host(*target.write, plan, selection.freed())
+                              : selection.released().host_bytes >= required)) {
             std::optional<std::size_t> best;
             ActionRank best_rank;
             std::size_t best_snapshot = 0;

@@ -225,7 +225,19 @@ ContextDemotion SessionImpl::describe_demotion(std::shared_ptr<const Demotion> p
     return out;
 }
 
-bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const Demotion& plan) {
+context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& plan) const {
+    context::HostWriteRequirements write;
+    write.kv_pages.resize(directory.pool_count());
+    for (const auto image : plan.images)
+        write.state_images += !directory.states().host_resident(image);
+    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
+        for (const auto page : plan.pages[pool])
+            write.kv_pages[pool] += !directory.pool(pool).pages().host_replica_current(page);
+    return write;
+}
+
+bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const Demotion& plan,
+                                   context::HostReservations& targets) {
     std::vector<Image> redundant;
     for (const auto image : plan.images) {
         auto& states = directory.states();
@@ -234,7 +246,8 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
         if (states.host_resident(image))
             redundant.push_back(image);
         else {
-            auto transfer = states.reserve_device_to_host(image);
+            auto transfer =
+                states.reserve_device_to_host(image, directory.take_host_image(targets));
             if (!transfer) return false;
             migration.add_state_copy(std::move(*transfer), false);
         }
@@ -253,9 +266,7 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
                 pages.push_back(page);
         }
         if (!pages.empty()) {
-            auto target = directory.host().prepare(store, pages);
-            if (!target) return false;
-            migration.add_backup(pool, std::move(pages), std::move(*target), true);
+            if (!migration.add_backups(pool, std::move(pages), targets, true)) return false;
         }
     }
     for (const auto image : redundant)
@@ -337,27 +348,47 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
     return out;
 }
 
-bool SessionImpl::start_demote(const ContextDemotion& quote) {
+runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
+                                                std::span<const CheckpointHandle> host_victims) {
     auto& p = *this;
     if (p.operation || !quote.impl || quote.impl->owner != &p ||
         !p.directory.host_allocation().capacity_bytes() || quote.sources != quote.impl->records ||
-        !detail::valid_demotion(p, *quote.impl) ||
-        quote.host_bytes > p.directory.host_allocation().free_bytes())
-        return false;
+        !detail::valid_demotion(p, *quote.impl))
+        return runtime::ContextStart::Stale;
     const auto current = p.describe_demotion(quote.impl);
-    if (current.host_bytes != quote.host_bytes || current.released != quote.released) return false;
+    if (current.host_bytes != quote.host_bytes || current.released != quote.released)
+        return runtime::ContextStart::Stale;
+    for (const auto victim : host_victims)
+        if (!p.checkpoints.erasable(victim) ||
+            std::find(quote.sources.begin(), quote.sources.end(), victim) != quote.sources.end())
+            return runtime::ContextStart::Stale;
+    std::optional<context::HostPlacement> placement;
+    if (host_victims.empty()) {
+        placement = p.directory.plan_host(p.host_requirements(*quote.impl));
+    } else {
+        const auto releases = p.plan_releases(host_victims, quote.sources, {.host_bytes = 1});
+        auto selected       = releases.inventory->select();
+        auto probe          = selected.probe(host_victims);
+        placement           = p.directory.plan_host(p.host_requirements(*quote.impl),
+                                                    releases.inventory->host_extents(selected.freed()),
+                                                    releases.inventory->host_pages(selected.freed()));
+    }
+    if (!placement) return runtime::ContextStart::Stale;
     auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
-    if (!execution) return false;
+    if (!execution) return runtime::ContextStart::Deferred;
+    for (const auto victim : host_victims)
+        if (!p.checkpoints.erase(victim))
+            throw std::logic_error("prepared Host victim changed before demotion");
+    auto targets = p.directory.host_allocation().reserve(*placement);
+    if (!targets) throw std::logic_error("prepared Host placement changed before demotion");
     p.operation = std::make_unique<detail::ContextOperation>(
         p.directory, detail::DemoteOperation{quote.impl}, std::move(*execution));
     try {
         auto& migration = p.operation->migration;
-        if (!p.prepare_demotion(migration, *quote.impl)) {
-            p.cancel_operation();
-            return false;
-        }
+        if (!p.prepare_demotion(migration, *quote.impl, *targets))
+            throw std::logic_error("prepared demotion lost its destination");
         p.submit_context();
-        return true;
+        return runtime::ContextStart::Started;
     } catch (...) {
         p.cancel_operation();
         throw;
@@ -445,17 +476,18 @@ bool ContextDemotionBatch::covers(const ContextRelease& release) const {
 
 std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
     if (!plan_->valid || plan_->components.empty()) return {};
-    const auto& p               = *plan_->owner;
-    const auto pool             = plan_->pool->index;
-    const auto& store           = p.directory.pool(pool).pages();
-    const auto free             = p.directory.host_allocation().free_bytes();
-    const auto stride           = p.pools[pool].host_page_stride;
+    const auto& p     = *plan_->owner;
+    const auto pool   = plan_->pool->index;
+    const auto& store = p.directory.pool(pool).pages();
+    const auto stride = p.pools[pool].host_page_stride;
+    const auto capacity =
+        p.directory.available_host_pages(pool, plan_->shortage.kv_page_groups[pool]);
     auto result                 = std::make_shared<detail::Demotion>();
     result->owner               = &p;
     result->checkpoint_revision = p.checkpoints.revision();
     std::unordered_set<std::uint32_t> selected;
-    std::size_t bytes = 0;
-    bool complete     = false;
+    std::uint32_t missing = 0;
+    bool complete         = false;
     for (const auto& component : plan_->components) {
         if (!detail::valid_demotion(p, *component, false)) return {};
         bool used = false;
@@ -463,11 +495,11 @@ std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
             const auto page = component->pages[pool][i];
             if (!selected.insert(store.descriptor_index(page)).second) continue;
             const auto needed = store.host_replica_current(page) ? 0 : stride;
-            if (needed > free - bytes) {
+            if (needed && missing == capacity) {
                 complete = true;
                 break;
             }
-            bytes += needed;
+            missing += needed != 0;
             result->pages[pool].push_back(page);
             result->page_versions[pool].push_back(component->page_versions[pool][i]);
             used = true;
@@ -484,7 +516,33 @@ std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
     return p.describe_demotion(std::move(result));
 }
 
-bool Session::start_demote(const ContextDemotion& quote) { return impl_->start_demote(quote); }
+runtime::ContextStart Session::start_demote(const ContextDemotion& quote,
+                                            std::span<const CheckpointHandle> host_victims) {
+    return impl_->start_demote(quote, host_victims);
+}
+
+Session::HostRequirement Session::demotion_host_requirements(const ContextDemotion& quote) const {
+    if (!quote.impl || quote.impl->owner != impl_.get())
+        throw std::invalid_argument("demotion quote belongs to another session");
+    return impl_->host_requirements(*quote.impl);
+}
+
+std::size_t Session::host_write_bytes(const HostRequirement& write) const {
+    return impl_->directory.host_write_bytes(write);
+}
+
+bool Session::can_place_host(const HostRequirement& write) const {
+    return impl_->directory.plan_host(write).has_value();
+}
+
+bool Session::can_place_host(const HostRequirement& write,
+                             const context::ReleasePlan<ContextRelease, ContextResources>& releases,
+                             std::span<const std::uint32_t> freed) const {
+    return impl_->directory
+        .plan_host(write, releases.inventory->host_extents(freed),
+                   releases.inventory->host_pages(freed))
+        .has_value();
+}
 
 std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> keep) {

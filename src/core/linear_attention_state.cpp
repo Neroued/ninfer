@@ -22,40 +22,43 @@ LinearAttentionStateLayout plan_linear_attention_state(StateImageBuilder& builde
 
 LinearAttentionStateView::LinearAttentionStateView(const StateImageStorage& storage,
                                                    const LinearAttentionStateLayout& layout)
-    : view_{storage.field(layout.conv), storage.field(layout.recurrent),
-            storage.layer_stride(layout.conv), storage.layer_stride(layout.recurrent),
-            layout.spec} {
-    const auto& conv      = view_.conv_layer0;
-    const auto& recurrent = view_.recurrent_layer0;
+    : view_{storage.field(layout.conv, {}), storage.field(layout.recurrent, {}), layout.spec} {
+    const auto& conv      = view_.conv.field;
+    const auto& recurrent = view_.recurrent.field;
     const auto& spec      = layout.spec;
-    if (conv.dtype != spec.conv_dtype || conv.ne[0] != spec.conv_channels ||
-        conv.ne[1] != spec.conv_width || conv.ne[3] != 1 || recurrent.dtype != DType::FP32 ||
-        recurrent.ne[0] != spec.key_head_dim || recurrent.ne[1] != spec.value_head_dim ||
-        recurrent.ne[2] != spec.value_heads || recurrent.ne[3] != conv.ne[2] ||
-        storage.layout().fields.at(layout.conv.index).layers != spec.layers ||
-        storage.layout().fields.at(layout.recurrent.index).layers != spec.layers) {
+    if (conv.tensor.dtype != spec.conv_dtype ||
+        conv.tensor.shape !=
+            std::array<std::int32_t, 4>{spec.conv_channels, spec.conv_width, 1, 1} ||
+        recurrent.tensor.dtype != DType::FP32 ||
+        recurrent.tensor.shape != std::array<std::int32_t, 4>{spec.key_head_dim,
+                                                              spec.value_head_dim, spec.value_heads,
+                                                              1} ||
+        conv.layers != spec.layers || recurrent.layers != spec.layers) {
         throw std::invalid_argument("Linear Attention state fields do not match their geometry");
     }
 }
 
-LinearAttentionStateLayerView LinearAttentionStateView::layer_view(std::uint32_t layer) const {
-    if (layer >= layer_count()) { throw std::out_of_range("Linear Attention layer out of range"); }
-    Tensor conv      = view_.conv_layer0;
-    Tensor recurrent = view_.recurrent_layer0;
-    conv.data        = static_cast<std::byte*>(conv.data) + layer * view_.conv_layer_stride_bytes;
-    recurrent.data =
-        static_cast<std::byte*>(recurrent.data) + layer * view_.recurrent_layer_stride_bytes;
-    return {conv, recurrent};
+LinearAttentionStateLayerView
+LinearAttentionStateView::layer_view(std::uint32_t layer, const Tensor& byte_offsets) const {
+    auto all = all_layers_view(byte_offsets);
+    return {all.conv.layer(layer), all.recurrent.layer(layer)};
 }
 
-Tensor LinearAttentionStateView::conv_slot(std::uint32_t layer, std::int32_t slot) const {
-    return layer_view(layer).conv.slice(2, slot, 1).view({spec().conv_channels, spec().conv_width});
+LinearAttentionStateAllLayersView
+LinearAttentionStateView::all_layers_view(const Tensor& byte_offsets) const {
+    auto result                           = view_;
+    result.conv.records.byte_offsets      = byte_offsets;
+    result.recurrent.records.byte_offsets = byte_offsets;
+    return result;
 }
 
-Tensor LinearAttentionStateView::recurrent_slot(std::uint32_t layer, std::int32_t slot) const {
-    return layer_view(layer)
-        .recurrent.slice(3, slot, 1)
-        .view({spec().key_head_dim, spec().value_head_dim, spec().value_heads});
+Tensor LinearAttentionStateView::conv_tensor(std::uint32_t layer, std::int64_t byte_offset) const {
+    return view_.conv.tensor(byte_offset, layer);
+}
+
+Tensor LinearAttentionStateView::recurrent_tensor(std::uint32_t layer,
+                                                  std::int64_t byte_offset) const {
+    return view_.recurrent.tensor(byte_offset, layer);
 }
 
 } // namespace ninfer

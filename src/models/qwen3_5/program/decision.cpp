@@ -116,8 +116,10 @@ void RankProgramImpl::decide_decode(std::uint32_t batch_value, std::uint32_t wid
             ops::gather_bf16_batch_columns(hidden, frame.accepted_drafts.slice(0, 0, batch),
                                            selected, device.execution_view());
         }
-        ops::scatter(selected, frame.state_destination_slots.slice(0, 0, batch),
-                     resources.state_images.continuation_hidden_store(), device.execution_view());
+        ops::scatter(selected,
+                     resources.state_images.continuation_hidden(
+                         frame.state_destination_offsets.slice(0, 0, batch)),
+                     device.execution_view());
     }
 }
 
@@ -176,7 +178,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
                              .view({frame.spec.hidden, 1});
             else
                 hidden = resources.state_images
-                             .continuation_hidden_slot(operation.rows[0].state_slots.source)
+                             .continuation_hidden(operation.rows[0].state_offsets.source)
                              .view({frame.spec.hidden, 1});
             auto position = frame.frontiers.slice(0, 0, 1);
             ops::set_i32_scalar(position,

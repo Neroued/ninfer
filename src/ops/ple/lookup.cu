@@ -25,9 +25,10 @@ struct HashHead {
 };
 
 struct Arguments {
-    const int *ids, *valid, *tail, *slots;
+    const int *ids, *valid, *tail;
+    const std::int64_t* state_offsets;
     std::uint32_t* out;
-    std::int64_t id_stride, tail_stride;
+    std::int64_t id_stride;
     int tokens, batch, eos;
     std::uint64_t multipliers[3];
     HashHead heads[kHeads];
@@ -44,32 +45,32 @@ Arguments arguments(const Tensor& ids, const Tensor& valid, const NgramTokenTail
                     const NgramHashParameters& hash, int eos,
                     std::span<const Nf4EmbeddingShard> shards, Tensor& out,
                     CudaExecutionView execution) {
-    const int tokens = ids.ne[0], batch = ids.ne[1], slots = before.token_ids.ne[1];
+    const int tokens = ids.ne[0], batch = ids.ne[1];
     const auto device = execution.device();
-    require(tokens > 0 && batch >= 1 && batch <= 8 && slots > 0, "invalid T/B/S");
+    require(tokens > 0 && batch >= 1 && batch <= 8, "invalid T/B");
     require(eos >= 0 && shards.size() <= 128, "invalid EOS or shard count");
     operand::slotted_tensor(ids, DType::I32, {tokens, batch}, 1, 4, kOp, "token IDs", device);
-    operand::slotted_tensor(before.token_ids, DType::I32, {2, slots}, 1, 4, kOp, "tail IDs",
-                            device);
+    require(before.token_ids.field.layers == 1, "tail layer");
+    operand::state_field(before.token_ids, DType::I32, {2}, 4, kOp, "tail IDs", device);
     operand::tensor(valid, DType::I32, {batch}, 4, kOp, "valid columns", device);
-    operand::tensor(before.slots, DType::I32, {batch}, 4, kOp, "tail slots", device);
+    operand::shape(before.token_ids.records.byte_offsets, {batch, 1, 1, 1}, kOp,
+                   "tail byte offsets");
     operand::tensor(out, DType::BF16, {kHeads * kWidth, tokens, batch}, 16, kOp, "embedding",
                     device);
     const auto destination = operand::range(out, kOp);
-    for (const auto* input : {&ids, &valid, &before.token_ids, &before.slots})
+    for (const auto* input : {&ids, &valid, &before.token_ids.records.byte_offsets})
         require(!operand::overlaps(operand::blocks(*input, kOp), destination), "output alias");
 
     Arguments a{};
-    a.ids         = static_cast<const int*>(ids.data);
-    a.valid       = static_cast<const int*>(valid.data);
-    a.tail        = static_cast<const int*>(before.token_ids.data);
-    a.slots       = static_cast<const int*>(before.slots.data);
-    a.out         = static_cast<std::uint32_t*>(out.data);
-    a.id_stride   = ids.nb[1] / 4;
-    a.tail_stride = before.token_ids.nb[1] / 4;
-    a.tokens      = tokens;
-    a.batch       = batch;
-    a.eos         = eos;
+    a.ids           = static_cast<const int*>(ids.data);
+    a.valid         = static_cast<const int*>(valid.data);
+    a.tail          = operand::state_field_base<const int>(before.token_ids);
+    a.state_offsets = static_cast<const std::int64_t*>(before.token_ids.records.byte_offsets.data);
+    a.out           = static_cast<std::uint32_t*>(out.data);
+    a.id_stride     = ids.nb[1] / 4;
+    a.tokens        = tokens;
+    a.batch         = batch;
+    a.eos           = eos;
     std::copy(hash.multipliers.begin(), hash.multipliers.end(), a.multipliers);
     std::uint64_t previous_end = 0;
     for (std::size_t i = 0; i < shards.size(); ++i) {
@@ -139,8 +140,8 @@ __global__ __launch_bounds__(Warps * 32) void lookup_kernel(const __grid_constan
         std::uint32_t row = 0;
         if (lane == 0 && head.first < head.last && t < a.valid[b]) {
             const auto* ids     = a.ids + b * a.id_stride;
-            const int slot      = t < 2 ? a.slots[b] : 0;
-            const auto* tail    = a.tail + std::int64_t(slot) * a.tail_stride;
+            const auto offset   = t < 2 ? a.state_offsets[b] : 0;
+            const auto* tail    = a.tail + offset / 4;
             const auto current  = std::uint64_t(ids[t]);
             const auto previous = std::uint64_t(t ? ids[t - 1] : tail[1]);
             const auto older    = std::uint64_t(previous == std::uint64_t(a.eos) ? a.eos

@@ -24,8 +24,8 @@ struct TextExecutionView {
 };
 
 // Contiguous ids/cache_positions I32 [W,B], RoPE positions I32 [W*B] or [W*B,3],
-// and valid_columns/kv_table_rows/state selectors I32 [B]. SequenceUpdate uses its Host
-// state slots; ReplayRecords only reads state_source_slots. Embeddings, when supplied,
+// valid_columns/kv_table_rows I32 [B], and State byte offsets I64 [B]. SequenceUpdate
+// uses Host byte offsets; ReplayRecords only reads source records. Embeddings, when supplied,
 // are immutable BF16 [H,W,B] with visual replacements already applied.
 struct TextInputs {
     Tensor ids;
@@ -33,8 +33,8 @@ struct TextInputs {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor state_source_offsets;
+    Tensor state_destination_offsets;
     std::optional<Tensor> input_embeddings;
 };
 
@@ -43,8 +43,8 @@ struct TextInputs {
 // ReplayRecords leaves master state unchanged and records every valid transition for the
 // caller's later accepted-prefix fold. Missing valid_columns means every column is valid.
 struct SequenceUpdate {
-    std::int32_t source_slot;
-    std::int32_t destination_slot;
+    std::int64_t source_offset;
+    std::int64_t destination_offset;
 };
 
 struct StepUpdate {};

@@ -22,11 +22,11 @@ MECHANISM_COUNTERS = {
 }
 
 TRANSFER_RESOURCES = ("state",)
-TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d")
-OCCUPANCY_FIELDS = (
-    "device_state_slots",
-    "host_state_slots", "host_kv_bytes", "host_context_occupied_bytes",
-    "host_context_reserved_bytes",
+TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d", "h2h")
+POOL_USAGE_FIELDS = (
+    "capacity_bytes", "block_bytes", "live_bytes", "reserved_bytes",
+    "pending_retirement_bytes", "relocation_bytes", "future_reserved_bytes",
+    "padding_bytes", "assigned_free_bytes", "unassigned_free_bytes", "tail_bytes",
 )
 
 TTFT_STAGES = ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")
@@ -176,9 +176,9 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     if any(event.get("schema_version") != REQUEST_LOG_SCHEMA_VERSION for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
-    def values_at(path: Sequence[str]) -> list[int | float] | None:
+    def values_at(path: Sequence[str | int], sources=intervals) -> list[int | float] | None:
         values = []
-        for event in intervals:
+        for event in sources:
             value: Any = event
             for part in path:
                 if isinstance(value, dict):
@@ -191,6 +191,13 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
                 return None
             values.append(value)
         return values
+
+    def sampled(path: Sequence[str | int], sources=intervals) -> dict[str, Any]:
+        values = values_at(path, sources)
+        return {
+            "sampled_max": max(values) if values else None,
+            "last": values[-1] if values else None,
+        }
 
     def total(*path: str) -> int | float | None:
         values = values_at(path)
@@ -230,14 +237,33 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         )
     }
     host_work["scheduler_yield_seconds"] = total("host_work", "scheduler_yield_seconds")
-    occupancy = {"kv_pools": pool_occupancy}
-    for field in OCCUPANCY_FIELDS:
-        values = values_at(("context_cache", "occupancy", field))
-        occupancy[field] = {
-            "sampled_max": max(values) if values is not None else None,
-            "last": values[-1] if values is not None else None,
-        }
-    peak = values_at(("context_cache", "occupancy", "host_context_peak_occupied_bytes"))
+    occupancy = {
+        "kv_pools": pool_occupancy,
+        **{field: sampled(("context_cache", "occupancy", field))
+           for field in ("state_objects", "history_objects")},
+        "metadata": {field: sampled(("context_cache", "occupancy", "metadata", field))
+                     for field in ("budget_bytes", "allocated_bytes", "reserved_bytes")},
+        "pools": [],
+    }
+    physical_pools: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in intervals:
+        seen = set()
+        for pool in event.get("context_cache", {}).get("occupancy", {}).get("pools", []):
+            rank, domain = pool.get("rank"), pool.get("domain")
+            if type(rank) is not int or rank < 0 or domain not in ("device", "host"):
+                return {"status": "unavailable", "reason": "invalid_context_domain"}
+            identity = (rank, domain)
+            if identity in seen:
+                return {"status": "unavailable", "reason": "duplicate_context_domain"}
+            seen.add(identity)
+            physical_pools[identity].append(pool)
+    for (rank, domain), observed in sorted(physical_pools.items()):
+        peaks = values_at(("peak_occupied_bytes",), observed)
+        occupancy["pools"].append({
+            "rank": rank, "domain": domain, "observations": len(observed),
+            **{field: sampled((field,), observed) for field in POOL_USAGE_FIELDS},
+            "peak_occupied_bytes": max(peaks) if peaks else None,
+        })
     final_intervals = [index for index, event in enumerate(intervals)
                        if event.get("final_interval") is True]
     tail_status = (
@@ -252,7 +278,6 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         "reported_interval_seconds": total("interval_seconds"),
         "shutdown_tail": tail_status,
         "transfers": transfers, "host_work": host_work, "occupancy": occupancy,
-        "host_context_peak_occupied_bytes": max(peak) if peak is not None else None,
         "scheduling": {field: total("scheduling", field) for field in
                        ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
         "startup_memory": startup.get("memory"),

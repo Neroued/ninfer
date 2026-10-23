@@ -2,13 +2,16 @@
 
 namespace ninfer::ops::detail::qsa {
 
-void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchLayerView& cache,
-                       const QsaBatchView& batch, const QsaBlockSelection& selected,
-                       SparseGqaPlan plan, const SparseGqaWorkspace& scratch, Tensor& out,
+void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
+                       const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
+                       const QsaBlockSelection& selected, SparseGqaPlan plan,
+                       const SparseGqaWorkspace& scratch, Tensor& out,
                        CudaExecutionView execution) {
     const auto i32  = [](const Tensor& t) { return static_cast<const int*>(t.data); };
-    const auto page = [](const Tensor& t) {
-        return SparseGqaPage{static_cast<const std::uint8_t*>(t.data), t.nb[1], t.nb[2], t.nb[3]};
+    const auto page = [](const ConstPagedPlaneView& t) {
+        return SparseGqaPage{static_cast<const std::uint8_t*>(t.data()),
+                             std::int64_t(t.row_stride_bytes()),
+                             std::int64_t(t.head_stride_bytes())};
     };
     SparseGqaArguments a{static_cast<const __nv_bfloat16*>(query.data),
                          static_cast<const __nv_bfloat16*>(gate.data),
@@ -20,10 +23,10 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBat
                          i32(batch.positions),
                          i32(batch.valid_columns),
                          i32(batch.table_rows),
-                         i32(cache.block_tables),
+                         static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
                          i32(selected.block_ids),
                          i32(selected.block_counts),
-                         cache.block_tables.nb[1] / 4,
+                         cache.k_pages.records.page_offsets.nb[1] / 8,
                          static_cast<float*>(scratch.numerator.data),
                          static_cast<float*>(scratch.maximum.data),
                          static_cast<float*>(scratch.sum.data),

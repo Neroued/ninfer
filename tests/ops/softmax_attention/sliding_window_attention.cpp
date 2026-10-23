@@ -56,7 +56,7 @@ struct Cache {
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
     GuardedDeviceBuffer device_k, device_v;
-    std::optional<SlottedStateFixture> key_state, value_state;
+    std::optional<RecordStateFixture> key_state, value_state;
 
     std::size_t index(int lane, int head, int position, int d) const {
         return (((static_cast<std::size_t>(lane) * Hkv + head) * padded +
@@ -88,16 +88,15 @@ struct Cache {
         device_v.copy_from_host(v_bits.data(), v_bits.size() * 2);
     }
 
-    CyclicKVCacheLayerView view() {
+    CyclicKVCacheLayerView view(const Tensor& offsets) {
         key_state.emplace(Tensor(device_k.span(), DType::BF16, {D, padded, Hkv, Lanes}), 3);
         value_state.emplace(Tensor(device_v.span(), DType::FP16, {D, padded, Hkv, Lanes}), 3);
-        return {.k               = key_state->tensor,
-                .v               = value_state->tensor,
+        return {.k               = key_state->view(offsets),
+                .v               = value_state->view(offsets),
                 .capacity        = static_cast<std::uint32_t>(window),
                 .padded_capacity = static_cast<std::uint32_t>(padded),
                 .num_kv_heads    = Hkv,
-                .head_dim        = D,
-                .slot_count      = Lanes};
+                .head_dim        = D};
     }
 
     int verify() const {
@@ -223,17 +222,17 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     GuardedDeviceBuffer dq(q_count * 2), dk(kv_count * 2), dv(kv_count * 2),
-        dp(positions.size() * 4), dvalid(batch * 4), dlane(batch * 4), output(q_count * 2);
+        dp(positions.size() * 4), dvalid(batch * 4), dlane(batch * 8), output(q_count * 2);
     Tensor tq(dq.span(), DType::BF16, {D, Hq, width, batch}),
         tk(dk.span(), DType::BF16, {D, Hkv, width, batch}),
         tv(dv.span(), DType::BF16, {D, Hkv, width, batch});
     Tensor tp(dp.span(), DType::I32, {width, batch}), tvalid(dvalid.span(), DType::I32, {batch}),
-        tlane(dlane.span(), DType::I32, {batch}),
+        tlane(dlane.span(), DType::I64, {batch}),
         to(output.span(), DType::BF16, {D, Hq, width, batch});
-    auto context = cache.view();
+    auto context = cache.view(tlane);
     DeviceContext device;
     const auto launch = [&] {
-        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window, Scale,
+        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, Geometry, cache.window, Scale,
                                       context, envelope, workspace, to, device.execution_view());
     };
     DecodeGraphDefinition definition;
@@ -270,7 +269,10 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
         dp.copy_from_host(positions.data(), positions.size() * 4);
         dvalid.copy_from_host(valid.data(), batch * 4);
-        dlane.copy_from_host(lanes.data(), batch * 4);
+        auto offsets = cache.key_state->record_offsets(lanes);
+        for (int b = 0; b < batch; ++b)
+            if (valid[b] == 0) offsets[b] = -1;
+        dlane.copy_from_host(offsets.data(), batch * 8);
         output.fill(0xff);
         scratch.fill(0xa7);
         cuda_synchronize();
@@ -318,7 +320,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         failures += verify_exact((label + " valid unchanged").c_str(),
                                  from_device<int>(dvalid.data(), batch), valid);
         failures += verify_exact((label + " lanes unchanged").c_str(),
-                                 from_device<int>(dlane.data(), batch), lanes);
+                                 from_device<std::int64_t>(dlane.data(), batch), offsets);
     }
     failures += dq.verify_guards("Q guards") + dk.verify_guards("query K guards") +
                 dv.verify_guards("query V guards") + dp.verify_guards("positions guards") +

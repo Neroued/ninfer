@@ -13,8 +13,9 @@ inline constexpr int kIndexerKeyTile          = 64;
 
 struct IndexerArguments {
     const __nv_bfloat16 *query, *keys;
-    const std::int32_t *positions, *valid, *table_rows, *tables;
-    std::int64_t key_row_stride, key_page_stride, table_stride;
+    const std::int32_t *positions, *valid, *table_rows;
+    const std::int64_t* tables;
+    std::int64_t key_row_stride, table_stride;
     float* scores;
     std::uint64_t* candidates;
     std::int32_t *ids, *counts;
@@ -30,8 +31,10 @@ struct IndexerArguments {
     }
 
     __device__ const __nv_bfloat16* key(int b, int g) const {
-        const int page = tables[g / 16 + std::int64_t(table_rows[b]) * table_stride];
-        return keys + (g % 16) * key_row_stride + std::int64_t(page) * key_page_stride;
+        const auto offset = tables[g / 16 + std::int64_t(table_rows[b]) * table_stride];
+        return reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const std::uint8_t*>(keys) +
+                                                      offset) +
+               (g % 16) * key_row_stride;
     }
 };
 

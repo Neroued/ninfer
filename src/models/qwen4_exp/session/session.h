@@ -19,14 +19,20 @@ class SessionImpl;
 struct RequestPlan;
 struct Suspended;
 struct Demotion;
-struct DemotionBatch;
-struct Release;
-struct Reclaim;
 } // namespace detail
 
-using ContextResources    = runtime::ContextResources<2>;
-using ResourceReservation = runtime::ResourceReservation<ContextResources>;
-using CheckpointHandle    = context::CheckpointHandle;
+using ContextDemand     = context::ContextDemand;
+using ContextAssessment = context::ContextAssessment;
+using ContextReleaseSet = context::ContextReleaseSet;
+
+struct ResourceReservation {
+    bool reserved = false;
+    ContextAssessment assessment;
+
+    explicit operator bool() const noexcept { return reserved; }
+};
+
+using CheckpointHandle = context::CheckpointHandle;
 
 struct PrefixShortlistKey {
     std::array<std::uint64_t, 2> digests{};
@@ -58,7 +64,6 @@ struct CheckpointMetadata {
 
 struct CheckpointSummary : CheckpointMetadata {
     PrefixShortlistKey key;
-    ContextResources evictable_resources;
 };
 
 struct SourceCandidate {
@@ -72,7 +77,7 @@ struct SourceCandidate {
 
 struct BindingReservation {
     bool reserved = false, source_valid = true, capacity_possible = true;
-    ContextResources shortage;
+    ContextAssessment assessment;
     std::vector<CheckpointHandle> retired_points;
     std::optional<CheckpointHandle> consumed_source;
 
@@ -82,33 +87,19 @@ struct BindingReservation {
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
     std::size_t host_bytes = 0;
-    ContextResources released;
+    ContextReleaseSet released;
     std::shared_ptr<const detail::Demotion> impl;
 };
 
 struct ContextRelease {
     std::vector<CheckpointHandle> sources;
-    ContextResources released;
-    std::shared_ptr<const detail::Release> impl;
-};
-
-class ContextDemotionBatch {
-public:
-    [[nodiscard]] bool append(const ContextDemotion&);
-    [[nodiscard]] bool covers(const ContextRelease&) const;
-    [[nodiscard]] std::optional<ContextDemotion> finish() const;
-private:
-    std::shared_ptr<detail::DemotionBatch> plan_;
-
-    explicit ContextDemotionBatch(std::shared_ptr<detail::DemotionBatch> p) : plan_(std::move(p)) {}
-    friend struct ContextReclaimPlan;
+    ContextReleaseSet released;
 };
 
 struct ContextReclaimPlan {
     std::vector<ContextDemotion> demotions;
     std::vector<ContextRelease> releases;
-    [[nodiscard]] ContextDemotionBatch begin_kv_batch(ContextResources) const;
-    std::shared_ptr<const detail::Reclaim> impl;
+    std::shared_ptr<const context::ReleaseInventory<ContextReleaseSet>> inventory;
 };
 
 class ResumeState {
@@ -209,11 +200,12 @@ struct ReplayProgress {
 struct CapturePreparation {
     std::uint32_t frontier = 0;
     bool reserved          = false;
-    ContextResources shortage;
+    ContextAssessment assessment;
     context::HostWriteRequirements host;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    std::vector<CheckpointHandle> retired_points;
 };
-enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
+enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause, Maintenance };
 
 struct ContextProgress {
     ContextOperationKind kind = ContextOperationKind::Bind;
@@ -228,12 +220,7 @@ struct ContextProgress {
     SpeculativeStats request_speculative;
 };
 
-struct PhysicalUsageSnapshot {
-    ContextResources occupied, capacity;
-    std::size_t host_reserved_bytes = 0, host_peak_occupied_bytes = 0;
-    std::uint32_t host_state_slots = 0;
-    std::size_t host_kv_bytes      = 0;
-};
+using PhysicalUsageSnapshot = context::ContextUsage;
 
 struct ControlComplete {};
 
@@ -269,7 +256,19 @@ private:
 
 class Session {
 public:
-    using ContextResources = qwen4_exp::ContextResources;
+    using ContextDemand     = qwen4_exp::ContextDemand;
+    using ContextAssessment = qwen4_exp::ContextAssessment;
+    using ContextReleaseSet = qwen4_exp::ContextReleaseSet;
+
+    [[nodiscard]] ContextAssessment assess(const ContextDemand&,
+                                           const ContextReleaseSet& = {}) const;
+    [[nodiscard]] bool releases_metadata(const ContextReleaseSet& released,
+                                         const ContextAssessment& assessment) const;
+    [[nodiscard]] std::uint64_t released_bytes(const ContextReleaseSet&,
+                                               const ContextAssessment&) const;
+    [[nodiscard]] std::uint64_t useful_release_bytes(const ContextReleaseSet&,
+                                                     const ContextAssessment&) const;
+    [[nodiscard]] runtime::ContextStart start_maintenance(const ContextAssessment&);
 
     Session(PreparedSession&&, runtime::Executor<ExecutionTypes>&);
     ~Session();
@@ -284,7 +283,6 @@ public:
                    std::span<const CheckpointHandle> carried = {},
                    std::span<const CheckpointHandle> retired = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t) const;
-    [[nodiscard]] ContextResources checkpoint_footprint(std::span<const CheckpointHandle>) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
@@ -298,7 +296,6 @@ public:
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
-    [[nodiscard]] ContextResources snapshot_resources(const ResumeState&) const;
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle>) const;
     using HostRequirement = context::HostWriteRequirements;
     [[nodiscard]] std::optional<HostRequirement> pause_host_requirements(SequenceHandle) const;
@@ -306,14 +303,12 @@ public:
                                      std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] HostRequirement demotion_host_requirements(const ContextDemotion&) const;
     [[nodiscard]] std::size_t host_write_bytes(const HostRequirement&) const;
-    [[nodiscard]] bool can_place_host(const HostRequirement&) const;
-    [[nodiscard]] bool can_place_host(const HostRequirement&,
-                                      const context::ReleasePlan<ContextRelease, ContextResources>&,
-                                      std::span<const std::uint32_t> freed) const;
+    [[nodiscard]] ContextDemand host_demand(const HostRequirement&) const;
+    [[nodiscard]] bool can_place_host(const HostRequirement&, const ContextReleaseSet& = {}) const;
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,
                                                      std::optional<SequenceHandle> = {});
     [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>);
-    [[nodiscard]] bool reclaim_capture_reservation(ContextResources);
+    [[nodiscard]] bool reclaim_capture_reservation(const ContextAssessment&);
     void release_units(std::span<const SequenceHandle>) noexcept;
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
                                                    const SourceCandidate&, ResumeState* = nullptr,
@@ -323,15 +318,16 @@ public:
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] bool capture_is_shared(SequenceHandle) const;
     [[nodiscard]] std::vector<std::uint32_t> capture_frontiers(SequenceHandle) const;
-    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
+    [[nodiscard]] std::optional<CapturePreparation>
+    prepare_capture(SequenceHandle, std::span<const CheckpointHandle> host_victims = {});
     void skip_capture(SequenceHandle,
                       runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
-                                                  ContextResources) const;
-    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
-        plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
-                      ContextResources) const;
+                                                  const ContextDemand&) const;
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextReleaseSet>
+    plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                  const ContextDemand&) const;
     [[nodiscard]] runtime::ContextStart
     start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] bool start_pause(SequenceHandle, bool save);

@@ -10,10 +10,10 @@ namespace ninfer::ops::detail {
 template <class G, class S, class Input>
 __device__ __forceinline__ void
 bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __nv_bfloat16* keys,
-                          const __half* values, Input input, int page, int head, int begin, int end,
-                          int first_position, int tid) {
+                          const __half* values, Input input, std::int64_t page_offset, int head,
+                          int begin, int end, int first_position, int tid) {
     constexpr int D       = G::kHeadDim;
-    const auto cache_base = bf16_kv_cache_index<G>(page, head, 0, begin & kv::kPageMask);
+    const auto cache_base = bf16_kv_cache_index<G>(page_offset, head, 0, begin & kv::kPageMask);
     // Small query tiles need enough outstanding loads to hide memory latency.
 #pragma unroll 1
     for (int i = tid; i < S::kKeyRows * (D / 8); i += S::kThreads) {
@@ -48,9 +48,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     void bf16_kv_grouped_mma_kernel(const __nv_bfloat16* q, Input input, const int* positions,
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
                                     typename Bf16KvCacheView<Input::writes_cache>::Value* cache_v,
-                                    const int* tables, const int* validity, const int* table_rows,
-                                    int table_stride, int runtime_width, float scale,
-                                    Bf16KvPartition partition, CausalPartialView partial) {
+                                    const std::int64_t* tables, const int* validity,
+                                    const int* table_rows, int table_stride, int runtime_width,
+                                    float scale, Bf16KvPartition partition,
+                                    CausalPartialView partial) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -102,10 +103,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const int first = positions[0], window = positions[live - 1] + 1;
     const auto work = partition.live(window);
     if (split >= work.splits) return;
-    const int start     = split * work.keys_per_split;
-    const int stop      = min(window, start + work.keys_per_split);
-    const int table_row = table_rows ? table_rows[batch] : 0;
-    const int* table    = tables + static_cast<std::int64_t>(table_row) * table_stride;
+    const int start           = split * work.keys_per_split;
+    const int stop            = min(window, start + work.keys_per_split);
+    const int table_row       = table_rows ? table_rows[batch] : 0;
+    const std::int64_t* table = tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (Input::writes_cache) {
         if (tile == 0) {
             for (int i = tid; i < live * (D / 8); i += S::kThreads) {
@@ -164,12 +165,12 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             const int page_count =
                 min(Storage::kPageWindow, common::div_up(end, kPagedKVPageSize) - page_window);
             for (int i = tid; i < page_count; i += S::kThreads)
-                storage->pages[i] = table[page_window + i];
+                storage->record_offsets[i] = table[page_window + i];
             __syncthreads();
         }
         bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
-                                        storage->pages[logical_page - page_window], head, k0, end,
-                                        first, tid);
+                                        storage->record_offsets[logical_page - page_window], head,
+                                        k0, end, first, tid);
         common::cp_commit();
         common::cp_wait<0>();
         __syncthreads();

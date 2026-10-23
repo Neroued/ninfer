@@ -37,7 +37,7 @@ void RankProgramImpl::commit_draft_history(ComputeOperation& operation) {
     execution::draft_append_context({parameters, resources.work, cuda, state.local,
                                      state.full ? &*state.full : nullptr, proposal_head},
                                     features, positions, counts,
-                                    frame.commit_destination_slots.slice(0, 0, batch),
+                                    frame.commit_destination_offsets.slice(0, 0, batch),
                                     frame.backend_table_rows.slice(0, 0, batch), {0, maximum});
 }
 

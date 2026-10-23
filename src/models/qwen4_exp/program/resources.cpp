@@ -16,6 +16,7 @@ ExecutionPlan checked_plan(const execution::Parameters& p, ExecutionPlan plan) {
 Resources::Resources(const execution::Parameters& p, ExecutionPlan input, DeviceContext& device,
                      const StartupObserver& observer)
     : plan(checked_plan(p, std::move(input))), device_(device),
+      context_(device.device(), plan.capacity.device_bytes),
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
       egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes),
@@ -30,22 +31,22 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         phase.complete(plan.host_context_bytes, plan.host_context_bytes);
     }
     const auto backing = persistent_.span();
-    states             = std::make_unique<StateViews>(backing, plan.persistent.state);
-    main               = std::make_unique<QsaCache>(backing, plan.persistent.main);
-    if (plan.persistent.mtp) mtp = std::make_unique<QsaCache>(backing, *plan.persistent.mtp);
-    std::vector<context::ContextPoolStorage> pools;
-    for (std::uint32_t i = 0; i < pool_count(); ++i)
-        pools.push_back({i, &pool(i).pages(), &pool(i).tables()});
-    context = std::make_unique<context::ContextStorage>(states->storage(), pools, 0,
-                                                        host_context_.span());
-    const auto mapping_elements = plan.pinned_context_bytes() / 2 / sizeof(std::int32_t);
+    states             = std::make_unique<StateViews>(context_.span(), plan.persistent.state);
+    main               = std::make_unique<QsaCache>(context_.span(), backing, plan.persistent.main);
+    if (plan.persistent.mtp)
+        mtp = std::make_unique<QsaCache>(context_.span(), backing, *plan.persistent.mtp);
+    std::vector<context::ContextTableStorage> pools;
+    for (std::uint32_t i = 0; i < pool_count(); ++i) pools.push_back({i, &pool(i).tables()});
+    context = std::make_unique<context::ContextStorage>(context_.span(), host_context_.span(),
+                                                        pools, p.profile->local.rank);
+    const auto mapping_elements = plan.pinned_context_bytes() / 2 / sizeof(std::int64_t);
     compute_actions             = std::make_unique<context::ContextMigration>(
         device, *context, device.execution_view(), mapping_elements);
     context_actions =
         std::make_unique<context::ContextMigration>(device, *context, mapping_elements);
     if (plan.persistent.buffers.gdn_records) {
         gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
-        gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view());
+        gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view({}));
     }
     if (plan.moe) {
         std::vector<const moe::Parameters*> layers;
@@ -63,7 +64,6 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
             ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
             throw std::logic_error("PLE allocated capacity differs from the execution plan");
     }
-    states->storage().clear_all(device.execution_view());
     if (plan.persistent.buffers.mtp) {
         const auto& region = plan.persistent.buffers.mtp->row_indices;
         auto* rows         = static_cast<std::int32_t*>(mtp_ingress_.data());
@@ -71,6 +71,18 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         copy_bytes_async(region.region.bind(backing),
                          mtp_ingress_.span().subspan(0, region.region.bytes),
                          device.execution_view());
+        const auto& tail = *plan.persistent.buffers.mtp;
+        const auto& qsa  = plan.profile->config.text.qsa;
+        std::vector<std::int64_t> offsets(plan.shape.max_concurrency);
+        const auto upload_offsets = [&](const TensorRegion& target, std::size_t stride) {
+            for (std::size_t row = 0; row < offsets.size(); ++row) offsets[row] = row * stride;
+            copy_bytes(target.region.bind(backing),
+                       {offsets.data(), offsets.size() * sizeof(offsets.front()), Device::cpu()},
+                       device.execution_view());
+        };
+        upload_offsets(tail.tail_key_offsets,
+                       qsa.index_key_width() * (qsa.compression - 1) * sizeof(std::uint16_t));
+        upload_offsets(tail.tail_coordinate_offsets, 3 * sizeof(std::int32_t));
     }
     if (const auto& counts = plan.persistent.buffers.token_counts)
         CUDA_CHECK(
@@ -148,8 +160,8 @@ execution::BatchView bind_batch(Resources& resources, const Layout& layout,
             resources.packed(layout.positions, {tokens, batch}),
             resources.packed(layout.rope_positions, {tokens, 3, batch}),
             row(layout.valid_columns),
-            row(layout.source_slots),
-            row(layout.destination_slots),
+            row(layout.source_offsets),
+            row(layout.destination_offsets),
             row(tables),
             row(layout.base_positions),
             row(layout.record_offsets),
@@ -172,8 +184,17 @@ ops::QsaTailStateView Resources::mtp_working_tail(std::uint32_t slot, std::int32
     const auto& frame = *plan.persistent.buffers.mtp;
     const auto& qsa   = plan.profile->config.text.qsa;
     const auto width = dimension(qsa.index_key_width()), history = dimension(qsa.compression - 1);
-    return {packed(frame.tail_keys, {width, history, batch, 3}).slice(3, slot, 1),
-            packed(frame.tail_coordinates, {3, batch, 3}).slice(2, slot, 1),
-            tensor(frame.row_indices).slice(0, 0, batch)};
+    const auto keys        = packed(frame.tail_keys, {width, history, batch, 3}).slice(3, slot, 1);
+    const auto coordinates = packed(frame.tail_coordinates, {3, batch, 3}).slice(2, slot, 1);
+    const auto field       = [&](const Tensor& values, const TensorRegion& offsets,
+                           std::array<std::int32_t, 4> shape, std::size_t bytes) {
+        return StateFieldView{
+                  {{values.data, values.bytes(), values.device}, tensor(offsets).slice(0, 0, batch)},
+                  {{{0, bytes, dtype_size(values.dtype)}, values.dtype, shape}, 1, bytes}};
+    };
+    return {
+        field(keys, frame.tail_key_offsets, {width, history, 1, 1},
+              std::size_t(width) * history * sizeof(std::uint16_t)),
+        field(coordinates, frame.tail_coordinate_offsets, {3, 1, 1, 1}, 3 * sizeof(std::int32_t))};
 }
 } // namespace ninfer::models::qwen4_exp

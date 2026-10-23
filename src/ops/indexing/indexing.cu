@@ -11,13 +11,20 @@
 
 namespace ninfer::ops {
 namespace {
-template <class Unit>
-__global__ void scatter_kernel(const Unit* source, const std::int32_t* indices, Unit* destination,
+template <class Index, class Unit>
+__device__ std::int64_t destination_index(Index index, std::int64_t stride) {
+    if constexpr (std::is_same_v<Index, std::int64_t>) return index / sizeof(Unit);
+    return static_cast<std::int64_t>(index) * stride;
+}
+
+template <class Unit, class Index>
+__global__ void scatter_kernel(const Unit* source, const Index* indices, Unit* destination,
                                std::int32_t units, std::int64_t source_stride,
                                std::int64_t destination_stride) {
-    const auto column           = static_cast<std::int32_t>(blockIdx.x);
-    const auto source_base      = column * source_stride;
-    const auto destination_base = indices[column] * destination_stride;
+    const auto column      = static_cast<std::int32_t>(blockIdx.x);
+    const auto source_base = column * source_stride;
+    const auto destination_base =
+        destination_index<Index, Unit>(indices[column], destination_stride);
     for (int unit = threadIdx.x; unit < units; unit += blockDim.x)
         destination[destination_base + unit] = source[source_base + unit];
 }
@@ -71,15 +78,16 @@ void launch_scatter(const Tensor& source, const Tensor& indices, Tensor& destina
 }
 
 #if NINFER_TARGET_SPARK
-template <int Blocks, int Threads>
+template <int Blocks, int Threads, class Index>
 __launch_bounds__(Threads) __global__
-    void scatter_d2560_kernel(const uint4* source, const std::int32_t* indices, uint4* destination,
+    void scatter_d2560_kernel(const uint4* source, const Index* indices, uint4* destination,
                               std::int64_t source_stride, std::int64_t destination_stride) {
     constexpr int Vectors = 2560 / 8, Tile = Vectors / Blocks;
     static_assert(Vectors % Blocks == 0);
     const auto column = blockIdx.x / Blocks, split = blockIdx.x % Blocks;
-    const auto source_base      = std::int64_t(column) * source_stride;
-    const auto destination_base = std::int64_t(indices[column]) * destination_stride;
+    const auto source_base = std::int64_t(column) * source_stride;
+    const auto destination_base =
+        destination_index<Index, uint4>(indices[column], destination_stride);
     for (int i = threadIdx.x; i < Tile; i += Threads) {
         const auto v                      = split * Tile + i;
         destination[destination_base + v] = source[source_base + v];
@@ -160,6 +168,42 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, CudaExecutio
         common::operand::overlaps(destination, common::operand::range(indices, "scatter")))
         throw std::invalid_argument("scatter: destination overlaps an input");
     select_scatter(src, dst)(src, indices, dst, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void scatter(const Tensor& source, const StateFieldView& destination, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "scatter";
+    const int d = source.ne[0], batch = source.ne[1];
+    if (d <= 0 || batch <= 0 || destination.field.layers != 1)
+        throw std::invalid_argument("scatter: invalid record geometry");
+    operand::slotted_tensor(source, DType::BF16, {d, batch}, 1, 2, op, "source",
+                            execution.device());
+    operand::state_field(destination, DType::BF16, {d}, 2, op, "destination", execution.device());
+    operand::tensor(destination.records.byte_offsets, DType::I64, {batch}, 8, op, "offsets",
+                    execution.device());
+    const auto* offsets = static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
+    auto* target        = operand::state_field_base<std::byte>(destination);
+    const auto launch   = [&]<class Unit>() {
+        scatter_kernel<<<batch, sizeof(Unit) == 16 ? 128 : 256, 0, execution.stream()>>>(
+            static_cast<const Unit*>(source.data), offsets, reinterpret_cast<Unit*>(target),
+            d * 2 / sizeof(Unit), source.nb[1] / sizeof(Unit), 0);
+    };
+    if (d % 8 == 0 && operand::aligned(source.data, 16) && operand::aligned(target, 16) &&
+        source.nb[1] % 16 == 0) {
+#if NINFER_TARGET_SPARK
+        if (d == 2560)
+            scatter_d2560_kernel<5, 64><<<batch * 5, 64, 0, execution.stream()>>>(
+                static_cast<const uint4*>(source.data), offsets, reinterpret_cast<uint4*>(target),
+                source.nb[1] / 16, 0);
+        else
+#endif
+            launch.template operator()<uint4>();
+    } else if (d % 2 == 0 && operand::aligned(source.data, 4) && operand::aligned(target, 4) &&
+               source.nb[1] % 4 == 0)
+        launch.template operator()<__nv_bfloat162>();
+    else
+        launch.template operator()<__nv_bfloat16>();
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -89,20 +89,24 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
                                     problem.qk_heads * tokens * problem.batch;
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    const std::int32_t slots = 2 * problem.batch;
-    DeviceBuffer states      = bench::make_f32(state_elements * slots, 211U, -.02F, .02F);
+    const std::int32_t records = 2 * problem.batch;
+    DeviceBuffer states        = bench::make_f32(state_elements * records, 211U, -.02F, .02F);
     SavedBuffer initial_states(states);
     const auto restore = [&](CudaExecutionView cuda) { initial_states.restore(cuda); };
-    std::vector<std::int32_t> state_slots_host(static_cast<std::size_t>(problem.batch));
-    std::vector<std::int32_t> destination_slots_host(static_cast<std::size_t>(problem.batch));
+    std::vector<std::int64_t> source_offsets_host(static_cast<std::size_t>(problem.batch));
+    std::vector<std::int64_t> destination_offsets_host(static_cast<std::size_t>(problem.batch));
     for (std::int32_t row = 0; row < problem.batch; ++row) {
-        state_slots_host[static_cast<std::size_t>(row)]       = 2 * row;
-        destination_slots_host[static_cast<std::size_t>(row)] = 2 * row + 1;
+        source_offsets_host[static_cast<std::size_t>(row)] =
+            2 * row * state_elements * sizeof(float);
+        destination_offsets_host[static_cast<std::size_t>(row)] =
+            (2 * row + 1) * state_elements * sizeof(float);
     }
-    DeviceBuffer state_slots(ninfer::bench::device_context().device(),
-                             state_slots_host.size() * sizeof(std::int32_t));
-    state_slots.copy_from_host(state_slots_host.data(), state_slots.size());
-    DeviceBuffer destination_slots = measurement::make_i32(destination_slots_host);
+    DeviceBuffer source_offsets(ninfer::bench::device_context().device(),
+                                source_offsets_host.size() * sizeof(std::int64_t));
+    source_offsets.copy_from_host(source_offsets_host.data(), source_offsets.size());
+    DeviceBuffer destination_offsets(ninfer::bench::device_context().device(),
+                                     destination_offsets_host.size() * sizeof(std::int64_t));
+    destination_offsets.copy_from_host(destination_offsets_host.data(), destination_offsets.size());
     DeviceBuffer q_normalized;
     DeviceBuffer k_normalized;
     if (options.qk_norm == "composed") {
@@ -116,13 +120,16 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
     Tensor g    = operands.gate();
     Tensor beta = operands.beta_tensor();
     Tensor out  = operands.output();
-    Tensor ssm_states(states.span(), DType::FP32,
-                      {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
-                       problem.value_heads, slots});
-    Tensor selected_slots(state_slots.span(), DType::I32, {problem.batch});
+    Tensor source_table(source_offsets.span(), DType::I64, {problem.batch});
     Tensor destinations = options.state_form == "alias"
-                              ? selected_slots
-                              : Tensor(destination_slots.span(), DType::I32, {problem.batch});
+                              ? source_table
+                              : Tensor(destination_offsets.span(), DType::I64, {problem.batch});
+    TensorRegion state_region{
+        {0, state_elements * sizeof(float), 16}, DType::FP32, {128, 128, problem.value_heads, 1}};
+    StateFieldView source_state{{states.span(), source_table},
+                                StateFieldLayout{state_region, 1, 0}};
+    StateFieldView destination_state{{states.span(), destinations},
+                                     StateFieldLayout{state_region, 1, 0}};
     Tensor q_norm;
     Tensor k_norm;
     if (options.qk_norm == "composed") {
@@ -143,8 +150,7 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                                  !composed, ssm_states, selected_slots, destinations, out,
-                                                  cuda);
+                                                  !composed, source_state, destination_state, out, cuda);
     };
     BenchRow row;
     row.normalization  = composed ? "composed" : "fused";
@@ -153,7 +159,7 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
     row.traffic        = gdn::running_traffic(problem);
     // Alias shares the read-only selector tensor; distinct form uses two arrays.
     row.traffic.logical.read +=
-        sizeof(std::int32_t) * problem.batch * (options.state_form == "alias" ? 1 : 2);
+        sizeof(std::int64_t) * problem.batch * (options.state_form == "alias" ? 1 : 2);
     if (composed) {
         row.workspace_bytes = row.workspace_peak = 2 * problem.qk_bytes();
         row.traffic.workspace_requests           = {row.workspace_bytes, row.workspace_bytes};

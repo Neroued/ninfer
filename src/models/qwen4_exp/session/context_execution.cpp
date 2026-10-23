@@ -86,23 +86,111 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
     return result;
 }
 
+void SessionImpl::prepare_binding_resources(context::ContextReservation& reserved) {
+    auto& bind             = std::get<BindOperation>(operation->action);
+    auto& migration        = operation->migration;
+    auto& states           = directory.states();
+    const auto* checkpoint = bind.source ? &checkpoints.at(*bind.source) : nullptr;
+    for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
+        const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
+        migration.add_binding(pool,
+                              directory.pool(pool).histories().prepare_binding(
+                                  prefix, prefix ? prefix->frontier() : 0,
+                                  pool ? mtp_history_frontier(bind.peak) : bind.peak, bind.lane,
+                                  reserved.take_history(pool), bind.consume_source));
+    }
+    if (bind.state_action == StateBindingAction::Move) return;
+    const bool materialize = bind.state_action == StateBindingAction::Root ||
+                             bind.state_action == StateBindingAction::Fork;
+    auto state_records     = reserved.take_state();
+    const auto destination = materialize ? states.reserve_destination(std::move(state_records))
+                                         : states.reserve_logical_destination(state_records);
+    if (!destination) throw std::logic_error("binding lost its State metadata reservation");
+    migration.own_state(*destination);
+    if (bind.state_action == StateBindingAction::Root) {
+        migration.clear_state();
+    } else if (bind.state_action == StateBindingAction::Restore) {
+        auto transfer = states.reserve_host_to_device(bind.source_image, *destination,
+                                                      std::move(state_records));
+        if (!transfer) throw std::logic_error("binding lost its Host State source");
+        migration.add_state_copy(std::move(*transfer), true);
+    }
+}
+
+void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) {
+    auto& pause    = std::get<PauseOperation>(operation->action);
+    auto& sequence = *sequences[pause.lane];
+    sequence.capture.reset();
+    sequence.capture_pending = false;
+    sequence.recovery_peak   = 0;
+    settle(sequence);
+    if (sequence.phase == Phase::Replay) sequence.phase = sequence.resume_phase;
+    if (pause.save_snapshot)
+        pause.paused->snapshot =
+            detach(sequence, runtime::CheckpointRole::Continuation, std::move(pause.checkpoint));
+    if (!pause.paused->snapshot) clear(sequence);
+    pause.paused->sequence = std::move(sequences[pause.lane]);
+    if (pause.paused->snapshot) {
+        const auto plan = demotion({&*pause.paused->snapshot, 1});
+        if (plan && !prepare_demotion(operation->migration, *plan, targets))
+            throw std::logic_error("prepared pause lost its reserved Host targets");
+    }
+}
+
+void SessionImpl::resume_context(context::ContextReservation targets) {
+    if (!operation || !operation->preparing_resources || !targets.ready())
+        throw std::logic_error("Context maintenance did not prepare its continuation");
+    auto execution = executor->try_reserve(runtime::FrameKind::Context);
+    if (!execution) throw std::logic_error("retired Context frame cannot submit its continuation");
+    auto previous = std::move(operation);
+    operation     = std::make_unique<ContextOperation>(directory, std::move(previous->action),
+                                                       std::move(*execution));
+    operation->previous_transfers = std::move(previous->previous_transfers);
+    if (std::holds_alternative<BindOperation>(operation->action)) {
+        prepare_binding_resources(targets);
+    } else if (std::holds_alternative<PauseOperation>(operation->action)) {
+        prepare_pause_resources(targets);
+    } else if (const auto* demote = std::get_if<DemoteOperation>(&operation->action)) {
+        if (!prepare_demotion(operation->migration, *demote->plan, targets))
+            throw std::logic_error("reserved demotion changed during Context maintenance");
+    } else {
+        throw std::logic_error("Context maintenance has no continuation");
+    }
+    submit_context();
+}
+
 void SessionImpl::submit_context() {
     try {
-        auto& transaction = *operation;
-        ContextWork context;
-        context.releases = std::move(releases);
-        if (auto* binding = std::get_if<BindOperation>(&transaction.action))
-            context.bindings.push_back(context_binding(*binding));
-        else if (const auto* pause = std::get_if<PauseOperation>(&transaction.action)) {
-            const auto residency = member(*pause->paused->sequence).residency;
-            if (std::find(context.releases.begin(), context.releases.end(), residency) ==
-                context.releases.end())
-                context.releases.push_back(residency);
+        auto& transaction      = *operation;
+        const bool first_batch = !transaction.actions_prepared;
+        if (first_batch) {
+            auto& residency = transaction.residency;
+            if (!transaction.preparing_resources) residency.releases = std::move(releases);
+            if (auto* binding = std::get_if<BindOperation>(&transaction.action);
+                binding && !transaction.preparing_resources)
+                residency.bindings.push_back(context_binding(*binding));
+            else if (const auto* pause = std::get_if<PauseOperation>(&transaction.action);
+                     pause && !transaction.preparing_resources) {
+                const auto id = member(*pause->paused->sequence).residency;
+                if (std::find(residency.releases.begin(), residency.releases.end(), id) ==
+                    residency.releases.end())
+                    residency.releases.push_back(id);
+            }
+            transaction.migration.prepare_actions();
+            transaction.actions_prepared = true;
         }
-        transaction.migration.prepare_actions();
-        Work work{transaction.migration.actions(), std::move(context)};
+        Work work;
+        transaction.final_batch = true;
+        for (const auto& rank : plan.context.ranks) {
+            const auto& actions = transaction.migration.actions(rank.rank);
+            auto& cursor        = transaction.cursors[rank.rank];
+            auto batch          = context::take_action_batch(actions, cursor);
+            if (!batch.empty()) work.actions.emplace(rank.rank, std::move(batch));
+            transaction.final_batch &= cursor.complete(actions);
+        }
+        work.operation = transaction.final_batch ? std::move(transaction.residency) : ContextWork{};
         transaction.ticket = executor->submit(std::move(transaction.reservation), std::move(work));
-        transaction.migration.mark_submitted();
+        if (first_batch) transaction.migration.mark_submitted();
     } catch (const std::exception& error) {
         executor->fail(error.what());
         throw;

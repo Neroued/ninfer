@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace ninfer::bench::gdn_replay {
-constexpr int kStateDim = 128, kRecordCapacity = 8, kStateSlots = 11;
+constexpr int kStateDim = 128, kRecordCapacity = 8, kStateRecords = 11;
 
 __global__ void initialize_record_gates(float* gates, std::size_t pairs) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -47,7 +47,8 @@ public:
         : profile_(profile), width_(width),
           record_storage_(ninfer::bench::device_context().device(), record_bytes(profile, width)),
           records_(record_storage_.span(), record_layout_),
-          state_storage_(ninfer::bench::device_context().device(), image_layout_.storage.bytes),
+          state_storage_(ninfer::bench::device_context().device(),
+                         image_layout_.image_bytes * kStateRecords),
           images_(state_storage_.span(), image_layout_), states_(images_, state_layout_) {
         record_storage_.fill(0); // alignment gaps only; represented planes are filled below.
         state_storage_.fill(0);
@@ -61,31 +62,40 @@ public:
         initialize_record_gates<<<(pairs + 255) / 256, 256>>>(
             static_cast<float*>(records_.gate.data), pairs);
         CUDA_CHECK(cudaGetLastError());
-        const auto first = states_.layer_view(0);
-        DeviceBuffer initial_conv(bench::device_context().device(), first.conv.bytes());
-        DeviceBuffer initial_recurrent(bench::device_context().device(), first.recurrent.bytes());
+        const auto conv_bytes      = states_.conv_tensor(0, 0).bytes();
+        const auto recurrent_bytes = states_.recurrent_tensor(0, 0).bytes();
+        DeviceBuffer initial_conv(bench::device_context().device(), conv_bytes * kStateRecords);
+        DeviceBuffer initial_recurrent(bench::device_context().device(),
+                                       recurrent_bytes * kStateRecords);
         for (int layer = 0; layer < profile.layers; ++layer) {
-            const auto view = states_.layer_view(layer);
-            // Preserve the original logical PRNG sequence across slots while changing storage.
             CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(initial_conv.data()),
-                                                   view.conv.numel(), 401U + layer, -.5F, .5F));
+                                                   initial_conv.size() / 2, 401U + layer, -.5F,
+                                                   .5F));
             CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(initial_recurrent.data()),
-                                                   view.recurrent.numel(), 501U + layer, -.02F,
-                                                   .02F));
-            const auto conv_bytes      = view.conv.bytes() / kStateSlots;
-            const auto recurrent_bytes = view.recurrent.bytes() / kStateSlots;
-            CUDA_CHECK(cudaMemcpy2DAsync(view.conv.data, view.conv.nb[2], initial_conv.data(),
-                                         conv_bytes, conv_bytes, kStateSlots,
-                                         cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy2DAsync(view.recurrent.data, view.recurrent.nb[3],
-                                         initial_recurrent.data(), recurrent_bytes, recurrent_bytes,
-                                         kStateSlots, cudaMemcpyDeviceToDevice));
+                                                   initial_recurrent.size() / 4, 501U + layer,
+                                                   -.02F, .02F));
+            for (int record = 0; record < kStateRecords; ++record) {
+                auto conv      = states_.conv_tensor(layer, byte_offset(record));
+                auto recurrent = states_.recurrent_tensor(layer, byte_offset(record));
+                CUDA_CHECK(cudaMemcpyAsync(conv.data,
+                                           static_cast<const std::byte*>(initial_conv.data()) +
+                                               record * conv_bytes,
+                                           conv_bytes, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(recurrent.data,
+                                           static_cast<const std::byte*>(initial_recurrent.data()) +
+                                               record * recurrent_bytes,
+                                           recurrent_bytes, cudaMemcpyDeviceToDevice));
+            }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         initial_ = std::make_unique<bench::SavedBuffer>(state_storage_);
     }
 
     void restore(CudaExecutionView cuda) const { initial_->restore(cuda); }
+
+    [[nodiscard]] std::int64_t byte_offset(int record) const {
+        return static_cast<std::int64_t>(record * image_layout_.image_bytes);
+    }
 
     [[nodiscard]] const ops::GdnReplayFoldPlan& fold_plan() const { return fold_plan_; }
 
@@ -124,10 +134,9 @@ private:
     std::int32_t width_;
     LayoutBuilder record_builder_;
     GdnReplayRecordLayout record_layout_ = make_record_layout(profile_, width_, record_builder_);
-    LayoutBuilder state_backing_builder_;
     StateImageBuilder state_builder_;
     LinearAttentionStateLayout state_layout_ = make_state_layout(profile_, state_builder_);
-    StateImageLayout image_layout_ = state_builder_.finish(state_backing_builder_, kStateSlots);
+    StateImageLayout image_layout_           = state_builder_.finish();
     DeviceBuffer record_storage_;
     GdnReplayRecords records_;
     DeviceBuffer state_storage_;
@@ -138,6 +147,12 @@ private:
 };
 
 using measurement::make_i32;
+
+inline DeviceBuffer make_offsets(const std::vector<std::int64_t>& values) {
+    DeviceBuffer result(bench::device_context().device(), values.size() * sizeof(std::int64_t));
+    result.copy_from_host(values.data(), result.size());
+    return result;
+}
 
 class RecordFixture {
 public:
@@ -150,7 +165,7 @@ public:
           beta_(bench::make_f32(gate_elements(), 213U, .1F, .9F)),
           record_states_(ninfer::bench::device_context().device(),
                          record_state_elements() * sizeof(float)),
-          record_initial_(make_i32(record_initial_slots())), valid_(make_valid()),
+          record_initial_(make_offsets(record_initial_offsets())), valid_(make_valid()),
           record_out_(ninfer::bench::device_context().device(),
                       value_elements() * sizeof(std::uint16_t)),
           key_record_(ninfer::bench::device_context().device(),
@@ -174,18 +189,21 @@ public:
         Tensor v(v_.span(), DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         Tensor g(g_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
         Tensor beta(beta_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
-        Tensor states(record_states_.span(), DType::FP32,
-                      {kStateDim, kStateDim, profile_.value_heads, batch_});
         Tensor valid = valid_tensor();
-        Tensor initial(record_initial_.span(), DType::I32, {batch_});
-        Tensor key_record(key_record_.span(), DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
+        Tensor initial(record_initial_.span(), DType::I64, {batch_});
+        Tensor key_record(key_record_.span(), DType::BF16,
+                          {kStateDim, profile_.qk_heads, width_, batch_});
         Tensor value_record(value_record_.span(), DType::BF16,
                             {kStateDim, profile_.value_heads, width_, batch_});
         Tensor gate_record(gate_record_.span(), DType::FP32,
                            {2, profile_.value_heads, width_, batch_});
         Tensor out(record_out_.span(), DType::BF16,
                    {kStateDim, profile_.value_heads, width_, batch_});
-        ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
+        TensorRegion region{{0, state_record_elements() * sizeof(float), 16},
+                            DType::FP32,
+                            {kStateDim, kStateDim, profile_.value_heads, 1}};
+        StateFieldView state_view{{record_states_.span(), initial}, StateFieldLayout{region, 1, 0}};
+        ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), state_view, valid,
                                            {key_record, value_record, gate_record}, out, cuda);
     }
 
@@ -204,18 +222,20 @@ private:
         return static_cast<std::size_t>(profile_.value_heads) * width_ * batch_;
     }
 
-    [[nodiscard]] std::size_t state_slot_elements() const {
+    [[nodiscard]] std::size_t state_record_elements() const {
         return static_cast<std::size_t>(kStateDim) * kStateDim * profile_.value_heads;
     }
 
     [[nodiscard]] std::size_t record_state_elements() const {
-        return state_slot_elements() * static_cast<std::size_t>(batch_);
+        return state_record_elements() * static_cast<std::size_t>(batch_);
     }
 
-    [[nodiscard]] std::vector<std::int32_t> record_initial_slots() const {
-        std::vector<std::int32_t> slots(static_cast<std::size_t>(batch_));
-        for (std::int32_t row = 0; row < batch_; ++row) { slots[row] = row; }
-        return slots;
+    [[nodiscard]] std::vector<std::int64_t> record_initial_offsets() const {
+        std::vector<std::int64_t> offsets(static_cast<std::size_t>(batch_));
+        for (std::int32_t row = 0; row < batch_; ++row) {
+            offsets[row] = row * state_record_elements() * sizeof(float);
+        }
+        return offsets;
     }
 
     [[nodiscard]] DeviceBuffer make_valid() const {

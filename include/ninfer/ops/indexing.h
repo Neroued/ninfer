@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/record_view.h"
 #include "core/tensor.h"
 #include <cstdint>
 
@@ -17,6 +18,11 @@ namespace ninfer::ops {
  */
 void scatter(const Tensor& source, const Tensor& indices, Tensor& destination,
              CudaExecutionView execution);
+
+// destination.record[b].field[:] = source[:,b]. Source is BF16 [D,B]; the field is
+// BF16 [D] with contiguous features and I64 record offsets [B]. Copies bits exactly.
+// Selected fields are distinct and disjoint from the inputs. Unselected storage is preserved.
+void scatter(const Tensor& source, const StateFieldView& destination, CudaExecutionView execution);
 
 /**
  * destination[:,j,lanes[b]] = source[:,j,b], for j < valid_columns[b].
@@ -51,15 +57,15 @@ void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Te
 void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
                                CudaExecutionView execution);
 
-// For columns[b]>=0, destination[:,slots[b]]=source[:,columns[b],b]; -1 preserves the
-// destination and reads no source or slot. Source is contiguous BF16 or I32 [D,T,B],
-// columns/slots are contiguous I32 [B], B=1..8, and destination has the same dtype [D,S]
-// with contiguous features and an explicit non-overlapping column stride. Live columns
-// and slots are in range and destination slots are distinct. Inputs and destination are
+// For columns[b]>=0, destination.record[b].field[:]=source[:,columns[b],b]; -1 preserves the
+// destination and reads no source or record offset. Source is contiguous BF16 or I32 [D,T,B],
+// columns is contiguous I32 [B], B=1..8, and destination has same-dtype contiguous [D] fields
+// with I64 record offsets [B]. Live columns are in range and destination fields are distinct.
+// Inputs and selected destination fields are
 // disjoint. Copies represented bits exactly, preserves all unselected storage, owns no
 // workspace, and consumes current Device selectors under Graph replay.
-void scatter_batch_columns(const Tensor& source, const Tensor& columns, const Tensor& slots,
-                           Tensor& destination, CudaExecutionView execution);
+void scatter_batch_columns(const Tensor& source, const Tensor& columns,
+                           const StateFieldView& destination, CudaExecutionView execution);
 
 /**
  * ids[i] = id_map[ids[i]]. The nonempty I32 ids vector is contiguous and updated in place.

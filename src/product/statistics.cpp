@@ -12,6 +12,7 @@ Json allocations_json(const MemoryAllocations& m) {
             {"host_weights_bytes", m.host_weights_bytes},
             {"registered_weights_bytes", m.registered_weights_bytes},
             {"persistent_device_bytes", m.persistent_device_bytes},
+            {"context_device_bytes", m.context_device_bytes},
             {"workspace_device_bytes", m.workspace_device_bytes},
             {"io_pinned_bytes", m.io_pinned_bytes},
             {"host_context_bytes", m.host_context_bytes},
@@ -37,7 +38,9 @@ Json budget_json(const RankMemoryBudget& b) {
     return {{"limit_bytes", b.limit_bytes},
             {"runtime_reservation_bytes", b.runtime_reservation_bytes},
             {"minimum_runtime_reservation_bytes", b.minimum_runtime_reservation_bytes},
-            {"bytes_per_page_group", b.bytes_per_page_group},
+            {"context_capacity_bytes", b.context_capacity_bytes},
+            {"minimum_context_capacity_bytes", b.minimum_context_capacity_bytes},
+            {"context_control_budget_bytes", b.context_control_budget_bytes},
             {"available_after_weights_bytes", b.available_after_weights_bytes},
             {"available_after_startup_bytes", b.available_after_startup_bytes},
             {"headroom_bytes", b.headroom_bytes},
@@ -48,6 +51,46 @@ Json budget_json(const RankMemoryBudget& b) {
 } // namespace
 
 double seconds(std::uint64_t ns) noexcept { return static_cast<double>(ns) * 1e-9; }
+
+const char* context_domain_name(ContextMemoryDomain domain) noexcept {
+    return domain == ContextMemoryDomain::Device ? "device" : "host";
+}
+
+Json context_capacity_json(std::span<const ContextPoolCapacity> capacity) {
+    Json result = Json::array();
+    for (const auto& pool : capacity)
+        result.push_back({{"rank", pool.rank},
+                          {"domain", context_domain_name(pool.domain)},
+                          {"capacity_bytes", pool.capacity_bytes},
+                          {"block_bytes", pool.block_bytes}});
+    return result;
+}
+
+Json context_usage_json(const RuntimeStats& stats) {
+    Json pools = Json::array();
+    for (const auto& pool : stats.context_pools)
+        pools.push_back({{"rank", pool.rank},
+                         {"domain", context_domain_name(pool.domain)},
+                         {"capacity_bytes", pool.capacity_bytes},
+                         {"block_bytes", pool.block_bytes},
+                         {"live_bytes", pool.live_bytes},
+                         {"reserved_bytes", pool.reserved_bytes},
+                         {"pending_retirement_bytes", pool.pending_retirement_bytes},
+                         {"relocation_bytes", pool.relocation_bytes},
+                         {"future_reserved_bytes", pool.future_reserved_bytes},
+                         {"padding_bytes", pool.padding_bytes},
+                         {"assigned_free_bytes", pool.assigned_free_bytes},
+                         {"unassigned_free_bytes", pool.unassigned_free_bytes},
+                         {"tail_bytes", pool.tail_bytes},
+                         {"peak_occupied_bytes", pool.peak_occupied_bytes}});
+    return {{"pools", std::move(pools)},
+            {"state_objects", stats.state_objects},
+            {"history_objects", stats.history_objects},
+            {"metadata",
+             {{"budget_bytes", stats.context_metadata.budget_bytes},
+              {"allocated_bytes", stats.context_metadata.allocated_bytes},
+              {"reserved_bytes", stats.context_metadata.reserved_bytes}}}};
+}
 
 double rate(std::uint64_t count, double elapsed) noexcept {
     return std::isfinite(elapsed) && elapsed > 0 ? static_cast<double>(count) / elapsed : 0;
@@ -108,6 +151,7 @@ MemoryAllocations sum_allocations(std::span<const RankSnapshot> ranks) {
         total.host_weights_bytes += a.host_weights_bytes;
         total.registered_weights_bytes += a.registered_weights_bytes;
         total.persistent_device_bytes += a.persistent_device_bytes;
+        total.context_device_bytes += a.context_device_bytes;
         total.workspace_device_bytes += a.workspace_device_bytes;
         total.io_pinned_bytes += a.io_pinned_bytes;
         total.host_context_bytes += a.host_context_bytes;
@@ -130,7 +174,6 @@ Json resource_json(const RankSnapshot& rank) {
              {"sampled_ns", rank.stamp.sampled_ns},
              {"received_ns", rank.received_ns},
              {"allocations", allocations_json(m.allocations)},
-             {"kv_payload_bytes", m.kv_payload_bytes},
              {"workspace",
               {{"allocation_cursor_bytes", m.workspace.allocation_cursor_bytes},
                {"required_peak_bytes", m.workspace.required_peak_bytes},

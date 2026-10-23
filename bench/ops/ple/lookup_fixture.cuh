@@ -60,7 +60,7 @@ struct Table {
 } // namespace lookup
 
 struct LookupFixture {
-    DeviceBuffer ids, valid, tail, slots, output;
+    DeviceBuffer ids, valid, tail, state_offsets, output;
     Tensor input, counts_view, embedding;
     ops::NgramTokenTailView before;
     const lookup::Table& table;
@@ -70,26 +70,26 @@ struct LookupFixture {
     LookupFixture(const Options& options, int tokens, const lookup::Table& weights)
         : ids(make_buffer(std::size_t(tokens) * options.batch * 4)),
           valid(make_buffer(options.batch * 4)), tail(make_buffer(options.batch * 2 * 4)),
-          slots(make_buffer(options.batch * 4)),
+          state_offsets(make_buffer(options.batch * 8)),
           output(make_buffer(std::size_t(tokens) * options.batch * 5120)),
           input(ids.span(), DType::I32, {tokens, options.batch}),
           counts_view(valid.span(), DType::I32, {options.batch}),
           embedding(output.span(), DType::BF16, {2560, tokens, options.batch}),
-          before{Tensor(tail.span(), DType::I32, {2, options.batch}),
-                 Tensor(slots.span(), DType::I32, {options.batch})},
+          before{{{tail.span(), Tensor(state_offsets.span(), DType::I64, {options.batch})},
+                  {{{0, 8, 4}, DType::I32, {2, 1, 1, 1}}, 1, 8}}},
           table(weights), counts(extents(options.valid, tokens, options.batch)) {
-        std::vector<int> host(std::size_t(tokens) * options.batch), history(options.batch * 2),
-            select(options.batch);
+        std::vector<int> host(std::size_t(tokens) * options.batch), history(options.batch * 2);
+        std::vector<std::int64_t> select(options.batch);
         std::unordered_set<std::uint32_t> visited;
         std::array<std::bitset<2048>, lookup::kShardCount> used_lut;
         for (int b = 0; b < options.batch; ++b) {
-            select[b]          = b;
+            select[b]          = b * 8;
             history[2 * b]     = 11 + b;
             history[2 * b + 1] = 19 + b;
             for (int t = 0; t < tokens; ++t)
                 host[b * tokens + t] = fixture::bits(b * tokens + t, 721) % 248000;
             if (!counts[b]) continue;
-            bytes += std::uint64_t(counts[b]) * 4 + 12;
+            bytes += std::uint64_t(counts[b]) * 4 + 16;
             for (int t = 0; t < counts[b]; ++t) {
                 const auto previous =
                     std::uint64_t(t ? host[b * tokens + t - 1] : history[2 * b + 1]);
@@ -128,7 +128,7 @@ struct LookupFixture {
         ids.copy_from_host(host.data(), ids.size());
         tail.copy_from_host(history.data(), tail.size());
         valid.copy_from_host(counts.data(), valid.size());
-        slots.copy_from_host(select.data(), slots.size());
+        state_offsets.copy_from_host(select.data(), state_offsets.size());
     }
 
     void launch(CudaExecutionView execution) {

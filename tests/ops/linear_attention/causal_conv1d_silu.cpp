@@ -575,31 +575,36 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     const std::vector<std::uint16_t> weight_bits   = bf16_bits(input.weight);
     const std::vector<std::uint16_t> state_bits    = bf16_bits(states);
     const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
-    const std::int32_t initial_slot_host           = initial_slot;
     const std::int32_t snapshot_base_slot_host     = snapshot_base_slot;
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer slot(sizeof(std::int32_t));
+    GuardedDeviceBuffer slot(sizeof(std::int64_t));
     GuardedDeviceBuffer snapshot_base(sizeof(std::int32_t));
     GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
     x.copy_from_host(x_bits.data(), x.bytes());
     weight.copy_from_host(weight_bits.data(), weight.bytes());
     state.copy_from_host(state_bits.data(), state.bytes());
-    slot.copy_from_host(&initial_slot_host, sizeof(initial_slot_host));
     snapshot_base.copy_from_host(&snapshot_base_slot_host, sizeof(snapshot_base_slot_host));
     output.fill(kOutputPoison);
 
     Tensor tx(x.span(), DType::BF16, {C, T});
     Tensor tw(weight.span(), DType::BF16, {C, 4});
     Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
-    SlottedStateFixture history(tstate, 2);
-    tstate = history.tensor;
-    Tensor tslot(slot.span(), DType::I32, {1});
+    RecordStateFixture history(tstate, 2);
+    const bool source_aliases_snapshots =
+        initial_slot >= snapshot_base_slot && initial_slot < snapshot_base_slot + T;
+    const std::int64_t initial_offset = source_aliases_snapshots
+                                            ? std::int64_t(initial_slot) * tstate.nb[2]
+                                            : history.byte_offset(initial_slot);
+    slot.copy_from_host(&initial_offset, sizeof(initial_offset));
+    Tensor tslot(slot.span(), DType::I64, {1});
+    const auto source =
+        source_aliases_snapshots ? dense_record_field(tstate, 2, tslot) : history.view(tslot);
     Tensor tsnapshot_base(snapshot_base.span(), DType::I32, {1});
     Tensor tout(output.span(), DType::BF16, {C, T});
-    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, Tensor{}, tslot, tsnapshot_base, tout,
+    ops::causal_conv1d_silu_snapshot(tx, tw, source, tstate, Tensor{}, tsnapshot_base, tout,
                                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -610,14 +615,13 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
-    history.copy_back();
     failures += history.verify_guards("snapshot history");
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
     failures += verify_exact((tag + " initial slot preserved").c_str(),
-                             from_device<std::int32_t>(slot.data(), 1),
-                             std::vector<std::int32_t>{initial_slot});
+                             from_device<std::int64_t>(slot.data(), 1),
+                             std::vector<std::int64_t>{initial_offset});
     failures += verify_exact((tag + " snapshot base slot preserved").c_str(),
                              from_device<std::int32_t>(snapshot_base.data(), 1),
                              std::vector<std::int32_t>{snapshot_base_slot});
@@ -678,7 +682,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer initial(initial_slots.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer initial(initial_slots.size() * sizeof(std::int64_t));
     GuardedDeviceBuffer bases(snapshot_bases.size() * sizeof(std::int32_t));
     std::unique_ptr<GuardedDeviceBuffer> valid;
     if (masked) {
@@ -689,21 +693,30 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     x.copy_from_host(x_bits.data(), x.bytes());
     weight.copy_from_host(weight_bits.data(), weight.bytes());
     state.copy_from_host(state_bits.data(), state.bytes());
-    initial.copy_from_host(initial_slots.data(), initial.bytes());
     bases.copy_from_host(snapshot_bases.data(), bases.bytes());
     output.fill(kOutputPoison);
 
     Tensor tx(x.span(), DType::BF16, {C, width, batch});
     Tensor tw(weight.span(), DType::BF16, {C, 4});
     Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
-    SlottedStateFixture history(tstate, 2);
-    tstate = history.tensor;
+    RecordStateFixture history(tstate, 2);
+    bool source_aliases_snapshots = false;
+    for (int row = 0; row < batch; ++row)
+        source_aliases_snapshots |= initial_slots[row] >= snapshot_bases[row] &&
+                                    initial_slots[row] < snapshot_bases[row] + width;
+    auto initial_offsets = history.record_offsets(initial_slots);
+    if (source_aliases_snapshots)
+        for (int row = 0; row < batch; ++row)
+            initial_offsets[row] = std::int64_t(initial_slots[row]) * tstate.nb[2];
+    initial.copy_from_host(initial_offsets.data(), initial.bytes());
     Tensor tvalid;
     if (masked) { tvalid = Tensor(valid->span(), DType::I32, {batch}); }
-    Tensor tinitial(initial.span(), DType::I32, {batch});
+    Tensor tinitial(initial.span(), DType::I64, {batch});
+    const auto source =
+        source_aliases_snapshots ? dense_record_field(tstate, 2, tinitial) : history.view(tinitial);
     Tensor tbases(bases.span(), DType::I32, {batch});
     Tensor tout(output.span(), DType::BF16, {C, width, batch});
-    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, tvalid, tinitial, tbases, tout,
+    ops::causal_conv1d_silu_snapshot(tx, tw, source, tstate, tvalid, tbases, tout,
                                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -713,14 +726,13 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
-    history.copy_back();
     failures += history.verify_guards("snapshot history");
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
     failures += verify_exact((tag + " initial selectors preserved").c_str(),
-                             from_device<std::int32_t>(initial.data(), initial_slots.size()),
-                             initial_slots);
+                             from_device<std::int64_t>(initial.data(), initial_offsets.size()),
+                             initial_offsets);
     failures += verify_exact((tag + " snapshot bases preserved").c_str(),
                              from_device<std::int32_t>(bases.data(), snapshot_bases.size()),
                              snapshot_bases);

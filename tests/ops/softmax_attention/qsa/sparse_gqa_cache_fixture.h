@@ -2,36 +2,50 @@
 
 #include "cache_reference.h"
 #include "ops/op_tester.h"
+#include "../../../../tools/support/paged_kv_fixture.h"
 
 namespace ninfer::test::qsa::sparse {
 
 struct EncodedPlane {
-    int leading, element;
+    int element;
     std::int64_t row, head, page;
     std::vector<std::uint8_t> host;
-    GuardedDeviceBuffer device;
+    tool::PackedKVFixture* packed = nullptr;
+    std::size_t plane_index       = 0;
     Tensor view;
 
-    EncodedPlane(int features, DType dtype, int pages, bool padded, int heads = 2)
-        : leading(padded ? dtype_size(dtype) : 0), element(dtype_size(dtype)),
-          row(features * element + (padded ? element : 0)), head(64 * row + leading),
-          page(heads * head + leading), host(leading + page * pages, 0xcd), device(host.size()),
-          view(device.span().subspan(leading), dtype, {features, 64, heads, pages}) {
+    EncodedPlane(int features, DType dtype, int pages, int heads = 2)
+        : element(dtype_size(dtype)), row(features * element), head(64 * row), page(heads * head),
+          host(page * pages, 0xcd), view(Tensor::metadata(dtype, {features, 64, heads, pages})) {
         view.nb[1] = row;
         view.nb[2] = head;
         view.nb[3] = page;
     }
 
-    std::size_t offset(int r, int h, int p) const {
-        return leading + r * row + h * head + p * page;
+    std::size_t offset(int r, int h, int p) const { return r * row + h * head + p * page; }
+
+    void bind(tool::PackedKVFixture& arena, std::size_t index) {
+        packed      = &arena;
+        plane_index = index;
     }
 
-    void upload() { device.copy_from_host(host.data(), host.size()); }
+    void upload() {
+        auto source   = view;
+        source.data   = host.data();
+        source.device = Device::cpu();
+        packed->upload_plane(plane_index, source);
+    }
 
     int preserved(const std::string& label) const {
-        return verify_exact(label.c_str(), from_device<std::uint8_t>(device.data(), host.size()),
-                            host) +
-               device.verify_guards(label);
+        if (packed) {
+            auto actual   = host;
+            auto target   = view;
+            target.data   = actual.data();
+            target.device = Device::cpu();
+            packed->download_plane(plane_index, target);
+            return verify_exact(label.c_str(), actual, host);
+        }
+        throw std::logic_error("encoded plane is not bound");
     }
 };
 
@@ -39,10 +53,9 @@ struct EncodedVector {
     prepare::VectorEncoding format;
     EncodedPlane data, scales;
 
-    EncodedVector(prepare::VectorEncoding fmt, int pages, bool padded, bool padded_scales = false,
-                  int heads = 2)
-        : format(fmt), data(fmt.data_extent, fmt.data_dtype, pages, padded, heads),
-          scales(fmt.scale_extent, fmt.scale_dtype, pages, padded || padded_scales, heads) {}
+    EncodedVector(prepare::VectorEncoding fmt, int pages, int heads = 2)
+        : format(fmt), data(fmt.data_extent, fmt.data_dtype, pages, heads),
+          scales(fmt.scale_extent, fmt.scale_dtype, pages, heads) {}
 
     template <class Source>
     void encode(const Source& source) {

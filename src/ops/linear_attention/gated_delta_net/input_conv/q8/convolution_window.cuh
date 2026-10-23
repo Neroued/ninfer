@@ -56,7 +56,7 @@ void launch_sliced(const Q8LinearOperands& operands, Output<ConvGeometry> output
 
 template <class ConvGeometry, class Gemv, int Width, class Publish>
 void launch_window(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                   const Tensor& states, const Tensor& valid, const Tensor& initial, Tensor& query,
+                   const ConstStateFieldView& states, const Tensor& valid, Tensor& query,
                    Tensor& key, Tensor& value, Tensor& z, Publish publish, bool aggregate,
                    cudaStream_t stream) {
     const int columns   = Width * x.ne[2];
@@ -64,8 +64,8 @@ void launch_window(const Tensor& x, const Weight& weight, const Tensor& conv_wei
     const auto operands = q8_linear_operands(flat, weight);
     const Output<ConvGeometry> output{static_cast<__nv_bfloat16*>(query.data),
                                       static_cast<__nv_bfloat16*>(z.data)};
-    const auto adapter = make_gdn_conv_output<ConvGeometry, Width>(
-        conv_weight, states, valid, initial, query, key, value, z, publish);
+    const auto adapter = make_gdn_conv_output<ConvGeometry, Width>(conv_weight, states, valid,
+                                                                   query, key, value, z, publish);
     const WindowEpilogue<ConvGeometry, Width, Publish> epilogue{adapter.conv, adapter.z};
     if constexpr (Width == 1) {
         if (columns == 1) {
@@ -98,16 +98,15 @@ constexpr auto window_launchers(std::index_sequence<I...>) {
 
 template <class ConvGeometry, class Gemv, class Publish>
 void dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-              const Tensor& states, const Tensor& valid, const Tensor& initial, Tensor& query,
-              Tensor& key, Tensor& value, Tensor& z, Publish publish, bool aggregate,
-              cudaStream_t stream) {
+              const ConstStateFieldView& states, const Tensor& valid, Tensor& query, Tensor& key,
+              Tensor& value, Tensor& z, Publish publish, bool aggregate, cudaStream_t stream) {
     if (x.ne[1] < 1 || x.ne[1] > 16 || x.ne[2] < 1 || x.ne[2] > 8 ||
         (aggregate && (x.ne[1] > 8 || x.ne[1] * x.ne[2] > 16)) || (!aggregate && x.ne[2] != 1))
         throw std::invalid_argument("Q8 fused convolution: invalid temporal tile");
     static constexpr auto launches =
         window_launchers<ConvGeometry, Gemv, Publish>(std::make_index_sequence<16>{});
-    launches[x.ne[1] - 1](x, weight, conv_weight, states, valid, initial, query, key, value, z,
-                          publish, aggregate, stream);
+    launches[x.ne[1] - 1](x, weight, conv_weight, states, valid, query, key, value, z, publish,
+                          aggregate, stream);
 }
 
 } // namespace gdn_q8_window

@@ -72,10 +72,11 @@ int split_window(DeviceContext& device, bool norm) {
     auto first_count   = to_device(std::vector<int>{5});
     auto second_count  = to_device(std::vector<int>{12});
     auto second_offset = to_device(std::vector<int>{5});
-    auto zero          = to_device(std::vector<int>{0});
+    auto zero          = to_device(std::vector<std::int64_t>{0});
     const Tensor first(first_count.span(), DType::I32, {1}),
         second(second_count.span(), DType::I32, {1});
-    const ops::PleConvStateView middle{intermediate.tensor, Tensor(zero.span(), DType::I32, {1})};
+    const ops::PleConvStateView middle{history_field(
+        intermediate.tensor, intermediate.device->span(), Tensor(zero.span(), DType::I64, {1}))};
     cuda_synchronize();
     const auto segment = [&](int start, int count, const Tensor& valid,
                              const ops::PleConvStateView& before, const Tensor& offsets) {
@@ -119,24 +120,25 @@ int split_window(DeviceContext& device, bool norm) {
 int output_in_history_gap(DeviceContext& device) {
     ConvFixture f(1, 1);
     f.prepare(0, false);
-    Words storage({D, 9, 1}, 0, {1, 2 * D, 18 * D, 18 * D});
+    Words storage({D, 9, 2});
     for (int j = 0; j < 9; ++j)
         for (int c = 0; c < D; ++c)
             storage.host[storage.index(c, j)] = f.history.host[f.history.index(c, j, f.source[0])];
     storage.upload();
-    auto slot = to_device(std::vector<int>{0});
-    f.y = Tensor(storage.device->span().subspan(std::size_t(D) * 2), DType::BF16, {H, C, 1, 1});
+    auto slot = to_device(std::vector<std::int64_t>{0});
+    f.y = Tensor(storage.device->span().subspan(std::size_t(D) * 9 * 2), DType::BF16, {H, C, 1, 1});
     cuda_synchronize();
     ops::ple_conv_add_norm(f.residual.tensor, f.gated.tensor, f.kernel.tensor, f.batch_view(),
-                           {storage.tensor, Tensor(slot.span(), DType::I32, {1})}, f.record_view(),
-                           f.norm.tensor, epsilon, f.y, f.normalized.tensor,
+                           {history_field(storage.tensor, storage.device->span(),
+                                          Tensor(slot.span(), DType::I64, {1}))},
+                           f.record_view(), f.norm.tensor, epsilon, f.y, f.normalized.tensor,
                            device.execution_view());
     device.synchronize();
     int failures  = f.verify(true, "PLE output in unused history gap");
     auto expected = storage.host;
     const auto y  = from_device<std::uint16_t>(f.y.data, D);
-    std::copy(y.begin(), y.end(), expected.begin() + D);
-    failures += verify_exact("PLE strided input regions preserved", storage.download(), expected);
+    std::copy(y.begin(), y.end(), expected.begin() + 9 * D);
+    failures += verify_exact("PLE other record regions preserved", storage.download(), expected);
     return failures + storage.device->verify_guards("PLE shared allocation");
 }
 

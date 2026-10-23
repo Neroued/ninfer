@@ -15,9 +15,54 @@
 
 namespace {
 
-using Usage = ninfer::runtime::ContextResources<3>;
-using Key   = std::vector<std::uint32_t>;
-using Role  = ninfer::runtime::CheckpointRole;
+struct Usage {
+    std::size_t device_bytes = 0, host_bytes = 0;
+    std::vector<std::uint32_t> records;
+
+    void merge(const Usage& other) {
+        device_bytes += other.device_bytes;
+        host_bytes += other.host_bytes;
+        records.insert(records.end(), other.records.begin(), other.records.end());
+    }
+
+    void subtract(const Usage& other) {
+        device_bytes -= other.device_bytes;
+        host_bytes -= other.host_bytes;
+        for (auto id : other.records) {
+            const auto found = std::find(records.begin(), records.end(), id);
+            require_record(found != records.end());
+            records.erase(found);
+        }
+    }
+
+    bool empty() const { return !device_bytes && !host_bytes && records.empty(); }
+private:
+    static void require_record(bool valid) {
+        if (!valid) throw std::logic_error("fixture release inventory lost a record");
+    }
+};
+
+struct Demand {
+    std::size_t device_bytes = 0, host_bytes = 0;
+};
+
+struct Assessment {
+    Demand demand;
+    bool available = false, exceeds_capacity = false, pending_dependency = false;
+
+    bool ready() const { return available; }
+
+    bool feasible() const { return available; }
+
+    bool requires_maintenance() const { return false; }
+
+    bool waiting() const { return pending_dependency; }
+
+    bool impossible() const { return exceeds_capacity; }
+};
+
+using Key  = std::vector<std::uint32_t>;
+using Role = ninfer::runtime::CheckpointRole;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -67,8 +112,10 @@ struct Source {
 // Concrete immutable contents and their Host aliases, without cache policy or an allocator.
 // The production stores have separate tests for actual allocation and transfer lifetimes.
 struct Program {
-    using ContextResources = Usage;
-    using HostRequirement  = std::size_t;
+    using ContextDemand     = Demand;
+    using ContextAssessment = Assessment;
+    using ContextReleaseSet = Usage;
+    using HostRequirement   = std::size_t;
 
     struct Content {
         Key tokens;
@@ -80,7 +127,6 @@ struct Program {
         bool release_blocked     = false;
         bool demotion_blocked    = false;
         std::uint32_t main_pages = 1;
-        std::array<std::uint32_t, 2> other_pool_pages{};
         std::optional<std::uint32_t> demotion_page_limit;
         std::optional<std::size_t> demotion_bytes;
         Role role                                = Role::SharedPrefix;
@@ -118,10 +164,8 @@ struct Program {
     std::vector<HostBlock> blocks;
     std::vector<Handle> released;
     std::vector<Handle> demoted;
-    std::vector<std::vector<Handle>> demotion_submissions;
-    std::uint32_t main_capacity    = 1024;
-    bool transfer_in_progress      = false;
-    bool combined_demotion_blocked = false;
+    std::size_t device_capacity = 4096;
+    bool transfer_in_progress   = false;
     std::vector<Handle> placement_holders;
     std::uint64_t checkpoint_revision = 1;
     mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index;
@@ -168,16 +212,17 @@ struct Program {
                                           block) != content.host_blocks.end();
     }
 
+    static std::size_t device_size(const Content& content) {
+        return content.device_state + content.main_pages;
+    }
+
     [[nodiscard]] Usage checkpoint_footprint(std::span<const Handle> handles) const {
         Usage result;
         std::vector<std::size_t> unique;
         for (const auto handle : handles) {
             const auto& content = contents.at(handle.index);
             require(content.alive, "cache queried a released checkpoint");
-            result.state_slots += content.device_state;
-            result.kv_page_groups[0] += content.main_pages;
-            result.kv_page_groups[1] += content.other_pool_pages[0];
-            result.kv_page_groups[2] += content.other_pool_pages[1];
+            result.device_bytes += device_size(content);
             for (const auto block : content.host_blocks) {
                 if (std::find(unique.begin(), unique.end(), block) == unique.end()) {
                     unique.push_back(block);
@@ -186,6 +231,47 @@ struct Program {
             }
         }
         return result;
+    }
+
+    Assessment assess(Demand demand, const Usage& released = {}) const {
+        const auto usage = physical_usage();
+        return {demand,
+                demand.device_bytes <=
+                        device_capacity - usage.occupied.device_bytes + released.device_bytes &&
+                    can_place_host(demand.host_bytes, released),
+                demand.device_bytes > device_capacity || demand.host_bytes > host_capacity};
+    }
+
+    Assessment pressure(std::size_t device_bytes = 0, std::size_t host_bytes = 0) const {
+        const auto usage = physical_usage();
+        return assess(
+            {device_bytes ? device_capacity - usage.occupied.device_bytes + device_bytes : 0,
+             host_bytes ? host_capacity - usage.occupied.host_bytes + host_bytes : 0});
+    }
+
+    Demand host_demand(std::size_t bytes) const { return {.host_bytes = bytes}; }
+
+    bool releases_metadata(const Usage&, const Assessment&) const { return false; }
+
+    std::size_t released_bytes(const Usage& released, const Assessment& assessment) const {
+        return (assessment.demand.device_bytes ? released.device_bytes : 0) +
+               (assessment.demand.host_bytes ? released.host_bytes : 0);
+    }
+
+    std::size_t useful_release_bytes(const Usage& released, const Assessment& assessment) const {
+        const auto usage    = physical_usage();
+        const auto shortage = [](std::size_t requested, std::size_t free) {
+            return requested > free ? requested - free : 0;
+        };
+        return std::min(released.device_bytes,
+                        shortage(assessment.demand.device_bytes,
+                                 device_capacity - usage.occupied.device_bytes)) +
+               std::min(released.host_bytes, shortage(assessment.demand.host_bytes,
+                                                      host_capacity - usage.occupied.host_bytes));
+    }
+
+    ninfer::runtime::ContextStart start_maintenance(const Assessment&) {
+        throw std::logic_error("the policy fixture does not require relocation");
     }
 
     std::size_t checkpoint_capacity() const { return contents.size(); }
@@ -220,9 +306,10 @@ struct Program {
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
-        PhysicalUsage result{.capacity = {.state_slots    = 64,
-                                          .kv_page_groups = {main_capacity, 1024, 1024},
-                                          .host_bytes     = host_capacity}};
+        PhysicalUsage result{
+            .capacity = {.device_bytes = device_capacity, .host_bytes = host_capacity}};
+        for (const auto& content : contents)
+            if (content.alive) result.occupied.device_bytes += device_size(content);
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference ||
                 std::any_of(contents.begin(), contents.end(),
@@ -316,132 +403,49 @@ struct Program {
     };
 
     struct ReclaimPlan {
-        struct Batch {
-            const Program* program;
-            Usage shortage;
-            std::vector<Demotion> ordered;
-
-            bool append(const Demotion& demotion) {
-                ordered.push_back(demotion);
-                return true;
-            }
-
-            [[nodiscard]] bool covers(const Release& release) const {
-                return program->covers_release(ordered, release.sources, shortage);
-            }
-
-            [[nodiscard]] std::optional<Demotion> finish() const {
-                return program->combined_demotion(ordered, shortage);
-            }
-        };
-
-        const Program* program;
         std::vector<Demotion> demotions;
         std::vector<Release> releases;
-
-        [[nodiscard]] Batch begin_kv_batch(Usage shortage) const { return {program, shortage}; }
+        std::shared_ptr<const ReleaseInventory> inventory;
     };
 
     [[nodiscard]] ReclaimPlan plan_reclaim(std::span<const Handle> allowed,
-                                           std::span<const Handle> excluded, Usage shortage) const {
-        return {this, demotion_options(allowed, excluded, shortage),
-                plan_releases(allowed, excluded, shortage).releases};
+                                           std::span<const Handle> excluded, Demand demand) const {
+        auto releases = plan_releases(allowed, excluded, demand);
+        return {demotion_options(allowed, excluded, demand), std::move(releases.releases),
+                std::move(releases.inventory)};
     }
 
     [[nodiscard]] std::vector<Demotion> demotion_options(std::span<const Handle> allowed,
                                                          std::span<const Handle> excluded,
-                                                         Usage shortage) const {
+                                                         Demand demand) const {
         std::vector<Demotion> result;
+        if (!demand.device_bytes) return result;
         for (const auto handle : allowed) {
             const auto& content = contents.at(handle.index);
             if (!content.alive || !content.evictable || content.leased || !content.demotion_bytes ||
-                std::find(excluded.begin(), excluded.end(), handle) != excluded.end()) {
+                std::find(excluded.begin(), excluded.end(), handle) != excluded.end())
                 continue;
-            }
-            Usage released;
-            if (shortage.state_slots && content.device_state) {
-                released.state_slots = 1;
-            } else if (!shortage.state_slots && shortage.kv_page_groups[0]) {
-                released.kv_page_groups[0] =
-                    std::min({shortage.kv_page_groups[0], content.main_pages,
-                              content.demotion_page_limit.value_or(content.main_pages)});
-            }
-            const auto units = released.state_slots + released.kv_page_groups[0];
-            if (!units) { continue; }
-            result.push_back(
-                {handle,
-                 *content.demotion_bytes * units,
-                 {handle},
-                 released,
-                 released.kv_page_groups[0]
-                     ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
-                                                                      released.kv_page_groups[0]}}
-                     : std::vector<std::pair<Handle, std::uint32_t>>{}});
+            const auto pages =
+                content.device_state
+                    ? 0
+                    : std::min(content.main_pages,
+                               content.demotion_page_limit.value_or(content.main_pages));
+            const auto bytes = content.device_state ? 1 : pages;
+            if (!bytes) continue;
+            result.push_back({handle,
+                              *content.demotion_bytes * bytes,
+                              {handle},
+                              {.device_bytes = bytes},
+                              pages ? std::vector<std::pair<Handle, std::uint32_t>>{{handle, pages}}
+                                    : std::vector<std::pair<Handle, std::uint32_t>>{}});
         }
         return result;
     }
 
-    [[nodiscard]] std::optional<Demotion> combined_demotion(std::span<const Demotion> ordered,
-                                                            Usage shortage) const {
-        if (ordered.empty() || shortage.state_slots || !shortage.kv_page_groups[0]) {
-            return std::nullopt;
-        }
-        Demotion combined{ordered.front().handle, 0, {}, {}};
-        auto remaining   = shortage.kv_page_groups[0];
-        const auto usage = physical_usage();
-        auto host_left   = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        // The fixture supplies disjoint, explicit page quantities. Physical aliases,
-        // reservations and transfer leases belong to the Native contract tests.
-        for (const auto& plan : ordered) {
-            if (plan.main_parts.empty()) { break; }
-            for (const auto& [handle, pages] : plan.main_parts) {
-                const auto bytes = *contents.at(handle.index).demotion_bytes;
-                const auto take  = static_cast<std::uint32_t>(std::min<std::size_t>(
-                    std::min(remaining, pages), bytes ? host_left / bytes : remaining));
-                if (take) {
-                    combined.main_parts.emplace_back(handle, take);
-                    combined.sources.push_back(handle);
-                    combined.released.kv_page_groups[0] += take;
-                    combined.host_bytes += take * bytes;
-                    remaining -= take;
-                    host_left -= take * bytes;
-                }
-                if (take < pages || !remaining) {
-                    return combined.main_parts.empty() ? std::nullopt
-                                                       : std::optional(std::move(combined));
-                }
-            }
-        }
-        return combined.main_parts.empty() ? std::nullopt : std::optional(std::move(combined));
-    }
-
-    [[nodiscard]] bool covers_release(std::span<const Demotion> ordered,
-                                      std::span<const Handle> removed, Usage shortage) const {
-        if (shortage.state_slots || shortage.host_bytes || !shortage.kv_page_groups[0]) {
-            return false;
-        }
-        std::vector<std::uint32_t> covered(contents.size());
-        for (const auto& plan : ordered) {
-            for (const auto& [handle, pages] : plan.main_parts) {
-                covered.at(handle.index) = std::max(covered.at(handle.index), pages);
-            }
-        }
-        bool releases_pages = false;
-        for (const auto handle : removed) {
-            const auto& content = contents.at(handle.index);
-            if (!content.alive || !content.evictable || content.leased || content.release_blocked ||
-                covered.at(handle.index) < content.main_pages) {
-                return false;
-            }
-            releases_pages = releases_pages || content.main_pages != 0;
-        }
-        return releases_pages;
-    }
-
     [[nodiscard]] ninfer::models::context::ReleasePlan<Release, Usage, Handle>
     plan_releases(std::span<const Handle> allowed, std::span<const Handle> excluded,
-                  Usage shortage) const {
-        host_plan_builds += shortage.host_bytes != 0;
+                  Demand demand) const {
+        host_plan_builds += demand.host_bytes != 0;
         const auto eligible = [&](Handle handle) {
             const auto& content = contents.at(handle.index);
             return content.alive && content.evictable && !content.leased &&
@@ -456,10 +460,7 @@ struct Program {
         for (std::uint32_t i = 0; i < contents.size(); ++i) {
             const auto& content = contents[i];
             if (eligible({i}))
-                inventory->add({Handle{i}},
-                               {.state_slots    = content.device_state,
-                                .kv_page_groups = {content.main_pages, content.other_pool_pages[0],
-                                                   content.other_pool_pages[1]}});
+                inventory->add({Handle{i}}, {.device_bytes = device_size(content), .records = {i}});
         }
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference) continue;
@@ -477,21 +478,17 @@ struct Program {
             Usage released;
             for (const auto handle : sources) {
                 const auto& content = contents.at(handle.index);
-                released.state_slots += content.device_state;
-                released.kv_page_groups[0] += content.main_pages;
-                released.kv_page_groups[1] += content.other_pool_pages[0];
-                released.kv_page_groups[2] += content.other_pool_pages[1];
+                released.device_bytes += device_size(content);
+                released.records.push_back(handle.index);
             }
             released.host_bytes = host_bytes_released(sources);
-            const bool useful   = released.useful(shortage) != 0;
-            if (!useful) { return; }
             if (std::none_of(result.releases.begin(), result.releases.end(),
                              [&](const auto& action) { return action.sources == sources; })) {
                 result.releases.push_back({std::move(sources), released});
             }
         };
         for (const auto handle : allowed) { append({handle}); }
-        if (shortage.host_bytes) {
+        if (demand.host_bytes) {
             for (std::size_t block = 0; block < blocks.size(); ++block) {
                 std::vector<Handle> sources;
                 for (std::uint32_t i = 0; i < contents.size(); ++i) {
@@ -560,35 +557,26 @@ struct Program {
         return bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes;
     }
 
-    bool can_place_host(std::size_t bytes,
-                        const ninfer::models::context::ReleasePlan<Release, Usage, Handle>& plan,
-                        std::span<const std::uint32_t> freed) const {
+    bool can_place_host(std::size_t bytes, const Usage& released) const {
         const auto usage = physical_usage();
-        auto available   = usage.capacity.host_bytes - usage.occupied.host_bytes;
         for (const auto h : placement_holders) {
             if (!bytes || !valid_checkpoint(h)) continue;
-            const auto released = std::any_of(freed.begin(), freed.end(), [&](auto index) {
-                const auto& holders = plan.inventory->objects()[index].holders;
-                return std::find(holders.begin(), holders.end(), h) != holders.end();
-            });
-            if (!released) return false;
+            if (std::find(released.records.begin(), released.records.end(), h.index) ==
+                released.records.end())
+                return false;
         }
-        for (const auto index : freed)
-            available += plan.inventory->objects()[index].released.host_bytes;
-        return bytes <= available;
+        return bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes + released.host_bytes;
     }
 
     ninfer::runtime::ContextStart start_demote(const Demotion& plan,
                                                std::span<const Handle> victims) {
         using ninfer::runtime::ContextStart;
-        if (combined_demotion_blocked && plan.main_parts.size() > 1) return ContextStart::Stale;
         if (std::any_of(plan.sources.begin(), plan.sources.end(),
                         [&](auto handle) { return contents.at(handle.index).demotion_blocked; }))
             return ContextStart::Deferred;
-        const auto usage = physical_usage();
-        if (plan.host_bytes >
-            usage.capacity.host_bytes - usage.occupied.host_bytes + host_bytes_released(victims))
-            return ContextStart::Stale;
+        Usage released{.host_bytes = host_bytes_released(victims)};
+        for (const auto victim : victims) released.records.push_back(victim.index);
+        if (!can_place_host(plan.host_bytes, released)) return ContextStart::Stale;
         for (const auto victim : victims)
             require(release_checkpoint(victim), "prepared Host victim was not releasable");
         if (!plan.main_parts.empty()) {
@@ -602,10 +590,9 @@ struct Program {
         } else {
             auto& content = contents.at(plan.handle.index);
             if (plan.host_bytes) { content.host_blocks.push_back(host_block(plan.host_bytes)); }
-            if (plan.released.state_slots) { content.device_state = false; }
+            if (plan.released.device_bytes) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
-        demotion_submissions.push_back(plan.sources);
         return ContextStart::Started;
     }
 };
@@ -756,11 +743,11 @@ void test_intermediate_capture_preserves_semantic_history() {
         const auto admission =
             f.cache.capture_admission(f.program, 0, request, 4, false, Origin::Intermediate);
         auto cursor = f.cache.begin_reclaim(f.program, admission);
-        require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+        require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                         ninfer::runtime::ReclaimProgress::Blocked &&
                     f.program.valid_checkpoint(semantic),
                 "cold intermediate capture displaced a semantic shared prefix");
-        require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed,
                 "semantic retention prevented required execution");
     }
@@ -976,7 +963,7 @@ void test_waiting_retention_allows_demotion_but_not_optional_deletion() {
     f.cache.retain_source(f.program, 10, f.source(base, point));
     auto cursor =
         f.cache.begin_reclaim(f.program, std::nullopt, {ReclaimPurpose::FreshAdmission, 20});
-    const auto progress = f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor);
+    const auto progress = f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor);
     require(progress != ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(point) && !f.program.demoted.empty() &&
                 f.cache.source_revocations(10) == 0,
@@ -1002,13 +989,13 @@ void test_shared_host_release_checks_every_waiting_owner() {
     f.cache.retain_source(f.program, 20, f.source(Base{.tokens = {2}}, b));
     auto fresh =
         f.cache.begin_reclaim(f.program, std::nullopt, {ReclaimPurpose::FreshAdmission, 15});
-    require(f.cache.reclaim(f.program, {.host_bytes = 64}, {}, fresh) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(0, 64), {}, fresh) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.released.empty() && f.cache.source_revocations(10) == 0 &&
                 f.cache.source_revocations(20) == 0,
             "partial revocation fabricated Host capacity still owned by an older waiter");
     auto required = f.cache.begin_reclaim(f.program);
-    require(f.cache.reclaim(f.program, {.host_bytes = 64}, {}, required) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(0, 64), {}, required) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.physical_usage().occupied.host_bytes == 0 &&
                 f.cache.source_revocations(10) == 1 && f.cache.source_revocations(20) == 1,
@@ -1028,7 +1015,7 @@ void test_waiting_only_source_is_not_a_public_capture_fallback() {
     f.publish(cold);
     const auto admission = f.cache.capture_admission(f.program, 0, base, 3);
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(cold) && f.program.valid_checkpoint(hidden),
             "an undiscoverable waiting point suppressed a useful public capture");
@@ -1105,14 +1092,18 @@ void test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity() {
     (void)f.program.host_block(32, true);
     const auto source                               = f.program.add({1, 9});
     f.program.contents[source.index].demotion_bytes = 16;
+    // Only the Device State is reclaimable; the history has no independently owned Device pages.
+    f.program.contents[source.index].main_pages   = 0;
     const auto first                              = f.program.add({2}, {f.program.host_block(16)});
     const auto second                             = f.program.add({3}, {f.program.host_block(16)});
     f.program.contents[first.index].device_state  = false;
+    f.program.contents[first.index].main_pages    = 0;
     f.program.contents[second.index].device_state = false;
+    f.program.contents[second.index].main_pages   = 0;
     f.publish(source);
     f.publish(first);
     f.publish(second);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{first} &&
                 f.program.demoted == std::vector<Handle>{source} &&
@@ -1125,10 +1116,10 @@ void test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity() {
     pinned.publish(leased);
     pinned.publish(available);
     pinned.program.contents[leased.index].evictable = false;
-    require(pinned.cache.reclaim(pinned.program, {.state_slots = 1}, {&available, 1}) ==
+    require(pinned.cache.reclaim(pinned.program, pinned.program.pressure(1), {&available, 1}) ==
                 ninfer::runtime::ReclaimProgress::Blocked,
             "reclaim removed an excluded or pinned Native checkpoint");
-    require(pinned.cache.reclaim(pinned.program, {.state_slots = 1}) ==
+    require(pinned.cache.reclaim(pinned.program, pinned.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 pinned.program.released == std::vector<Handle>{available},
             "reclaim failed to release the available unpinned history");
@@ -1169,62 +1160,6 @@ void test_explicit_anchor_updates_remain_bounded_across_requests() {
     require(!f.program.valid_checkpoint(blocked) && f.program.valid_checkpoint(anchors[1]) &&
                 f.program.valid_checkpoint(anchors[3]) && f.program.valid_checkpoint(next),
             "leased oldest anchor caused a request failure or a search for a different victim");
-}
-
-void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
-    Fixture f(64);
-    f.program.main_capacity = 100;
-    (void)f.program.host_block(32, true);
-    const auto parent = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[parent.index].main_pages = 40;
-    f.publish(parent, 42);
-    const Base branch{.tokens = {1, 2, 3},
-                      .advice = {.update_session_index = false, .session_key = 42}};
-    const auto owner = f.begin(branch, parent);
-    const auto child = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[child.index].main_pages = 40;
-    f.cache.publish(f.program, owner, child);
-    f.cache.finish(f.program, owner, branch, 2);
-    const auto entrant = f.program.add({9, 8, 7});
-    f.publish(entrant);
-    const auto victims = f.cache.host_victims(f.program, 16, entrant);
-    require(victims && *victims == std::vector<Handle>{parent},
-            "equal-adoption parent and child bypassed the per-resource protection soft target");
-}
-
-void test_reclaim_targets_the_requested_pool() {
-    Fixture f(64);
-    const auto text                                     = f.program.add({1});
-    const auto third                                    = f.program.add({2});
-    f.program.contents[text.index].main_pages           = 100;
-    f.program.contents[third.index].main_pages          = 0;
-    f.program.contents[third.index].other_pool_pages[1] = 2;
-    f.publish(text);
-    f.publish(third);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {0, 0, 1}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.valid_checkpoint(text) && !f.program.valid_checkpoint(third),
-            "pages in another pool satisfied the third pool's deficit");
-}
-
-void test_large_hotspot_is_preserved_per_resource_pool() {
-    Fixture f(64);
-    f.program.main_capacity = 100;
-    (void)f.program.host_block(32, true);
-    const auto main                             = f.program.add({1}, {f.program.host_block(16)});
-    f.program.contents[main.index].main_pages   = 80;
-    f.program.contents[main.index].device_state = false;
-    const auto host                             = f.program.add({2}, {f.program.host_block(16)});
-    f.program.contents[host.index].main_pages   = 0;
-    f.program.contents[host.index].device_state = false;
-    const auto entrant                          = f.program.add({3});
-    f.publish(main);
-    f.publish(host);
-    f.publish(entrant);
-    f.use_shared(main);
-    f.use_shared(host);
-    require(!f.cache.host_victims(f.program, 16, entrant),
-            "a newer Host-only hit demoted the sole Main KV hotspot");
 }
 
 void test_one_off_fanout_competes_with_repeated_continuation() {
@@ -1271,12 +1206,12 @@ void test_one_off_fanout_competes_with_repeated_continuation() {
                 f.program.physical_usage().occupied.host_bytes == 64,
             "fanout counted its shared prefix once per logical branch");
     require(slow_used < recent_used && f.cache.retention(slow_owner).last_demand == slow_used &&
-                !f.cache.retention(slow_owner).reused && f.cache.retention(dialogue_owner).reused,
+                f.cache.retention(dialogue_owner).reused,
             "late fanout completion displaced the recently adopted dialogue's soft protection");
     auto cursor                = f.cache.begin_reclaim(f.program);
     const auto released_before = f.program.released.size();
     require(
-        f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+        f.cache.reclaim(f.program, f.program.pressure(0, 16), {}, cursor) ==
                 ninfer::runtime::ReclaimProgress::Changed &&
             f.program.released.size() == released_before + 1 && f.program.released.back() == slow &&
             f.program.physical_usage().occupied.host_bytes == 48 &&
@@ -1294,13 +1229,13 @@ void test_reclaim_cursor_keeps_order_across_hits_and_transfers() {
     f.publish(second);
     auto cursor                    = f.cache.begin_reclaim(f.program);
     f.program.transfer_in_progress = true;
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Transferring &&
                 f.program.released.empty(),
             "an in-flight transfer restarted or consumed the fixed reclaim decision");
     f.program.transfer_in_progress = false;
     f.use_shared(first);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{first} &&
                 f.program.valid_checkpoint(second),
@@ -1314,15 +1249,15 @@ void test_reclaim_cursor_reconsiders_a_previously_excluded_source() {
     f.publish(source);
     f.publish(other);
     auto cursor = f.cache.begin_reclaim(f.program);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {&source, 1}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {&source, 1}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{other},
             "reclaim deleted its current source");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>({other, source}),
             "root fallback could not reclaim the preceding candidate's excluded source");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                 ninfer::runtime::ReclaimProgress::Blocked,
             "completed physical reclamation manufactured further progress");
 }
@@ -1337,15 +1272,15 @@ void test_reclaim_cursor_filters_retired_handles_and_defers_new_history() {
     require(f.program.release_checkpoint(retired), "fixture could not retire its native handle");
     const auto later = f.program.add({3});
     f.publish(later);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>({retired, retained}),
             "fixed reclaim decision dereferenced a retired native handle");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(later),
             "fixed reclaim decision silently expanded to newly published history");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(later),
             "a new necessary-execution decision omitted newly available history");
@@ -1353,22 +1288,24 @@ void test_reclaim_cursor_filters_retired_handles_and_defers_new_history() {
 
 void test_reclaim_cursor_can_demote_remaining_pages_of_the_same_history() {
     Fixture f(128);
-    const auto history     = f.program.add({1});
-    auto& content          = f.program.contents[history.index];
-    content.device_state   = false;
-    content.main_pages     = 5;
-    content.demotion_bytes = 4;
+    const auto history          = f.program.add({1});
+    auto& content               = f.program.contents[history.index];
+    content.device_state        = false;
+    content.main_pages          = 5;
+    content.demotion_page_limit = 2;
+    content.demotion_bytes      = 4;
     f.publish(history);
     auto cursor = f.cache.begin_reclaim(f.program);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(2), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 3,
             "first finite demotion did not release only its required pages");
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}, {}, cursor) ==
+    content.demotion_page_limit = 3;
+    require(f.cache.reclaim(f.program, f.program.pressure(3), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 0 && f.program.physical_usage().occupied.host_bytes == 20,
             "later shortage could not demote the remaining pages of the same history");
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {1}}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 content.alive && f.program.demoted.size() == 2,
             "already migrated physical content was copied or deleted again");
@@ -1379,17 +1316,21 @@ void test_reclaim_cursor_keeps_host_writeback_permissions() {
     (void)f.program.host_block(32, true);
     const auto incoming                               = f.program.add({1, 9});
     f.program.contents[incoming.index].demotion_bytes = 16;
-    const auto donor                             = f.program.add({2}, {f.program.host_block(16)});
-    const auto protected_host                    = f.program.add({3}, {f.program.host_block(16)});
-    f.program.contents[donor.index].device_state = false;
+    // Only the Device State is reclaimable; the history has no independently owned Device pages.
+    f.program.contents[incoming.index].main_pages = 0;
+    const auto donor                              = f.program.add({2}, {f.program.host_block(16)});
+    const auto protected_host                     = f.program.add({3}, {f.program.host_block(16)});
+    f.program.contents[donor.index].device_state  = false;
+    f.program.contents[donor.index].main_pages    = 0;
     f.program.contents[protected_host.index].device_state = false;
+    f.program.contents[protected_host.index].main_pages   = 0;
     f.publish(incoming);
     f.publish(donor);
     f.publish(protected_host);
     f.use_shared(protected_host);
     auto cursor = f.cache.begin_reclaim(f.program);
     f.use_shared(donor);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demoted == std::vector<Handle>{incoming} &&
                 f.program.released == std::vector<Handle>{donor} &&
@@ -1406,7 +1347,7 @@ void test_reclaim_cursor_keeps_host_writeback_permissions() {
     cold.use_shared(hot);
     auto cold_cursor = cold.cache.begin_reclaim(cold.program);
     cold.use_shared(source);
-    require(cold.cache.reclaim(cold.program, {.state_slots = 1}, {}, cold_cursor) ==
+    require(cold.cache.reclaim(cold.program, cold.program.pressure(1), {}, cold_cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 cold.program.demoted.empty() &&
                 cold.program.released == std::vector<Handle>{source} &&
@@ -1424,7 +1365,7 @@ void test_deferred_demotion_keeps_sources() {
     f.publish(next);
     f.program.contents[blocked.index].release_blocked  = true;
     f.program.contents[blocked.index].demotion_blocked = true;
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Deferred &&
                 f.program.demoted.empty() && f.program.valid_checkpoint(next) &&
                 f.program.contents[blocked.index].alive && f.program.released.empty(),
@@ -1442,16 +1383,16 @@ void test_deferred_demotion_preserves_host_victims() {
     f.publish(incoming);
     f.program.contents[incoming.index].release_blocked  = true;
     f.program.contents[incoming.index].demotion_blocked = true;
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Deferred &&
                 f.program.released.empty() && f.program.valid_checkpoint(victim) &&
                 f.program.contents[incoming.index].alive && f.program.demoted.empty(),
             "deferred transfer discarded its planned Host victims");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                 ninfer::runtime::ReclaimProgress::Deferred,
             "deferred transfer was treated as a capacity change");
     f.program.contents[incoming.index].demotion_blocked = false;
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{victim} &&
                 f.program.valid_checkpoint(incoming),
@@ -1476,12 +1417,12 @@ void test_necessary_execution_preserves_long_recovery_across_one_off_requests() 
     auto short_history = f.program.add(tokens(3, 1000));
     f.publish(short_history);
     require(
-        f.cache.reclaim(f.program, {.state_slots = 1}) ==
+        f.cache.reclaim(f.program, f.program.pressure(1)) ==
                 ninfer::runtime::ReclaimProgress::Changed &&
             !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(input),
         "necessary execution discarded the long input instead of its one-token endpoint extension");
     for (std::uint32_t request = 0; request < 4; ++request) {
-        require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                         ninfer::runtime::ReclaimProgress::Changed &&
                     !f.program.valid_checkpoint(short_history) && f.program.valid_checkpoint(input),
                 "one-off short requests displaced the last long recovery point");
@@ -1489,7 +1430,7 @@ void test_necessary_execution_preserves_long_recovery_across_one_off_requests() 
         f.publish(short_history);
     }
     require(f.cache.erase(f.program, short_history), "could not retire final interference history");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(input),
             "ordinary recovery value became a pin against necessary execution");
@@ -1527,12 +1468,12 @@ void test_optional_capture_does_not_inherit_required_eviction_rights() {
     const Base shorter{.tokens = tokens(3, 1000)};
     const auto admission = f.cache.capture_admission(f.program, 0, shorter, 3);
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 !f.cache.host_victims(f.program, 64, {}, {}, {}, admission) &&
                 f.program.valid_checkpoint(long_history),
             "optional short capture erased more recovery work than it added");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                 ninfer::runtime::ReclaimProgress::Changed,
             "necessary execution accidentally inherited optional admission restrictions");
 }
@@ -1570,7 +1511,7 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     const auto admission = permission();
     require(admission.priority.reused, "two completed requests failed to qualify new demand");
     auto cursor = f.cache.begin_reclaim(f.program, admission);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(old),
             "old long history permanently excluded the repeated short working set");
@@ -1582,7 +1523,7 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     const Base unrelated{.tokens = {9999}};
     auto cold =
         f.cache.begin_reclaim(f.program, f.cache.capture_admission(f.program, 0, unrelated, 1));
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cold) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cold) ==
                 ninfer::runtime::ReclaimProgress::Blocked,
             "publishing the newly learned Shared point lost its actual demand evidence");
 }
@@ -1600,8 +1541,11 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
     const auto host_victims = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
     require(host_victims && *host_victims == std::vector<Handle>{host},
             "first Host action did not fit optional capture's recovery budget");
-    f.cache.commit_host_victims(f.program, *host_victims, decision);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, decision) ==
+    const auto loss = f.cache.release_cost(f.program, *host_victims);
+    for (const auto victim : *host_victims)
+        require(f.program.release_checkpoint(victim), "prepared capture victim was not released");
+    f.cache.adopt_release(f.program, *host_victims, decision, loss);
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, decision) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(device),
             "optional capture spent its full recovery benefit again on a second resource pool");
@@ -1705,11 +1649,40 @@ void test_demotion_competes_with_its_actual_host_recovery_loss() {
     f.publish(movable);
     f.publish(device);
     f.publish(host);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
                 f.program.valid_checkpoint(movable) && f.program.demoted.empty(),
             "zero-loss Device quote hid a more expensive Host history deletion");
+}
+
+void test_device_pressure_does_not_erase_host_only_sources() {
+    Fixture f(32);
+    const auto host = f.program.add(tokens(100), {f.program.host_block(16)});
+    f.program.contents[host.index].device_state = false;
+    f.program.contents[host.index].main_pages   = 0;
+    f.publish(host);
+    const auto device = f.program.add(tokens(1000, 10000));
+    f.publish(device);
+    f.use_shared(device);
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.valid_checkpoint(host) && !f.program.valid_checkpoint(device),
+            "Device pressure erased a Host-only source that contributes no capacity");
+}
+
+void test_reclaim_does_not_reward_excess_release() {
+    Fixture f(0);
+    const auto large                           = f.program.add(tokens(1000));
+    f.program.contents[large.index].main_pages = 31;
+    const auto small                           = f.program.add(tokens(100, 10000));
+    f.program.contents[small.index].main_pages = 0;
+    f.publish(large);
+    f.publish(small);
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.valid_checkpoint(large) && !f.program.valid_checkpoint(small),
+            "reclaim overvalued capacity beyond the pending admission's shortage");
 }
 
 void test_device_candidates_share_host_inventory() {
@@ -1722,182 +1695,16 @@ void test_device_candidates_share_host_inventory() {
     const auto host                             = f.program.add({1}, {f.program.host_block(16)});
     f.program.contents[host.index].device_state = false;
     f.publish(host);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demoted.size() == 1 && f.program.host_plan_builds == 1,
             "Device candidates rebuilt physical Host facts for each protected source or final "
             "preflight");
 }
 
-void test_adjacent_kv_demotions_share_one_submission() {
-    Fixture f(64);
-    const auto first                                = f.program.add(tokens(100));
-    const auto second                               = f.program.add(tokens(200, 1000));
-    f.program.contents[first.index].main_pages      = 2;
-    f.program.contents[second.index].main_pages     = 3;
-    f.program.contents[first.index].demotion_bytes  = 4;
-    f.program.contents[second.index].demotion_bytes = 4;
-    f.publish(first);
-    f.publish(second);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {4}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.demotion_submissions ==
-                    std::vector<std::vector<Handle>>{{first, second}} &&
-                f.program.contents[first.index].main_pages == 0 &&
-                f.program.contents[second.index].main_pages == 1 &&
-                f.program.physical_usage().occupied.host_bytes == 16 && f.program.released.empty(),
-            "adjacent admitted KV transfers did not satisfy the page shortage in one submission");
-}
-
-void test_kv_demotion_batch_stops_at_an_intervening_delete() {
-    Fixture f(64);
-    const auto first     = f.program.add(tokens(100));
-    const auto removable = f.program.add(tokens(50, 1000));
-    const auto later     = f.program.add(tokens(100, 2000));
-    const auto survivor  = f.program.add(tokens(50, 1000), {}, Role::Continuation);
-    f.program.contents[first.index].demotion_bytes = 4;
-    f.program.contents[later.index].demotion_bytes = 4;
-    f.program.contents[survivor.index].leased      = true;
-    f.publish(first);
-    f.publish(removable);
-    f.publish(later);
-    f.publish(survivor);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
-                f.program.contents[later.index].main_pages == 1 && f.program.released.empty(),
-            "KV transfer batching skipped an intervening lower-ranked delete");
-}
-
-void test_redundant_delete_does_not_split_or_replace_a_deferred_kv_batch() {
-    for (const bool reject_transfer : {false, true}) {
-        Fixture f(64);
-        const auto first    = f.program.add(tokens(100));
-        const auto second   = f.program.add(tokens(100, 1000));
-        const auto survivor = f.program.add(tokens(100), {}, Role::Continuation);
-        f.program.contents[first.index].demotion_bytes   = 4;
-        f.program.contents[second.index].demotion_bytes  = 4;
-        f.program.contents[first.index].demotion_blocked = reject_transfer;
-        f.program.contents[survivor.index].leased        = true;
-        f.publish(first);
-        f.publish(second);
-        f.publish(survivor);
-        require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}) ==
-                    (reject_transfer ? ninfer::runtime::ReclaimProgress::Deferred
-                                     : ninfer::runtime::ReclaimProgress::Changed),
-                "redundant-delete fixture failed to make legitimate reclamation progress");
-        if (!reject_transfer) {
-            require(f.program.demotion_submissions ==
-                            std::vector<std::vector<Handle>>{{first, second}} &&
-                        f.program.valid_checkpoint(first) && f.program.valid_checkpoint(second) &&
-                        f.program.valid_checkpoint(survivor) && f.program.released.empty(),
-                    "a covered delete split the transfer or erased retained checkpoint metadata");
-        } else {
-            require(f.program.demotion_submissions.empty() && f.program.released.empty() &&
-                        f.program.valid_checkpoint(first) && f.program.valid_checkpoint(survivor) &&
-                        f.program.contents[second.index].main_pages == 1,
-                    "deferred migration fell through to its delete alternative");
-        }
-    }
-}
-
-void test_partially_covered_delete_still_stops_a_kv_batch() {
-    Fixture f(64);
-    const auto first                           = f.program.add(tokens(100));
-    const auto second                          = f.program.add(tokens(100, 1000));
-    const auto survivor                        = f.program.add(tokens(100), {}, Role::Continuation);
-    f.program.contents[first.index].main_pages = 2;
-    f.program.contents[first.index].demotion_page_limit = 1;
-    f.program.contents[first.index].demotion_bytes      = 4;
-    f.program.contents[second.index].demotion_bytes     = 4;
-    f.program.contents[survivor.index].leased           = true;
-    f.publish(first);
-    f.publish(second);
-    f.publish(survivor);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
-                f.program.contents[first.index].main_pages == 1 &&
-                f.program.contents[second.index].main_pages == 1 && f.program.released.empty(),
-            "partial page coverage hid a delete that could release another required page");
-}
-
-void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
-    Fixture bounded(12);
-    const auto first  = bounded.program.add(tokens(100));
-    const auto second = bounded.program.add(tokens(100, 1000));
-    for (const auto handle : {first, second}) {
-        bounded.program.contents[handle.index].main_pages     = 2;
-        bounded.program.contents[handle.index].demotion_bytes = 4;
-        bounded.publish(handle);
-    }
-    require(bounded.cache.reclaim(bounded.program, {.kv_page_groups = {4}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                bounded.program.demotion_submissions ==
-                    std::vector<std::vector<Handle>>{{first, second}} &&
-                bounded.program.contents[first.index].main_pages == 0 &&
-                bounded.program.contents[second.index].main_pages == 1 &&
-                bounded.program.physical_usage().occupied.host_bytes == 12 &&
-                bounded.program.released.empty(),
-            "combined KV transfer exceeded available Host space or deleted unquoted history");
-
-    Fixture protected_owner(64);
-    const auto replay = protected_owner.program.add(tokens(100), {}, Role::InputReplay);
-    const auto owner  = protected_owner.publish(replay);
-    const Base continued{.tokens = tokens(200)};
-    require(protected_owner.begin(continued, replay, {&replay, 1}) == owner,
-            "fixture failed to establish adopted private progress");
-    const auto anchor = protected_owner.program.add(tokens(100), {}, Role::LongAnchor);
-    protected_owner.cache.publish(protected_owner.program, owner, anchor);
-    protected_owner.cache.finish(protected_owner.program, owner, continued,
-                                 protected_owner.next_order);
-    for (const auto handle : {replay, anchor}) {
-        protected_owner.program.contents[handle.index].demotion_bytes = 4;
-        // Native offers migration but no deletion in this fixture. Each independent
-        // migration leaves an exact fallback; the union removes both Device sources.
-        protected_owner.program.contents[handle.index].release_blocked = true;
-    }
-    const Base incoming{.tokens = tokens(1000, 10000)};
-    const auto admission =
-        protected_owner.cache.capture_admission(protected_owner.program, 0, incoming, 1000, false);
-    auto cursor = protected_owner.cache.begin_reclaim(protected_owner.program, admission);
-    require(protected_owner.cache.reclaim(protected_owner.program, {.kv_page_groups = {2}}, {},
-                                          cursor) == ninfer::runtime::ReclaimProgress::Changed &&
-                protected_owner.program.demotion_submissions.size() == 1 &&
-                protected_owner.program.demotion_submissions.front().size() == 1 &&
-                protected_owner.program.contents[replay.index].main_pages +
-                        protected_owner.program.contents[anchor.index].main_pages ==
-                    1 &&
-                protected_owner.program.released.empty(),
-            "individually admitted migrations lent the outer capture combined hot protection");
-}
-
-void test_failed_kv_demotion_batch_falls_back_without_host_deletion() {
-    Fixture f(64);
-    const auto first  = f.program.add(tokens(100));
-    const auto second = f.program.add(tokens(200, 1000));
-    const auto host   = f.program.add(tokens(10, 2000), {f.program.host_block(32)});
-    f.program.contents[host.index].device_state     = false;
-    f.program.contents[host.index].main_pages       = 0;
-    f.program.contents[first.index].demotion_bytes  = 4;
-    f.program.contents[second.index].demotion_bytes = 4;
-    f.program.combined_demotion_blocked             = true;
-    f.publish(first);
-    f.publish(second);
-    f.publish(host);
-    require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
-                f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
-                f.program.contents[second.index].main_pages == 1 &&
-                f.program.valid_checkpoint(host) && f.program.released.empty() &&
-                f.program.physical_usage().occupied.host_bytes == 36,
-            "a rejected combined transfer lost the first action or deleted unrelated Host history");
-}
-
 void test_optional_capture_cannot_borrow_a_demotion_sources_heat() {
     Fixture f(64);
-    f.program.main_capacity = 64;
-    const auto host         = f.program.add(tokens(100, 10000), {f.program.host_block(64)});
+    const auto host = f.program.add(tokens(100, 10000), {f.program.host_block(64)});
     f.program.contents[host.index].device_state     = false;
     f.program.contents[host.index].main_pages       = 0;
     const auto source                               = f.program.add(tokens(2000));
@@ -1920,7 +1727,7 @@ void test_optional_capture_cannot_borrow_a_demotion_sources_heat() {
             "cold optional capture could directly evict the hot Host history");
     // Deleting source costs 2000 tokens and exceeds this capture's gain. Moving source
     // would cost only the Host victim's 100 tokens, but must not borrow its hotter demand.
-    require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, decision) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1), {}, decision) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(host) && f.program.valid_checkpoint(source) &&
                 f.program.valid_checkpoint(newer) && f.program.released.empty() &&
@@ -1941,7 +1748,7 @@ void test_unproven_suffix_can_retreat_without_losing_a_new_dialogue() {
     f.cache.finish(f.program, owner, next, f.next_order);
     const auto newcomer = f.program.add(tokens(2079, 10000), {}, Role::Continuation);
     f.publish(newcomer);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(replay) &&
                 f.program.valid_checkpoint(newcomer),
@@ -1963,7 +1770,7 @@ void test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it() {
     const auto newcomer = f.program.add(tokens(1000, 10000), {}, Role::Continuation);
     f.publish(newcomer);
     const auto released_before = f.program.released.size();
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demoted == std::vector<Handle>{endpoint} &&
                 f.program.released.size() == released_before &&
@@ -1988,7 +1795,7 @@ void test_proven_deep_progress_survives_a_shallow_fallback_and_fork() {
     f.cache.finish(f.program, owner, next, f.next_order);
     const auto cold = f.program.add(tokens(55000, 10000));
     f.publish(cold);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(cold) && f.program.valid_checkpoint(endpoint),
             "a shallow R32 was treated as coverage of actually adopted E4000 progress");
@@ -2001,7 +1808,7 @@ void test_proven_deep_progress_survives_a_shallow_fallback_and_fork() {
             "a shallow Fork refreshed its donor's deep proof instead of only its child");
     const auto another = f.program.add(tokens(55000, 70000));
     f.publish(another);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(another) && f.program.valid_checkpoint(endpoint),
             "a shallow Fork reset its unchanged donor's proven deep progress");
@@ -2037,7 +1844,7 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
     f.cache.finish(f.program, owner, rewind, f.next_order);
     const auto other = f.program.add(tokens(1000, 10000));
     f.publish(other);
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(other),
             "an abandoned deep branch remained the proof after a consuming rewind");
@@ -2104,7 +1911,7 @@ void test_host_selection_against_full_rescoring() {
                         combined.push_back(h);
                 const auto bytes = f.program.host_bytes_released(combined);
                 if (bytes <= f.program.host_bytes_released(expected)) continue;
-                const auto units  = std::min(bytes, required);
+                const auto units  = std::min<std::size_t>(bytes, required);
                 const auto loss   = recovery_oracle(f.program, combined, advertised);
                 std::size_t order = 0;
                 for (std::size_t j = 0; j < cursor.victims.size(); ++j)
@@ -2133,6 +1940,26 @@ void test_host_selection_against_full_rescoring() {
     }
 }
 
+void test_reclaim_assesses_combined_device_and_host_demand() {
+    Fixture f(2);
+    const auto device                           = f.program.add({1});
+    const auto host                             = f.program.add({2}, {f.program.host_block(2)});
+    f.program.contents[host.index].device_state = false;
+    f.program.contents[host.index].main_pages   = 0;
+    f.program.device_capacity                   = 2;
+    f.publish(device);
+    f.publish(host);
+    const Demand demand{1, 1};
+    const auto assessment = f.program.assess(demand);
+    require(!assessment.feasible(), "combined demand unexpectedly fits before reclaim");
+    require(!f.program.assess(demand, {.device_bytes = 2}).feasible() &&
+                !f.program.assess(demand, {.host_bytes = 2}).feasible(),
+            "one capacity domain satisfied a demand in both domains");
+    require(f.cache.reclaim(f.program, assessment) == ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.assess(demand).ready() && f.program.released.size() == 2,
+            "reclaim did not combine the releases needed by the complete demand");
+}
+
 void test_host_placement_overrides_aggregate_free_bytes() {
     Fixture f(48);
     (void)f.program.host_block(16, true);
@@ -2140,7 +1967,9 @@ void test_host_placement_overrides_aggregate_free_bytes() {
     const auto second                             = f.program.add({2}, {f.program.host_block(8)});
     const auto incoming                           = f.program.add(tokens(100, 1000));
     f.program.contents[first.index].device_state  = false;
+    f.program.contents[first.index].main_pages        = 0;
     f.program.contents[second.index].device_state = false;
+    f.program.contents[second.index].main_pages       = 0;
     f.program.contents[incoming.index].demotion_bytes = 8;
     f.program.placement_holders                       = {first, second};
     f.publish(first);
@@ -2150,7 +1979,7 @@ void test_host_placement_overrides_aggregate_free_bytes() {
     require(!f.cache.host_victims(f.program, 8, incoming, {}, excluded) &&
                 f.program.released.empty(),
             "Host placement accepted enough aggregate bytes without a realizable destination");
-    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{first, second} &&
                 f.program.demoted == std::vector<Handle>{incoming} &&
@@ -2178,23 +2007,31 @@ void test_independent_host_candidates_reuse_scores() {
         }
     }
 }
+
+void test_execution_dependency_does_not_become_empty_payload_reclaim() {
+    Fixture f(64);
+    const auto retained = f.program.add({1, 2, 3});
+    f.publish(retained);
+    const Assessment waiting{.pending_dependency = true};
+    require(f.cache.reclaim(f.program, waiting) == ninfer::runtime::ReclaimProgress::Deferred &&
+                f.program.released.empty() && f.program.demoted.empty(),
+            "execution dependency was reinterpreted as an immediately retryable empty demand");
+}
 } // namespace
 
 int main() {
     try {
         test_shared_publication_deduplicates_complete_snapshots();
+        test_execution_dependency_does_not_become_empty_payload_reclaim();
         test_intermediate_capture_preserves_semantic_history();
         test_host_selection_against_full_rescoring();
+        test_reclaim_assesses_combined_device_and_host_demand();
         test_host_placement_overrides_aggregate_free_bytes();
         test_independent_host_candidates_reuse_scores();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_device_candidates_share_host_inventory();
-        test_adjacent_kv_demotions_share_one_submission();
-        test_kv_demotion_batch_stops_at_an_intervening_delete();
-        test_redundant_delete_does_not_split_or_replace_a_deferred_kv_batch();
-        test_partially_covered_delete_still_stops_a_kv_batch();
-        test_kv_demotion_batch_preserves_host_and_outer_permission_limits();
-        test_failed_kv_demotion_batch_falls_back_without_host_deletion();
+        test_device_pressure_does_not_erase_host_only_sources();
+        test_reclaim_does_not_reward_excess_release();
         test_optional_capture_cannot_borrow_a_demotion_sources_heat();
         test_unproven_suffix_can_retreat_without_losing_a_new_dialogue();
         test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it();
@@ -2230,9 +2067,6 @@ int main() {
         test_session_submission_order_controls_only_the_named_hint();
         test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity();
         test_explicit_anchor_updates_remain_bounded_across_requests();
-        test_forked_hot_records_do_not_bypass_the_soft_capacity_target();
-        test_reclaim_targets_the_requested_pool();
-        test_large_hotspot_is_preserved_per_resource_pool();
         test_one_off_fanout_competes_with_repeated_continuation();
         test_reclaim_cursor_keeps_order_across_hits_and_transfers();
         test_reclaim_cursor_reconsiders_a_previously_excluded_source();

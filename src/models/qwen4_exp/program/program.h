@@ -28,7 +28,6 @@ public:
     [[nodiscard]] SessionPlan session_plan() const;
     void prepare_execution();
     void release_execution();
-    [[nodiscard]] std::vector<context::KVTransferProfile> context_transfer_profiles() const;
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);
     void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;

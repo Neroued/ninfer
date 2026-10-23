@@ -80,7 +80,7 @@ inline Options parse_options(int argc, char** argv) {
     bool token_options = false, state_options = false;
     bool projection_only = false, tail_only = false, prepare_only = false, head_options = false;
     bool indexer_only = false, base_options = false, sparse_only = false, cache_option = false;
-    bool score_option = false;
+    bool score_option = false, layout_option = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -98,14 +98,14 @@ inline Options parse_options(int argc, char** argv) {
                    "contiguous|layered|unaligned\n"
                    "Indexer: --tokens T[,T...] --batch B --contexts L[,L...]\n"
                    "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
-                   "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
+                   "  --valid dense|N[,N...]\n"
                    "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n  "
                    "--query-heads Hq --kv-heads Hkv (24/2 or 12/1)\n  --prefix-tokens "
                    "P[,P...] (derive each context as prefix + valid length)\n"
                    "  --selection random|shared|contiguous --selected-blocks 0..512\n"
                    "  --context-capacity N (default maximum L)\n"
                    "  --kv-cache bf16|int8|fp8|nvfp4|k8v4 (default bf16)\n"
-                   "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
+                   "  --valid dense|N[,N...]\n"
                    "Tail extraction:\n"
                    "  --capacity R[,R...] --batch B --base-positions F0[,F0...]\n"
                    "  --valid dense|N[,N...] --accepted dense|mixed|N[,N...]\n"
@@ -131,6 +131,7 @@ inline Options parse_options(int argc, char** argv) {
         sparse_only |= flag == "--selection" || flag == "--selected-blocks" ||
                        flag == "--query-heads" || flag == "--prefix-tokens";
         score_option |= flag == "--score-pattern";
+        layout_option |= flag == "--layout";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
@@ -208,7 +209,8 @@ inline Options parse_options(int argc, char** argv) {
         o.op != "prepare-kv" && o.op != "indexer" && o.op != "sparse-gqa")
         throw std::invalid_argument(
             "op: input-proj|tail-extract|prepare|prepare-kv|indexer|sparse-gqa");
-    if ((o.op != "input-proj" && o.op != "prepare" && o.op != "prepare-kv" &&
+    if (((o.op == "indexer" || o.op == "sparse-gqa") && layout_option) ||
+        (o.op != "input-proj" && o.op != "prepare" && o.op != "prepare-kv" &&
          o.op != "sparse-gqa" && head_options) ||
         (o.op != "indexer" && score_option) ||
         (o.op != "prepare" && o.op != "prepare-kv" && o.op != "sparse-gqa" && cache_option) ||

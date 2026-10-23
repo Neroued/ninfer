@@ -9,7 +9,7 @@
 namespace ninfer::runtime {
 
 struct StartupMemorySummary {
-    ContextCapacityResolution context_capacity;
+    std::vector<ContextCapacityResolution> context_capacities;
     std::size_t device_budget_bytes = 0;
     std::optional<GraphMemorySummary> cuda_graph;
     std::int64_t startup_retained_bytes = 0;

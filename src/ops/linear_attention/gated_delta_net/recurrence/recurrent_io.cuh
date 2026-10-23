@@ -70,11 +70,10 @@ struct BatchUpdateAccess {
     const float* beta;
     const float* states_read;
     float* states_write;
-    const std::int32_t* source_state_slots;
-    const std::int32_t* destination_state_slots;
+    const std::int64_t* source_offsets;
+    const std::int64_t* destination_offsets;
     __nv_bfloat16* out;
     HeadMap heads;
-    std::int64_t state_slot_stride;
     float scale;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
@@ -90,14 +89,12 @@ struct BatchUpdateAccess {
 
     __device__ __forceinline__ const float*
     state_read_base(const RecurrentCoordinates& coord) const {
-        return states_read +
-               static_cast<std::int64_t>(source_state_slots[coord.batch]) * state_slot_stride +
+        return states_read + source_offsets[coord.batch] / sizeof(float) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
-        return states_write +
-               static_cast<std::int64_t>(destination_state_slots[coord.batch]) * state_slot_stride +
+        return states_write + destination_offsets[coord.batch] / sizeof(float) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 

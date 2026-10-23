@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/buffer.h"
+#include "core/transfer.h"
 #include "models/common/context/storage.h"
 
 #include <span>
@@ -50,6 +51,7 @@ private:
     ContextStorage* storage_;
     CudaExecutionView execution_;
     PinnedHostBuffer mapping_;
+    CudaCopyBatch copies_;
     CudaCompletionEvent source_ready_;
     CudaCompletionEvent completed_;
     std::vector<CudaEventTimer> timers_;

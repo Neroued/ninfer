@@ -163,15 +163,17 @@ Options parse_options(int argc, char** argv) {
 }
 
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t window,
-                                         std::int32_t batch) {
+                                         const Tensor& offsets) {
+    const std::size_t bytes = std::size_t(kHeadDim) * window * kKvHeads * 2;
     return {
-        .k               = Tensor(k.span(), DType::BF16, {kHeadDim, window, kKvHeads, batch}),
-        .v               = Tensor(v.span(), DType::FP16, {kHeadDim, window, kKvHeads, batch}),
+        .k               = {{k.span(), offsets},
+                            {{{0, bytes, 16}, DType::BF16, {kHeadDim, window, kKvHeads, 1}}, 1, bytes}},
+        .v               = {{v.span(), offsets},
+                            {{{0, bytes, 16}, DType::FP16, {kHeadDim, window, kKvHeads, 1}}, 1, bytes}},
         .capacity        = static_cast<std::uint32_t>(window),
         .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
-        .slot_count      = batch,
     };
 }
 
@@ -207,7 +209,7 @@ public:
           valid_(ninfer::bench::device_context().device(),
                  static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
           lane_(ninfer::bench::device_context().device(),
-                static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+                static_cast<std::size_t>(batch) * sizeof(std::int64_t)),
           context_k_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * window * kKvHeads * batch, 107U)),
           context_v_(
@@ -222,15 +224,16 @@ public:
           query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
           positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
           valid_tensor_(valid_.span(), DType::I32, {batch}),
-          lane_tensor_(lane_.span(), DType::I32, {batch}),
+          lane_tensor_(lane_.span(), DType::I64, {batch}),
           output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
-          context_view_(make_context_view(context_k_, context_v_, window, batch)),
+          context_view_(make_context_view(context_k_, context_v_, window, lane_tensor_)),
           envelope_{0, static_cast<std::uint32_t>(maximum)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch);
         std::vector<std::int32_t> host_valid(static_cast<std::size_t>(batch), tokens);
-        std::vector<std::int32_t> host_lanes(static_cast<std::size_t>(batch));
+        std::vector<std::int64_t> host_lanes(static_cast<std::size_t>(batch));
         for (std::int32_t row = 0; row < batch; ++row) {
-            host_lanes[static_cast<std::size_t>(row)] = row;
+            host_lanes[static_cast<std::size_t>(row)] =
+                std::int64_t(row) * kHeadDim * window * kKvHeads * 2;
             for (std::int32_t token = 0; token < tokens; ++token) {
                 host_positions[static_cast<std::size_t>(row * tokens + token)] = context + token;
             }
@@ -245,7 +248,7 @@ public:
 
     void launch(CudaExecutionView cuda) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                      positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
+                                      positions_tensor_, valid_tensor_, kGeometry,
                                       static_cast<std::uint32_t>(window_), kScale, context_view_,
                                       envelope_, workspace_, output_tensor_, cuda);
     }

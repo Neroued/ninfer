@@ -255,14 +255,15 @@ void run_snapshot(const Options& options) {
     DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
     DeviceBuffer weight =
         make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DeviceBuffer states = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer states    = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer snapshots = make_zeros(state_n * sizeof(std::uint16_t));
     DeviceBuffer initial_slot =
-        make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int32_t));
+        make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int64_t));
     DeviceBuffer snapshot_base_slot =
         make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int32_t));
     DeviceBuffer valid_columns;
     DeviceBuffer out = make_zeros(n * 2u);
-    std::vector<std::int32_t> initial_host(static_cast<std::size_t>(options.batch));
+    std::vector<std::int64_t> initial_host(static_cast<std::size_t>(options.batch));
     std::vector<std::int32_t> base_host(static_cast<std::size_t>(options.batch));
     if (options.batch == 1) {
         initial_host[0] = options.initial_slot;
@@ -272,6 +273,7 @@ void run_snapshot(const Options& options) {
             initial_host[static_cast<std::size_t>(row)] = options.batch * options.tokens + row;
         }
     }
+    for (auto& offset : initial_host) offset *= 6LL * options.channels;
     CUDA_CHECK(cudaMemcpy(initial_slot.data(), initial_host.data(), initial_slot.size(),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(snapshot_base_slot.data(), base_host.data(), snapshot_base_slot.size(),
@@ -286,12 +288,17 @@ void run_snapshot(const Options& options) {
     const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
     Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens, options.batch});
     Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
-    Tensor ts(states.span(), DType::BF16, {options.channels, 3, slots});
     Tensor tvalid;
     if (!options.valid_columns.empty()) {
         tvalid = Tensor(valid_columns.span(), DType::I32, {options.batch});
     }
-    Tensor tslot(initial_slot.span(), DType::I32, {options.batch});
+    Tensor tslot(initial_slot.span(), DType::I64, {options.batch});
+    const StateFieldView source{
+        {states.span(), tslot},
+        {{{0, std::size_t(options.channels) * 6, 2}, DType::BF16, {options.channels, 3, 1, 1}},
+         1,
+         0}};
+    Tensor snapshot(snapshots.span(), DType::BF16, {options.channels, 3, slots});
     Tensor tsnapshot_base(snapshot_base_slot.span(), DType::I32, {options.batch});
     Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens, options.batch});
 
@@ -302,7 +309,8 @@ void run_snapshot(const Options& options) {
     const Result r = time_stage(
         options,
         [&](CudaExecutionView cuda) {
-            ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, cuda);
+            ops::causal_conv1d_silu_snapshot(tx, tw, source, snapshot, tvalid, tsnapshot_base, tout,
+                                             cuda);
         },
         bytes, restore);
     const std::string tag = shape_tag(

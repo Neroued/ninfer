@@ -103,19 +103,21 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
- * capacity query below; implementations that need no partial state return zero capacity.
+ * Cache planes share packed page records selected by an I64 byte-offset table. Row and head
+ * strides describe fields inside one record. Attention consumes this cache directly.
+ * Caller-owned transient storage is bounded by the capacity query below; implementations that
+ * need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
  * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
  * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
- * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
- * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
- * allocation, frontier, request identity, or commit authority. `execution` supplies the stream and
- * positive physical SM count used for launch and workspace planning; capacity queries must use the
- * same count as execution.
+ * each capture. Inputs, output, addressed cache fields, the offset table, and live workspace
+ * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but owns
+ * no cache allocation, frontier, request identity, or commit authority. `execution` supplies the
+ * stream and positive physical SM count used for launch and workspace planning; capacity queries
+ * must use the same count as execution.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
@@ -128,13 +130,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
- * and cache geometry, visible rows, scale, numerical semantics, envelope, alias, and workspace rules
- * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
- * unchanged; out is completely overwritten.
+ * and cache geometry, visible rows, scale, numerical semantics, envelope, alias, and workspace
+ * rules are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache
+ * byte unchanged; out is completely overwritten.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
-                                     const PagedKVLayerView& cache,
+                                     const ConstPagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
                                      MemoryArena& workspace, Tensor& out,
                                      CudaExecutionView execution);
@@ -156,8 +158,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
  * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
- * [128,64,Nphysical,8].
+ * The read-only BFloat16 context stores BF16 K and FP16 V fields [128,64,8] within each
+ * packed page record. Its I64 [logical_pages,table_rows] table contains arena-relative byte
+ * offsets; table_rows selects a row of that table.
  *
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
  * complete logical set consisting of context rows [0,L) followed by every temporary query K/V row
@@ -173,7 +176,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
-                               float scale, const PagedKVBatchLayerView& context,
+                               float scale, const ConstPagedKVBatchLayerView& context,
                                ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                                Tensor& out, CudaExecutionView execution);
 

@@ -1,7 +1,8 @@
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
-#include "runtime/contract/resources.h"
+#include "models/common/context/directory.h"
 
+#include <array>
 #include <iostream>
 #include <random>
 
@@ -19,7 +20,8 @@ struct Record {
 };
 
 struct View {
-    context::CheckpointStore<Record> store{128};
+    context::MetadataBudget metadata{context::CheckpointStore<Record>::metadata_bytes(128)};
+    context::CheckpointStore<Record> store{128, metadata};
     bool collide = false;
 
     const std::uint64_t& revision() const { return store.revision(); }
@@ -82,6 +84,22 @@ std::uint64_t oracle(const View& view, std::span<const Handle> input,
         result += worst;
     }
     return result;
+}
+
+void catalog_reclamation() {
+    View view;
+    const auto old    = view.add({1, 2, 3});
+    const auto bytes  = view.store.released_metadata(std::array{view.store.retirement(old)});
+    const auto before = view.metadata.allocated();
+    require(view.store.erase(old) && before == view.metadata.allocated() + bytes && bytes != 0,
+            "catalog quote differs from actual empty-segment retirement");
+    const auto fresh = view.add({4, 5, 6});
+    require(!view.store.valid(old) && view.store.valid(fresh) && fresh.generation != old.generation,
+            "catalog segment reuse revived a stale checkpoint");
+    view.store.clear();
+    context::MetadataAccount other(view.metadata);
+    other.acquire(view.metadata.available());
+    require(!view.store.reserve(), "optional checkpoint capture ignored shared metadata pressure");
 }
 
 void known_losses() {
@@ -204,8 +222,15 @@ void exhaustive_and_random() {
     }
 }
 
+bool same_release(const context::ContextReleaseSet& a, const context::ContextReleaseSet& b) {
+    return a.records.size() == b.records.size() &&
+           std::all_of(a.records.begin(), a.records.end(), [&](const auto& record) {
+               return std::find(b.records.begin(), b.records.end(), record) != b.records.end();
+           });
+}
+
 void physical_selection() {
-    using Resources = ninfer::runtime::ContextResources<3>;
+    using Resources = context::ContextReleaseSet;
     std::mt19937 random(403);
     for (unsigned trial = 0; trial < 60; ++trial) {
         context::ReleaseInventory<Resources> inventory(12);
@@ -219,11 +244,12 @@ void physical_selection() {
             for (const auto h : handles)
                 if (random() % 5 == 0) holders.push_back(h);
             if (holders.empty()) holders.push_back(handles[random() % handles.size()]);
-            inventory.add(std::move(holders),
-                          {.state_slots    = unsigned(random() % 2),
-                           .kv_page_groups = {unsigned(random() % 4), unsigned(random() % 3),
-                                              unsigned(random() % 2)},
-                           .host_bytes     = random() % 64});
+            Resources released;
+            released.records.push_back(
+                {{unsigned(random() % 2), context::ContextMemory::Device}, {0, i, 1}});
+            if (random() % 2)
+                released.records.push_back({{0, context::ContextMemory::Host}, {1, i, 1}});
+            inventory.add(std::move(holders), std::move(released));
         }
         auto selection    = inventory.select();
         const auto oracle = [&] {
@@ -233,10 +259,7 @@ void physical_selection() {
                         return std::find(selection.handles().begin(), selection.handles().end(),
                                          h) != selection.handles().end();
                     })) {
-                    expected.state_slots += object.released.state_slots;
-                    expected.host_bytes += object.released.host_bytes;
-                    for (unsigned pool = 0; pool < 3; ++pool)
-                        expected.kv_page_groups[pool] += object.released.kv_page_groups[pool];
+                    expected.merge(object.released);
                 }
             return expected;
         };
@@ -247,11 +270,12 @@ void physical_selection() {
             const bool commit = random() % 4 == 0;
             {
                 auto probe = selection.probe(additions);
-                require(selection.released() == oracle(),
+                require(same_release(selection.released(), oracle()),
                         "incremental release counted a partial or duplicate holder set");
                 if (commit) probe.commit();
             }
-            require(selection.released() == oracle() && (commit || selection.released() == before),
+            require(same_release(selection.released(), oracle()) &&
+                        (commit || same_release(selection.released(), before)),
                     "physical trial did not restore its release facts");
         }
     }
@@ -260,6 +284,7 @@ void physical_selection() {
 
 int main() {
     try {
+        catalog_reclamation();
         known_losses();
         lifecycle();
         exhaustive_and_random();

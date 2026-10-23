@@ -20,7 +20,7 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
     const float scale    = static_cast<float>(1.0 / std::sqrt(double(c.key_dim)));
     auto scope           = arena.scope();
     const auto m         = batch.tokens * batch.batch;
-    const auto* sequence = std::get_if<SequenceSlots>(&update);
+    const auto* sequence = std::get_if<SequenceState>(&update);
     auto b               = workspace::gdn(arena, c, m, sequence != nullptr);
     {
         auto scratch = arena.scope();
@@ -32,20 +32,20 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
             const std::array outputs{b.qkv, b.z};
             ops::linear_split(input, p.input, outputs, arena, cuda);
         }
-        auto before = states.conv_slot(layer, sequence->source);
-        auto after  = states.conv_slot(layer, sequence->destination);
+        auto before = states.conv_tensor(layer, sequence->source);
+        auto after  = states.conv_tensor(layer, sequence->destination);
         auto q      = b.query.view({kw, m});
         auto k      = b.key.view({kw, m});
         auto v      = b.value.view({vw, m});
         ops::causal_conv1d_silu_split(b.qkv, p.convolution, before, after, q, k, v, cuda);
-        auto initial   = states.recurrent_slot(layer, sequence->source);
-        auto final     = states.recurrent_slot(layer, sequence->destination);
+        auto initial   = states.recurrent_tensor(layer, sequence->source);
+        auto final     = states.recurrent_tensor(layer, sequence->destination);
         auto recurrent = b.recurrent.view({vd, vh, m});
         auto scratch   = arena.scope();
         ops::gated_delta_net(b.query, b.key, b.value, b.g, b.beta, scale, true, arena, initial,
                              final, recurrent, cuda);
     } else if (const auto* record = std::get_if<VerifyRecords>(&update)) {
-        auto state         = states.layer_view(layer);
+        auto state         = states.layer_view(layer, batch.source_offsets);
         const auto records = record->gdn.layer(layer, batch.batch);
         const auto t       = batch.tokens;
         auto q             = b.query.view({kd, kh, t, batch.batch});
@@ -55,37 +55,38 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
         {
             auto scratch = arena.scope();
             auto conv    = records.conv;
-            ops::gdn_input_proj_conv_record(
-                input.view({input.ne[0], t, batch.batch}), p.input, p.convolution,
-                {state.conv, batch.source_slots}, batch.valid_columns,
-                {q.view({kw, t, batch.batch}), k.view({kw, t, batch.batch}),
-                 v.view({vw, t, batch.batch}), z},
-                conv, arena, cuda);
+            ops::gdn_input_proj_conv_record(input.view({input.ne[0], t, batch.batch}), p.input,
+                                            p.convolution, state.conv, batch.valid_columns,
+                                            {q.view({kw, t, batch.batch}),
+                                             k.view({kw, t, batch.batch}),
+                                             v.view({vw, t, batch.batch}), z},
+                                            conv, arena, cuda);
         }
         auto recurrent = b.recurrent.view({vd, vh, t, batch.batch});
         ops::gated_delta_net_replay_record(
             q, k, v, b.g.view({vh, t, batch.batch}), b.beta.view({vh, t, batch.batch}), scale,
-            state.recurrent, batch.valid_columns, batch.source_slots,
-            {records.key, records.value, records.gate}, recurrent, cuda);
+            state.recurrent, batch.valid_columns, {records.key, records.value, records.gate},
+            recurrent, cuda);
     } else {
-        auto state = states.layer_view(layer);
-        auto q     = b.query.view({kd, kh, 1, batch.batch});
-        auto k     = b.key.view({kd, kh, 1, batch.batch});
-        auto v     = b.value.view({vd, vh, 1, batch.batch});
-        auto z     = b.z.view({vw, 1, batch.batch});
+        auto before = states.layer_view(layer, batch.source_offsets);
+        auto after  = states.layer_view(layer, batch.destination_offsets);
+        auto q      = b.query.view({kd, kh, 1, batch.batch});
+        auto k      = b.key.view({kd, kh, 1, batch.batch});
+        auto v      = b.value.view({vd, vh, 1, batch.batch});
+        auto z      = b.z.view({vw, 1, batch.batch});
         {
             auto scratch = arena.scope();
-            ops::gdn_input_proj_conv_snapshot(
-                input.view({input.ne[0], 1, batch.batch}), p.input, p.convolution,
-                {state.conv, batch.source_slots, batch.destination_slots}, batch.valid_columns,
+            ops::gdn_input_proj_conv_update(
+                input.view({input.ne[0], 1, batch.batch}), p.input, p.convolution, before.conv,
+                after.conv, batch.valid_columns,
                 {q.view({kw, 1, batch.batch}), k.view({kw, 1, batch.batch}),
                  v.view({vw, 1, batch.batch}), z},
                 arena, cuda);
         }
         auto recurrent = b.recurrent.view({vd, vh, 1, batch.batch});
-        ops::gated_delta_net_batch_update(
-            q, k, v, b.g.view({vh, 1, batch.batch}), b.beta.view({vh, 1, batch.batch}), scale, true,
-            state.recurrent, batch.source_slots, batch.destination_slots, recurrent, cuda);
+        ops::gated_delta_net_batch_update(q, k, v, b.g.view({vh, 1, batch.batch}),
+                                          b.beta.view({vh, 1, batch.batch}), scale, true,
+                                          before.recurrent, after.recurrent, recurrent, cuda);
     }
     auto normalized = b.normalized.view({vd, vh, m});
     ops::sigmoid_gated_rmsnorm(b.recurrent.view({vd, vh, m}), p.norm, b.z.view({vd, vh, m}),

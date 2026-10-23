@@ -1,6 +1,8 @@
 #pragma once
 
 #include "models/common/context/contract.h"
+#include "models/common/context/directory/state.h"
+#include "models/common/context/directory/history.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include "runtime/contract/resources.h"
 #include "runtime/executor/contract.h"
@@ -22,7 +24,7 @@ struct ExecutionRow {
     runtime::ExecutionMember member;
     context::StateId source_state;
     context::StateId destination_state;
-    context::StateSelectors state_slots;
+    context::StateSelectors state_offsets;
     context::TableRow main_table;
     std::optional<context::TableRow> backend_table;
     std::uint32_t main_frontier    = 0;

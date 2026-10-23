@@ -47,8 +47,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    const std::int32_t kQkHeads     = value_heads == 24 ? 8 : 16;
-    const bool dense                = valid_columns.empty();
+    const std::int32_t kQkHeads = value_heads == 24 ? 8 : 16;
+    const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
     const std::int32_t slots         = 8;
@@ -89,8 +89,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer reference_final(ninfer::test::cuda_environment().context.device(),
                                  static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
                                      batch * sizeof(float));
-    DeviceBuffer record_state   = to_device(state);
-    DeviceBuffer device_initial = to_device(initial_slots);
+    DeviceBuffer record_state = to_device(state);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
@@ -119,15 +118,16 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                             {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.span(), DType::FP32,
                          {kStateDim, kStateDim, value_heads, slots});
-    SlottedStateFixture history(record_states, 3);
-    record_states = history.tensor;
+    RecordStateFixture history(record_states, 3);
     Tensor reference_final_states(reference_final.span(), DType::FP32,
                                   {kStateDim, kStateDim, value_heads, batch});
-    DeviceBuffer reference_slot = to_device(std::vector<std::int32_t>{0});
-    Tensor selected_reference_slot(reference_slot.span(), DType::I32, {1});
+    DeviceBuffer reference_slot = to_device(std::vector<std::int64_t>{0});
+    Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
-    Tensor initial(device_initial.span(), DType::I32, {batch});
+    auto initial_offsets        = history.record_offsets(initial_slots);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {batch});
     Tensor reference_output(reference_out.span(), DType::BF16,
                             {kStateDim, value_heads, width, batch});
     Tensor record_output(record_out.span(), DType::BF16, {kStateDim, value_heads, width, batch});
@@ -178,15 +178,17 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                 auto gt = g_row.slice(1, token, 1);
                 auto bt = beta_row.slice(1, token, 1);
                 auto ot = out_row.slice(2, token, 1);
-                ops::gated_delta_net_batch_update(qt, kt, vt, gt, bt, kScale, true, final_row,
-                                                  selected_reference_slot, selected_reference_slot,
-                                                  ot, stream_execution);
+                ops::gated_delta_net_batch_update(
+                    qt, kt, vt, gt, bt, kScale, true,
+                    dense_record_field(final_row, 3, selected_reference_slot),
+                    dense_record_field(final_row, 3, selected_reference_slot), ot,
+                    stream_execution);
             }
         }
     };
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(
-            q, k, v, g_tensor, beta_tensor, kScale, record_states, valid, initial,
+            q, k, v, g_tensor, beta_tensor, kScale, history.view(initial), valid,
             {key_record_tensor, value_record_tensor, gate_record_tensor}, record_output,
             stream_execution);
     };
@@ -206,7 +208,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaMemcpyAsync(device_q.data(), q_bits.data(), device_q.size(),
                                    cudaMemcpyHostToDevice, stream));
         for (auto& slot : initial_slots) slot = (slot + 3) % slots;
-        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_slots.data(),
+        initial_offsets = history.record_offsets(initial_slots);
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
                                    device_initial.size(), cudaMemcpyHostToDevice, stream));
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;

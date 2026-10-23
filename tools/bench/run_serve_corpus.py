@@ -480,7 +480,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     actual = {
         "device": engine.get("device"),
         "max_context": engine.get("max_context"),
-        "kv_capacity": engine.get("kv_capacity"),
+        "context_capacity_mode": engine.get("context_capacity_mode"),
         "prefill_chunk": engine.get("prefill_chunk"),
         "kv_cache": engine.get("kv_cache"),
         "cuda_graph": engine.get("cuda_graph"),
@@ -492,7 +492,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     expected = {
         "device": device,
         "max_context": 262144,
-        "kv_capacity": 262144,
+        "context_capacity_mode": "auto",
         "prefill_chunk": 1024,
         "kv_cache": KV_CACHE_NAMES[spec.kv_dtype],
         "cuda_graph": True,
@@ -504,10 +504,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
-    if (
-        context_cache.get("extra_state_slots") != 0
-        or context_cache.get("host_capacity_bytes") != 0
-    ):
+    if context_cache.get("host_capacity_bytes") != 0:
         raise CampaignError("server_start context cache capacity differs from the campaign")
     if (event.get("sampling_defaults", {}).get("server_overrides", {}).get("temperature") == 0) != (
         spec.sampling_mode == "greedy"
@@ -762,8 +759,8 @@ def server_command(
         spec.model_id,
         "--max-context",
         "262144",
-        "--kv-capacity",
-        "262144",
+        "--context-capacity",
+        "auto",
         "--prefill-chunk",
         "1024",
         "--stats-interval",
@@ -775,8 +772,6 @@ def server_command(
         "--kv-dtype",
         spec.kv_dtype,
         "--no-prefix-reuse",
-        "--extra-state-slots",
-        "0",
         "--host-cache-capacity",
         "0",
     ]

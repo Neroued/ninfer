@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/buffer.h"
+#include "core/context_pool.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "models/common/moe/schedule.h"
@@ -30,6 +31,7 @@ struct ResourceSpec {
     std::optional<GdnReplayRecordSpec> replay_records;
     std::optional<DFlashPersistentSpec> dflash;
     FrameSpec frame;
+    std::size_t context_bytes      = 0;
     std::size_t host_context_bytes = 0;
 };
 
@@ -38,10 +40,6 @@ struct DFlashPersistentLayout {
     TensorRegion prefill_features;
     TensorRegion prefill_positions;
     TensorRegion pending_features;
-
-    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return full ? full->payload_bytes() : 0;
-    }
 };
 
 struct ResourceLayout {
@@ -51,11 +49,12 @@ struct ResourceLayout {
     std::optional<DFlashPersistentLayout> dflash;
     FrameLayout frame;
     std::optional<TensorRegion> token_counts;
+    std::size_t context_bytes      = 0;
     std::size_t host_context_bytes = 0;
     std::size_t bytes              = 0;
-    std::size_t kv_payload_bytes   = 0;
 
     [[nodiscard]] std::size_t pinned_bytes() const;
+    [[nodiscard]] std::vector<RecordSpec> context_records() const;
 };
 
 struct WorkspaceSpec {
@@ -78,15 +77,15 @@ struct DFlashPersistentState {
     std::optional<PagedKVCache> full;
     Tensor prefill_features, prefill_positions, pending_features;
 
-    DFlashPersistentState(MemorySpan backing, const DFlashPersistentLayout& layout,
-                          CyclicKVCacheView& local_state);
+    DFlashPersistentState(MemorySpan arena, MemorySpan backing,
+                          const DFlashPersistentLayout& layout, CyclicKVCacheView& local_state);
 
-    [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer) const;
+    [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer,
+                                                     const Tensor& offsets) const;
     [[nodiscard]] PagedKVBatchLayerView full_batch_layer(std::uint32_t layer) const;
 };
 
-// Fixed rank-local backing. Logical slots, references and residency assignment belong to the
-// Session's context directory; this object only binds their physical views.
+// Rank-owned arenas and execution storage; the Directory assigns each Context record.
 class Resources {
 public:
     Resources(DeviceContext& device, const ResourceLayout& layout, const WorkspaceSpec& workspace,
@@ -97,6 +96,8 @@ public:
     [[nodiscard]] PagedKVCache* backend_kv() noexcept;
     [[nodiscard]] const PagedKVCache* backend_kv() const noexcept;
 
+    const std::vector<RecordSpec> context_records;
+    DeviceBuffer context;
     DeviceBuffer persistent;
     DeviceBuffer workspace_storage;
     PinnedHostBuffer host_context;

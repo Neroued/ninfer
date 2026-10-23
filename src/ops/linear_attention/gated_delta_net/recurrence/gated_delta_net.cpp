@@ -75,10 +75,12 @@ RecurrenceGeometry validate_recurrent(const Tensor& q, const Tensor& k, const Te
     return geometry;
 }
 
-RecurrenceGeometry validate_recurrent_batch_update(
-    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
-    float scale, const Tensor& ssm_states, const Tensor& source_state_slots,
-    const Tensor& destination_state_slots, const Tensor& out, Device device) {
+RecurrenceGeometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k,
+                                                   const Tensor& v, const Tensor& g,
+                                                   const Tensor& beta, float scale,
+                                                   ConstStateFieldView source_state,
+                                                   StateFieldView destination_state,
+                                                   const Tensor& out, Device device) {
     constexpr std::int32_t kMaximumBatch = 8;
     common::operand::dtype(q, DType::BF16, "gated_delta_net", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "gated_delta_net", "k must be BF16");
@@ -86,11 +88,6 @@ RecurrenceGeometry validate_recurrent_batch_update(
     common::operand::dtype(out, DType::BF16, "gated_delta_net", "out must be BF16");
     common::operand::dtype(g, DType::FP32, "gated_delta_net", "g must be FP32");
     common::operand::dtype(beta, DType::FP32, "gated_delta_net", "beta must be FP32");
-    common::operand::dtype(ssm_states, DType::FP32, "gated_delta_net", "ssm_states must be FP32");
-    common::operand::dtype(source_state_slots, DType::I32, "gated_delta_net",
-                           "source_state_slots must be I32");
-    common::operand::dtype(destination_state_slots, DType::I32, "gated_delta_net",
-                           "destination_state_slots must be I32");
 
     const RecurrenceGeometry geometry = require_geometry(q, v);
     const std::int32_t batch          = q.ne[3];
@@ -113,38 +110,23 @@ RecurrenceGeometry validate_recurrent_batch_update(
                            "g");
     common::operand::shape(beta, {geometry.value_heads, geometry.tokens, batch, 1},
                            "gated_delta_net", "beta");
-    if (ssm_states.ne[0] != detail::gated_delta_net::kStateDim ||
-        ssm_states.ne[1] != detail::gated_delta_net::kStateDim ||
-        ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] <= 0) {
-        throw std::invalid_argument("gated_delta_net: invalid shape for pooled ssm_states");
+    for (const auto& state : std::array<ConstStateFieldView, 2>{source_state, destination_state}) {
+        if (state.field.layers != 1)
+            throw std::invalid_argument("gated_delta_net: select one recurrent state layer");
+        common::operand::state_field(state, DType::FP32, {128, 128, geometry.value_heads}, 16,
+                                     "gated_delta_net", "recurrent state", device);
+        common::operand::shape(state.records.byte_offsets, {batch, 1, 1, 1}, "gated_delta_net",
+                               "state byte offsets");
     }
-    common::operand::shape(source_state_slots, {batch, 1, 1, 1}, "gated_delta_net",
-                           "source_state_slots");
-    common::operand::shape(destination_state_slots, {batch, 1, 1, 1}, "gated_delta_net",
-                           "destination_state_slots");
 
     common::operand::contiguous_nonnull(q, "gated_delta_net", "q", device);
     common::operand::contiguous_nonnull(k, "gated_delta_net", "k", device);
     common::operand::contiguous_nonnull(v, "gated_delta_net", "v", device);
     common::operand::contiguous_nonnull(g, "gated_delta_net", "g", device);
     common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta", device);
-    common::operand::slotted_tensor(ssm_states, DType::FP32,
-                                    {128, 128, geometry.value_heads, ssm_states.ne[3]}, 3, 16,
-                                    "gated_delta_net", "ssm_states", device);
-    common::operand::contiguous_nonnull(source_state_slots, "gated_delta_net", "source_state_slots",
-                                        device);
-    common::operand::contiguous_nonnull(destination_state_slots, "gated_delta_net",
-                                        "destination_state_slots", device);
     common::operand::contiguous_nonnull(out, "gated_delta_net", "out", device);
 
     detail::gated_delta_net::require_scale(scale, "gated_delta_net");
-    const auto state_blocks = common::operand::blocks(ssm_states, "gated_delta_net");
-    for (const Tensor* operand :
-         {&q, &k, &v, &g, &beta, &source_state_slots, &destination_state_slots, &out}) {
-        if (common::operand::overlaps(state_blocks,
-                                      common::operand::range(*operand, "gated_delta_net")))
-            throw std::invalid_argument("gated_delta_net: operands overlap state storage");
-    }
 
     return geometry;
 }
@@ -188,17 +170,15 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
-                                  bool normalize_qk, Tensor& ssm_states,
-                                  const Tensor& source_state_slots,
-                                  const Tensor& destination_state_slots, Tensor& out,
+                                  bool normalize_qk, ConstStateFieldView source_state,
+                                  StateFieldView destination_state, Tensor& out,
                                   CudaExecutionView execution) {
     const auto stream = execution.stream();
-    validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
-                                    destination_state_slots, out, execution.device());
+    validate_recurrent_batch_update(q, k, v, g, beta, scale, source_state, destination_state, out,
+                                    execution.device());
 
-    detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
-                                                           ssm_states, source_state_slots,
-                                                           destination_state_slots, out, stream);
+    detail::gated_delta_net::launch_recurrent_batch_update(
+        q, k, v, g, beta, scale, normalize_qk, source_state, destination_state, out, stream);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

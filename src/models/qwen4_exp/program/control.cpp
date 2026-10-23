@@ -26,7 +26,8 @@ void RankProgramImpl::prepare_control_window() {
     row.main_frontier += begin;
     row.mtp_frontier = row.main_frontier ? row.main_frontier - 1 : 0;
     if (begin) {
-        row.slots.source = row.slots.destination;
+        row.states.at(parameters.profile->local.rank).source =
+            row.states.at(parameters.profile->local.rank).destination;
         row.ple_raw_tail = {begin > 1 ? original.ids[begin - 2] : original.ple_raw_tail[1],
                             original.ids[begin - 1]};
         for (int axis = 0; axis < 3; ++axis)

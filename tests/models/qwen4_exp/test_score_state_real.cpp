@@ -79,7 +79,7 @@ public:
             } else {
                 first_request = request;
             }
-            const auto image = read_state(row.slots.source);
+            const auto image = read_state(row.states.at(0).source);
             require(std::all_of(image.begin(), image.end(),
                                 [](std::byte value) { return value == std::byte{}; }),
                     "fresh scoring inherited nonzero GDN, QSA or PLE state");
@@ -121,7 +121,7 @@ public:
                 require(positions[t] == static_cast<std::int32_t>(t),
                         "fresh scoring device positions do not start at zero");
             if (!results) {
-                const auto image    = read_state(row.slots.destination);
+                const auto image    = read_state(row.states.at(0).destination);
                 first_state_written = std::any_of(image.begin(), image.end(), [](std::byte value) {
                     return value != std::byte{};
                 });
@@ -144,8 +144,8 @@ public:
     unsigned starts = 0, results = 0;
 
 private:
-    [[nodiscard]] std::vector<std::byte> read_state(std::int32_t slot) const {
-        const auto image = implementation.resources.states->storage().image(slot);
+    [[nodiscard]] std::vector<std::byte> read_state(std::int64_t offset) const {
+        const auto image = implementation.resources.states->storage().image(offset);
         std::vector<std::byte> bytes(image.bytes);
         CUDA_CHECK(cudaMemcpy(bytes.data(), image.data, image.bytes, cudaMemcpyDeviceToHost));
         return bytes;
@@ -192,15 +192,14 @@ int main() {
         CUDA_CHECK(error);
         auto device = std::make_unique<DeviceContext>();
         EngineOptions options;
-        options.purpose         = EnginePurpose::CausalScoring;
-        options.use_cuda_graph  = false;
-        options.enable_vision   = false;
-        options.max_context     = 128;
-        options.prefill_chunk   = 128;
-        options.max_concurrency = 1;
-        options.kv_capacity     = KvCapacityPolicy::explicit_capacity(128);
-        options.context_cache   = {
-              .enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
+        options.purpose          = EnginePurpose::CausalScoring;
+        options.use_cuda_graph   = false;
+        options.enable_vision    = false;
+        options.max_context      = 128;
+        options.prefill_chunk    = 128;
+        options.max_concurrency  = 1;
+        options.context_capacity = ContextCapacityPolicy::explicit_capacity(256ULL << 20);
+        options.context_cache    = {.enabled = false, .host_capacity_bytes = 0};
         artifact::Reader reader(path);
         auto definition = q4::read_definition(reader, models::load_options(options));
         auto profile    = q4::execution::describe_model(*definition);
@@ -216,14 +215,12 @@ int main() {
             std::make_unique<runtime::RankModelInstance<ObservedTypes>>(std::move(model), profile);
         instance->program =
             std::make_unique<ObservedRank>(instance->parameters, std::move(*execution), *device);
-        auto& rank = *instance->program;
-        plan.context.pools[0].transfer =
-            rank.implementation.resources.main->pages().transfer_profile();
+        auto& rank  = *instance->program;
         auto worker = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
                                                                            std::move(instance));
         runtime::LocalExecutor<ObservedTypes> executor(std::move(worker), {1});
         q4::Session session(q4::prepare_session(definition, std::move(plan)), executor);
-        const auto empty = session.physical_usage().occupied;
+        const auto empty = session.physical_usage();
         models::qwen::FrontendOptions frontend_options;
         frontend_options.vision_enabled = false;
         frontend_options.max_context    = options.max_context;
@@ -239,7 +236,15 @@ int main() {
                         std::all_of(result.logprobs.begin(), result.logprobs.end(),
                                     [](float value) { return std::isfinite(value) && value <= 0; }),
                     "scoring returned invalid log probabilities");
-            require(session.physical_usage().occupied == empty && !executor.has_pending_work(),
+            const auto usage = session.physical_usage();
+            require(usage.state_objects == empty.state_objects &&
+                        usage.kv_page_groups == empty.kv_page_groups &&
+                        std::all_of(usage.pools.begin(), usage.pools.end(),
+                                    [](const auto& pool) {
+                                        return pool.live_bytes == 0 && pool.reserved_bytes == 0 &&
+                                               pool.pending_retirement_bytes == 0;
+                                    }) &&
+                        !executor.has_pending_work(),
                     "scoring completion left context ownership or an execution frame alive");
         }
         require(rank.starts == 2 && rank.results == 2, "fresh scoring observation was incomplete");

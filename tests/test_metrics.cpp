@@ -17,11 +17,9 @@ int main() {
         }
     };
     EngineOptions options;
-    options.max_concurrency                 = 2;
-    options.context_cache.extra_state_slots = 1;
+    options.max_concurrency = 2;
     EngineDescription description;
-    description.device_state_capacity       = 3;
-    description.host_context_capacity_bytes = 1048576;
+    description.context_pools = {{0, ContextMemoryDomain::Host, 1048576, 4096}};
     StartupReport startup;
     EngineSnapshot baseline;
     baseline.runtime.generated_tokens         = 4;
@@ -40,9 +38,13 @@ int main() {
     running.runtime.speculative_draft_tokens += 6;
     running.runtime.speculative_accepted_tokens = 3;
     running.runtime.running_requests            = 1;
-    running.runtime.host_context_occupied_bytes = 4096;
-    running.runtime.host_context_reserved_bytes = 1024;
-    running.runtime.kv_pools = {{0, "text", 2, 8}, {1, "draft", 1, 4}, {2, "index", 3, 6}};
+    running.runtime.context_pools               = {{.rank           = 0,
+                                                    .domain         = ContextMemoryDomain::Host,
+                                                    .capacity_bytes = 1048576,
+                                                    .block_bytes    = 4096,
+                                                    .live_bytes     = 3072,
+                                                    .reserved_bytes = 1024}};
+    running.runtime.kv_pools = {{0, "text", 2}, {1, "draft", 1}, {2, "index", 3}};
     running.runtime.context_transfers.kv.resize(3);
     running.runtime.context_transfers.kv[2][1].bytes = 8192;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
@@ -67,10 +69,15 @@ int main() {
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
     check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
-    check(live.find("ninfer_host_context_used_bytes 4096\n") != std::string::npos,
-          "reserved bytes must not be added to occupancy twice");
+    check(
+        live.find("ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"live\"} 3072\n") !=
+                std::string::npos &&
+            live.find(
+                "ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"reserved\"} 1024\n") !=
+                std::string::npos,
+        "reserved bytes must not be added to occupancy twice");
 
-    check(live.find("ninfer_device_kv_used_page_groups{pool_id=\"2\"} 3\n") != std::string::npos &&
+    check(live.find("ninfer_context_kv_page_groups{pool_id=\"2\"} 3\n") != std::string::npos &&
               live.find("ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"2\","
                         "direction=\"h2d\"} 8192\n") != std::string::npos,
           "pool metrics dropped the third pool or used a model role as its identity");

@@ -126,8 +126,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     return "unknown";
 }
 
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+const char* context_capacity_mode_name(ninfer::ContextCapacityMode mode) {
+    return mode == ninfer::ContextCapacityMode::Automatic ? "auto" : "explicit";
 }
 
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
@@ -383,10 +383,10 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
     };
 }
 
-Json transfer_timings_json(const std::array<ninfer::GenerationTransferTiming, 3>& current,
-                           const std::array<ninfer::GenerationTransferTiming, 3>& previous = {}) {
+Json transfer_timings_json(const std::array<ninfer::GenerationTransferTiming, 4>& current,
+                           const std::array<ninfer::GenerationTransferTiming, 4>& previous = {}) {
     Json result = Json::object();
-    constexpr std::array directions{"d2h", "h2d", "d2d"};
+    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h"};
     for (std::size_t i = 0; i < directions.size(); ++i) {
         const auto& now       = current[i];
         const auto& before    = previous[i];
@@ -549,14 +549,11 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                               {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
-    const auto total_device_state_slots            = description.device_state_capacity;
     record["engine"]                               = Json{
                                       {"device", engine_options.device},
                                       {"max_context", engine_options.max_context},
-                                      {"kv_capacity_mode", kv_capacity_mode_name(engine_options.kv_capacity.mode)},
-                                      {"kv_capacity", description.kv_capacity},
-                                      {"kv_capacity_page_groups",
-                                       (description.kv_pools.empty() ? 0 : description.kv_pools.front().capacity_page_groups)},
+                                      {"context_capacity_mode", context_capacity_mode_name(engine_options.context_capacity.mode)},
+                                      {"context_pools", product::context_capacity_json(description.context_pools)},
                                       {"max_concurrency", engine_options.max_concurrency},
                                       {"max_pending_requests", engine_options.max_pending_requests},
                                       {"pending_timeout_ms", engine_options.pending_timeout_ms},
@@ -578,8 +575,6 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                                             {"prefill_signature", context_cost.prefill_signature},
                                                             {"preset_path", context_cost.preset_path.string()}}},
                                       {"context_cache", Json{{"enabled", cache.enabled},
-                                                             {"extra_state_slots", cache.extra_state_slots.value()},
-                                                             {"total_device_state_slots", total_device_state_slots},
                                                              {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
@@ -826,24 +821,17 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
               {"partial_tail_cow_pages",
                monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)}}},
-        {"occupancy",
-         Json{{"device_state_slots", current.device_state_occupied_slots},
-              {"host_state_slots", current.host_state_occupied_slots},
-              {"host_kv_bytes", current.host_kv_occupied_bytes},
-              {"host_context_occupied_bytes", current.host_context_occupied_bytes},
-              {"host_context_peak_occupied_bytes", current.host_context_peak_occupied_bytes},
-              {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
+        {"occupancy", product::context_usage_json(current)},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     Json pools = Json::array();
     for (const auto& pool : current.kv_pools) {
         const auto before = pool.id < previous.context_transfers.kv.size()
                                 ? previous.context_transfers.kv[pool.id]
-                                : std::array<ninfer::GenerationTransferTiming, 3>{};
+                                : std::array<ninfer::GenerationTransferTiming, 4>{};
         pools.push_back({{"pool_id", pool.id},
                          {"label", pool.label},
                          {"occupied_page_groups", pool.occupied_page_groups},
-                         {"capacity_page_groups", pool.capacity_page_groups},
                          {"transfers", transfer_timings_json(
                                            current.context_transfers.kv.at(pool.id), before)}});
     }

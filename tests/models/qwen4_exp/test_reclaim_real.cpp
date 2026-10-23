@@ -48,8 +48,8 @@ void execute(Executor& executor, context::ContextTransaction& transaction) {
     transaction.prepare_actions();
     auto reservation = executor.try_reserve(runtime::FrameKind::Context);
     require(reservation.has_value(), "context fixture execution slot is occupied");
-    const auto ticket =
-        executor.submit(std::move(*reservation), {transaction.actions(), q4::ContextWork{}});
+    const auto ticket = executor.submit(std::move(*reservation),
+                                        {{{0, transaction.actions(0)}}, q4::ContextWork{}});
     transaction.mark_submitted();
     try {
         (void)retire_context(executor, ticket);
@@ -59,20 +59,37 @@ void execute(Executor& executor, context::ContextTransaction& transaction) {
         try {
             executor.drain();
         } catch (...) {}
-        if (transaction.in_flight()) transaction.mark_completed();
+        if (transaction.in_flight()) transaction.fail_after_drain();
         transaction.discard();
         throw;
     }
 }
 
 void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
-    const auto empty = p.usage().occupied;
+    const auto live_bytes = [&](ContextMemoryDomain domain) {
+        std::size_t bytes = 0;
+        for (const auto& pool : p.usage().pools) {
+            if (pool.domain == domain) bytes += pool.live_bytes;
+        }
+        return bytes;
+    };
+    const auto empty_device = live_bytes(ContextMemoryDomain::Device);
+    const auto empty_host   = live_bytes(ContextMemoryDomain::Host);
     std::array<context::HistoryOwner, 2> owners;
     {
         auto bindings = p.directory.begin_transaction();
-        for (std::uint16_t pool = 0; pool < 2; ++pool)
-            bindings.add_binding(pool, p.directory.pool(pool).histories().prepare_binding(
-                                           nullptr, 0, 256U - pool, 0));
+        context::ContextDemand demand;
+        for (std::uint16_t pool = 0; pool < 2; ++pool) {
+            demand.add_history(
+                pool, p.directory.pool(pool).histories().binding_demand(nullptr, 0, 256U - pool));
+        }
+        auto reserved = p.directory.reserve(demand);
+        require(reserved && reserved.reservation->ready(), "history reservation failed");
+        for (std::uint16_t pool = 0; pool < 2; ++pool) {
+            bindings.add_binding(
+                pool, p.directory.pool(pool).histories().prepare_binding(
+                          nullptr, 0, 256U - pool, 0, reserved.reservation->take_history(pool)));
+        }
         execute(executor, bindings);
         for (std::uint16_t pool = 0; pool < 2; ++pool)
             owners[pool] = bindings.binding(pool)->commit();
@@ -124,7 +141,8 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     p.checkpoints.publish(alias, p.checkpoints.at(shallow));
     const std::array all{shallow, deep, alias};
     for (auto& owner : owners) owner.reset();
-    const auto plan = p.plan_reclaim(all, {}, {.kv_page_groups = {4}});
+    const context::ContextDemand demand{.new_states = 1};
+    const auto plan = p.plan_reclaim(all, {}, demand);
     const auto tail =
         std::find_if(plan.demotions.begin(), plan.demotions.end(),
                      [&](const auto& quote) { return quote.sources == std::vector{deep}; });
@@ -140,88 +158,84 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     require(tail != plan.demotions.end() && family != plan.demotions.end() &&
                 tail_release != plan.releases.end() && family_release != plan.releases.end(),
             "complete physical holder cohorts missing");
-    auto partial = p.plan_reclaim(all, {}, {.kv_page_groups = {1}});
-    const auto one_tail =
-        std::find_if(partial.demotions.begin(), partial.demotions.end(),
-                     [&](const auto& quote) { return quote.sources == std::vector{deep}; });
-    require(one_tail != partial.demotions.end(), "suffix demotion missing");
-    auto partial_batch = partial.begin_kv_batch({.kv_page_groups = {4}});
-    require(partial_batch.append(*one_tail) && !partial_batch.covers(*tail_release),
-            "partial physical move covered a two-page deletion by checkpoint name");
-    auto batch = plan.begin_kv_batch({.kv_page_groups = {1}});
-    require(batch.append(*tail) && batch.covers(*tail_release) && !batch.covers(*family_release) &&
-                batch.append(*family) && batch.covers(*family_release),
-            "batch coverage ignored actual page identities");
-    auto wrong_pool = plan.begin_kv_batch({.kv_page_groups = {0, 1}});
-    require(!wrong_pool.append(*tail), "Main quote entered an MTP batch");
-    const auto clipped = batch.finish();
-    require(clipped && clipped->released.kv_page_groups == std::array<std::uint32_t, 2>{1, 0} &&
-                clipped->released.state_slots == 0,
-            "batch did not clip to the requested typed shortage");
-
+    require(tail->released.records.size() < tail_release->released.records.size(),
+            "partial physical move was confused with deletion of its checkpoint");
+    auto selection = plan.inventory->select();
+    {
+        auto probe = selection.probe({&shallow, 1});
+        require(selection.released() ==
+                    context::ContextReleaseSet{.catalog = {p.checkpoints.retirement(shallow)}},
+                "retiring an alias must release only its catalog entry, not shared State/KV");
+    }
+    {
+        auto probe = selection.probe(all);
+        require(selection.released() == p.footprint(all, true),
+                "co-holder inventory differs from actual complete release proof");
+    }
     const auto extra = *p.checkpoints.reserve();
     p.checkpoints.publish(extra, p.checkpoints.at(deep));
-    require((p.start_demote(*one_tail, {}) != runtime::ContextStart::Started) && !batch.finish(),
+    require(p.start_demote(*tail, {}) != runtime::ContextStart::Started,
             "stale quote ignored a newly published physical holder");
     require(p.checkpoints.erase(extra), "extra holder retirement failed");
-    const auto pinned = one_tail->impl->pages[0].front();
-    p.directory.pool(0).pages().pin_source(pinned);
-    require((p.start_demote(*one_tail, {}) != runtime::ContextStart::Started),
+    const auto& pinned_pages =
+        tail->impl->pages[0].empty() ? tail->impl->pages[1] : tail->impl->pages[0];
+    require(!pinned_pages.empty(), "suffix quote has no KV record");
+    const auto pinned = pinned_pages.front();
+    p.directory.pool(pinned.pool_id).pages().pin_source(pinned);
+    require((p.start_demote(*tail, {}) != runtime::ContextStart::Started),
             "demotion ignored a new KV reader");
-    p.directory.pool(0).pages().unpin_source(pinned);
-    auto altered = *one_tail;
+    p.directory.pool(pinned.pool_id).pages().unpin_source(pinned);
+    auto altered = *tail;
     ++altered.host_bytes;
     require((p.start_demote(altered, {}) != runtime::ContextStart::Started),
             "demotion accepted a changed physical quote");
 
     const auto settle = [&] {
-        require(p.operation && p.operation->ticket &&
-                    std::holds_alternative<q4::detail::DemoteOperation>(p.operation->action),
-                "unexpected native transaction in demotion fixture");
-        p.operation->result.emplace(retire_context(executor, *p.operation->ticket));
-        const auto completed = p.complete_context();
-        require(completed.complete && completed.published && !p.operation,
-                "demotion did not publish after physical retirement");
+        while (p.operation) {
+            require(p.operation->ticket &&
+                        std::holds_alternative<q4::detail::DemoteOperation>(p.operation->action),
+                    "unexpected native transaction in demotion fixture");
+            p.operation->result.emplace(retire_context(executor, *p.operation->ticket));
+            const auto completed = p.complete_context();
+            require(!completed.complete || (completed.published && !p.operation),
+                    "demotion did not publish after physical retirement");
+        }
     };
-    auto current = p.plan_reclaim(all, {}, {.kv_page_groups = {1}});
-    require(!current.demotions.empty(), "Main demotion quote missing");
-    const auto before = p.usage().occupied;
-    require((p.start_demote(current.demotions.front(), {}) == runtime::ContextStart::Started),
-            "Main demotion refused a valid quote");
+    auto current = p.plan_reclaim(all, {}, demand);
+    require(!current.demotions.empty(), "demotion quote missing");
+    const auto quote           = current.demotions.front();
+    const auto device_before   = live_bytes(ContextMemoryDomain::Device);
+    const auto host_before     = live_bytes(ContextMemoryDomain::Host);
+    const auto released_device = p.directory.released_bytes(quote.released);
+    require(p.start_demote(quote, {}) == runtime::ContextStart::Started,
+            "demotion refused a valid physical quote");
     settle();
-    auto after = p.usage().occupied;
-    require(after.kv_page_groups[0] + 1 == before.kv_page_groups[0] &&
-                after.kv_page_groups[1] == before.kv_page_groups[1] &&
-                after.state_slots == before.state_slots,
-            "Main demotion changed another physical pool");
-    require((p.start_demote(current.demotions.front(), {}) != runtime::ContextStart::Started),
+    require(live_bytes(ContextMemoryDomain::Device) + released_device == device_before &&
+                live_bytes(ContextMemoryDomain::Host) == host_before + quote.host_bytes,
+            "demotion did not account for its actual Device and Host records");
+    require(p.start_demote(quote, {}) != runtime::ContextStart::Started,
             "stale residency quote was reused");
-    auto mtp = p.plan_reclaim(all, {}, {.kv_page_groups = {0, 1}});
-    require(!mtp.demotions.empty() &&
-                (p.start_demote(mtp.demotions.front(), {}) == runtime::ContextStart::Started),
-            "MTP demotion missing");
+
+    const auto remaining = p.demotion(all);
+    require(remaining && !remaining->images.empty(), "State demotion missing");
+    const auto whole = p.describe_demotion(remaining);
+    require(p.start_demote(whole, {}) == runtime::ContextStart::Started,
+            "complete State/Main/MTP demotion refused its reserved destination");
     settle();
-    const auto after_mtp = p.usage().occupied;
-    require(after_mtp.kv_page_groups[1] + 1 == after.kv_page_groups[1] &&
-                after_mtp.kv_page_groups[0] == after.kv_page_groups[0],
-            "MTP demotion used Main resources");
-    auto state = p.plan_reclaim(all, {}, {.state_slots = 1});
-    require(!state.demotions.empty() &&
-                (p.start_demote(state.demotions.front(), {}) == runtime::ContextStart::Started),
-            "State demotion missing");
-    settle();
-    const auto after_state = p.usage().occupied;
-    require(after_state.state_slots + 1 == after_mtp.state_slots &&
-                after_state.kv_page_groups == after_mtp.kv_page_groups,
-            "State demotion changed KV residency");
-    auto host              = p.plan_releases(all, {}, {.host_bytes = 1});
-    auto selected          = host.inventory->select();
-    auto probe             = selected.probe(all);
-    const auto quoted_host = selected.released().host_bytes;
+    auto host = p.plan_releases(all, {}, {.new_states = 1, .memory = context::ContextMemory::Host});
+    auto selected     = host.inventory->select();
+    auto probe        = selected.probe(all);
+    auto host_records = selected.released();
+    std::erase_if(host_records.records, [](const auto& record) {
+        return record.domain.memory != context::ContextMemory::Host;
+    });
+    const auto quoted_host   = p.directory.released_bytes(host_records);
+    const auto occupied_host = live_bytes(ContextMemoryDomain::Host);
     p.checkpoints.clear();
-    const auto released = p.usage().occupied;
-    require(after_state.host_bytes - released.host_bytes == quoted_host && released == empty,
-            "fixed physical release differed from actual Native occupancy");
+    require(occupied_host - live_bytes(ContextMemoryDomain::Host) == quoted_host &&
+                live_bytes(ContextMemoryDomain::Device) == empty_device &&
+                live_bytes(ContextMemoryDomain::Host) == empty_host,
+            "physical release proof differed from actual Native occupancy");
 }
 } // namespace
 
@@ -236,16 +250,16 @@ int main() {
         CUDA_CHECK(error);
         auto device = std::make_unique<DeviceContext>(0);
         EngineOptions options;
-        options.use_cuda_graph                    = false;
-        options.enable_vision                     = false;
-        options.max_context                       = 512;
-        options.prefill_chunk                     = 256;
-        options.max_concurrency                   = 1;
-        options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(512);
+        options.use_cuda_graph   = false;
+        options.enable_vision    = false;
+        options.max_context      = 512;
+        options.prefill_chunk    = 256;
+        options.max_concurrency  = 1;
+        options.context_capacity = ContextCapacityPolicy::explicit_capacity(1024ULL * 1024 * 1024);
         options.speculative.backend               = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens          = 1;
-        options.context_cache.extra_state_slots   = 4;
-        options.context_cache.host_capacity_bytes = 256ULL * 1024 * 1024;
+        // Two State records and the Main/MTP record classes need four Context blocks.
+        options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
         artifact::Reader reader(path);
         auto definition = q4::read_definition(reader, models::load_options(options));
         auto profile    = q4::execution::describe_model(*definition);

@@ -23,6 +23,12 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
                 .subspan(region.region.offset - frame.ingress.offset, region.region.bytes)
                 .data);
     };
+    const auto offsets = [&](const TensorRegion& region) {
+        return static_cast<std::int64_t*>(
+            resources.mtp_ingress()
+                .subspan(region.region.offset - frame.ingress.offset, region.region.bytes)
+                .data);
+    };
     std::uint32_t maximum = 1;
     for (int b = 0; b < batch; ++b) {
         const auto& row   = rows[b];
@@ -30,11 +36,12 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
         const auto n      = input.ids.size();
         if (n > tokens) throw std::logic_error("MTP input exceeds its window");
         host(layout.valid_columns)[b]     = n;
-        host(layout.source_slots)[b]      = row.slots.source;
-        host(layout.destination_slots)[b] = row.slots.destination;
-        host(layout.table_rows)[b]        = row.mtp_table.index;
-        host(layout.base_positions)[b]    = input.base;
-        host(layout.record_offsets)[b]    = 0;
+        offsets(layout.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
+        offsets(layout.destination_offsets)[b] =
+            row.states.at(parameters.profile->local.rank).destination;
+        host(layout.table_rows)[b]     = row.mtp_table.index;
+        host(layout.base_positions)[b] = input.base;
+        host(layout.record_offsets)[b] = 0;
         for (int j = 0; j < t; ++j) {
             const auto position         = input.base + std::min<std::size_t>(j, n ? n - 1 : 0);
             host(layout.ids)[j + t * b] = static_cast<std::size_t>(j) < n
@@ -69,7 +76,7 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t ba
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto call     = resources.mtp_batch(frame.draft_steps[step], 1, batch, visible);
-    const auto before   = step == 0 ? resources.states->mtp_tail(call.source_slots)
+    const auto before   = step == 0 ? resources.states->mtp_tail(call.source_offsets)
                                     : mtp_working_tail(step == 1 ? 0 : 1 + (step - 2) % 2, batch);
     auto after          = mtp_working_tail(step == 0 ? 0 : 1 + (step - 1) % 2, batch);
     auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
@@ -172,15 +179,15 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
     }
     execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
                            *parameters.mtp, aligned, metadata,
-                           resources.states->mtp_tail(metadata.source_slots),
-                           resources.states->mtp_tail(metadata.destination_slots),
+                           resources.states->mtp_tail(metadata.source_offsets),
+                           resources.states->mtp_tail(metadata.destination_offsets),
                            resources.mtp->layer(0), visual, resources.workspace, cuda);
     for (int b = 0; b < batch; ++b) {
         const auto next = conditioning.view({channels, static_cast<std::int32_t>(tokens), batch})
                               .slice(2, b, 1)
                               .slice(1, tokens - 1, 1);
-        const auto destination =
-            resources.states->conditioning().slice(1, rows[b].slots.destination, 1);
+        const auto destination = resources.states->conditioning(
+            rows[b].states.at(parameters.profile->local.rank).destination);
         copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                          {next.data, next.bytes(), cuda.device()}, cuda);
     }
@@ -264,8 +271,9 @@ void RankProgramImpl::prepare_mtp() {
                     sizeof(TokenId), f.rows.size(), cuda);
     auto base = packed_tensor(frame.base_conditioning, {channels, batch});
     for (int b = 0; b < batch; ++b) {
-        auto previous = resources.states->conditioning().slice(1, f.rows[b].slots.source, 1);
-        auto saved    = base.slice(1, b, 1);
+        auto previous = resources.states->conditioning(
+            f.rows[b].states.at(parameters.profile->local.rank).source);
+        auto saved = base.slice(1, b, 1);
         copy_bytes_async({saved.data, saved.bytes(), cuda.device()},
                          {previous.data, previous.bytes(), cuda.device()}, cuda);
     }

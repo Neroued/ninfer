@@ -319,11 +319,14 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
 
 def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
                      host_seconds=0.0, occupied=0, peak=None):
-    occupancy = {"device_state_slots": 1, "host_state_slots": 1,
-                 "host_kv_bytes": occupied, "host_context_occupied_bytes": occupied,
-                 "host_context_reserved_bytes": 0}
+    pool = {"rank": 0, "domain": "host", "capacity_bytes": 2048, "block_bytes": 256,
+            "live_bytes": occupied, "reserved_bytes": 0, "pending_retirement_bytes": 0,
+            "relocation_bytes": 0, "future_reserved_bytes": 0, "padding_bytes": 0,
+            "assigned_free_bytes": 0, "unassigned_free_bytes": 2048 - occupied, "tail_bytes": 0}
     if peak is not None:
-        occupancy["host_context_peak_occupied_bytes"] = peak
+        pool["peak_occupied_bytes"] = peak
+    occupancy = {"state_objects": 2, "history_objects": 3, "pools": [pool],
+                 "metadata": {"budget_bytes": 4096, "allocated_bytes": 1024, "reserved_bytes": 128}}
     event = {
         "artifact_type": "ninfer_serve_request_log", "schema_version": schema,
         "event": "throughput", "server_instance_id": "serve-test",
@@ -338,7 +341,7 @@ def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
         return {direction: {"bytes": amount if direction == "d2h" else 0,
                             "seconds": 0.001 if direction == "d2h" else 0.0,
                             "images": 1, "page_groups": 1, "copy_operations": 1}
-                for direction in ("d2h", "h2d", "d2d")}
+                for direction in ("d2h", "h2d", "d2d", "h2h")}
     event["context_cache"]["state_transfers"] = transfers(state_bytes)
     event["context_cache"]["kv_pools"] = [
         {"pool_id": 0, "occupied_page_groups": 8, "transfers": transfers(main_bytes)},
@@ -364,8 +367,11 @@ def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path):
     assert global_work["transfers"]["state"]["d2h"]["bytes"] == 25
     assert global_work["host_work"]["elapsed_seconds"]["total"] == pytest.approx(0.12)
     assert global_work["host_work"]["scheduler_yield_seconds"] == 0.5
-    assert global_work["occupancy"]["host_context_occupied_bytes"] == {"sampled_max": 800, "last": 200}
-    assert global_work["host_context_peak_occupied_bytes"] == 1000
+    pool = global_work["occupancy"]["pools"][0]
+    assert (pool["rank"], pool["domain"], pool["observations"]) == (0, "host", 2)
+    assert pool["live_bytes"] == {"sampled_max": 800, "last": 200}
+    assert pool["peak_occupied_bytes"] == 1000
+    assert global_work["transfers"]["state"]["h2h"]["bytes"] == 0
     assert summary["stream_observations"][0]["device_to_host_bytes"] == 0
     markdown = render_markdown(summary)
     assert "Global runtime costs" in markdown and "Sampled max" in markdown
@@ -379,10 +385,30 @@ def test_missing_runtime_fields_remain_explicit(tmp_path):
     global_work = summary["global_runtime_observations"][0]
     assert global_work["status"] == "available"
     assert global_work["shutdown_tail"] == "unconfirmed"
-    assert global_work["host_context_peak_occupied_bytes"] is None
+    assert global_work["occupancy"]["pools"][0]["peak_occupied_bytes"] is None
     assert global_work["transfers"]["kv_pools"]["0"]["d2h"]["bytes"] == 100
     assert global_work["transfers"]["kv_pools"]["1"]["h2d"]["seconds"] is None
     assert summary["stream_observations"][0]["preemptions"] is None
+
+
+def test_context_domains_are_matched_by_rank_and_domain(tmp_path):
+    first = runtime_interval(occupied=800, peak=900)
+    second = runtime_interval(final=True, occupied=200, peak=1000)
+    device = {**first["context_cache"]["occupancy"]["pools"][0], "rank": 1, "domain": "device",
+              "live_bytes": 400, "peak_occupied_bytes": 450}
+    first["context_cache"]["occupancy"]["pools"].append(device)
+    second["context_cache"]["occupancy"]["pools"].insert(
+        0, {**device, "live_bytes": 500, "peak_occupied_bytes": 600},
+    )
+    second["context_cache"]["state_transfers"]["h2h"].update(bytes=64, seconds=0.002)
+    summary = summarize_campaign(logged_campaign(tmp_path, [], [first, second]))
+    observed = summary["global_runtime_observations"][0]
+    pools = {(pool["rank"], pool["domain"]): pool for pool in observed["occupancy"]["pools"]}
+    assert pools[(0, "host")]["live_bytes"] == {"sampled_max": 800, "last": 200}
+    assert pools[(1, "device")]["live_bytes"] == {"sampled_max": 500, "last": 500}
+    assert pools[(1, "device")]["peak_occupied_bytes"] == 600
+    assert observed["transfers"]["state"]["h2h"]["bytes"] == 64
+    assert observed["transfers"]["state"]["h2h"]["seconds"] == pytest.approx(0.002)
 
 
 def test_unsupported_runtime_schema_is_unavailable(tmp_path):

@@ -119,7 +119,7 @@ struct Fixture {
     DeviceBuffer initial;
     DeviceBuffer final;
     DeviceBuffer out;
-    DeviceBuffer slots;
+    DeviceBuffer state_offsets;
 
     Fixture(Profile p, int tokens, int batch)
         : hq(p.qk), hv(p.value), t(tokens), b(batch),
@@ -132,10 +132,12 @@ struct Fixture {
           initial(fp32(std::size_t(D) * D * hv * b, 18, -0.02F, 0.02F)),
           final(ninfer::bench::device_context().device(), initial.size()),
           out(ninfer::bench::device_context().device(), v.size()),
-          slots(ninfer::bench::device_context().device(), std::size_t(b) * sizeof(std::int32_t)) {
-        std::vector<std::int32_t> selectors(b);
-        for (int i = 0; i < b; ++i) selectors[i] = b - 1 - i;
-        slots.copy_from_host(selectors.data(), slots.size());
+          state_offsets(ninfer::bench::device_context().device(),
+                        std::size_t(b) * sizeof(std::int64_t)) {
+        std::vector<std::int64_t> offsets(b);
+        for (int i = 0; i < b; ++i)
+            offsets[i] = std::int64_t(b - 1 - i) * D * D * hv * sizeof(float);
+        state_offsets.copy_from_host(offsets.data(), state_offsets.size());
     }
 
     void public_call(MemoryArena& ws, CudaExecutionView ex, bool batch_mode) {
@@ -145,11 +147,15 @@ struct Fixture {
             dt(bias.span(), DType::FP32, {D, hv});
         Tensor si(initial.span(), DType::FP32, {D, D, hv, b}),
             so(final.span(), DType::FP32, {D, D, hv, b});
-        Tensor ot(out.span(), DType::BF16, {D, hv, t, b}), st(slots.span(), DType::I32, {b});
-        if (batch_mode)
-            ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dt, -5, scale, so, st,
-                                                   ot, ex);
-        else
+        Tensor ot(out.span(), DType::BF16, {D, hv, t, b}),
+            st(state_offsets.span(), DType::I64, {b});
+        if (batch_mode) {
+            TensorRegion region{
+                {0, std::size_t(D) * D * hv * sizeof(float), 16}, DType::FP32, {D, D, hv, 1}};
+            StateFieldView state{{final.span(), st}, StateFieldLayout{region, 1, 0}};
+            ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dt, -5, scale, state, ot,
+                                                   ex);
+        } else
             ops::kimi_delta_attention(qt, kt, vt, gt, bt, at, dt, -5, scale, ws, si, so, ot, ex);
     }
 };
@@ -163,7 +169,7 @@ double logical_bytes(Profile p, int t, int b) {
 void print(Profile p, int t, int b, std::size_t ws, std::size_t nodes, ColdTiming time,
            const Options& o) {
     const char* op = o.batch_update ? "kimi_delta_attention_batch_update" : "kimi_delta_attention";
-    const double bytes = logical_bytes(p, t, b);
+    const double bytes = logical_bytes(p, t, b) + (o.batch_update ? b * sizeof(std::int64_t) : 0);
     const double gbps  = bytes / (time.median_us * 1e3);
     if (o.csv) {
         std::printf("%s,%d,%d,%d,%d,%s,%zu,%.0f,%zu,cold_l2,%.3f,%.3f,%.3f,%.3f\n", p.name, p.qk,

@@ -9,7 +9,6 @@
 #endif
 
 #include <atomic>
-#include <limits>
 #include <stdexcept>
 
 namespace ninfer::runtime {
@@ -25,25 +24,6 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
-    }
-    switch (options.kv_capacity.mode) {
-    case KvCapacityMode::Explicit:
-        if (options.kv_capacity.explicit_tokens == 0) {
-            throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
-        }
-        if (options.kv_capacity.automatic_headroom_bytes != 0) {
-            throw std::invalid_argument(
-                "Engine explicit kv_capacity must not carry automatic headroom");
-        }
-        break;
-    case KvCapacityMode::Automatic:
-        if (options.kv_capacity.explicit_tokens != 0) {
-            throw std::invalid_argument(
-                "Engine automatic kv_capacity must not carry explicit tokens");
-        }
-        break;
-    default:
-        throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -69,12 +49,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
-        options.context_cache =
-            ContextCacheOptions{.enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
+        options.context_cache = ContextCacheOptions{.enabled = false, .host_capacity_bytes = 0};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
@@ -83,14 +61,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
-    ContextCacheOptions& cache      = options.context_cache;
-    const std::uint32_t concurrency = options.max_concurrency;
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + cache.extra_state_slots.value_or(0);
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
-    }
-    if (!cache.checkpoint_interval)
+    if (!options.context_cache.checkpoint_interval)
         throw std::invalid_argument("checkpoint interval must be positive");
     return options;
 }

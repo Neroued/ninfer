@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/transfer_work.h"
+#include "core/context_pool.h"
 #include "runtime/contract/request.h"
 
 #include <algorithm>
@@ -10,10 +11,8 @@
 #include <limits>
 #include <optional>
 #include <string_view>
-
-namespace ninfer {
-struct KVPageGeometry;
-}
+#include <string>
+#include <vector>
 
 namespace ninfer::runtime {
 
@@ -27,56 +26,10 @@ struct KvPoolId {
     friend constexpr bool operator==(KvPoolId, KvPoolId) noexcept = default;
 };
 
-// Pool IDs are contiguous and fixed for a Program's lifetime. Labels are diagnostic only.
+// IDs describe logical history kinds, not physical memory partitions.
 struct KvPoolDescriptor {
     KvPoolId id;
     std::string_view label;
-    const KVPageGeometry* geometry   = nullptr;
-    std::uint32_t device_page_groups = 0;
-    std::size_t host_page_stride     = 0;
-};
-
-// Physical quantities are sampled from stores. Each architecture declares its pool capacity;
-// inactive pools have zero capacity. Page groups from different pools never offset each other.
-template <std::size_t PoolCapacity>
-struct ContextResources {
-    static constexpr std::size_t pool_capacity = PoolCapacity;
-    std::uint32_t state_slots                  = 0;
-    std::array<std::uint32_t, PoolCapacity> kv_page_groups{};
-    std::size_t host_bytes = 0;
-
-    [[nodiscard]] std::optional<KvPoolId> first_kv_deficit() const noexcept {
-        for (std::size_t i = 0; i < PoolCapacity; ++i) {
-            if (kv_page_groups[i]) return KvPoolId{static_cast<std::uint16_t>(i)};
-        }
-        return std::nullopt;
-    }
-
-    [[nodiscard]] std::uint64_t useful(const ContextResources& shortage) const noexcept {
-        if (shortage.state_slots) return std::min(state_slots, shortage.state_slots);
-        if (const auto pool = shortage.first_kv_deficit()) {
-            return std::min(kv_page_groups[pool->index], shortage.kv_page_groups[pool->index]);
-        }
-        return std::min(host_bytes, shortage.host_bytes);
-    }
-
-    [[nodiscard]] std::array<std::uint64_t, PoolCapacity + 2> quantities() const noexcept {
-        std::array<std::uint64_t, PoolCapacity + 2> result{};
-        result[0] = state_slots;
-        for (std::size_t i = 0; i < PoolCapacity; ++i) result[i + 1] = kv_page_groups[i];
-        result.back() = host_bytes;
-        return result;
-    }
-
-    friend bool operator==(const ContextResources&, const ContextResources&) noexcept = default;
-};
-
-template <class Resources>
-struct ResourceReservation {
-    bool reserved = false;
-    Resources shortage;
-
-    explicit operator bool() const noexcept { return reserved; }
 };
 
 // Exact features for the startup-selected static prefill cost model. They describe only the
@@ -133,6 +86,7 @@ enum class ContextTransferDirection : std::uint8_t {
     DeviceToHost,
     HostToDevice,
     DeviceToDevice,
+    HostToHost,
 };
 
 struct ContextTransferObservation {
@@ -142,6 +96,7 @@ struct ContextTransferObservation {
     std::uint32_t page_groups          = 0;
     TransferWork work;
     std::uint64_t elapsed_ns = 0;
+    std::uint32_t rank       = 0;
 };
 
 struct ContextTransferRequirement {
@@ -150,6 +105,7 @@ struct ContextTransferRequirement {
     std::uint32_t image_count          = 0;
     std::uint32_t page_groups          = 0;
     TransferWork work;
+    std::uint32_t rank = 0;
 
     [[nodiscard]] friend constexpr bool operator==(ContextTransferRequirement,
                                                    ContextTransferRequirement) noexcept = default;
@@ -164,49 +120,52 @@ struct ContextOperationCounts {
 };
 
 struct ContextCapacity {
-    std::uint32_t primary_page_groups = 0;
-    std::uint32_t device_state_slots  = 0;
+    std::size_t device_bytes = 0;
 
     friend bool operator==(ContextCapacity, ContextCapacity) = default;
 };
 
-struct ContextCapacityCurve {
-    std::uint32_t primary_page_tokens                   = 0;
-    std::uint32_t minimum_primary_page_groups           = 0;
-    std::uint32_t maximum_primary_page_groups           = 0;
-    std::size_t minimum_device_reservation_bytes        = 0;
-    std::size_t bytes_per_additional_primary_page_group = 0;
-    std::uint32_t minimum_state_slots                   = 0;
-    std::size_t bytes_per_additional_state_slot         = 0;
-    // Coordinator metadata charged to a shared physical-memory owner. Dynamic request
-    // contents and allocator rounding remain covered by startup headroom.
-    std::size_t minimum_control_bytes        = 0;
-    std::size_t control_bytes_per_page_group = 0;
-    std::size_t control_bytes_per_state_slot = 0;
+struct ContextStartupWorkingSet {
+    std::string name;
+    std::vector<RecordRequest> records;
+};
 
+// The directory supplies the cost of its own nodes. Classes follow the canonical pool geometry.
+struct ContextMetadataPlan {
+    std::size_t fixed_bytes     = 0;
+    std::size_t bytes_per_block = 0;
+    std::vector<std::size_t> bytes_per_record;
+};
+
+struct ContextCapacityPlan {
+    std::vector<RecordSpec> records;
+    std::vector<ContextStartupWorkingSet> working_sets;
+    // Device reservation includes colocated Host buffers on a shared-memory device.
+    std::size_t fixed_device_bytes = 0;
+    std::size_t fixed_host_bytes   = 0;
+    ContextMetadataPlan metadata;
+
+    [[nodiscard]] ContextCapacity minimum_capacity() const;
     [[nodiscard]] std::size_t reservation_bytes(ContextCapacity capacity) const;
     [[nodiscard]] std::size_t control_bytes(ContextCapacity capacity) const;
-    [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t primary_page_groups) const;
 };
 
 struct ContextCapacityResolution {
-    KvCapacityMode mode                                 = KvCapacityMode::Explicit;
-    std::uint32_t primary_page_groups                   = 0;
-    std::uint32_t maximum_primary_page_groups           = 0;
-    std::uint32_t resolved_tokens                       = 0;
-    std::size_t minimum_runtime_reservation_bytes       = 0;
-    std::size_t bytes_per_additional_primary_page_group = 0;
-    std::size_t runtime_reservation_bytes               = 0;
-    std::size_t available_after_weights_bytes           = 0;
-    std::size_t available_after_startup_bytes           = 0;
-    std::size_t automatic_headroom_bytes                = 0;
-    std::size_t planned_slack_bytes                     = 0;
-    std::uint32_t device_state_slots                    = 0;
-    std::size_t control_reservation_bytes               = 0;
+    ContextCapacityMode mode                      = ContextCapacityMode::Automatic;
+    std::size_t device_bytes                      = 0;
+    std::size_t minimum_device_bytes              = 0;
+    std::size_t block_bytes                       = 0;
+    std::size_t minimum_runtime_reservation_bytes = 0;
+    std::size_t runtime_reservation_bytes         = 0;
+    std::size_t available_after_weights_bytes     = 0;
+    std::size_t available_after_startup_bytes     = 0;
+    std::size_t automatic_headroom_bytes          = 0;
+    std::size_t planned_slack_bytes               = 0;
+    // Directory budget generated by this rank's schema, and its physical owner charge.
+    std::size_t metadata_budget_bytes     = 0;
+    std::size_t control_reservation_bytes = 0;
 
-    [[nodiscard]] ContextCapacity capacity() const noexcept {
-        return {primary_page_groups, device_state_slots};
-    }
+    [[nodiscard]] ContextCapacity capacity() const noexcept { return {device_bytes}; }
 };
 
 } // namespace ninfer::runtime

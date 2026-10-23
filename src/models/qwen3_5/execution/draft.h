@@ -19,7 +19,8 @@ struct DraftExecutionView {
     const PagedKVCache* full   = nullptr;
     ProposalHead proposal_head = ProposalHead::Full;
 
-    [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer) const;
+    [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer,
+                                                     const Tensor& offsets) const;
     [[nodiscard]] PagedKVBatchLayerView full_layer(std::uint32_t layer) const;
 };
 
@@ -27,7 +28,7 @@ struct DraftInputs {
     Tensor anchors;
     Tensor frontiers;
     Tensor valid_columns;
-    Tensor state_slots;
+    Tensor state_offsets;
     Tensor full_kv_rows;
     const ops::SamplingConfig* sampling = nullptr;
 };
@@ -45,10 +46,10 @@ struct DraftEnvelopes {
     ops::ContextAttentionExecutionEnvelope full;
 };
 
-// Appends the indicated target feature prefix to the draft's context state. Slots select
-// cyclic state; table rows select full-attention state. Inputs and page mappings are borrowed.
+// Appends target features to cyclic State records and full-attention history. Byte offsets
+// select State records; I32 table rows select paged histories.
 void draft_append_context(DraftExecutionView, const Tensor& features, const Tensor& positions,
-                          const Tensor& counts, const Tensor& slots, const Tensor& table_rows,
+                          const Tensor& counts, const Tensor& offsets, const Tensor& table_rows,
                           ops::KVCacheAppendPrefixExecutionEnvelope);
 
 // Produces this round's proposal for each row. ids/positions are [K+1,B], drafts [K,B].

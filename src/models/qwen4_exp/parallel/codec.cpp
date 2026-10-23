@@ -17,18 +17,21 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     runtime::protocol::encode(envelope, runtime::protocol::Envelope{{}, {}, 0, scope});
     const auto header = std::move(envelope).take().size();
 
-    // Each live history can update its full mapping. Copies and clears consume existing
-    // page/state slots; this includes the complete context transaction attached to a command.
-    std::size_t actions = 8 + 25ULL * p.context.state.device_slots;
-    for (const auto& pool : p.context.pools)
-        actions += 25ULL * pool.device_pages + 29ULL * pool.table_rows +
-                   12ULL * pool.table_rows * pool.page_capacity;
-    // Control work may span the remaining context, while prefill is chunked inside Program.
-    // Per row: IDs, count history, window boundaries and three RoPE axes, plus fixed fields.
+    const auto histories     = p.context.pools.size();
+    const auto history_pages = (context + 63) / 64;
+    const auto write_pages   = batch * histories * history_pages;
+    const auto compute_actions =
+        8 + 46 * (write_pages + batch) + 21 * batch * histories + 8 * write_pages;
+    const auto context_actions =
+        8 + 46 * context::kContextActionBatchOperations + 8 * context::kContextActionBatchOffsets;
+    const auto commit_pages = batch * histories * 2;
+    const auto commit_actions =
+        8 + 46 * (commit_pages + batch) + 21 * batch * histories + 8 * commit_pages;
+    // Control inputs may cover the remaining context; native execution chunks them internally.
     const auto work =
-        header + actions + 128 + batch * (192 + 24 * context) + 4ULL * s.prefill_chunk;
-    const auto context_work = header + actions + 32 + batch * (88 + 4 * context);
-    const auto commit       = header + actions + 8 + batch * 43;
+        header + 4 + compute_actions + 128 + batch * (200 + 24 * context) + 4ULL * s.prefill_chunk;
+    const auto context_work = header + 4 + context_actions + 32 + batch * (88 + 4 * context);
+    const auto commit       = header + 4 + 8 + batch * 51 + commit_actions;
     const auto words        = (std::size_t(definition.resources().public_token_count) + 31) / 32;
     const auto decision     = header + 12 + batch * (20 + 4 * words * positions);
     // Generated and verification tokens are bounded by speculative positions. Scoring emits
@@ -40,7 +43,7 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     const auto event =
         std::move(completion).take().size() + 96 +
         std::max<std::size_t>({batch * (64 + 8 * positions), 4ULL * s.prefill_chunk + 64,
-                               32ULL * 3 * (p.context.pools.size() + 1)});
+                               40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
     runtime::protocol::encode(report, rank.observation);
     return {work, context_work, decision, commit, event, 8 + std::move(report).take().size()};
@@ -53,10 +56,37 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
     if (ranks.empty() || ranks.size() != parallel.ranks.size())
         throw std::invalid_argument("Qwen4Exp execution descriptions omit a rank");
     GroupExecutionPlan plan{ranks.front().session, ranks.front().capacity};
+    plan.session.context.ranks.clear();
+    plan.session.context.state.layouts.front().parts.clear();
+    plan.session.context.metadata_budget_bytes = 0;
+    for (auto& pool : plan.session.context.pools) pool.parts.clear();
     for (const auto& rank : ranks) {
-        // The native TP plan partitions equal head counts and shares logical slot/page IDs.
-        if (rank.session != plan.session)
-            throw std::invalid_argument("Qwen4Exp rank context plans differ");
+        const auto& session = rank.session;
+        if (session.shape != plan.session.shape ||
+            session.checkpoint_interval != plan.session.checkpoint_interval ||
+            session.context.pools.size() != plan.session.context.pools.size())
+            throw std::invalid_argument("Qwen4Exp rank execution semantics differ");
+        auto& context = plan.session.context;
+        context.ranks.insert(context.ranks.end(), session.context.ranks.begin(),
+                             session.context.ranks.end());
+        const auto& local_state = session.context.state.layouts.front();
+        if (session.context.state.layouts.size() != 1 || local_state.variant != 0)
+            throw std::invalid_argument("Qwen4Exp State placement has an unexpected variant");
+        auto& parts = context.state.layouts.front().parts;
+        parts.insert(parts.end(), local_state.parts.begin(), local_state.parts.end());
+        context.state.logical_capacity =
+            std::max(context.state.logical_capacity, session.context.state.logical_capacity);
+        context.metadata_budget_bytes += session.context.metadata_budget_bytes;
+        for (std::size_t i = 0; i < context.pools.size(); ++i) {
+            auto& pool        = context.pools[i];
+            const auto& local = session.context.pools[i];
+            if (pool.pool_id != local.pool_id || pool.page_capacity != local.page_capacity ||
+                pool.table_rows != local.table_rows)
+                throw std::invalid_argument("Qwen4Exp history geometry differs across ranks");
+            pool.logical_pages = std::max(pool.logical_pages, local.logical_pages);
+            pool.histories     = std::max(pool.histories, local.histories);
+            pool.parts.insert(pool.parts.end(), local.parts.begin(), local.parts.end());
+        }
         plan.capacity.compute_frames =
             std::min(plan.capacity.compute_frames, rank.capacity.compute_frames);
         plan.capacity.context_frames =
@@ -99,13 +129,21 @@ void ExecutionCodec::validate_commit(const Work& work, const Result& result,
     contract_.validate(work, result, commit);
 }
 
-runtime::protocol::Scope ExecutionCodec::scope(const Work&,
+runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
                                                const distributed::ExecutionTopology&) const {
-    return scope_;
+    const auto* context = std::get_if<ContextWork>(&work.operation);
+    if (!context || !context->bindings.empty() || !context->releases.empty()) return scope_;
+    runtime::protocol::Scope scope;
+    for (const auto& [rank, actions] : work.actions)
+        if (!actions.empty()) scope.owners.push_back(rank);
+    if (scope.owners.empty()) return scope_;
+    scope.result_owner = scope.owners.front();
+    return scope;
 }
 
-void ExecutionCodec::encode_work(wire::Encoder& out, const Work& work, distributed::RankId) const {
-    qwen4_exp::encode_work(out, work, inputs_);
+void ExecutionCodec::encode_work(wire::Encoder& out, const Work& work,
+                                 distributed::RankId rank) const {
+    qwen4_exp::encode_work(out, work, inputs_, rank);
 }
 
 Work ExecutionCodec::decode_work(wire::Decoder& in) const {
@@ -113,8 +151,8 @@ Work ExecutionCodec::decode_work(wire::Decoder& in) const {
 }
 
 void ExecutionCodec::encode_commit(wire::Encoder& out, const Commit& commit,
-                                   distributed::RankId) const {
-    qwen4_exp::encode_commit(out, commit);
+                                   distributed::RankId rank) const {
+    qwen4_exp::encode_commit(out, commit, rank);
 }
 
 Commit ExecutionCodec::decode_commit(wire::Decoder& in) const {
@@ -132,23 +170,13 @@ Result ExecutionCodec::decode_result(wire::Decoder& in) const {
 Result
 ExecutionCodec::merge_context_results(const runtime::protocol::Scope& scope,
                                       const std::vector<std::optional<Result>>& results) const {
-    auto combined = std::get<ContextResult>(results.at(scope.result_owner).value());
-    for (auto owner : scope.owners) {
-        const auto& local = std::get<ContextResult>(results.at(owner).value());
-        if (local.transfers.size() != combined.transfers.size())
-            throw std::logic_error("Qwen4Exp context owners completed different transfers");
-        for (auto& transfer : combined.transfers) {
-            const auto found = std::find_if(local.transfers.begin(), local.transfers.end(),
-                                            [&](const auto& value) {
-                                                return value.resource == transfer.resource &&
-                                                       value.direction == transfer.direction;
-                                            });
-            if (found == local.transfers.end() || found->image_count != transfer.image_count ||
-                found->page_groups != transfer.page_groups || found->work != transfer.work)
-                throw std::logic_error("Qwen4Exp context owners completed different transfers");
-            // Equal local shards run in parallel. Price a logical operation by its slowest
-            // owner, retaining the matching per-shard physical work rather than double-counting.
-            transfer.elapsed_ns = std::max(transfer.elapsed_ns, found->elapsed_ns);
+    ContextResult combined;
+    for (auto rank : scope.owners) {
+        const auto& local = std::get<ContextResult>(results.at(rank).value());
+        for (const auto& transfer : local.transfers) {
+            if (transfer.rank != rank)
+                throw std::logic_error("Qwen4Exp transfer observation has a foreign rank");
+            combined.transfers.push_back(transfer);
         }
     }
     return combined;

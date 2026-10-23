@@ -78,7 +78,7 @@ std::vector<SnapshotCase> cases(Profile p) {
                   {1024, Policy::AllowA4}};
         batch(6, 3, {6, 3, 1}, 829, Policy::AllowA4);
     } else {
-        result = {{.width = 1, .convenience = true, .shared_selectors = true},
+        result = {{.width = 1},
                   {3},
                   {4},
                   {6},
@@ -95,6 +95,9 @@ std::vector<SnapshotCase> cases(Profile p) {
         batch(4, 2, {4, 2}, 937, Policy::AllowA8);
         batch(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941, Policy::AllowA8);
     }
+    // The persistent single-token publication has its own public entry and offset mapping.
+    batch(1, 1, {}, 977U);
+    result.back().graph = true;
     return result;
 }
 } // namespace

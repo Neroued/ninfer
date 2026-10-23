@@ -209,28 +209,31 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     const auto in    = [&](std::size_t offset) {
         return Tensor(ingress.subspan(offset), DType::I32, {batch});
     };
-    anchors                 = in(offsetof(FrameIngress, anchors));
-    frontiers               = in(offsetof(FrameIngress, frontiers));
-    backend_frontiers       = in(offsetof(FrameIngress, backend_frontiers));
-    extents                 = in(offsetof(FrameIngress, extents));
-    valid_columns           = in(offsetof(FrameIngress, valid_columns));
-    proposal_valid_columns  = in(offsetof(FrameIngress, proposal_valid_columns));
-    budgets                 = in(offsetof(FrameIngress, budgets));
-    main_table_rows         = in(offsetof(FrameIngress, main_table_rows));
-    backend_table_rows      = in(offsetof(FrameIngress, backend_table_rows));
-    state_source_slots      = in(offsetof(FrameIngress, state_source_slots));
-    state_destination_slots = in(offsetof(FrameIngress, state_destination_slots));
-    residency_slots         = in(offsetof(FrameIngress, residency_slots));
-    rope_deltas             = in(offsetof(FrameIngress, rope_deltas));
-    sampling                = static_cast<const ops::SamplingConfig*>(
+    anchors                = in(offsetof(FrameIngress, anchors));
+    frontiers              = in(offsetof(FrameIngress, frontiers));
+    backend_frontiers      = in(offsetof(FrameIngress, backend_frontiers));
+    extents                = in(offsetof(FrameIngress, extents));
+    valid_columns          = in(offsetof(FrameIngress, valid_columns));
+    proposal_valid_columns = in(offsetof(FrameIngress, proposal_valid_columns));
+    budgets                = in(offsetof(FrameIngress, budgets));
+    main_table_rows        = in(offsetof(FrameIngress, main_table_rows));
+    backend_table_rows     = in(offsetof(FrameIngress, backend_table_rows));
+    state_source_offsets =
+        Tensor(ingress.subspan(offsetof(FrameIngress, state_source_offsets)), DType::I64, {batch});
+    state_destination_offsets = Tensor(
+        ingress.subspan(offsetof(FrameIngress, state_destination_offsets)), DType::I64, {batch});
+    residency_slots = in(offsetof(FrameIngress, residency_slots));
+    rope_deltas     = in(offsetof(FrameIngress, rope_deltas));
+    sampling        = static_cast<const ops::SamplingConfig*>(
         ingress.subspan(offsetof(FrameIngress, sampling)).data);
     const auto committed = [&](std::size_t offset) {
         return Tensor(commit.subspan(offset), DType::I32, {batch});
     };
-    commit_destination_slots = committed(offsetof(FrameCommit, state_destination_slots));
-    history_columns          = committed(offsetof(FrameCommit, history_columns));
-    draft_append_starts      = committed(offsetof(FrameCommit, draft_append_starts));
-    draft_append_ends        = committed(offsetof(FrameCommit, draft_append_ends));
+    commit_destination_offsets = Tensor(
+        commit.subspan(offsetof(FrameCommit, state_destination_offsets)), DType::I64, {batch});
+    history_columns     = committed(offsetof(FrameCommit, history_columns));
+    draft_append_starts = committed(offsetof(FrameCommit, draft_append_starts));
+    draft_append_ends   = committed(offsetof(FrameCommit, draft_append_ends));
     output_tokens =
         Tensor(egress.subspan(offsetof(FrameEgress, tokens)), DType::I32, {width, batch});
     output_counts = Tensor(egress.subspan(offsetof(FrameEgress, counts)), DType::I32, {batch});

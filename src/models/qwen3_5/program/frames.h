@@ -34,15 +34,15 @@ struct FrameIngress {
     std::array<std::int32_t, kMaximumConcurrency> budgets{};
     std::array<std::int32_t, kMaximumConcurrency> main_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> backend_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int64_t, kMaximumConcurrency> state_source_offsets{};
+    std::array<std::int64_t, kMaximumConcurrency> state_destination_offsets{};
     std::array<std::int32_t, kMaximumConcurrency> residency_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
 struct FrameCommit {
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int64_t, kMaximumConcurrency> state_destination_offsets{};
     std::array<std::int32_t, kMaximumConcurrency> history_columns{};
     std::array<std::int32_t, kMaximumConcurrency> draft_append_starts{};
     std::array<std::int32_t, kMaximumConcurrency> draft_append_ends{};
@@ -171,9 +171,9 @@ public:
     MemorySpan ingress, commit, egress;
     Tensor anchors, frontiers, backend_frontiers, extents, valid_columns;
     Tensor proposal_valid_columns, budgets, main_table_rows, backend_table_rows;
-    Tensor state_source_slots, state_destination_slots, residency_slots, rope_deltas;
+    Tensor state_source_offsets, state_destination_offsets, residency_slots, rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
-    Tensor commit_destination_slots, history_columns;
+    Tensor commit_destination_offsets, history_columns;
     Tensor draft_append_starts, draft_append_ends;
     Tensor output_tokens, output_counts, accepted_drafts;
     Tensor input_ids, cache_positions, rope_positions, hidden;

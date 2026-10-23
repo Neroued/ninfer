@@ -33,15 +33,16 @@ enum class PdlOrder {
 };
 
 template <class Publish>
-GdnConvEpilogue<Publish> make_epilogue(const Tensor& conv_weight, const Tensor& conv_states,
-                                       const Tensor& valid_columns, const Tensor& initial_slot,
-                                       Tensor& query, Tensor& key, Tensor& value,
-                                       int global_row_offset, Publish publish) {
+GdnConvEpilogue<Publish> make_epilogue(const Tensor& conv_weight,
+                                       const ConstStateFieldView& conv_states,
+                                       const Tensor& valid_columns, Tensor& query, Tensor& key,
+                                       Tensor& value, int global_row_offset, Publish publish) {
     return {
         static_cast<const __nv_bfloat16*>(conv_weight.data),
-        static_cast<const __nv_bfloat16*>(conv_states.data),
-        conv_states.nb[2] / 2,
-        static_cast<const std::int32_t*>(initial_slot.data),
+        reinterpret_cast<const __nv_bfloat16*>(
+            (static_cast<const std::byte*>(conv_states.records.storage.data) +
+             conv_states.field.tensor.region.offset)),
+        static_cast<const std::int64_t*>(conv_states.records.byte_offsets.data),
         valid_columns.data == nullptr ? nullptr
                                       : static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<__nv_bfloat16*>(query.data),
@@ -207,14 +208,13 @@ void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 template <PdlOrder Order, class Publish>
 void launch_conv(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                 const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,
-                 const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                 const Tensor& conv_weight, const ConstStateFieldView& conv_states,
+                 const Tensor& valid_columns, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                  Publish publish, cudaStream_t stream) {
-    const GdnConvEpilogue<Publish> qk_epilogue = make_epilogue(
-        conv_weight, conv_states, valid_columns, initial_slot, query, key, value, 0, publish);
-    const GdnConvEpilogue<Publish> value_epilogue =
-        make_epilogue(conv_weight, conv_states, valid_columns, initial_slot, query, key, value,
-                      kValueOffset, publish);
+    const GdnConvEpilogue<Publish> qk_epilogue =
+        make_epilogue(conv_weight, conv_states, valid_columns, query, key, value, 0, publish);
+    const GdnConvEpilogue<Publish> value_epilogue = make_epilogue(
+        conv_weight, conv_states, valid_columns, query, key, value, kValueOffset, publish);
 
     switch (x.ne[1]) {
     case 1:
@@ -247,46 +247,36 @@ void launch_conv(const Tensor& x, const Weight& qk_weight, const Weight& value_z
 
 void launch_q4_q5_gdn_input_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                           const Weight& value_z_weight, const Tensor& conv_weight,
-                                          Tensor& conv_states, const Tensor& valid_columns,
-                                          const Tensor& initial_slot,
-                                          const Tensor& snapshot_base_slot, Tensor& query,
-                                          Tensor& key, Tensor& value, Tensor& z,
+                                          const ConstStateFieldView& conv_states,
+                                          const Tensor& valid_columns,
+                                          const gdn_input::HistoryDestination& destination,
+                                          Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream) {
     if (x.ne[1] == 2) {
         launch_conv<PdlOrder::Q4ThenQ5>(
-            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, initial_slot,
-            query, key, value, z,
-            SnapshotHistoryPublish{
-                static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
-                static_cast<const std::int32_t*>(snapshot_base_slot.data), kChannels},
-            stream);
+            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, query, key,
+            value, z, make_snapshot_history_publish(destination, kChannels), stream);
     } else {
         launch_conv<PdlOrder::Q5ThenQ4>(
-            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, initial_slot,
-            query, key, value, z,
-            SnapshotHistoryPublish{
-                static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
-                static_cast<const std::int32_t*>(snapshot_base_slot.data), kChannels},
-            stream);
+            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, query, key,
+            value, z, make_snapshot_history_publish(destination, kChannels), stream);
     }
 }
 
 void launch_q4_q5_gdn_input_conv_record(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, const Tensor& conv_weight,
-                                        const Tensor& conv_states, const Tensor& valid_columns,
-                                        const Tensor& initial_slot, Tensor& conv_record,
+                                        const ConstStateFieldView& conv_states,
+                                        const Tensor& valid_columns, Tensor& conv_record,
                                         Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                         cudaStream_t stream) {
     const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data), kChannels,
                                       x.ne[1]};
     if (x.ne[1] == 2) {
         launch_conv<PdlOrder::Q4ThenQ5>(x, qk_weight, value_z_weight, conv_weight, conv_states,
-                                        valid_columns, initial_slot, query, key, value, z, publish,
-                                        stream);
+                                        valid_columns, query, key, value, z, publish, stream);
     } else {
         launch_conv<PdlOrder::Q5ThenQ4>(x, qk_weight, value_z_weight, conv_weight, conv_states,
-                                        valid_columns, initial_slot, query, key, value, z, publish,
-                                        stream);
+                                        valid_columns, query, key, value, z, publish, stream);
     }
 }
 

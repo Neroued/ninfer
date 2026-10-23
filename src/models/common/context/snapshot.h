@@ -81,45 +81,45 @@ public:
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
     restore_requirements(const ContextDirectory& directory) const {
         std::vector<runtime::ContextTransferRequirement> result;
-        if (!states_->device_resident(continuation_.image))
-            result.push_back(state_transfer_requirement(
-                {states_->image_bytes(), 1}, runtime::ContextTransferDirection::HostToDevice));
+        const auto state_records = states_->allocations(continuation_.image);
+        for (const auto rank : states_->ranks(states_->variant(continuation_.image))) {
+            if (std::any_of(state_records.begin(), state_records.end(), [&](const auto& record) {
+                    return record.domain.rank == rank &&
+                           record.domain.memory == ContextMemory::Device;
+                }))
+                continue;
+            const auto source = states_->host_binding(continuation_.image, rank);
+            auto requirement  = state_transfer_requirement(
+                {source.bytes, 1}, runtime::ContextTransferDirection::HostToDevice);
+            requirement.rank = rank;
+            result.push_back(requirement);
+        }
         for (const auto& prefix : prefixes_) {
-            const auto pool       = prefix.history().pool_id;
-            const auto& storage   = directory.pool(pool);
-            std::uint32_t missing = 0, run_pages = 0;
-            TransferWork work;
-            std::optional<HostPageReplica> previous;
-            const auto finish = [&] {
-                if (!run_pages) return;
-                const auto run = storage.pages().host_transfer_run_work(run_pages);
-                work.payload_bytes += run.payload_bytes;
-                if (run.copy_operations > UINT32_MAX - work.copy_operations)
-                    throw std::overflow_error("checkpoint restore operation count exceeds uint32");
-                work.copy_operations += run.copy_operations;
-                run_pages = 0;
-            };
-            for (std::uint32_t i = 0; i < kv_pages_for_frontier(prefix.frontier()); ++i) {
-                const auto page = storage.histories().logical_page(prefix.history(), i);
-                if (storage.pages().device_covers(page,
-                                                  std::min(64U, prefix.frontier() - i * 64))) {
-                    finish();
-                    previous.reset();
-                    continue;
+            const auto pool     = prefix.history().pool_id;
+            const auto& storage = directory.pool(pool);
+            for (const auto& part : storage.pages().layout().parts) {
+                std::uint32_t missing = 0;
+                TransferWork work;
+                for (std::uint32_t i = 0; i < kv_pages_for_frontier(prefix.frontier()); ++i) {
+                    const auto page  = storage.histories().logical_page(prefix.history(), i);
+                    const auto ranks = storage.pages().ranks(page);
+                    if (std::find(ranks.begin(), ranks.end(), part.rank) == ranks.end()) continue;
+                    const auto columns = std::min<std::uint32_t>(
+                        kPagedKVPageSize, prefix.frontier() - i * kPagedKVPageSize);
+                    if (storage.pages().device_covers(page, part.rank, columns)) continue;
+                    const auto source = storage.pages().host_binding(page, part.rank);
+                    work.payload_bytes += source.bytes;
+                    ++work.copy_operations;
+                    ++missing;
                 }
-                const auto replica = storage.pages().host_replica(page);
-                if (previous && (replica.extent != previous->extent ||
-                                 replica.page_offset != previous->page_offset + 1))
-                    finish();
-                previous = replica;
-                ++missing;
-                ++run_pages;
+                if (missing) {
+                    auto requirement = kv_transfer_requirement(
+                        {runtime::KvPoolId{static_cast<std::uint16_t>(pool)}},
+                        runtime::ContextTransferDirection::HostToDevice, missing, work);
+                    requirement.rank = part.rank;
+                    result.push_back(requirement);
+                }
             }
-            finish();
-            if (missing)
-                result.push_back(kv_transfer_requirement(
-                    {runtime::KvPoolId{static_cast<std::uint16_t>(pool)}},
-                    runtime::ContextTransferDirection::HostToDevice, missing, work));
         }
         return result;
     }

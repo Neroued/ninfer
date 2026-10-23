@@ -3,6 +3,7 @@
 #include "core/buffer.h"
 #include "state_fixture.cuh"
 #include "ninfer/ops/qsa.h"
+#include "../../../../tools/support/paged_kv_fixture.h"
 
 #include <algorithm>
 #include <memory>
@@ -22,16 +23,13 @@ struct PrepareFixture {
     DeviceBuffer wik;
     DeviceBuffer out_q;
     DeviceBuffer out_iq;
-    DeviceBuffer keys;
-    DeviceBuffer values;
-    DeviceBuffer index_keys;
-    DeviceBuffer key_scales;
-    DeviceBuffer value_scales;
+    std::unique_ptr<tool::PackedKVFixture> packed;
     DeviceBuffer positions;
     DeviceBuffer rope;
     DeviceBuffer valid;
     DeviceBuffer table_rows;
-    DeviceBuffer slots;
+    DeviceBuffer raw_offsets;
+    DeviceBuffer rope_offsets;
     DeviceBuffer offsets;
     DeviceBuffer tables;
     StatePlane<std::uint16_t> before_raw, record_raw;
@@ -61,9 +59,9 @@ struct PrepareFixture {
           wik(make_bf16(128, 139)),
           out_q(ninfer::bench::device_context().device(), o.inplace ? 0 : q.size()),
           out_iq(ninfer::bench::device_context().device(), o.inplace ? 0 : iq.size()),
-          before_raw(128, 3, o.batch, DType::BF16, o.layout),
+          before_raw(128, 3, o.batch, DType::BF16, o.layout, false, true),
           record_raw(128, tokens, o.batch, DType::BF16, o.layout),
-          before_rope(3, o.batch, 1, DType::I32, o.layout, true),
+          before_rope(3, o.batch, 1, DType::I32, o.layout, true, true),
           record_rope(3, tokens, o.batch, DType::I32, o.layout), bases(broadcast(o.bases, o.batch)),
           kv_only(o.op == "prepare-kv") {
         const int B = o.batch, A = o.axes;
@@ -101,26 +99,43 @@ struct PrepareFixture {
         rope                      = measurement::make_i32(coords);
         valid                     = measurement::make_i32(counts);
         table_rows                = measurement::make_i32(indices);
-        slots                     = measurement::make_i32(indices);
         offsets                   = measurement::make_i32(zero);
-        tables                    = measurement::make_i32(table);
-        const auto schema         = paged_kv_storage_layout(o.storage, 256);
-        const auto allocate_plane = [=](DeviceBuffer& buffer, DType dtype, int leading) {
-            if (leading == 0) return Tensor{};
-            buffer = make_zeros(std::size_t(pages) * leading * 64 * o.kv_heads * dtype_size(dtype));
-            return Tensor(buffer.span(), dtype, {leading, 64, o.kv_heads, pages});
+        const auto upload_offsets = [](const std::vector<std::int64_t>& values) {
+            auto buffer = make_buffer(values.size() * sizeof(std::int64_t));
+            buffer.copy_from_host(values.data(), buffer.size());
+            return buffer;
         };
-        const auto k_data =
-            allocate_plane(keys, schema.key.data_dtype, schema.key.data_leading_extent);
-        const auto v_data =
-            allocate_plane(values, schema.value.data_dtype, schema.value.data_leading_extent);
-        const auto k_scales =
-            allocate_plane(key_scales, schema.key.scale_dtype, schema.key.scale_leading_extent);
-        const auto v_scales = allocate_plane(value_scales, schema.value.scale_dtype,
-                                             schema.value.scale_leading_extent);
-        index_keys          = make_zeros(std::size_t(pages) * 128 * 16 * 2);
-        projected           = {kv_only ? Tensor{}
-                                       : Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
+        raw_offsets       = upload_offsets(before_raw.offsets(indices));
+        rope_offsets      = upload_offsets(before_rope.offsets(indices, true));
+        const auto schema = paged_kv_storage_layout(o.storage, 256);
+        KVPageGeometry geometry;
+        const auto add_plane = [&](DType dtype, int leading, int heads, int tokens_per_row = 1) {
+            if (leading == 0) return -1;
+            const int index = geometry.planes.size();
+            geometry.planes.push_back({dtype, leading, heads, 256, std::uint32_t(tokens_per_row)});
+            return index;
+        };
+        const int key_plane =
+            add_plane(schema.key.data_dtype, schema.key.data_leading_extent, o.kv_heads);
+        const int value_plane =
+            add_plane(schema.value.data_dtype, schema.value.data_leading_extent, o.kv_heads);
+        const int key_scale_plane =
+            add_plane(schema.key.scale_dtype, schema.key.scale_leading_extent, o.kv_heads);
+        const int value_scale_plane =
+            add_plane(schema.value.scale_dtype, schema.value.scale_leading_extent, o.kv_heads);
+        const int index_plane = add_plane(DType::BF16, 128, 1, 4);
+        packed =
+            std::make_unique<tool::PackedKVFixture>(device_context().device(), geometry, pages);
+        tables = upload_offsets(packed->table_offsets(table));
+        const Tensor block_tables(tables.span(), DType::I64, {logical, B});
+        const auto plane = [&](int index) {
+            return index >= 0 ? packed->plane(index, block_tables) : PagedPlaneView{};
+        };
+        cache     = {{plane(key_plane), plane(value_plane), plane(key_scale_plane),
+                      plane(value_scale_plane), 256, o.kv_heads, o.storage},
+                     {plane(index_plane)}};
+        projected = {kv_only ? Tensor{}
+                             : Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
                      Tensor(k.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
                      Tensor(v.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
                      kv_only ? Tensor{} : Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
@@ -129,17 +144,15 @@ struct PrepareFixture {
             {Tensor(wk.span(), DType::BF16, {256}), Tensor(wik.span(), DType::BF16, {128})},
             kv_only ? Tensor{} : Tensor(wq.span(), DType::BF16, {256}),
             kv_only ? Tensor{} : Tensor(wiq.span(), DType::BF16, {128})};
-        batch   = {Tensor(positions.span(), DType::I32, {tokens, B}),
-                   Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
-        before  = {before_raw.view, before_rope.view, Tensor(slots.span(), DType::I32, {B})};
-        records = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
-        Tensor block_tables(tables.span(), DType::I32, {logical, B});
-        cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, o.kv_heads, o.storage},
-                 {Tensor(index_keys.span(), DType::BF16, {128, 16, 1, pages}), block_tables}};
-        rho   = Tensor(rope.span(), DType::I32, {tokens, A, B});
-        query = kv_only     ? Tensor{}
-                : o.inplace ? projected.query
-                            : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
+        batch       = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                       Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
+        before      = {before_raw.field(Tensor(raw_offsets.span(), DType::I64, {B})),
+                       before_rope.field(Tensor(rope_offsets.span(), DType::I64, {B}), true)};
+        records     = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
+        rho         = Tensor(rope.span(), DType::I32, {tokens, A, B});
+        query       = kv_only     ? Tensor{}
+                      : o.inplace ? projected.query
+                                  : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
         index_query = kv_only     ? Tensor{}
                       : o.inplace ? projected.index_query
                                   : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});

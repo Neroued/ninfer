@@ -160,21 +160,17 @@ int main() {
         const q35::execution::Parameters parameters(*model, profile);
         const auto capacity = [&](std::uint32_t max_context) {
             ninfer::EngineOptions options;
-            options.max_context         = max_context;
-            options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
-            options.prefill_chunk       = 1024;
-            options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
-            options.speculative.draft_tokens        = 3;
-            options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
-            options.enable_vision                   = true;
-            options.use_cuda_graph                  = false;
-            options.context_cache.extra_state_slots = 1;
-            auto planner     = q35::make_sequence_planner(parameters, device, options);
-            const auto pages = planner.capacity_curve().minimum_primary_page_groups;
-            auto plan        = std::move(planner).finalize(
-                {pages,
-                        options.max_concurrency + options.context_cache.extra_state_slots.value_or(0)});
+            options.max_context               = max_context;
+            options.prefill_chunk             = 1024;
+            options.kv_cache                  = ninfer::KvCacheStorage::Fp8E4M3Row256;
+            options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens  = 3;
+            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            options.enable_vision             = true;
+            options.use_cuda_graph            = false;
+            auto planner       = q35::make_sequence_planner(parameters, device, options);
+            const auto minimum = planner.capacity_plan().minimum_capacity();
+            auto plan          = std::move(planner).finalize(minimum);
             const auto session = q35::plan_session(plan);
             require(session.vision_workspace.has_value(), "Vision session lost its workspace plan");
             const auto vision = *session.vision_workspace;

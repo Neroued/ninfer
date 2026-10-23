@@ -40,8 +40,8 @@ __launch_bounds__(256) __global__
     const int kv_head               = unit % Geometry::KVHeads;
     const int token                 = unit / Geometry::KVHeads;
     const int position              = positions[0] + token;
-    const std::int32_t* block_table = metadata.block_table();
-    int page                        = lane == 0 ? lookup_page(block_table, position) : 0;
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t page               = lane == 0 ? lookup_page(block_table, position) : 0;
     const int page_off              = position & kPageMask;
     page                            = __shfl_sync(FullMask, page, 0);
 
@@ -55,27 +55,27 @@ __launch_bounds__(256) __global__
 
 #pragma unroll
     for (int group = 0; group < kInt8Groups; ++group) {
-        const int d0                 = group * kInt8Group + lane;
-        const int d1                 = d0 + 32;
-        const float k0               = k_values[2 * group];
-        const float k1               = k_values[2 * group + 1];
-        const std::int64_t src0      = source_offset<Geometry>(kv_head, d0, token);
-        const std::int64_t src1      = source_offset<Geometry>(kv_head, d1, token);
-        const float v0               = __bfloat162float(v[src0]);
-        const float v1               = __bfloat162float(v[src1]);
-        const float k_abs            = common::warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
-        const float v_abs            = common::warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
-        const auto k_quant           = common::int8_fp16_scale(k_abs);
-        const auto v_quant           = common::int8_fp16_scale(v_abs);
-        const std::int64_t code_base = Int8G64Layout<Geometry::KVHeads>::code_offset(
-            page, kv_head, group * kInt8Group, page_off);
+        const int d0            = group * kInt8Group + lane;
+        const int d1            = d0 + 32;
+        const float k0          = k_values[2 * group];
+        const float k1          = k_values[2 * group + 1];
+        const std::int64_t src0 = source_offset<Geometry>(kv_head, d0, token);
+        const std::int64_t src1 = source_offset<Geometry>(kv_head, d1, token);
+        const float v0          = __bfloat162float(v[src0]);
+        const float v1          = __bfloat162float(v[src1]);
+        const float k_abs       = common::warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
+        const float v_abs       = common::warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
+        const auto k_quant      = common::int8_fp16_scale(k_abs);
+        const auto v_quant      = common::int8_fp16_scale(v_abs);
+        const std::int64_t code_base =
+            Int8G64Layout::code_offset(page, kv_head, group * kInt8Group, page_off);
         cache_k[code_base + lane]      = common::int8_quant_code(k0, k_quant.inverse_scale);
         cache_k[code_base + lane + 32] = common::int8_quant_code(k1, k_quant.inverse_scale);
         cache_v[code_base + lane]      = common::int8_quant_code(v0, v_quant.inverse_scale);
         cache_v[code_base + lane + 32] = common::int8_quant_code(v1, v_quant.inverse_scale);
         if (lane == 0) {
             const std::int64_t scale_off =
-                Int8G64Layout<Geometry::KVHeads>::scale_offset(page, kv_head, group, page_off);
+                Int8G64Layout::scale_offset(page, kv_head, group, page_off);
             scale_k[scale_off] = k_quant.scale;
             scale_v[scale_off] = v_quant.scale;
         }
@@ -107,9 +107,9 @@ __launch_bounds__(256) __global__
     const int token = token_begin + warp;
     if (token >= token_end) return;
 
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? block_table[logical_page] : 0;
-    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? block_table[logical_page] : 0;
+    record                          = __shfl_sync(FullMask, record, 0);
 
     const int position = base_position + token;
     const int page_off = position & kPageMask;
@@ -124,27 +124,27 @@ __launch_bounds__(256) __global__
 
 #pragma unroll
     for (int group = 0; group < kInt8Groups; ++group) {
-        const int d0                 = group * kInt8Group + lane;
-        const int d1                 = d0 + 32;
-        const float k0               = k_values[2 * group];
-        const float k1               = k_values[2 * group + 1];
-        const std::int64_t src0      = source_offset<Geometry>(kv_head, d0, token);
-        const std::int64_t src1      = source_offset<Geometry>(kv_head, d1, token);
-        const float v0               = __bfloat162float(v[src0]);
-        const float v1               = __bfloat162float(v[src1]);
-        const float k_abs            = common::warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
-        const float v_abs            = common::warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
-        const auto k_quant           = common::int8_fp16_scale(k_abs);
-        const auto v_quant           = common::int8_fp16_scale(v_abs);
-        const std::int64_t code_base = Int8G64Layout<Geometry::KVHeads>::code_offset(
-            physical_page, kv_head, group * kInt8Group, page_off);
+        const int d0            = group * kInt8Group + lane;
+        const int d1            = d0 + 32;
+        const float k0          = k_values[2 * group];
+        const float k1          = k_values[2 * group + 1];
+        const std::int64_t src0 = source_offset<Geometry>(kv_head, d0, token);
+        const std::int64_t src1 = source_offset<Geometry>(kv_head, d1, token);
+        const float v0          = __bfloat162float(v[src0]);
+        const float v1          = __bfloat162float(v[src1]);
+        const float k_abs       = common::warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
+        const float v_abs       = common::warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
+        const auto k_quant      = common::int8_fp16_scale(k_abs);
+        const auto v_quant      = common::int8_fp16_scale(v_abs);
+        const std::int64_t code_base =
+            Int8G64Layout::code_offset(record, kv_head, group * kInt8Group, page_off);
         cache_k[code_base + lane]      = common::int8_quant_code(k0, k_quant.inverse_scale);
         cache_k[code_base + lane + 32] = common::int8_quant_code(k1, k_quant.inverse_scale);
         cache_v[code_base + lane]      = common::int8_quant_code(v0, v_quant.inverse_scale);
         cache_v[code_base + lane + 32] = common::int8_quant_code(v1, v_quant.inverse_scale);
         if (lane == 0) {
-            const std::int64_t scale_offset = Int8G64Layout<Geometry::KVHeads>::scale_offset(
-                physical_page, kv_head, group, page_off);
+            const std::int64_t scale_offset =
+                Int8G64Layout::scale_offset(record, kv_head, group, page_off);
             scale_k[scale_offset] = k_quant.scale;
             scale_v[scale_offset] = v_quant.scale;
         }

@@ -1,4 +1,5 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include <array>
 #include "ops/common/host/operands.h"
 #include "ops/linear_attention/causal_conv/launch.h"
 #include <cstdint>
@@ -55,14 +56,6 @@ void require_out_shape(const Tensor& x, const Tensor& out) {
         if (out.ne[d] != x.ne[d]) {
             throw std::invalid_argument("causal_conv1d: out shape must match x");
         }
-    }
-}
-
-void require_selector_shape(const Tensor& selector, std::int32_t batch, const char* label) {
-    if (selector.ne[0] != batch || selector.ne[1] != 1 || selector.ne[2] != 1 ||
-        selector.ne[3] != 1) {
-        throw std::invalid_argument(std::string("causal_conv1d: ") + label +
-                                    " must have shape [B]");
     }
 }
 
@@ -252,62 +245,54 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
     causal_conv1d_silu(x, weight, conv_state, conv_state, out, execution);
 }
 
-void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, ConstStateFieldView source,
+                                 Tensor& snapshots, const Tensor& valid_columns,
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  CudaExecutionView execution) {
-    const auto stream = execution.stream();
     const bool masked = valid_columns.data != nullptr;
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
-    }
-    if (initial_state_slots.dtype != DType::I32 || snapshot_base_slots.dtype != DType::I32 ||
-        (masked && valid_columns.dtype != DType::I32)) {
-        throw std::invalid_argument("causal_conv1d: snapshot selectors must be I32");
-    }
-
-    const std::int64_t n = common::operand::numel(x, "causal_conv1d");
-    (void)common::operand::numel(weight, "causal_conv1d");
-    (void)common::operand::numel(conv_states, "causal_conv1d");
-    if (masked) { (void)common::operand::numel(valid_columns, "causal_conv1d"); }
-    (void)common::operand::numel(initial_state_slots, "causal_conv1d");
-    (void)common::operand::numel(snapshot_base_slots, "causal_conv1d");
-    (void)common::operand::numel(out, "causal_conv1d");
-
     require_snapshot_x_shape(x);
-    const std::int32_t batch = x.ne[2];
-    require_weight_shape(weight, x.ne[0]);
-    require_snapshot_state_shape(conv_states, x.ne[0], x.ne[1], batch);
-    if (masked) { require_selector_shape(valid_columns, batch, "valid_columns"); }
-    require_selector_shape(initial_state_slots, batch, "initial_state_slots");
-    require_selector_shape(snapshot_base_slots, batch, "snapshot_base_slots");
-    require_out_shape(x, out);
-    if (n == 0) { return; }
-
-    for (const Tensor* tensor : std::initializer_list<const Tensor*>{&x, &weight, &out})
-        common::operand::contiguous_nonnull(*tensor, "causal_conv1d", "operand",
-                                            execution.device());
-    common::operand::slotted_tensor(conv_states, DType::BF16, {x.ne[0], 3, conv_states.ne[2]}, 2, 2,
-                                    "causal_conv1d", "states", execution.device());
-    if (masked) {
-        common::operand::contiguous_nonnull(valid_columns, "causal_conv1d", "valid_columns",
-                                            execution.device());
+    const auto channels = x.ne[0];
+    const auto batch    = x.ne[2];
+    common::operand::tensor(x, DType::BF16, {channels, x.ne[1], batch}, 2, "causal_conv1d", "x",
+                            execution.device());
+    common::operand::tensor(weight, DType::BF16, {channels, 4}, 2, "causal_conv1d", "weight",
+                            execution.device());
+    common::operand::tensor(out, DType::BF16, {channels, x.ne[1], batch}, 2, "causal_conv1d", "out",
+                            execution.device());
+    common::operand::state_field(source, DType::BF16, {channels, 3}, 2, "causal_conv1d", "source",
+                                 execution.device());
+    if (source.field.layers != 1 || source.records.byte_offsets.ne[0] != batch) {
+        throw std::invalid_argument("causal_conv1d: source row count differs from batch");
     }
-    common::operand::contiguous_nonnull(initial_state_slots, "causal_conv1d", "initial_state_slots",
-                                        execution.device());
-    common::operand::contiguous_nonnull(snapshot_base_slots, "causal_conv1d", "snapshot_base_slots",
-                                        execution.device());
-    const auto state_blocks = common::operand::blocks(conv_states, "causal_conv1d");
-    for (const Tensor* operand : std::initializer_list<const Tensor*>{
-             &x, &weight, &valid_columns, &initial_state_slots, &snapshot_base_slots, &out}) {
-        if (operand->data && common::operand::overlaps(
-                                 state_blocks, common::operand::range(*operand, "causal_conv1d")))
-            throw std::invalid_argument("causal_conv1d: operands overlap snapshot storage");
+    require_snapshot_state_shape(snapshots, channels, x.ne[1], batch);
+    common::operand::tensor(snapshots, DType::BF16, {channels, 3, snapshots.ne[2]}, 2,
+                            "causal_conv1d", "snapshots", execution.device());
+    if (masked) {
+        common::operand::tensor(valid_columns, DType::I32, {batch}, alignof(std::int32_t),
+                                "causal_conv1d", "valid columns", execution.device());
+    }
+    common::operand::tensor(snapshot_base_slots, DType::I32, {batch}, alignof(std::int32_t),
+                            "causal_conv1d", "snapshot bases", execution.device());
+    const std::array<const Tensor*, 7> operands{&x,
+                                                &weight,
+                                                &snapshots,
+                                                &valid_columns,
+                                                &source.records.byte_offsets,
+                                                &snapshot_base_slots,
+                                                &out};
+    for (std::size_t i = 0; i < operands.size(); ++i) {
+        if (!operands[i]->data) continue;
+        for (std::size_t j = i + 1; j < operands.size(); ++j) {
+            if (operands[j]->data &&
+                common::operand::overlaps(common::operand::range(*operands[i], "causal_conv1d"),
+                                          common::operand::range(*operands[j], "causal_conv1d"))) {
+                throw std::invalid_argument("causal_conv1d: snapshot operands overlap");
+            }
+        }
     }
     detail::launch_causal_conv_snapshot(
-        x, weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots, out,
-        detail::select_causal_conv_snapshot_plan(x.ne[1], batch, masked), stream);
+        x, weight, source, snapshots, valid_columns, snapshot_base_slots, out,
+        detail::select_causal_conv_snapshot_plan(x.ne[1], batch, masked), execution.stream());
 }
 
 } // namespace ninfer::ops

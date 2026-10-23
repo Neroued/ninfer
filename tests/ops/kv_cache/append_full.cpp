@@ -1,7 +1,7 @@
 #include "ops/suite.h"
+#include "../../../tools/support/paged_kv_fixture.h"
 #include "kv_cache_storage.h"
 #include "ops/float_codec.h"
-#include "ops/state_fixture.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -260,6 +260,73 @@ void encode_full_group(const std::vector<float>& source, std::size_t source_base
         scale_bits;
 }
 
+class FullCacheFixture {
+public:
+    FullCacheFixture(const TestCacheLayout& layout, std::int32_t heads, std::int32_t pages,
+                     std::span<const std::int32_t> mapping, std::int32_t logical_pages,
+                     std::array<MemorySpan, 4> planes)
+        : packed_(planes[0].device, geometry(layout, heads), pages),
+          expected_offsets_(packed_.table_offsets(mapping)), offsets_(to_device(expected_offsets_)),
+          table_(offsets_.span(), DType::I64,
+                 {logical_pages, static_cast<std::int32_t>(mapping.size()) / logical_pages}) {
+        const std::array<TestVectorLayout, 2> vectors{layout.key, layout.value};
+        for (int side = 0; side < 2; ++side) {
+            const auto& vector = vectors[side];
+            dense_[side] =
+                Tensor(planes[side], vector.code_dtype, {vector.code_extent, kPage, heads, pages});
+            if (vector.scale_extent)
+                dense_[side + 2] = Tensor(planes[side + 2], vector.scale_dtype,
+                                          {vector.scale_extent, kPage, heads, pages});
+        }
+    }
+
+    PagedKVLayerView view(int heads, KvCacheStorage storage) {
+        return {packed_.plane(0, table_),
+                packed_.plane(1, table_),
+                dense_[2].data ? packed_.plane(2, table_) : PagedPlaneView{},
+                dense_[3].data ? packed_.plane(3, table_) : PagedPlaneView{},
+                kFullHeadDim,
+                heads,
+                storage};
+    }
+
+    void upload() {
+        for (int i = 0; i < 4; ++i)
+            if (dense_[i].data) packed_.upload_plane(i, dense_[i]);
+    }
+
+    void copy_back() {
+        for (int i = 0; i < 4; ++i)
+            if (dense_[i].data) packed_.download_plane(i, dense_[i]);
+    }
+
+    bool guards_intact() const { return packed_.guards_intact(); }
+
+    int verify_offsets() const {
+        return verify_exact("page offsets readonly",
+                            from_device<std::int64_t>(offsets_, expected_offsets_.size()),
+                            expected_offsets_);
+    }
+
+private:
+    static KVPageGeometry geometry(const TestCacheLayout& layout, int heads) {
+        KVPageGeometry result;
+        result.planes = {{layout.key.code_dtype, layout.key.code_extent, heads},
+                         {layout.value.code_dtype, layout.value.code_extent, heads}};
+        if (layout.key.scale_extent) {
+            result.planes.push_back({layout.key.scale_dtype, layout.key.scale_extent, heads});
+            result.planes.push_back({layout.value.scale_dtype, layout.value.scale_extent, heads});
+        }
+        return result;
+    }
+
+    tool::PackedKVFixture packed_;
+    std::vector<std::int64_t> expected_offsets_;
+    DeviceBuffer offsets_;
+    Tensor table_;
+    std::array<Tensor, 4> dense_;
+};
+
 int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
     const TestCacheLayout layout = test_cache_layout(storage);
     const int first_position     = tokens >= 128 ? 61 : 63;
@@ -339,7 +406,6 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
     DeviceBuffer d_k         = to_device(input_k);
     DeviceBuffer d_v         = to_device(input_v);
     DeviceBuffer d_positions = to_device(positions);
-    DeviceBuffer d_mapping   = to_device(mapping);
     Tensor k(d_k.span(), DType::BF16, {kFullHeadDim, kv_heads, tokens});
     Tensor v(d_v.span(), DType::BF16, {kFullHeadDim, kv_heads, tokens});
     Tensor position_tensor(d_positions.span(), DType::I32, {tokens});
@@ -350,16 +416,9 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         layout.key.scale_extent == 0 ? 1 : k_scale_count * dtype_size(layout.key.scale_dtype));
     GuardedDeviceBuffer scale_v(
         layout.value.scale_extent == 0 ? 1 : v_scale_count * dtype_size(layout.value.scale_dtype));
-    PagedKVLayerView cache{
-        .k_pages      = Tensor(cache_k.span(), layout.key.code_dtype,
-                               {layout.key.code_extent, kPage, kv_heads, physical_pages}),
-        .v_pages      = Tensor(cache_v.span(), layout.value.code_dtype,
-                               {layout.value.code_extent, kPage, kv_heads, physical_pages}),
-        .block_table  = Tensor(d_mapping.span(), DType::I32, {logical_pages}),
-        .head_dim     = kFullHeadDim,
-        .num_kv_heads = kv_heads,
-        .storage      = storage,
-    };
+    FullCacheFixture fixture(layout, kv_heads, physical_pages, mapping, logical_pages,
+                             {cache_k.span(), cache_v.span(), scale_k.span(), scale_v.span()});
+    auto cache = fixture.view(kv_heads, storage);
 
     int failures = 0;
     if (storage == KvCacheStorage::BFloat16) {
@@ -380,9 +439,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                 }
             }
         }
+        fixture.upload();
         ops::kv_cache_append(k, v, position_tensor, cache,
                              ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
+        fixture.copy_back();
         const std::string label = "kv_cache_append full bf16 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
                                   " P=" + std::to_string(first_position);
@@ -403,10 +464,6 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                expected_scale_k.size() * sizeof(std::uint16_t));
         scale_v.copy_from_host(expected_scale_v.data(),
                                expected_scale_v.size() * sizeof(std::uint16_t));
-        cache.k_scale_pages =
-            Tensor(scale_k.span(), DType::FP16, {kFullGroups, kPage, kv_heads, physical_pages});
-        cache.v_scale_pages =
-            Tensor(scale_v.span(), DType::FP16, {kFullGroups, kPage, kv_heads, physical_pages});
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
             const int page     = mapping[static_cast<std::size_t>(position / kPage)];
@@ -418,9 +475,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                 }
             }
         }
+        fixture.upload();
         ops::kv_cache_append(k, v, position_tensor, cache,
                              ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
+        fixture.copy_back();
         const std::string label = "kv_cache_append full int8-g64 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
                                   " P=" + std::to_string(first_position);
@@ -443,10 +502,6 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                expected_scale_k.size() * sizeof(std::uint16_t));
         scale_v.copy_from_host(expected_scale_v.data(),
                                expected_scale_v.size() * sizeof(std::uint16_t));
-        cache.k_scale_pages =
-            Tensor(scale_k.span(), DType::FP16, {kFullFp8Groups, kPage, kv_heads, physical_pages});
-        cache.v_scale_pages =
-            Tensor(scale_v.span(), DType::FP16, {kFullFp8Groups, kPage, kv_heads, physical_pages});
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
             const int page     = mapping[static_cast<std::size_t>(position / kPage)];
@@ -465,9 +520,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                     expected_scale_v);
             }
         }
+        fixture.upload();
         ops::kv_cache_append(k, v, position_tensor, cache,
                              ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
+        fixture.copy_back();
         const std::string label =
             "kv_cache_append full fp8-row256 Hkv=" + std::to_string(kv_heads) +
             " T=" + std::to_string(tokens) + " P=" + std::to_string(first_position);
@@ -495,10 +552,6 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         scale_k.copy_from_host(expected_scale_k.data(),
                                expected_scale_k.size() * sizeof(std::uint16_t));
         scale_v.copy_from_host(expected_scale_v.data(), expected_scale_v.size());
-        cache.k_scale_pages =
-            Tensor(scale_k.span(), DType::FP16, {kFullFp8Groups, kPage, kv_heads, physical_pages});
-        cache.v_scale_pages =
-            Tensor(scale_v.span(), DType::U8, {kFullNvfp4Groups, kPage, kv_heads, physical_pages});
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
             const int page     = mapping[static_cast<std::size_t>(position / kPage)];
@@ -518,9 +571,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                       expected_scale_v);
             }
         }
+        fixture.upload();
         ops::kv_cache_append(k, v, position_tensor, cache,
                              ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
+        fixture.copy_back();
         const std::string label = "kv_cache_append full k8v4 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
                                   " P=" + std::to_string(first_position);
@@ -547,10 +602,6 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         cache_v.copy_from_host(expected_v.data(), expected_v.size());
         scale_k.copy_from_host(expected_scale_k.data(), expected_scale_k.size());
         scale_v.copy_from_host(expected_scale_v.data(), expected_scale_v.size());
-        cache.k_scale_pages =
-            Tensor(scale_k.span(), DType::U8, {kFullNvfp4Groups, kPage, kv_heads, physical_pages});
-        cache.v_scale_pages =
-            Tensor(scale_v.span(), DType::U8, {kFullNvfp4Groups, kPage, kv_heads, physical_pages});
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
             const int page     = mapping[static_cast<std::size_t>(position / kPage)];
@@ -570,9 +621,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                       expected_scale_v);
             }
         }
+        fixture.upload();
         ops::kv_cache_append(k, v, position_tensor, cache,
                              ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
+        fixture.copy_back();
         const std::string label = "kv_cache_append full nvfp4-g16 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
                                   " P=" + std::to_string(first_position);
@@ -600,10 +653,10 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                              from_device<std::uint16_t>(d_v, input_count), input_v);
     failures += verify_exact((label + " positions unchanged").c_str(),
                              from_device<std::int32_t>(d_positions, positions.size()), positions);
-    failures += verify_exact((label + " block table unchanged").c_str(),
-                             from_device<std::int32_t>(d_mapping, mapping.size()), mapping);
+    failures += fixture.verify_offsets();
     failures += cache_k.verify_guards((label + " k guards").c_str());
     failures += cache_v.verify_guards((label + " v guards").c_str());
+    failures += !fixture.guards_intact();
     return failures;
 }
 
@@ -699,8 +752,8 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
 
     DeviceBuffer d_k = to_device(input_k), d_v = to_device(input_v);
     DeviceBuffer d_counts = to_device(counts), d_rows = to_device(rows);
-    DeviceBuffer d_positions = to_device(positions), d_mapping = to_device(mapping);
-    const auto plane_bytes = [&](const TestVectorLayout& vector, bool scales) {
+    DeviceBuffer d_positions = to_device(positions);
+    const auto plane_bytes   = [&](const TestVectorLayout& vector, bool scales) {
         return static_cast<std::size_t>(scales ? vector.scale_extent : vector.code_extent) * kPage *
                kv_heads * physical_pages *
                dtype_size(scales ? vector.scale_dtype : vector.code_dtype);
@@ -712,22 +765,13 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
         GuardedDeviceBuffer(sizes[0]), GuardedDeviceBuffer(sizes[1]),
         GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[2])),
         GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[3]))};
-    PagedKVBatchLayerView cache{
-        .k_pages      = Tensor(storage_buffers[0].span(), layout.key.code_dtype,
-                               {layout.key.code_extent, kPage, kv_heads, physical_pages}),
-        .v_pages      = Tensor(storage_buffers[1].span(), layout.value.code_dtype,
-                               {layout.value.code_extent, kPage, kv_heads, physical_pages}),
-        .block_tables = Tensor(d_mapping.span(), DType::I32, {logical_pages, table_rows}),
-        .head_dim     = kFullHeadDim,
-        .num_kv_heads = kv_heads,
-        .storage      = storage,
-    };
-    if (layout.key.scale_extent)
-        cache.k_scale_pages = Tensor(storage_buffers[2].span(), layout.key.scale_dtype,
-                                     {layout.key.scale_extent, kPage, kv_heads, physical_pages});
-    if (layout.value.scale_extent)
-        cache.v_scale_pages = Tensor(storage_buffers[3].span(), layout.value.scale_dtype,
-                                     {layout.value.scale_extent, kPage, kv_heads, physical_pages});
+    FullCacheFixture fixture(layout, kv_heads, physical_pages, mapping, logical_pages,
+                             {storage_buffers[0].span(), storage_buffers[1].span(),
+                              storage_buffers[2].span(), storage_buffers[3].span()});
+    const auto planes = fixture.view(kv_heads, storage);
+    const PagedKVBatchLayerView cache{
+        planes.k_pages, planes.v_pages, planes.k_scale_pages, planes.v_scale_pages, kFullHeadDim,
+        kv_heads,       storage};
     Tensor k(d_k.span(), DType::BF16, {kFullHeadDim, kv_heads, width, batch});
     Tensor v(d_v.span(), DType::BF16, {kFullHeadDim, kv_heads, width, batch});
     Tensor p(d_positions.span(), DType::I32, {width, batch});
@@ -792,11 +836,14 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
         d_counts.copy_from_host(counts.data(), counts.size() * sizeof(std::int32_t));
         d_rows.copy_from_host(rows.data(), rows.size() * sizeof(std::int32_t));
         d_positions.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        fixture.upload();
         if (captured)
             graph.launch(device.stream());
         else
             launch();
         device.synchronize();
+        fixture.copy_back();
+        failures += !fixture.guards_intact();
         for (int plane = 0; plane < 4; ++plane) {
             if (!sizes[plane]) continue;
             const auto label = "D256 prefix " + std::string(kv_cache_storage_name(storage)) +
@@ -813,8 +860,7 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
                              from_device<std::uint16_t>(d_k, input_count), input_k);
     failures += verify_exact("prefix input V unchanged",
                              from_device<std::uint16_t>(d_v, input_count), input_v);
-    failures += verify_exact("prefix mapping unchanged",
-                             from_device<std::int32_t>(d_mapping, mapping.size()), mapping);
+    failures += fixture.verify_offsets();
     failures += verify_exact("prefix counts unchanged",
                              from_device<std::int32_t>(d_counts, counts.size()), counts);
     failures +=

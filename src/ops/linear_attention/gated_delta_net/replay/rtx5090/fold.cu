@@ -3,15 +3,16 @@
 #include "ops/linear_attention/gated_delta_net/replay/fold_io.cuh"
 #include <type_traits>
 #include "core/device.h"
+#include "ops/common/host/operands.h"
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
-static_assert(sizeof(GdnReplayFoldKernelRow) == 16);
+static_assert(sizeof(GdnReplayFoldKernelRow) == 32);
 static_assert(alignof(GdnReplayFoldKernelRow) == 16);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 256);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
@@ -24,12 +25,10 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         static_cast<const __nv_bfloat16*>(records.value.data),
         reinterpret_cast<const uint2*>(records.gate.data),
         static_cast<const __nv_bfloat16*>(records.conv.data),
-        static_cast<float*>(states.recurrent_layer0.data),
-        static_cast<__nv_bfloat16*>(states.conv_layer0.data),
-        states.recurrent_layer_stride_bytes / static_cast<std::int64_t>(sizeof(float)),
-        states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-        states.recurrent_layer0.nb[3] / static_cast<std::int64_t>(sizeof(float)),
-        states.conv_layer0.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        common::operand::state_field_base<float>(states.recurrent),
+        common::operand::state_field_base<__nv_bfloat16>(states.conv),
+        static_cast<std::int64_t>(states.recurrent.field.layer_stride / sizeof(float)),
+        static_cast<std::int64_t>(states.conv.field.layer_stride / sizeof(__nv_bfloat16)),
         records.spec.record_capacity,
         records.spec.width,
         rows,

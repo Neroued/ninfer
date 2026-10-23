@@ -95,7 +95,7 @@ struct BatchEpilogue {
             // tile. A row has a single owner, including its initial history reads,
             // so an own-source/destination overlap remains valid.
             const int batch            = (n0 + first) / conv.width;
-            const std::int64_t initial = std::int64_t(conv.initial_slots[batch]) * conv.slot_stride;
+            const std::int64_t initial = conv.source_offsets[batch] / 2;
             float s0                   = __bfloat162float(conv.state_read[initial + row]);
             float s1  = __bfloat162float(conv.state_read[initial + Geometry::channels + row]);
             float s2  = __bfloat162float(conv.state_read[initial + 2LL * Geometry::channels + row]);
@@ -122,17 +122,17 @@ using Mid96    = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
 using Large128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
 
 template <class Publish>
-void launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight, const Tensor& state,
-            const Tensor& valid, const Tensor& initial, Tensor& query, Tensor& key, Tensor& value,
-            Tensor& z, Publish publish, cudaStream_t stream) {
+void launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+            const ConstStateFieldView& state, const Tensor& valid, Tensor& query, Tensor& key,
+            Tensor& value, Tensor& z, Publish publish, cudaStream_t stream) {
     const int columns = x.ne[1] * x.ne[2];
     if (weight.n != 16384 || weight.k != 2560 || x.ne[2] < 2 || x.ne[2] > 8 || x.ne[1] < 1 ||
         x.ne[1] > 16 || columns <= 64 || columns > 128)
         throw std::invalid_argument("Q8 fused batch TMA: unsupported physical block");
     const auto flat     = x.view({2560, columns});
     const auto operands = q8_linear_operands(flat, weight);
-    auto adapter = make_gdn_conv_output<Geometry, 1>(conv_weight, state, valid, initial, query, key,
-                                                     value, z, publish);
+    auto adapter =
+        make_gdn_conv_output<Geometry, 1>(conv_weight, state, valid, query, key, value, z, publish);
     adapter.conv.width = x.ne[1];
     const BatchEpilogue<Publish> epilogue{adapter.conv, adapter.z};
     if (columns <= 96)
@@ -142,22 +142,21 @@ void launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight, co
 } // namespace
 
 void launch_q8_gdn_tma_n16384_k2560_snapshot(const Tensor& x, const Weight& weight,
-                                             const Tensor& conv_weight, Tensor& state,
-                                             const Tensor& valid, const Tensor& initial,
-                                             const Tensor& bases, Tensor& query, Tensor& key,
-                                             Tensor& value, Tensor& z, cudaStream_t stream) {
-    launch(x, weight, conv_weight, state, valid, initial, query, key, value, z,
-           SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(state.data), state.nb[2] / 2,
-                                  static_cast<const std::int32_t*>(bases.data), Geometry::channels},
-           stream);
+                                             const Tensor& conv_weight,
+                                             const ConstStateFieldView& state, const Tensor& valid,
+                                             const gdn_input::HistoryDestination& destination,
+                                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                             cudaStream_t stream) {
+    launch(x, weight, conv_weight, state, valid, query, key, value, z,
+           make_snapshot_history_publish(destination, Geometry::channels), stream);
 }
 
 void launch_q8_gdn_tma_n16384_k2560_record(const Tensor& x, const Weight& weight,
-                                           const Tensor& conv_weight, const Tensor& state,
-                                           const Tensor& valid, const Tensor& initial,
+                                           const Tensor& conv_weight,
+                                           const ConstStateFieldView& state, const Tensor& valid,
                                            Tensor& record, Tensor& query, Tensor& key,
                                            Tensor& value, Tensor& z, cudaStream_t stream) {
-    launch(x, weight, conv_weight, state, valid, initial, query, key, value, z,
+    launch(x, weight, conv_weight, state, valid, query, key, value, z,
            RecordColumnPublish{static_cast<__nv_bfloat16*>(record.data), Geometry::channels,
                                static_cast<std::int32_t>(x.ne[1])},
            stream);

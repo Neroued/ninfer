@@ -58,7 +58,7 @@ void RankProgramImpl::append_draft_history(std::uint32_t batch_size,
                                frame.frontiers.slice(0, 0, batch), features, positions, counts,
                                device.execution_view());
     execution::draft_append_context(draft_view(*this), features, positions, counts,
-                                    frame.state_destination_slots.slice(0, 0, batch),
+                                    frame.state_destination_offsets.slice(0, 0, batch),
                                     frame.backend_table_rows.slice(0, 0, batch), envelope);
 }
 
@@ -74,7 +74,7 @@ void RankProgramImpl::run_dflash_draft(std::uint32_t batch_value, std::uint32_t 
                                        ? frame.proposal_valid_columns
                                        : frame.valid_columns)
                                       .slice(0, 0, batch),
-                                  frame.state_destination_slots.slice(0, 0, batch),
+                                  frame.state_destination_offsets.slice(0, 0, batch),
                                   frame.backend_table_rows.slice(0, 0, batch),
                                   frame.sampling};
     execution::DraftOutputs outputs{
@@ -153,13 +153,13 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
                                  input.rope_positions,
                                  frame.valid_columns.slice(0, 0, batch),
                                  frame.main_table_rows.slice(0, 0, batch),
-                                 frame.state_source_slots.slice(0, 0, batch),
-                                 frame.state_destination_slots.slice(0, 0, batch),
+                                 frame.state_source_offsets.slice(0, 0, batch),
+                                 frame.state_destination_offsets.slice(0, 0, batch),
                                  operation.input_embeddings};
     execution::TextStateUpdate update = execution::StepUpdate{};
     if (forward) {
         const auto& row = operation.rows[operation.forward_row];
-        update = execution::SequenceUpdate{row.state_slots.source, row.state_slots.destination};
+        update = execution::SequenceUpdate{row.state_offsets.source, row.state_offsets.destination};
     } else if (operation.speculative) {
         update.emplace<execution::ReplayRecords>(*resources.replay_records);
     }

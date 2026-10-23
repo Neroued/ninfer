@@ -69,17 +69,15 @@ TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate
                       "Main input embeddings");
     if (const auto* sequence = std::get_if<SequenceUpdate>(&update_)) {
         if (batch != 1) throw std::invalid_argument("SequenceUpdate requires one sequence");
-        if (config.gdn &&
-            (sequence->source_slot < 0 || sequence->source_slot >= view_.states.slot_count() ||
-             sequence->destination_slot < 0 ||
-             sequence->destination_slot >= view_.states.slot_count()))
-            throw std::invalid_argument("Main sequence state slots are invalid");
+        if (config.gdn && (sequence->source_offset < 0 || sequence->destination_offset < 0))
+            throw std::invalid_argument("Main sequence State offsets are invalid");
     } else if (config.gdn) {
-        require_shape(inputs_.state_source_slots, DType::I32, {batch}, "Main source state slots");
+        require_shape(inputs_.state_source_offsets, DType::I64, {batch},
+                      "Main source State offsets");
         if (std::holds_alternative<StepUpdate>(update_)) {
             if (width != 1) throw std::invalid_argument("StepUpdate requires one token per row");
-            require_shape(inputs_.state_destination_slots, DType::I32, {batch},
-                          "Main destination state slots");
+            require_shape(inputs_.state_destination_offsets, DType::I64, {batch},
+                          "Main destination State offsets");
         }
     }
     if (features) {
@@ -215,8 +213,8 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
         Tensor qkv    = workspace::gdn_prefill_conv(work, cfg, tokens);
         Tensor z_flat = z.view({dimension(gdn.value_width()), tokens});
         gdn_projection(h, p, qkv, z_flat, work, cuda);
-        Tensor source      = view_.states.conv_slot(compact_layer, sequence->source_slot);
-        Tensor destination = view_.states.conv_slot(compact_layer, sequence->destination_slot);
+        Tensor source      = view_.states.conv_tensor(compact_layer, sequence->source_offset);
+        Tensor destination = view_.states.conv_tensor(compact_layer, sequence->destination_offset);
         ops::causal_conv1d_silu_split(qkv, p.convolution, source, destination, qc, kc, vc, cuda);
     } else {
         Tensor projection_input = h.view({dimension(cfg.hidden_size), width, batch});
@@ -224,18 +222,19 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
         Tensor key_output       = kc.view({dimension(gdn.key_width()), width, batch});
         Tensor value_output     = vc.view({dimension(gdn.value_width()), width, batch});
         Tensor gate_output      = z.view({dimension(gdn.value_width()), width, batch});
-        Tensor conv             = view_.states.layer_view(compact_layer).conv;
+        const auto source = view_.states.layer_view(compact_layer, inputs_.state_source_offsets);
         if (replay) {
             const auto records = replay->records.layer(compact_layer, batch);
             Tensor conv_record = records.conv;
-            gdn_projection_record(projection_input, p, conv, inputs_.valid_columns,
-                                  inputs_.state_source_slots, conv_record, query_output, key_output,
-                                  value_output, gate_output, work, cuda);
+            gdn_projection_record(projection_input, p, source.conv, inputs_.valid_columns,
+                                  conv_record, query_output, key_output, value_output, gate_output,
+                                  work, cuda);
         } else {
-            gdn_projection_snapshot(projection_input, p, conv, inputs_.valid_columns,
-                                    inputs_.state_source_slots, inputs_.state_destination_slots,
-                                    query_output, key_output, value_output, gate_output, work,
-                                    cuda);
+            gdn_projection_update(
+                projection_input, p, source.conv,
+                view_.states.layer_view(compact_layer, inputs_.state_destination_offsets).conv,
+                inputs_.valid_columns, query_output, key_output, value_output, gate_output, work,
+                cuda);
         }
     }
 
@@ -244,26 +243,29 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     Tensor v = vc.view({dv, vh, tokens});
     Tensor o = workspace::gdn_recurrent_output(work, cfg, tokens).view({dv, vh, tokens});
     if (sequence) {
-        Tensor source      = view_.states.recurrent_slot(compact_layer, sequence->source_slot);
-        Tensor destination = view_.states.recurrent_slot(compact_layer, sequence->destination_slot);
+        Tensor source = view_.states.recurrent_tensor(compact_layer, sequence->source_offset);
+        Tensor destination =
+            view_.states.recurrent_tensor(compact_layer, sequence->destination_offset);
         ops::gated_delta_net(q, k, v, g, beta, scale, true, work, source, destination, o, cuda);
     } else {
-        Tensor states = view_.states.layer_view(compact_layer).recurrent;
-        Tensor qb     = q.view({dk, qh, width, batch});
-        Tensor kb     = k.view({dk, qh, width, batch});
-        Tensor vb     = v.view({dv, vh, width, batch});
-        Tensor gb     = g.view({vh, width, batch});
-        Tensor bb     = beta.view({vh, width, batch});
-        Tensor ob     = o.view({dv, vh, width, batch});
+        const auto source =
+            view_.states.layer_view(compact_layer, inputs_.state_source_offsets).recurrent;
+        Tensor qb = q.view({dk, qh, width, batch});
+        Tensor kb = k.view({dk, qh, width, batch});
+        Tensor vb = v.view({dv, vh, width, batch});
+        Tensor gb = g.view({vh, width, batch});
+        Tensor bb = beta.view({vh, width, batch});
+        Tensor ob = o.view({dv, vh, width, batch});
         if (replay) {
             const auto records = replay->records.layer(compact_layer, batch);
             ops::gated_delta_net_replay_record(
-                qb, kb, vb, gb, bb, scale, states, inputs_.valid_columns,
-                inputs_.state_source_slots, {records.key, records.value, records.gate}, ob, cuda);
+                qb, kb, vb, gb, bb, scale, source, inputs_.valid_columns,
+                {records.key, records.value, records.gate}, ob, cuda);
         } else {
-            ops::gated_delta_net_batch_update(qb, kb, vb, gb, bb, scale, true, states,
-                                              inputs_.state_source_slots,
-                                              inputs_.state_destination_slots, ob, cuda);
+            ops::gated_delta_net_batch_update(
+                qb, kb, vb, gb, bb, scale, true, source,
+                view_.states.layer_view(compact_layer, inputs_.state_destination_offsets).recurrent,
+                ob, cuda);
         }
     }
 

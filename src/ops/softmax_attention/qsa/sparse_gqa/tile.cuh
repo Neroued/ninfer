@@ -52,15 +52,13 @@ __device__ void sparse_gqa_addresses(const SparseGqaArguments& a,
                                    ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
                                    : work.complete;
         const int table_row  = a.table_rows[q / a.tokens];
-        const int page       = a.tables[std::int64_t(table_row) * a.table_stride + g / 16],
-                  row        = 4 * (g % 16);
-        s.addresses.key[i]   = page * a.key.page + head * a.key.head + row * a.key.row;
-        s.addresses.value[i] = page * a.value.page + head * a.value.head + row * a.value.row;
+        const auto page      = a.tables[std::int64_t(table_row) * a.table_stride + g / 16];
+        const int row        = 4 * (g % 16);
+        s.addresses.key[i]   = page + head * a.key.head + row * a.key.row;
+        s.addresses.value[i] = page + head * a.value.head + row * a.value.row;
         if constexpr (kSparseQuantized<Storage>) {
-            s.addresses.key_scale[i] =
-                page * a.key_scale.page + head * a.key_scale.head + row * a.key_scale.row;
-            s.addresses.value_scale[i] =
-                page * a.value_scale.page + head * a.value_scale.head + row * a.value_scale.row;
+            s.addresses.key_scale[i]   = page + head * a.key_scale.head + row * a.key_scale.row;
+            s.addresses.value_scale[i] = page + head * a.value_scale.head + row * a.value_scale.row;
         }
     }
     __syncthreads();

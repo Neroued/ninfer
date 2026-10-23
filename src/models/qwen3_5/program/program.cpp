@@ -58,14 +58,6 @@ RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_r
 
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
-std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles() const {
-    std::vector<context::KVTransferProfile> profiles{
-        impl_->resources.decoder.text_kv.pages().transfer_profile()};
-    if (const auto* backend = impl_->resources.backend_kv())
-        profiles.push_back(backend->pages().transfer_profile());
-    return profiles;
-}
-
 std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& parameters,
                                                  SequencePlan&& plan, DeviceContext& device,
                                                  const StartupObserver& observer) {
@@ -94,16 +86,16 @@ void RankProgramImpl::validate_row(const ExecutionRow& row) const {
     const auto lane = row.member.residency.lane.value;
     if (lane >= max_concurrency || !row.member.sequence.generation ||
         !row.member.residency.generation || !row.source_state.valid() ||
-        !row.destination_state.valid() || row.state_slots.source < 0 ||
-        row.state_slots.destination < 0 ||
-        row.state_slots.source >= resources.state_images.storage().slot_count() ||
-        row.state_slots.destination >= resources.state_images.storage().slot_count() ||
-        !row.main_table.valid() || row.main_table.pool_id != 0 ||
+        !row.destination_state.valid() || row.state_offsets.source < 0 ||
+        row.state_offsets.destination < 0 || !row.main_table.valid() ||
+        row.main_table.pool_id != 0 ||
         row.main_table.index >=
             static_cast<std::uint32_t>(resources.decoder.text_kv.tables().row_count()) ||
         row.main_frontier > capacity || row.backend_frontier > row.main_frontier) {
         throw std::invalid_argument("Qwen3.5 work has an invalid row binding");
     }
+    (void)resources.state_images.storage().image(row.state_offsets.source);
+    (void)resources.state_images.storage().image(row.state_offsets.destination);
     const auto* cache = resources.backend_kv();
     if (bool(cache) != row.backend_table.has_value() ||
         (cache &&

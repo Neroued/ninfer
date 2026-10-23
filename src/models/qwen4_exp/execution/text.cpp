@@ -19,7 +19,7 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
                                          : std::nullopt) {
     if (batch.tokens <= 0 || batch.batch < 1 ||
         batch.batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
-        (std::holds_alternative<SequenceSlots>(update) && batch.batch != 1) ||
+        (std::holds_alternative<SequenceState>(update) && batch.batch != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
         (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
@@ -77,7 +77,7 @@ void TextRun::local_mixer(std::uint32_t i) {
             state.state_index, update_, config.norm_epsilon, roots_.output, arena, cuda_);
     } else {
         ops::QsaRawRecordWriteView records;
-        if (!std::holds_alternative<SequenceSlots>(update_)) {
+        if (!std::holds_alternative<SequenceState>(update_)) {
             records = {
                 execution_.qsa_raw_records.slice(3, state.state_index, 1).slice(2, 0, batch_.batch),
                 execution_.qsa_coordinate_records.slice(3, state.state_index, 1)
@@ -87,9 +87,9 @@ void TextRun::local_mixer(std::uint32_t i) {
         const auto after = std::holds_alternative<VerifyRecords>(update_)
                                ? std::nullopt
                                : std::optional{execution_.states.main_tail(
-                                     state.state_index, batch_.destination_slots)};
+                                     state.state_index, batch_.destination_offsets)};
         qsa(roots_.input, parameters_.profile->local.qsa, std::get<QsaParameters>(p.mixer), batch_,
-            execution_.states.main_tail(state.state_index, batch_.source_slots), after,
+            execution_.states.main_tail(state.state_index, batch_.source_offsets), after,
             execution_.cache.layer(state.state_index), records, roots_.output, arena, cuda_);
     }
 }
@@ -136,13 +136,13 @@ void TextRun::consume_ple(const Tensor& embedding) {
     const auto& p    = parameters_.text;
     const auto start = parameters_.profile->config.text.ple.layer;
     ops::PleConvRecordWindowView records;
-    if (!std::holds_alternative<SequenceSlots>(update_))
+    if (!std::holds_alternative<SequenceState>(update_))
         records = {execution_.ple_records.slice(2, 0, batch_.batch), batch_.record_offsets};
     const auto after = std::holds_alternative<VerifyRecords>(update_)
                            ? std::nullopt
-                           : std::optional{execution_.states.ple(batch_.destination_slots)};
+                           : std::optional{execution_.states.ple(batch_.destination_offsets)};
     ple(embedding, parameters_.profile->config.text, p.ple, batch_,
-        execution_.states.ple(batch_.source_slots), after, records, p.layers[start].attention_hc,
+        execution_.states.ple(batch_.source_offsets), after, records, p.layers[start].attention_hc,
         roots_.residual, roots_.normalized, execution_.workspace, cuda_);
 }
 

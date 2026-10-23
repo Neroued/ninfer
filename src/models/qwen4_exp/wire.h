@@ -19,9 +19,10 @@ private:
     std::map<std::uint64_t, std::shared_ptr<const qwen::VisionExecutionInput>> inputs_;
 };
 
-void encode_work(distributed::wire::Encoder&, const Work&, const VisionInputBindings&);
+void encode_work(distributed::wire::Encoder&, const Work&, const VisionInputBindings&,
+                 std::uint32_t rank);
 [[nodiscard]] Work decode_work(distributed::wire::Decoder&, const VisionInputBindings&);
-void encode_commit(distributed::wire::Encoder&, const Commit&);
+void encode_commit(distributed::wire::Encoder&, const Commit&, std::uint32_t rank);
 [[nodiscard]] Commit decode_commit(distributed::wire::Decoder&);
 void encode_result(distributed::wire::Encoder&, const Result&);
 [[nodiscard]] Result decode_result(distributed::wire::Decoder&);

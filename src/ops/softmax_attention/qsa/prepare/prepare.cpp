@@ -17,8 +17,8 @@ bool identical(const Tensor& a, const Tensor& b) {
 
 void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView& p,
                  const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
-                 const Tensor& rope_positions, const QsaTailStateView& before, QsaCacheView cache,
-                 QsaRawRecordWriteView records) {
+                 const Tensor& rope_positions, const ConstQsaTailStateView& before,
+                 QsaCacheView cache, QsaRawRecordWriteView records) {
     const int tokens = p.key.ne[2], rows = p.key.ne[3], axes = rope_positions.ne[1];
     const int kv_heads = p.key.ne[1];
     v.require(kv_heads == 1 || kv_heads == 2, "unsupported head geometry");
@@ -45,32 +45,39 @@ void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView
     v.columns(records.rope_positions, DType::I32, 3, capacity, rows, "coordinate records");
 
     const auto& main = cache.main;
-    const int pages  = main.k_pages.ne[3];
     v.require(main.head_dim == 256 && main.num_kv_heads == kv_heads, "cache geometry");
     const auto layout        = paged_kv_storage_layout(main.storage, 256);
-    const auto vector_planes = [&](const Tensor& data, const Tensor& scale,
+    const auto vector_planes = [&](const PagedPlaneView& data, const PagedPlaneView& scale,
                                    const PagedKVVectorLayout& schema) {
-        v.plane(data, schema.data_dtype, {schema.data_leading_extent, 64, kv_heads, pages},
-                "cache data");
-        if (schema.has_scale())
-            v.plane(scale, schema.scale_dtype, {schema.scale_leading_extent, 64, kv_heads, pages},
-                    "cache scale");
-        else
-            v.require(scale.data == nullptr, "absent cache scale");
+        common::operand::paged_plane(data, schema.data_dtype,
+                                     {schema.data_leading_extent, 64, kv_heads},
+                                     dtype_size(schema.data_dtype), v.op, "cache data", v.device);
+        common::operand::same_paged_records(main.k_pages, data, v.op, "cache");
+        v.require(data.records.page_tokens == 64 && data.plane.geometry.tokens_per_row == 1,
+                  "main record geometry");
+        if (schema.has_scale()) {
+            common::operand::paged_plane(
+                scale, schema.scale_dtype, {schema.scale_leading_extent, 64, kv_heads},
+                dtype_size(schema.scale_dtype), v.op, "cache scale", v.device);
+            common::operand::same_paged_records(data, scale, v.op, "scales");
+        } else {
+            v.require(scale.data() == nullptr, "absent cache scale");
+        }
     };
     vector_planes(main.k_pages, main.k_scale_pages, layout.key);
     vector_planes(main.v_pages, main.v_scale_pages, layout.value);
-    v.plane(cache.index.keys, DType::BF16, {128, 16, 1, pages}, "index pages");
-    v.plane(main.block_tables, DType::I32, {main.block_tables.ne[0], main.block_tables.ne[1], 1, 1},
-            "block tables");
-    v.require(identical(main.block_tables, cache.index.block_tables), "shared block tables");
+    common::operand::paged_plane(cache.index.keys, DType::BF16, {128, 16, 1}, 2, v.op,
+                                 "index pages", v.device);
+    common::operand::same_paged_records(main.k_pages, cache.index.keys, v.op, "index cache");
+    v.require(cache.index.keys.plane.geometry.tokens_per_row == 4, "index record geometry");
 }
 } // namespace
 
 void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
                  const QsaBatchView& batch, const Tensor& rope_positions,
-                 const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
-                 Tensor& query, Tensor& index_query, CudaExecutionView execution) {
+                 const ConstQsaTailStateView& before, QsaCacheView cache,
+                 QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
+                 CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
     validate_kv(v, {p.key, p.value, p.index_key}, parameters.kv, batch, rope_positions, before,
                 cache, records);
@@ -92,7 +99,8 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
         for (const Tensor* in : std::initializer_list<const Tensor*>{
                  &parameters.query_norm, &parameters.kv.key_norm, &parameters.index_query_norm,
                  &parameters.kv.index_key_norm, &batch.positions, &batch.valid_columns,
-                 &batch.table_rows, &rope_positions, &before.slots, &records.offsets})
+                 &batch.table_rows, &rope_positions, &before.raw_keys.records.byte_offsets,
+                 &before.first_rope.records.byte_offsets, &records.offsets})
             v.require(!v.overlap(*out, *in), "output/parameter overlap");
     }
     detail::qsa::launch_prepare(p, parameters, batch, rope_positions, before, cache, records, query,
@@ -101,7 +109,7 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
 
 void qsa_prepare_kv(const QsaKvProjectionView& p, const QsaKvPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
-                    const QsaTailStateView& before, QsaCacheView cache,
+                    const ConstQsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_prepare_kv", execution.device()};
     validate_kv(v, p, parameters, batch, rope_positions, before, cache, records);

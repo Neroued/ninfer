@@ -81,18 +81,16 @@ struct RuntimeStats {
     std::uint64_t state_restores              = 0;
     ContextTransferStats context_transfers;
     std::vector<ContextKvPoolUsage> kv_pools;
+    std::vector<ContextPoolUsage> context_pools;
+    ContextMetadataUsage context_metadata;
 
-    std::uint64_t pressure_spill_pages        = 0;
-    std::uint64_t partial_tail_cow_pages      = 0;
-    std::uint32_t device_state_occupied_slots = 0;
-    std::uint32_t host_state_occupied_slots   = 0;
-    std::size_t host_kv_occupied_bytes        = 0;
-    // Unified physical Host context occupancy. Reserved destinations are included in occupied.
-    std::size_t host_context_occupied_bytes = 0;
-    std::size_t host_context_reserved_bytes = 0;
-    // Allocator lifetime high-water mark, including reserved transfer destinations.
-    std::size_t host_context_peak_occupied_bytes = 0;
-    double actual_context_transfer_seconds       = 0.0;
+    std::uint64_t pressure_spill_pages   = 0;
+    std::uint64_t partial_tail_cow_pages = 0;
+    std::uint64_t state_objects          = 0;
+    std::uint64_t history_objects        = 0;
+    // Sum of the largest per-rank copy time in each completed Context operation.
+    // Host scheduling gaps are excluded.
+    double actual_context_transfer_seconds = 0.0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -149,9 +147,8 @@ struct EngineDescription {
     std::string architecture, model_name;
     std::vector<RankDescriptor> ranks;
     std::uint32_t max_context = 0, max_concurrency = 0, prefill_chunk = 0;
-    std::uint32_t kv_capacity = 0, device_state_capacity = 0;
-    std::uint64_t host_context_capacity_bytes = 0;
-    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    std::vector<ContextPoolCapacity> context_pools;
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     std::vector<ContextKvPoolUsage> kv_pools;
 };
 

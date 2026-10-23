@@ -17,7 +17,7 @@ __device__ __forceinline__ void
 write_fp8_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
               std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
               __half* __restrict__ scale_k, __half* __restrict__ scale_v, int token, int kv_head,
-              int physical_page, int page_off, int lane) {
+              std::int64_t record, int page_off, int lane) {
     constexpr unsigned FullMask = 0xffffffffU;
     float values[8];
     float local_absmax = 0.0F;
@@ -33,12 +33,11 @@ write_fp8_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restri
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        cache_k[Fp8RowLayout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d, page_off)] =
+        cache_k[Fp8RowLayout::code_offset(record, kv_head, d, page_off)] =
             common::fp8_quant_code(values[r], k_quant.inverse_scale);
     }
     if (lane == 0) {
-        scale_k[Fp8RowLayout<Geometry::KVHeads>::scale_offset(physical_page, kv_head, page_off)] =
-            k_quant.scale;
+        scale_k[Fp8RowLayout::scale_offset(record, kv_head, page_off)] = k_quant.scale;
     }
 
     local_absmax = 0.0F;
@@ -52,12 +51,11 @@ write_fp8_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restri
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
-        cache_v[Fp8RowLayout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d, page_off)] =
+        cache_v[Fp8RowLayout::code_offset(record, kv_head, d, page_off)] =
             common::fp8_quant_code(values[r], v_quant.inverse_scale);
     }
     if (lane == 0) {
-        scale_v[Fp8RowLayout<Geometry::KVHeads>::scale_offset(physical_page, kv_head, page_off)] =
-            v_quant.scale;
+        scale_v[Fp8RowLayout::scale_offset(record, kv_head, page_off)] = v_quant.scale;
     }
 }
 
@@ -80,10 +78,10 @@ __launch_bounds__(256) __global__
     const int kv_head               = unit % Geometry::KVHeads;
     const int token                 = unit / Geometry::KVHeads;
     const int position              = positions[0] + token;
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? lookup_page(block_table, position) : 0;
-    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
-    write_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? lookup_page(block_table, position) : 0;
+    record                          = __shfl_sync(FullMask, record, 0);
+    write_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, record,
                             position & kPageMask, lane);
 }
 
@@ -106,7 +104,7 @@ __launch_bounds__(256) __global__
     const auto input_offset = static_cast<std::int64_t>(batch) * width * 256 * Geometry::KVHeads;
     const int position      = positions[batch * width] + token;
     const auto* table       = metadata.block_table();
-    int page                = lane == 0 ? lookup_page(table, position) : 0;
+    std::int64_t page       = lane == 0 ? lookup_page(table, position) : 0;
     page                    = __shfl_sync(0xffffffffU, page, 0);
     write_fp8_row<Geometry>(k + input_offset, v + input_offset, cache_k, cache_v, scale_k, scale_v,
                             token, kv_head, page, position & kPageMask, lane);
@@ -136,11 +134,11 @@ __launch_bounds__(256) __global__
 
     const int token = token_begin + warp;
     if (token >= token_end) return;
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? block_table[logical_page] : 0;
-    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? block_table[logical_page] : 0;
+    record                          = __shfl_sync(FullMask, record, 0);
     const int position              = base_position + token;
-    write_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+    write_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, record,
                             position & kPageMask, lane);
 }
 

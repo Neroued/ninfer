@@ -6,17 +6,29 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& state) {
+PreparedCheckpoint SessionImpl::prepare_checkpoint(SequenceState& state) {
     const auto frontier = state.continuation.metadata.text_kv_valid;
-    if (!frontier || !state.kv) return std::nullopt;
+    if (!frontier || !state.kv) return {};
+    auto record = checkpoints.reserve_owned();
+    if (!record.valid()) return {};
+    ContextDemand demand;
+    demand.add_growth(*text_kv_histories, state.kv->text.handle(), 0);
+    if (state.kv->backend) demand.add_growth(*backend_kv_histories, state.kv->backend->handle(), 0);
+    if (!directory.reserve(demand)) return {};
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);
     backing->ledger.assign(state.ledger.begin(), state.ledger.begin() + frontier);
     backing->prefix_identity = state.prefix_identity;
     backing->prefix_identity.truncate(frontier);
-    auto handle = reserve_checkpoint();
-    if (!handle) return std::nullopt;
+    return {std::move(record), std::move(backing)};
+}
+
+std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& state,
+                                                               PreparedCheckpoint prepared) {
+    if (!prepared.record.valid()) prepared = prepare_checkpoint(state);
+    if (!prepared.record.valid()) return {};
+    const auto frontier = state.continuation.metadata.text_kv_valid;
     if (state_store->role(state.continuation.image) == context::StateRole::ActiveMutable)
         state_store->freeze(state.continuation.image);
     auto captured                        = state.continuation;
@@ -27,17 +39,17 @@ std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& st
     if (state.kv->backend)
         prefixes.push_back(backend_kv_histories->retain_prefix(state.kv->backend->handle(),
                                                                backend_kv_valid(state)));
-    CheckpointState snapshot{
-        .snapshot = Snapshot(*state_store, captured, std::move(prefixes), std::move(backing)),
-        .key      = {state.prefix_digests.at(frontier), frontier,
-                     requests[state.lane].base->prefix_identity_tag}};
+    CheckpointState snapshot{.snapshot = Snapshot(*state_store, captured, std::move(prefixes),
+                                                  std::move(prepared.identity)),
+                             .key      = {state.prefix_digests.at(frontier), frontier,
+                                          requests[state.lane].base->prefix_identity_tag}};
     // The complete snapshot now owns the base before an outstanding writer is discarded.
     if (state.pending_write.valid()) {
         state_store->abort_write(state.continuation.image, state.write_state());
         if (!state_store->release(state.write_state()))
             throw std::logic_error("unused writer could not be released");
     }
-    checkpoints.publish(*handle, std::move(snapshot));
+    const auto handle = prepared.record.publish(std::move(snapshot));
     state.kv.reset();
     state.continuation.image = {};
     state.pending_write      = {};
@@ -46,13 +58,13 @@ std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& st
 
 bool SessionImpl::prepare_backup(context::ContextTransaction& migration, CheckpointState& record,
                                  bool shared_device, bool& preserve_state_device,
-                                 context::HostReservations& targets) {
-    if (!host_context_arena) return false;
+                                 context::ContextReservation& targets) {
+    if (!host_context_enabled) return false;
     preserve_state_device =
         shared_device && state_store->source_pins(record.continuation().image) != 0;
     if (!state_store->host_resident(record.continuation().image)) {
-        auto transfer = state_store->reserve_device_to_host(record.continuation().image,
-                                                            directory.take_host_image(targets));
+        auto transfer =
+            state_store->reserve_device_to_host(record.continuation().image, targets.take_state());
         if (!transfer) return false;
         migration.add_state_copy(std::move(*transfer), preserve_state_device);
     }
@@ -71,7 +83,7 @@ bool SessionImpl::prepare_backup(context::ContextTransaction& migration, Checkpo
             }
         }
         if (!logical.empty()) {
-            if (!migration.add_backups(pool.index, std::move(logical), targets, true)) return false;
+            migration.add_backups(pool.index, logical, targets.take_history(pool.index), true);
         }
         return true;
     };
@@ -88,23 +100,25 @@ bool SessionImpl::prepare_pause(SequenceHandle handle, bool save_snapshot,
     const auto write = save_snapshot ? pause_host_requirements(handle)
                                      : std::optional(context::HostWriteRequirements{});
     if (!write) return false;
-    std::optional<context::HostPlacement> placement;
-    if (host_victims.empty()) {
-        placement = directory.plan_host(*write);
-    } else {
-        for (const auto victim : host_victims)
-            if (!can_release_checkpoint(victim)) return false;
-        const auto releases = plan_releases(host_victims, {}, {.host_bytes = 1});
-        auto selected       = releases.inventory->select();
-        auto probe          = selected.probe(host_victims);
-        placement = directory.plan_host(*write, releases.inventory->host_extents(selected.freed()),
-                                        releases.inventory->host_pages(selected.freed()));
-    }
-    if (!placement) return false;
+    const auto released = checkpoint_release_set(host_victims);
+    if (!released) return false;
+    auto placement = directory.plan_host(*write, *released);
+    if (!placement.feasible()) return false;
     auto execution = executor().try_reserve(runtime::FrameKind::Context);
     if (!execution) return false;
-    pause_reservation_.emplace(
-        PauseReservation{handle, save_snapshot, std::move(*placement), {}, std::move(*execution)});
+    PreparedCheckpoint checkpoint;
+    auto& state = sequences[lane(handle)];
+    if (save_snapshot && state.continuation.metadata.text_kv_valid) {
+        checkpoint = prepare_checkpoint(state);
+        if (!checkpoint.record.valid()) return false;
+    }
+    pause_reservation_.emplace(PauseReservation{handle,
+                                                save_snapshot,
+                                                std::move(placement),
+                                                {},
+                                                std::move(*execution),
+                                                {},
+                                                std::move(checkpoint)});
     return true;
 }
 
@@ -121,9 +135,26 @@ bool SessionImpl::start_pause(SequenceHandle handle, bool save_snapshot) {
     if (pause_reservation_->sequence != handle ||
         pause_reservation_->save_snapshot != save_snapshot)
         throw std::logic_error("pause does not match its preparation");
-    auto targets = directory.host_allocation().reserve(pause_reservation_->placement);
+    auto targets = directory.reserve(pause_reservation_->placement.demand);
     if (!targets) throw std::logic_error("prepared pause placement changed before reservation");
-    pause_reservation_->targets = std::move(*targets);
+    if (!targets.reservation->ready()) {
+        auto maintenance =
+            directory.prepare_maintenance(std::move(*targets.reservation), targets.assessment);
+        context_operation_ = std::make_unique<PendingContext>(
+            std::move(maintenance),
+            MaintenanceOperation{.pause_sequence = handle, .save_snapshot = save_snapshot});
+        context_operation_->reservation.emplace(std::move(pause_reservation_->execution));
+        (void)submit_context(*context_operation_, ContextWork{});
+        return true;
+    }
+    pause_reservation_->targets = std::move(*targets.reservation);
+    return continue_pause_ready(handle, save_snapshot);
+}
+
+bool SessionImpl::continue_pause_ready(SequenceHandle handle, bool save_snapshot) {
+    const auto index = lane(handle);
+    auto& state      = sequences[index];
+    auto& control    = requests[index];
     control.capture_reservation.reset();
     if (control.capture_pending) skip_capture(handle);
     control.recovery.reset();
@@ -140,8 +171,8 @@ bool SessionImpl::start_pause(SequenceHandle handle, bool save_snapshot) {
             }
             release_units(std::span(&handle, 1));
         }
-        save_snapshot = false;
-        pause_reservation_->targets.clear();
+        save_snapshot               = false;
+        pause_reservation_->targets = {};
     }
     return begin_pause(handle, save_snapshot);
 }
@@ -179,7 +210,8 @@ bool SessionImpl::begin_pause(SequenceHandle handle, bool save_snapshot) {
             }
         }
     }
-    if (save_snapshot && saved->frontier) saved->snapshot = detach_checkpoint(state);
+    if (save_snapshot && saved->frontier)
+        saved->snapshot = detach_checkpoint(state, std::move(pause_reservation_->checkpoint));
     if (!saved->snapshot) {
         release_sequence_kv(state);
         release_sequence_state(state);
@@ -192,7 +224,8 @@ bool SessionImpl::begin_pause(SequenceHandle handle, bool save_snapshot) {
     control.lifecycle  = Lifecycle::Pausing;
     context_operation_ = std::make_unique<PendingContext>(
         directory, PauseOperation{lane, ResumeState(std::move(saved))});
-    auto targets = std::move(pause_reservation_->targets);
+    auto targets                            = std::move(pause_reservation_->targets);
+    context_operation_->preceding_transfers = std::move(pause_reservation_->preceding_transfers);
     context_operation_->reservation.emplace(std::move(pause_reservation_->execution));
     pause_reservation_.reset();
     auto& tx        = std::get<PauseOperation>(context_operation_->action);

@@ -26,39 +26,31 @@ void require_profile(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char* op,
+std::uint32_t validate_context(const ConstPagedKVBatchLayerView& context, const char* op,
                                Device device) {
     common::operand::device(context.device(), device, op, "cache");
     if (context.storage != KvCacheStorage::BFloat16 || context.num_kv_heads != kKVHeads ||
         context.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid context geometry or dtype");
     }
-    const std::int32_t physical_pages = context.k_pages.ne[2];
-    if (physical_pages <= 0 || context.v_pages.ne[2] != physical_pages ||
-        context.block_tables.ne[0] <= 0 || context.block_tables.ne[1] <= 0) {
+    const auto& offsets = context.k_pages.records.page_offsets;
+    if (offsets.ne[0] <= 0 || offsets.ne[1] <= 0 ||
+        context.k_pages.records.page_tokens != kPagedKVPageSize) {
         throw std::invalid_argument(std::string(op) + ": invalid context capacity");
     }
-    if (context.k_pages.dtype != DType::BF16 || context.v_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16/FP16");
-    }
-    common::operand::shape(context.k_pages, {kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads},
-                           op, "context k pages");
-    common::operand::shape(context.v_pages, {kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads},
-                           op, "context v pages");
-    common::operand::contiguous_nonnull(context.k_pages, op, "context k pages", device);
-    common::operand::contiguous_nonnull(context.v_pages, op, "context v pages", device);
-    common::operand::shape(context.block_tables,
-                           {context.block_tables.ne[0], context.block_tables.ne[1], 1, 1}, op,
-                           "context block tables");
-    if (context.block_tables.dtype != DType::I32) {
-        throw std::invalid_argument(std::string(op) + ": context block tables must be I32");
-    }
-    common::operand::contiguous_nonnull(context.block_tables, op, "context block tables", device);
-    if (context.k_scale_pages.data != nullptr || context.v_scale_pages.data != nullptr) {
+    common::operand::paged_plane(context.k_pages, DType::BF16,
+                                 {kHeadDim, kPagedKVPageSize, kKVHeads}, 16, op, "context K",
+                                 device);
+    common::operand::paged_plane(context.v_pages, DType::FP16,
+                                 {kHeadDim, kPagedKVPageSize, kKVHeads}, 16, op, "context V",
+                                 device);
+    common::operand::same_paged_records(context.k_pages, context.v_pages, op, "context K/V");
+    if (context.k_scale_pages.records.storage.data != nullptr ||
+        context.v_scale_pages.records.storage.data != nullptr) {
         throw std::invalid_argument(std::string(op) + ": BF16 context must not have scales");
     }
     const std::uint64_t logical_capacity =
-        static_cast<std::uint64_t>(context.block_tables.ne[0]) * kPagedKVPageSize;
+        static_cast<std::uint64_t>(context.k_pages.records.page_offsets.ne[0]) * kPagedKVPageSize;
     if (logical_capacity > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(std::string(op) + ": logical context capacity exceeds int32");
     }
@@ -113,7 +105,7 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(
 void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
-                               float scale, const PagedKVBatchLayerView& context,
+                               float scale, const ConstPagedKVBatchLayerView& context,
                                ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                                Tensor& out, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {

@@ -21,7 +21,9 @@ struct RuntimeTypes {
     using RankProgram       = qwen4_exp::RankProgram;
     using Session           = qwen4_exp::Session;
     using PreparedSession   = qwen4_exp::PreparedSession;
-    using ContextResources  = qwen4_exp::ContextResources;
+    using ContextDemand     = qwen4_exp::ContextDemand;
+    using ContextAssessment = qwen4_exp::ContextAssessment;
+    using ContextReleaseSet = qwen4_exp::ContextReleaseSet;
     using RequestBasePlan   = qwen4_exp::RequestBasePlan;
     using SequenceHandle    = qwen4_exp::SequenceHandle;
     using CheckpointHandle  = qwen4_exp::CheckpointHandle;

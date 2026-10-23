@@ -6,23 +6,34 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::CheckpointRole role) {
+PreparedCheckpoint SessionImpl::prepare_checkpoint(Sequence& s) {
+    const auto frontier = s.continuation.metadata.main_frontier;
+    if (!s.request->can_checkpoint(frontier)) return {};
+    auto record = checkpoints.reserve_owned();
+    if (!record.valid()) return {};
+    ContextDemand demand;
+    for (std::uint32_t pool = 0; pool < pool_count(); ++pool)
+        demand.add_growth(directory.pool(pool).histories(), s.histories[pool].handle(), 0);
+    if (!directory.reserve(demand)) return {};
+    return {std::move(record), capture_identity(s)};
+}
+
+std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::CheckpointRole role,
+                                                    PreparedCheckpoint prepared) {
     const auto f = s.continuation.metadata.main_frontier;
-    if (!s.request->can_checkpoint(f)) return {};
-    auto identity = capture_identity(s);
+    if (!prepared.record.valid()) prepared = prepare_checkpoint(s);
+    if (!prepared.record.valid()) return {};
     std::vector<context::HistoryPrefix> prefixes;
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
         prefixes.push_back(directory.pool(pool).histories().retain_prefix(
             s.histories[pool].handle(),
             pool == 0 ? f : s.continuation.metadata.mtp_frontier.value()));
-    const auto record = checkpoints.reserve();
-    if (!record) return {};
     auto& states     = directory.states();
     const auto image = s.continuation.image;
     if (states.role(image) == context::StateRole::ActiveMutable) states.freeze(image);
-    checkpoints.publish(
-        *record,
-        {Snapshot(states, s.continuation, std::move(prefixes), std::move(identity)), role});
+    const auto record = prepared.record.publish(
+        {Snapshot(states, s.continuation, std::move(prefixes), std::move(prepared.identity)),
+         role});
     if (s.write_destination.valid()) {
         states.abort_write(image, s.write_destination);
         if (!states.release(s.write_destination))
@@ -38,9 +49,11 @@ std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::Checkp
 
 namespace ninfer::models::qwen4_exp {
 
-std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
+std::optional<CapturePreparation>
+Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> host_victims) {
     auto& p = *impl_;
     auto& s = p.sequence(h);
+    if (p.directory.maintenance_pending()) return {};
     if (!s.permit || !s.request->summary.publish_continuation) return {};
     if (s.recovery_peak) {
         s.capture.reset();
@@ -83,17 +96,48 @@ std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
-        if (!record) return CapturePreparation{.frontier = point.frontier, .origin = point.origin};
+        if (!record) return {};
         ticket->records.emplace_back(*record, role);
     }
-    auto destination = context::reserve_capture_destination(
-        *ticket->states, p.directory.host_allocation(), ticket->host);
+    std::vector<CheckpointHandle> retired;
+    std::optional<context::StateId> destination;
+    if (host_victims.empty()) {
+        destination = context::reserve_capture_destination(p.directory, ticket->host);
+    } else {
+        for (const auto victim : host_victims)
+            if (!p.checkpoints.erasable(victim)) return {};
+        const auto released   = p.footprint(host_victims, true);
+        const auto assessment = p.directory.plan_host({.state_images = 1}, released);
+        if (!assessment.ready())
+            return CapturePreparation{.frontier   = point.frontier,
+                                      .assessment = assessment,
+                                      .host       = {.state_images = 1},
+                                      .origin     = point.origin};
+        destination = p.directory.states().reserve_logical_destination();
+        if (!destination) return {};
+        ticket->destination = *destination;
+        for (const auto victim : host_victims) {
+            if (!p.checkpoints.erase(victim))
+                throw std::logic_error("capture Host release changed after its assessment");
+            retired.push_back(victim);
+        }
+        auto reserved = p.directory.reserve(assessment.demand);
+        if (!reserved || !reserved.reservation->ready())
+            throw std::logic_error("capture Host placement changed after its assessment");
+        ticket->host.emplace(reserved.reservation->take_state());
+    }
     if (!destination)
-        return CapturePreparation{
-            point.frontier, false, {.state_slots = 1}, {.state_images = 1}, point.origin};
+        return CapturePreparation{point.frontier,
+                                  false,
+                                  p.directory.assess({.new_states = 1}),
+                                  {.state_images = 1},
+                                  point.origin};
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
-    return CapturePreparation{.frontier = point.frontier, .reserved = true, .origin = point.origin};
+    return CapturePreparation{.frontier       = point.frontier,
+                              .reserved       = true,
+                              .origin         = point.origin,
+                              .retired_points = std::move(retired)};
 }
 
 std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
@@ -127,15 +171,12 @@ void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
     if (s.next_capture < s.captures.size()) ++s.next_capture;
 }
 
-bool Session::reclaim_capture_reservation(ContextResources shortage) {
-    for (auto& s : impl_->sequences) {
-        if (!s || !s->capture || s->capture_pending) continue;
-        if ((shortage.state_slots &&
-             impl_->directory.states().device_resident(s->capture->destination)) ||
-            (shortage.host_bytes && s->capture->host)) {
-            s->capture.reset();
-            return true;
-        }
+bool Session::reclaim_capture_reservation(const ContextAssessment& assessment) {
+    if (assessment.ready()) return false;
+    for (auto& sequence : impl_->sequences) {
+        if (!sequence || !sequence->capture || sequence->capture_pending) continue;
+        sequence->capture.reset();
+        return true;
     }
     return false;
 }
@@ -143,8 +184,8 @@ bool Session::reclaim_capture_reservation(ContextResources shortage) {
 bool Session::start_capture(SequenceHandle h) {
     auto& p = *impl_;
     auto& s = p.sequence(h);
-    if (p.operation || execution_pending(h) || !s.capture_pending || !s.capture ||
-        s.write_destination.valid())
+    if (p.directory.maintenance_pending() || p.operation || execution_pending(h) ||
+        !s.capture_pending || !s.capture || s.write_destination.valid())
         return false;
     auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return false;
@@ -178,7 +219,8 @@ std::optional<Session::HostRequirement> Session::pause_host_requirements(Sequenc
     const auto& p = *impl_;
     const auto& s = p.sequence(h);
     if (!s.request->can_checkpoint(s.continuation.metadata.main_frontier) ||
-        !p.directory.host_allocation().capacity_bytes())
+        std::none_of(p.plan.context.ranks.begin(), p.plan.context.ranks.end(),
+                     [](const auto& rank) { return rank.host_bytes != 0; }))
         return {};
     HostRequirement write;
     write.state_images = p.directory.states().host_resident(s.continuation.image) ? 0 : 1;
@@ -208,24 +250,26 @@ bool Session::prepare_pause(SequenceHandle h, bool save,
         throw std::logic_error("pause requires a committed boundary");
     const auto write = save ? pause_host_requirements(h) : std::optional(HostRequirement{});
     if (!write) return false;
-    std::optional<context::HostPlacement> placement;
-    if (host_victims.empty()) {
-        placement = p.directory.plan_host(*write);
-    } else {
+    ContextReleaseSet released;
+    if (!host_victims.empty()) {
         for (const auto victim : host_victims)
             if (!p.checkpoints.erasable(victim)) return false;
-        const auto releases = p.plan_releases(host_victims, {}, {.host_bytes = 1});
-        auto selected       = releases.inventory->select();
-        auto probe          = selected.probe(host_victims);
-        placement =
-            p.directory.plan_host(*write, releases.inventory->host_extents(selected.freed()),
-                                  releases.inventory->host_pages(selected.freed()));
+        released = p.footprint(host_victims, true);
     }
-    if (!placement) return false;
+    const auto assessment = p.directory.plan_host(*write, released);
+    if (!assessment.feasible()) return false;
+    if (assessment.requires_maintenance() && (p.compute || p.executor->has_pending_work()))
+        return false;
     auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return false;
+    detail::PreparedCheckpoint checkpoint;
+    auto& sequence = p.sequence(h);
+    if (save && sequence.request->can_checkpoint(sequence.continuation.metadata.main_frontier)) {
+        checkpoint = p.prepare_checkpoint(sequence);
+        if (!checkpoint.record.valid()) return false;
+    }
     p.pause_reservation.emplace(detail::SessionImpl::PauseReservation{
-        h, save, std::move(*placement), std::move(*execution)});
+        h, save, p.directory.host_demand(*write), std::move(*execution), std::move(checkpoint)});
     return true;
 }
 
@@ -235,9 +279,10 @@ bool Session::start_pause(SequenceHandle h, bool save) {
     if (!p.pause_reservation && !prepare_pause(h, save)) return false;
     if (p.pause_reservation->sequence != h || p.pause_reservation->save_snapshot != save)
         throw std::logic_error("pause does not match its preparation");
-    auto targets = p.directory.host_allocation().reserve(p.pause_reservation->placement);
+    auto targets = p.directory.reserve(p.pause_reservation->demand);
     if (!targets) throw std::logic_error("prepared pause placement changed before reservation");
-    auto execution = std::move(p.pause_reservation->execution);
+    auto execution  = std::move(p.pause_reservation->execution);
+    auto checkpoint = std::move(p.pause_reservation->checkpoint);
     p.pause_reservation.reset();
     auto& s       = p.sequence(h);
     auto paused   = std::make_unique<detail::Suspended>();
@@ -245,24 +290,20 @@ bool Session::start_pause(SequenceHandle h, bool save) {
     paused->frontier =
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     p.operation = std::make_unique<detail::ContextOperation>(
-        p.directory, detail::PauseOperation{s.lane, std::move(paused)}, std::move(execution));
-    auto& tx        = std::get<detail::PauseOperation>(p.operation->action);
-    auto& migration = p.operation->migration;
+        p.directory, detail::PauseOperation{s.lane, std::move(paused), save, std::move(checkpoint)},
+        std::move(execution));
     try {
-        s.capture.reset();
-        s.capture_pending = false;
-        s.recovery_peak   = 0;
-        p.settle(s);
-        if (s.phase == detail::Phase::Replay) s.phase = s.resume_phase;
-        if (save) tx.paused->snapshot = p.detach(s, runtime::CheckpointRole::Continuation);
-        if (!tx.paused->snapshot) p.clear(s);
-        tx.paused->sequence = std::move(p.sequences[s.lane]);
-        if (tx.paused->snapshot) {
-            const auto demotion =
-                p.demotion({&*tx.paused->snapshot, 1},
-                           {.state_slots = 1, .kv_page_groups = {UINT32_MAX, UINT32_MAX}});
-            if (demotion && !p.prepare_demotion(migration, *demotion, *targets))
-                throw std::logic_error("prepared pause backup lost its destination");
+        if (!targets.reservation->ready()) {
+            p.operation->migration.discard();
+            auto maintenance = p.directory.prepare_maintenance(std::move(*targets.reservation),
+                                                               targets.assessment);
+            auto previous    = std::move(p.operation);
+            p.operation      = std::make_unique<detail::ContextOperation>(
+                std::move(maintenance), std::move(previous->action),
+                std::move(previous->reservation));
+            p.operation->preparing_resources = true;
+        } else {
+            p.prepare_pause_resources(*targets.reservation);
         }
         p.submit_context();
         return true;
@@ -280,9 +321,5 @@ bool Session::revoke_snapshot(ResumeState& state) noexcept {
     return true;
 }
 
-ContextResources Session::snapshot_resources(const ResumeState& s) const {
-    return s.has_snapshot() ? impl_->footprint({&*s.state_->snapshot, 1}, true)
-                            : ContextResources{};
-}
 
 } // namespace ninfer::models::qwen4_exp

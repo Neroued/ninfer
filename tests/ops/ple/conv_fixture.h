@@ -25,18 +25,19 @@ struct ConvFixture {
     ConvFixture(int t, int b, int layout = 0, bool in_place = false)
         : tokens(t), batch(b), capacity(t + 5), slots(b + 3), residual({H, C, t, b}),
           gated({H, C, t, b}), kernel({D, 4}, layout == 1), norm({H, C}, layout == 1),
-          history({D, 9, slots}, layout == 1, column_strides(9, slots, layout)),
+          history({D, 9, slots}, layout == 1, history_strides(slots, layout)),
           records({D, capacity, b}, layout == 1, column_strides(capacity, b, layout)),
           updated({H, C, t, b}), normalized({H, C, t, b}), valid(b), source(b), offset(b),
           d_valid(ninfer::test::cuda_environment().context.device(), b * 4),
-          d_source(ninfer::test::cuda_environment().context.device(), b * 4),
+          d_source(ninfer::test::cuda_environment().context.device(), b * 8),
           d_offset(ninfer::test::cuda_environment().context.device(), b * 4),
           y(in_place ? residual.tensor : updated.tensor), inplace(in_place) {}
 
     ops::PleBatchView batch_view() { return {Tensor(d_valid.span(), DType::I32, {batch})}; }
 
     ops::PleConvStateView state_view() {
-        return {history.tensor, Tensor(d_source.span(), DType::I32, {batch})};
+        return {history_field(history.tensor, history.device->span(),
+                              Tensor(d_source.span(), DType::I64, {batch}))};
     }
 
     ops::PleConvRecordWindowView record_view() {
@@ -77,7 +78,7 @@ struct ConvFixture {
              {&residual, &gated, &kernel, &norm, &history, &records, &updated, &normalized})
             w->upload();
         upload_i32(d_valid, valid);
-        upload_i32(d_source, source);
+        upload_offsets(d_source, history.tensor, source);
         upload_i32(d_offset, offset);
         // Fixture uploads use the default stream; the Op uses a nonblocking compute stream.
         cuda_synchronize();
@@ -143,7 +144,8 @@ struct ConvFixture {
         for (const Words* w : {&residual, &updated, &normalized})
             failures += w->device->verify_guards(label);
         failures += verify_exact("valid", from_device<int>(d_valid, batch), valid);
-        failures += verify_exact("source", from_device<int>(d_source, batch), source);
+        failures += verify_exact("source", from_device<std::int64_t>(d_source, batch),
+                                 history_offsets(history.tensor, source));
         failures += verify_exact("offset", from_device<int>(d_offset, batch), offset);
         if (failures) std::cerr << label << ": failures=" << failures << '\n';
         return failures;

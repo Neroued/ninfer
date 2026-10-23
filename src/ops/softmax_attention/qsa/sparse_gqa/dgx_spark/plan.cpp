@@ -53,11 +53,11 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
             visible};
 }
 
-SparseGqaLaunchPlan select_sparse_gqa_launch(const PagedKVBatchLayerView& cache, SparseGqaPlan plan,
-                                             int queries, int batch, int sms) {
-    const auto aligned = [](const Tensor& t) {
-        return common::operand::aligned(t.data, 16) && t.nb[1] % 16 == 0 && t.nb[2] % 16 == 0 &&
-               t.nb[3] % 16 == 0;
+SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& cache,
+                                             SparseGqaPlan plan, int queries, int batch, int sms) {
+    const auto aligned = [](const ConstPagedPlaneView& t) {
+        return common::operand::aligned(t.data(), 16) && t.row_stride_bytes() % 16 == 0 &&
+               t.head_stride_bytes() % 16 == 0 && t.plane.tensor.region.alignment % 16 == 0;
     };
     const bool vector    = aligned(cache.k_pages) && aligned(cache.v_pages);
     const bool quantized = cache.storage != KvCacheStorage::BFloat16;

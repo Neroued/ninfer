@@ -44,15 +44,15 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage,
     return maximum;
 }
 
-void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchLayerView& cache,
-                    const QsaBatchView& batch, const QsaBlockSelection& selected,
-                    QsaSparseGqaExecutionEnvelope envelope, MemoryArena& workspace, Tensor& out,
-                    CudaExecutionView execution) {
+void qsa_sparse_gqa(const Tensor& query, const Tensor& gate,
+                    const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
+                    const QsaBlockSelection& selected, QsaSparseGqaExecutionEnvelope envelope,
+                    MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument("QSA workspace belongs to another device");
     }
     const detail::qsa::ViewValidation v{"qsa_sparse_gqa", execution.device()};
-    const int tokens = query.ne[2], rows = query.ne[3], pages = cache.k_pages.ne[3];
+    const int tokens = query.ne[2], rows = query.ne[3];
     const int query_heads = query.ne[1], kv_heads = cache.num_kv_heads;
     profile(cache.storage, query_heads, kv_heads, tokens, tokens, rows, envelope,
             execution.multiprocessor_count());
@@ -61,19 +61,26 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
     v.dense(out, DType::BF16, {256, query_heads, tokens, rows}, 16, "output");
     v.require(cache.head_dim == 256, "cache geometry");
     const auto layout = paged_kv_storage_layout(cache.storage, 256);
-    const auto plane  = [&](const Tensor& data, const Tensor& scales, PagedKVVectorLayout format) {
-        v.plane(data, format.data_dtype, {format.data_leading_extent, 64, kv_heads, pages},
-                 "cache data");
-        if (format.has_scale())
-            v.plane(scales, format.scale_dtype, {format.scale_leading_extent, 64, kv_heads, pages},
-                     "cache scales");
-        else
-            v.require(!scales.data, "absent scales");
+    const auto plane  = [&](const ConstPagedPlaneView& data, const ConstPagedPlaneView& scales,
+                           PagedKVVectorLayout format) {
+        common::operand::paged_plane(
+            data, format.data_dtype, {format.data_leading_extent, 64, kv_heads},
+            dtype_size(format.data_dtype), "qsa_sparse_gqa", "cache data", execution.device());
+        common::operand::same_paged_records(cache.k_pages, data, "qsa_sparse_gqa", "cache");
+        v.require(data.records.page_tokens == 64 && data.plane.geometry.tokens_per_row == 1,
+                   "record geometry");
+        if (format.has_scale()) {
+            common::operand::paged_plane(scales, format.scale_dtype,
+                                          {format.scale_leading_extent, 64, kv_heads},
+                                          dtype_size(format.scale_dtype), "qsa_sparse_gqa",
+                                          "cache scales", execution.device());
+            common::operand::same_paged_records(data, scales, "qsa_sparse_gqa", "scales");
+        } else {
+            v.require(!scales.data(), "absent scales");
+        }
     };
     plane(cache.k_pages, cache.k_scale_pages, layout.key);
     plane(cache.v_pages, cache.v_scale_pages, layout.value);
-    v.plane(cache.block_tables, DType::I32,
-            {cache.block_tables.ne[0], cache.block_tables.ne[1], 1, 1}, "block tables");
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
     v.metadata(batch.valid_columns, rows, "valid columns");
     v.metadata(batch.table_rows, rows, "table rows");
@@ -81,11 +88,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
     v.dense(selected.block_counts, DType::I32, {tokens, rows, 1, 1}, 4, "block counts");
     const Tensor* inputs[]{&query,
                            &gate,
-                           &cache.k_pages,
-                           &cache.v_pages,
-                           &cache.k_scale_pages,
-                           &cache.v_scale_pages,
-                           &cache.block_tables,
+                           &cache.k_pages.records.page_offsets,
                            &batch.positions,
                            &batch.valid_columns,
                            &batch.table_rows,

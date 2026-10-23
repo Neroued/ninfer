@@ -1,10 +1,10 @@
 #pragma once
 
-#include "core/device.h"
 #include "core/arena.h"
+#include "core/device.h"
+#include "core/record_view.h"
 #include "core/tensor.h"
 #include "ninfer/ops/projection_weights.h"
-
 
 #include <cstddef>
 #include <cstdint>
@@ -15,24 +15,29 @@ struct GdnConvOutputs {
     Tensor query, key, value, z;
 };
 
-struct GdnConvSourceState {
-    Tensor history;      // Read-only BF16 [C,3,S].
-    Tensor source_slots; // Read-only device I32 [B], absolute slots in [0,S).
+struct GdnConvSnapshotState {
+    ConstStateFieldView source; // Read-only BF16 [C,3] field selected by device I64 byte offsets.
+    Tensor snapshots;           // Contiguous BF16 [C,3,N] temporary histories.
+    Tensor snapshot_bases;      // Read-only device I32 [B], reserves [base,base+T).
 };
 
-struct GdnConvSnapshotState {
-    Tensor history;        // BF16 [C,3,S], source and destination pool.
-    Tensor source_slots;   // Read-only device I32 [B], absolute slots in [0,S).
-    Tensor snapshot_bases; // Read-only device I32 [B], reserves [base,base+T).
-};
+// The single-token form writes the new BF16 [C,3] history directly to destination records.
+// Each row's source and destination fields are disjoint or exactly alias the complete [C,3]
+// field. Destination fields are distinct across rows and cannot overwrite another row's source.
+// Other math and workspace requirements match the snapshot form below, with T=1.
+void gdn_input_proj_conv_update(const Tensor& x, const ProjectionWeights& weights,
+                                const Tensor& conv_weight, ConstStateFieldView source,
+                                StateFieldView destination, const Tensor& valid_columns,
+                                GdnConvOutputs outputs, MemoryArena& workspace,
+                                CudaExecutionView execution);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
  *
  * Math / indexing:
  *   Let p=concat(Wq*x,Wk*x,Wv*x) and z=Wz*x. For each batch row b, read the width-three
- *   history selected by source_slots[b]. At each valid token t, evaluate the four-tap
- *   causal depthwise convolution over history and p[:,t,b], apply SiLU, and split its
+ *   history selected by source.records.byte_offsets[b]. At each valid token t, evaluate the
+ * four-tap causal depthwise convolution over history and p[:,t,b], apply SiLU, and split its
  *   channels to query/key/value. Publish the resulting width-three history at
  *   snapshot_bases[b]+t. Z bypasses convolution.
  *
@@ -44,9 +49,10 @@ struct GdnConvSnapshotState {
  *   [12288,5120] use V=6144. The logical row order is [q,k,v,z]. Q8 and paired weights
  *   use A16. Single-parent LinearPolicy permits A8 for FP8 or A4 for NVFP4.
  *
- *   x BF16 [H,T,B], conv_weight BF16 [C,4], history BF16 [C,3,S], query/key BF16 [Q,T,B],
- *   value/z BF16 [V,T,B]. History has dense [C,3] slots with explicit nb[2]; other tensors
- *   are contiguous. Every slot starts 16-byte aligned. Selectors are contiguous device I32 [B].
+ *   x BF16 [H,T,B], conv_weight BF16 [C,4], query/key BF16 [Q,T,B], value/z BF16 [V,T,B].
+ *   Source is a BF16 [C,3] field in each record, selected by device I64 [B] byte offsets.
+ *   Snapshots are contiguous BF16 [C,3,N]; snapshot_bases is contiguous device I32 [B].
+ *   Fields, snapshots and other data tensors are 16-byte aligned; data tensors are contiguous.
  *   B=1 accepts every positive T; B=2..8 accepts T=1..16. Empty valid_columns means every
  *   row is dense; otherwise it is device I32 [B] with each extent in [1,T]. Projection
  *   processes all M=B*T safe columns.
@@ -55,12 +61,14 @@ struct GdnConvSnapshotState {
  *   Projection, convolution and SiLU form one computation. Private projected values are
  *   not an observable BF16 boundary. Outputs and published histories are BF16.
  *   Query/key/value are exact zero in invalid tails; z is written for every physical
- *   column. Only valid destination history slots are written. The caller reserves disjoint
- *   complete [base,base+T) intervals, prevents a row from overwriting another row's source,
- *   and may overlap its own source with its destination after the initial history is loaded.
- *   Other slots are unchanged. Tensor operands are disjoint except that the two read-only
- *   state selector tensors may alias. Weight parents and call-local scratch overlap none
- *   of the tensors. Device selector values and cross-row slot relationships are caller promises.
+ *   column. Only valid destination snapshot rows are written. The caller reserves disjoint
+ *   complete [base,base+T) intervals and prevents a row from overwriting another row's source.
+ *   A source field is disjoint from the snapshot destination or exactly aliases one complete
+ *   [C,3] row in its own reservation; partial overlap is not allowed.
+ *   Other snapshot rows are unchanged. Tensor operands are disjoint. Selected source fields
+ *   overlap no operands except their own permitted snapshot destination. Weight parents and
+ *   call-local scratch overlap no accessed fields or tensors. Valid byte offsets, field bounds,
+ *   and cross-row alias relationships are caller promises.
  *
  * Workspace / execution:
  *   Uses scoped storage at the caller arena cursor; earlier allocations may hold operands.
@@ -95,7 +103,7 @@ gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& w
  * cover the complete Op and the supplied inclusive T interval. Capture/replay is supported.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const ProjectionWeights& weights,
-                                const Tensor& conv_weight, GdnConvSourceState state,
+                                const Tensor& conv_weight, ConstStateFieldView state,
                                 const Tensor& valid_columns, GdnConvOutputs outputs,
                                 Tensor& conv_record, MemoryArena& workspace,
                                 CudaExecutionView execution);

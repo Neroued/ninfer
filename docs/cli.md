@@ -63,8 +63,8 @@ scope, state handling and resource limits.
   --proposal-head optimized
 ```
 
-Exactly one of `--prompt` and `--messages` is required. The CLI normally omits `--kv-capacity`, so
-the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
+Exactly one of `--prompt` and `--messages` is required. Context capacity defaults to `auto`;
+`--max-context` limits each request, while KV and State share the resolved byte capacity.
 
 Answer content is streamed to stdout. Tool calls supplied through `--messages` also stream to stdout
 as `{"name":"...","arguments":...}` records, with argument bytes appearing as they are generated.
@@ -302,8 +302,8 @@ The complete field/flag mapping, defaults and override rules are maintained in
 [Startup configuration](startup-configuration.md). Both CLI and serve accept `--config FILE` and
 share the engine controls. The root [ninfer.example.toml](../ninfer.example.toml) lists every setting.
 
-CLI defaults are 8192 context tokens, 128 output tokens, seed 0, no prefix reuse, zero extra state
-slots and zero Host context capacity. Explicit cache and concurrency settings are retained.
+CLI defaults are 8192 context tokens, 128 output tokens, seed 0, no prefix reuse, automatic Device
+Context capacity and zero Host context capacity. Explicit cache and concurrency settings are retained.
 Use `--temperature 0` for greedy sampling. `--seed random` chooses a fresh seed for the request;
 `model` clears a sampling or template override and `default` restores an entry-specific default
 where supported.
@@ -355,20 +355,14 @@ on one RTX 5090 depends on the selected artifact, media workload, output budget,
 The artifact describes its model configuration and weight representations;
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
-`--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
-the 64-token page size. Startup plans the selected weights and complete enabled runtime layout
-from artifact metadata before allocating their backing. With resident weights,
-`--kv-capacity auto` chooses the largest legal page capacity within the available Device budget,
-including the selected speculative backend, fixed sequence state, unified workspace and
-measured CUDA Graph rebuilding cost. Both explicit and automatic capacity use 1 GiB of base startup
-planning headroom. On Spark, Vision also reserves the configured live media capacity in shared memory.
-Startup calibration releases its temporary storage before sizing the final pools;
-retained driver memory is already included in the remaining free memory. With CPU expert
-offload, `auto` reserves one full context and assigns the remaining budget to expert storage;
-set an explicit capacity when more shared KV is needed. Graph calibration runs only at startup;
-the pool stays fixed while serving requests. The single-request
-CLI normally leaves the option omitted so it follows
-`--max-context`; the distinction matters primarily to a concurrent Engine or server.
+`--context-capacity SIZE|auto` controls each rank's Device backing shared by KV and State.
+The default `auto` accounts for weights, workspace, Graph rebuilding, control metadata and other
+required resources before allocating the remainder. Explicit capacity is specified in bytes,
+for example `--context-capacity 4GiB`. Both modes validate the model's complete minimum working
+sets and keep 1 GiB of startup planning headroom. On Spark, Host resources such as live media
+also consume the unified-memory budget. Graph calibration releases its temporary storage before
+final sizing. The backing stays fixed during inference; its allocation among State and the
+selected KV histories follows actual demand.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and CUDA Graph resources sized through calibration. With Vision enabled, that one

@@ -6,7 +6,6 @@ namespace ninfer::ops::detail {
 
 struct ContextKVMaterializeImplementation {
     void (*launch)(const Tensor& context, const Tensor& positions, const Tensor& counts,
-                   const Tensor& state_slots,
                    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>&,
                    ContextKVMaterializeExecutionEnvelope, const Tensor& key_scratch,
                    cudaStream_t stream);

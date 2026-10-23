@@ -149,10 +149,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-context", type=int, default=262144)
     parser.add_argument(
-        "--kv-capacity",
-        default="262144",
-        metavar="N|auto",
-        help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
+        "--context-capacity",
+        default="auto",
+        metavar="SIZE|auto",
+        help="per-rank shared KV/State capacity passed to ninfer-serve (default: auto)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
     parser.add_argument("--kv-dtype", choices=tuple(corpus.KV_CACHE_NAMES), default="int8")
@@ -176,11 +176,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--decode-tokens must be positive")
     if args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0:
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
-    if args.kv_capacity != "auto":
-        if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
-            raise corpus.CampaignError("--kv-capacity must be a positive integer or auto")
-        if int(args.kv_capacity) < args.max_context:
-            raise corpus.CampaignError("--kv-capacity must be at least --max-context")
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
     for concurrency in args.concurrency:
@@ -299,8 +294,8 @@ def server_command(
         point.model_id,
         "--max-context",
         str(args.max_context),
-        "--kv-capacity",
-        args.kv_capacity,
+        "--context-capacity",
+        args.context_capacity,
         "--max-concurrency",
         str(point.concurrency),
         "--max-pending-requests",
@@ -318,8 +313,6 @@ def server_command(
         "--kv-dtype",
         point.kv_dtype,
         "--no-prefix-reuse",
-        "--extra-state-slots",
-        "0",
         "--host-cache-capacity",
         "0",
     ]
@@ -365,7 +358,7 @@ def validate_server_start(
     expected = {
         "device": args.device,
         "max_context": args.max_context,
-        "kv_capacity_mode": "auto" if args.kv_capacity == "auto" else "explicit",
+        "context_capacity_mode": "auto" if args.context_capacity == "auto" else "explicit",
         "max_concurrency": point.concurrency,
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
@@ -382,10 +375,7 @@ def validate_server_start(
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
-    if (
-        context_cache.get("extra_state_slots") != 0
-        or context_cache.get("host_capacity_bytes") != 0
-    ):
+    if context_cache.get("host_capacity_bytes") != 0:
         raise corpus.CampaignError("server_start context cache capacity differs from the point")
     if (event.get("sampling_defaults", {}).get("server_overrides", {}).get("temperature") == 0) != (
         point.sampling_mode == "greedy"
@@ -656,7 +646,7 @@ def steady_metrics(
     if not selected:
         raise corpus.CampaignError(
             f"concurrency {concurrency} produced no recovery-free full-batch decode interval; "
-            "increase --decode-tokens or --kv-capacity, or reduce concurrency"
+            "increase --decode-tokens or --context-capacity, or reduce concurrency"
         )
     duration = sum(float(event["interval_seconds"]) for event in selected)
     tokens = sum(int(event["tokens"]["committed_decode"]) for event in selected)

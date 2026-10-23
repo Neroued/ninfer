@@ -128,10 +128,6 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
     return "unknown";
 }
 
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) noexcept {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
-}
-
 void append_clause(std::ostringstream& out, std::string_view clause) { out << " | " << clause; }
 
 void append_counted_clause(std::ostringstream& out, std::string_view label, std::uint64_t count) {
@@ -461,10 +457,13 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const auto& engine       = service.engine_options();
     const auto& cache        = engine.context_cache;
     const auto& context_cost = startup.load.context_cost;
-    logger_->info("capacity | KV {} tokens, {} | {} device states | {} ranks",
-                  product::format_pretty_count(description.kv_capacity),
-                  kv_cache_name(description.kv_cache), description.device_state_capacity,
-                  description.ranks.size());
+    logger_->info("capacity | {} | {} ranks | {} active lanes", kv_cache_name(description.kv_cache),
+                  description.ranks.size(), engine.max_concurrency);
+    for (const auto& pool : description.context_pools)
+        logger_->info("context rank {} | {} {} | block {}", pool.rank,
+                      pool.domain == ninfer::ContextMemoryDomain::Device ? "device" : "host",
+                      product::format_pretty_bytes(pool.capacity_bytes),
+                      product::format_pretty_bytes(pool.block_bytes));
     for (std::size_t i = 0; i < description.ranks.size(); ++i) {
         const auto& rank   = description.ranks[i];
         const auto& budget = startup.ranks.at(i);
@@ -480,9 +479,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                 budget.graphs->preparation_increment_bytes, budget.retained_bytes);
     }
 
-    logger_->info("context | history {} | {} active + {} extra device states | host {}",
-                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.extra_state_slots,
-                  product::format_pretty_bytes(*cache.host_capacity_bytes));
+    logger_->info("context | history {} | checkpoint interval {} tokens",
+                  cache.enabled ? "on" : "off", cache.checkpoint_interval);
 
     if (service.options().launch.engine.enable_vision) {
         const ninfer::MediaCacheSummary media = service.snapshot().media;

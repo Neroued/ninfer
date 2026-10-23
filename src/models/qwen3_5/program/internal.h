@@ -146,7 +146,6 @@ public:
     const execution::Parameters& parameters;
     DeviceContext& device;
     const std::uint32_t capacity;
-    const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
@@ -154,7 +153,6 @@ public:
     const ProposalHead proposal_head;
     const bool use_cuda_graph;
     const KvCacheStorage kv_storage;
-    const std::size_t kv_payload_bytes;
     const WorkspaceSpec workspace_plan;
     Resources resources;
     std::unique_ptr<context::ContextStorage> storage;

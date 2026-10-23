@@ -92,8 +92,32 @@ std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
     return impl_->plan.kv_pools;
 }
 
-ContextResources Session::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
-    return impl_->checkpoint_footprint(handles);
+ContextAssessment Session::assess(const ContextDemand& demand,
+                                  const ContextReleaseSet& releases) const {
+    return impl_->directory.assess(demand, releases);
+}
+
+bool Session::releases_metadata(const ContextReleaseSet& released,
+                                const ContextAssessment& assessment) const {
+    return assessment.metadata_contribution(released);
+}
+
+std::uint64_t Session::released_bytes(const ContextReleaseSet& releases,
+                                      const ContextAssessment& assessment) const {
+    ContextReleaseSet relevant = releases;
+    std::erase_if(relevant.records, [&](const auto& record) {
+        return record.domain.memory != assessment.demand.memory;
+    });
+    return impl_->directory.released_bytes(relevant);
+}
+
+std::uint64_t Session::useful_release_bytes(const ContextReleaseSet& released,
+                                            const ContextAssessment& assessment) const {
+    return impl_->directory.useful_release_bytes(released, assessment);
+}
+
+runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
+    return impl_->start_maintenance(assessment);
 }
 
 CheckpointSummary Session::checkpoint_summary(CheckpointHandle h) const {
@@ -120,7 +144,7 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
     return impl_->recovery_index.evaluate(advertised);
 }
 
-std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.capacity(); }
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -137,10 +161,6 @@ bool Session::release_checkpoint(CheckpointHandle h) noexcept {
 
 bool Session::revoke_snapshot(ResumeState& paused) noexcept {
     return impl_->revoke_snapshot(paused);
-}
-
-ContextResources Session::snapshot_resources(const ResumeState& paused) const {
-    return impl_->snapshot_resources(paused);
 }
 
 std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
@@ -161,8 +181,8 @@ ResourceReservation Session::reserve_units(std::span<const ExecutionUnit> units)
     return impl_->reserve_units(units);
 }
 
-bool Session::reclaim_capture_reservation(ContextResources shortage) {
-    return impl_->reclaim_capture_reservation(shortage);
+bool Session::reclaim_capture_reservation(const ContextAssessment& assessment) {
+    return impl_->reclaim_capture_reservation(assessment);
 }
 
 void Session::release_units(std::span<const SequenceHandle> units) noexcept {
@@ -193,8 +213,9 @@ bool Session::capture_is_shared(SequenceHandle h) const {
 
 bool Session::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
 
-std::optional<CapturePreparation> Session::prepare_capture(SequenceHandle h) {
-    return impl_->prepare_capture(h);
+std::optional<CapturePreparation>
+Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> host_victims) {
+    return impl_->prepare_capture(h, host_victims);
 }
 
 void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
@@ -220,29 +241,29 @@ std::size_t Session::host_write_bytes(const HostRequirement& write) const {
 }
 
 bool Session::can_place_host(const HostRequirement& write) const {
-    return impl_->directory.plan_host(write).has_value();
+    return impl_->directory.plan_host(write).feasible();
 }
 
 bool Session::can_place_host(const HostRequirement& write,
-                             const context::ReleasePlan<ContextRelease, ContextResources>& releases,
-                             std::span<const std::uint32_t> freed) const {
-    return impl_->directory
-        .plan_host(write, releases.inventory->host_extents(freed),
-                   releases.inventory->host_pages(freed))
-        .has_value();
+                             const ContextReleaseSet& releases) const {
+    return impl_->directory.assess(host_demand(write), releases).feasible();
+}
+
+ContextDemand Session::host_demand(const HostRequirement& write) const {
+    return impl_->directory.host_demand(write);
 }
 
 ContextReclaimPlan Session::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,
-                                         ContextResources shortage) const {
-    return impl_->plan_reclaim(allowed, excluded, shortage);
+                                         const ContextDemand& demand) const {
+    return impl_->plan_reclaim(allowed, excluded, demand);
 }
 
-context::ReleasePlan<ContextRelease, ContextResources>
+context::ReleasePlan<ContextRelease, ContextReleaseSet>
 Session::plan_releases(std::span<const CheckpointHandle> allowed,
                        std::span<const CheckpointHandle> excluded,
-                       ContextResources shortage) const {
-    return impl_->plan_releases(allowed, excluded, shortage);
+                       const ContextDemand& demand) const {
+    return impl_->plan_releases(allowed, excluded, demand);
 }
 
 bool Session::start_pause(SequenceHandle h, bool save) { return impl_->start_pause(h, save); }
@@ -322,21 +343,17 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       backend_kv_histories(directory.pool_count() > 1 ? &directory.pool(1).histories() : nullptr),
       text_kv_pages(&directory.pool(0).pages()),
       backend_kv_pages(directory.pool_count() > 1 ? &directory.pool(1).pages() : nullptr),
-      host_kv_extents(plan.context.host.extent_count ? &directory.host() : nullptr),
-      host_context_arena(plan.context.host.bytes ? &directory.host_allocation() : nullptr),
-      capacity(plan.capacity), max_concurrency(plan.max_concurrency),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), context_cache(plan.context_cache),
-      vision_enabled(plan.profile->options.vision), causal_scoring(plan.causal_scoring) {
+      host_context_enabled(plan.context.ranks.at(0).host_bytes != 0), capacity(plan.capacity),
+      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
+      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
+      causal_scoring(plan.causal_scoring) {
     if (!definition || !plan.profile || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
-    checkpoints.resize(4ULL * plan.context.state.logical_capacity + 2ULL * max_concurrency);
+    checkpoints.configure(4ULL * plan.context.state.logical_capacity + 2ULL * max_concurrency,
+                          directory.metadata_budget());
     releases.reserve(max_concurrency);
     for (std::uint32_t i = 0; i < max_concurrency; ++i) sequences[i].lane = i;
-    for (std::size_t i = 0; i < plan.kv_pools.size(); ++i) {
-        auto& descriptor    = plan.kv_pools[i];
-        descriptor.geometry = &plan.context.pools[i].geometry;
-    }
 }
 
 SessionImpl::~SessionImpl() {
@@ -350,17 +367,13 @@ void SessionImpl::fail_all_cleanup() noexcept {
             executor().drain();
         } catch (...) {}
     }
-    if (context_operation_ && context_operation_->transaction.in_flight())
-        context_operation_->transaction.mark_completed();
+    pending_maintenance_.reset();
+    if (context_operation_) context_operation_->transaction.fail_after_drain();
     abort_context();
     if (execution) {
         try {
-            if (execution->preparation && execution->preparation->in_flight())
-                execution->preparation->mark_completed();
-            if (execution->settlement && execution->settlement->in_flight())
-                execution->settlement->mark_completed();
-            if (execution->preparation) execution->preparation->discard();
-            if (execution->settlement) execution->settlement->discard();
+            if (execution->preparation) execution->preparation->fail_after_drain();
+            if (execution->settlement) execution->settlement->fail_after_drain();
         } catch (...) { std::terminate(); }
         execution.reset();
     }
@@ -395,9 +408,6 @@ AbortResult SessionImpl::abort(SequenceHandle h) noexcept {
     return out;
 }
 
-void SessionImpl::reset_measurement_peaks() {
-    executor().reset_measurement_peaks();
-    directory.host_allocation().reset_peak();
-}
+void SessionImpl::reset_measurement_peaks() { executor().reset_measurement_peaks(); }
 
 } // namespace ninfer::models::qwen3_5::detail

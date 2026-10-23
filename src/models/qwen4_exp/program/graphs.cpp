@@ -21,7 +21,8 @@ std::vector<std::uint32_t> decode_context_bounds(std::uint32_t capacity) {
 }
 
 namespace {
-void write_i32(const Tensor& target, std::span<const std::int32_t> values, CudaExecutionView cuda) {
+template <class T>
+void write_values(const Tensor& target, std::span<const T> values, CudaExecutionView cuda) {
     copy_bytes({target.data, target.bytes(), cuda.device()},
                {values.data(), values.size_bytes(), Device::cpu()}, cuda);
 }
@@ -29,30 +30,45 @@ void write_i32(const Tensor& target, std::span<const std::int32_t> values, CudaE
 } // namespace
 
 void GraphInputs::prepare() {
-    auto& r = owner_.resources;
-    if (r.states->storage().slot_count() < static_cast<std::int32_t>(owner_.shape.max_concurrency))
-        throw std::logic_error("Graph preparation requires one StateImage per row");
-    for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b) {
-        slots_.push_back(static_cast<std::int32_t>(b));
-        r.states->storage().clear(slots_.back(), owner_.cuda);
+    auto& r            = owner_.resources;
+    const auto& images = r.plan.persistent.state.images;
+    std::vector<RecordSpec> specs{{images.image_bytes, images.alignment}};
+    for (std::uint32_t history = 0; history < r.pool_count(); ++history) {
+        const auto& layout = history == 0 ? r.plan.persistent.main : *r.plan.persistent.mtp;
+        specs.push_back({layout.pages.page_bytes, layout.pages.alignment});
     }
+    const auto geometry = describe_context_pool(specs);
+    std::vector<RecordRequest> demand;
+    for (const auto id : geometry.spec_classes)
+        demand.push_back({id, owner_.shape.max_concurrency});
+    const auto bytes = geometry.required_bytes(demand);
+    if (bytes > r.context_backing().bytes)
+        throw std::logic_error("Graph records exceed the planned Context working set");
+    records_      = std::make_unique<ContextPool>(0, bytes, specs);
+    auto reserved = records_->reserve(demand);
+    if (!reserved.reservation || !reserved.reservation->ready())
+        throw std::logic_error("Graph preparation cannot reserve its complete Context records");
+    const auto allocate = [&](std::size_t kind) {
+        const auto allocation = reserved.reservation->materialize(records_->record_class(kind));
+        allocations_.push_back(allocation);
+        const auto binding = records_->resolve(allocation);
+        const auto record  = r.context_backing().subspan(binding.offset, binding.bytes);
+        CUDA_CHECK(cudaMemsetAsync(record.data, 0, record.bytes, owner_.cuda.stream()));
+        return static_cast<std::int64_t>(binding.offset);
+    };
+    for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b)
+        state_offsets_.push_back(allocate(0));
     for (std::uint32_t pool = 0; pool < r.pool_count(); ++pool) {
-        auto& cache  = r.pool(pool);
-        auto& pages  = cache.pages();
-        auto& tables = cache.tables();
-        if (pages.capacity_pages() < owner_.shape.max_concurrency ||
-            tables.row_count() < static_cast<std::int32_t>(owner_.shape.max_concurrency))
-            throw std::logic_error("Graph preparation requires one KV page and table per row");
+        auto& tables         = r.pool(pool).tables();
         const auto capacity  = tables.logical_page_capacity();
-        const auto row_bytes = static_cast<std::size_t>(capacity) * sizeof(std::int32_t);
+        const auto row_bytes = std::size_t(capacity) * sizeof(std::int64_t);
         mappings_[pool]      = PinnedHostBuffer(row_bytes * owner_.shape.max_concurrency);
         for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b) {
-            const auto page = static_cast<std::int32_t>(b);
-            pages.zero_pages({&page, 1}, owner_.cuda);
-            const auto staging = mappings_[pool].span().subspan(b * row_bytes, row_bytes);
-            auto* indices      = static_cast<std::int32_t*>(staging.data);
-            std::fill_n(indices, capacity, page);
-            tables.publish(page, 0, {indices, capacity}, staging, owner_.cuda);
+            const auto page_offset = allocate(pool + 1);
+            const auto staging     = mappings_[pool].span().subspan(b * row_bytes, row_bytes);
+            auto* offsets          = static_cast<std::int64_t*>(staging.data);
+            std::fill_n(offsets, capacity, page_offset);
+            tables.publish(b, 0, {offsets, capacity}, staging, owner_.cuda);
         }
     }
     for (std::uint32_t slot = 0; r.ple_upload && slot < 2; ++slot) {
@@ -79,6 +95,7 @@ void GraphInputs::prepare() {
 GraphInputs::~GraphInputs() {
     // prepare() reports execution failures; unwinding still drains the staging readers.
     (void)cudaStreamSynchronize(owner_.cuda.stream());
+    for (const auto id : allocations_) records_->release(id);
 }
 
 void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
@@ -95,21 +112,29 @@ void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
             for (int axis = 0; axis < 3; ++axis) rope[j + t * (axis + 3 * row)] = position;
         }
     }
-    write_i32(call.ids, ids, owner_.cuda);
-    write_i32(call.positions, positions, owner_.cuda);
-    write_i32(call.rope_positions, rope, owner_.cuda);
-    write_i32(call.source_slots, std::span(slots_).first(b), owner_.cuda);
-    write_i32(call.destination_slots, std::span(slots_).first(b), owner_.cuda);
-    write_i32(call.table_rows, rows, owner_.cuda);
-    write_i32(call.base_positions, bases, owner_.cuda);
+    write_values<std::int32_t>(call.ids, ids, owner_.cuda);
+    write_values<std::int32_t>(call.positions, positions, owner_.cuda);
+    write_values<std::int32_t>(call.rope_positions, rope, owner_.cuda);
+    write_values<std::int64_t>(call.source_offsets, std::span(state_offsets_).first(b),
+                               owner_.cuda);
+    write_values<std::int64_t>(call.destination_offsets, std::span(state_offsets_).first(b),
+                               owner_.cuda);
+    write_values<std::int32_t>(call.table_rows, rows, owner_.cuda);
+    write_values<std::int32_t>(call.base_positions, bases, owner_.cuda);
     std::vector<std::int32_t> counts(b, valid), offsets(b, 0);
-    write_i32(call.valid_columns, counts, owner_.cuda);
-    write_i32(call.record_offsets, offsets, owner_.cuda);
+    write_values<std::int32_t>(call.valid_columns, counts, owner_.cuda);
+    write_values<std::int32_t>(call.record_offsets, offsets, owner_.cuda);
     const auto& io = owner_.resources.plan.persistent.buffers.batch;
-    write_i32(owner_.resources.packed(io.raw_tail, {2, b}),
-              std::vector<std::int32_t>(2 * b, owner_.parameters.profile->config.text.ple.eos),
-              owner_.cuda);
-    write_i32(owner_.resources.tensor(io.row_indices).slice(0, 0, b), rows, owner_.cuda);
+    write_values<std::int32_t>(
+        owner_.resources.packed(io.raw_tail, {2, b}),
+        std::vector<std::int32_t>(2 * b, owner_.parameters.profile->config.text.ple.eos),
+        owner_.cuda);
+    std::vector<std::int64_t> tail_offsets(b);
+    for (int row = 0; row < b; ++row) tail_offsets[row] = row * 2 * sizeof(TokenId);
+    write_values<std::int64_t>(owner_.resources.tensor(io.raw_tail_offsets).slice(0, 0, b),
+                               tail_offsets, owner_.cuda);
+    write_values<std::int32_t>(owner_.resources.tensor(io.row_indices).slice(0, 0, b), rows,
+                               owner_.cuda);
 }
 
 Graphs::Graphs(RankProgramImpl& owner)
@@ -333,10 +358,12 @@ void MtpCommitGraphs::prepare(GraphInputs& inputs) {
                      p.shape.max_context);
         std::vector<std::int32_t> slots(batch);
         for (std::uint32_t b = 0; b < batch; ++b) slots[b] = b;
-        write_i32(r.tensor(io.batch.count_slots).slice(0, 0, batch), slots, p.cuda);
+        write_values<std::int32_t>(r.tensor(io.batch.count_slots).slice(0, 0, batch), slots,
+                                   p.cuda);
         for (int rebuild = 0; rebuild < 2; ++rebuild) {
-            write_i32(r.tensor(io.batch.accepted_columns).slice(0, 0, batch),
-                      std::vector<std::int32_t>(batch, rebuild ? width : 1), p.cuda);
+            write_values<std::int32_t>(r.tensor(io.batch.accepted_columns).slice(0, 0, batch),
+                                       std::vector<std::int32_t>(batch, rebuild ? width : 1),
+                                       p.cuda);
             r.workspace.reset_peak();
             auto& variant = batches_[batch - 1][rebuild];
             variant.graph.prepare(p.cuda, [&] { p.execute_mtp_commit(batch, rebuild); });
@@ -372,7 +399,6 @@ void RankProgramImpl::initialize_graphs() {
     graph_memory.emplace();
     graph_memory->preparation_increment_bytes =
         device_memory_growth(before, device_memory_snapshot(cuda.device()));
-    resources.states->storage().clear_all(cuda);
     device.synchronize();
 }
 

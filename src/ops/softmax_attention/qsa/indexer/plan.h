@@ -52,8 +52,8 @@ IndexerWorkspace allocate_indexer_workspace(Allocator& allocator, IndexerPlan pl
     return out;
 }
 
-void launch_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaBatchView& batch,
-                    IndexerPlan plan, const IndexerWorkspace& scratch, QsaBlockSelection& out,
-                    CudaExecutionView execution);
+void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                    const QsaBatchView& batch, IndexerPlan plan, const IndexerWorkspace& scratch,
+                    QsaBlockSelection& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa

@@ -41,6 +41,7 @@ struct ExecutionPlan {
     [[nodiscard]] std::size_t device_bytes() const;
 
     [[nodiscard]] std::size_t device_reservation_bytes() const;
+    [[nodiscard]] std::size_t host_reservation_bytes() const;
 
     [[nodiscard]] std::size_t pinned_context_bytes() const;
 
@@ -50,7 +51,7 @@ struct ExecutionPlan {
 
     [[nodiscard]] std::size_t host_capacity_bytes() const { return host_context_bytes; }
 
-    [[nodiscard]] std::uint32_t kv_capacity() const { return capacity.resolved_tokens; }
+    [[nodiscard]] std::size_t context_capacity() const { return capacity.device_bytes; }
 };
 
 [[nodiscard]] std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile&,
@@ -61,13 +62,14 @@ struct ExecutionPlan {
 [[nodiscard]] std::optional<ExecutionPlan>
 plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableGeometry,
                const EngineOptions&, DeviceContext&, std::size_t available_bytes,
-               std::shared_ptr<const moe::Plan> prototype = {}, bool control_owner = true);
+               std::shared_ptr<const moe::Plan> prototype = {}, bool control_owner = true,
+               std::size_t available_host_bytes = SIZE_MAX);
 
 [[nodiscard]] ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile>,
                                              ple::disk::TableGeometry, const EngineOptions&,
                                              DeviceContext&, std::shared_ptr<const moe::Plan>);
 
-[[nodiscard]] runtime::ContextCapacityCurve
+[[nodiscard]] runtime::ContextCapacityPlan
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile>, const EngineOptions&,
-                            DeviceContext&, bool control_owner);
+                            DeviceContext&);
 } // namespace ninfer::models::qwen4_exp

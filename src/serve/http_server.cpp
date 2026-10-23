@@ -83,15 +83,11 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.context_transfers != report.previous.context_transfers ||
            report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.device_state_occupied_slots !=
-               report.previous.device_state_occupied_slots ||
-           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
+           report.current.state_objects != report.previous.state_objects ||
+           report.current.history_objects != report.previous.history_objects ||
            report.current.kv_pools != report.previous.kv_pools ||
-           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.host_context_occupied_bytes !=
-               report.previous.host_context_occupied_bytes ||
-           report.current.host_context_reserved_bytes !=
-               report.previous.host_context_reserved_bytes ||
+           report.current.context_pools != report.previous.context_pools ||
+           report.current.context_metadata != report.previous.context_metadata ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
            report.current.host_work.session_call_ns != report.previous.host_work.session_call_ns ||

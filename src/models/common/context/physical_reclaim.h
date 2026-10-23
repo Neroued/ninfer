@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/common/context/directory/history.h"
+#include "models/common/context/directory.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/context/directory/state.h"
 #include "models/common/context/work.h"
@@ -23,12 +23,10 @@ namespace ninfer::models::context {
 struct ReclaimPool {
     const HistoryDirectory* histories = nullptr;
     const PageDirectory* pages        = nullptr;
-    std::size_t host_page_bytes       = 0;
 };
 
 // Shared store facts for both Native implementations. Model code supplies actual snapshot
 // prefixes (including its backend frontier), pool layouts, and state-image size.
-template <class Resources>
 struct PhysicalReclaim {
     struct Page {
         PageId handle;
@@ -39,20 +37,19 @@ struct PhysicalReclaim {
     struct Group {
         std::vector<CheckpointHandle> sources;
         std::vector<StateId> states;
-        std::array<std::vector<Page>, Resources::pool_capacity> pages;
-        Resources released;
-        std::vector<HostExtent> host_extents;
-        std::uint32_t host_pages = 0;
+        std::vector<std::vector<Page>> pages;
+        ContextReleaseSet released;
     };
 
     std::vector<Group> groups;
-    std::shared_ptr<ReleaseInventory<Resources>> inventory;
+    std::shared_ptr<ReleaseInventory<ContextReleaseSet>> inventory;
 
     template <class Store>
-    PhysicalReclaim(const Store& checkpoints, const StateDirectory& states, std::size_t state_bytes,
+    PhysicalReclaim(const Store& checkpoints, const ContextDirectory& directory,
                     std::span<const ReclaimPool> pools, std::span<const CheckpointHandle> allowed,
-                    std::span<const CheckpointHandle> excluded, Resources shortage)
-        : inventory(std::make_shared<ReleaseInventory<Resources>>(checkpoints.size())) {
+                    std::span<const CheckpointHandle> excluded)
+        : inventory(std::make_shared<ReleaseInventory<ContextReleaseSet>>(checkpoints.size())) {
+        const auto& states = directory.states();
         std::vector<bool> eligible(checkpoints.size());
         for (const auto h : allowed)
             if (checkpoints.erasable(h)) eligible[h.index] = true;
@@ -66,21 +63,25 @@ struct PhysicalReclaim {
             return std::all_of(holders.begin(), holders.end(), [&](auto i) { return eligible[i]; });
         };
         for (std::uint32_t i = 0; i < eligible.size(); ++i)
-            if (eligible[i]) cohorts.try_emplace(std::vector{i});
+            if (eligible[i])
+                cohorts[std::vector{i}].released.catalog.push_back(
+                    checkpoints.retirement(checkpoints.handle(i)));
 
-        if (shortage.state_slots || shortage.host_bytes) {
+        {
             struct Image {
                 StateId handle;
                 std::vector<std::uint32_t> holders;
             };
 
-            std::vector<Image> images(states.capacity());
+            std::vector<Image> images;
             for (std::uint32_t i = 0; i < checkpoints.size(); ++i) {
                 const auto& slot = checkpoints[i];
                 if (!slot.value) continue;
                 const auto image = slot.value->snapshot.continuation().image;
-                auto& entry      = images[states.descriptor_index(image)];
-                entry.handle     = image;
+                const auto index = states.descriptor_index(image);
+                if (images.size() <= index) images.resize(std::size_t(index) + 1);
+                auto& entry  = images[index];
+                entry.handle = image;
                 entry.holders.push_back(i);
             }
             for (const auto& image : images) {
@@ -91,20 +92,14 @@ struct PhysicalReclaim {
                     !states.can_release_after_checkpoint_references(image.handle,
                                                                     image.holders.size()))
                     continue;
-                if (shortage.state_slots)
-                    group.released.state_slots += states.device_resident(image.handle);
-                if (shortage.host_bytes && states.host_resident(image.handle)) {
-                    group.released.host_bytes += state_bytes;
-                    group.host_extents.push_back(states.host_extent(image.handle));
-                }
+                group.released.merge(directory.state_release(image.handle));
             }
         }
 
         constexpr auto none = std::numeric_limits<std::uint32_t>::max();
         for (std::uint16_t pool = 0; pool < pools.size(); ++pool) {
             const auto& storage = pools[pool];
-            if (!storage.histories || (!shortage.host_bytes && !shortage.kv_page_groups[pool]))
-                continue;
+            if (!storage.histories) continue;
             const auto& histories = *storage.histories;
             const auto& pages     = *storage.pages;
 
@@ -113,29 +108,39 @@ struct PhysicalReclaim {
                 std::vector<std::uint32_t> holders;
             };
 
-            std::vector<History> histories_by_id(histories.capacity());
+            std::vector<History> histories_by_id;
             std::vector<const HistoryPrefix*> prefixes;
             for (std::uint32_t i = 0; i < checkpoints.size(); ++i) {
                 const auto& slot = checkpoints[i];
                 if (!slot.value || pool >= slot.value->snapshot.prefixes().size()) continue;
                 const auto& prefix = slot.value->snapshot.prefix(pool);
                 prefixes.push_back(&prefix);
-                auto& entry  = histories_by_id[histories.descriptor_index(prefix.history())];
+                const auto index = histories.descriptor_index(prefix.history());
+                if (histories_by_id.size() <= index) histories_by_id.resize(std::size_t(index) + 1);
+                auto& entry  = histories_by_id[index];
                 entry.handle = prefix.history();
                 entry.holders.push_back(i);
             }
+            const auto retired_histories = histories.released_histories(prefixes);
+            for (const auto handle : retired_histories) {
+                const auto& holders = histories_by_id[handle.index].holders;
+                if (permitted(holders)) cohorts[holders].released.histories.push_back(handle);
+            }
             // Store proof includes owners outside the checkpoint catalog, active histories,
             // unfinished bindings, and source pins. They never become fictitious free bytes.
-            std::vector<bool> releasable(pages.capacity());
-            for (const auto page : histories.released_pages(prefixes))
-                releasable[pages.descriptor_index(page)] = true;
+            std::vector<bool> releasable;
+            for (const auto page : histories.released_pages(prefixes)) {
+                const auto index = pages.descriptor_index(page);
+                if (releasable.size() <= index) releasable.resize(std::size_t(index) + 1);
+                releasable[index] = true;
+            }
 
             struct PageOwners {
                 PageId handle;
                 std::uint32_t holders = none, position = 0, last_owner = 0;
             };
 
-            std::vector<PageOwners> owners(pages.capacity());
+            std::vector<PageOwners> owners;
             std::vector<std::vector<std::uint32_t>> holder_sets;
             std::unordered_map<std::uint64_t, std::uint32_t> merged_sets;
             for (const auto& history : histories_by_id) {
@@ -158,11 +163,10 @@ struct PhysicalReclaim {
                     const auto set        = static_cast<std::uint32_t>(holder_sets.size());
                     holder_sets.push_back(std::move(holders));
                     for (auto position = begin; position < end; ++position) {
-                        const auto page = histories.logical_page(history.handle, position);
-                        if (!(shortage.host_bytes && pages.host_resident(page)) &&
-                            !(shortage.kv_page_groups[pool] && pages.device_resident(page)))
-                            continue;
-                        auto& entry  = owners[pages.descriptor_index(page)];
+                        const auto page  = histories.logical_page(history.handle, position);
+                        const auto index = pages.descriptor_index(page);
+                        if (owners.size() <= index) owners.resize(std::size_t(index) + 1);
+                        auto& entry  = owners[index];
                         entry.handle = page;
                         if (entry.holders == none)
                             entry.holders = set;
@@ -190,25 +194,25 @@ struct PhysicalReclaim {
                 const auto& entry = owners[i];
                 if (entry.holders == none || !permitted(holder_sets[entry.holders])) continue;
                 auto& group = cohorts[holder_sets[entry.holders]];
-                group.pages[pool].push_back({entry.handle, entry.position, releasable[i]});
-                if (releasable[i]) {
-                    if (shortage.kv_page_groups[pool])
-                        group.released.kv_page_groups[pool] += pages.device_resident(entry.handle);
-                    if (shortage.host_bytes && pages.host_resident(entry.handle)) {
-                        group.released.host_bytes += storage.host_page_bytes;
-                        group.host_extents.push_back(pages.host_extent(entry.handle));
-                        ++group.host_pages;
-                    }
+                if (group.pages.size() < pools.size()) group.pages.resize(pools.size());
+                const bool released = i < releasable.size() && releasable[i];
+                group.pages[pool].push_back({entry.handle, entry.position, released});
+                if (released) {
+                    const auto facts = directory.page_release(entry.handle);
+                    group.released.records.insert(group.released.records.end(),
+                                                  facts.records.begin(), facts.records.end());
+                    group.released.pages.push_back(entry.handle);
                 }
             }
         }
         for (auto& [indices, group] : cohorts) {
+            group.released.normalize();
             for (const auto i : indices) group.sources.push_back(checkpoints.handle(i));
             for (auto& pages : group.pages)
                 std::sort(pages.begin(), pages.end(),
                           [](const auto& a, const auto& b) { return a.position > b.position; });
-            inventory->add(group.sources, group.released, std::move(group.host_extents),
-                           group.host_pages);
+            if (group.pages.size() < pools.size()) group.pages.resize(pools.size());
+            inventory->add(group.sources, group.released);
             groups.push_back(std::move(group));
         }
     }

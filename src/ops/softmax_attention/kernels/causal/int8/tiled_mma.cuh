@@ -66,7 +66,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
         return;
     }
     const int base_pos              = positions[0];
-    const std::int32_t* block_table = metadata.block_table();
+    const std::int64_t* block_table = metadata.block_table();
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -103,14 +103,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     __syncthreads();
 
     auto issue_kv_tile = [&](int tile_k0) {
-        const int physical_page = block_table[tile_k0 >> kv::kPageShift];
+        const std::int64_t record_offset = block_table[tile_k0 >> kv::kPageShift];
         for (int key_l = tid; key_l < Bc; key_l += Schedule::kThreads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
-                    physical_page, kv_head, 0, key & kv::kPageMask);
+                const std::int64_t off =
+                    kv::Int8G64Layout::scale_offset(record_offset, kv_head, 0, key & kv::kPageMask);
                 common::cp_async<8>(kd, &cache_k_scale[off]);
                 common::cp_async<8>(vd, &cache_v_scale[off]);
             } else {
@@ -127,8 +127,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             std::int8_t* kd = &k_i8[(key_l * DB16 + common::swizzle_xor_64(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
-                    physical_page, kv_head, d, key & kv::kPageMask);
+                const std::int64_t off =
+                    kv::Int8G64Layout::code_offset(record_offset, kv_head, d, key & kv::kPageMask);
                 common::cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 common::cp_async<16, Cache::cg>(vd, &cache_v[off]);
             } else {

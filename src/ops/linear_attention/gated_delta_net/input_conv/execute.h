@@ -13,10 +13,11 @@ struct ProjectedOutputs {
 void launch_projection(const Tensor& x, const WeightOperands& weights, ProjectedOutputs outputs,
                        ProjectionPlan plan, const Scratch& scratch, cudaStream_t stream);
 void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tensor& conv_weight,
-                     GdnConvSnapshotState state, const Tensor& valid, GdnConvOutputs outputs,
-                     Batch batch, ConvPlan plan, const Scratch& scratch, cudaStream_t stream);
+                     ConstStateFieldView state, HistoryDestination destination, const Tensor& valid,
+                     GdnConvOutputs outputs, Batch batch, ConvPlan plan, const Scratch& scratch,
+                     cudaStream_t stream);
 void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor& conv_weight,
-                   GdnConvSourceState state, const Tensor& valid, GdnConvOutputs outputs,
+                   ConstStateFieldView state, const Tensor& valid, GdnConvOutputs outputs,
                    Tensor& record, Batch batch, ConvPlan plan, const Scratch& scratch,
                    cudaStream_t stream);
 

@@ -1,9 +1,12 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/record_view.h"
+#include "core/paged_kv_cache.h"
 #include "core/weight.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -11,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops::common::operand {
 
@@ -78,6 +82,46 @@ inline void tensor(const Tensor& value, DType dtype, std::initializer_list<std::
             throw std::invalid_argument(std::string(op) + ": invalid " + name);
     if (value.bytes() != expected.bytes())
         throw std::invalid_argument(std::string(op) + ": invalid " + name);
+}
+
+template <class FieldView>
+inline void state_field(const FieldView& value, DType dtype,
+                        std::initializer_list<std::int32_t> dimensions, std::size_t alignment,
+                        const char* op, const char* name, Device expected_device,
+                        bool require_offsets = true) {
+    device(value.records.storage.device, expected_device, op, name);
+    const auto expected            = Tensor::metadata(dtype, dimensions);
+    const auto& layout             = value.field.tensor;
+    const auto& region             = layout.region;
+    const std::size_t layer_stride = value.field.layer_stride;
+    if (!value.records.storage.data || layout.dtype != dtype ||
+        !std::equal(layout.shape.begin(), layout.shape.end(), expected.ne) ||
+        !value.field.metadata().is_contiguous() || value.field.layers == 0 ||
+        region.bytes != expected.bytes() || region.offset > value.records.storage.bytes ||
+        region.bytes > value.records.storage.bytes - region.offset ||
+        !aligned(static_cast<const std::byte*>(value.records.storage.data) + region.offset,
+                 alignment) ||
+        (value.field.layers > 1 &&
+         (layer_stride < region.bytes || layer_stride % alignment != 0 ||
+          (value.field.layers - 1) >
+              (value.records.storage.bytes - region.offset - region.bytes) / layer_stride))) {
+        throw std::invalid_argument(std::string(op) + ": invalid " + name);
+    }
+    if (require_offsets || value.records.byte_offsets.data) {
+        const auto& offsets = value.records.byte_offsets;
+        if (offsets.ne[0] <= 0)
+            throw std::invalid_argument(std::string(op) + ": empty state offset table");
+        tensor(offsets, DType::I64, {offsets.ne[0]}, 8, op, "state byte offsets", expected_device);
+    }
+}
+
+template <class T, class FieldView>
+[[nodiscard]] T* state_field_base(const FieldView& value) {
+    using Byte = std::conditional_t<
+        std::is_const_v<std::remove_pointer_t<decltype(value.records.storage.data)>>,
+        const std::byte, std::byte>;
+    return reinterpret_cast<T*>(static_cast<Byte*>(value.records.storage.data) +
+                                value.field.tensor.region.offset);
 }
 
 inline std::size_t bytes(std::uint64_t count, std::size_t width, const char* op) {
@@ -173,6 +217,52 @@ inline bool overlaps(Blocks a, Blocks b) noexcept {
 
 inline bool overlaps(Blocks a, Range b) noexcept {
     return overlaps(a, Blocks{b, b.end - b.begin, 1});
+}
+
+inline void paged_plane(const ConstPagedPlaneView& value, DType dtype,
+                        std::initializer_list<std::int32_t> dimensions, std::size_t alignment,
+                        const char* op, const char* name, Device expected_device) {
+    device(value.device(), expected_device, op, name);
+    const auto expected  = Tensor::metadata(dtype, dimensions);
+    const auto& layout   = value.plane.tensor;
+    const auto& region   = layout.region;
+    const auto& geometry = value.plane.geometry;
+    const auto& backing  = value.records.storage;
+    if (!backing.data || layout.dtype != dtype ||
+        !std::equal(layout.shape.begin(), layout.shape.end(), expected.ne) ||
+        region.bytes != expected.bytes() || region.offset > backing.bytes ||
+        region.bytes > backing.bytes - region.offset ||
+        !aligned(static_cast<const std::byte*>(backing.data) + region.offset, alignment) ||
+        geometry.dtype != dtype || geometry.leading_extent != expected.ne[0] ||
+        geometry.head_extent != expected.ne[2] || geometry.tokens_per_row == 0 ||
+        value.records.page_tokens == 0 ||
+        value.records.page_tokens % geometry.tokens_per_row != 0 ||
+        value.records.page_tokens / geometry.tokens_per_row !=
+            static_cast<std::uint32_t>(expected.ne[1]) ||
+        value.plane.head_stride_bytes != static_cast<std::size_t>(expected.nb[2])) {
+        throw std::invalid_argument(std::string(op) + ": invalid " + name);
+    }
+    const auto& offsets = value.records.page_offsets;
+    if (offsets.ne[0] <= 0 || offsets.ne[1] <= 0) {
+        throw std::invalid_argument(std::string(op) + ": empty page offset table");
+    }
+    tensor(offsets, DType::I64, {offsets.ne[0], offsets.ne[1]}, 8, op, "page byte offsets",
+           expected_device);
+}
+
+inline void same_paged_records(const ConstPagedPlaneView& a, const ConstPagedPlaneView& b,
+                               const char* op, const char* name) {
+    const auto& x = a.records;
+    const auto& y = b.records;
+    if (x.storage.data != y.storage.data || x.storage.bytes != y.storage.bytes ||
+        x.storage.device != y.storage.device || x.page_tokens != y.page_tokens ||
+        x.page_offsets.data != y.page_offsets.data ||
+        x.page_offsets.dtype != y.page_offsets.dtype ||
+        !std::equal(x.page_offsets.ne, x.page_offsets.ne + 4, y.page_offsets.ne) ||
+        !std::equal(x.page_offsets.nb, x.page_offsets.nb + 4, y.page_offsets.nb)) {
+        throw std::invalid_argument(std::string(op) + ": " + name +
+                                    " must share the same records and page offset table");
+    }
 }
 
 inline void slotted_tensor(const Tensor& value, DType dtype,

@@ -235,9 +235,7 @@ struct RequestRecord {
     std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;
-    std::array<std::array<GenerationTransferTiming, 3>,
-               ModelContract::Session::ContextResources::pool_capacity + 1>
-        context_transfers{};
+    std::vector<std::array<GenerationTransferTiming, 4>> context_transfers;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
 

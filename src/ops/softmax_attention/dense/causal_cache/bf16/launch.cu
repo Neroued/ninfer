@@ -62,9 +62,9 @@ void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvC
         invoke.template operator()<CausalD256H16Kv2>();
 }
 
-template <class Input>
+template <class Input, class Cache>
 void execute_grouped(const Tensor& q, Input input, const Tensor& positions, float scale,
-                     PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
+                     Cache cache, const Tensor* valid, const Tensor* rows,
                      const Bf16KvCausalPlan& plan, MemoryArena& workspace, Tensor& out,
                      cudaStream_t stream) {
     auto scope   = workspace.scope();
@@ -103,7 +103,7 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
-                              const PagedKVLayerView& cache,
+                              const ConstPagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                               Tensor& out, CudaExecutionView execution) {
     const cudaStream_t stream = execution.stream();

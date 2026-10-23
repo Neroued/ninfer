@@ -60,13 +60,9 @@ bool SessionImpl::submit_score() {
     auto& tx = *compute;
     tx.members.push_back(handle(s));
     try {
-        for (std::uint32_t i = 0; i < pool_count(); ++i) {
-            auto& histories  = directory.pool(i).histories();
-            const auto first = i ? s.continuation.metadata.mtp_frontier.value() : begin;
-            const auto last  = i ? mtp_history_frontier(end) : end;
-            histories.reserve_growth(s.histories[i].handle(),
-                                     histories.write_pages(s.histories[i].handle(), first, last));
-        }
+        const ExecutionUnit unit{handle(s), ExecutionUnitKind::Prefill, end - begin};
+        if (!reserve_units({&unit, 1}))
+            throw std::logic_error("scoring working set cannot reserve its execution chain");
         prepare_write(s, end, tx.context);
         ScoreWork work;
         work.row                 = work_row(s, end - begin);
@@ -77,7 +73,7 @@ bool SessionImpl::submit_score() {
         tx.rows.push_back(work.row);
         tx.context.prepare_actions();
         tx.ticket =
-            executor->submit(std::move(*reservation), {tx.context.actions(), std::move(work)});
+            executor->submit(std::move(*reservation), {actions(tx.context), std::move(work)});
         tx.context.mark_submitted();
         return true;
     } catch (const std::exception& error) {
@@ -103,8 +99,8 @@ void SessionImpl::finish_score(ScoreResult result) {
     const auto completed = prepare_commit(s, tx.rows[0], tx.rows[0].ids, false, *tx.completion);
     tx.completion->prepare_actions();
     Commit commit;
-    commit.rows.push_back({member(s), tx.rows[0].slots, result.processed});
-    commit.actions = tx.completion->actions();
+    commit.rows.push_back({member(s), tx.rows[0].states, result.processed});
+    commit.actions = actions(*tx.completion);
     (void)executor->commit(tx.ticket, std::move(commit));
     tx.completion->mark_submitted();
     tx.completion->adopt();

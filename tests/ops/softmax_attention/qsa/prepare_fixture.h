@@ -3,6 +3,7 @@
 #include "cache_reference.h"
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
+#include "../../../../tools/support/paged_kv_fixture.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,8 +19,10 @@ struct Buffer {
     Tensor view;
     std::vector<T> host;
     std::unique_ptr<GuardedDeviceBuffer> device;
+    tool::PackedKVFixture* packed = nullptr;
+    std::size_t plane_index       = 0;
 
-    Buffer(DType dtype, std::initializer_list<int> shape, int layout = 0)
+    Buffer(DType dtype, std::initializer_list<int> shape, int layout = 0, bool allocate = true)
         : view(Tensor::metadata(dtype, shape)) {
         if (layout) {
             if (layout == 2 && view.ne[3] == 1) {
@@ -33,9 +36,11 @@ struct Buffer {
         std::size_t words = 1;
         for (int d = 0; d < 4; ++d) words += std::size_t(view.ne[d] - 1) * view.nb[d] / sizeof(T);
         host.resize(words);
-        device      = std::make_unique<GuardedDeviceBuffer>(words * sizeof(T));
-        view.data   = device->data();
-        view.device = device->device();
+        if (allocate) {
+            device      = std::make_unique<GuardedDeviceBuffer>(words * sizeof(T));
+            view.data   = device->data();
+            view.device = device->device();
+        }
     }
 
     std::size_t index(int x, int y = 0, int z = 0, int w = 0) const {
@@ -46,16 +51,39 @@ struct Buffer {
 
     T at(int x, int y = 0, int z = 0, int w = 0) const { return host[index(x, y, z, w)]; }
 
+    void bind(tool::PackedKVFixture& arena, std::size_t plane) {
+        packed      = &arena;
+        plane_index = plane;
+        device.reset();
+    }
+
     void upload() const {
+        if (packed) {
+            auto source   = view;
+            source.data   = const_cast<T*>(host.data());
+            source.device = Device::cpu();
+            packed->upload_plane(plane_index, source);
+            return;
+        }
         device->copy_from_host(host.data(), host.size() * sizeof(T));
         // Fixture copies use the default stream; public Ops run on a nonblocking compute stream.
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
-    auto download() const { return from_device<T>(device->data(), host.size()); }
+    std::vector<T> download() const {
+        if (!packed) return from_device<T>(device->data(), host.size());
+        auto result   = host;
+        auto target   = view;
+        target.data   = result.data();
+        target.device = Device::cpu();
+        packed->download_plane(plane_index, target);
+        return result;
+    }
+
+    int guards(const std::string& label) const { return device ? device->verify_guards(label) : 0; }
 
     int preserved(const std::string& label) const {
-        return verify_exact(label.c_str(), download(), host) + device->verify_guards(label);
+        return verify_exact(label.c_str(), download(), host) + guards(label);
     }
 };
 
@@ -70,39 +98,48 @@ inline std::uint16_t sample(int p, int b, int c, unsigned seed) {
 struct CachePlane {
     Tensor view;
     std::vector<std::uint8_t> host;
-    std::unique_ptr<GuardedDeviceBuffer> device;
+    tool::PackedKVFixture* packed = nullptr;
+    std::size_t plane_index       = 0;
 
-    CachePlane(DType dtype, int features, int pages, bool padded, int heads) {
+    CachePlane(DType dtype, int features, int pages, int heads) {
         if (features == 0) return;
         view               = Tensor::metadata(dtype, {features, 64, heads, pages});
         const auto element = dtype_size(dtype);
-        if (padded)
-            for (int d = 1; d < 4; ++d)
-                view.nb[d] = view.nb[d - 1] * view.ne[d - 1] + (d + 1) * element;
-        std::size_t bytes = element;
+        std::size_t bytes  = element;
         for (int d = 0; d < 4; ++d) bytes += (view.ne[d] - 1) * view.nb[d];
         host.resize(bytes);
-        device      = std::make_unique<GuardedDeviceBuffer>(bytes);
-        view.data   = device->data();
-        view.device = device->device();
     }
 
     std::size_t index(int d, int p, int h, int page) const {
         return d * view.nb[0] + p * view.nb[1] + h * view.nb[2] + page * view.nb[3];
     }
 
+    void bind(tool::PackedKVFixture& arena, std::size_t plane) {
+        packed      = &arena;
+        plane_index = plane;
+    }
+
     void upload() const {
-        if (!device) return;
-        device->copy_from_host(host.data(), host.size());
-        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        if (packed) {
+            auto source   = view;
+            source.data   = const_cast<std::uint8_t*>(host.data());
+            source.device = Device::cpu();
+            packed->upload_plane(plane_index, source);
+            return;
+        }
     }
 
     std::vector<std::uint8_t> download() const {
-        return device ? from_device<std::uint8_t>(device->data(), host.size())
-                      : std::vector<std::uint8_t>{};
+        if (packed) {
+            auto result   = host;
+            auto target   = view;
+            target.data   = result.data();
+            target.device = Device::cpu();
+            packed->download_plane(plane_index, target);
+            return result;
+        }
+        return {};
     }
-
-    int guards(const std::string& label) const { return device ? device->verify_guards(label) : 0; }
 };
 
 struct Fixture {
@@ -116,6 +153,8 @@ struct Fixture {
     CachePlane keys, values, key_scales, value_scales;
     Buffer<std::int32_t> first, record_rope, positions, rope, valid, table_rows, slots, offsets,
         tables;
+    Buffer<std::int64_t> raw_offsets, rope_offsets, page_offsets;
+    std::unique_ptr<tool::PackedKVFixture> packed;
     std::vector<int> bases;
     ops::QsaProjectionView projected;
     ops::QsaPrepareParameters parameters;
@@ -134,29 +173,62 @@ struct Fixture {
           v(DType::BF16, {256, kv_heads, T, B}), iq(DType::BF16, {128, 4, T, B}),
           ik(DType::BF16, {128, T, B}), out_q(DType::BF16, {256, query_heads, T, B}),
           out_iq(DType::BF16, {128, 4, T, B}), wq(DType::BF16, {256}), wk(DType::BF16, {256}),
-          wiq(DType::BF16, {128}), wik(DType::BF16, {128}),
-          tail(DType::BF16, {128, 3, B + 2}, layout), records(DType::BF16, {128, R, B}, layout),
-          compressed(DType::BF16, {128, 16, 1, B * pages_per_row + 2}, layout != 0),
-          keys(encoding.key.data_dtype, encoding.key.data_extent, B * pages_per_row + 2,
-               layout != 0, kv_heads),
+          wiq(DType::BF16, {128}), wik(DType::BF16, {128}), tail(DType::BF16, {128, 3, B + 2}),
+          records(DType::BF16, {128, R, B}, layout),
+          compressed(DType::BF16, {128, 16, 1, B * pages_per_row + 2}, 0, false),
+          keys(encoding.key.data_dtype, encoding.key.data_extent, B * pages_per_row + 2, kv_heads),
           values(encoding.value.data_dtype, encoding.value.data_extent, B * pages_per_row + 2,
-                 layout != 0, kv_heads),
+                 kv_heads),
           key_scales(encoding.key.scale_dtype, encoding.key.scale_extent, B * pages_per_row + 2,
-                     layout != 0, kv_heads),
+                     kv_heads),
           value_scales(encoding.value.scale_dtype, encoding.value.scale_extent,
-                       B * pages_per_row + 2, layout != 0, kv_heads),
-          first(DType::I32, {3, B + 2}, layout), record_rope(DType::I32, {3, R, B}, layout),
+                       B * pages_per_row + 2, kv_heads),
+          first(DType::I32, {3, B + 2}), record_rope(DType::I32, {3, R, B}, layout),
           positions(DType::I32, {T, B}), rope(DType::I32, {T, A, B}), valid(DType::I32, {B}),
           table_rows(DType::I32, {B}), slots(DType::I32, {B}), offsets(DType::I32, {B}),
-          tables(DType::I32, {(T + 256 + 63) / 64, B + 1}, layout != 0), bases(B) {
-        projected  = {q.view, k.view, v.view, iq.view, ik.view};
-        parameters = {{wk.view, wik.view}, wq.view, wiq.view};
-        batch      = {positions.view, valid.view, table_rows.view};
-        before     = {tail.view, first.view, slots.view};
-        write      = {records.view, record_rope.view, offsets.view};
-        cache      = {{keys.view, values.view, key_scales.view, value_scales.view, tables.view, 256,
-                       kv_heads, storage},
-                      {compressed.view, tables.view}};
+          tables(DType::I32, {(T + 256 + 63) / 64, B + 1}), raw_offsets(DType::I64, {B}),
+          rope_offsets(DType::I64, {B}), page_offsets(DType::I64, {(T + 256 + 63) / 64, B + 1}),
+          bases(B) {
+        projected        = {q.view, k.view, v.view, iq.view, ik.view};
+        parameters       = {{wk.view, wik.view}, wq.view, wiq.view};
+        batch            = {positions.view, valid.view, table_rows.view};
+        const auto field = [](const auto& source, const Tensor& selectors, int axis) {
+            std::array<std::int32_t, 4> shape;
+            std::copy_n(source.view.ne, 4, shape.begin());
+            shape[axis]      = 1;
+            const auto bytes = std::size_t(source.view.nb[axis]);
+            return StateFieldView{
+                {source.device->span(), selectors},
+                {{{0, bytes, std::size_t(dtype_size(source.view.dtype))}, source.view.dtype, shape},
+                 1,
+                 0}};
+        };
+        before = {field(tail, raw_offsets.view, 2), field(first, rope_offsets.view, 1)};
+        write  = {records.view, record_rope.view, offsets.view};
+        KVPageGeometry geometry;
+        const auto add_plane = [&](const Tensor& view, std::uint32_t span) {
+            geometry.planes.push_back({view.dtype, view.ne[0], view.ne[2],
+                                       layout ? std::size_t(dtype_size(view.dtype)) : 256, span});
+            return geometry.planes.size() - 1;
+        };
+        const auto kp = add_plane(keys.view, 1), vp = add_plane(values.view, 1);
+        std::size_t ks = 0, vs = 0;
+        if (!key_scales.host.empty()) ks = add_plane(key_scales.view, 1);
+        if (!value_scales.host.empty()) vs = add_plane(value_scales.view, 1);
+        const auto ip = add_plane(compressed.view, 4);
+        packed =
+            std::make_unique<tool::PackedKVFixture>(q.view.device, geometry, B * pages_per_row + 2);
+        keys.bind(*packed, kp);
+        values.bind(*packed, vp);
+        compressed.bind(*packed, ip);
+        if (!key_scales.host.empty()) key_scales.bind(*packed, ks);
+        if (!value_scales.host.empty()) value_scales.bind(*packed, vs);
+        cache = {
+            {packed->plane(kp, page_offsets.view), packed->plane(vp, page_offsets.view),
+             key_scales.host.empty() ? PagedPlaneView{} : packed->plane(ks, page_offsets.view),
+             value_scales.host.empty() ? PagedPlaneView{} : packed->plane(vs, page_offsets.view),
+             256, kv_heads, storage},
+            {packed->plane(ip, page_offsets.view)}};
         query_output = alias & 1 ? q.view : out_q.view;
         iq_output    = alias & 2 ? iq.view : out_iq.view;
         reset(0);
@@ -231,7 +303,7 @@ struct Fixture {
         upload();
     }
 
-    void upload() const {
+    void upload() {
         for (auto* x : {&q, &k, &v, &iq, &ik, &out_q, &out_iq, &wq, &wk, &wiq, &wik, &tail,
                         &records, &compressed})
             x->upload();
@@ -239,6 +311,18 @@ struct Fixture {
         for (auto* x : {&first, &record_rope, &positions, &rope, &valid, &table_rows, &slots,
                         &offsets, &tables})
             x->upload();
+        upload_offsets();
+    }
+
+    void upload_offsets() {
+        for (int b = 0; b < B; ++b) {
+            raw_offsets.at(b)  = slots.at(b) < 0 ? -1 : slots.at(b) * tail.view.nb[2];
+            rope_offsets.at(b) = slots.at(b) < 0 ? -1 : slots.at(b) * first.view.nb[1];
+        }
+        page_offsets.host = packed->table_offsets(tables.host);
+        raw_offsets.upload();
+        rope_offsets.upload();
+        page_offsets.upload();
     }
 
     void launch(CudaExecutionView execution) {

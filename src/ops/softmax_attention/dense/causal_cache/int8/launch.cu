@@ -50,10 +50,10 @@ void grouped_instance(const CausalAttentionOperands& p, Int8KvCacheView<Writable
     throw std::logic_error("INT8 grouped plan exceeds the selected token tile");
 }
 
-template <class Input>
-void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
-                     PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
-                     Input input, const Int8KvCausalPlan& plan, MemoryArena& workspace, Tensor& out,
+template <class Input, class Cache>
+void execute_grouped(const Tensor& q, const Tensor& positions, float scale, Cache cache,
+                     const Tensor* valid, const Tensor* rows, Input input,
+                     const Int8KvCausalPlan& plan, MemoryArena& workspace, Tensor& out,
                      cudaStream_t stream) {
     const auto view =
         make_quantized_causal_cache_view<Int8KvCacheView<Input::writes_cache>>(cache, valid, rows);
@@ -140,7 +140,7 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
-                              const PagedKVLayerView& cache,
+                              const ConstPagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                               Tensor& out, CudaExecutionView execution) {
     const cudaStream_t stream = execution.stream();

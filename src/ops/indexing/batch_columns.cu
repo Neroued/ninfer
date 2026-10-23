@@ -14,13 +14,14 @@ using namespace common;
 namespace {
 
 template <class Word>
-__global__ void scatter_columns_kernel(const Word* source, const int* columns, const int* slots,
-                                       Word* destination, int features, int tokens,
-                                       std::int64_t stride) {
+__global__ void scatter_columns_kernel(const Word* source, const int* columns,
+                                       const std::int64_t* offsets, Word* destination, int features,
+                                       int tokens) {
     const int row = blockIdx.y, column = columns[row];
     if (column < 0) return;
+    const std::int64_t destination_base = offsets[row] / sizeof(Word);
     for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < features; d += blockDim.x * gridDim.x)
-        destination[std::int64_t(slots[row]) * stride + d] =
+        destination[destination_base + d] =
             source[(std::int64_t(row) * tokens + column) * features + d];
 }
 
@@ -105,29 +106,29 @@ void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t n,
     remap_ids_inplace_launch(ids, id_map, n, stream);
 }
 
-void scatter_batch_columns(const Tensor& source, const Tensor& columns, const Tensor& slots,
-                           Tensor& destination, CudaExecutionView execution) {
+void scatter_batch_columns(const Tensor& source, const Tensor& columns,
+                           const StateFieldView& destination, CudaExecutionView execution) {
     namespace operand        = common::operand;
     constexpr const char* op = "scatter_batch_columns";
-    const int d = source.ne[0], t = source.ne[1], b = source.ne[2], s = destination.ne[1];
-    if (d <= 0 || t <= 0 || b < 1 || b > 8 || s <= 0 ||
+    const int d = source.ne[0], t = source.ne[1], b = source.ne[2];
+    if (d <= 0 || t <= 0 || b < 1 || b > 8 ||
         (source.dtype != DType::BF16 && source.dtype != DType::I32))
         throw std::invalid_argument("scatter_batch_columns: invalid shape or type");
     const auto bytes = dtype_size(source.dtype);
     operand::tensor(source, source.dtype, {d, t, b}, bytes, op, "source", execution.device());
     operand::tensor(columns, DType::I32, {b}, 4, op, "columns", execution.device());
-    operand::tensor(slots, DType::I32, {b}, 4, op, "slots", execution.device());
-    operand::slotted_tensor(destination, source.dtype, {d, s}, 1, bytes, op, "destination",
-                            execution.device());
-    for (const auto* input : {&source, &columns, &slots})
-        if (operand::overlaps(operand::blocks(destination, op), operand::range(*input, op)))
-            throw std::invalid_argument("scatter_batch_columns: input/output alias");
+    operand::state_field(destination, source.dtype, {d}, bytes, op, "destination",
+                         execution.device());
+    operand::tensor(destination.records.byte_offsets, DType::I64, {b}, 8, op, "offsets",
+                    execution.device());
+    if (destination.field.layers != 1)
+        throw std::invalid_argument("scatter_batch_columns: expected a single-layer field");
     const dim3 grid(std::min(32, div_up(d, 256)), b);
     const auto launch = [&]<class Word>() {
         scatter_columns_kernel<<<grid, 256, 0, execution.stream()>>>(
             static_cast<const Word*>(source.data), static_cast<const int*>(columns.data),
-            static_cast<const int*>(slots.data), static_cast<Word*>(destination.data), d, t,
-            destination.nb[1] / sizeof(Word));
+            static_cast<const std::int64_t*>(destination.records.byte_offsets.data),
+            operand::state_field_base<Word>(destination), d, t);
     };
     if (source.dtype == DType::BF16)
         launch.template operator()<std::uint16_t>();

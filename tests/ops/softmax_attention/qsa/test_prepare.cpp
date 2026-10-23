@@ -221,13 +221,12 @@ int verify(Fixture& f, const std::string& label) {
                     &f.tables})
         failures += x->preserved("metadata/state");
     for (auto* x : {&f.q, &f.iq, &f.out_q, &f.out_iq, &f.compressed, &f.records})
-        failures += x->device->verify_guards(label);
-    for (auto* x : {&f.keys, &f.values, &f.key_scales, &f.value_scales})
         failures += x->guards(label);
     failures += f.record_rope.device->verify_guards(label);
     if (f.kv_only)
         failures += f.out_q.preserved("unused Q output") + f.out_iq.preserved("unused IQ output");
     if (failures) std::cerr << label << ": " << failures << " failures\n";
+    failures += !f.packed->guards_intact();
     return failures;
 }
 
@@ -449,6 +448,7 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
     f.table_rows.at(1) = -1;
     f.valid.upload();
     f.slots.upload();
+    f.upload_offsets();
     f.table_rows.upload();
     std::vector<DeviceBuffer> inputs;
     for (auto* view : {&f.projected.query, &f.projected.key, &f.projected.value,
@@ -500,10 +500,10 @@ int validation(DeviceContext& device) {
     f.cache.main.storage = KvCacheStorage::Int8Group64;
     failures += rejects("storage/plane mismatch", [&] { f.launch(device.execution_view()); });
     f.cache = saved;
-    f.cache.index.block_tables.nb[1] += 4;
+    f.cache.index.keys.records.page_offsets.nb[1] += 8;
     failures += rejects("different table view", [&] { f.launch(device.execution_view()); });
-    f.cache                    = saved;
-    f.cache.main.k_pages.nb[2] = 256;
+    f.cache                                      = saved;
+    f.cache.main.k_pages.plane.head_stride_bytes = 256;
     failures += rejects("overlapping cache heads", [&] { f.launch(device.execution_view()); });
     f.cache             = saved;
     auto q              = f.query_output;

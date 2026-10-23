@@ -77,23 +77,23 @@ struct QuantizedCausalCacheView {
     Code* values;
     KeyScale* key_scales;
     ValueScale* value_scales;
-    const std::int32_t* tables;
+    const std::int64_t* tables;
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     int table_stride, kv_heads;
 };
 
-template <class View>
-View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
-                                      const Tensor* valid = nullptr, const Tensor* rows = nullptr) {
-    return {static_cast<typename View::Code*>(cache.k_pages.data),
-            static_cast<typename View::Code*>(cache.v_pages.data),
-            static_cast<typename View::KeyScale*>(cache.k_scale_pages.data),
-            static_cast<typename View::ValueScale*>(cache.v_scale_pages.data),
-            static_cast<const std::int32_t*>(cache.block_tables.data),
+template <class View, class Cache>
+View make_quantized_causal_cache_view(const Cache& cache, const Tensor* valid = nullptr,
+                                      const Tensor* rows = nullptr) {
+    return {static_cast<typename View::Code*>(cache.k_pages.data()),
+            static_cast<typename View::Code*>(cache.v_pages.data()),
+            static_cast<typename View::KeyScale*>(cache.k_scale_pages.data()),
+            static_cast<typename View::ValueScale*>(cache.v_scale_pages.data()),
+            static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
             valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
-            cache.block_tables.ne[0],
+            cache.k_pages.records.page_offsets.ne[0],
             cache.num_kv_heads};
 }
 
@@ -114,7 +114,7 @@ struct Bf16KvCacheView {
     using Value = std::conditional_t<Writable, __half, const __half>;
     Key* keys;
     Value* values;
-    const std::int32_t* tables;
+    const std::int64_t* tables;
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     int table_stride;
@@ -124,16 +124,15 @@ struct Bf16KvCacheView {
 
 using Bf16KvReadView = Bf16KvCacheView<false>;
 
-template <bool Writable>
-Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
-                                             const Tensor* valid = nullptr,
-                                             const Tensor* rows  = nullptr) {
-    return {static_cast<typename Bf16KvCacheView<Writable>::Key*>(cache.k_pages.data),
-            static_cast<typename Bf16KvCacheView<Writable>::Value*>(cache.v_pages.data),
-            static_cast<const std::int32_t*>(cache.block_tables.data),
+template <bool Writable, class Cache>
+Bf16KvCacheView<Writable> bf16_kv_cache_view(const Cache& cache, const Tensor* valid = nullptr,
+                                             const Tensor* rows = nullptr) {
+    return {static_cast<typename Bf16KvCacheView<Writable>::Key*>(cache.k_pages.data()),
+            static_cast<typename Bf16KvCacheView<Writable>::Value*>(cache.v_pages.data()),
+            static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
             valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
-            cache.block_tables.ne[0],
+            cache.k_pages.records.page_offsets.ne[0],
             cache.head_dim,
             cache.num_kv_heads};
 }

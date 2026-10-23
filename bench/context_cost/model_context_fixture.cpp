@@ -2,10 +2,9 @@
 #include "core/buffer.h"
 
 #include "artifact/reader.h"
-#include "core/arena.h"
 #include "core/device.h"
 #include "models/common/context/storage.h"
-#include "core/layout.h"
+#include "models/common/context/transfer.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/engine.h"
 
@@ -21,7 +20,6 @@
 #include <limits>
 #include <map>
 #include <set>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -33,7 +31,6 @@ namespace {
 
 constexpr std::uint64_t kMiB                 = 1ULL << 20U;
 constexpr std::uint32_t kMaximumFixturePages = 1024;
-constexpr std::uint32_t kMaximumCopyRuns     = 8;
 
 std::size_t checked_size_mul(std::size_t left, std::size_t right, const char* label) {
     if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
@@ -153,13 +150,13 @@ std::vector<TransferCase> transfer_cases(std::size_t payload_bytes) {
     return out;
 }
 
-std::vector<std::int32_t> select_runs(const std::vector<std::int32_t>& physical, std::size_t base,
+std::vector<std::int64_t> select_runs(const std::vector<std::int64_t>& physical, std::size_t base,
                                       std::uint32_t pages, std::uint32_t runs) {
     if (pages == 0 || runs == 0 || runs > pages ||
         base + static_cast<std::size_t>(pages) + runs - 1U > physical.size()) {
         throw std::invalid_argument("invalid fragmented transfer selection");
     }
-    std::vector<std::int32_t> selected;
+    std::vector<std::int64_t> selected;
     selected.reserve(pages);
     std::size_t cursor           = base;
     std::uint32_t remaining      = pages;
@@ -183,10 +180,9 @@ struct GeometryCase {
 };
 
 std::vector<GeometryCase> transfer_geometries() {
-    const auto page_major = [](std::size_t plane_count) {
+    const auto records = [](std::size_t plane_count) {
         KVPageGeometry geometry{
-            .page_tokens        = kPagedKVPageSize,
-            .device_plane_order = PagedKVPlaneOrder::PageMajor,
+            .page_tokens = kPagedKVPageSize,
         };
         geometry.planes.assign(plane_count, KVPlaneGeometry{.dtype          = DType::I8,
                                                             .leading_extent = 128,
@@ -195,14 +191,13 @@ std::vector<GeometryCase> transfer_geometries() {
         return geometry;
     };
     return {
-        GeometryCase{.label = "page-major-4", .geometry = page_major(4)},
-        GeometryCase{.label = "page-major-64", .geometry = page_major(64)},
+        GeometryCase{.label = "record-4", .geometry = records(4)},
+        GeometryCase{.label = "record-64", .geometry = records(64)},
         GeometryCase{
-            .label = "head-major-2x8",
+            .label = "draft-full-2x8",
             .geometry =
                 {
-                    .page_tokens        = kPagedKVPageSize,
-                    .device_plane_order = PagedKVPlaneOrder::HeadMajor,
+                    .page_tokens = kPagedKVPageSize,
                     .planes =
                         {
                             {DType::BF16, 128, 8, 256},
@@ -215,63 +210,79 @@ std::vector<GeometryCase> transfer_geometries() {
 
 void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
                       const MeasurementOptions& options, std::vector<TransferMeasurement>& output) {
-    const HostKVPageLayout host_layout = plan_host_kv_page_layout(fixture.geometry);
-    std::size_t page_payload           = 0;
-    for (const auto& plane : host_layout.planes) { page_payload += plane.page_payload_bytes; }
-    const std::vector<TransferCase> cases = transfer_cases(page_payload);
-    std::uint32_t maximum_pages           = 0;
-    for (const TransferCase& test : cases) { maximum_pages = std::max(maximum_pages, test.pages); }
-    const std::uint32_t region_pages   = maximum_pages + kMaximumCopyRuns;
+    namespace context           = models::context;
+    const auto layout           = plan_kv_page_layout(fixture.geometry);
+    const auto record_bytes     = layout.page_bytes;
+    const auto cases            = transfer_cases(record_bytes);
+    std::uint32_t maximum_pages = 0;
+    std::uint32_t maximum_runs  = 0;
+    for (const auto& test : cases) {
+        maximum_pages = std::max(maximum_pages, test.pages);
+        maximum_runs  = std::max(maximum_runs, test.runs);
+    }
+    const std::uint32_t region_pages   = maximum_pages + maximum_runs;
     const std::uint32_t physical_pages = 2U * region_pages;
-
-    LayoutBuilder builder;
-    const DeviceKVPagePoolLayout layout =
-        plan_device_kv_page_pool(builder, DeviceKVPagePoolSpec{.page_group_count = physical_pages,
-                                                               .geometry = fixture.geometry});
-    DeviceBuffer backing(device.device(), builder.finish(256, "context-cost transfer fixture"));
-    models::context::DevicePageStorage pool(backing.span(), layout);
-    std::vector<std::int32_t> handles(physical_pages);
-    for (std::uint32_t i = 0; i < physical_pages; ++i) handles[i] = static_cast<std::int32_t>(i);
-    pool.zero_pages(handles, device.transfer_view());
-
-    const std::size_t host_bytes =
-        checked_size_mul(host_layout.page_stride, region_pages, "transfer fixture Host bytes");
+    DeviceBuffer backing(device.device(), checked_size_mul(record_bytes, physical_pages,
+                                                           "transfer fixture Device bytes"));
+    const auto host_bytes =
+        checked_size_mul(record_bytes, region_pages, "transfer fixture Host bytes");
     PinnedHostBuffer host(host_bytes);
     fill_transfer_payload(host.data(), host_bytes, 0x7ac5d3e91b2468f0ULL);
-    pool.copy_from_host(host.span(), host_layout,
-                        std::span<const std::int32_t>(handles).first(region_pages),
-                        device.transfer_view());
-    pool.copy_from_host(host.span(), host_layout,
-                        std::span<const std::int32_t>(handles).subspan(region_pages),
-                        device.transfer_view());
+    context::ContextStorage storage(backing.span(), host.span(), {});
+    const runtime::ContextTransferResource resource{runtime::KvPoolId{0}};
+    context::ContextActions initialize;
+    for (std::uint32_t region = 0; region < 2; ++region) {
+        initialize.operations.push_back(context::RecordCopy{
+            .source      = {context::ContextMemory::Host, 0, host_bytes},
+            .destination = {context::ContextMemory::Device,
+                            static_cast<std::int64_t>(region * host_bytes), host_bytes},
+            .resource    = resource,
+            .page_groups = region_pages});
+    }
+    storage.execute(initialize, {}, device.transfer_view());
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
 
-    CudaEventTimer timer(device, device.transfer_stream());
-    const auto run = [&](const TransferCase& test) {
-        TransferWork work;
-        timer.start();
-        if (test.direction == TransferDirection::DeviceToHost) {
-            const auto source = select_runs(handles, 0, test.pages, test.runs);
-            work              = pool.copy_to_host(source,
-                                                  host.span().subspan(0, test.pages * host_layout.page_stride),
-                                                  host_layout, device.transfer_view());
-        } else if (test.direction == TransferDirection::HostToDevice) {
-            const auto destination = select_runs(handles, region_pages, test.pages, test.runs);
-            work = pool.copy_from_host(host.span().subspan(0, test.pages * host_layout.page_stride),
-                                       host_layout, destination, device.transfer_view());
-        } else {
-            for (std::uint32_t page = 0; page < test.pages; ++page) {
-                const auto part = pool.copy_page(handles[page], handles[region_pages + page],
-                                                 device.transfer_view());
-                work.payload_bytes += part.payload_bytes;
-                work.copy_operations += part.copy_operations;
-            }
+    std::vector<std::int64_t> offsets(physical_pages);
+    for (std::uint32_t i = 0; i < physical_pages; ++i)
+        offsets[i] = static_cast<std::int64_t>(i * record_bytes);
+    std::vector<context::ContextActions> actions;
+    actions.reserve(cases.size());
+    for (const auto& test : cases) {
+        const auto source      = select_runs(offsets, 0, test.pages, test.runs);
+        const auto destination = select_runs(offsets, region_pages, test.pages, test.runs);
+        context::ContextActions action;
+        action.operations.reserve(test.pages);
+        for (std::uint32_t i = 0; i < test.pages; ++i) {
+            const auto host_offset = static_cast<std::int64_t>(i * record_bytes);
+            context::ContextRange from{context::ContextMemory::Device, source[i], record_bytes};
+            context::ContextRange to{context::ContextMemory::Device, destination[i], record_bytes};
+            if (test.direction == TransferDirection::DeviceToHost)
+                to = {context::ContextMemory::Host, host_offset, record_bytes};
+            else if (test.direction == TransferDirection::HostToDevice)
+                from = {context::ContextMemory::Host, host_offset, record_bytes};
+            action.operations.push_back(context::RecordCopy{from, to, resource, 0, 1});
         }
-        return std::pair{elapsed_ns(timer.stop_ms()), work};
+        actions.push_back(std::move(action));
+    }
+    context::ContextMigration migration(device, storage, 0, 1);
+    const auto run = [&](std::size_t index) {
+        try {
+            migration.submit(actions[index]);
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+            const auto observations = migration.observations();
+            if (observations.size() != 1)
+                throw std::logic_error("transfer fixture must produce one observation segment");
+            const auto observed = observations.front();
+            migration.finish();
+            return std::pair{static_cast<double>(observed.elapsed_ns), observed.work};
+        } catch (...) {
+            migration.drain();
+            throw;
+        }
     };
 
-    for (const TransferCase& test : cases) {
-        for (int warmup = 0; warmup < options.transfer_warmup; ++warmup) { (void)run(test); }
+    for (std::size_t index = 0; index < cases.size(); ++index) {
+        for (int warmup = 0; warmup < options.transfer_warmup; ++warmup) { (void)run(index); }
     }
     std::vector<std::vector<double>> samples(cases.size());
     std::vector<TransferWork> measured_work(cases.size());
@@ -279,7 +290,7 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
         for (std::size_t offset = 0; offset < cases.size(); ++offset) {
             const std::size_t index =
                 (offset + static_cast<std::size_t>(repetition)) % cases.size();
-            const auto [elapsed, work] = run(cases[index]);
+            const auto [elapsed, work] = run(index);
             samples[index].push_back(elapsed);
             measured_work[index] = work;
         }
@@ -477,19 +488,18 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     }
 
     EngineOptions engine_options;
-    engine_options.artifact_path         = artifact.path;
-    engine_options.device                = options.device;
-    engine_options.max_context           = options.max_context;
-    engine_options.kv_capacity           = KvCapacityPolicy::explicit_capacity(options.max_context);
-    engine_options.max_concurrency       = 1;
-    engine_options.max_pending_requests  = 1;
-    engine_options.prefill_chunk         = options.prefill_chunk;
-    engine_options.kv_cache              = KvCacheStorage::BFloat16;
-    engine_options.speculative.backend   = SpeculativeBackend::None;
-    engine_options.enable_vision         = true;
-    engine_options.use_cuda_graph        = true;
-    engine_options.context_cache.enabled = false;
-    engine_options.context_cache.extra_state_slots   = 0;
+    engine_options.artifact_path                     = artifact.path;
+    engine_options.device                            = options.device;
+    engine_options.max_context                       = options.max_context;
+    engine_options.context_capacity                  = ContextCapacityPolicy::automatic();
+    engine_options.max_concurrency                   = 1;
+    engine_options.max_pending_requests              = 1;
+    engine_options.prefill_chunk                     = options.prefill_chunk;
+    engine_options.kv_cache                          = KvCacheStorage::BFloat16;
+    engine_options.speculative.backend               = SpeculativeBackend::None;
+    engine_options.enable_vision                     = true;
+    engine_options.use_cuda_graph                    = true;
+    engine_options.context_cache.enabled             = false;
     engine_options.context_cache.host_capacity_bytes = 0;
 
     Engine engine(engine_options);

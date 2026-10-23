@@ -6,8 +6,16 @@
 namespace ninfer {
 
 Device CyclicKVCacheLayerView::device() const {
-    if (k.device != v.device) { throw std::invalid_argument("cyclic KV spans different devices"); }
-    return k.device;
+    return ConstCyclicKVCacheLayerView(*this).device();
+}
+
+Device ConstCyclicKVCacheLayerView::device() const {
+    const auto device = k.records.storage.device;
+    if (v.records.storage.device != device || k.records.byte_offsets.device != device ||
+        v.records.byte_offsets.device != device) {
+        throw std::invalid_argument("Cyclic KV spans different devices");
+    }
+    return device;
 }
 
 CyclicKVCacheLayout plan_cyclic_kv_cache(StateImageBuilder& builder, std::uint32_t layers,
@@ -35,33 +43,33 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(StateImageBuilder& builder, std::uint32
 
 CyclicKVCacheView::CyclicKVCacheView(const StateImageStorage& storage,
                                      const CyclicKVCacheLayout& layout)
-    : layer0_{storage.field(layout.k), storage.field(layout.v), layout.capacity,
-              layout.padded_capacity,  layout.num_kv_heads,     layout.head_dim,
-              storage.slot_count()},
-      layers_(layout.layers), k_layer_stride_(storage.layer_stride(layout.k)),
-      v_layer_stride_(storage.layer_stride(layout.v)) {
+    : all_layers_{storage.field(layout.k, {}), storage.field(layout.v, {}), layout.capacity,
+                  layout.padded_capacity,      layout.num_kv_heads,         layout.head_dim},
+      layers_(layout.layers) {
     if (layers_ == 0 || layout.capacity == 0 || layout.padded_capacity < layout.capacity ||
-        layout.head_dim <= 0 || layout.num_kv_heads <= 0 ||
-        storage.layout().fields.at(layout.k.index).layers != layers_ ||
-        storage.layout().fields.at(layout.v.index).layers != layers_) {
+        layout.head_dim <= 0 || layout.num_kv_heads <= 0) {
         throw std::invalid_argument("Cyclic KV field geometry is inconsistent");
     }
-    for (const Tensor* tensor : {&layer0_.k, &layer0_.v}) {
-        if (tensor->ne[0] != layout.head_dim || tensor->ne[1] != layout.padded_capacity ||
-            tensor->ne[2] != layout.num_kv_heads || tensor->ne[3] != storage.slot_count()) {
+    const std::array<std::int32_t, 4> shape{
+        layout.head_dim, static_cast<std::int32_t>(layout.padded_capacity), layout.num_kv_heads, 1};
+    for (const auto* field : {&all_layers_.k.field, &all_layers_.v.field}) {
+        if (field->tensor.shape != shape || field->layers != layers_) {
             throw std::invalid_argument("Cyclic KV field shape is inconsistent");
         }
     }
-    if (layer0_.k.dtype != DType::BF16 || layer0_.v.dtype != DType::FP16) {
+    if (all_layers_.k.field.tensor.dtype != DType::BF16 ||
+        all_layers_.v.field.tensor.dtype != DType::FP16) {
         throw std::invalid_argument("Cyclic KV requires BF16 K and FP16 V");
     }
 }
 
-CyclicKVCacheLayerView CyclicKVCacheView::layer_view(std::uint32_t layer) const {
-    if (layer >= layers_) { throw std::out_of_range("Cyclic KV layer is out of range"); }
-    auto result   = layer0_;
-    result.k.data = static_cast<std::byte*>(result.k.data) + layer * k_layer_stride_;
-    result.v.data = static_cast<std::byte*>(result.v.data) + layer * v_layer_stride_;
+CyclicKVCacheLayerView CyclicKVCacheView::layer_view(std::uint32_t layer,
+                                                     const Tensor& byte_offsets) const {
+    auto result                   = all_layers_;
+    result.k                      = result.k.layer(layer);
+    result.v                      = result.v.layer(layer);
+    result.k.records.byte_offsets = byte_offsets;
+    result.v.records.byte_offsets = byte_offsets;
     return result;
 }
 

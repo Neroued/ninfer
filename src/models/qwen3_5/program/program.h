@@ -32,7 +32,6 @@ public:
 
     [[nodiscard]] RankMemoryUsage observe_resources() const;
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
-    [[nodiscard]] std::vector<context::KVTransferProfile> context_transfer_profiles() const;
     void reset_measurement_peaks() noexcept;
 
 private:

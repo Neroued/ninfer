@@ -22,8 +22,9 @@ union alignas(16) MaterializeStorage {
 
 template <int Rows, int Columns, int BlockK, int ColumnWarps>
 __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mma_kernel(
-    const __nv_bfloat16* hidden, const int* positions, const int* counts, const int* slots,
-    DeviceLayers layers, float* key_scratch, int width, int batch, int min_count, int max_count) {
+    const __nv_bfloat16* hidden, const int* positions, const int* counts,
+    const std::int64_t* offsets, DeviceLayers layers, float* key_scratch, int width, int batch,
+    int min_count, int max_count) {
     constexpr int kBlockRows = Rows, kBlockK = BlockK;
     constexpr int kBlockColumns = Columns;
     constexpr int kColumnWarps  = ColumnWarps;
@@ -225,7 +226,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
         if (count < min_count || count > max_count || column % width >= count) continue;
         if constexpr (Rows == 128) {
             if (!value) {
-                store_key_head(storage.scores[local], layer, positions, slots, column, width,
+                store_key_head(storage.scores[local], layer, positions, offsets, column, width,
                                row_begin / 128);
                 continue;
             }
@@ -237,7 +238,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 key_scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] =
                     result;
             } else {
-                store_value(row, column, slots[request], positions, layer, result);
+                store_value(row, column, offsets[request], positions, layer, result);
             }
         }
     }
@@ -250,14 +251,14 @@ using GroupedSchedule =
 
 template <int Columns, int KWarps = 8>
 __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
-    const __nv_bfloat16* x, const int* positions, const int* counts, const int* slots,
+    const __nv_bfloat16* x, const int* positions, const int* counts, const std::int64_t* offsets,
     DeviceLayers layers, float* scratch, int width, int batch, int min_count, int max_count) {
     const int l        = blockIdx.z >> 1;
     const bool value   = (blockIdx.z & 1) != 0;
     const auto layer   = layers.layer[l];
     const auto* codes  = value ? layer.value_codes : layer.key_codes;
     const auto* scales = value ? layer.value_scales : layer.key_scales;
-    const MaterializeProjectionEpilogue epilogue{layer, positions, counts,    slots,     scratch, l,
+    const MaterializeProjectionEpilogue epilogue{layer, positions, counts,    offsets,   scratch, l,
                                                  width, batch,     min_count, max_count, value};
     q8_a16_sliced_k_mma<GroupedSchedule<Columns, KWarps>, true>(
         Q8LinearOperands{x, codes, scales, 1024, 5120, max_count * batch, 5120},

@@ -200,14 +200,13 @@ private:
         description.kv_cache        = options.kv_cache;
         std::visit(
             [&](const auto& instance) {
-                const auto usage                        = instance->session->physical_usage();
-                description.device_state_capacity       = usage.capacity.state_slots;
-                description.host_context_capacity_bytes = usage.capacity.host_bytes;
-                description.kv_capacity = instance->context_capacity.resolved_tokens;
-                startup.ranks           = instance->rank_budgets;
+                const auto usage = instance->session->physical_usage();
+                for (const auto& pool : usage.pools)
+                    description.context_pools.push_back(
+                        {pool.rank, pool.domain, pool.capacity_bytes, pool.block_bytes});
+                startup.ranks = instance->rank_budgets;
                 for (const auto& pool : instance->session->kv_pools())
-                    description.kv_pools.push_back(
-                        {pool.id.index, std::string(pool.label), 0, pool.device_page_groups});
+                    description.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
                 for (const auto& rank : instance->executor->observations()) {
                     int device = options.device;
                     if (options.deployment)

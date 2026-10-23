@@ -264,6 +264,11 @@ std::optional<SessionEvent> SessionImpl::poll() {
                 }
                 return event;
             }
+            if (pending_maintenance_ && !execution && !has_context_operation()) {
+                auto assessment = std::move(*pending_maintenance_);
+                pending_maintenance_.reset();
+                (void)start_maintenance(assessment);
+            }
             auto event = executor().poll();
             if (!event) return {};
             if (const auto* failed = std::get_if<runtime::ExecutionFailed>(&*event))

@@ -493,8 +493,6 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
     states.copy_from_host(initial_states.data(), states.bytes());
     out.fill(0xff);
-    DeviceBuffer device_source_slots      = to_device(source_slots);
-    DeviceBuffer device_destination_slots = to_device(destination_slots);
 
     Tensor q(device.q.span(), DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
     Tensor k(device.k.span(), DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
@@ -503,14 +501,18 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     Tensor beta(device.beta.span(), DType::FP32, {test_case.value_heads, width, batch});
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
-    SlottedStateFixture history(states_tensor, 3);
-    states_tensor = history.tensor;
-    Tensor source_slots_tensor(device_source_slots.span(), DType::I32, {batch});
-    Tensor destination_slots_tensor(device_destination_slots.span(), DType::I32, {batch});
+    RecordStateFixture history(states_tensor, 3);
+    const auto source_offsets             = history.record_offsets(source_slots);
+    const auto destination_offsets        = history.record_offsets(destination_slots);
+    DeviceBuffer device_source_slots      = to_device(source_offsets);
+    DeviceBuffer device_destination_slots = to_device(destination_offsets);
+    Tensor source_slots_tensor(device_source_slots.span(), DType::I64, {batch});
+    Tensor destination_slots_tensor(device_destination_slots.span(), DType::I64, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
-    ops::gated_delta_net_batch_update(
-        q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor, source_slots_tensor,
-        destination_slots_tensor, out_tensor, ninfer::test::cuda_environment().default_execution);
+    ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
+                                      history.view(source_slots_tensor),
+                                      history.view(destination_slots_tensor), out_tensor,
+                                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -543,12 +545,13 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
             std::vector<float>(initial_states.begin() + begin,
                                initial_states.begin() + begin + state_size));
     }
-    failures +=
-        verify_exact(label + " source selectors unchanged",
-                     from_device_i32(device_source_slots, source_slots.size()), source_slots);
-    failures += verify_exact(label + " destination selectors unchanged",
-                             from_device_i32(device_destination_slots, destination_slots.size()),
-                             destination_slots);
+    failures += verify_exact(label + " source selectors unchanged",
+                             from_device<std::int64_t>(device_source_slots, source_offsets.size()),
+                             source_offsets);
+    failures += verify_exact(
+        label + " destination selectors unchanged",
+        from_device<std::int64_t>(device_destination_slots, destination_offsets.size()),
+        destination_offsets);
     failures += states.verify_guards((label + " states").c_str());
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
@@ -569,7 +572,8 @@ int graph_case(Case c, int batch, bool pooled) {
     GuardedDeviceBuffer state(state_size * slots * sizeof(float));
     GuardedDeviceBuffer output(value_size * batch * sizeof(std::uint16_t));
     std::vector<std::int32_t> source(batch), destination(batch);
-    DeviceBuffer source_device = to_device(source), destination_device = to_device(destination);
+    DeviceBuffer source_device      = to_device(std::vector<std::int64_t>(batch)),
+                 destination_device = to_device(std::vector<std::int64_t>(batch));
     Tensor q(device.q.span(), DType::BF16, {kStateDim, c.qk_heads, c.tokens, batch});
     Tensor k(device.k.span(), DType::BF16, {kStateDim, c.qk_heads, c.tokens, batch});
     Tensor v(device.v.span(), DType::BF16, {kStateDim, c.value_heads, c.tokens, batch});
@@ -577,10 +581,9 @@ int graph_case(Case c, int batch, bool pooled) {
     Tensor beta(device.beta.span(), DType::FP32, {c.value_heads, c.tokens, batch});
     Tensor out(output.span(), DType::BF16, {kStateDim, c.value_heads, c.tokens, batch});
     Tensor states(state.span(), DType::FP32, {kStateDim, kStateDim, c.value_heads, slots});
-    SlottedStateFixture history(states, 3);
-    states = history.tensor;
-    Tensor sources(source_device.span(), DType::I32, {batch});
-    Tensor destinations(destination_device.span(), DType::I32, {batch});
+    RecordStateFixture history(states, 3);
+    Tensor sources(source_device.span(), DType::I64, {batch});
+    Tensor destinations(destination_device.span(), DType::I64, {batch});
     const auto capacity = pooled ? 0
                                  : ops::gated_delta_net_workspace_capacity_bytes(
                                        c.qk_heads, c.value_heads, c.tokens, c.tokens);
@@ -591,11 +594,12 @@ int graph_case(Case c, int batch, bool pooled) {
     const float scale    = 1.0F / std::sqrt(float(kStateDim));
     const auto launch    = [&] {
         if (pooled) {
-            ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, c.normalize_qk, states,
-                                                 sources, destinations, out, execution);
+            ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, c.normalize_qk,
+                                              history.view(sources), history.view(destinations),
+                                              out, execution);
         } else {
-            auto si = states.slice(3, 0, 1).view({kStateDim, kStateDim, c.value_heads});
-            auto so = states.slice(3, 1, 1).view({kStateDim, kStateDim, c.value_heads});
+            auto si = history.tensor(0);
+            auto so = history.tensor(1);
             ops::gated_delta_net(q, k, v, g, beta, scale, c.normalize_qk, workspace, si, so, out,
                                     execution);
         }
@@ -624,8 +628,10 @@ int graph_case(Case c, int batch, bool pooled) {
         }
         state.copy_from_host(initial.data(), state.bytes());
         history.upload();
-        source_device.copy_from_host(source.data(), source_device.size());
-        destination_device.copy_from_host(destination.data(), destination_device.size());
+        const auto source_offsets      = history.record_offsets(source);
+        const auto destination_offsets = history.record_offsets(destination);
+        source_device.copy_from_host(source_offsets.data(), source_device.size());
+        destination_device.copy_from_host(destination_offsets.data(), destination_device.size());
         output.fill(0xff);
         scratch.fill(0xff);
         cuda_synchronize();
@@ -684,9 +690,11 @@ int graph_case(Case c, int batch, bool pooled) {
         }
         failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v,
                                                    device.g, device.beta);
-        failures += verify_exact(label + " sources", from_device_i32(source_device, batch), source);
-        failures += verify_exact(label + " destinations",
-                                 from_device_i32(destination_device, batch), destination);
+        failures += verify_exact(label + " sources",
+                                 from_device<std::int64_t>(source_device, batch), source_offsets);
+        failures +=
+            verify_exact(label + " destinations",
+                         from_device<std::int64_t>(destination_device, batch), destination_offsets);
         failures += history.verify_guards(label);
         failures += output.verify_guards(label);
         failures += scratch.verify_guards(label);

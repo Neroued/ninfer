@@ -1,16 +1,12 @@
 # 统一 Context 存储池
 
-本文定义选定的重构目标：KV history 与请求 state 共用底层容量，保留各自的对象语义，
-通过执行视图隔离物理分配。启动验证完整工作集，运行按执行链成组预留，缓存按真实释放结果让出容量，
-调度负责在压力下保障请求推进。现有固定 Device KV pools、State slots 及相关容量合同将整体替换，
-不保留旧接口或兼容执行分支。本文是设计与实施依据，不表示新池已经实现或通过性能验证。
+本文记录 KV history 与请求 State 共用底层容量的设计决策、容量论证与验证要求。
+当前存储和执行视图合同见 [Context 存储](../maintainer/paged-kv-cache.md)，
+准入、缓存与回收合同见 [Context 缓存](../maintainer/resource-scheduling-and-context-cache.md)，
+所有权与执行生命周期见 [Engine 架构](../maintainer/engine-architecture.md)。
 
-所有权遵循 [Engine 架构](../maintainer/engine-architecture.md)。现有行为参考
-[Context 缓存](../maintainer/resource-scheduling-and-context-cache.md)与
-[Paged KV](../maintainer/paged-kv-cache.md)；其中固定分区、物理 slot 与固定池 Tensor 的约定，
-在本次重构范围内由本文替换。模型数学、量化编码及 checkpoint 的数学条件继续由各自合同维护。
-GLM 待实现设计中的固定 slot/plane-pool 视图同样按本文的资源合同迁移，其 KDA、mHC、MLA
-数学定义和既定并行策略保持各自的权威来源。
+模型数学、量化编码及 checkpoint 的数学条件由各自合同维护。GLM 待实现设计采用相同的资源
+合同；其 KDA、mHC、MLA 数学定义和既定并行策略仍以对应设计为准，完整模型验证随集成进行。
 
 ## 1. 目标、对象与边界
 

@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/record_view.h"
 
 
 #include <cstddef>
@@ -60,18 +61,17 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      CudaExecutionView execution);
 
 /**
- * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],
- * v/out are BF16 [128,Hv,1,B], g/beta are FP32 [Hv,1,B], `ssm_states` is FP32
- * [128,128,Hv,Slots] with dense inner states and explicit 16-byte-aligned nb[3], and both selector
- * tensors are contiguous device I32 [B]. B is in [1,8]. Row b reads source_state_slots[b] and
- * publishes the transition to destination_state_slots[b]; selectors may be equal for an in-place
- * row. Destination slots are distinct across active rows. This form uses no arena allocation.
+ * One-token update for B independent records. q/k are contiguous BF16 [128,Hqk,1,B],
+ * v/out BF16 [128,Hv,1,B], and g/beta FP32 [Hv,1,B]. Source and destination fields are dense
+ * FP32 [128,128,Hv] within caller-owned records, selected by device I64 [B] arena-relative byte
+ * offsets. B is in [1,8]. Each selected field must be 16-byte aligned and fully inside its arena.
+ * A row may update in place. Destinations are distinct and do not overwrite other active sources.
+ * Input/output tensors do not overlap selected state fields. This form uses no arena allocation.
  */
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
-                                  bool normalize_qk, Tensor& ssm_states,
-                                  const Tensor& source_state_slots,
-                                  const Tensor& destination_state_slots, Tensor& out,
+                                  bool normalize_qk, ConstStateFieldView source_state,
+                                  StateFieldView destination_state, Tensor& out,
                                   CudaExecutionView execution);
 
 struct GdnRecurrenceRecords {
@@ -81,27 +81,22 @@ struct GdnRecurrenceRecords {
 };
 
 /**
- * Op: gated_delta_net_replay_record
+ * Evaluates B independent normalized Gated DeltaNet recurrences without modifying initial state.
+ * q/k are BF16 [128,Hq,T,B], v/out BF16 [128,Hv,T,B], and g/beta FP32 [Hv,T,B].
+ * initial_state selects dense FP32 [128,128,Hv] fields using device I64 [B] record byte offsets.
+ * Every selected field is 16-byte aligned and in bounds. B=1..8, T=2..16; (Hq,Hv) is one of
+ * (16,32), (16,48), (8,24). scale is 1/sqrt(128).
  *
- * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
- * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
- * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S].
- * State slots have dense inner [128,128,Hv] and explicit 16-byte-aligned nb[3]. Other tensors
- * are contiguous. B=1..8 and T=2..16, with (Hq,Hv) in {(16,32),(16,48),(8,24)}. scale is
- * 1/sqrt(128).
- *
- * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
- * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid
- * transition, key_record BF16 [128,Hq,T,B], value_record BF16 [128,Hv,T,B], and gate_record FP32
- * [2,Hv,T,B] receive bit-preserving copies of raw k, v, and {g,beta}. The invalid record suffix is
- * unchanged, while the invalid out suffix is exact BF16 zero. Inputs, state, records, and out are
- * pairwise non-overlapping. Valid outputs must be bit-identical to the normalized recurrent
- * one-token state-pool execution from the same FP32 initial state and represented inputs.
+ * valid_columns is empty for dense rows or device I32 [B] with values in [1,T]. Each valid
+ * transition copies raw k, v and {g,beta} into the corresponding record fields. Invalid record
+ * suffixes remain unchanged; invalid output suffixes are exact BF16 zero. Inputs, selected state
+ * fields, records and output do not overlap. Valid outputs are bit-identical to normalized
+ * recurrent one-token execution from the same represented inputs and initial FP32 state.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
-                                   const Tensor& ssm_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, GdnRecurrenceRecords records,
-                                   Tensor& out, CudaExecutionView execution);
+                                   ConstStateFieldView initial_state, const Tensor& valid_columns,
+                                   GdnRecurrenceRecords records, Tensor& out,
+                                   CudaExecutionView execution);
 
 } // namespace ninfer::ops

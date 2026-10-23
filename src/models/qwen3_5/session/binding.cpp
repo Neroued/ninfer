@@ -83,7 +83,8 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         requests[lane].lifecycle != Lifecycle::Empty || !base.impl_)
         throw std::logic_error("binding requires a free lane and context transaction slot");
     auto execution_reservation = executor().try_reserve(runtime::FrameKind::Context);
-    if (!execution_reservation) return {};
+    if (!execution_reservation)
+        return {.assessment = {.status = context::ContextAvailability::Waiting}};
     if (resume && (!resume->impl_ || resume->impl_->owner != this))
         throw std::invalid_argument("resume state belongs to another Session");
     const bool own_snapshot = resume && resume->has_snapshot();
@@ -136,7 +137,7 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             transaction.state_action = StateBindingAction::Move;
         } else if (state_store->device_resident(image) && state_store->host_resident(image) &&
                    state_store->source_pins(image) == 0 &&
-                   state_store->device_occupied() == state_store->device_capacity()) {
+                   !directory.assess(ContextDemand{.new_states = 1}).ready()) {
             transaction.state_action = StateBindingAction::Split;
         }
     }
@@ -189,46 +190,33 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             ? backend_kv_histories->binding_demand(backend_source, transaction.backend_frontier,
                                                    coverage.backend_frontier, retired_backend)
             : context::HistoryBindingDemand{};
-    const auto usage      = physical_usage();
-    const auto difference = [](auto needed, auto available) {
-        return needed > available ? needed - available : 0U;
-    };
     const auto action = transaction.state_action;
     const bool needs_state =
         action == StateBindingAction::Root || action == StateBindingAction::Fork ||
         action == StateBindingAction::Restore ||
         (action == StateBindingAction::Move &&
          !state_store->device_resident(checkpoint(*source).continuation().image));
-    ContextResources shortage{
-        .state_slots =
-            needs_state && usage.occupied.state_slots == usage.capacity.state_slots ? 1U : 0U,
-        .kv_page_groups = {
-            difference(main.device_pages(), text_kv_pages->allocator().available_pages()),
-            backend_kv_pages ? difference(backend.device_pages(),
-                                          backend_kv_pages->allocator().available_pages())
-                             : 0U}};
-    if (!candidate.retired_points.empty() &&
-        (shortage.state_slots || shortage.kv_page_groups[kTextKvPool.index] ||
-         shortage.kv_page_groups[kBackendKvPool.index])) {
-        const auto credit = checkpoint_release_resources(candidate.retired_points, shortage);
-        if (!credit) return {.source_valid = false};
-        shortage.state_slots = difference(shortage.state_slots, credit->state_slots);
-        shortage.kv_page_groups[kTextKvPool.index] = difference(
-            shortage.kv_page_groups[kTextKvPool.index], credit->kv_page_groups[kTextKvPool.index]);
-        shortage.kv_page_groups[kBackendKvPool.index] =
-            difference(shortage.kv_page_groups[kBackendKvPool.index],
-                       credit->kv_page_groups[kBackendKvPool.index]);
+    ContextDemand demand{.new_states = static_cast<std::uint32_t>(needs_state),
+                         .logical_states =
+                             static_cast<std::uint32_t>(action != StateBindingAction::Move)};
+    demand.add_history(kTextKvPool.index, main);
+    if (backend_kv_histories) demand.add_history(kBackendKvPool.index, backend);
+    ContextReleaseSet releases;
+    if (!candidate.retired_points.empty()) {
+        const auto quoted = checkpoint_release_set(candidate.retired_points);
+        if (!quoted) return {.source_valid = false};
+        releases = *quoted;
     }
-    if (shortage.state_slots || shortage.kv_page_groups[kTextKvPool.index] ||
-        shortage.kv_page_groups[kBackendKvPool.index])
-        return {
-            .capacity_possible =
-                context::kv_pages_for_frontier(coverage.main_frontier) + main.tail_copies <=
-                    usage.capacity.kv_page_groups[kTextKvPool.index] &&
-                (!backend_kv_pages ||
-                 context::kv_pages_for_frontier(coverage.backend_frontier) + backend.tail_copies <=
-                     usage.capacity.kv_page_groups[kBackendKvPool.index]),
-            .shortage = shortage};
+    auto assessment = directory.assess(demand, releases);
+    if (!assessment.ready())
+        return {.capacity_possible = !assessment.impossible(), .assessment = std::move(assessment)};
+    const ContextDemand backup_demand{
+        .new_states = 1, .logical_states = 0, .memory = context::ContextMemory::Host};
+    if (action == StateBindingAction::BackupSplit) {
+        auto backup = directory.assess(backup_demand, releases);
+        if (!backup.ready())
+            return {.capacity_possible = !backup.impossible(), .assessment = std::move(backup)};
+    }
     BindingReservation result{.reserved       = true,
                               .retired_points = candidate.retired_points,
                               .consumed_source =
@@ -261,16 +249,18 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             throw std::logic_error("binding retirement changed after its quote");
         transaction.retired_points.push_back(point);
     }
-    if (source && !own_snapshot && transaction.state_action == StateBindingAction::Move &&
-        !candidate.retired_points.empty() &&
-        std::find(candidate.private_points.begin(), candidate.private_points.end(), *source) !=
-            candidate.private_points.end()) {
-        const auto actual =
-            inspect_source(base, source, candidate.consume_source, candidate.private_points);
-        if (!actual) throw std::logic_error("accepted binding lost its source");
-        select_source(*actual);
-        result.consumed_source = transaction.consume_source ? source : std::nullopt;
+    auto reserved = directory.reserve(demand);
+    if (!reserved)
+        throw std::logic_error("binding placement changed after its accepted assessment");
+    std::optional<context::ContextReservation> backup_reservation;
+    if (action == StateBindingAction::BackupSplit) {
+        auto backup = directory.reserve(backup_demand);
+        if (!backup || !backup.reservation->ready())
+            throw std::logic_error("binding Host placement changed after its accepted assessment");
+        backup_reservation.emplace(std::move(*backup.reservation));
     }
+    auto& destinations = *reserved.reservation;
+    auto state_records = destinations.take_state();
     if (source) transaction.source_lease = checkpoints.lease(*source);
     context_operation_   = std::make_unique<PendingContext>(directory, std::move(transaction));
     request              = std::move(prepared);
@@ -293,20 +283,23 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         migration.add_binding(kTextKvPool.index,
                               text_kv_histories->prepare_binding(
                                   main_source, tx.reuse_frontier,
-                                  tx.reservation_demand.main_frontier, lane, tx.consume_source));
+                                  tx.reservation_demand.main_frontier, lane,
+                                  destinations.take_history(kTextKvPool.index), tx.consume_source));
         if (backend_kv_histories)
-            migration.add_binding(kBackendKvPool.index, backend_kv_histories->prepare_binding(
-                                                            backend_source, tx.backend_frontier,
-                                                            tx.reservation_demand.backend_frontier,
-                                                            lane, tx.consume_source));
+            migration.add_binding(
+                kBackendKvPool.index,
+                backend_kv_histories->prepare_binding(
+                    backend_source, tx.backend_frontier, tx.reservation_demand.backend_frontier,
+                    lane, destinations.take_history(kBackendKvPool.index), tx.consume_source));
         const auto source_image =
             source ? checkpoint(*source).continuation().image : context::StateId{};
         if (tx.state_action != StateBindingAction::Move) {
             const bool device = tx.state_action == StateBindingAction::Root ||
                                 tx.state_action == StateBindingAction::Fork;
-            const auto destination = device ? state_store->reserve_destination()
-                                            : state_store->reserve_logical_destination();
-            if (!destination) throw std::logic_error("binding lost its reserved State slot");
+            const auto destination =
+                device ? state_store->reserve_destination(std::move(state_records))
+                       : state_store->reserve_logical_destination(state_records);
+            if (!destination) throw std::logic_error("binding lost its reserved State record");
             migration.own_state(*destination);
         }
         switch (tx.state_action) {
@@ -325,13 +318,15 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             const auto destination = tx.state_action == StateBindingAction::Move
                                          ? source_image
                                          : migration.state_destination().image();
-            auto transfer          = state_store->reserve_host_to_device(source_image, destination);
+            auto transfer          = state_store->reserve_host_to_device(source_image, destination,
+                                                                         std::move(state_records));
             if (!transfer) throw std::logic_error("Host State restore reservation failed");
             migration.add_state_copy(std::move(*transfer), true);
             break;
         }
         case StateBindingAction::BackupSplit: {
-            auto backup = state_store->reserve_device_to_host(source_image);
+            auto backup =
+                state_store->reserve_device_to_host(source_image, backup_reservation->take_state());
             if (!backup) throw std::logic_error("source backup lost its Host reservation");
             migration.add_state_copy(std::move(*backup), true);
             break;

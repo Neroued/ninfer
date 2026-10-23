@@ -15,10 +15,10 @@ namespace gdn_projected_parallel {
 template <class ConvGeometry, int WarpsPerCta, int TokenTile, class Publish>
 __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
-    const __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
+    const __nv_bfloat16* conv_states, const std::int64_t* __restrict__ source_offsets,
     const std::int32_t* __restrict__ valid_columns, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t tokens,
-    std::int64_t slot_stride, Publish publish) {
+    Publish publish) {
     static_assert((ConvGeometry::channels % 32) == 0);
 
     struct Shared {
@@ -34,7 +34,7 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
     std::int32_t valid = valid_columns == nullptr ? tokens : *valid_columns;
     valid              = valid < 0 ? 0 : (valid > tokens ? tokens : valid);
     if (warp == 0) {
-        const std::int64_t initial_base = static_cast<std::int64_t>(*initial_slot) * slot_stride;
+        const std::int64_t initial_base = *source_offsets / 2;
 #pragma unroll
         for (int history = 0; history < 3; ++history) {
             shared.initial[history][lane] = __bfloat162float(
@@ -107,9 +107,9 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
 }
 
 template <int WarpsPerCta, class ConvGeometry = GdnConvGeometry<6144>, class Publish>
-void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& conv_states,
-            const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query, Tensor& key,
-            Tensor& value, Publish publish, cudaStream_t stream) {
+void launch(const Tensor& projected, const Tensor& conv_weight,
+            const ConstStateFieldView& conv_states, const Tensor& valid_columns, Tensor& query,
+            Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
     constexpr int kWarpsPerCta = WarpsPerCta;
     constexpr int kBlockTokens = 8;
     constexpr int kBlocks      = ConvGeometry::channels / 32;
@@ -117,13 +117,14 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& co
         <<<kBlocks, kWarpsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projected.data),
             static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
+            reinterpret_cast<const __nv_bfloat16*>(
+                (static_cast<const std::byte*>(conv_states.records.storage.data) +
+                 conv_states.field.tensor.region.offset)),
+            static_cast<const std::int64_t*>(conv_states.records.byte_offsets.data),
             valid_columns.data == nullptr ? nullptr
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), projected.ne[1], conv_states.nb[2] / 2,
-            publish);
+            static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish);
     CUDA_CHECK(cudaGetLastError());
 }
 

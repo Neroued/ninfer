@@ -46,8 +46,6 @@ struct SnapshotCase {
     int initial              = -1;
     bool graph               = false;
     bool full_reference      = false;
-    bool convenience         = false;
-    bool shared_selectors    = false;
     int batch                = 0; // Zero selects the single-request state form.
     std::vector<int> valid;
     unsigned conv_seed = 0;

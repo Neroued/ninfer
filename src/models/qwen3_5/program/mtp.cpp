@@ -42,7 +42,7 @@ void retain_conditioning(Resources& resources, std::span<const ExecutionRow> row
                          Tensor& destination, CudaExecutionView execution) {
     for (std::size_t row = 0; row < rows.size(); ++row) {
         const auto source =
-            resources.state_images.continuation_hidden_slot(rows[row].state_slots.source);
+            resources.state_images.continuation_hidden(rows[row].state_offsets.source);
         copy_tensor(destination.slice(1, static_cast<std::int32_t>(row), 1).view({source.ne[0]}),
                     source, execution);
     }
@@ -181,10 +181,9 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
         if (skip) {
             copy_tensor(destination_hidden, source_hidden.slice(1, 0, history_width), cuda);
         } else {
-            copy_tensor(
-                destination_hidden.slice(1, 0, 1).view({hidden}),
-                resources.state_images.continuation_hidden_slot(rows[row].state_slots.source),
-                cuda);
+            copy_tensor(destination_hidden.slice(1, 0, 1).view({hidden}),
+                        resources.state_images.continuation_hidden(rows[row].state_offsets.source),
+                        cuda);
             if (history_width > 1)
                 copy_tensor(destination_hidden.slice(1, 1, history_width - 1),
                             source_hidden.slice(1, 0, history_width - 1), cuda);

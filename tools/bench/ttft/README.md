@@ -129,8 +129,8 @@ binary to use its own CLI without compatibility flags in the candidate:
 {
   "common_args": ["--kv-dtype", "fp8", "--no-thinking", "--temperature", "0"],
   "profiles": {
-    "cache-hot": ["--max-context", "8192", "--kv-capacity", "8192",
-                  "--max-concurrency", "1", "--extra-state-slots", "2",
+    "cache-hot": ["--max-context", "8192", "--context-capacity", "1GiB",
+                  "--max-concurrency", "1",
                   "--host-cache-capacity", "0"]
   }
 }
@@ -139,7 +139,8 @@ binary to use its own CLI without compatibility flags in the candidate:
 The controller applies a common one-second statistics interval, enables request logging, and
 records these effective arguments in its manifest. Host capacity is a unified byte budget for KV
 and state; when comparing a baseline with separate pools, match its actual aggregate backing.
-`--extra-state-slots` remains extra state capacity beyond active lanes.
+A unified pool may fit more or fewer records at the same backing size because of block packing.
+Report an unconstructed pressure scenario as such; do not infer the old independent quotas.
 
 Servers read the selected artifact directly. Server warmup completes before measurement and does
 not populate the logical prefix cache.

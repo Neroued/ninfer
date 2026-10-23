@@ -58,13 +58,18 @@ struct Checkpoint {
 
 using Checkpoints = context::CheckpointStore<Checkpoint>;
 
+struct PreparedCheckpoint {
+    Checkpoints::Reservation record;
+    std::shared_ptr<const Identity> identity;
+};
+
 enum class Phase { Prefill, Replay, Active, Pending, Finished };
 
 struct CaptureReservation {
     context::StateDirectory* states;
     Checkpoints* checkpoints;
     Image destination;
-    std::optional<context::HostAllocation> host;
+    std::optional<context::RecordReservation> host;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -104,8 +109,7 @@ struct Demotion {
         std::uint32_t columns;
     };
 
-    const SessionImpl* owner          = nullptr;
-    std::uint64_t checkpoint_revision = 0;
+    const SessionImpl* owner = nullptr;
     std::vector<Image> images;
     std::vector<std::uint64_t> image_epochs;
     std::array<std::vector<context::PageId>, 2> pages;
@@ -115,16 +119,6 @@ struct Demotion {
     [[nodiscard]] bool empty() const {
         return images.empty() && pages[0].empty() && pages[1].empty();
     }
-};
-
-struct Reclaim {
-    const SessionImpl* owner;
-    ContextResources shortage;
-};
-
-struct Release {
-    const SessionImpl* owner;
-    std::array<std::vector<context::PageId>, 2> pages;
 };
 
 enum class StateBindingAction { Root, Move, Fork, Restore, Split };
@@ -156,24 +150,43 @@ struct PauseOperation {
     static constexpr auto kind = ContextOperationKind::Pause;
     std::uint32_t lane;
     std::unique_ptr<Suspended> paused;
+    bool save_snapshot = false;
+    PreparedCheckpoint checkpoint;
 };
 
 struct DemoteOperation {
     static constexpr auto kind = ContextOperationKind::Demote;
     std::shared_ptr<const Demotion> plan;
+    std::vector<Checkpoints::Lease> sources;
+};
+
+struct MaintenanceOperation {
+    static constexpr auto kind = ContextOperationKind::Maintenance;
 };
 
 struct ContextOperation {
-    using Action = std::variant<BindOperation, CaptureOperation, PauseOperation, DemoteOperation>;
+    using Action = std::variant<BindOperation, CaptureOperation, PauseOperation, DemoteOperation,
+                                MaintenanceOperation>;
     context::ContextTransaction migration;
     Action action;
     runtime::ExecutionReservation reservation;
     std::optional<runtime::ExecutionTicket> ticket;
     std::optional<ContextResult> result;
+    bool preparing_resources = false;
+    bool actions_prepared    = false;
+    bool final_batch         = false;
+    std::map<std::uint32_t, context::ContextActionCursor> cursors;
+    ContextWork residency;
+    std::vector<runtime::ContextTransferObservation> previous_transfers;
 
     ContextOperation(context::ContextDirectory& directory, Action value,
                      runtime::ExecutionReservation reserved)
         : migration(directory), action(std::move(value)), reservation(std::move(reserved)) {}
+
+    ContextOperation(context::ContextTransaction&& transaction, Action value,
+                     runtime::ExecutionReservation reserved)
+        : migration(std::move(transaction)), action(std::move(value)),
+          reservation(std::move(reserved)) {}
 
     [[nodiscard]] ContextOperationKind kind() const {
         return std::visit([](const auto& value) { return value.kind; }, action);
@@ -215,8 +228,9 @@ public:
     struct PauseReservation {
         SequenceHandle sequence;
         bool save_snapshot;
-        context::HostPlacement placement;
+        ContextDemand demand;
         runtime::ExecutionReservation execution;
+        PreparedCheckpoint checkpoint;
     };
 
     SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
@@ -226,7 +240,7 @@ public:
     [[nodiscard]] Sequence& sequence(SequenceHandle) const;
     [[nodiscard]] SequenceHandle handle(const Sequence&) const;
     [[nodiscard]] runtime::ExecutionMember member(const Sequence&) const;
-    [[nodiscard]] context::StateSelectors selectors(const Sequence&) const;
+    [[nodiscard]] StateBindings selectors(const Sequence&) const;
     [[nodiscard]] std::uint32_t pool_count() const noexcept;
     [[nodiscard]] std::uint32_t window_end(const Sequence&, std::uint32_t begin,
                                            std::uint32_t end) const;
@@ -250,8 +264,14 @@ public:
     void retire_compute(const runtime::DeviceRetired&);
     void finish_result(ComputeResult);
     void finish_score(ScoreResult);
+    [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>);
     [[nodiscard]] bool submit_score();
 
+    [[nodiscard]] ContextActions actions(const context::ContextTransaction&) const;
+    void prepare_binding_resources(context::ContextReservation&);
+    void prepare_pause_resources(context::ContextReservation&);
+    void resume_context(context::ContextReservation);
+    [[nodiscard]] runtime::ContextStart try_pending_maintenance();
     void submit_context();
     [[nodiscard]] ContextProgress complete_context();
     void cancel_operation() noexcept;
@@ -259,28 +279,29 @@ public:
 
     [[nodiscard]] std::shared_ptr<const qwen::VisionExecutionInput>
     plan_vision(const qwen::PreparedPromptData&) const;
-    [[nodiscard]] std::optional<CheckpointHandle> detach(Sequence&, runtime::CheckpointRole);
+    [[nodiscard]] PreparedCheckpoint prepare_checkpoint(Sequence&);
+    [[nodiscard]] std::optional<CheckpointHandle> detach(Sequence&, runtime::CheckpointRole,
+                                                         PreparedCheckpoint = {});
     [[nodiscard]] std::vector<context::PageId> checkpoint_pages(std::span<const CheckpointHandle>,
                                                                 std::uint32_t pool) const;
     [[nodiscard]] std::vector<Image> checkpoint_images(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] ContextResources footprint(std::span<const CheckpointHandle>,
-                                             bool released) const;
+    [[nodiscard]] ContextReleaseSet footprint(std::span<const CheckpointHandle>,
+                                              bool released) const;
     [[nodiscard]] std::size_t host_released(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] std::shared_ptr<Demotion> demotion(std::span<const CheckpointHandle>,
-                                                     ContextResources shortage) const;
+    [[nodiscard]] std::shared_ptr<Demotion> demotion(std::span<const CheckpointHandle>) const;
     [[nodiscard]] ContextDemotion describe_demotion(std::shared_ptr<const Demotion>) const;
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
-                                                  ContextResources) const;
-    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextResources>
-        plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
-                      ContextResources) const;
+                                                  const ContextDemand&) const;
+    [[nodiscard]] context::ReleasePlan<ContextRelease, ContextReleaseSet>
+    plan_releases(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                  const ContextDemand&) const;
     [[nodiscard]] runtime::ContextStart
     start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
     [[nodiscard]] context::HostWriteRequirements host_requirements(const Demotion&) const;
     bool prepare_demotion(context::ContextTransaction&, const Demotion&,
-                          context::HostReservations&);
+                          context::ContextReservation&);
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
@@ -293,6 +314,7 @@ public:
     std::array<std::uint64_t, kMaximumConcurrency> epochs{};
     std::vector<runtime::KvPoolDescriptor> pools;
     std::unique_ptr<ContextOperation> operation;
+    std::optional<ContextAssessment> pending_maintenance;
     std::optional<PauseReservation> pause_reservation;
     std::unique_ptr<ComputeTransaction> compute;
     std::unique_ptr<Scoring> scoring;

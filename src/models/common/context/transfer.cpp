@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <exception>
 #include <string>
 #include <limits>
@@ -12,9 +13,9 @@ namespace ninfer::models::context {
 namespace {
 std::size_t mapping_bytes(const ContextStorage& storage, std::size_t requested) {
     const auto elements = requested ? requested : storage.mapping_capacity_elements();
-    if (elements > SIZE_MAX / sizeof(std::int32_t))
+    if (elements > SIZE_MAX / sizeof(std::int64_t))
         throw std::overflow_error("context mapping staging size overflow");
-    return elements * sizeof(std::int32_t);
+    return elements * sizeof(std::int64_t);
 }
 } // namespace
 
@@ -29,8 +30,8 @@ ContextMigration::ContextMigration(DeviceContext& device, ContextStorage& storag
                                    std::size_t mapping_capacity_elements,
                                    std::size_t copy_segment_capacity)
     : device_(&device), storage_(&storage), execution_(execution),
-      mapping_(mapping_bytes(storage, mapping_capacity_elements)), source_ready_(device),
-      completed_(device) {
+      mapping_(mapping_bytes(storage, mapping_capacity_elements)), copies_(device.device(), 64),
+      source_ready_(device), completed_(device) {
     if (execution.device() != device.device())
         throw std::invalid_argument("context action stream belongs to another device");
     const auto capacity =
@@ -91,9 +92,25 @@ void ContextMigration::prepare(const ContextActions& actions) {
 
 void ContextMigration::enqueue(const ContextActions& actions, CudaExecutionView execution) {
     occupied_ = true;
-    if (actions.empty()) {
-        submitted_stream_ = nullptr;
-        fenced_           = true;
+    if (!storage_->uses_cuda(actions)) {
+        submitted_stream_   = nullptr;
+        fenced_             = false;
+        std::size_t segment = 0;
+        auto started        = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < actions.operations.size(); ++i) {
+            if (segment < segments_.size() && segments_[segment].begin == i) {
+                started = std::chrono::steady_clock::now();
+            }
+            storage_->execute(actions.operations[i], {}, execution);
+            if (segment < segments_.size() && segments_[segment].end == i + 1) {
+                segments_[segment].observed.elapsed_ns =
+                    std::max<std::int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - started)
+                                                  .count());
+                ++segment;
+            }
+        }
+        fenced_ = true;
         return;
     }
     fenced_           = false;
@@ -104,14 +121,35 @@ void ContextMigration::enqueue(const ContextActions& actions, CudaExecutionView 
     }
     auto staging        = mapping_.span();
     std::size_t segment = 0;
+    copies_.clear();
+    const auto flush = [&] {
+        if (!copies_.size()) return;
+        copies_.submit(execution);
+        segments_[segment].observed.work.copy_operations +=
+            static_cast<std::uint32_t>(copies_.size());
+        copies_.clear();
+    };
     for (std::size_t i = 0; i < actions.operations.size(); ++i) {
-        if (segment < segments_.size() && segments_[segment].begin == i) timers_[segment].start();
-        const auto consumed = storage_->execute(actions.operations[i], staging, execution);
-        if (consumed) {
-            staging.data = static_cast<std::byte*>(staging.data) + consumed;
-            staging.bytes -= consumed;
+        if (segment < segments_.size() && segments_[segment].begin == i) {
+            segments_[segment].observed.work.copy_operations = 0;
+            timers_[segment].start();
+        }
+        if (const auto* copy = std::get_if<RecordCopy>(&actions.operations[i])) {
+            if (!copies_.try_append(storage_->range(copy->destination),
+                                    storage_->range(copy->source))) {
+                flush();
+                if (!copies_.try_append(storage_->range(copy->destination),
+                                        storage_->range(copy->source))) {
+                    throw std::logic_error("Context copy cannot fit an empty batch");
+                }
+            }
+        } else {
+            flush();
+            const auto consumed = storage_->execute(actions.operations[i], staging, execution);
+            if (consumed) staging = staging.subspan(consumed);
         }
         if (segment < segments_.size() && segments_[segment].end == i + 1) {
+            flush();
             timers_[segment].record_stop();
             ++segment;
         }
@@ -135,8 +173,10 @@ std::span<const runtime::ContextTransferObservation> ContextMigration::observati
     observations_.clear();
     for (std::size_t i = 0; i < segments_.size(); ++i) {
         auto observed = segments_[i].observed;
-        observed.elapsed_ns =
-            std::max<std::uint64_t>(1, std::llround(timers_[i].elapsed_ms() * 1.0e6));
+        if (submitted_stream_) {
+            observed.elapsed_ns =
+                std::max<std::uint64_t>(1, std::llround(timers_[i].elapsed_ms() * 1.0e6));
+        }
         const auto existing =
             std::find_if(observations_.begin(), observations_.end(), [&](const auto& item) {
                 return item.resource == observed.resource && item.direction == observed.direction;
@@ -169,7 +209,7 @@ void ContextMigration::drain() {
     try {
         if (fenced_ && submitted_stream_)
             completed_.synchronize();
-        else if (!fenced_) {
+        else if (!fenced_ && submitted_stream_) {
             const auto status = cudaStreamSynchronize(submitted_stream_);
             if (status != cudaSuccess)
                 throw std::runtime_error(std::string("context action drain failed: ") +

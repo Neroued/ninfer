@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from tools.bench.ttft.diagnostics import TTFT_STAGES, request_timing_analysis
+from tools.bench.ttft.diagnostics import POOL_USAGE_FIELDS, TTFT_STAGES, request_timing_analysis
 from tools.bench.ttft.report import ReportError, load_campaign, summarize_campaign
 
 
@@ -574,7 +574,7 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         ))
         lines.extend([
             "", "### Resource occupancy", "",
-            "Sampled maxima can miss short-lived allocations. Only the Host allocator's recorded",
+            "Sampled maxima can miss short-lived allocations. Each rank/domain pool's recorded",
             "lifetime high-water mark is labelled peak. Startup backing/capacity and the full Host",
             "work breakdown remain in the JSON report; sampled occupancy is not reserved backing.", "",
         ])
@@ -582,13 +582,17 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
             ("Case", "Sample", "Resource", "Sampled max", "Last sample"),
             ((row["case"], row["sample"], resource, value["sampled_max"], value["last"])
              for row in available for resource, value in {
-                 **{key: value for key, value in row["occupancy"].items() if key != "kv_pools"},
+                 **{key: row["occupancy"][key] for key in ("state_objects", "history_objects")},
+                 **{f"metadata.{key}": value for key, value in row["occupancy"]["metadata"].items()},
                  **{f"kv_pool_{pool}": value for pool, value in row["occupancy"]["kv_pools"].items()},
+                 **{f"rank_{pool['rank']}.{pool['domain']}.{field}": pool[field]
+                    for pool in row["occupancy"]["pools"] for field in POOL_USAGE_FIELDS},
              }.items()),
         ))
         lines.extend(["", *_table(
-            ("Case", "Sample", "Host allocator peak occupied bytes"),
-            ((row["case"], row["sample"], row["host_context_peak_occupied_bytes"]) for row in available),
+            ("Case", "Sample", "Rank", "Domain", "Observed intervals", "Pool peak occupied bytes"),
+            ((row["case"], row["sample"], pool["rank"], pool["domain"], pool["observations"],
+              pool["peak_occupied_bytes"]) for row in available for pool in row["occupancy"]["pools"]),
         )])
     return [*lines, ""]
 

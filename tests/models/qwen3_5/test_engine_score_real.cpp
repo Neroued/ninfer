@@ -21,12 +21,18 @@ int main() {
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
     if (effective.max_concurrency != 1 || effective.prefill_chunk == 0 ||
-        effective.kv_capacity.mode != ninfer::KvCapacityMode::Explicit ||
-        effective.kv_capacity.explicit_tokens != effective.max_context ||
         effective.context_cache.enabled ||
         effective.speculative.backend != ninfer::SpeculativeBackend::None ||
         effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
         std::cerr << "causal scoring options were not normalized correctly\n";
+        return 1;
+    }
+    const auto& budget = engine.startup_report().ranks.at(0);
+    if (budget.minimum_context_capacity_bytes == 0 ||
+        budget.context_capacity_bytes < budget.minimum_context_capacity_bytes ||
+        engine.snapshot().ranks.at(0).memory.allocations.context_device_bytes !=
+            budget.context_capacity_bytes) {
+        std::cerr << "causal scoring did not materialize its required Context working set\n";
         return 1;
     }
 

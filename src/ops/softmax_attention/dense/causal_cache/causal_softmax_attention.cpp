@@ -37,7 +37,7 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
+std::uint32_t validate_batch_cache(const ConstPagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op, Device device) {
     common::operand::device(cache.device(), device, op, "cache");
     PagedKVStorageLayout layout{};
@@ -50,62 +50,48 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
     }
 
-    const std::int32_t physical_pages = cache.k_pages.ne[3];
-    const std::int32_t logical_pages  = cache.block_tables.ne[0];
-    const std::int32_t table_rows     = cache.block_tables.ne[1];
-    const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
-    if (physical_pages <= 0 || logical_pages <= 0 || table_rows <= 0 ||
-        capacity > std::numeric_limits<std::int32_t>::max()) {
+    const auto& offsets              = cache.k_pages.records.page_offsets;
+    const std::int32_t logical_pages = offsets.ne[0];
+    const std::int32_t table_rows    = offsets.ne[1];
+    const std::int64_t capacity      = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
+    if (logical_pages <= 0 || table_rows <= 0 ||
+        capacity > std::numeric_limits<std::int32_t>::max() ||
+        cache.k_pages.records.page_tokens != kPagedKVPageSize) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
-
-    if (cache.k_pages.dtype != layout.key.data_dtype ||
-        cache.v_pages.dtype != layout.value.data_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache data dtype");
-    }
-    common::operand::shape(
-        cache.k_pages, {layout.key.data_leading_extent, kPagedKVPageSize, kv_heads, physical_pages},
-        op, "cache k pages");
-    common::operand::shape(
-        cache.v_pages,
-        {layout.value.data_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
-        "cache v pages");
-    common::operand::contiguous_nonnull(cache.k_pages, op, "cache k pages", device);
-    common::operand::contiguous_nonnull(cache.v_pages, op, "cache v pages", device);
-    if (cache.block_tables.dtype != DType::I32) {
-        throw std::invalid_argument(std::string(op) + ": block tables must be I32");
-    }
-    common::operand::shape(cache.block_tables, {logical_pages, table_rows, 1, 1}, op,
-                           "block tables");
-    common::operand::contiguous_nonnull(cache.block_tables, op, "block tables", device);
-
-    const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
-                                    const char* name) {
+    common::operand::paged_plane(cache.k_pages, layout.key.data_dtype,
+                                 {layout.key.data_leading_extent, kPagedKVPageSize, kv_heads}, 16,
+                                 op, "cache K", device);
+    common::operand::paged_plane(cache.v_pages, layout.value.data_dtype,
+                                 {layout.value.data_leading_extent, kPagedKVPageSize, kv_heads}, 16,
+                                 op, "cache V", device);
+    common::operand::same_paged_records(cache.k_pages, cache.v_pages, op, "cache K/V");
+    const auto validate_scale = [&](const ConstPagedPlaneView& plane,
+                                    const PagedKVVectorLayout& vector, const char* name) {
         if (!vector.has_scale()) {
-            if (tensor.data != nullptr) {
+            if (plane.records.storage.data != nullptr) {
                 throw std::invalid_argument(std::string(op) +
                                             ": unscaled KV cache must not have scales");
             }
             return;
         }
-        if (tensor.dtype != vector.scale_dtype) {
-            throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-        }
-        common::operand::shape(
-            tensor, {vector.scale_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
-            name);
-        common::operand::contiguous_nonnull(tensor, op, name, device);
+        common::operand::paged_plane(plane, vector.scale_dtype,
+                                     {vector.scale_leading_extent, kPagedKVPageSize, kv_heads}, 16,
+                                     op, name, device);
+        common::operand::same_paged_records(cache.k_pages, plane, op, name);
     };
-    validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
-    validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
+    validate_scale(cache.k_scale_pages, layout.key, "cache K scales");
+    validate_scale(cache.v_scale_pages, layout.value, "cache V scales");
     return static_cast<std::uint32_t>(capacity);
 }
 
-void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVLayerView& cache,
-                       std::int32_t tokens, const char* op, Device device) {
-    common::operand::shape(cache.block_table, {cache.block_table.ne[0], 1, 1, 1}, op,
-                           "block table");
-    common::operand::contiguous_nonnull(cache.block_table, op, "block table", device);
+void validate_envelope(CausalAttentionExecutionEnvelope envelope,
+                       const ConstPagedKVLayerView& cache, std::int32_t tokens, const char* op,
+                       Device device) {
+    common::operand::shape(cache.k_pages.records.page_offsets,
+                           {cache.k_pages.records.page_offsets.ne[0], 1, 1, 1}, op, "block table");
+    common::operand::contiguous_nonnull(cache.k_pages.records.page_offsets, op, "block table",
+                                        device);
     const std::uint32_t capacity =
         validate_batch_cache(single_row_paged_kv_batch_view(cache), cache.num_kv_heads, op, device);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -119,7 +105,7 @@ void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVL
 }
 
 void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,
-                                AttentionHeadGeometry geometry, const PagedKVLayerView& cache,
+                                AttentionHeadGeometry geometry, const ConstPagedKVLayerView& cache,
                                 CausalAttentionExecutionEnvelope envelope, float scale,
                                 const char* op, Device device) {
     require_causal_geometry(geometry, op);
@@ -150,7 +136,7 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
 
 void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions,
                                         const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                        const Tensor& out, const PagedKVBatchLayerView& cache,
+                                        const Tensor& out, const ConstPagedKVBatchLayerView& cache,
                                         AttentionHeadGeometry geometry,
                                         CausalAttentionExecutionEnvelope envelope, float scale,
                                         const char* op, Device device) {
@@ -188,7 +174,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op, device);
-    if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
+    if (cache.k_pages.records.page_offsets.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity ||
@@ -292,7 +278,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
-                                     const PagedKVLayerView& cache,
+                                     const ConstPagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
                                      MemoryArena& workspace, Tensor& out,
                                      CudaExecutionView execution) {

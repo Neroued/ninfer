@@ -18,95 +18,97 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
-    const ninfer::ContextCacheOptions fixed{.enabled = false, .extra_state_slots = 0};
-    const ninfer::runtime::ContextCapacityCurve curve{
-        .primary_page_tokens                     = 64,
-        .minimum_primary_page_groups             = 2,
-        .maximum_primary_page_groups             = 6,
-        .minimum_device_reservation_bytes        = 1000,
-        .bytes_per_additional_primary_page_group = 128,
-        .minimum_state_slots                     = 1,
-        .bytes_per_additional_state_slot         = 100,
+    using namespace ninfer;
+    using namespace ninfer::runtime;
+    constexpr std::size_t block = 1ULL << 20;
+    const ContextCapacityPlan plan{
+        .records            = {{block, 256}, {block / 4, 256}},
+        .working_sets       = {{"long request", {{{0}, 1}, {{1}, 5}}},
+                               {"concurrent short requests", {{{0}, 2}, {{1}, 1}}}},
+        .fixed_device_bytes = 100,
+        .metadata           = {80, 8, {2, 4}},
     };
+    const auto geometry = describe_context_pool(plan.records);
+    const auto metadata = [&](std::size_t blocks) {
+        return geometry.metadata_bytes(blocks * block) + 80 + 24 * blocks;
+    };
+    failures += check(plan.minimum_capacity().device_bytes == 3 * block,
+                      "startup worksets did not use independent slab packing peaks");
+    const auto budget_bytes = 10 * block + 150;
+    const auto automatic    = resolve_context_capacity(ContextCapacityPolicy::automatic(50), plan,
+                                                       budget_bytes, SIZE_MAX, true);
+    failures += check(automatic.device_bytes == 9 * block && automatic.block_bytes == block &&
+                          automatic.runtime_reservation_bytes == 9 * block + 100 &&
+                          automatic.metadata_budget_bytes == metadata(9) &&
+                          automatic.control_reservation_bytes == metadata(9) &&
+                          automatic.planned_slack_bytes == block + 50 - metadata(9),
+                      "shared-memory capacity omitted directory budget or slab rounding");
+    const auto discrete = resolve_context_capacity(ContextCapacityPolicy::automatic(50), plan,
+                                                   budget_bytes, SIZE_MAX, false);
+    failures += check(discrete.device_bytes == 10 * block &&
+                          discrete.metadata_budget_bytes == metadata(10) &&
+                          discrete.control_reservation_bytes == metadata(10),
+                      "discrete Device budget charged Host directory bytes");
+    const auto explicit_bytes = 3 * block + 500;
+    const auto explicit_capacity =
+        resolve_context_capacity(ContextCapacityPolicy::explicit_capacity(explicit_bytes), plan,
+                                 explicit_bytes + 100 + metadata(3), SIZE_MAX, true);
+    failures += check(explicit_capacity.device_bytes == explicit_bytes &&
+                          explicit_capacity.control_reservation_bytes == metadata(3),
+                      "explicit byte capacity was silently rounded or repartitioned");
 
-    const auto automatic = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(50), fixed, curve, 1360);
-    failures +=
-        check(automatic.primary_page_groups == 4 && automatic.resolved_tokens == 256 &&
-                  automatic.runtime_reservation_bytes == 1256 &&
-                  automatic.automatic_headroom_bytes == 50 && automatic.planned_slack_bytes == 104,
-              "automatic KV capacity did not select the largest fitting page count");
-
-    const auto capped = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(50), fixed, curve, 10000);
-    failures += check(capped.primary_page_groups == 6 && capped.resolved_tokens == 384,
-                      "automatic KV capacity exceeded or missed the target maximum");
-
-    const std::array offers{
-        ninfer::runtime::RankCapacityOffer{curve, 2000},
-        ninfer::runtime::RankCapacityOffer{{64, 2, 6, 1500, 256, 1, 100}, 2100}};
-    const auto common = ninfer::runtime::resolve_group_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), fixed, offers);
-    failures += check(common[0].primary_page_groups == 4 && common[1].primary_page_groups == 4 &&
-                          common[0].runtime_reservation_bytes == 1256 &&
-                          common[1].runtime_reservation_bytes == 2012,
-                      "group capacity did not preserve common pages and local byte costs");
-    bool group_rejected = false;
+    auto remote_plan               = plan;
+    remote_plan.fixed_device_bytes = 500;
+    const std::array offers{RankCapacityOffer{plan, budget_bytes, SIZE_MAX, true},
+                            RankCapacityOffer{remote_plan, 13 * block + 550, SIZE_MAX, true}};
+    const auto group =
+        resolve_group_context_capacity(ContextCapacityPolicy::automatic(50), offers, 0);
+    failures += check(group[0].device_bytes == 9 * block && group[1].device_bytes == 13 * block &&
+                          group[0].control_reservation_bytes == metadata(9) + metadata(13) &&
+                          group[1].control_reservation_bytes == 0,
+                      "rank budgets did not keep independent backings and one metadata owner");
+    bool explicit_rejected = false;
     try {
-        (void)ninfer::runtime::resolve_group_context_capacity(
-            ninfer::KvCapacityPolicy::explicit_capacity(320), fixed, offers);
-    } catch (const std::invalid_argument&) { group_rejected = true; }
-    failures += check(group_rejected, "group capacity silently reduced an explicit request");
-
-    const auto explicit_capacity = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::explicit_capacity(129), fixed, curve, 1200);
-    failures += check(explicit_capacity.primary_page_groups == 3 &&
-                          explicit_capacity.resolved_tokens == 192 &&
-                          explicit_capacity.runtime_reservation_bytes == 1128,
-                      "explicit KV capacity did not use page-aligned token semantics");
-
+        (void)resolve_group_context_capacity(ContextCapacityPolicy::explicit_capacity(11 * block),
+                                             offers, 0);
+    } catch (const std::invalid_argument&) { explicit_rejected = true; }
+    failures += check(explicit_rejected, "group capacity silently reduced explicit backing bytes");
     bool insufficient_rejected = false;
     try {
-        (void)ninfer::runtime::resolve_context_capacity(ninfer::KvCapacityPolicy::automatic(50),
-                                                        fixed, curve, 1049);
-    } catch (const std::invalid_argument&) { insufficient_rejected = true; }
+        (void)resolve_context_capacity(ContextCapacityPolicy::explicit_capacity(3 * block - 1),
+                                       plan, budget_bytes, SIZE_MAX, true);
+    } catch (const std::invalid_argument& error) {
+        insufficient_rejected = std::string(error.what()).find("long request") != std::string::npos;
+    }
     failures += check(insufficient_rejected,
-                      "automatic KV capacity accepted less than the minimum reservation");
+                      "undersized Context did not identify its failed startup working set");
 
-    auto expanded                        = curve;
-    expanded.maximum_primary_page_groups = 100;
-    const ninfer::ContextCacheOptions joint{.checkpoint_interval = 128};
-    const auto tight = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), joint, expanded, 1150);
-    failures += check(tight.primary_page_groups == 2 && tight.device_state_slots == 2,
-                      "tight memory expanded KV while state remained below its target");
-    const auto roomy = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), joint, expanded, 5000);
-    failures += check(roomy.primary_page_groups > 6 && roomy.device_state_slots > 2 &&
-                          roomy.runtime_reservation_bytes <= 5000,
-                      "joint allocation did not use memory for both history and states");
-    const auto fixed_kv = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::explicit_capacity(129), joint, expanded, 1428);
-    failures += check(fixed_kv.primary_page_groups == 3 && fixed_kv.device_state_slots == 4,
-                      "automatic states changed explicit KV or missed its density target");
-    const auto fixed_states = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), ninfer::ContextCacheOptions{.extra_state_slots = 3},
-        expanded, 1800);
-    failures += check(fixed_states.device_state_slots == 4 && fixed_states.primary_page_groups == 5,
-                      "explicit state capacity did not constrain automatic KV");
-    const auto group_joint = ninfer::runtime::resolve_group_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), joint, offers);
+    auto costly_metadata                      = plan;
+    costly_metadata.metadata.bytes_per_record = {64, 64};
+    const auto minimum_metadata               = 2 * geometry.metadata_bytes(3 * block) + 1024;
+    const std::array constrained{
+        RankCapacityOffer{plan, 100 + 3 * block + minimum_metadata, SIZE_MAX, true},
+        RankCapacityOffer{costly_metadata, 20 * block, SIZE_MAX, true}};
+    const auto bounded =
+        resolve_group_context_capacity(ContextCapacityPolicy::automatic(0), constrained, 0);
     failures +=
-        check(group_joint[0].capacity() == group_joint[1].capacity() &&
-                  group_joint[0].device_state_slots == 4 && group_joint[0].primary_page_groups == 3,
-              "rank negotiation independently sized state or KV");
-    auto with_control                  = expanded;
-    with_control.minimum_control_bytes = 500;
-    const auto accounted               = ninfer::runtime::resolve_context_capacity(
-        ninfer::KvCapacityPolicy::automatic(0), joint, with_control, 5500);
-    failures += check(accounted.capacity() == roomy.capacity() &&
-                          accounted.control_reservation_bytes == 500,
-                      "control metadata was omitted or charged twice");
+        check(bounded[0].device_bytes == 3 * block && bounded[1].device_bytes == 3 * block &&
+                  bounded[0].control_reservation_bytes == minimum_metadata,
+              "remote growth spent the coordinator metadata needed by minimum worksets");
+
+    auto host_plan             = plan;
+    host_plan.fixed_host_bytes = 400;
+    const auto host_limited    = resolve_context_capacity(
+        ContextCapacityPolicy::automatic(50), host_plan, budget_bytes, 400 + metadata(9), false);
+    failures += check(host_limited.device_bytes == 9 * block &&
+                          host_limited.control_reservation_bytes == metadata(9),
+                      "Host directory budget did not constrain an otherwise fitting Device pool");
+    bool host_rejected = false;
+    try {
+        (void)resolve_context_capacity(ContextCapacityPolicy::explicit_capacity(10 * block),
+                                       host_plan, budget_bytes, 400 + metadata(9), false);
+    } catch (const std::invalid_argument&) { host_rejected = true; }
+    failures += check(host_rejected, "explicit Context capacity ignored available Host RAM");
 
     const std::array boundaries{11000U};
     failures += check(
@@ -135,11 +137,20 @@ int main() {
     failures += check(physical.available({2000, 12000}) == 1500,
                       "physical availability did not bound the configured budget");
 
-    const ninfer::runtime::StartupMemoryBudget shared({10000, 12000}, 8000, 500, 1000);
-    failures += check(shared.available({7800, 12000}) == 4300 && shared.headroom() == 1500,
+    const auto unified = [](std::size_t available) {
+        return DeviceMemorySnapshot{available, 12000, available, 12000, true};
+    };
+    const StartupMemoryBudget shared(unified(10000), 8000, 500, 1000);
+    failures += check(shared.available(unified(7800)) == 4300 && shared.headroom() == 1500,
                       "shared Host payload capacity was not reserved");
-    failures += check(shared.fits({3000, 12000}) && !shared.fits({2999, 12000}),
+    failures += check(shared.fits(unified(3000)) && !shared.fits(unified(2999)),
                       "startup consumed the shared Host payload reservation");
+    const DeviceMemorySnapshot discrete_start{10000, 12000, 5000, 6000, false};
+    const StartupMemoryBudget host_media(discrete_start, 8000, 500, 1000);
+    failures += check(host_media.available({7800, 12000, 5000, 6000, false}) == 5300 &&
+                          host_media.available_host(discrete_start) == 4000 &&
+                          !host_media.fits({7800, 12000, 999, 6000, false}),
+                      "discrete Host reservation was charged to VRAM or not protected in RAM");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

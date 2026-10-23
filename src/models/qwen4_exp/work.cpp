@@ -63,6 +63,12 @@ std::span<const WorkRow> work_rows(const Work& work) {
         work.operation);
 }
 
+const context::ContextActions& local_actions(const ContextActions& actions, std::uint32_t rank) {
+    const auto found = actions.find(rank);
+    static const context::ContextActions empty;
+    return found == actions.end() ? empty : found->second;
+}
+
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     const auto rows = work_rows(work);
     if (!std::holds_alternative<ContextWork>(work.operation)) {
@@ -72,8 +78,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         for (std::size_t b = 0; b < rows.size(); ++b) {
             const auto& row = rows[b];
             member(row.member, shape.max_concurrency);
-            if (row.slots.source < 0 || row.slots.destination < 0 || !row.main_table.valid() ||
-                row.main_table.pool_id != 0)
+            if (row.states.empty() || !row.main_table.valid() || row.main_table.pool_id != 0)
                 throw std::invalid_argument("Qwen4Exp work has invalid context selectors");
             if (mtp) {
                 if (!row.mtp_table.valid() || row.mtp_table.pool_id != 1 ||
@@ -106,10 +111,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 if (row.member.residency.lane == other.member.residency.lane ||
                     row.member.sequence == other.member.sequence ||
                     row.main_table.index == other.main_table.index ||
-                    (mtp && row.mtp_table.index == other.mtp_table.index) ||
-                    row.slots.destination == other.slots.destination ||
-                    row.slots.destination == other.slots.source ||
-                    row.slots.source == other.slots.destination)
+                    (mtp && row.mtp_table.index == other.mtp_table.index))
                     throw std::invalid_argument("Qwen4Exp batch rows have overlapping writes");
             }
         }
@@ -281,9 +283,14 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
     for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto& row    = commit.rows[b];
         const auto& source = rows[b];
-        if (!same_member(row.member, source.member) || row.slots.source != source.slots.source ||
-            (!verify && row.slots.destination != source.slots.destination))
+        if (!same_member(row.member, source.member) || row.states.size() != source.states.size())
             throw std::logic_error("Qwen4Exp commit differs from its work");
+        for (const auto& [rank, offsets] : row.states) {
+            const auto previous = source.states.at(rank);
+            if (offsets.source != previous.source ||
+                (!verify && offsets.destination != previous.destination))
+                throw std::logic_error("Qwen4Exp commit changes its prepared State binding");
+        }
         if (sampled) {
             const auto& output  = results[b];
             const auto produced = output.tokens.size();
@@ -301,10 +308,11 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                 (row.cancelled ? (!row.terminal || row.accepted != 0) : row.accepted != processed))
                 throw std::invalid_argument("invalid Qwen4Exp processed-input commit");
         }
-        for (std::size_t i = 0; i < rows.size(); ++i)
-            if (i != b && (row.slots.destination == commit.rows[i].slots.destination ||
-                           row.slots.destination == rows[i].slots.source))
-                throw std::invalid_argument("Qwen4Exp commit rows have overlapping writes");
+        for (const auto& [rank, offsets] : row.states)
+            for (std::size_t i = 0; i < rows.size(); ++i)
+                if (i != b && (offsets.destination == commit.rows[i].states.at(rank).destination ||
+                               offsets.destination == rows[i].states.at(rank).source))
+                    throw std::invalid_argument("Qwen4Exp commit rows have overlapping writes");
     }
 }
 

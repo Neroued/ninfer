@@ -37,19 +37,19 @@ int main(int argc, char** argv) {
             if (options.op == "fold") {
                 gdn_replay::FoldFixture f(options.profile, t);
                 const auto counts = gdn_replay::extents(options.commits, t, options.batch, true);
-                constexpr int slots[] = {10, 2, 8, 0, 6, 4, 9, 1};
+                constexpr int records[] = {10, 2, 8, 0, 6, 4, 9, 1};
                 std::vector<ops::GdnReplayFoldRow> rows;
                 for (int b = 0; b < options.batch; ++b)
-                    rows.push_back({slots[b], slots[b], counts[b]});
+                    rows.push_back(
+                        {f.byte_offset(records[b]), f.byte_offset(records[b]), counts[b]});
                 const bool on_device = options.row_metadata == "device";
-                auto selected =
-                    on_device
-                        ? measurement::make_i32(std::vector<int>(slots, slots + options.batch))
-                        : DeviceBuffer{};
+                std::vector<std::int64_t> offsets(options.batch);
+                for (int b = 0; b < options.batch; ++b) offsets[b] = f.byte_offset(records[b]);
+                auto selected = on_device ? gdn_replay::make_offsets(offsets) : DeviceBuffer{};
                 auto prefixes = on_device ? measurement::make_i32(counts) : DeviceBuffer{};
                 Tensor selectors, commits;
                 if (on_device) {
-                    selectors = Tensor(selected.span(), DType::I32, {options.batch});
+                    selectors = Tensor(selected.span(), DType::I64, {options.batch});
                     commits   = Tensor(prefixes.span(), DType::I32, {options.batch});
                 }
                 row.commits = gdn_replay::csv_extent(options.commits);

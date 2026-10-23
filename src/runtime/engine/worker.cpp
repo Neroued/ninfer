@@ -39,25 +39,35 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
                                                   device, topology, connection.communication());
         const auto requirement = preparing->memory();
         StartupMemoryBudget budget(
-            initial, device_budget(initial.available_bytes()), requirement.headroom_bytes,
-            NINFER_SHARED_PHYSICAL_MEMORY ? requirement.host_reservation_bytes : 0);
-        if (requirement.weight_bytes > budget.available(device_memory_snapshot(device.device())))
+            initial, device_budget(initial.available_bytes()),
+            std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
+            requirement.host_reservation_bytes);
+        const auto before_weights    = device_memory_snapshot(device.device());
+        const auto available_weights = budget.available(before_weights);
+        if (requirement.weight_bytes > available_weights ||
+            (before_weights.shared_physical_memory &&
+             requirement.host_weight_bytes > available_weights - requirement.weight_bytes))
             throw DeviceAllocationError("rank immutable weights exceed device budget",
                                         requirement.weight_bytes);
+        if (requirement.host_weight_bytes > budget.available_host(before_weights))
+            throw std::invalid_argument("rank immutable Host weights exceed available RAM");
         preparing->materialize();
         reader.reset();
         const auto after_weights = device_memory_snapshot(device.device());
         std::uint32_t attempt    = 0;
         std::size_t correction   = 0;
-        ContextCapacityCurve capacity_curve;
+        ContextCapacityPlan capacity_plan;
         const auto report = [&] {
-            const auto available = budget.available(device_memory_snapshot(device.device()));
+            const auto snapshot  = device_memory_snapshot(device.device());
+            const auto available = budget.available(snapshot);
             wire::Encoder out;
             out.u64(topology.plan);
             out.u32(attempt);
-            auto value     = preparing->report(available > correction ? available - correction : 0);
-            capacity_curve = value.capacity.curve;
-            value.hardware_class = context_cost_hardware_class(
+            auto value = preparing->report(available > correction ? available - correction : 0);
+            value.capacity.available_host_bytes   = budget.available_host(snapshot);
+            value.capacity.shared_physical_memory = snapshot.shared_physical_memory;
+            capacity_plan                         = value.capacity.plan;
+            value.hardware_class                  = context_cost_hardware_class(
                 device.properties().name, device.properties().major, device.properties().minor);
             value.cuda_sync_mode           = device.sync_mode();
             value.free_after_weights_bytes = after_weights.available_bytes();
@@ -87,6 +97,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
                                                                after.shared_physical_memory,
                                                                observation.stamp.sampled_ns};
             result.budget.limit_bytes                   = budget.limit();
+            result.budget.context_control_budget_bytes  = control_reservation_bytes;
             result.budget.headroom_bytes                = budget.headroom();
             result.budget.available_after_weights_bytes = after_weights.available_bytes();
             result.budget.available_after_startup_bytes = after.available_bytes();
@@ -94,7 +105,8 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             result.budget.retained_bytes =
                 budget.retained(allocation_snapshot, requirement.weight_bytes);
             const auto planned =
-                result.budget.runtime_reservation_bytes + control_reservation_bytes +
+                result.budget.runtime_reservation_bytes +
+                (after.shared_physical_memory ? control_reservation_bytes : 0) +
                 (result.budget.graphs ? result.budget.graphs->rebuild_estimate_bytes : 0);
             const auto observed = device_memory_growth(allocation_snapshot, after);
             opaque_growth = observed > static_cast<std::int64_t>(planned) ? observed - planned : 0;
@@ -124,7 +136,8 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             if (command.u64() != topology.plan || command.u32() != attempt)
                 throw std::logic_error("rank preparation attempt differs");
             const auto action = static_cast<PreparationAction>(command.u8());
-            const ContextCapacity capacity{command.u32(), command.u32()};
+            const ContextCapacity capacity{command.u64()};
+            const auto planned_control_bytes = command.u64();
             command.finish();
             if (action == PreparationAction::PrepareProbe) {
                 bool success = true;
@@ -196,10 +209,21 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             allocation_snapshot       = before;
             opaque_growth             = 0;
             const auto available      = budget.available(before);
-            control_reservation_bytes = capacity_curve.control_bytes(capacity);
+            control_reservation_bytes = planned_control_bytes;
             wire::Bytes description;
             try {
-                preparing->prepare(capacity, available > correction ? available - correction : 0);
+                const auto local_control  = capacity_plan.control_bytes(capacity);
+                const auto remote_control = planned_control_bytes > local_control
+                                                ? planned_control_bytes - local_control
+                                                : 0;
+                auto remaining            = available > correction ? available - correction : 0;
+                auto host_remaining       = budget.available_host(before);
+                if (before.shared_physical_memory)
+                    remaining = remaining > remote_control ? remaining - remote_control : 0;
+                else
+                    host_remaining =
+                        host_remaining > remote_control ? host_remaining - remote_control : 0;
+                preparing->prepare(capacity, remaining, host_remaining);
                 description = describe();
             } catch (const DeviceAllocationError&) { accepted = false; }
             entered            = true;

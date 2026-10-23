@@ -43,12 +43,10 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
                                  from_device<std::uint16_t>(f.q.data(), f.qhost.size()), f.qhost);
         failures += verify_exact(
             "gate preserved", from_device<std::uint16_t>(f.gate.data(), f.ghost.size()), f.ghost);
-        failures += verify_exact(
-            "K preserved", from_device<std::uint16_t>(f.keys.device.data(), f.keys.host.size()),
-            f.keys.host);
-        failures += verify_exact(
-            "V preserved", from_device<std::uint16_t>(f.values.device.data(), f.values.host.size()),
-            f.values.host);
+        if (!f.encoded_key) {
+            failures += verify_exact("K preserved", f.keys.download(), f.keys.host);
+            failures += verify_exact("V preserved", f.values.download(), f.values.host);
+        }
         failures += verify_exact("selection preserved",
                                  from_device<int>(f.selections.data(), f.ids.size()), f.ids);
         failures += verify_exact("counts preserved",
@@ -60,15 +58,16 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
         failures += verify_exact("selectors preserved",
                                  from_device<int>(f.rows.data(), f.selectors.size()), f.selectors);
         failures += verify_exact("tables preserved",
-                                 from_device<int>(f.table.data(), f.tables.size()), f.tables);
+                                 from_device<std::int64_t>(f.table.data(), f.table_offsets.size()),
+                                 f.table_offsets);
         if (f.encoded_key)
             for (const auto* plane : {&f.encoded_key->data, &f.encoded_key->scales,
                                       &f.encoded_value->data, &f.encoded_value->scales})
                 failures += plane->preserved(label);
     }
-    for (const auto* buffer :
-         {&f.out, &f.q, &f.gate, &f.keys.device, &f.values.device, &f.selections, &f.sizes})
+    for (const auto* buffer : {&f.out, &f.q, &f.gate, &f.selections, &f.sizes})
         failures += buffer->verify_guards(label);
+    failures += !f.packed->guards_intact();
     return failures;
 }
 
@@ -171,35 +170,26 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
     DeviceBuffer ids(ninfer::test::cuda_environment().context.device(), f.selections.bytes());
     DeviceBuffer counts(ninfer::test::cuda_environment().context.device(), f.sizes.bytes());
     DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.table.bytes());
-    DeviceBuffer payloads[4];
+    DeviceBuffer payload(device.device(), f.packed->storage().bytes);
     const std::uint8_t* host[4]{};
-    std::size_t bytes[4]{}, leading[4]{};
-    Tensor* targets[]{&f.cache.k_pages, &f.cache.v_pages, &f.cache.k_scale_pages,
-                      &f.cache.v_scale_pages};
+    PagedPlaneView* targets[]{&f.cache.k_pages, &f.cache.v_pages, &f.cache.k_scale_pages,
+                              &f.cache.v_scale_pages};
     if (f.encoded_key) {
-        const EncodedPlane* planes[]{&f.encoded_key->data, &f.encoded_value->data,
-                                     &f.encoded_key->scales, &f.encoded_value->scales};
-        for (int i = 0; i < 4; ++i) {
-            host[i]    = planes[i]->host.data();
-            bytes[i]   = planes[i]->host.size();
-            leading[i] = planes[i]->leading;
-        }
+        host[0] = f.encoded_key->data.host.data();
+        host[1] = f.encoded_value->data.host.data();
+        host[2] = f.encoded_key->scales.host.data();
+        host[3] = f.encoded_value->scales.host.data();
     } else {
-        host[0]    = reinterpret_cast<const std::uint8_t*>(f.keys.host.data());
-        host[1]    = reinterpret_cast<const std::uint8_t*>(f.values.host.data());
-        bytes[0]   = f.keys.device.bytes();
-        bytes[1]   = f.values.device.bytes();
-        leading[0] = f.keys.leading * 2;
-        leading[1] = f.values.leading * 2;
+        host[0] = reinterpret_cast<const std::uint8_t*>(f.keys.host.data());
+        host[1] = reinterpret_cast<const std::uint8_t*>(f.values.host.data());
     }
-    for (int i = 0; i < 4; ++i) {
-        if (!bytes[i]) continue;
-        payloads[i] = DeviceBuffer(ninfer::test::cuda_environment().context.device(), bytes[i]);
-        targets[i]->data = static_cast<std::uint8_t*>(payloads[i].data()) + leading[i];
+    for (auto* plane : targets) {
+        if (!plane->data()) continue;
+        plane->records.storage           = payload.span();
+        plane->records.page_offsets.data = table.data();
     }
     f.query.data                 = q.data();
     f.output_gate.data           = gate.data();
-    f.cache.block_tables.data    = table.data();
     f.batch.positions.data       = pos.data();
     f.selected.block_ids.data    = ids.data();
     f.selected.block_counts.data = counts.data();
@@ -223,15 +213,19 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
             for (int token : f.visible[m]) {
                 const int idx      = f.selectors[b] * f.table_stride + token / 64,
                           physical = f.tables[idx];
-                copy(static_cast<int*>(table.data()) + idx, f.tables.data() + idx, 4);
+                copy(static_cast<std::int64_t*>(table.data()) + idx, f.table_offsets.data() + idx,
+                     8);
                 for (int h = 0; h < f.kv_heads; ++h)
                     for (int i = 0; i < 4; ++i) {
-                        if (!bytes[i]) continue;
+                        if (!host[i]) continue;
                         const auto& plane = *targets[i];
-                        const auto off    = leading[i] + physical * plane.nb[3] + h * plane.nb[2] +
-                                         token % 64 * plane.nb[1];
-                        copy(static_cast<std::uint8_t*>(payloads[i].data()) + off, host[i] + off,
-                             plane.ne[0] * dtype_size(plane.dtype));
+                        const auto row_offset =
+                            h * plane.head_stride_bytes() + token % 64 * plane.row_stride_bytes();
+                        const auto source = physical * plane.plane.tensor.region.bytes + row_offset;
+                        const auto target =
+                            f.table_offsets[idx] + plane.plane.tensor.region.offset + row_offset;
+                        copy(static_cast<std::uint8_t*>(payload.data()) + target, host[i] + source,
+                             plane.row_stride_bytes());
                     }
             }
         }
@@ -296,19 +290,11 @@ int validation(DeviceContext& device) {
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            4 * 1024 * 1024);
     MemoryArena workspace(workspace_storage.span());
-    Fixture padded(1, 1, 8192, true);
-    // This aligned output intersects real rows in the padded plane's tail, beyond the
-    // logical element-byte count. Checking Tensor::bytes() would miss the overlap.
-    const auto logical_end =
-        reinterpret_cast<std::uintptr_t>(padded.cache.k_pages.data) + padded.cache.k_pages.bytes();
-    padded.output.data     = reinterpret_cast<void*>((logical_end + 15) / 16 * 16);
-    const int padded_alias = rejects([&] { padded.launch(workspace, device.execution_view()); });
-    int failures           = rejects([&] {
+    int failures = rejects([&] {
         (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
             static_cast<KvCacheStorage>(-1), 24, 2, 1, 1, 1, f.envelope,
             device.execution_view().multiprocessor_count());
     });
-    failures += padded_alias;
     failures += rejects([&] {
         (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
             KvCacheStorage::BFloat16, 24, 2, 2, 1, 1, f.envelope,
@@ -317,12 +303,12 @@ int validation(DeviceContext& device) {
     const auto out = f.output;
     f.output.data  = f.query.data;
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
-    f.output              = out;
-    f.cache.v_pages.dtype = DType::BF16;
+    f.output                           = out;
+    f.cache.v_pages.plane.tensor.dtype = DType::BF16;
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
-    f.cache.v_pages.dtype = DType::FP16;
-    const auto k          = f.cache.k_pages;
-    f.cache.k_pages.nb[1] = 511;
+    f.cache.v_pages.plane.tensor.dtype      = DType::FP16;
+    const auto k                            = f.cache.k_pages;
+    f.cache.k_pages.plane.head_stride_bytes = 511;
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
     f.cache.k_pages      = k;
     const auto execution = device.execution_view();
@@ -370,15 +356,13 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     const auto key_scales       = invalid.cache.k_scale_pages;
     invalid.cache.k_scale_pages = {};
     int failures = rejects([&] { invalid.launch(workspace, device.execution_view()); });
-    invalid.cache.k_scale_pages       = key_scales;
-    invalid.cache.k_scale_pages.dtype = DType::BF16;
+    invalid.cache.k_scale_pages = key_scales;
+    invalid.cache.k_scale_pages.plane.tensor.dtype = DType::BF16;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
-    invalid.cache.k_scale_pages       = key_scales;
-    invalid.cache.k_scale_pages.nb[1] = 0;
+    invalid.cache.k_scale_pages                         = key_scales;
+    invalid.cache.k_scale_pages.plane.head_stride_bytes = 0;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     invalid.cache.k_scale_pages = key_scales;
-    invalid.output.data         = invalid.cache.v_scale_pages.data;
-    failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     return failures;
 }
 

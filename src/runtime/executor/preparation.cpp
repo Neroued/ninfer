@@ -8,11 +8,22 @@ namespace {
 namespace dist = distributed;
 namespace wire = dist::wire;
 
-void broadcast(dist::ExecutionGroup& group, wire::Kind kind, const wire::Bytes& payload) {
-    const auto message =
-        std::make_shared<const wire::Message>(wire::Message{kind, group.epoch(), payload});
+void enter(dist::ExecutionGroup& group, const GroupPreparation& prepared, std::uint32_t attempt,
+           PreparationAction action) {
     std::vector<dist::OutgoingMessage> messages;
-    for (const auto& rank : group.topology().ranks) messages.push_back({rank.rank, message});
+    for (const auto& rank : group.topology().ranks) {
+        const auto* capacity =
+            prepared.capacities.empty() ? nullptr : &prepared.capacities.at(rank.rank);
+        wire::Encoder out;
+        out.u64(group.topology().plan);
+        out.u32(attempt);
+        out.u8(static_cast<std::uint8_t>(action));
+        out.u64(capacity ? capacity->device_bytes : 0);
+        out.u64(capacity ? capacity->control_reservation_bytes : 0);
+        messages.push_back(
+            {rank.rank, std::make_shared<const wire::Message>(wire::Message{
+                            wire::Kind::Enter, group.epoch(), std::move(out).take()})});
+    }
     if (!group.transport().try_send(messages, distributed::Traffic::Continuation))
         throw std::runtime_error("preparation control queue is full");
 }
@@ -49,18 +60,30 @@ std::vector<wire::Bytes> receive(dist::ExecutionGroup& group, wire::Kind kind,
 } // namespace
 
 void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& r) {
-    const auto& c = r.capacity.curve;
-    out.u32(c.primary_page_tokens);
-    out.u32(c.minimum_primary_page_groups);
-    out.u32(c.maximum_primary_page_groups);
-    out.u64(c.minimum_device_reservation_bytes);
-    out.u64(c.bytes_per_additional_primary_page_group);
-    out.u32(c.minimum_state_slots);
-    out.u64(c.bytes_per_additional_state_slot);
-    out.u64(c.minimum_control_bytes);
-    out.u64(c.control_bytes_per_page_group);
-    out.u64(c.control_bytes_per_state_slot);
+    const auto& plan = r.capacity.plan;
+    out.u64(plan.fixed_device_bytes);
+    out.u64(plan.fixed_host_bytes);
+    out.u32(plan.records.size());
+    for (const auto& record : plan.records) {
+        out.u64(record.bytes);
+        out.u64(record.alignment);
+    }
+    out.u32(plan.working_sets.size());
+    for (const auto& set : plan.working_sets) {
+        out.string(set.name);
+        out.u32(set.records.size());
+        for (const auto& record : set.records) {
+            out.u32(record.record_class.index);
+            out.u32(record.count);
+        }
+    }
+    out.u64(plan.metadata.fixed_bytes);
+    out.u64(plan.metadata.bytes_per_block);
+    out.u32(plan.metadata.bytes_per_record.size());
+    for (const auto bytes : plan.metadata.bytes_per_record) out.u64(bytes);
     out.u64(r.capacity.available_bytes);
+    out.u64(r.capacity.available_host_bytes);
+    out.boolean(r.capacity.shared_physical_memory);
     out.u64(r.weight_bytes);
     out.u64(r.host_weight_bytes);
     out.u64(r.staging_bytes);
@@ -71,33 +94,50 @@ void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& 
     out.u64(r.host_objects);
     out.u64(r.free_after_weights_bytes);
     out.boolean(r.preparation_required);
+    out.boolean(r.control_owner);
     out.string(r.hardware_class);
     out.string(r.cuda_sync_mode);
 }
 
 RankPreparationReport decode_preparation_report(wire::Decoder& in) {
     RankPreparationReport r;
-    r.capacity.curve           = {in.u32(), in.u32(), in.u32(), in.u64(), in.u64(),
-                                  in.u32(), in.u64(), in.u64(), in.u64(), in.u64()};
-    r.capacity.available_bytes = in.u64();
-    r.weight_bytes             = in.u64();
-    r.host_weight_bytes        = in.u64();
-    r.staging_bytes            = in.u64();
-    r.read_bytes               = in.u64();
-    r.upload_bytes             = in.u64();
-    r.load_seconds             = in.f64();
-    r.device_objects           = in.u64();
-    r.host_objects             = in.u64();
-    r.free_after_weights_bytes = in.u64();
-    r.preparation_required     = in.boolean();
-    r.hardware_class           = in.string();
-    r.cuda_sync_mode           = in.string();
+    auto& plan              = r.capacity.plan;
+    plan.fixed_device_bytes = in.u64();
+    plan.fixed_host_bytes   = in.u64();
+    plan.records.resize(in.u32());
+    for (auto& record : plan.records) record = {in.u64(), in.u64()};
+    plan.working_sets.resize(in.u32());
+    for (auto& set : plan.working_sets) {
+        set.name = in.string();
+        set.records.resize(in.u32());
+        for (auto& record : set.records) record = {{in.u32()}, in.u32()};
+    }
+    plan.metadata.fixed_bytes     = in.u64();
+    plan.metadata.bytes_per_block = in.u64();
+    plan.metadata.bytes_per_record.resize(in.u32());
+    for (auto& bytes : plan.metadata.bytes_per_record) bytes = in.u64();
+    r.capacity.available_bytes        = in.u64();
+    r.capacity.available_host_bytes   = in.u64();
+    r.capacity.shared_physical_memory = in.boolean();
+    r.weight_bytes                    = in.u64();
+    r.host_weight_bytes               = in.u64();
+    r.staging_bytes                   = in.u64();
+    r.read_bytes                      = in.u64();
+    r.upload_bytes                    = in.u64();
+    r.load_seconds                    = in.f64();
+    r.device_objects                  = in.u64();
+    r.host_objects                    = in.u64();
+    r.free_after_weights_bytes        = in.u64();
+    r.preparation_required            = in.boolean();
+    r.control_owner                   = in.boolean();
+    r.hardware_class                  = in.string();
+    r.cuda_sync_mode                  = in.string();
     return r;
 }
 
 GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                                          std::span<const wire::Bytes> payloads,
-                                         KvCapacityPolicy policy, ContextCacheOptions cache,
+                                         ContextCapacityPolicy policy,
                                          std::chrono::milliseconds timeout,
                                          ControlPreparation control) {
     if (payloads.size() != group.topology().ranks.size())
@@ -118,14 +158,8 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
             throw std::runtime_error("rank preparation payloads exceed control capacity");
         GroupPreparation result;
         for (std::uint32_t attempt = 0; attempt < 2; ++attempt) {
-            const auto enter = [&](PreparationAction action) {
-                wire::Encoder out;
-                out.u64(group.topology().plan);
-                out.u32(attempt);
-                out.u8(static_cast<std::uint8_t>(action));
-                out.u32(result.capacity.primary_page_groups);
-                out.u32(result.capacity.device_state_slots);
-                broadcast(group, wire::Kind::Enter, std::move(out).take());
+            const auto enter_phase = [&](PreparationAction action) {
+                enter(group, result, attempt, action);
             };
             const auto reports = [&] {
                 result.reports.clear();
@@ -158,25 +192,34 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
             if (attempt == 0 &&
                 std::any_of(result.reports.begin(), result.reports.end(),
                             [](const auto& report) { return report.preparation_required; })) {
-                enter(PreparationAction::PrepareProbe);
+                enter_phase(PreparationAction::PrepareProbe);
                 if (!allocated(false))
                     throw DeviceAllocationError("rank calibration resources do not fit");
-                enter(PreparationAction::Calibrate);
+                enter_phase(PreparationAction::Calibrate);
                 reports();
             }
             std::vector<RankCapacityOffer> offers;
             for (const auto& report : result.reports) offers.push_back(report.capacity);
-            const auto capacities = resolve_group_context_capacity(policy, cache, offers);
-            result.capacity       = capacities.front().capacity();
-            enter(PreparationAction::Allocate);
+            std::optional<std::size_t> control_owner;
+            for (std::size_t rank = 0; rank < result.reports.size(); ++rank) {
+                const auto& report = result.reports[rank];
+                if (report.control_owner) {
+                    if (control_owner)
+                        throw std::logic_error("Context directory has multiple memory owners");
+                    control_owner = rank;
+                }
+            }
+            if (!control_owner) throw std::logic_error("Context directory memory owner is absent");
+            result.capacities = resolve_group_context_capacity(policy, offers, *control_owner);
+            enter_phase(PreparationAction::Allocate);
             bool success = allocated(true);
             if (success) {
-                enter(PreparationAction::PrepareExecution);
+                enter_phase(PreparationAction::PrepareExecution);
                 success = allocated(true);
             }
             if (success) {
                 if (control.prepare) control.prepare(result.layouts);
-                enter(PreparationAction::CheckMemory);
+                enter_phase(PreparationAction::CheckMemory);
                 if (allocated(true)) {
                     result.attempt = attempt;
                     return result;
@@ -184,8 +227,8 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
             }
             if (control.release) control.release();
             if (attempt == 1)
-                throw std::runtime_error("rank resources do not fit the common capacity");
-            enter(PreparationAction::Release);
+                throw std::runtime_error("rank resources do not fit their Context capacities");
+            enter_phase(PreparationAction::Release);
         }
         throw std::logic_error("preparation attempt exhausted");
     } catch (const std::exception& error) {
@@ -198,13 +241,7 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
 void activate_execution_group(dist::ExecutionGroup& group, const GroupPreparation& prepared,
                               std::chrono::milliseconds timeout) {
     try {
-        wire::Encoder out;
-        out.u64(group.topology().plan);
-        out.u32(prepared.attempt);
-        out.u8(static_cast<std::uint8_t>(PreparationAction::Activate));
-        out.u32(prepared.capacity.primary_page_groups);
-        out.u32(prepared.capacity.device_state_slots);
-        broadcast(group, wire::Kind::Enter, std::move(out).take());
+        enter(group, prepared, prepared.attempt, PreparationAction::Activate);
         for (const auto& bytes : receive(group, wire::Kind::Ready, timeout)) {
             wire::Decoder in(bytes);
             if (in.u64() != group.topology().plan || in.u32() != prepared.attempt)

@@ -1,11 +1,14 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,7 +18,6 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 4096;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
@@ -23,16 +25,17 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.enable_vision                     = true;
     options.use_cuda_graph                    = std::getenv("NINFER_TEST_EAGER") == nullptr;
     options.context_cache.host_capacity_bytes = 0;
+    ninfer::test::qwen3_5::set_context_capacity(options);
     return options;
 }
 
 ninfer::EngineOptions maximum_engine_options(const char* artifact) {
     ninfer::EngineOptions options     = engine_options(artifact);
     options.max_context               = 262144;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(262144);
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 5;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    ninfer::test::qwen3_5::set_context_capacity(options);
     return options;
 }
 
@@ -201,6 +204,9 @@ int exercise_vision(ninfer::Engine& engine) {
         std::cerr << "35B Vision request did not complete through the public Engine\n";
         return 1;
     }
+    // Read a sample published after the short Vision request, rather than the reset snapshot.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)engine.generate(engine.prepare_tokens({198}), greedy_options(1, false));
     const auto after = engine.snapshot().ranks.at(0).memory;
     if (!after.vision ||
         after.vision->handoff_offset_bytes != before.vision->handoff_offset_bytes ||
@@ -221,7 +227,8 @@ int exercise_maximum_configuration(const char* artifact) {
     const auto* vision = memory.vision ? &*memory.vision : nullptr;
     if (engine.description().max_context != 262144 ||
         engine.description().kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
-        memory.kv_payload_bytes == 0 || memory.allocations.persistent_device_bytes == 0 ||
+        memory.allocations.context_device_bytes == 0 ||
+        memory.allocations.persistent_device_bytes == 0 ||
 
         memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
         vision->handoff_offset_bytes > memory.allocations.workspace_device_bytes ||
@@ -231,7 +238,8 @@ int exercise_maximum_configuration(const char* artifact) {
         vision->handoff_active_bytes != 0 ||
         !engine.startup_report().ranks.at(0).graphs.has_value()) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
-                  << engine.description().max_context << " kv_payload=" << memory.kv_payload_bytes
+                  << engine.description().max_context
+                  << " context=" << memory.allocations.context_device_bytes
                   << " sequence=" << memory.allocations.persistent_device_bytes
                   << " workspace=" << memory.allocations.workspace_device_bytes << '\n';
         return 1;
@@ -279,6 +287,7 @@ int exercise_expert_priority(const char* artifact) {
             priority[layer].push_back((255 - e + layer) % 256);
         }
     }
+    ninfer::test::qwen3_5::set_context_capacity(options);
     ninfer::Engine engine(options);
     const auto before = engine.snapshot().ranks.at(0).memory;
     if (engine.options().prefill_chunk != 2048 || engine.description().prefill_chunk != 2048) {

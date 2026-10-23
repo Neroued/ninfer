@@ -30,8 +30,8 @@ void RankProgramImpl::initialize_graphs() {
                                      input.rope_positions,
                                      frame.valid_columns.slice(0, 0, batch),
                                      frame.main_table_rows.slice(0, 0, batch),
-                                     frame.state_source_slots.slice(0, 0, batch),
-                                     frame.state_destination_slots.slice(0, 0, batch),
+                                     frame.state_source_offsets.slice(0, 0, batch),
+                                     frame.state_destination_offsets.slice(0, 0, batch),
                                      {}};
         execution::TextStateUpdate update = execution::StepUpdate{};
         if (call.width > 1) update.emplace<execution::ReplayRecords>(*resources.replay_records);

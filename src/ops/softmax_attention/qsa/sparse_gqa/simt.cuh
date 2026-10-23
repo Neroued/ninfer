@@ -25,20 +25,20 @@ __launch_bounds__(Warps * 32) __global__
     if constexpr (kSparseQuantized<Storage>) kv::normalized_hadamard_d256_inplace(query, lane);
     const auto table = a.tables + std::int64_t(a.table_rows[q / a.tokens]) * a.table_stride;
     for (int j = start + warp; j < end; j += Warps) {
-        const int ordinal  = j / 4;
-        const int g        = ordinal < work.count
-                                 ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
-                                 : work.complete;
-        const int physical = table[g / 16], row = 4 * (g % 16) + j % 4;
-        const auto* kp = a.key.data + physical * a.key.page + kvh * a.key.head + row * a.key.row;
-        const auto* vp =
-            a.value.data + physical * a.value.page + kvh * a.value.head + row * a.value.row;
+        const int ordinal   = j / 4;
+        const int g         = ordinal < work.count
+                                  ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
+                                  : work.complete;
+        const auto physical = table[g / 16];
+        const int row       = 4 * (g % 16) + j % 4;
+        const auto* kp      = a.key.data + physical + kvh * a.key.head + row * a.key.row;
+        const auto* vp      = a.value.data + physical + kvh * a.value.head + row * a.value.row;
         float keys[8], values[8];
         if constexpr (kSparseQuantized<Storage>) {
-            const auto* ks = a.key_scale.data + physical * a.key_scale.page +
-                             kvh * a.key_scale.head + row * a.key_scale.row;
-            const auto* vs = a.value_scale.data + physical * a.value_scale.page +
-                             kvh * a.value_scale.head + row * a.value_scale.row;
+            const auto* ks =
+                a.key_scale.data + physical + kvh * a.key_scale.head + row * a.key_scale.row;
+            const auto* vs =
+                a.value_scale.data + physical + kvh * a.value_scale.head + row * a.value_scale.row;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 keys[i]   = sparse_gqa_decode<Storage, true>(kp, ks, lane + 32 * i);

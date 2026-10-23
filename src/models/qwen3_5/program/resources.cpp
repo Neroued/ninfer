@@ -23,14 +23,13 @@ std::int32_t dimension(std::uint64_t value) {
 ResourceLayout plan_resources(const ResourceSpec& spec) {
     if (spec.decoder.enable_mtp != (spec.frame.backend == SpeculativeBackend::Mtp) ||
         spec.dflash.has_value() != is_masked_draft_backend(spec.frame.backend) ||
-        spec.state_images.slot_count < static_cast<std::int32_t>(spec.frame.batch_capacity) ||
         spec.decoder.kv_table_rows < static_cast<std::int32_t>(spec.frame.batch_capacity)) {
         throw std::invalid_argument("Qwen3.5 context and frame capacities do not agree");
     }
     LayoutBuilder builder;
     ResourceLayout out;
     out.decoder      = plan_decoder_state(builder, spec.decoder);
-    out.state_images = plan_state_image_device_pool(builder, spec.state_images);
+    out.state_images = plan_state_image_layout(spec.state_images);
     if (spec.replay_records) {
         out.replay_records = plan_gdn_replay_records(builder, *spec.replay_records);
     }
@@ -41,10 +40,9 @@ ResourceLayout plan_resources(const ResourceSpec& spec) {
             throw std::invalid_argument("DFlash resources require features and local state");
         }
         if (draft.full_layers) {
-            layout.full = plan_paged_kv_cache(
-                builder, draft.full_layers, spec.decoder.capacity, draft.kv_heads, draft.head_dim,
-                KvCacheStorage::BFloat16, spec.decoder.kv_table_rows,
-                spec.decoder.text_physical_page_groups, PagedKVPlaneOrder::HeadMajor);
+            layout.full = plan_paged_kv_cache(builder, draft.full_layers, spec.decoder.capacity,
+                                              draft.kv_heads, draft.head_dim,
+                                              KvCacheStorage::BFloat16, spec.decoder.kv_table_rows);
         }
         layout.prefill_features = builder.add_tensor(
             DType::BF16, {draft.feature_rows, dimension(spec.frame.prefill_chunk)}, kAlignment,
@@ -64,17 +62,27 @@ ResourceLayout plan_resources(const ResourceSpec& spec) {
             DType::I32, {spec.frame.public_tokens, dimension(spec.frame.batch_capacity)},
             kAlignment, "residency sampling token counts");
     }
+    out.context_bytes      = spec.context_bytes;
     out.host_context_bytes = spec.host_context_bytes;
     out.bytes              = builder.finish(kAlignment, "Qwen3.5 execution resources");
-    out.kv_payload_bytes =
-        out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     return out;
+}
+
+std::vector<RecordSpec> ResourceLayout::context_records() const {
+    std::vector<RecordSpec> records{
+        {state_images.images.image_bytes, state_images.images.alignment},
+        {decoder.text_kv.pages.page_bytes, decoder.text_kv.pages.alignment}};
+    const auto* backend = decoder.mtp_kv           ? &*decoder.mtp_kv
+                          : dflash && dflash->full ? &*dflash->full
+                                                   : nullptr;
+    if (backend) records.push_back({backend->pages.page_bytes, backend->pages.alignment});
+    return records;
 }
 
 std::size_t ResourceLayout::pinned_bytes() const {
     const auto mapping_bytes = [](const PagedKVCacheLayout& cache) {
         const auto& table = cache.execution_tables.spec;
-        return std::size_t(table.logical_page_capacity) * table.table_rows * sizeof(std::int32_t);
+        return std::size_t(table.logical_page_capacity) * table.table_rows * sizeof(std::int64_t);
     };
     auto mapping = mapping_bytes(decoder.text_kv);
     if (decoder.mtp_kv) mapping += mapping_bytes(*decoder.mtp_kv);
@@ -85,17 +93,18 @@ std::size_t ResourceLayout::pinned_bytes() const {
     return frame.host.bytes + 2 * mapping + counts;
 }
 
-DFlashPersistentState::DFlashPersistentState(MemorySpan backing,
+DFlashPersistentState::DFlashPersistentState(MemorySpan arena, MemorySpan backing,
                                              const DFlashPersistentLayout& layout,
                                              CyclicKVCacheView& local_state)
     : local(local_state), prefill_features(layout.prefill_features.bind(backing)),
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
-    if (layout.full) full.emplace(backing, *layout.full);
+    if (layout.full) full.emplace(arena, backing, *layout.full);
 }
 
-CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer) const {
-    return local.layer_view(layer);
+CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer,
+                                                          const Tensor& offsets) const {
+    return local.layer_view(layer, offsets);
 }
 
 PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t layer) const {
@@ -105,11 +114,12 @@ PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t laye
 
 Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
                      const WorkspaceSpec& workspace, const StartupObserver& observer)
-    : persistent(device.device(), layout.bytes),
+    : context_records(layout.context_records()), context(device.device(), layout.context_bytes),
+      persistent(device.device(), layout.bytes),
       workspace_storage(device.device(), workspace.capacity),
       work(workspace_storage.span().subspan(0, workspace.general_capacity)),
-      decoder(persistent.span(), layout.decoder),
-      state_images(persistent.span(), layout.state_images), frame(persistent.span(), layout.frame) {
+      decoder(context.span(), persistent.span(), layout.decoder),
+      state_images(context.span(), layout.state_images), frame(persistent.span(), layout.frame) {
     if (workspace.general_capacity == 0 ||
         (workspace.vision &&
          workspace.vision->general_capacity_bytes != workspace.general_capacity)) {
@@ -129,7 +139,7 @@ Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
     if (layout.dflash) {
         auto* local = state_images.dflash_local();
         if (!local) throw std::logic_error("DFlash StateImage has no local state");
-        dflash.emplace(backing, *layout.dflash, *local);
+        dflash.emplace(context.span(), backing, *layout.dflash, *local);
     }
     if (layout.token_counts) {
         token_counts = layout.token_counts->bind(backing);

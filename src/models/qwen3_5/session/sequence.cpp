@@ -64,7 +64,7 @@ ExecutionRow SessionImpl::execution_row(const SequenceState& state) const {
     row.member            = {state.id, state.residency};
     row.source_state      = state.continuation.image;
     row.destination_state = state.write_state();
-    row.state_slots       = state_store->selectors(row.source_state, row.destination_state);
+    row.state_offsets     = state_store->selectors(row.source_state, row.destination_state);
     row.main_table        = text_kv_histories->execution_row(state.kv->text.handle()).handle();
     if (state.kv->backend)
         row.backend_table =

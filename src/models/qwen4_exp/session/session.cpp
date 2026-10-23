@@ -6,15 +6,12 @@ namespace ninfer::models::qwen4_exp::detail {
 
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
-      directory(plan.context), checkpoints(plan.context.state.logical_capacity * 8ULL) {
+      directory(plan.context),
+      checkpoints(plan.context.state.logical_capacity * 8ULL, directory.metadata_budget()) {
     if (!definition) throw std::invalid_argument("invalid Qwen4Exp session definition");
     releases.reserve(shape.max_concurrency);
-    for (std::uint16_t i = 0; i < pool_count(); ++i) {
-        const auto& spec = plan.context.pools[i];
-        const auto host  = plan_host_kv_page_layout(spec.geometry);
-        pools.push_back(
-            {{i}, i == 0 ? "main" : "mtp", &spec.geometry, spec.device_pages, host.page_stride});
-    }
+    for (std::uint16_t i = 0; i < pool_count(); ++i)
+        pools.push_back({{i}, i == 0 ? "main" : "mtp"});
 }
 
 SessionImpl::~SessionImpl() { cleanup(); }
@@ -39,10 +36,23 @@ runtime::ExecutionMember SessionImpl::member(const Sequence& s) const {
     return {handle(s), {{s.lane}, s.binding_generation}};
 }
 
-context::StateSelectors SessionImpl::selectors(const Sequence& s) const {
-    return directory.states().selectors(s.continuation.image, s.write_destination.valid()
-                                                                  ? s.write_destination
-                                                                  : s.continuation.image);
+StateBindings SessionImpl::selectors(const Sequence& s) const {
+    StateBindings bindings;
+    for (const auto rank : directory.states().ranks())
+        bindings.emplace(rank, directory.states().selectors(s.continuation.image,
+                                                            s.write_destination.valid()
+                                                                ? s.write_destination
+                                                                : s.continuation.image,
+                                                            rank));
+    return bindings;
+}
+
+ContextActions SessionImpl::actions(const context::ContextTransaction& transaction) const {
+    ContextActions actions;
+    for (const auto& rank : plan.context.ranks)
+        if (!transaction.actions(rank.rank).empty())
+            actions.emplace(rank.rank, transaction.actions(rank.rank));
+    return actions;
 }
 
 void SessionImpl::complete_write(Sequence& s) {
@@ -107,6 +117,7 @@ void SessionImpl::clear(Sequence& s) noexcept {
 void SessionImpl::cleanup() noexcept {
     if (!executor) return;
     pause_reservation.reset();
+    pending_maintenance.reset();
     try {
         executor->drain();
     } catch (...) {
@@ -114,15 +125,11 @@ void SessionImpl::cleanup() noexcept {
     }
     try {
         if (compute) {
-            if (compute->context.in_flight()) compute->context.mark_completed();
-            compute->context.discard();
-            if (compute->completion) {
-                if (compute->completion->in_flight()) compute->completion->mark_completed();
-                compute->completion->discard();
-            }
+            compute->context.fail_after_drain();
+            if (compute->completion) compute->completion->fail_after_drain();
             compute.reset();
         }
-        if (operation && operation->migration.in_flight()) operation->migration.mark_completed();
+        if (operation) operation->migration.fail_after_drain();
         cancel_operation();
         scoring.reset();
         for (auto& s : sequences) {
@@ -184,7 +191,7 @@ void SessionImpl::settle(Sequence& s) {
     auto transaction = directory.begin_transaction();
     settle(s, transaction);
     transaction.prepare_actions();
-    if (!transaction.actions().empty())
+    if (!actions(transaction).empty())
         throw std::logic_error("settlement outside execution changed a live mapping");
     transaction.mark_submitted();
     transaction.mark_completed();
@@ -194,7 +201,7 @@ void SessionImpl::settle(Sequence& s) {
 WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     WorkRow row;
     row.member     = member(s);
-    row.slots      = selectors(s);
+    row.states     = selectors(s);
     row.main_table = directory.pool(0).histories().execution_row(s.histories[0].handle()).handle();
     if (pool_count() > 1)
         row.mtp_table =
@@ -262,24 +269,7 @@ void SessionImpl::adopt_commit(Sequence& s, const ContinuationMetadata& metadata
     s.permit.reset();
 }
 
-PhysicalUsageSnapshot SessionImpl::usage() const noexcept {
-    PhysicalUsageSnapshot out;
-    out.occupied.state_slots = directory.states().device_occupied();
-    out.capacity.state_slots = directory.states().device_capacity();
-    for (std::uint32_t i = 0; i < pool_count(); ++i) {
-        const auto& pages              = directory.pool(i).allocation();
-        out.occupied.kv_page_groups[i] = pages.allocated_pages() + pages.reserved_pages();
-        out.capacity.kv_page_groups[i] = pages.capacity_pages();
-    }
-    const auto& host             = directory.host_allocation();
-    out.host_state_slots         = directory.states().host_occupied();
-    out.occupied.host_bytes      = host.occupied_bytes();
-    out.capacity.host_bytes      = host.capacity_bytes();
-    out.host_reserved_bytes      = host.reserved_bytes();
-    out.host_peak_occupied_bytes = host.peak_occupied_bytes();
-    out.host_kv_bytes            = directory.host().occupied_bytes();
-    return out;
-}
+PhysicalUsageSnapshot SessionImpl::usage() const noexcept { return directory.usage(); }
 
 } // namespace ninfer::models::qwen4_exp::detail
 
@@ -315,7 +305,8 @@ std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->usage(); }
 
 bool Session::has_context_operation() const noexcept {
-    return impl_->operation || impl_->release_ticket || !impl_->releases.empty();
+    return impl_->operation || impl_->pending_maintenance || impl_->release_ticket ||
+           !impl_->releases.empty();
 }
 
 bool Session::execution_pending(SequenceHandle handle) const noexcept {
@@ -326,7 +317,10 @@ bool Session::execution_pending(SequenceHandle handle) const noexcept {
 
 bool Session::context_blocks(SequenceHandle handle) const noexcept {
     const auto& p = *impl_;
-    if (!p.operation || !p.valid(handle)) return false;
+    if (!p.valid(handle)) return false;
+    if (p.directory.maintenance_pending() || (p.operation && p.operation->preparing_resources))
+        return true;
+    if (!p.operation) return false;
     const auto& s = p.sequence(handle);
     if (const auto* bind = std::get_if<detail::BindOperation>(&p.operation->action)) {
         for (std::uint32_t i = 0; i < p.pool_count(); ++i) {
@@ -364,6 +358,7 @@ std::optional<SessionEvent> Session::poll() {
                 p.events.pop_front();
                 return event;
             }
+            if (p.pending_maintenance) (void)p.try_pending_maintenance();
             p.submit_releases();
             auto event = p.executor->poll();
             if (!event) return {};
@@ -411,6 +406,7 @@ std::optional<SessionEvent> Session::poll() {
                             if (!p.operation->result)
                                 throw std::logic_error("context retired without its result");
                             auto progress = p.complete_context();
+                            if (!progress.complete) return;
                             if (p.scoring && !p.scoring->sequence) {
                                 if (!progress.published || !progress.sequence)
                                     throw std::logic_error("scoring binding did not publish");
@@ -436,10 +432,7 @@ std::optional<SessionEvent> Session::poll() {
 
 void Session::fail_all_cleanup() noexcept { impl_->cleanup(); }
 
-void Session::reset_measurement_peaks() {
-    impl_->executor->reset_measurement_peaks();
-    impl_->directory.host_allocation().reset_peak();
-}
+void Session::reset_measurement_peaks() { impl_->executor->reset_measurement_peaks(); }
 
 ResumeState::ResumeState(std::unique_ptr<detail::Suspended> state) : state_(std::move(state)) {}
 

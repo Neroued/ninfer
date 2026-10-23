@@ -1,12 +1,15 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -16,7 +19,6 @@ ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 128;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk                     = 128;
     options.kv_cache                          = ninfer::KvCacheStorage::BFloat16;
     options.use_cuda_graph                    = false;
@@ -29,12 +31,12 @@ ninfer::EngineOptions dflash_engine_options(const char* artifact, ninfer::Propos
                                             std::uint32_t max_context) {
     ninfer::EngineOptions options     = base_engine_options(artifact);
     options.max_context               = max_context;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
     options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = std::getenv("NINFER_TEST_EAGER") == nullptr;
-    options.context_cache.extra_state_slots = 2;
+    ninfer::test::qwen3_5::set_context_capacity(options, 2);
+
     return options;
 }
 
@@ -44,6 +46,7 @@ ninfer::EngineOptions dflash_vision_engine_options(const char* artifact) {
     options.prefill_chunk   = 1024;
     options.max_concurrency = 2;
     options.enable_vision   = true;
+    ninfer::test::qwen3_5::set_context_capacity(options, 2);
     return options;
 }
 
@@ -167,7 +170,8 @@ int verify_dflash_load(const ninfer::Engine& engine) {
     const auto memory = engine.snapshot().ranks.at(0).memory;
     if (engine.description().max_context != 4352 ||
         engine.description().kv_cache != ninfer::KvCacheStorage::BFloat16 ||
-        memory.kv_payload_bytes == 0 || memory.allocations.device_weights_bytes == 0 ||
+        memory.allocations.context_device_bytes == 0 ||
+        memory.allocations.device_weights_bytes == 0 ||
 
         memory.allocations.persistent_device_bytes == 0 ||
 
@@ -359,12 +363,19 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
         return 1;
     }
 
+    // Resource snapshots are rate-limited. A fast fixture can finish before the first sample;
+    // submit a small ordinary request after the sampling interval to publish the retained peak.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)engine.generate(engine.prepare_tokens(text_prompt), greedy_options(1, false));
     const auto after = engine.snapshot().ranks.at(0).memory;
     if (!after.vision || after.vision->handoff_active_bytes != 0 ||
         after.vision->handoff_peak_bytes == 0 || after.workspace.measurement_peak_bytes == 0 ||
         after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
-        std::cerr
-            << "combined DFlash and Vision execution exceeded or bypassed its workspace plan\n";
+        std::cerr << "combined DFlash and Vision workspace: available=" << after.vision.has_value()
+                  << " active=" << (after.vision ? after.vision->handoff_active_bytes : 0)
+                  << " handoff_peak=" << (after.vision ? after.vision->handoff_peak_bytes : 0)
+                  << " work_peak=" << after.workspace.measurement_peak_bytes
+                  << " capacity=" << after.allocations.workspace_device_bytes << '\n';
         return 1;
     }
     return 0;
@@ -392,6 +403,7 @@ int main() {
             ninfer::EngineOptions options =
                 dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128);
             options.max_concurrency = 2;
+            ninfer::test::qwen3_5::set_context_capacity(options, 2);
             ninfer::Engine full(std::move(options));
             auto first  = full.submit(full.prepare_tokens(prompt), greedy_options(17, false));
             auto second = full.submit(full.prepare_tokens(prompt), greedy_options(9, false));
@@ -442,7 +454,7 @@ int main() {
         }
 
         // Restore fixtures need their own optional cache points. The page-boundary fixture above
-        // leaves reused points that may legitimately win retention under the same slot budget.
+        // leaves reused points that may legitimately win retention under the same byte budget.
         {
             ninfer::Engine engine(
                 dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));

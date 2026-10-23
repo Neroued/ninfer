@@ -22,7 +22,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         typename Int8KvCacheView<CacheInput::writes_cache>::Code* cache_v_i8,
         typename Int8KvCacheView<CacheInput::writes_cache>::KeyScale* cache_k_scale,
         typename Int8KvCacheView<CacheInput::writes_cache>::ValueScale* cache_v_scale,
-        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int64_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
         float* partial_m, float* partial_l) {
@@ -105,7 +105,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         input.v += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
-    const std::int32_t* block_table =
+    const std::int64_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc +=
@@ -157,12 +157,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int grp      = pair - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            const int physical_page = block_table[position >> kv::kPageShift];
-            const int page_offset   = position & kv::kPageMask;
-            const int d0            = grp * kv::kInt8Group + lane;
-            const int d1            = d0 + 32;
-            const std::int64_t src0 = causal_new_index<Geometry>(kv_head, d0, token);
-            const std::int64_t src1 = causal_new_index<Geometry>(kv_head, d1, token);
+            const std::int64_t record_offset = block_table[position >> kv::kPageShift];
+            const int page_offset            = position & kv::kPageMask;
+            const int d0                     = grp * kv::kInt8Group + lane;
+            const int d1                     = d0 + 32;
+            const std::int64_t src0          = causal_new_index<Geometry>(kv_head, d0, token);
+            const std::int64_t src1          = causal_new_index<Geometry>(kv_head, d1, token);
 
             float k_out[2];
 #pragma unroll
@@ -186,21 +186,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             vamax              = common::warp_max(vamax, FullMask);
             const auto k_quant = common::int8_fp16_scale(kamax);
             const auto v_quant = common::int8_fp16_scale(vamax);
-            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
-                                                                         page_offset)] =
+            cache_k_i8[kv::Int8G64Layout::code_offset(record_offset, kv_head, d0, page_offset)] =
                 common::int8_quant_code(kv0, k_quant.inverse_scale);
-            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
-                                                                         page_offset)] =
+            cache_k_i8[kv::Int8G64Layout::code_offset(record_offset, kv_head, d1, page_offset)] =
                 common::int8_quant_code(kv1, k_quant.inverse_scale);
-            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
-                                                                         page_offset)] =
+            cache_v_i8[kv::Int8G64Layout::code_offset(record_offset, kv_head, d0, page_offset)] =
                 common::int8_quant_code(vv0, v_quant.inverse_scale);
-            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
-                                                                         page_offset)] =
+            cache_v_i8[kv::Int8G64Layout::code_offset(record_offset, kv_head, d1, page_offset)] =
                 common::int8_quant_code(vv1, v_quant.inverse_scale);
             if (lane == 0) {
-                const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
-                    physical_page, kv_head, grp, page_offset);
+                const std::int64_t so =
+                    kv::Int8G64Layout::scale_offset(record_offset, kv_head, grp, page_offset);
                 cache_k_scale[so] = k_quant.scale;
                 cache_v_scale[so] = v_quant.scale;
             }
@@ -281,12 +277,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    auto issue_kv_tile = [&](int tile_k0, std::int64_t record_offset) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
-                    physical_page, kv_head, 0, key & kv::kPageMask);
+                const std::int64_t off =
+                    kv::Int8G64Layout::scale_offset(record_offset, kv_head, 0, key & kv::kPageMask);
                 common::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
                 common::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
@@ -301,8 +297,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
-                    physical_page, kv_head, d, key & kv::kPageMask);
+                const std::int64_t off =
+                    kv::Int8G64Layout::code_offset(record_offset, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
                 common::cp_async<16>(dst, &cache_k_i8[off]);
                 common::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
@@ -315,8 +311,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         common::cp_commit();
     };
 
-    int physical_page = block_table[first_tile >> kv::kPageShift];
-    issue_kv_tile(first_tile, physical_page);
+    std::int64_t record_offset = block_table[first_tile >> kv::kPageShift];
+    issue_kv_tile(first_tile, record_offset);
     common::cp_wait<0>();
     __syncthreads();
 
@@ -501,9 +497,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kv::kPageMask) == 0) {
-                physical_page = block_table[next_k0 >> kv::kPageShift];
+                record_offset = block_table[next_k0 >> kv::kPageShift];
             }
-            issue_kv_tile(next_k0, physical_page);
+            issue_kv_tile(next_k0, record_offset);
         }
 
         const int consumer_tile     = warp % RowTiles;

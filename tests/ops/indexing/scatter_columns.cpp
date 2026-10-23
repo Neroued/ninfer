@@ -1,5 +1,6 @@
 #include "ops/suite.h"
 #include "ops/op_tester.h"
+#include "ops/state_fixture.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/indexing.h"
@@ -16,15 +17,19 @@ int run(DType type, int features, int tokens, int batch) {
     std::vector<Word> values(features * tokens * batch), initial(slots * stride, Word(0xabcd));
     for (std::size_t i = 0; i < values.size(); ++i) values[i] = Word(i * 7919 + 0x8000);
     std::vector<int> columns(batch), selected(batch);
-    auto input = to_device(values), dc = to_device(columns), ds = to_device(selected);
+    auto input = to_device(values), dc = to_device(columns);
+    auto ds = to_device(std::vector<std::int64_t>(batch));
     GuardedDeviceBuffer output(initial.size() * sizeof(Word));
     Tensor source(input.span(), type, {features, tokens, batch}), c(dc.span(), DType::I32, {batch});
-    Tensor s(ds.span(), DType::I32, {batch}), destination(output.span(), type, {features, slots});
+    Tensor s(ds.span(), DType::I64, {batch}), destination(output.span(), type, {features, slots});
     destination.nb[1] = stride * sizeof(Word);
+    output.copy_from_host(initial.data(), output.bytes());
+    RecordStateFixture records(destination, 1);
+    const auto field = records.view(s);
     DeviceContext device;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::scatter_batch_columns(source, c, s, destination, device.execution_view());
+        ops::scatter_batch_columns(source, c, field, device.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -44,13 +49,21 @@ int run(DType type, int features, int tokens, int batch) {
                                    cudaMemcpyHostToDevice, device.stream()));
         CUDA_CHECK(cudaMemcpyAsync(dc.data(), columns.data(), dc.size(), cudaMemcpyHostToDevice,
                                    device.stream()));
-        CUDA_CHECK(cudaMemcpyAsync(ds.data(), selected.data(), ds.size(), cudaMemcpyHostToDevice,
+        std::vector<std::int64_t> offsets(batch);
+        for (int row = 0; row < batch; ++row)
+            offsets[row] =
+                columns[row] < 0 ? kInvalidRecordOffset : records.byte_offset(selected[row]);
+        device.synchronize();
+        records.upload();
+        CUDA_CHECK(cudaMemcpyAsync(ds.data(), offsets.data(), ds.size(), cudaMemcpyHostToDevice,
                                    device.stream()));
         if (phase % 2)
             graph.launch(device.stream());
         else
             launch();
         device.synchronize();
+        records.copy_back();
+        failures += records.verify_guards("scatter records");
         failures += verify_exact("scatter columns",
                                  from_device<Word>(output.data(), expected.size()), expected);
     }

@@ -73,7 +73,7 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
             m.candidate_blocks += blocks;
             maximum_scored = blocks;
         }
-        if (maximum_scored) m.read_bytes += 4ULL * (1 + (maximum_scored + 15) / 16);
+        if (maximum_scored) m.read_bytes += 4ULL + 8ULL * ((maximum_scored + 15) / 16);
         m.index_read += 256ULL * maximum_scored;
     }
     m.qk_flops              = m.candidate_blocks * 2 * 4 * 128;
@@ -98,8 +98,8 @@ inline Metrics prepare_metrics(int tokens, int axes, int kv_heads, std::span<con
         complete += blocks;
         m.read_bytes +=
             std::uint64_t(n) * ((query_elements + 512 * kv_heads + 128) * 2 + 4 * (axes + 1));
-        m.read_bytes += 8 + 4ULL * ((first + n - 1) / 64 - first / 64 + 1);
-        if (blocks && first % 4) m.read_bytes += 256ULL * (first % 4) + 12 + 4;
+        m.read_bytes += 8 + 8ULL * ((first + n - 1) / 64 - first / 64 + 1);
+        if (blocks && first % 4) m.read_bytes += 256ULL * (first % 4) + 12 + 16;
     }
     if (m.live_queries) m.read_bytes += (256 + (queries ? 256 + 128 : 0)) * 2;
     if (complete) m.read_bytes += 128 * 2;

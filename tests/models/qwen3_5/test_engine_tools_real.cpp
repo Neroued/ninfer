@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 
 #include <nlohmann/json.hpp>
 #include <cstdlib>
@@ -356,7 +357,7 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
     }
 }
 
-void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
+void pressure(ninfer::Engine& engine, bool snapshot, bool cancel, std::uint32_t prompt_tokens) {
     const Json schema{{"type", "object"},
                       {"properties",
                        {{"message", {{"type", "string"}, {"pattern", "^(ab cd ){180}$"}}},
@@ -375,8 +376,18 @@ void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
     auto first = prompt(schema), second = prompt(schema);
     first.messages[0].parts[0].text  = "Call record. First request.";
     second.messages[0].parts[0].text = "Call record. Second request.";
-    auto a                           = engine.submit(engine.prepare(first), options);
-    auto b                           = engine.submit(engine.prepare(second), options);
+    for (auto* input : {&first, &second}) {
+        const auto initial = engine.count_tokens(*input);
+        require(initial < prompt_tokens, "tool framing exceeds the pressure prompt target");
+        std::string padding;
+        for (std::uint32_t index = initial; index < prompt_tokens; ++index) padding += " A";
+        input->messages[0].parts[0].text.insert(0, padding + '\n');
+        const auto tokens = engine.count_tokens(*input);
+        require(tokens + 8 >= prompt_tokens && tokens <= prompt_tokens + 8,
+                "tool prompt padding missed the Context pressure interval");
+    }
+    auto a = engine.submit(engine.prepare(first), options);
+    auto b = engine.submit(engine.prepare(second), options);
     std::string expected;
     for (int i = 0; i < 180; ++i) expected += "ab cd ";
     if (cancel) {
@@ -424,16 +435,13 @@ int main(int argc, char** argv) {
         require(pressure_mode || mode == "graph" || mode == "eager" || mode == "basic",
                 "unknown test mode");
         ninfer::EngineOptions options;
-        options.artifact_path   = artifact;
-        options.max_context     = pressure_mode ? 1024 : 1536;
-        options.max_concurrency = argc > 3 ? std::stoul(argv[3]) : 2;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(
-            pressure_mode ? 1024 : options.max_concurrency * 1024);
+        options.artifact_path                     = artifact;
+        options.max_context                       = pressure_mode ? 1024 : 1536;
+        options.max_concurrency                   = argc > 3 ? std::stoul(argv[3]) : 2;
         options.prefill_chunk                     = 128;
         options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
         options.use_cuda_graph                    = mode != "eager";
         options.context_cache.enabled             = !pressure_mode;
-        options.context_cache.extra_state_slots   = pressure_mode ? 0 : 8;
         options.context_cache.host_capacity_bytes = mode == "replay" ? 0 : 512ULL << 20;
         if (backend == "mtp")
             options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
@@ -447,9 +455,12 @@ int main(int argc, char** argv) {
             options.speculative.draft_tokens  = 3;
             options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
         }
+        const auto pressure_prompt =
+            pressure_mode ? ninfer::test::qwen3_5::configure_two_request_pressure(options, 256) : 0;
+        if (!pressure_mode) ninfer::test::qwen3_5::set_context_capacity(options, 8);
         ninfer::Engine engine(options);
         if (pressure_mode)
-            pressure(engine, mode != "replay", mode == "cancel");
+            pressure(engine, mode != "replay", mode == "cancel", pressure_prompt);
         else if (mode == "basic")
             exercise_basic(engine, options.max_concurrency, backend != "none");
         else

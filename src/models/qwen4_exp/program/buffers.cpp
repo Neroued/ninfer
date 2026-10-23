@@ -22,18 +22,19 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.batch.rope_positions = tensor(DType::I32, {positions, 3}, "input RoPE coordinates");
     if (c.vision)
         out.batch.visual_indices = tensor(DType::I32, {positions}, "visual embedding indices");
-    out.batch.valid_columns      = rows();
-    out.batch.source_slots       = rows();
-    out.batch.destination_slots  = rows();
-    out.batch.main_tables        = rows();
-    out.batch.base_positions     = rows();
-    out.batch.record_offsets     = rows();
-    out.batch.accepted_columns   = rows();
-    out.batch.raw_tail           = tensor(DType::I32, {2, batch}, "PLE input token tail");
-    out.batch.row_indices        = rows();
-    out.batch.count_slots        = rows();
-    out.batch.sampling_positions = rows();
-    out.batch.max_positions      = positions;
+    out.batch.valid_columns       = rows();
+    out.batch.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
+    out.batch.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
+    out.batch.main_tables         = rows();
+    out.batch.base_positions      = rows();
+    out.batch.record_offsets      = rows();
+    out.batch.accepted_columns    = rows();
+    out.batch.raw_tail            = tensor(DType::I32, {2, batch}, "PLE input token tail");
+    out.batch.raw_tail_offsets    = tensor(DType::I64, {batch}, "PLE token-tail offsets");
+    out.batch.row_indices         = rows();
+    out.batch.count_slots         = rows();
+    out.batch.sampling_positions  = rows();
+    out.batch.max_positions       = positions;
     out.prefill_sample =
         tensor(DType::BF16, {hidden, static_cast<std::int32_t>(chunk)}, "prefill sample");
     out.pending_sample = tensor(DType::BF16, {hidden, width, batch}, "pending sample");
@@ -59,18 +60,18 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         auto& mtp           = out.mtp.emplace();
         const auto metadata = [&](std::int32_t n, bool visual) {
             MtpBatchLayout out;
-            out.ids               = tensor(DType::I32, {n}, "MTP IDs");
-            out.positions         = tensor(DType::I32, {n}, "MTP positions");
-            out.rope_positions    = tensor(DType::I32, {n, 3}, "MTP RoPE");
-            out.valid_columns     = rows();
-            out.source_slots      = rows();
-            out.destination_slots = rows();
-            out.table_rows        = rows();
-            out.base_positions    = rows();
-            out.record_offsets    = rows();
-            const auto begin      = out.ids.region.offset;
-            const auto& last      = out.record_offsets.region;
-            out.ingress           = {begin, last.offset + last.bytes - begin, 256};
+            out.ids                 = tensor(DType::I32, {n}, "MTP IDs");
+            out.positions           = tensor(DType::I32, {n}, "MTP positions");
+            out.rope_positions      = tensor(DType::I32, {n, 3}, "MTP RoPE");
+            out.valid_columns       = rows();
+            out.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
+            out.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
+            out.table_rows          = rows();
+            out.base_positions      = rows();
+            out.record_offsets      = rows();
+            const auto begin        = out.ids.region.offset;
+            const auto& last        = out.record_offsets.region;
+            out.ingress             = {begin, last.offset + last.bytes - begin, 256};
             if (visual) out.visual_indices = tensor(DType::I32, {n}, "MTP visual indices");
             return out;
         };
@@ -88,16 +89,18 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
             tensor(DType::BF16, {index_key, dimension(c.text.qsa.compression - 1), batch, 3},
                    "MTP working tails");
         mtp.tail_coordinates = tensor(DType::I32, {3, batch, 3}, "MTP working tail coordinates");
-        mtp.row_indices      = tensor(DType::I32, {batch}, "MTP compact rows");
-        mtp.drafts           = tensor(DType::I32, {width - 1, batch}, "MTP proposals");
-        mtp.extents          = rows();
-        mtp.anchors          = rows();
-        mtp.frontiers        = rows();
-        mtp.last_columns     = rows();
-        mtp.active_columns   = rows();
-        mtp.target_tokens    = tensor(DType::I32, {width, batch}, "MTP target argmax");
-        mtp.token_counts     = tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch},
-                                      "MTP provisional token counts");
+        mtp.tail_key_offsets        = tensor(DType::I64, {batch}, "MTP tail key offsets");
+        mtp.tail_coordinate_offsets = tensor(DType::I64, {batch}, "MTP tail coordinate offsets");
+        mtp.row_indices             = tensor(DType::I32, {batch}, "MTP compact rows");
+        mtp.drafts                  = tensor(DType::I32, {width - 1, batch}, "MTP proposals");
+        mtp.extents                 = rows();
+        mtp.anchors                 = rows();
+        mtp.frontiers               = rows();
+        mtp.last_columns            = rows();
+        mtp.active_columns          = rows();
+        mtp.target_tokens           = tensor(DType::I32, {width, batch}, "MTP target argmax");
+        mtp.token_counts = tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch},
+                                  "MTP provisional token counts");
     }
     if (device_ple)
         out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},

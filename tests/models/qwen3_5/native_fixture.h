@@ -1,5 +1,6 @@
 #pragma once
 
+#include "context_budget.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/session/internal.h"
 #include "runtime/executor/local_executor.h"
@@ -100,35 +101,32 @@ struct ObservedTypes {
     using ExecutionTypes = q35::ExecutionTypes;
 };
 
+struct ContextBudget {
+    std::uint32_t retained_states = 0;
+};
+
 class NativeRankFixture {
 public:
     NativeRankFixture(std::shared_ptr<const q35::ModelDefinition> definition,
                       std::shared_ptr<const q35::ModelShard> model,
                       std::shared_ptr<const q35::execution::ModelProfile> profile,
-                      const EngineOptions& options, std::uint32_t page_groups)
+                      const EngineOptions& options, ContextBudget budget = {})
         : definition(std::move(definition)) {
         auto device   = std::make_unique<DeviceContext>();
         device_       = device.get();
         auto instance = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(
             std::make_unique<SharedModel>(SharedModel{std::move(model)}), profile);
         auto planner = q35::make_sequence_planner(profile, *device, options);
-        auto plan    = std::move(planner).finalize(
-            {page_groups,
-                options.max_concurrency + options.context_cache.extra_state_slots.value_or(0)});
+        const runtime::ContextCapacity capacity{
+            context_capacity_bytes(planner.capacity_plan(), budget.retained_states)};
+        auto plan           = std::move(planner).finalize(capacity);
         session_plan        = q35::plan_session(plan);
         auto native_planner = q35::detail::make_sequence_planner_impl(profile, *device, options);
-        auto native_plan    = q35::detail::finalize_sequence_plan_impl(
-            std::move(native_planner),
-            {page_groups,
-                options.max_concurrency + options.context_cache.extra_state_slots.value_or(0)});
+        auto native_plan =
+            q35::detail::finalize_sequence_plan_impl(std::move(native_planner), capacity);
         instance->program =
             std::make_unique<ObservedRank>(instance->parameters, *native_plan, *device);
-        observed_             = instance->program.get();
-        const auto& resources = observed_->implementation.resources;
-        session_plan.context.pools[0].transfer =
-            resources.decoder.text_kv.pages().transfer_profile();
-        if (const auto* backend = resources.backend_kv())
-            session_plan.context.pools[1].transfer = backend->pages().transfer_profile();
+        observed_   = instance->program.get();
         auto worker = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
                                                                            std::move(instance));
         executor_   = std::make_unique<runtime::LocalExecutor<ObservedTypes>>(

@@ -84,13 +84,12 @@ struct Fixture {
     Fixture(int tokens, int batch, bool padded, bool wide = false)
         : t(tokens), b(batch), stride(t + (padded ? 3 : 0)), tail_stride(padded ? 5 : 2),
           slots(b + 2), ids(stride * b), tail(tail_stride * slots), valid(b), selected(b),
-          d_ids(ids.size() * 4), d_tail(tail.size() * 4), d_valid(b * 4), d_selected(b * 4),
+          d_ids(ids.size() * 4), d_tail(tail.size() * 4), d_valid(b * 4), d_selected(b * 8),
           output(std::size_t(2560) * t * b * 2), input(d_ids.span(), DType::I32, {t, b}),
           counts(d_valid.span(), DType::I32, {b}), result(output.span(), DType::BF16, {2560, t, b}),
-          before{Tensor(d_tail.span(), DType::I32, {2, slots}),
-                 Tensor(d_selected.span(), DType::I32, {b})} {
-        input.nb[1]            = stride * 4;
-        before.token_ids.nb[1] = tail_stride * 4;
+          before{{{d_tail.span(), Tensor(d_selected.span(), DType::I64, {b})},
+                  {{{0, 8, 4}, DType::I32, {2, 1, 1, 1}}, 1, 8}}} {
+        input.nb[1]      = stride * 4;
         hash.multipliers = {0xd6e8feb86659fd93ULL, 0xa5a3564e27f8862bULL, 0x9e3779b97f4a7c15ULL};
         if (wide) {
             hash.multipliers = {UINT64_MAX, 1ULL << 63, 3};
@@ -146,9 +145,17 @@ struct Fixture {
         d_ids.copy_from_host(ids.data(), ids.size() * 4);
         d_tail.copy_from_host(tail.data(), tail.size() * 4);
         d_valid.copy_from_host(valid.data(), valid.size() * 4);
-        d_selected.copy_from_host(selected.data(), selected.size() * 4);
+        const auto offsets = selected_offsets();
+        d_selected.copy_from_host(offsets.data(), offsets.size() * 8);
         CUDA_CHECK(cudaMemset(output.data(), 0xa5, output.bytes()));
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+
+    std::vector<std::int64_t> selected_offsets() const {
+        std::vector<std::int64_t> offsets;
+        for (int index : selected)
+            offsets.push_back(index < 0 ? -1 : std::int64_t(index) * tail_stride * 4);
+        return offsets;
     }
 
     std::uint32_t hash_for(int h, int col, int row) const {
@@ -205,7 +212,8 @@ struct Fixture {
         failures +=
             verify_exact("counts preserved", from_device<int>(d_valid.data(), valid.size()), valid);
         failures += verify_exact("slots preserved",
-                                 from_device<int>(d_selected.data(), selected.size()), selected);
+                                 from_device<std::int64_t>(d_selected.data(), selected.size()),
+                                 selected_offsets());
         for (const auto& shard : table) failures += shard->preserved();
         return failures;
     }

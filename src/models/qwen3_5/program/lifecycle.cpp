@@ -11,12 +11,12 @@ namespace ninfer::models::qwen3_5::detail {
 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const SequencePlanImpl& plan,
                                  DeviceContext& context, const StartupObserver& observer)
-    : parameters(values), device(context), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
+    : parameters(values), device(context), capacity(plan.capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), backend(plan.speculative_backend),
       proposal_head(plan.proposal_head), use_cuda_graph(plan.use_cuda_graph),
-      kv_storage(plan.kv_storage), kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      workspace_plan(plan.workspace), resources(context, plan.persistent, plan.workspace, observer),
+      kv_storage(plan.kv_storage), workspace_plan(plan.workspace),
+      resources(context, plan.persistent, plan.workspace, observer),
       context_counts(plan.causal_scoring ? 0
                                          : std::size_t(values.profile->public_tokens) *
                                                plan.max_concurrency * sizeof(std::int32_t)),
@@ -24,12 +24,10 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
       context_ready(context), prefill_timer(context), gpu_timer(context, plan.gpu_timing) {
     if (parameters.profile != plan.profile || parameters.profile->options != plan.features)
         throw std::invalid_argument("Qwen3.5 rank parameters differ from the prepared plan");
-    std::vector<context::ContextPoolStorage> pools{
-        {0, &resources.decoder.text_kv.pages(), &resources.decoder.text_kv.tables()}};
-    if (auto* cache = resources.backend_kv())
-        pools.push_back({1, &cache->pages(), &cache->tables()});
-    storage = std::make_unique<context::ContextStorage>(resources.state_images.storage(), pools, 0,
-                                                        resources.host_context.span());
+    std::vector<context::ContextTableStorage> tables{{0, &resources.decoder.text_kv.tables()}};
+    if (auto* cache = resources.backend_kv()) tables.push_back({1, &cache->tables()});
+    storage = std::make_unique<context::ContextStorage>(resources.context.span(),
+                                                        resources.host_context.span(), tables);
     compute_actions =
         std::make_unique<context::ContextMigration>(device, *storage, device.execution_view());
     context_actions = std::make_unique<context::ContextMigration>(device, *storage);

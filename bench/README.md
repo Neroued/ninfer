@@ -198,7 +198,7 @@ time. Per-request phase rates remain separate from this aggregate throughput.
 
 The benchmark disables context retention because every repetition is an independent root request.
 Reports record `speculative_backend`, `draft_tokens`, and the proposal head independently;
-JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
+JSON and CSV identify DFlash2 explicitly. KV/State capacity uses the native shared Context policy.
 
 ## Context-cost calibration
 
@@ -206,8 +206,8 @@ JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead
 materialization alternatives. It is an offline tool, not a startup benchmark or runtime autotuner.
 It has two independent suites:
 
-- `transfer` measures one machine-level D2H/H2D/D2D roofline with the production paged-KV transfer
-  primitives and representative PageMajor/HeadMajor geometries. Contiguous D2D batches independently
+- `transfer` measures one machine-level D2H/H2D/D2D roofline with the production packed-record transfer
+  primitives and representative KV record geometries. Contiguous D2D batches independently
   vary bytes and operation count to represent StateImage components and identify device bandwidth.
   It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
 - `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation

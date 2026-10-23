@@ -436,7 +436,6 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     }
 
     DeviceInputs device(aggregate);
-    DeviceBuffer device_state_slots = to_device_i32(state_slots);
     GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
     GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
     states.copy_from_host(initial_states.data(), states.bytes());
@@ -451,13 +450,14 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     Tensor dt_bias(device.dt_bias.span(), DType::FP32, {kStateDim, test_case.heads});
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.heads, slots});
-    SlottedStateFixture history(states_tensor, 3);
-    states_tensor = history.tensor;
-    Tensor state_slots_tensor(device_state_slots.span(), DType::I32, {batch});
+    RecordStateFixture history(states_tensor, 3);
+    const auto state_offsets        = history.record_offsets(state_slots);
+    DeviceBuffer device_state_slots = to_device(state_offsets);
+    Tensor state_slots_tensor(device_state_slots.span(), DType::I64, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
 
     ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
-                                           states_tensor, state_slots_tensor, out_tensor,
+                                           history.view(state_slots_tensor), out_tensor,
                                            ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -490,7 +490,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     }
     const std::string selector_label = label + " state selectors unchanged";
     failures += verify_exact(selector_label.c_str(),
-                             from_device_i32(device_state_slots, state_slots.size()), state_slots);
+                             from_device<std::int64_t>(device_state_slots, state_offsets.size()),
+                             state_offsets);
     failures += states.verify_guards(label + " states");
     failures += out.verify_guards(label + " out");
     failures += verify_inputs_unchanged(label, aggregate, device);
@@ -579,7 +580,7 @@ int batch_contract_rejection_cases() {
                               static_cast<std::size_t>(kStateDim) * kStateDim * heads * 2 *
                                   sizeof(float));
     DeviceBuffer slot_buffer(ninfer::test::cuda_environment().context.device(),
-                             static_cast<std::size_t>(batch_capacity) * sizeof(std::int32_t));
+                             static_cast<std::size_t>(batch_capacity) * sizeof(std::int64_t));
 
     const auto rejects = [&](int tokens, int batch, DType slot_dtype) {
         Tensor q(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
@@ -594,7 +595,8 @@ int batch_contract_rejection_cases() {
         Tensor out(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
         try {
             ops::kimi_delta_attention_batch_update(
-                q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale, states, state_slots, out,
+                q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
+                dense_record_field(states, 3, state_slots), out,
                 ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
@@ -602,11 +604,11 @@ int batch_contract_rejection_cases() {
     };
 
     int failures = 0;
-    if (!rejects(1, 9, DType::I32)) {
+    if (!rejects(1, 9, DType::I64)) {
         std::cerr << "kimi_delta_attention batch update accepted B=9\n";
         ++failures;
     }
-    if (!rejects(2, 2, DType::I32)) {
+    if (!rejects(2, 2, DType::I64)) {
         std::cerr << "kimi_delta_attention batch update accepted W=2\n";
         ++failures;
     }

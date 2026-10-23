@@ -29,6 +29,30 @@ void copy_host_2d_async(MemorySpan destination, std::size_t destination_pitch, C
                         std::size_t source_pitch, std::size_t width, std::size_t rows,
                         CudaExecutionView execution);
 
+// Bounded CUDA copies between Device and pinned Host spans. Adjacent source/destination
+// runs are coalesced. try_append returns false on capacity or an ordering dependency;
+// submit and clear before appending that copy. Backing remains alive until stream retirement.
+class CudaCopyBatch {
+public:
+    CudaCopyBatch(Device device, std::size_t capacity);
+
+    void clear() noexcept { count_ = 0; }
+
+    [[nodiscard]] bool try_append(MemorySpan destination, ConstMemorySpan source);
+    void submit(CudaExecutionView execution) const;
+
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+
+private:
+    Device device_;
+    std::vector<ConstMemorySpan> source_spans_;
+    std::vector<MemorySpan> destination_spans_;
+    std::vector<const void*> sources_;
+    std::vector<void*> destinations_;
+    std::vector<std::size_t> sizes_;
+    std::size_t count_ = 0;
+};
+
 // Preallocated descriptors for independent H2D copies. Destinations do not overlap;
 // source backing and mappings outlive completion. Calls within a batch are unordered.
 class CudaHostCopyBatch {

@@ -20,14 +20,14 @@ struct Nvfp4KvBarriers {
 template <typename Geometry, typename Schedule>
 __device__ __forceinline__ void
 nvfp4_kv_decode_tile(__half* destination, const std::uint8_t* cache,
-                     const std::uint8_t* cache_scale, const std::int32_t* block_table, int kv_head,
+                     const std::uint8_t* cache_scale, const std::int64_t* block_table, int kv_head,
                      int tile_k0, int max_query_abs, int producer_tid) {
-    constexpr int D               = 256;
-    constexpr int Bc              = Schedule::kKeyRows;
-    constexpr int GroupsPerTile   = Bc * kv::kNvfp4Groups;
-    constexpr int ProducerThreads = Schedule::kProducerThreads;
-    const int physical_page       = block_table[tile_k0 >> kv::kPageShift];
-    const int page_offset0        = tile_k0 & kv::kPageMask;
+    constexpr int D                  = 256;
+    constexpr int Bc                 = Schedule::kKeyRows;
+    constexpr int GroupsPerTile      = Bc * kv::kNvfp4Groups;
+    constexpr int ProducerThreads    = Schedule::kProducerThreads;
+    const std::int64_t record_offset = block_table[tile_k0 >> kv::kPageShift];
+    const int page_offset0           = tile_k0 & kv::kPageMask;
 
 #pragma unroll 1
     for (int task = producer_tid; task < GroupsPerTile; task += ProducerThreads) {
@@ -38,10 +38,10 @@ nvfp4_kv_decode_tile(__half* destination, const std::uint8_t* cache,
         __half* target_lo = destination + key_l * D + common::swizzle_xor_64(key_l, d);
         __half* target_hi = destination + key_l * D + common::swizzle_xor_64(key_l, d + 8);
         if (key <= max_query_abs) {
-            const std::int64_t code_offset = kv::Nvfp4G16Layout<Geometry::KVHeads>::code_offset(
-                physical_page, kv_head, d, page_offset0 + key_l);
-            const std::int64_t scale_offset = kv::Nvfp4G16Layout<Geometry::KVHeads>::scale_offset(
-                physical_page, kv_head, group, page_offset0 + key_l);
+            const std::int64_t code_offset =
+                kv::Nvfp4G16Layout::code_offset(record_offset, kv_head, d, page_offset0 + key_l);
+            const std::int64_t scale_offset = kv::Nvfp4G16Layout::scale_offset(
+                record_offset, kv_head, group, page_offset0 + key_l);
             const auto represented =
                 common::nvfp4_dequant_f16x16(cache + code_offset, cache_scale[scale_offset]);
             common::store_vec(target_lo, represented.lo);
@@ -91,7 +91,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
     }
 
     const int base_pos              = positions[0];
-    const std::int32_t* block_table = metadata.block_table();
+    const std::int64_t* block_table = metadata.block_table();
     const int tile_rows             = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + tile_rows - 1;
     const int key_blocks            = max_query_abs / Bc + 1;

@@ -300,9 +300,9 @@ cost::FitResult fit_prefill(const cost::PrefillSuiteResult& samples) {
         kMaximumPrefillP95, kOrderingSignificance);
 }
 
-std::array<ninfer::runtime::ContextTransferCost, 3>
-runtime_transfer_cost(const std::array<cost::FitResult, 3>& fits) {
-    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+std::array<ninfer::runtime::ContextTransferCost, 4>
+runtime_transfer_cost(const std::array<cost::FitResult, 3>& fits,
+                      std::array<ninfer::runtime::ContextTransferCost, 4> result) {
     for (std::size_t index = 0; index < fits.size(); ++index) {
         const auto& values = fits[index].quantized_coefficients;
         if (values.size() != 3) { throw std::logic_error("incomplete transfer roofline fit"); }
@@ -471,8 +471,14 @@ int main(int argc, char** argv) {
                 provenance["suite"]                = "transfer";
                 provenance["transfer_warmup"]      = options.measurement.transfer_warmup;
                 provenance["transfer_repetitions"] = options.measurement.transfer_repetitions;
+                provenance["measured_directions"]  = {"d2h", "h2d", "d2d"};
+                const auto existing                = ninfer::runtime::resolve_context_machine_cost(
+                    {hardware_class, {}}, std::filesystem::exists(options.preset_output)
+                                                             ? options.preset_output
+                                                             : std::filesystem::path{});
                 ninfer::runtime::upsert_context_transfer_cost_atomic(
-                    options.preset_output, hardware_class, runtime_transfer_cost(*transfer_fits),
+                    options.preset_output, hardware_class,
+                    runtime_transfer_cost(*transfer_fits, existing.model.transfer),
                     provenance.dump());
             }
             if (prefill_fit) {

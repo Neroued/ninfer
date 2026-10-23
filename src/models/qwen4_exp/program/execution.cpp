@@ -38,22 +38,27 @@ void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t t
     const auto host = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host_tensor(r).data);
     };
+    const auto offsets = [&](const TensorRegion& r) {
+        return static_cast<std::int64_t*>(host_tensor(r).data);
+    };
     const auto batch = rows.size();
     frame.visible    = 1;
     for (std::size_t b = 0; b < batch; ++b) {
         const auto& row           = rows[b];
         const auto valid          = frame.verify ? frame.verify->extents[b] + 1 : row.ids.size();
         host(io.valid_columns)[b] = valid;
-        host(io.source_slots)[b]  = row.slots.source;
-        host(io.destination_slots)[b] = row.slots.destination;
-        host(io.main_tables)[b]       = row.main_table.index;
-        host(io.base_positions)[b]    = row.main_frontier;
-        host(io.record_offsets)[b]    = 0;
-        host(io.accepted_columns)[b]  = frame.verify ? valid - 1 : valid;
-        host(io.raw_tail)[2 * b]      = row.ple_raw_tail[0];
-        host(io.raw_tail)[2 * b + 1]  = row.ple_raw_tail[1];
-        host(io.row_indices)[b]       = b;
-        host(io.count_slots)[b]       = row.member.residency.lane.value;
+        offsets(io.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
+        offsets(io.destination_offsets)[b] =
+            row.states.at(parameters.profile->local.rank).destination;
+        host(io.main_tables)[b]         = row.main_table.index;
+        host(io.base_positions)[b]      = row.main_frontier;
+        host(io.record_offsets)[b]      = 0;
+        host(io.accepted_columns)[b]    = frame.verify ? valid - 1 : valid;
+        host(io.raw_tail)[2 * b]        = row.ple_raw_tail[0];
+        host(io.raw_tail)[2 * b + 1]    = row.ple_raw_tail[1];
+        offsets(io.raw_tail_offsets)[b] = b * 2 * sizeof(TokenId);
+        host(io.row_indices)[b]         = b;
+        host(io.count_slots)[b]         = row.member.residency.lane.value;
         for (std::uint32_t j = 0; j < tokens; ++j) {
             const auto offset            = std::min<std::size_t>(j, valid - 1);
             host(io.ids)[j + tokens * b] = row.ids[std::min<std::size_t>(j, row.ids.size() - 1)];
@@ -90,8 +95,9 @@ void RankProgramImpl::prepare_forward() {
     f.tokens       = f.rows.front().ids.size();
     f.first_sample = forward && forward->sample == SampleKind::FirstToken;
     if (!f.tokens) {
-        f.sample = resources.states->sample_hidden().slice(1, f.rows.front().slots.source, 1);
-        f.phase  = ComputePhase::Decision;
+        f.sample = resources.states->sample_hidden(
+            f.rows.front().states.at(parameters.profile->local.rank).source);
+        f.phase = ComputePhase::Decision;
         request_decision();
         return;
     }
@@ -129,7 +135,8 @@ void RankProgramImpl::prepare_main() {
             const auto channels = dimension(parameters.profile->config.text.residual_width());
             auto base           = packed_tensor(layout.mtp->base_conditioning, {channels, batch});
             for (int b = 0; b < batch; ++b) {
-                auto old   = resources.states->conditioning().slice(1, f.rows[b].slots.source, 1);
+                auto old = resources.states->conditioning(
+                    f.rows[b].states.at(parameters.profile->local.rank).source);
                 auto saved = base.slice(1, b, 1);
                 copy_bytes_async({saved.data, saved.bytes(), cuda.device()},
                                  {old.data, old.bytes(), cuda.device()}, cuda);
@@ -188,7 +195,9 @@ void RankProgramImpl::prepare_main() {
     if (f.verify)
         update.emplace<execution::VerifyRecords>(*resources.gdn_records);
     else if (f.sequence)
-        update = execution::SequenceSlots{f.rows[0].slots.source, f.rows[0].slots.destination};
+        update = execution::SequenceState{
+            f.rows[0].states.at(parameters.profile->local.rank).source,
+            f.rows[0].states.at(parameters.profile->local.rank).destination};
     f.run = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
     if (graphs && host_ple && !f.sequence) {
         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
@@ -222,16 +231,17 @@ void RankProgramImpl::after_main() {
     if (!f.verify) {
         if (parameters.mtp)
             align_mtp(f.rows, f.tokens, f.previous_conditioning, f.conditioning, f.visual);
-        auto hidden = resources.states->sample_hidden();
         if (f.sequence) {
             const auto last  = f.sample.slice(1, f.tokens - 1, 1);
-            auto destination = hidden.slice(1, f.rows[0].slots.destination, 1);
+            auto destination = resources.states->sample_hidden(
+                f.rows[0].states.at(parameters.profile->local.rank).destination);
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
         } else {
             auto sample = f.sample.view({dimension(parameters.profile->config.text.hidden),
                                          static_cast<std::int32_t>(f.rows.size())});
-            ops::scatter(sample, f.batch.destination_slots, hidden, cuda);
+            ops::scatter(sample, resources.states->sample_hidden(f.batch.destination_offsets),
+                         cuda);
         }
     }
     if (f.timer_started) prefill_timer.record_stop();

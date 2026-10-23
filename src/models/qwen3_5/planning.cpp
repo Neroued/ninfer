@@ -2,12 +2,58 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/common/context/storage.h"
+#include "models/qwen3_5/session/internal.h"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5 {
+namespace {
+
+std::uint32_t directory_count(std::uint64_t count) {
+    if (count > std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("Qwen3.5 Context metadata capacity exceeds uint32");
+    return static_cast<std::uint32_t>(count);
+}
+
+context::ContextDirectorySpec context_spec(const detail::SequencePlanImpl& plan) {
+    context::ContextDirectorySpec result;
+    const auto& resources = plan.persistent;
+    const auto host       = resources.host_context_bytes;
+    result.ranks.push_back({0, plan.context_bytes, host});
+    const auto records  = resources.context_records();
+    const auto geometry = describe_context_pool(records);
+    const auto blocks   = plan.context_bytes / geometry.block_bytes + host / geometry.block_bytes;
+    const auto maximum_records = [&](std::size_t layout) {
+        return blocks * geometry.classes[geometry.spec_classes[layout].index].records_per_block;
+    };
+    const auto& image = resources.state_images.images;
+    result.state.logical_capacity =
+        directory_count(maximum_records(0) + 2ULL * plan.max_concurrency);
+    result.state.layouts.push_back({0, {{0, image.image_bytes, image.alignment}}});
+    const auto histories =
+        directory_count(4ULL * result.state.logical_capacity + 3ULL * plan.max_concurrency + 2);
+    const auto add_pool = [&](std::uint32_t id, const PagedKVCacheLayout& layout) {
+        context::KVDirectorySpec spec;
+        spec.pool_id       = id;
+        spec.logical_pages = directory_count(maximum_records(id + 1));
+        spec.histories     = histories;
+        spec.page_capacity = layout.execution_tables.spec.logical_page_capacity;
+        spec.table_rows    = layout.execution_tables.spec.table_rows;
+        spec.parts.push_back({0, {layout.pages.page_bytes, layout.pages.alignment}});
+        result.pools.push_back(std::move(spec));
+    };
+    add_pool(0, resources.decoder.text_kv);
+    if (resources.decoder.mtp_kv)
+        add_pool(1, *resources.decoder.mtp_kv);
+    else if (resources.dflash && resources.dflash->full)
+        add_pool(1, *resources.dflash->full);
+    result.metadata_budget_bytes = plan.context_metadata_bytes;
+    return result;
+}
+
+} // namespace
 
 SequencePlan::SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -22,8 +68,8 @@ std::uint32_t SequencePlan::capacity() const noexcept {
     return impl_ != nullptr ? impl_->capacity : 0;
 }
 
-std::uint32_t SequencePlan::kv_capacity() const noexcept {
-    return impl_ != nullptr ? impl_->kv_capacity : 0;
+std::size_t SequencePlan::context_capacity_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->context_bytes : 0;
 }
 
 std::uint32_t SequencePlan::max_concurrency() const noexcept {
@@ -51,9 +97,9 @@ SequencePlanner& SequencePlanner::operator=(SequencePlanner&&) noexcept = defaul
 
 SequencePlanner::~SequencePlanner() = default;
 
-const runtime::ContextCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
-    static const runtime::ContextCapacityCurve empty;
-    return impl_ != nullptr ? impl_->curve : empty;
+const runtime::ContextCapacityPlan& SequencePlanner::capacity_plan() const noexcept {
+    static const runtime::ContextCapacityPlan empty;
+    return impl_ != nullptr ? impl_->capacity_plan : empty;
 }
 
 SequencePlan SequencePlanner::finalize(runtime::ContextCapacity capacity) && {
@@ -69,18 +115,26 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
 SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
                                       DeviceContext& device, const EngineOptions& options,
                                       std::shared_ptr<const moe::Plan> moe) {
-    return SequencePlanner(
-        detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe)));
+    auto impl =
+        detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe));
+    auto spec                    = context_spec(*impl->minimum);
+    impl->capacity_plan.metadata = context::ContextDirectory::metadata_plan(spec);
+    auto& metadata               = impl->capacity_plan.metadata;
+    metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(4ULL * spec.state.logical_capacity +
+                                                                2ULL * options.max_concurrency);
+    const auto geometry    = describe_context_pool(impl->capacity_plan.records);
+    const auto state_class = geometry.spec_classes.front().index;
+    metadata.bytes_per_record[state_class] += 4 * sizeof(detail::Checkpoints::Slot);
+    for (const auto& pool : spec.pools)
+        metadata.bytes_per_record[state_class] +=
+            4 * (context::HistoryDirectory::metadata_bytes(1, 0, 0) -
+                 sizeof(context::HistoryDirectory));
+    return SequencePlanner(std::move(impl));
 }
 
 SessionPlan plan_session(const SequencePlan& sequence) {
     if (!sequence.impl_) throw std::invalid_argument("sequence plan is empty");
     const auto& source = *sequence.impl_;
-    const auto checked = [](std::uint64_t n) {
-        if (n > std::numeric_limits<std::uint32_t>::max())
-            throw std::overflow_error("context directory capacity exceeds uint32");
-        return static_cast<std::uint32_t>(n);
-    };
     SessionPlan out;
     out.profile             = source.profile;
     out.capacity            = source.capacity;
@@ -99,36 +153,12 @@ SessionPlan plan_session(const SequencePlan& sequence) {
         out.dflash_local_group    = image.dflash_local->group;
         out.dflash_local_transfer = TransferWork{image.dflash_local->group.bytes, 1};
     }
-    const auto host           = source.context_cache.host_capacity_bytes.value_or(0);
-    const auto logical_states = checked(image.images.slot_count + host / image.images.image_stride);
-    out.context.state = {logical_states, static_cast<std::uint32_t>(image.images.slot_count),
-                         image.images.image_stride};
-    std::size_t minimum_stride    = image.images.image_stride;
-    std::size_t minimum_kv_stride = std::numeric_limits<std::size_t>::max();
-    const auto histories = checked(4ULL * logical_states + 3ULL * source.max_concurrency + 2);
-    const auto add_pool  = [&](runtime::KvPoolId id, std::string_view label,
-                              const PagedKVCacheLayout& layout) {
-        const auto host_layout = plan_host_kv_page_layout(layout.pages.spec.geometry);
-        const auto stride      = host_layout.page_stride;
-        minimum_stride         = std::min(minimum_stride, stride);
-        minimum_kv_stride      = std::min(minimum_kv_stride, stride);
-        context::KVDirectorySpec spec;
-        spec.pool_id       = id.index;
-        spec.device_pages  = layout.pages.spec.page_group_count;
-        spec.logical_pages = checked(spec.device_pages + host / stride);
-        spec.histories     = histories;
-        spec.page_capacity = layout.execution_tables.spec.logical_page_capacity;
-        spec.table_rows    = layout.execution_tables.spec.table_rows;
-        spec.geometry      = layout.pages.spec.geometry;
-        out.kv_pools.push_back({id, label, nullptr, spec.device_pages, stride});
-        out.context.pools.push_back(std::move(spec));
-    };
-    add_pool(kTextKvPool, "text", source.persistent.decoder.text_kv);
+    out.context = context_spec(source);
+    out.kv_pools.push_back({kTextKvPool, "text"});
     if (source.persistent.decoder.mtp_kv)
-        add_pool(kBackendKvPool, "mtp", *source.persistent.decoder.mtp_kv);
+        out.kv_pools.push_back({kBackendKvPool, "mtp"});
     else if (source.persistent.dflash && source.persistent.dflash->full)
-        add_pool(kBackendKvPool, "draft_full", *source.persistent.dflash->full);
-    out.context.host = {0, host, minimum_stride, checked(host / minimum_kv_stride)};
+        out.kv_pools.push_back({kBackendKvPool, "draft_full"});
     return out;
 }
 

@@ -9,6 +9,7 @@ enum class WeightPlacement { Resident, HostExperts };
 struct WeightCandidate {
     WeightPlacement placement;
     std::size_t device_bytes;
+    std::size_t host_bytes;
 };
 
 template <class SequencePlan, class Preparation>

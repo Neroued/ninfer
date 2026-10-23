@@ -24,8 +24,17 @@ struct Plan;
 
 namespace ninfer::models::qwen3_5 {
 
-using ContextResources    = runtime::ContextResources<2>;
-using ResourceReservation = runtime::ResourceReservation<ContextResources>;
+using ContextDemand     = context::ContextDemand;
+using ContextAssessment = context::ContextAssessment;
+using ContextReleaseSet = context::ContextReleaseSet;
+
+struct ResourceReservation {
+    bool reserved = false;
+    ContextAssessment assessment;
+
+    explicit operator bool() const noexcept { return reserved; }
+};
+
 inline constexpr runtime::KvPoolId kTextKvPool{0};
 inline constexpr runtime::KvPoolId kBackendKvPool{1};
 inline constexpr std::uint32_t kPrefillChunkAlignment     = 128;
@@ -77,7 +86,7 @@ public:
     SequencePlan& operator=(const SequencePlan&) = delete;
 
     [[nodiscard]] std::uint32_t capacity() const noexcept;
-    [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
+    [[nodiscard]] std::size_t context_capacity_bytes() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
@@ -104,7 +113,7 @@ public:
     SequencePlanner(const SequencePlanner&)            = delete;
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
-    [[nodiscard]] const runtime::ContextCapacityCurve& capacity_curve() const noexcept;
+    [[nodiscard]] const runtime::ContextCapacityPlan& capacity_plan() const noexcept;
     [[nodiscard]] SequencePlan finalize(runtime::ContextCapacity capacity) &&;
 
 private:

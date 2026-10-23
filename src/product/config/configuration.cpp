@@ -126,11 +126,11 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::KvDtype:
             value = std::string(kv_name(e.kv_cache));
             break;
-        case Field::KvCapacity:
-            if (e.kv_capacity.mode == KvCapacityMode::Automatic)
+        case Field::ContextCapacity:
+            if (e.context_capacity.mode == ContextCapacityMode::Automatic)
                 value = std::string("auto");
             else
-                value = std::uint64_t{e.kv_capacity.explicit_tokens};
+                value = std::uint64_t{e.context_capacity.explicit_bytes};
             break;
         case Field::PrefillChunk:
             if (e.prefill_chunk == 0)
@@ -155,9 +155,6 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             break;
         case Field::PrefixReuse:
             value = e.context_cache.enabled;
-            break;
-        case Field::ExtraStateSlots:
-            value = optional_value(e.context_cache.extra_state_slots, "auto");
             break;
         case Field::CheckpointInterval:
             value = std::uint64_t{e.context_cache.checkpoint_interval};

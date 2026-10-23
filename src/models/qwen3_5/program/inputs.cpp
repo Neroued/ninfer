@@ -16,8 +16,8 @@ void bind_row(FrameIngress& input, std::size_t index, const ExecutionRow& row) {
     input.main_table_rows[index]   = static_cast<std::int32_t>(row.main_table.index);
     input.backend_table_rows[index] =
         row.backend_table ? static_cast<std::int32_t>(row.backend_table->index) : 0;
-    input.state_source_slots[index]      = row.state_slots.source;
-    input.state_destination_slots[index] = row.state_slots.destination;
+    input.state_source_offsets[index]      = row.state_offsets.source;
+    input.state_destination_offsets[index] = row.state_offsets.destination;
     input.residency_slots[index] = static_cast<std::int32_t>(row.member.residency.lane.value);
     input.rope_deltas[index]     = row.rope_delta;
 }
@@ -92,8 +92,8 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
     auto& row      = operation.rows[index];
     row            = work.rows[index];
     if (offset) {
-        row.source_state       = row.destination_state;
-        row.state_slots.source = row.state_slots.destination;
+        row.source_state         = row.destination_state;
+        row.state_offsets.source = row.state_offsets.destination;
         row.main_frontier += offset;
         row.backend_frontier = backend == SpeculativeBackend::Mtp ? row.main_frontier - 1
                                : resources.dflash                 ? row.main_frontier

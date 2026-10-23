@@ -18,51 +18,58 @@ PrepareColumns<T> prepare_columns(const Tensor& t) {
 }
 
 template <class T>
-PreparePage<T> prepare_page(const Tensor& t) {
-    return {static_cast<T*>(t.data), t.nb[1] / std::int64_t(sizeof(T)),
-            t.nb[2] / std::int64_t(sizeof(T)), t.nb[3] / std::int64_t(sizeof(T))};
+PreparePage<T> prepare_page(const PagedPlaneView& t) {
+    return {static_cast<T*>(t.data()), std::int64_t(t.row_stride_bytes() / sizeof(T)),
+            std::int64_t(t.head_stride_bytes() / sizeof(T))};
+}
+
+template <class T>
+PrepareState<T> prepare_state(const ConstStateFieldView& view) {
+    return {common::operand::state_field_base<const T>(view),
+            static_cast<const std::int64_t*>(view.records.byte_offsets.data),
+            view.field.tensor.shape[0]};
 }
 
 PrepareArguments prepare_arguments(const QsaKvProjectionView& p,
                                    const QsaKvPrepareParameters& params, const QsaBatchView& batch,
-                                   const Tensor& rope, const QsaTailStateView& before,
+                                   const Tensor& rope, const ConstQsaTailStateView& before,
                                    QsaCacheView cache, QsaRawRecordWriteView records) {
     const auto bf  = [](const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); };
     const auto i32 = [](const Tensor& t) { return static_cast<const std::int32_t*>(t.data); };
-    PrepareArguments a{nullptr,
-                       bf(p.key),
-                       bf(p.value),
-                       nullptr,
-                       bf(p.index_key),
-                       nullptr,
-                       bf(params.key_norm),
-                       nullptr,
-                       bf(params.index_key_norm),
-                       nullptr,
-                       nullptr,
-                       i32(batch.positions),
-                       i32(rope),
-                       i32(batch.valid_columns),
-                       i32(batch.table_rows),
-                       i32(before.slots),
-                       i32(records.offsets),
-                       i32(cache.main.block_tables),
-                       cache.main.block_tables.nb[1] / 4,
-                       prepare_columns<const __nv_bfloat16>(before.raw_keys),
-                       prepare_columns<const std::int32_t>(before.first_rope),
-                       prepare_columns<__nv_bfloat16>(records.raw_keys),
-                       prepare_columns<std::int32_t>(records.rope_positions),
-                       prepare_page<__nv_bfloat16>(cache.index.keys),
-                       prepare_page<std::uint8_t>(cache.main.k_pages),
-                       prepare_page<std::uint8_t>(cache.main.v_pages),
-                       prepare_page<std::uint8_t>(cache.main.k_scale_pages),
-                       prepare_page<std::uint8_t>(cache.main.v_scale_pages),
-                       p.key.ne[2],
-                       p.key.ne[3],
-                       rope.ne[1],
-                       p.key.ne[1],
-                       params.rms_epsilon,
-                       {}};
+    PrepareArguments a{
+        nullptr,
+        bf(p.key),
+        bf(p.value),
+        nullptr,
+        bf(p.index_key),
+        nullptr,
+        bf(params.key_norm),
+        nullptr,
+        bf(params.index_key_norm),
+        nullptr,
+        nullptr,
+        i32(batch.positions),
+        i32(rope),
+        i32(batch.valid_columns),
+        i32(batch.table_rows),
+        i32(records.offsets),
+        static_cast<const std::int64_t*>(cache.main.k_pages.records.page_offsets.data),
+        cache.main.k_pages.records.page_offsets.nb[1] / 8,
+        prepare_state<__nv_bfloat16>(before.raw_keys),
+        prepare_state<std::int32_t>(before.first_rope),
+        prepare_columns<__nv_bfloat16>(records.raw_keys),
+        prepare_columns<std::int32_t>(records.rope_positions),
+        prepare_page<__nv_bfloat16>(cache.index.keys),
+        prepare_page<std::uint8_t>(cache.main.k_pages),
+        prepare_page<std::uint8_t>(cache.main.v_pages),
+        prepare_page<std::uint8_t>(cache.main.k_scale_pages),
+        prepare_page<std::uint8_t>(cache.main.v_scale_pages),
+        p.key.ne[2],
+        p.key.ne[3],
+        rope.ne[1],
+        p.key.ne[1],
+        params.rms_epsilon,
+        {}};
     // Default model frequencies are constructed once on Host, with no Device allocation.
     static const auto default_frequency = [] {
         std::array<double, 32> result{};
@@ -161,7 +168,7 @@ void launch(const PrepareArguments& args, PreparePlan plan, KvCacheStorage stora
 
 void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
-                    const QsaTailStateView& before, QsaCacheView cache,
+                    const ConstQsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                     CudaExecutionView execution) {
     auto args   = prepare_arguments({projected.key, projected.value, projected.index_key},
@@ -178,7 +185,7 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
 
 void launch_prepare_kv(const QsaKvProjectionView& projected,
                        const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
-                       const Tensor& rope_positions, const QsaTailStateView& before,
+                       const Tensor& rope_positions, const ConstQsaTailStateView& before,
                        QsaCacheView cache, QsaRawRecordWriteView records,
                        CudaExecutionView execution) {
     const auto args =

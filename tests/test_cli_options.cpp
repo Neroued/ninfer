@@ -62,19 +62,19 @@ struct Files {
 void test_arguments() {
     const auto defaults = parse({"ninfer", "--prompt", "hello", "model.ninfer"});
     const auto& engine  = defaults.launch.engine;
-    require(engine.max_context == 8192 && engine.kv_capacity.explicit_tokens == 8192,
+    require(engine.max_context == 8192 &&
+                engine.context_capacity.mode == ninfer::ContextCapacityMode::Automatic,
             "shared context defaults differ");
-    require(!engine.context_cache.enabled && engine.context_cache.extra_state_slots == 0 &&
-                engine.context_cache.host_capacity_bytes == 0,
+    require(!engine.context_cache.enabled && engine.context_cache.host_capacity_bytes == 0,
             "CLI cache defaults differ");
     require(defaults.launch.generation.max_tokens == 128 &&
                 defaults.launch.generation.sampling.seed == 0,
             "CLI generation defaults differ");
     const auto resources =
         parse({"ninfer", "model.ninfer", "--prompt", "hello", "--max-concurrency", "4",
-               "--extra-state-slots", "2", "--host-cache-capacity", "64MiB", "--prefix-reuse",
+               "--context-capacity", "2GiB", "--host-cache-capacity", "64MiB", "--prefix-reuse",
                "--preserve-thinking", "--cuda-graph=false"});
-    require(resources.launch.engine.context_cache.extra_state_slots == 2 &&
+    require(resources.launch.engine.context_capacity.explicit_bytes == (2ULL << 30) &&
                 resources.launch.engine.context_cache.host_capacity_bytes == (64ULL << 20) &&
                 resources.launch.engine.context_cache.enabled &&
                 !resources.launch.engine.use_cuda_graph &&
@@ -127,11 +127,10 @@ path = "weights/model.ninfer"
 vision = true
 [engine]
 max_context = 16384
-kv_capacity = "context"
+context_capacity = "1.5GiB"
 prefill_chunk = 4096
 cuda_graph = true
 [context_cache]
-extra_state_slots = 3
 host_capacity = "0.0625MiB"
 [speculative]
 backend = "mtp"
@@ -154,7 +153,7 @@ regex = "file"
     const auto base = parse({"ninfer", "--config", path.string()});
     require(base.launch.engine.artifact_path == files.root / "weights/model.ninfer",
             "file-relative model path changed");
-    require(base.launch.engine.kv_capacity.explicit_tokens == 16384 &&
+    require(base.launch.engine.context_capacity.explicit_bytes == (1536ULL << 20) &&
                 base.launch.engine.context_cache.host_capacity_bytes == 65536,
             "file values or exact capacity conversion failed");
     require(base.launch.generation.sampling.seed == UINT64_MAX,
@@ -173,8 +172,8 @@ regex = "file"
                                  "--seed",
                                  "default",
                                  "--no-thinking",
-                                 "--extra-state-slots",
-                                 "default",
+                                 "--context-capacity",
+                                 "auto",
                                  "--host-cache-capacity",
                                  "default",
                                  "--choice",
@@ -182,7 +181,9 @@ regex = "file"
                                  "--clear-stops",
                                  "--reasoning-stop",
                                  "FIN"});
-    require(replaced.launch.engine.kv_capacity.explicit_tokens == 32768 &&
+    require(replaced.launch.engine.max_context == 32768 &&
+                replaced.launch.engine.context_capacity.mode ==
+                    ninfer::ContextCapacityMode::Automatic &&
                 !replaced.launch.engine.enable_vision,
             "command-line overrides were applied before the file");
     require(replaced.prompt.empty() && replaced.messages_path == fs::absolute("local.json"),
@@ -193,7 +194,6 @@ regex = "file"
             "disabled backend retained dependent settings");
     require(!replaced.launch.generation.sampling.temperature &&
                 replaced.launch.generation.sampling.seed == 0 &&
-                replaced.launch.engine.context_cache.extra_state_slots == 0 &&
                 replaced.launch.engine.context_cache.host_capacity_bytes == 0,
             "explicit reset inherited lower-priority values");
     require(replaced.launch.generation.enable_thinking == false && !replaced.reasoning_effort,
@@ -223,7 +223,7 @@ void test_file_errors_and_example(const Files& files) {
          {"[unknown]\n", "[engine]\ndevice = '0'\n", "[engine]\nmax_context = 1.5\n",
           "[model]\nvision = 'false'\n", "[engine]\ndevice = -1\n",
           "[generation.sampling]\ntemperature = inf\n", "[engine]\ndevice = 0\ndevice = 1\n",
-          "[engine]\nkv_capacity = 1\n", "[speculative]\nbackend = 'mtp'\n"}) {
+          "[engine]\ncontext_capacity = 0\n", "[speculative]\nbackend = 'mtp'\n"}) {
         const auto path =
             files.write(std::string("model.path = 'model.ninfer'\ncli.prompt = 'x'\n") + extra);
         const auto message = rejection([&] { parse({"ninfer", "--config", path.string()}); });
@@ -241,11 +241,10 @@ void test_file_errors_and_example(const Files& files) {
     require(cli.launch.engine.artifact_path ==
                 fs::path(NINFER_SOURCE_DIR) / "out/qwen3_8_flash_next.ninfer",
             "root example path is not relative to its file");
-    require(cli.launch.generation.max_tokens == 128 &&
-                server.launch.generation.max_tokens == 8192 &&
-                cli.launch.engine.context_cache.extra_state_slots == 0 &&
-                !server.launch.engine.context_cache.extra_state_slots,
-            "shared example did not select entry-specific defaults");
+    require(
+        cli.launch.generation.max_tokens == 128 && server.launch.generation.max_tokens == 8192 &&
+            !cli.launch.engine.context_cache.enabled && server.launch.engine.context_cache.enabled,
+        "shared example did not select entry-specific defaults");
 }
 
 void test_deployment(const Files& files) {

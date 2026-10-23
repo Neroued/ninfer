@@ -26,6 +26,7 @@ add_library(ninfer_core SHARED
   io/read_queue.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
+  context_pool.cpp
   paged_kv_cache.cpp
   paged_kv_geometry.cpp
   linear_attention_state.cpp

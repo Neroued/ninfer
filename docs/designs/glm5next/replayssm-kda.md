@@ -55,10 +55,10 @@ Op 的状态写入是物理效果；完整模型状态的采用由 Session 在�
 
 | 字段 | 单层 native Tensor | 含义 |
 |---|---|---|
-| recurrent | FP32 `[128,128,Hv,Slots]` | 逻辑 `S[value,key]`，key 轴连续 |
-| conv | BF16 `[C,3,Slots]` | 最近三列卷积前投影，最旧到最新，channels 为 `[Q;K;V]` |
+| recurrent | FP32 `[128,128,Hv]` field | 逻辑 `S[value,key]`，key 轴连续 |
+| conv | BF16 `[C,3]` field | 最近三列卷积前投影，最旧到最新，channels 为 `[Q;K;V]` |
 
-每个 slot 的内层数据连续；slot stride 由 Tensor 给出。All-layer view 的 conv 和
+每条 State record 的字段内连续；字段与层偏移由 StateFieldLayout 给出。All-layer view 的 conv 和
 recurrent layer strides 独立，按现有 StateImage field 布局读取。
 初始 image 的这两个字段置零，初始化和存储寿命由现有 context/state 机制负责。
 
@@ -109,10 +109,12 @@ words；fold 从 log_decay 重新计算 alpha 的 exp，使用与 update/record 
 - n[b]：本次有效前缀长度，`1<=n[b]<=T`；空 `valid_columns` 表示各行均为 T。
 - m[b]：最终采用的输入列数，`0<=m[b]<=n[b]`。
 
-第零维连续，token/batch 展平为 `column=t+T*b`。Record row、StateImage slot 和
+第零维连续，token/batch 展平为 `column=t+T*b`。Record row、State record 和
 request 身份分别表达；一轮 record 到 fold 完成期间，physical row 顺序保持不变。
 实际 T/B 是本轮产生 records 时的形状，不能把 backing 直接重解释成更短的窗口。
-所有 state selectors 使用对应池的绝对 slot，值在 `[0,Slots)`；B 与 Slots 无须相等。
+持久 state 通过 StateFieldView/ConstStateFieldView 的 Device I64 `[B]` byte offsets 选择，
+相对于本 rank 的 Context backing。字段布局不含容量轴，临时 record rows 仍保持 I32 索引语义。
+存储与借用合同见 [Context 存储](../../maintainer/paged-kv-cache.md)。
 
 ### 3.2 五个 planes
 
@@ -177,7 +179,7 @@ struct KdaReplayRecords {
 Planner 使用 `LayoutBuilder` 计算五个 TensorRegion，检查物理形状、字节数与 extent
 溢出；不申请内存。`payload_bytes()` 是五个 plane 的有效载荷之和，包含 alignment
 的 frame 容量使用 builder 的最终结果。绑定对象借用 backing，不保存有效长度、
-source slot、frontier 或采用策略。计算支持域由消费这些 views 的 Op 验证。
+source offset、frontier 或采用策略。计算支持域由消费这些 views 的 Op 验证。
 
 ## 4. 输入 projection/conv
 
@@ -212,14 +214,12 @@ struct KdaConvOutputs {
 };
 
 struct KdaConvSourceState {
-    Tensor history;      // Read-only BF16 [C,3,Slots].
-    Tensor source_slots; // Device I32 [B].
+    ConstStateFieldView history; // Read-only BF16 [C,3], with Device I64 record offsets.
 };
 
 struct KdaConvUpdateState {
-    Tensor history;           // BF16 [C,3,Slots], source and destination pool.
-    Tensor source_slots;      // Device I32 [B].
-    Tensor destination_slots; // Device I32 [B].
+    ConstStateFieldView source; // BF16 [C,3].
+    StateFieldView destination; // BF16 [C,3], with independently selected record offsets.
 };
 
 void kda_input_proj_conv_update(
@@ -263,14 +263,14 @@ words 按同一计算实现保持逐 bit 一致。
 Update 的 source/destination selectors 可为相同 Tensor，单行允许原位更新。
 各行 destinations 互异，不能覆盖其他行的 source。实现须在覆盖原位 history 前
 完成所有依赖旧三列的读取；长窗口并行计算也遵循此规则。
-不同只读 rows 可以使用同一 source。Record 不写任何 state slot。
+不同只读 rows 可以使用同一 source。Record 不写任何 state record。
 
 x 的全部物理列需可读且为有效有限输入，投影可以计算 padding 列；只有 n[b] 的
 前缀参加卷积/history 语义。两个入口都不对外暴露每个位置的完整 history snapshots。
 
 ### 4.3 存储与容量
 
-History slot 内 `[C,3]` 连续，slot stride 显式；slot 起点至少 16 B 对齐。
+History 字段内 `[C,3]` 连续，记录偏移由 I64 metadata 给出；字段起点至少 16 B 对齐。
 x、Q/K/V、conv_record、conv weight 连续且至少 16 B 对齐，selectors 至少 4 B 对齐。
 QKV 使用原生 Q8 codes/scales 对齐要求。History 的实际数据块与所有非 state
 operands 和当前 scratch disjoint。输出和 records 彼此 disjoint，与输入、权重、
@@ -321,14 +321,14 @@ void kimi_delta_attention_batch_update(
     const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& g, const Tensor& beta,
     const Tensor& A_log, const Tensor& dt_bias,
-    float lower_bound, float scale, Tensor& ssm_states,
-    const Tensor& source_state_slots, const Tensor& destination_state_slots,
+    float lower_bound, float scale, ConstStateFieldView source,
+    StateFieldView destination,
     Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops
 ```
 
-T=1、B=1..8；selectors 为 Device I32 `[B]`。每行从 source 做一次 recurrent 更新，
+T=1、B=1..8；source/destination views 的 record offsets 为 Device I64 `[B]`。每行从 source 做一次 recurrent 更新，
 写 destination 和 out。允许原位，各行 destinations 互异且不能覆盖其他行 source；
 只读 source 可以重复。只写 recurrent 字段，conv 由输入准备负责。该入口无全局
 workspace。实施时替换旧单 selector 签名及其 callers。
@@ -350,16 +350,16 @@ void kimi_delta_attention_replay_record(
     const Tensor& g, const Tensor& beta,
     const Tensor& A_log, const Tensor& dt_bias,
     float lower_bound, float scale,
-    const Tensor& ssm_states, const Tensor& valid_columns,
-    const Tensor& initial_state_slots, KdaRecurrenceRecords records,
+    ConstStateFieldView initial_state, const Tensor& valid_columns,
+    KdaRecurrenceRecords records,
     Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops
 ```
 
-B=1..8、T 为正；`initial_state_slots` 和非空 `valid_columns` 为 Device I32 `[B]`。
+B=1..8、T 为正；initial_state 的 offsets 为 Device I64 `[B]`，非空 valid_columns 为 I32 `[B]`。
 每行从指定只读 source state 开始，按 n[b] 个有效 inputs 产生 outputs 和四个
-transition record planes。它不写任何 state slot，不保存完整 recurrent trajectory。
+transition record planes。它不写任何 state record，不保存完整 recurrent trajectory。
 有效 records 完整写入，无效后缀不变；out 的无效后缀为 BF16 +0。
 
 Key/value records 保留实际输入 words；log_decay/beta records 保留内部实际 gate
@@ -374,14 +374,14 @@ words。每个元素由唯一写者发布，state tiles 不竞争重复写同一
 
 ### 5.4 共同存储要求
 
-Pooled state 每 slot 的 `[128,128,Hv]` 连续，slot stride 显式，起点至少 16 B 对齐。
-Q/K/V/g/out 连续且至少 16 B 对齐；beta、A_log、dt_bias 和 I32 selectors 自然对齐。
+State record 内的 `[128,128,Hv]` 字段连续，字段偏移显式，起点至少 16 B 对齐。
+Q/K/V/g/out 连续且至少 16 B 对齐；beta、A_log、dt_bias 自然对齐，record offsets 至少 8 B 对齐。
 Record vectors 至少 16 B 对齐，beta record 至少 4 B 对齐；Core planner 提供更强的
 256 B plane 对齐。
 
 除声明的 state 原位和 K/V record 同 view 外，写入范围与所有其他 operands disjoint。
 只读 operands 可在数学与形状允许时共享 backing。Operands、metadata、workspace
-均属于 execution device。Device slot/length 的合法值由调用者保证，Op 检查公开
+均属于 execution device。Device offset/length 的合法值由调用者保证，Op 检查公开
 metadata 和地址域；不为验证 device 值增加 Host readback。
 
 ## 6. Prepared all-layer fold
@@ -392,8 +392,8 @@ metadata 和地址域；不为验证 device 值增加 Host readback。
 namespace ninfer::ops {
 
 struct KdaReplayFoldRow {
-    std::int32_t source_state_slot;
-    std::int32_t destination_state_slot;
+    std::int64_t source_offset;
+    std::int64_t destination_offset;
     std::int32_t commit_columns;
 };
 
@@ -405,7 +405,7 @@ public:
     void execute(std::span<const KdaReplayFoldRow> rows,
                  CudaExecutionView execution) const;
 
-    void execute(const Tensor& source_slots, const Tensor& destination_slots,
+    void execute(const Tensor& source_offsets, const Tensor& destination_offsets,
                  const Tensor& commit_columns, CudaExecutionView execution) const;
 };
 
@@ -417,12 +417,12 @@ public:
 channels/width 与 records 对应；conv_width=3、Dk=Dv=128。
 
 `rows[b]` 对应 physical record row b，Host rows.size() 或 Device metadata 长度为
-B，`1<=B<=R`。Selectors 是绝对 slots，m 在 `[0,T]`；调用者保证 `m[b]<=n[b]`，
+B，`1<=B<=R`。Selectors 是 arena-relative byte offsets，m 在 `[0,T]`；调用者保证 `m[b]<=n[b]`，
 且 source 内容仍是产生该行 records 的原始版本。
 
-All-layer state 的字段、层和 slot 起点遵循 Core 的 256 B 对齐。Device metadata
-是连续、至少 4 B 对齐的 I32 `[B]`，与 state/records disjoint，三个只读 metadata
-之间可以共享 backing。Host 形式检查行数、slot 值、m 和行间写入关系；Device
+All-layer state 的字段、层和记录起点遵循 Core 的 256 B 对齐。Device offsets 为连续、至少
+8 B 对齐的 I64 `[B]`，commit_columns 为至少 4 B 对齐的 I32 `[B]`；metadata 与所选字段及
+records disjoint。Host 形式检查行数、offset、m 和行间写入关系；Device
 形式检查 Tensor metadata/地址域，值与行间关系由调用者保证，不做 Host readback。
 
 ### 6.1 正提交与零提交
@@ -490,14 +490,14 @@ Verify 的 source image 保持只读，frame 保存 physical row 到 source imag
 Graph 使用规则：
 
 - 输入准备和 record 读取当前 Device selectors/valid lengths；固定地址下可更新内容。
-- Device fold 的三个 I32 `[B]` metadata 每次 replay 读取当前值。全零 m 在 kernel
+- Device fold 的两个 I64 offsets 与一个 I32 commit metadata 每次 replay 读取当前值。全零 m 在 kernel
   内跳过，不通过 Host 读取值决定是否放入 Graph。
 - Host fold 将 row descriptors 按值提交；capture 后改变 Host vector 不改变图中值。
   全零 Host rows 可直接返回。需要每轮改变 descriptors 的图使用 Device 形式。
 - Plan、records 和 state backing 在引用它们的提交及 Graph 生命周期内保持有效。
   T、R、几何和布局固定于相应执行 variant；同一 backing 上的下一轮写入等待旧消费者。
 
-TP2 每 rank 独立处理本地 32 heads 和 34 层，source/destination slot 编号可以不同，
+TP2 每 rank 独立处理本地 32 heads 和 34 层，source/destination record offsets 可以不同，
 逻辑 batch 和采用长度一致。模型负责完整输出的归约和状态采用。GLM 的 MTP 层是
 MLA，不增加 MTP KDA records；这套 ReplaySSM 服务 Main 的 speculative verify。
 
@@ -534,7 +534,7 @@ callers、tests/bench 随相应接口一起更新。
 2. Records 的实际 words、同物理 T/B 的 update/record 一致性；K/V 同 view 与独立
    backing 两种合法形式；固定 R 下 B<R 的跨层寻址。
 3. Fold 与逐步 recurrent state/output 的精确关系，覆盖 m=0/1/2/3/完整前缀、混合
-   接受长度、非连续 slots、原位和独立目的、显式 state strides。
+   接受长度、非连续 record offsets、原位和独立目的、显式 state strides。
 4. 固定地址的 Graph 重放改变 inputs、selectors、valid lengths 和 Device commit
    lengths，检查未使用 record 后缀及非目标 state 字段保持不变。
 

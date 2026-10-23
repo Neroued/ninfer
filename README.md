@@ -75,10 +75,9 @@ Start a long-running text/agent server with two execution lanes and prefix cachi
 ```bash
 ./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 240000 \
-  --kv-capacity 240000 \
+  --context-capacity auto \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
   --proposal-head optimized \
   --preserve-thinking
@@ -223,10 +222,9 @@ docker run --rm \
   ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
   --host 0.0.0.0 \
   --max-context 240000 \
-  --kv-capacity 240000 \
+  --context-capacity auto \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
   --proposal-head optimized \
   --preserve-thinking
@@ -265,16 +263,16 @@ The product boundary remains intentionally small:
 - one RTX 5090 and one resident model per Engine;
 - one to eight resident execution lanes with bounded FIFO ingress;
 - resource-pressure preemption with snapshot or token-replay recovery;
-- no priority/QoS, multi-GPU, or distributed serving;
-- startup-fixed typed KV pools shared by active requests and retained prefixes;
+- centralized scheduling; local or supported model-parallel rank execution;
+- startup-fixed Context backing shared by growing KV and request state;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;
 - the in-tree C++ headers are not distributed as an installed SDK.
 
-`--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
-used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
-startup from the memory remaining after weights. Both explicit and automatic modes use 1 GiB of
-startup planning headroom. Explicit capacities remain fixed for the process lifetime.
+`--max-context` limits each sequence. `--context-capacity SIZE|auto` sizes each rank's shared
+Device Context backing for KV and State. The default `auto` uses the startup memory budget after
+weights, workspace, Graph and other required resources, with 1 GiB planning headroom. The backing
+stays fixed while records are allocated, retained, reclaimed or moved within it.
 
 ## Documentation
 

@@ -52,7 +52,7 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                 dimension(target.hidden_size * std::uint64_t(config.target_layer_ids.size())) ||
             features.ne[3] != 1 || positions.dtype != DType::I32 || positions.ne[0] != width ||
             positions.ne[1] != batch || commit_counts.dtype != DType::I32 ||
-            commit_counts.ne[0] != batch || lanes.dtype != DType::I32 || lanes.ne[0] != batch ||
+            commit_counts.ne[0] != batch || lanes.dtype != DType::I64 || lanes.ne[0] != batch ||
             table_rows.dtype != DType::I32 || table_rows.ne[0] != batch) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
@@ -109,13 +109,13 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 const auto& weights = execution.parameters.draft->layers[layer];
                 layers[layer]       = {weights.context_key.weight, weights.context_value.weight,
-                                       weights.key_norm, execution.local_layer(layer)};
+                                       weights.key_norm, execution.local_layer(layer, lanes)};
             }
             const Tensor local_positions =
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
+                local_counts, layers, {local_envelope.min_count, local_envelope.max_count},
                 execution.work, execution.cuda);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
@@ -163,8 +163,9 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                 Tensor position_batch = layer_positions.view({layer_width, batch});
                 if (local_layer) {
                     ops::kv_cache_append_prefix(
-                        key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
-                        execution.local_layer(config.compact_layer_index(layer)), execution.cuda);
+                        key_batch, value_batch, position_batch, local_counts, local_envelope,
+                        execution.local_layer(config.compact_layer_index(layer), lanes),
+                        execution.cuda);
                 } else {
                     ops::kv_cache_append_prefix(
                         key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,
@@ -219,7 +220,7 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
         Tensor anchors                 = inputs.anchors;
         Tensor frontiers               = inputs.frontiers;
         Tensor valid_columns           = inputs.valid_columns;
-        Tensor state_slots             = inputs.state_slots;
+        Tensor state_offsets           = inputs.state_offsets;
         Tensor ids                     = outputs.ids;
         Tensor positions               = outputs.positions;
         work.reset();
@@ -259,14 +260,14 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
                 ops::sliding_window_attention(
-                    query, key, value, positions, valid_columns, state_slots,
+                    query, key, value, positions, valid_columns,
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads),
                      dimension(config.attention.num_key_value_heads)},
                     dimension(config.sliding_window.value_or(0)),
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                    execution.local_layer(static_cast<std::uint32_t>(layer_index)), envelopes.local,
-                    work, attention, cuda);
+                    execution.local_layer(static_cast<std::uint32_t>(layer_index), state_offsets),
+                    envelopes.local, work, attention, cuda);
                 finish_dynamic_branch(
                     execution,
                     attention.view({dimension(config.attention.query_width()), width, batch}),
@@ -340,7 +341,7 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
         Tensor anchors            = inputs.anchors;
         Tensor frontiers          = inputs.frontiers;
         Tensor valid_columns      = inputs.valid_columns;
-        Tensor state_destinations = inputs.state_slots;
+        Tensor state_destinations = inputs.state_offsets;
         Tensor full_rows          = inputs.full_kv_rows;
         Tensor ids                = outputs.ids;
         Tensor positions          = outputs.positions;
@@ -410,14 +411,14 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                 if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
                     ops::sliding_window_attention(
                         query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations,
                         {dimension(config.attention.head_dim),
                          dimension(config.attention.num_attention_heads),
                          dimension(config.attention.num_key_value_heads)},
                         dimension(config.sliding_window.value_or(0)),
                         static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                        execution.local_layer(config.compact_layer_index(layer)), envelopes.local,
-                        execution.work, attention_batch, execution.cuda);
+                        execution.local_layer(config.compact_layer_index(layer),
+                                              state_destinations),
+                        envelopes.local, execution.work, attention_batch, execution.cuda);
                 } else {
                     ops::context_softmax_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
@@ -498,8 +499,9 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
 
 } // namespace
 
-CyclicKVCacheLayerView DraftExecutionView::local_layer(std::uint32_t layer) const {
-    return local.layer_view(layer);
+CyclicKVCacheLayerView DraftExecutionView::local_layer(std::uint32_t layer,
+                                                       const Tensor& offsets) const {
+    return local.layer_view(layer, offsets);
 }
 
 PagedKVBatchLayerView DraftExecutionView::full_layer(std::uint32_t layer) const {
@@ -508,12 +510,12 @@ PagedKVBatchLayerView DraftExecutionView::full_layer(std::uint32_t layer) const 
 }
 
 void draft_append_context(DraftExecutionView execution, const Tensor& features,
-                          const Tensor& positions, const Tensor& counts, const Tensor& slots,
+                          const Tensor& positions, const Tensor& counts, const Tensor& offsets,
                           const Tensor& table_rows,
                           ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
     auto scope = execution.work.scope();
-    append_context_impl(execution, features, positions, counts, slots, table_rows, envelope);
+    append_context_impl(execution, features, positions, counts, offsets, table_rows, envelope);
 }
 
 void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, DraftOutputs& outputs,

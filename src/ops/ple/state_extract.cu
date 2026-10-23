@@ -8,8 +8,9 @@ namespace {
 struct ExtractArguments {
     const std::uint16_t *before, *records;
     std::uint16_t* after;
-    const std::int32_t *source, *destination, *accepted;
-    std::int64_t before_column, before_slot, record_column, record_batch, after_column, after_slot;
+    const std::int64_t *source, *destination;
+    const std::int32_t* accepted;
+    std::int64_t before_column, record_column, record_batch, after_column;
 };
 
 template <class Word>
@@ -18,8 +19,8 @@ __global__ void extract_kernel(const __grid_constant__ ExtractArguments a) {
     const int c         = (blockIdx.x * blockDim.x + threadIdx.x) * width;
     if (c >= kChannels) return;
     const int b = blockIdx.y, accepted = a.accepted[b];
-    const auto* before = a.before + a.source[b] * a.before_slot + c;
-    auto* after        = a.after + a.destination[b] * a.after_slot + c;
+    const auto* before = a.before + a.source[b] / 2 + c;
+    auto* after        = a.after + a.destination[b] / 2 + c;
     if (accepted == 0 && before == after) return;
     const auto* records = a.records + b * a.record_batch + c;
     // Load the complete result before writing: this row may update its source in place.
@@ -45,8 +46,9 @@ void launch_extract(const ExtractArguments& args, int batch, cudaStream_t stream
 
 using ExtractLaunch = void (*)(const ExtractArguments&, int, cudaStream_t);
 
-ExtractLaunch select_extract(const Tensor& before, const Tensor& records, const Tensor& after) {
-    return pair_aligned(before) && pair_aligned(after) && pair_aligned(records)
+ExtractLaunch select_extract(const ConstStateFieldView& before, const Tensor& records,
+                             const StateFieldView& after) {
+    return field_aligned(before, 4) && field_aligned(after, 4) && pair_aligned(records)
                ? launch_extract<std::uint32_t>
                : launch_extract<std::uint16_t>;
 }
@@ -55,23 +57,22 @@ ExtractLaunch select_extract(const Tensor& before, const Tensor& records, const 
 
 namespace ninfer::ops {
 
-void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
+void ple_state_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted, PleConvStateView after,
                        CudaExecutionView execution) {
     using namespace detail::ple;
     validate_extract(before, records, accepted, after, execution);
-    const ExtractArguments a{static_cast<const std::uint16_t*>(before.history.data),
-                             static_cast<const std::uint16_t*>(records.values.data),
-                             static_cast<std::uint16_t*>(after.history.data),
-                             static_cast<const std::int32_t*>(before.slots.data),
-                             static_cast<const std::int32_t*>(after.slots.data),
-                             static_cast<const std::int32_t*>(accepted.data),
-                             before.history.nb[1] / 2,
-                             before.history.nb[2] / 2,
-                             records.values.nb[1] / 2,
-                             records.values.nb[2] / 2,
-                             after.history.nb[1] / 2,
-                             after.history.nb[2] / 2};
+    const ExtractArguments a{
+        common::operand::state_field_base<const std::uint16_t>(before.history),
+        static_cast<const std::uint16_t*>(records.values.data),
+        common::operand::state_field_base<std::uint16_t>(after.history),
+        static_cast<const std::int64_t*>(before.history.records.byte_offsets.data),
+        static_cast<const std::int64_t*>(after.history.records.byte_offsets.data),
+        static_cast<const std::int32_t*>(accepted.data),
+        kChannels,
+        records.values.nb[1] / 2,
+        records.values.nb[2] / 2,
+        kChannels};
     select_extract(before.history, records.values, after.history)(a, accepted.ne[0],
                                                                   execution.stream());
 }

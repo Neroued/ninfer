@@ -29,26 +29,6 @@ struct ViewValidation {
         for (int d = 0; d < 4; ++d) require(t.ne[d] == shape[d] && shape[d] > 0, label);
     }
 
-    // Page-major planes have contiguous features and ordered, non-overlapping outer axes.
-    void plane(const Tensor& t, DType dtype, std::array<int, 4> shape, const char* label) const {
-        require(device.type() == DeviceType::CUDA && t.device == device, "operand device");
-        const std::int64_t element = dtype_size(dtype);
-        require(t.dtype == dtype && t.nb[0] == element && common::operand::aligned(t.data, element),
-                label);
-        std::uint64_t span = element;
-        for (int d = 0; d < 4; ++d) {
-            require(t.ne[d] == shape[d] && shape[d] > 0, label);
-            if (shape[d] == 1) continue;
-            require(t.nb[d] >= static_cast<std::int64_t>(span) && t.nb[d] % element == 0, label);
-            const std::uint64_t stride = t.nb[d], count = shape[d] - 1;
-            require(stride <= (std::numeric_limits<std::int64_t>::max() - span) / count, label);
-            span += count * stride;
-        }
-        require(span <= std::numeric_limits<std::uintptr_t>::max() -
-                            reinterpret_cast<std::uintptr_t>(t.data),
-                label);
-    }
-
     bool overlap(const Tensor& a, const Tensor& b) const {
         const auto span = [&](const Tensor& t) {
             std::uint64_t bytes = dtype_size(t.dtype);
@@ -115,11 +95,15 @@ struct ViewValidation {
         }
     }
 
-    void state(const QsaTailStateView& v, int batch) const {
-        metadata(v.slots, batch, "state slots");
-        const int slots = v.raw_keys.ne[2];
-        columns(v.raw_keys, DType::BF16, 128, 3, slots, "tail raw keys");
-        columns(v.first_rope, DType::I32, 3, slots, 1, "tail coordinates");
+    void state(const ConstQsaTailStateView& v, int batch) const {
+        common::operand::state_field(v.raw_keys, DType::BF16, {128, 3}, 2, op, "tail raw keys",
+                                     device);
+        common::operand::state_field(v.first_rope, DType::I32, {3}, 4, op, "tail coordinates",
+                                     device);
+        require(v.raw_keys.field.layers == 1 && v.first_rope.field.layers == 1, "state layer");
+        const auto& raw  = v.raw_keys.records;
+        const auto& rope = v.first_rope.records;
+        require(raw.byte_offsets.ne[0] == batch && rope.byte_offsets.ne[0] == batch, "state rows");
     }
 };
 

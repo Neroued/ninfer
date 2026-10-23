@@ -2,8 +2,8 @@
 
 namespace ninfer::models::qwen4_exp {
 QsaCacheLayout plan_qsa_cache(LayoutBuilder& builder, const QsaConfig& config, std::uint32_t layers,
-                              std::uint32_t max_context, std::uint32_t pages,
-                              std::int32_t table_rows, KvCacheStorage storage) {
+                              std::uint32_t max_context, std::int32_t table_rows,
+                              KvCacheStorage storage) {
     const auto head_dim = dimension(config.head_dim), kv_heads = dimension(config.kv_heads);
     const auto schema = paged_kv_storage_layout(storage, head_dim);
     KVPageGeometry geometry;
@@ -21,7 +21,7 @@ QsaCacheLayout plan_qsa_cache(LayoutBuilder& builder, const QsaConfig& config, s
         geometry.planes.push_back({DType::BF16, dimension(config.index_dim),
                                    dimension(config.index_kv_heads), 256, config.compression});
     }
-    return {plan_device_kv_page_pool(builder, {pages, std::move(geometry)}),
+    return {plan_kv_page_layout(geometry),
             plan_kv_execution_tables(builder, {(max_context + 63) / 64, table_rows}),
             schema,
             layers,
@@ -29,18 +29,21 @@ QsaCacheLayout plan_qsa_cache(LayoutBuilder& builder, const QsaConfig& config, s
             kv_heads};
 }
 
-QsaCache::QsaCache(MemorySpan backing, const QsaCacheLayout& layout)
-    : layout_(layout), pages_(backing, layout.pages), tables_(backing, layout.tables, pages_) {}
+QsaCache::QsaCache(MemorySpan context, MemorySpan fixed, const QsaCacheLayout& layout)
+    : layout_(layout), context_(context),
+      tables_(fixed, layout.tables, context, layout.pages.page_bytes) {}
 
 ops::QsaCacheView QsaCache::layer(std::uint32_t layer) const {
     if (layer >= layout_.layers) throw std::out_of_range("QSA cache layer");
-    const auto& s     = layout_.storage;
-    const auto base   = layer * (s.planes_per_layer() + 1);
-    const auto tables = tables_.matrix();
-    return {{pages_.plane(base), pages_.plane(base + 1),
-             s.key.has_scale() ? pages_.plane(base + 2) : Tensor{},
-             s.value.has_scale() ? pages_.plane(base + 2 + s.key.has_scale()) : Tensor{}, tables,
+    const auto& s   = layout_.storage;
+    const auto base = layer * (s.planes_per_layer() + 1);
+    const PagedRecordView records{context_, tables_.matrix(), layout_.pages.geometry.page_tokens};
+    const auto plane = [&](std::uint32_t index) {
+        return PagedPlaneView{records, layout_.pages.planes.at(index)};
+    };
+    return {{plane(base), plane(base + 1), s.key.has_scale() ? plane(base + 2) : PagedPlaneView{},
+             s.value.has_scale() ? plane(base + 2 + s.key.has_scale()) : PagedPlaneView{},
              layout_.head_dim, layout_.kv_heads, s.storage},
-            {pages_.plane(base + s.planes_per_layer()), tables}};
+            {plane(base + s.planes_per_layer())}};
 }
 } // namespace ninfer::models::qwen4_exp

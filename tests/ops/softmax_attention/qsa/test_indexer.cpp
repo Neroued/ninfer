@@ -102,22 +102,30 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
     if (preserved) {
         failures += verify_exact(
             "query preserved", from_device<std::uint16_t>(f.query.data, f.q_host.size()), f.q_host);
-        failures +=
-            verify_exact("keys preserved",
-                         from_device<std::uint16_t>(f.cache.keys.data, f.k_host.size()), f.k_host);
+        failures += verify_exact(
+            "keys preserved",
+            [&] {
+                auto bytes = f.packed->download_plane(0);
+                std::vector<std::uint16_t> words(bytes.size() / 2);
+                std::memcpy(words.data(), bytes.data(), bytes.size());
+                return words;
+            }(),
+            f.k_host);
         failures +=
             verify_exact("positions preserved",
                          from_device<int>(f.batch.positions.data, f.positions.size()), f.positions);
-        failures +=
-            verify_exact("tables preserved",
-                         from_device<int>(f.cache.block_tables.data, f.tables.size()), f.tables);
+        failures += verify_exact("tables preserved",
+                                 from_device<std::int64_t>(f.cache.keys.records.page_offsets.data,
+                                                           f.table_offsets.size()),
+                                 f.table_offsets);
         failures += verify_exact("counts metadata preserved",
                                  from_device<int>(f.batch.valid_columns.data, f.B), f.valid);
         failures += verify_exact("selectors preserved",
                                  from_device<int>(f.batch.table_rows.data, f.B), f.table_rows);
     }
-    for (auto* buffer : {&f.q, &f.keys, &f.pos, &f.lengths, &f.rows, &f.table, &f.ids, &f.counts})
+    for (auto* buffer : {&f.q, &f.pos, &f.lengths, &f.rows, &f.table, &f.ids, &f.counts})
         failures += buffer->verify_guards(label);
+    failures += !f.packed->guards_intact();
     return failures;
 }
 
@@ -189,14 +197,15 @@ int read_footprint(DeviceContext& device) {
     Fixture f(8, 4, 32772, 0, Pattern::Dyadic);
     f.reset(0);
     DeviceBuffer query(ninfer::test::cuda_environment().context.device(), f.q_host.size() * 2);
-    DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.k_host.size() * 2);
+    DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.packed->storage().bytes);
     DeviceBuffer positions(ninfer::test::cuda_environment().context.device(),
                            f.positions.size() * 4);
-    DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.tables.size() * 4);
-    f.query.data              = query.data();
-    f.cache.keys.data         = keys.data();
-    f.cache.block_tables.data = table.data();
-    f.batch.positions.data    = positions.data();
+    DeviceBuffer table(ninfer::test::cuda_environment().context.device(),
+                       f.table_offsets.size() * 8);
+    f.query.data                           = query.data();
+    f.cache.keys.records.storage           = keys.span();
+    f.cache.keys.records.page_offsets.data = table.data();
+    f.batch.positions.data                 = positions.data();
     for (int b = 0; b < f.B; ++b) {
         const int n = f.valid[b];
         if (!n) continue;
@@ -213,13 +222,15 @@ int read_footprint(DeviceContext& device) {
         const int c = (f.positions[b * f.T + n - 1] + 1) / 4;
         if (c <= 512) continue;
         const int page_count = (c + 15) / 16, row = f.table_rows[b];
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(table.data()) + row * f.table_stride,
-                                   f.tables.data() + row * f.table_stride, page_count * 4,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(table.data()) + row * f.table_stride,
+                                   f.table_offsets.data() + row * f.table_stride, page_count * 8,
                                    cudaMemcpyHostToDevice, device.stream()));
         for (int p = 0; p < page_count; ++p) {
             const auto offset =
                 std::int64_t(f.tables[row * f.table_stride + p]) * f.key_page_stride;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(keys.data()) + offset,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(keys.data()) +
+                                           f.table_offsets[row * f.table_stride + p] +
+                                           f.cache.keys.plane.tensor.region.offset,
                                        f.k_host.data() + offset, std::min(16, c - p * 16) * 256,
                                        cudaMemcpyHostToDevice, device.stream()));
         }

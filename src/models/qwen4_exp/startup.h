@@ -24,7 +24,8 @@ public:
     [[nodiscard]] Architecture architecture() const noexcept { return Architecture::Qwen4Exp; }
 
     [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
-                                                    WeightPlacement, std::size_t available) const;
+                                                    WeightPlacement, std::size_t available,
+                                                    std::size_t available_host_bytes) const;
     [[nodiscard]] std::unique_ptr<ModelShard> materialize(DeviceContext&, WeightPlacement,
                                                           const StartupObserver&);
     [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;

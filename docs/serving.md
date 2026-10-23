@@ -17,21 +17,20 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_C
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
-  --kv-capacity 240000 \
+  --context-capacity auto \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
   --proposal-head optimized \
   --preserve-thinking
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
-240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
-when running alone. Requests acquire KV pages as execution advances; if concurrent growth exhausts
-the pool, the scheduler can pause a request and restore it later.
+The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling.
+State and all enabled KV histories share the Device Context byte capacity resolved at startup.
+Requests allocate records as execution advances; if concurrent growth exhausts the pool, the
+scheduler can pause a request and restore it later.
 
-With `C=2` and two extra Device slots, the process owns four Device StateImages. The default shared
+The default shared
 pinned Host budget on RTX 5090 is 8 GiB plus eight model StateImages. This pool holds retained
 state, KV and pause snapshots, including in-flight destinations; `--host-cache-capacity` sets an
 explicit total instead. DGX Spark uses Device context storage with zero Host context capacity.
@@ -933,9 +932,9 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process settings. `--temperature 0` sets the default to greedy sampling;
 an explicit request temperature takes precedence.
 
-For `C=--max-concurrency` and `H=--extra-state-slots`, total Device StateImage capacity is `C+H`.
-Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
-limit on total process RAM. `--host-cache-capacity 0B` disables Host context backing.
+`--context-capacity SIZE|auto` sets the shared Device backing for KV and State on each rank.
+Host State and KV share a separate startup-fixed byte budget; `--host-cache-capacity 0B` disables
+that backing. These capacities do not limit total process RAM.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
 
@@ -972,8 +971,10 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_generation_tokens_total`, `ninfer_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
 | `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
-| `ninfer_device_kv_{used,capacity}_page_groups{pool_id}`, `ninfer_device_state_{used,capacity}_slots` | Physical per-pool KV and StateImage occupancy; retained history also occupies these pools |
-| `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
+| `ninfer_context_pool_bytes{rank,domain,kind}` | Per-rank Device/Host capacity, live, reserved, pending retirement, padding, assigned/unassigned free and tail bytes |
+| `ninfer_context_pool_reserved_detail_bytes{rank,domain,kind}`, `ninfer_context_pool_peak_bytes{rank,domain}` | Relocation subset, future reservations and peak physical occupancy |
+| `ninfer_context_{state,history}_objects`, `ninfer_context_kv_page_groups{pool_id}` | Logical object counts, without independent capacity quotas |
+| `ninfer_context_metadata_{budget,allocated,reserved}_bytes` | Coordinator Context metadata budget and usage |
 | `ninfer_context_transfer_bytes_total{resource,pool_id,direction}` | Completed State or KV payload transfers; `pool_id` is present for KV |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
 | `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
@@ -1167,11 +1168,11 @@ cancellation and timeout deadline. Model output is bounded by the same finite re
 each request's effective output-token limit; output callbacks and network serialization run
 outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
-pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-when sizing the pool; omitting the option makes it follow `--max-context`. Both explicit and automatic
-capacity use 1 GiB of base startup planning headroom. On Spark, Vision additionally reserves
-`--media-live-capacity` in shared memory. Capacity resolves once at startup.
+`--max-context` is each sequence's logical ceiling. `--context-capacity` is a byte capacity for
+active and retained KV/State records. Its default `auto` accounts for the complete enabled runtime
+and the model's minimum working sets. Both explicit and automatic capacity use 1 GiB of startup
+planning headroom. On Spark, Vision's live media capacity is included in the shared-memory budget.
+Backing capacity resolves once at startup; the mix of KV and State records changes with demand.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

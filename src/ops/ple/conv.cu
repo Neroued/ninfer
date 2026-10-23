@@ -8,22 +8,21 @@ constexpr int kChannelTiles = kChannels / 256;
 
 inline ConvArguments conv_arguments(const Tensor& residual, const Tensor& gated,
                                     const Tensor& kernel, const PleBatchView& batch,
-                                    const PleConvStateView& before,
+                                    const ConstPleConvStateView& before,
                                     const PleConvRecordWindowView& current, Tensor& updated,
                                     const Tensor* norm, float epsilon, Tensor* normalized) {
     return {static_cast<const __nv_bfloat16*>(residual.data),
             static_cast<const __nv_bfloat16*>(gated.data),
             static_cast<const __nv_bfloat16*>(kernel.data),
-            static_cast<const __nv_bfloat16*>(before.history.data),
+            common::operand::state_field_base<const __nv_bfloat16>(before.history),
             static_cast<const __nv_bfloat16*>(current.values.data),
             norm ? static_cast<const __nv_bfloat16*>(norm->data) : nullptr,
             static_cast<__nv_bfloat16*>(updated.data),
             normalized ? static_cast<__nv_bfloat16*>(normalized->data) : nullptr,
             static_cast<const std::int32_t*>(batch.valid_columns.data),
-            static_cast<const std::int32_t*>(before.slots.data),
             static_cast<const std::int32_t*>(current.offsets.data),
-            before.history.nb[1] / 2,
-            before.history.nb[2] / 2,
+            static_cast<const std::int64_t*>(before.history.records.byte_offsets.data),
+            kChannels,
             current.values.nb[1] / 2,
             current.values.nb[2] / 2,
             residual.ne[2],
@@ -59,17 +58,18 @@ void launch_conv_norm(const ConvArguments& a, cudaStream_t stream) {
 
 using ConvLaunch = void (*)(const ConvArguments&, cudaStream_t);
 
-ConvLaunch select_conv(const ConvArguments& a, bool paired, int multiprocessors) {
+ConvLaunch select_conv(const ConvArguments& a, bool paired, bool wide_history,
+                       int multiprocessors) {
     const auto columns = std::int64_t(a.tokens) * a.batch;
     if (a.normalized) {
         if (!paired) return launch_conv_norm<256, 1, true>;
         if (columns * kStreams <= 2LL * multiprocessors) return launch_conv_norm<512, 2, true>;
 #if NINFER_TARGET_SPARK
         if (columns >= 1024) {
-            bool aligned = true;
+            bool aligned = wide_history;
             for (const auto* p : {a.kernel, a.history, a.records, a.norm})
                 aligned &= reinterpret_cast<std::uintptr_t>(p) % 8 == 0;
-            for (auto stride : {a.history_column, a.history_slot, a.record_column, a.record_batch})
+            for (auto stride : {a.history_column, a.record_column, a.record_batch})
                 aligned &= stride % 4 == 0;
             if (aligned) return launch_conv_norm<512, 4, true>;
         }
@@ -84,7 +84,7 @@ ConvLaunch select_conv(const ConvArguments& a, bool paired, int multiprocessors)
 }
 
 void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& kernel,
-                  const PleBatchView& batch, const PleConvStateView& before,
+                  const PleBatchView& batch, const ConstPleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated,
                   const Tensor* norm_weight, float epsilon, Tensor* normalized,
                   CudaExecutionView execution) {
@@ -92,10 +92,11 @@ void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& ker
                   normalized, execution);
     const auto args   = conv_arguments(residual, gated, kernel, batch, before, current, updated,
                                        norm_weight, epsilon, normalized);
-    const bool paired = pair_aligned(kernel) && pair_aligned(before.history) &&
+    const bool paired = pair_aligned(kernel) && field_aligned(before.history, 4) &&
                         pair_aligned(current.values) &&
                         (!norm_weight || pair_aligned(*norm_weight));
-    select_conv(args, paired, execution.multiprocessor_count())(args, execution.stream());
+    select_conv(args, paired, field_aligned(before.history, 8),
+                execution.multiprocessor_count())(args, execution.stream());
 }
 } // namespace
 } // namespace ninfer::ops::detail::ple
@@ -103,7 +104,7 @@ void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& ker
 namespace ninfer::ops {
 
 void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
-                  const PleBatchView& batch, const PleConvStateView& before,
+                  const PleBatchView& batch, const ConstPleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated_residual,
                   CudaExecutionView execution) {
     detail::ple::execute_conv(residual, gated_value, kernel, batch, before, current,
@@ -111,7 +112,7 @@ void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tenso
 }
 
 void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
-                       const PleBatchView& batch, const PleConvStateView& before,
+                       const PleBatchView& batch, const ConstPleConvStateView& before,
                        const PleConvRecordWindowView& current, const Tensor& next_hc_norm_weight,
                        float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
                        CudaExecutionView execution) {

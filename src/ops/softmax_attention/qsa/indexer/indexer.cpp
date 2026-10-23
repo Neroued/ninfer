@@ -27,9 +27,9 @@ std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::i
     return layout.peak_bytes(1);
 }
 
-void qsa_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaBatchView& batch,
-                 QsaIndexerExecutionEnvelope envelope, MemoryArena& workspace,
-                 QsaBlockSelection& out, CudaExecutionView execution) {
+void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                 const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
+                 MemoryArena& workspace, QsaBlockSelection& out, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument("QSA workspace belongs to another device");
     }
@@ -40,15 +40,16 @@ void qsa_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaB
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
     v.metadata(batch.valid_columns, rows, "valid columns");
     v.metadata(batch.table_rows, rows, "table rows");
-    v.plane(cache.keys, DType::BF16, {128, 16, 1, cache.keys.ne[3]}, "index pages");
-    v.plane(cache.block_tables, DType::I32,
-            {cache.block_tables.ne[0], cache.block_tables.ne[1], 1, 1}, "block tables");
-    v.require(std::uint64_t(cache.block_tables.ne[0]) * 64 >= envelope.max_visible_tokens,
-              "table capacity");
+    common::operand::paged_plane(cache.keys, DType::BF16, {128, 16, 1}, 2, "qsa_indexer",
+                                 "index pages", execution.device());
+    v.require(cache.keys.records.page_tokens == 64 && cache.keys.plane.geometry.tokens_per_row == 4,
+              "index record geometry");
+    const auto& table = cache.keys.records.page_offsets;
+    v.require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "table capacity");
     v.dense(out.block_ids, DType::I32, {512, tokens, rows, 1}, 4, "block ids");
     v.dense(out.block_counts, DType::I32, {tokens, rows, 1, 1}, 4, "block counts");
-    const Tensor* inputs[]{&query,           &cache.keys,          &cache.block_tables,
-                           &batch.positions, &batch.valid_columns, &batch.table_rows};
+    const Tensor* inputs[]{&query, &table, &batch.positions, &batch.valid_columns,
+                           &batch.table_rows};
     v.require(!v.overlap(out.block_ids, out.block_counts), "output overlap");
     for (const auto* dst : {&out.block_ids, &out.block_counts})
         for (const auto* src : inputs) v.require(!v.overlap(*dst, *src), "output/input overlap");

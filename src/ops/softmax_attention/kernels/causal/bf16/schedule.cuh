@@ -60,7 +60,7 @@ struct alignas(16) Bf16KvGroupedStorage {
 
     // A rolling page window, not a bound on the KV partition length.
     static constexpr int kPageWindow = 32;
-    int pages[kPageWindow];
+    std::int64_t record_offsets[kPageWindow];
     float maximum[kStateRows];
     float sum[kStateRows];
 };

@@ -87,10 +87,6 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
     return "unknown";
 }
 
-std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
-}
-
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
     std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
               << std::setw(12) << format_seconds(seconds) << '\n';
@@ -202,7 +198,6 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     const auto snapshot     = engine.snapshot();
     print_metric("max context", std::to_string(description.max_context));
     print_metric("prefill chunk", std::to_string(description.prefill_chunk));
-    print_metric("KV capacity", std::to_string(description.kv_capacity));
     print_metric("kv cache dtype", format_kv_cache(description.kv_cache));
     for (std::size_t i = 0; i < description.ranks.size(); ++i) {
         const auto& rank   = description.ranks[i];
@@ -216,13 +211,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric(prefix + "GPU weights", format_bytes(memory.allocations.device_weights_bytes));
         print_metric(prefix + "GPU persistent",
                      format_bytes(memory.allocations.persistent_device_bytes));
+        print_metric(prefix + "GPU context", format_bytes(memory.allocations.context_device_bytes));
         print_metric(prefix + "GPU workspace",
                      format_bytes(memory.allocations.workspace_device_bytes));
         print_metric(prefix + "workspace peak",
                      format_bytes(memory.workspace.measurement_peak_bytes));
         print_metric(prefix + "GPU allocations", format_bytes(memory.allocations.device_bytes()));
         print_metric(prefix + "Host allocations", format_bytes(memory.allocations.host_bytes()));
-        print_metric(prefix + "KV payload", format_bytes(memory.kv_payload_bytes));
         print_metric(prefix + "startup free", format_bytes(budget.available_after_startup_bytes));
         if (memory.experts) {
             print_metric(prefix + "expert cache", format_bytes(memory.experts->cache_bytes));

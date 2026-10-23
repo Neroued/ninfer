@@ -38,16 +38,16 @@ __global__ void write_bf16_kernel(const __nv_bfloat16* __restrict__ k,
     const int d                     = vec * VecElems;
     const int position              = positions[0] + token;
     const int lane                  = static_cast<int>(threadIdx.x) & 31;
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? lookup_page(block_table, position) : 0;
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? lookup_page(block_table, position) : 0;
     const std::int64_t src_off =
         static_cast<std::int64_t>(d) +
         static_cast<std::int64_t>(kHeadDim) * (kv_head + Geometry::KVHeads * token);
     const int4 k_value = common::load_vec<int4>(&k[src_off]);
     const int4 v_value = common::bf16x8_bits_to_f16x8_bits(common::load_vec<int4>(&v[src_off]));
-    physical_page      = __shfl_sync(0xffffffffu, physical_page, 0);
-    const std::int64_t cache_off = page_major_offset<kHeadDim, Geometry::KVHeads>(
-        physical_page, kv_head, position & kPageMask, d);
+    record             = __shfl_sync(0xffffffffu, record, 0);
+    const std::int64_t cache_off =
+        record_offset<kHeadDim, 2>(record, kv_head, position & kPageMask, d);
     common::store_vec(&cache_k[cache_off], k_value);
     common::store_vec(&cache_v[cache_off], v_value);
 }

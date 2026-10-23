@@ -12,15 +12,15 @@ struct QsaRecordLayout {
 struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
     std::optional<TensorRegion> visual_indices;
-    TensorRegion valid_columns, source_slots, destination_slots, main_tables;
+    TensorRegion valid_columns, source_offsets, destination_offsets, main_tables;
     TensorRegion base_positions, record_offsets, accepted_columns;
-    TensorRegion raw_tail, row_indices, count_slots, sampling_positions;
+    TensorRegion raw_tail, raw_tail_offsets, row_indices, count_slots, sampling_positions;
     std::uint32_t max_positions;
 };
 
 struct MtpBatchLayout {
     TensorRegion ids, positions, rope_positions;
-    TensorRegion valid_columns, source_slots, destination_slots, table_rows;
+    TensorRegion valid_columns, source_offsets, destination_offsets, table_rows;
     TensorRegion base_positions, record_offsets;
     std::optional<TensorRegion> visual_indices;
     LayoutRegion ingress;
@@ -31,7 +31,8 @@ struct MtpBufferLayout {
     std::vector<MtpBatchLayout> draft_steps;
     LayoutRegion ingress;
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
-    TensorRegion tail_keys, tail_coordinates, row_indices;
+    TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets,
+        row_indices;
     TensorRegion drafts, extents, anchors, frontiers, target_tokens, token_counts;
     TensorRegion last_columns, active_columns;
 };

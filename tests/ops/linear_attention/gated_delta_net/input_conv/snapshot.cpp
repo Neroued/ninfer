@@ -318,7 +318,6 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_initial       = to_device(initial_slots);
     DeviceBuffer device_snapshot_base = to_device(snapshot_bases);
     DeviceBuffer device_valid;
     if (!valid_columns.empty()) { device_valid = to_device(valid_columns); }
@@ -332,12 +331,21 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     Tensor x(device_activation.span(), DType::BF16, {hidden, width, batch});
     Tensor conv(device_conv_weight.span(), DType::BF16, {channels, 4});
     Tensor conv_state(state.span(), DType::BF16, {channels, 3, slots});
-    SlottedStateFixture history(conv_state, 2);
-    conv_state = history.tensor;
+    RecordStateFixture history(conv_state, 2);
+    const bool source_aliases_snapshots = width == 4 && batch == 2;
+    auto initial_offsets                = history.record_offsets(initial_slots);
+    if (source_aliases_snapshots)
+        for (int row = 0; row < batch; ++row)
+            initial_offsets[row] = std::int64_t(initial_slots[row]) * conv_state.nb[2];
+    DeviceBuffer device_initial = to_device(initial_offsets);
     Tensor valid;
     if (!valid_columns.empty()) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
-    Tensor initial(device_initial.span(), DType::I32, {batch});
+    Tensor initial(device_initial.span(), DType::I64, {batch});
+    const auto source = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
+                                                 : history.view(initial);
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {batch});
+    auto destination_storage = to_device(history.record_offsets(snapshot_bases));
+    Tensor destination_offsets(destination_storage.span(), DType::I64, {batch});
     Tensor q(query.span(), DType::BF16, {qk_rows, width, batch});
     Tensor k(key.span(), DType::BF16, {qk_rows, width, batch});
     Tensor v(value.span(), DType::BF16, {value_rows, width, batch});
@@ -347,8 +355,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     MemoryArena workspace(workspace_storage.span());
 
     const auto invoke = [&](CudaExecutionView execution) {
-        launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace,
-               execution);
+        launch(x, conv, source, history.view(destination_offsets), conv_state, valid, snapshot_base,
+               q, k, v, z_output, workspace, execution);
     };
     if (graph) {
         cudaStream_t stream;
@@ -362,6 +370,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        state.copy_from_bits(state_before);
         history.upload();
         if (!valid_columns.empty()) {
             valid_columns[0] = width > 1 ? width - 1 : 1;
@@ -387,7 +396,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     const std::vector<double> key_values   = key.values();
     const std::vector<double> value_values = value.values();
     const std::vector<double> z_values     = z.values();
-    history.copy_back();
+    if (width == 1) history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     std::vector<double> query_actual;
     std::vector<double> query_expected;
@@ -473,7 +482,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     failures +=
         verify_preserved(std::string(label) + " conv weight", device_conv_weight, conv_weight_bits);
     failures +=
-        verify_preserved(std::string(label) + " initial slots", device_initial, initial_slots);
+        verify_preserved(std::string(label) + " initial slots", device_initial, initial_offsets);
     failures += verify_preserved(std::string(label) + " snapshot bases", device_snapshot_base,
                                  snapshot_bases);
     if (!valid_columns.empty()) {
@@ -506,7 +515,6 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_initial       = to_device(initial_value);
     DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
     GuardedBf16Tensor state(kChannels * 3, slots);
     state.copy_from_bits(state_before);
@@ -517,9 +525,17 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
-    SlottedStateFixture history(conv_state, 2);
-    conv_state = history.tensor;
-    Tensor initial(device_initial.span(), DType::I32, {1});
+    RecordStateFixture history(conv_state, 2);
+    const bool source_aliases_snapshots =
+        initial_slot >= snapshot_base_value[0] && initial_slot < snapshot_base_value[0] + tokens;
+    const auto initial_offsets =
+        source_aliases_snapshots
+            ? std::vector<std::int64_t>{std::int64_t(initial_slot) * conv_state.nb[2]}
+            : history.record_offsets(initial_value);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {1});
+    const auto source = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
+                                                 : history.view(initial);
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
@@ -533,7 +549,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 
     ops::gdn_input_proj_conv_snapshot(
         x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-        {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
+        {source, conv_state, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -552,8 +568,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                                               token_activation, kHidden);
         },
         full_reference);
-    const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
-    history.copy_back();
+    const std::int32_t sample_count              = snapshot_sample_count(tokens, full_reference);
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
                                " initial=" + std::to_string(initial_slot) +
@@ -578,7 +593,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
-    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_offsets);
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += query_key.verify_preserved("snapshot query/key weight" + suffix);
@@ -618,7 +633,6 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_initial       = to_device(initial_value);
     DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
     GuardedBf16Tensor state(kChannels * 3, slots);
     state.copy_from_bits(state_before);
@@ -629,9 +643,17 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
-    SlottedStateFixture history(conv_state, 2);
-    conv_state = history.tensor;
-    Tensor initial(device_initial.span(), DType::I32, {1});
+    RecordStateFixture history(conv_state, 2);
+    const bool source_aliases_snapshots =
+        initial_slot >= snapshot_base_value[0] && initial_slot < snapshot_base_value[0] + tokens;
+    const auto initial_offsets =
+        source_aliases_snapshots
+            ? std::vector<std::int64_t>{std::int64_t(initial_slot) * conv_state.nb[2]}
+            : history.record_offsets(initial_value);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {1});
+    const auto source = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
+                                                 : history.view(initial);
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
@@ -646,7 +668,7 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     const auto launch = [&](CudaExecutionView cuda) {
         ops::gdn_input_proj_conv_snapshot(
             x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
-            {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace, cuda);
+            {source, conv_state, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace, cuda);
     };
     if (graph) {
         cudaStream_t stream;
@@ -688,7 +710,6 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix =
         " Q8 K=" + std::to_string(kHidden) + " A16 T=" + std::to_string(tokens) +
@@ -711,7 +732,7 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
-    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_offsets);
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
@@ -743,7 +764,6 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_initial       = to_device(initial_value);
     DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
     GuardedBf16Tensor state(kChannels * 3, slots);
     state.copy_from_bits(state_before);
@@ -754,9 +774,17 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
-    SlottedStateFixture history(conv_state, 2);
-    conv_state = history.tensor;
-    Tensor initial(device_initial.span(), DType::I32, {1});
+    RecordStateFixture history(conv_state, 2);
+    const bool source_aliases_snapshots =
+        initial_slot >= snapshot_base_value[0] && initial_slot < snapshot_base_value[0] + tokens;
+    const auto initial_offsets =
+        source_aliases_snapshots
+            ? std::vector<std::int64_t>{std::int64_t(initial_slot) * conv_state.nb[2]}
+            : history.record_offsets(initial_value);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {1});
+    const auto source = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
+                                                 : history.view(initial);
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
@@ -769,7 +797,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     MemoryArena workspace(workspace_storage.span());
 
     ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy}, conv,
-                                      {conv_state, initial, snapshot_base}, Tensor{},
+                                      {source, conv_state, snapshot_base}, Tensor{},
                                       {q, k, v, z_output}, workspace,
                                       ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
@@ -789,7 +817,6 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
-    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -811,7 +838,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
-    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_offsets);
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
@@ -823,16 +850,14 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 }
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
-                 std::int32_t initial_slot, bool convenience = false,
-                 bool shared_state_selectors = false) {
+                 std::int32_t initial_slot) {
     constexpr std::int32_t kHidden               = 5120;
     constexpr std::int32_t kValueRows            = 6144;
     constexpr std::int32_t kZRows                = 6144;
     constexpr std::int32_t kChannels             = 10240;
     constexpr std::int32_t kRows                 = kChannels + kZRows;
     constexpr std::int32_t kSeparateSnapshotBase = 1;
-    const std::int32_t snapshot_base_slot =
-        shared_state_selectors ? initial_slot : kSeparateSnapshotBase;
+    const std::int32_t snapshot_base_slot        = kSeparateSnapshotBase;
     const std::int32_t slots = std::max(tokens + snapshot_base_slot + 1, initial_slot + 1);
     const std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 907U + static_cast<std::uint32_t>(tokens));
@@ -846,7 +871,6 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_initial       = to_device(initial_value);
     DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
     GuardedBf16Tensor state(kChannels * 3, slots);
     state.copy_from_bits(state_before);
@@ -857,32 +881,32 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
-    SlottedStateFixture history(conv_state, 2);
-    conv_state = history.tensor;
-    Tensor initial(device_initial.span(), DType::I32, {1});
-    Tensor snapshot_base =
-        shared_state_selectors ? initial : Tensor(device_snapshot_base.span(), DType::I32, {1});
-    Tensor q                          = query.tensor();
-    Tensor k                          = key.tensor();
-    Tensor v                          = value.tensor();
-    Tensor z_output                   = z.tensor();
+    RecordStateFixture history(conv_state, 2);
+    const bool source_aliases_snapshots =
+        initial_slot >= snapshot_base_value[0] && initial_slot < snapshot_base_value[0] + tokens;
+    const auto initial_offsets =
+        source_aliases_snapshots
+            ? std::vector<std::int64_t>{std::int64_t(initial_slot) * conv_state.nb[2]}
+            : history.record_offsets(initial_value);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {1});
+    const auto source    = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
+                                                    : history.view(initial);
+    Tensor snapshot_base = Tensor(device_snapshot_base.span(), DType::I32, {1});
+    Tensor q             = query.tensor();
+    Tensor k             = key.tensor();
+    Tensor v             = value.tensor();
+    Tensor z_output      = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{parent.view(), policy}, 1, tokens, tokens);
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(256, workspace_bytes));
     MemoryArena workspace(workspace_storage.span());
 
-    if (convenience) {
-        ops::gdn_input_proj_conv_snapshot(
-            x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
-            {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
-            ninfer::test::cuda_environment().default_execution);
-    } else {
-        ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy},
-                                          conv, {conv_state, initial, snapshot_base}, Tensor{},
-                                          {q, k, v, z_output}, workspace,
-                                          ninfer::test::cuda_environment().default_execution);
-    }
+    ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy}, conv,
+                                      {source, conv_state, snapshot_base}, Tensor{},
+                                      {q, k, v, z_output}, workspace,
+                                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -900,7 +924,6 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     const std::string suffix =
         std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
-    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -923,7 +946,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
-    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_offsets);
     failures +=
         verify_preserved("snapshot base slot" + suffix, device_snapshot_base, snapshot_base_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
@@ -950,8 +973,7 @@ int run_snapshot(Weights& weights, const SnapshotCase& c) {
         case QType::NVFP4:
             return run_nvfp4_case(weights.first, c.width, c.policy, initial);
         case QType::FP8_E4M3FN_ROW_BF16:
-            return run_fp8_case(weights.first, c.width, c.policy, initial, c.convenience,
-                                c.shared_selectors);
+            return run_fp8_case(weights.first, c.width, c.policy, initial);
         default:
             throw std::logic_error("unknown snapshot test format");
         }
@@ -978,11 +1000,15 @@ int run_snapshot(Weights& weights, const SnapshotCase& c) {
         [&](int row, int column, const std::vector<float>& x) {
             return weights.project(channels + row, x.data() + std::size_t(column) * p.hidden);
         },
-        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
-            const Tensor& initial, const Tensor& bases, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
-            MemoryArena& arena, CudaExecutionView execution) {
-            ops::gdn_input_proj_conv_snapshot(x, projection, conv, {state, initial, bases}, valid,
-                                              {q, k, v, z}, arena, execution);
+        [&](const Tensor& x, const Tensor& conv, StateFieldView source, StateFieldView destination,
+            Tensor& state, const Tensor& valid, const Tensor& bases, Tensor& q, Tensor& k,
+            Tensor& v, Tensor& z, MemoryArena& arena, CudaExecutionView execution) {
+            if (x.ne[1] == 1)
+                ops::gdn_input_proj_conv_update(x, projection, conv, source, destination, valid,
+                                                {q, k, v, z}, arena, execution);
+            else
+                ops::gdn_input_proj_conv_snapshot(x, projection, conv, {source, state, bases},
+                                                  valid, {q, k, v, z}, arena, execution);
         },
         p.qk_rows, c.graph, c.full_reference);
 }

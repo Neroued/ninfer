@@ -57,8 +57,9 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform
  * results and raw code/scale bytes are not standalone mathematical outputs. Standalone and fused
  * append produce byte-identical cache representations. Every addressed code/value and scale is
- * overwritten, and no unrelated cache row is read or written. Inputs and every cache plane/table
- * are pairwise non-overlapping. The Op owns no persistent allocation, frontier, request identity,
+ * overwritten, and no unrelated cache row is read or written. Page tables contain I64 record byte
+ * offsets into the shared arena. Inputs, tables and addressed record-local planes are pairwise
+ * non-overlapping. The Op owns no persistent allocation, frontier, request identity,
  * or commit authority.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -70,8 +71,8 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * k/v are contiguous BF16 [D,Hkv,T,B], positions is contiguous device I32 [T,B], and counts and
  * table_rows are contiguous device I32 [B]. For row b and i in [0,counts[b]), k/v[:, :, i, b]
  * are encoded at logical position positions[i,b] through table row table_rows[b]. D128/Hkv8
- * uses head-major BF16 K and FP16 V planes [128,64,Nphysical,8]. D256/Hkv2|4 uses page-major
- * planes and any storage format defined by kv_cache_append, with the same exact codec.
+ * uses BF16 K and FP16 V record-local planes [128,64,8]. D256/Hkv2|4 uses
+ * record-local planes and any storage format defined by kv_cache_append, with the same exact codec.
  * No byte belonging only to the rejected physical tail [counts[b],T) is written. A zero count
  * reads no positions or K/V for that batch row. Inputs are unchanged, and the Op
  * neither decides nor publishes a committed frontier.
@@ -89,19 +90,17 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Append device-selected BF16 prefixes to StateImage cyclic storage.
  *
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
- * overload; state_slots[b] selects the destination state slot. The registered profiles have fixed
- * geometry K/V have dense inner [128,padded_capacity,8] and explicit 16-byte-aligned slot strides
- * nb[3]. D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
- * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
- * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot
- * dead, and one row commits at most the ring capacity. A zero count reads no positions or K/V
- * and changes no cache bytes. Physical T is independent of the committed prefix length.
- * Consequently, no two live writes race for one physical slot. The Op does not own or publish the
- * state frontier.
+ * overload. The cache State fields select destination records through device I64 byte offsets
+ * [B]. Each field is dense [128,padded_capacity,8] within its record and 16-byte aligned. D=128,
+ * Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity. For a nonempty
+ * prefix, the caller guarantees that the row's existing live interval ends immediately before
+ * positions[0,b]. Advancing it by counts[b] makes every overwritten old slot dead, and one row
+ * commits at most the ring capacity. A zero count reads no positions or K/V and changes no cache
+ * bytes. Physical T is independent of the committed prefix length. Consequently, no two live writes
+ * race for one physical slot. The Op does not own or publish the state frontier.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
-                            const Tensor& counts, const Tensor& state_slots,
-                            KVCacheAppendPrefixExecutionEnvelope envelope,
+                            const Tensor& counts, KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, CudaExecutionView execution);
 
 } // namespace ninfer::ops

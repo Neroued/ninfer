@@ -107,8 +107,7 @@ Geometry validate(const Tensor& q, const Tensor& k, const Tensor& v, const Tenso
 BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& g, const Tensor& beta, const Tensor& a_log,
                                     const Tensor& dt_bias, float lower_bound, float scale,
-                                    const Tensor& ssm_states, const Tensor& state_slots,
-                                    const Tensor& out, Device device) {
+                                    StateFieldView states, const Tensor& out, Device device) {
     constexpr std::int32_t kMaximumBatch = 8;
     common::operand::dtype(q, DType::BF16, "kimi_delta_attention", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "kimi_delta_attention", "k must be BF16");
@@ -118,10 +117,6 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     common::operand::dtype(out, DType::BF16, "kimi_delta_attention", "out must be BF16");
     common::operand::dtype(a_log, DType::FP32, "kimi_delta_attention", "A_log must be FP32");
     common::operand::dtype(dt_bias, DType::FP32, "kimi_delta_attention", "dt_bias must be FP32");
-    common::operand::dtype(ssm_states, DType::FP32, "kimi_delta_attention",
-                           "ssm_states must be FP32");
-    common::operand::dtype(state_slots, DType::I32, "kimi_delta_attention",
-                           "state_slots must be I32");
 
     const BatchGeometry geometry{q.ne[1], v.ne[1], q.ne[3]};
     if (q.ne[0] != kStateDim) {
@@ -148,12 +143,12 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     common::operand::shape(a_log, {geometry.value_heads, 1, 1, 1}, "kimi_delta_attention", "A_log");
     common::operand::shape(dt_bias, {kStateDim, geometry.value_heads, 1, 1}, "kimi_delta_attention",
                            "dt_bias");
-    if (ssm_states.ne[0] != kStateDim || ssm_states.ne[1] != kStateDim ||
-        ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] <= 0) {
-        throw std::invalid_argument("kimi_delta_attention: invalid shape for pooled ssm_states");
-    }
-    common::operand::shape(state_slots, {geometry.batch, 1, 1, 1}, "kimi_delta_attention",
-                           "state_slots");
+    if (states.field.layers != 1)
+        throw std::invalid_argument("kimi_delta_attention: select one recurrent state layer");
+    common::operand::state_field(states, DType::FP32, {128, 128, geometry.value_heads}, 16,
+                                 "kimi_delta_attention", "recurrent state", device);
+    common::operand::shape(states.records.byte_offsets, {geometry.batch, 1, 1, 1},
+                           "kimi_delta_attention", "state byte offsets");
 
     common::operand::contiguous_nonnull(q, "kimi_delta_attention", "q", device);
     common::operand::contiguous_nonnull(k, "kimi_delta_attention", "k", device);
@@ -162,19 +157,9 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     common::operand::contiguous_nonnull(beta, "kimi_delta_attention", "beta", device);
     common::operand::contiguous_nonnull(a_log, "kimi_delta_attention", "A_log", device);
     common::operand::contiguous_nonnull(dt_bias, "kimi_delta_attention", "dt_bias", device);
-    common::operand::slotted_tensor(ssm_states, DType::FP32,
-                                    {128, 128, geometry.value_heads, ssm_states.ne[3]}, 3, 16,
-                                    "kimi_delta_attention", "ssm_states", device);
-    common::operand::contiguous_nonnull(state_slots, "kimi_delta_attention", "state_slots", device);
     common::operand::contiguous_nonnull(out, "kimi_delta_attention", "out", device);
 
     require_control_parameters(lower_bound, scale);
-    const auto state_blocks = common::operand::blocks(ssm_states, "kimi_delta_attention");
-    for (const Tensor* operand : {&q, &k, &v, &g, &beta, &a_log, &dt_bias, &state_slots, &out}) {
-        if (common::operand::overlaps(state_blocks,
-                                      common::operand::range(*operand, "kimi_delta_attention")))
-            throw std::invalid_argument("kimi_delta_attention: operands overlap state storage");
-    }
 
     return geometry;
 }
@@ -182,7 +167,7 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
 detail::kimi_delta_attention::Arguments
 arguments(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
           const Tensor& a_log, const Tensor& dt_bias, float lower_bound, float scale,
-          const Tensor& state_in, Tensor& state_out, Tensor& out) {
+          const float* state_in, float* state_out, Tensor& out) {
     return {static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data),
@@ -190,8 +175,8 @@ arguments(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, co
             static_cast<const __nv_bfloat16*>(beta.data),
             static_cast<const float*>(a_log.data),
             static_cast<const float*>(dt_bias.data),
-            static_cast<const float*>(state_in.data),
-            static_cast<float*>(state_out.data),
+            state_in,
+            state_out,
             static_cast<__nv_bfloat16*>(out.data),
             q.ne[1],
             v.ne[1],
@@ -232,10 +217,11 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
     namespace kda       = detail::kimi_delta_attention;
     const auto geometry = validate(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in,
                                    state_out, out, execution.device());
-    const auto args =
-        arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in, state_out, out);
-    const auto plan = kda::select_recurrence_plan(geometry.value_heads, geometry.tokens,
-                                                  execution.multiprocessor_count());
+    const auto args     = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
+                                    static_cast<const float*>(state_in.data),
+                                    static_cast<float*>(state_out.data), out);
+    const auto plan     = kda::select_recurrence_plan(geometry.value_heads, geometry.tokens,
+                                                      execution.multiprocessor_count());
     if (plan.route == kda::RecurrenceRoute::Recurrent) {
         kda::launch_recurrent(args, execution.stream());
         return;
@@ -250,14 +236,16 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& a_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
-                                       Tensor& states, const Tensor& slots, Tensor& out,
+                                       StateFieldView states, Tensor& out,
                                        CudaExecutionView execution) {
     const auto stream   = execution.stream();
     const auto geometry = validate_batch_update(q, k, v, g, beta, a_log, dt_bias, lower_bound,
-                                                scale, states, slots, out, execution.device());
+                                                scale, states, out, execution.device());
     detail::kimi_delta_attention::launch_batch_update(
-        arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out),
-        static_cast<const std::int32_t*>(slots.data), geometry.batch, states.nb[3] / 4, stream);
+        arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
+                  common::operand::state_field_base<const float>(states),
+                  common::operand::state_field_base<float>(states), out),
+        static_cast<const std::int64_t*>(states.records.byte_offsets.data), geometry.batch, stream);
 }
 
 } // namespace ninfer::ops

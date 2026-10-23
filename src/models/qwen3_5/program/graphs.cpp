@@ -37,9 +37,23 @@ GraphInvocation invocation(GraphPhase phase, std::uint32_t batch, std::uint32_t 
 class PreparationInputs {
 public:
     PreparationInputs(Resources& resources, DeviceContext& device)
-        : resources_(resources), device_(device) {
-        initialize_tables(resources.decoder.text_kv);
-        if (auto* backend = resources.backend_kv()) initialize_tables(*backend);
+        : resources_(resources), device_(device),
+          pool_(0, resources.context.size(), resources.context_records) {
+        const auto batch = resources.frame.spec.batch_capacity;
+        std::vector<RecordRequest> demand;
+        for (std::size_t i = 0; i < resources.context_records.size(); ++i)
+            demand.push_back({pool_.record_class(i), batch});
+        auto reserved = pool_.reserve(demand);
+        if (!reserved.reservation || !reserved.reservation->ready())
+            throw std::logic_error("Graph preparation Context records do not fit");
+        auto& reservation = *reserved.reservation;
+        for (std::uint32_t row = 0; row < batch; ++row) {
+            const auto id = reservation.materialize(pool_.record_class(0));
+            records_.push_back(id);
+            state_offsets_.push_back(static_cast<std::int64_t>(pool_.resolve(id).offset));
+        }
+        initialize_tables(resources.decoder.text_kv, 1, reservation);
+        if (auto* backend = resources.backend_kv()) initialize_tables(*backend, 2, reservation);
         device.synchronize();
     }
 
@@ -68,11 +82,11 @@ public:
             host.budgets[row]                       = frame.spec.draft_window + 1;
             host.main_table_rows[row]               = row;
             host.backend_table_rows[row]            = row;
-            host.state_source_slots[row]            = row;
-            host.state_destination_slots[row]       = row;
+            host.state_source_offsets[row]          = state_offsets_[row];
+            host.state_destination_offsets[row]     = state_offsets_[row];
             host.residency_slots[row]               = row;
             frame.host_commit->history_columns[row] = extent;
-            frame.host_commit->state_destination_slots[row] = row;
+            frame.host_commit->state_destination_offsets[row] = state_offsets_[row];
             for (std::uint32_t column = 0; column < call.width; ++column) {
                 const auto index = row * call.width + column;
                 ids[index]       = 0;
@@ -95,7 +109,8 @@ public:
         CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
                                    cudaMemcpyHostToDevice, cuda.stream()));
         CUDA_CHECK(cudaMemsetAsync(frame.egress.data, 0, frame.egress.bytes, cuda.stream()));
-        resources_.state_images.storage().clear_all(cuda);
+        for (const auto offset : state_offsets_)
+            resources_.state_images.storage().clear(offset, cuda);
         if (resources_.token_counts.data) {
             CUDA_CHECK(cudaMemsetAsync(resources_.token_counts.data, 0,
                                        resources_.token_counts.bytes(), cuda.stream()));
@@ -136,7 +151,8 @@ public:
 
     void finish() {
         const auto cuda = device_.execution_view();
-        resources_.state_images.storage().clear_all(cuda);
+        for (const auto offset : state_offsets_)
+            resources_.state_images.storage().clear(offset, cuda);
         if (resources_.token_counts.data) {
             CUDA_CHECK(cudaMemsetAsync(resources_.token_counts.data, 0,
                                        resources_.token_counts.bytes(), cuda.stream()));
@@ -148,31 +164,36 @@ public:
         clear_table(resources_.decoder.text_kv);
         if (auto* backend = resources_.backend_kv()) clear_table(*backend);
         device_.synchronize();
+        for (const auto record : records_) pool_.release(record);
+        records_.clear();
     }
 
 private:
-    void initialize_tables(PagedKVCache& cache) {
-        const auto batch = resources_.frame.spec.batch_capacity;
-        if (cache.pages().capacity_pages() < batch) {
-            throw std::invalid_argument("graph preparation needs one private KV page per row");
-        }
+    void initialize_tables(PagedKVCache& cache, std::size_t spec_index,
+                           PoolReservation& reservation) {
+        const auto batch     = resources_.frame.spec.batch_capacity;
         const auto count     = cache.tables().logical_page_capacity();
-        const auto row_bytes = std::size_t(count) * sizeof(std::int32_t);
+        const auto row_bytes = std::size_t(count) * sizeof(std::int64_t);
         tables_.emplace_back(row_bytes * batch);
         const auto host = tables_.back().span();
-        std::vector<std::int32_t> pages(batch);
         for (std::uint32_t row = 0; row < batch; ++row) {
+            const auto allocation = reservation.materialize(pool_.record_class(spec_index));
+            records_.push_back(allocation);
+            const auto binding = pool_.resolve(allocation);
             const auto staging = host.subspan(row * row_bytes, row_bytes);
-            auto* ids          = static_cast<std::int32_t*>(staging.data);
-            std::fill_n(ids, count, static_cast<std::int32_t>(row));
-            cache.tables().publish(row, 0, {ids, count}, staging, device_.execution_view());
-            pages[row] = row;
+            auto* offsets      = static_cast<std::int64_t*>(staging.data);
+            std::fill_n(offsets, count, static_cast<std::int64_t>(binding.offset));
+            cache.tables().publish(row, 0, {offsets, count}, staging, device_.execution_view());
+            const auto record = resources_.context.span().subspan(binding.offset, binding.bytes);
+            CUDA_CHECK(cudaMemsetAsync(record.data, 0, record.bytes, device_.stream()));
         }
-        cache.pages().zero_pages(pages, device_.execution_view());
     }
 
     Resources& resources_;
     DeviceContext& device_;
+    ContextPool pool_;
+    std::vector<AllocationId> records_;
+    std::vector<std::int64_t> state_offsets_;
     std::vector<PinnedHostBuffer> tables_;
 };
 

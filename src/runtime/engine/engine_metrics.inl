@@ -178,25 +178,22 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.decode_rounds     = executions[static_cast<std::size_t>(ExecutionKind::Decode)].units;
     snapshot.decode_row_rounds = executions[static_cast<std::size_t>(ExecutionKind::Decode)].rows;
     const auto physical        = instance_.session->physical_usage();
-    snapshot.device_state_occupied_slots = physical.occupied.state_slots;
+    snapshot.context_pools     = physical.pools;
+    snapshot.context_metadata  = physical.metadata;
+    snapshot.state_objects     = physical.state_objects;
+    snapshot.history_objects   = physical.history_objects;
     for (auto& pool : snapshot.kv_pools) {
-        pool.occupied_page_groups = physical.occupied.kv_page_groups[pool.id];
-        pool.capacity_page_groups = physical.capacity.kv_page_groups[pool.id];
+        pool.occupied_page_groups = physical.kv_page_groups.at(pool.id);
     }
 
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
     }
-    snapshot.prefilling_requests              = 0;
-    snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
-    snapshot.replaying_requests               = 0;
-    snapshot.host_context_occupied_bytes      = physical.occupied.host_bytes;
-    snapshot.host_state_occupied_slots        = physical.host_state_slots;
-    snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
-    snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
-    snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
-    snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.prefilling_requests    = 0;
+    snapshot.paused_requests        = static_cast<std::uint32_t>(paused_.size());
+    snapshot.replaying_requests     = 0;
+    snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;
@@ -252,7 +249,6 @@ void EngineCore<Instance>::record_context_work(
             timing.copy_operations += transfer.work.copy_operations;
         };
         accumulate(total);
-        cumulative_stats_.actual_context_transfer_seconds += transfer.elapsed_ns * 1.0e-9;
         if (owner) {
             if (!owner->first_output_timing) {
                 auto& observed =
@@ -267,6 +263,21 @@ void EngineCore<Instance>::record_context_work(
             }
         }
     }
+    std::uint64_t longest_rank_ns = 0;
+    for (std::size_t first = 0; first < progress.transfers.size(); ++first) {
+        const auto rank = progress.transfers[first].rank;
+        if (std::any_of(progress.transfers.begin(), progress.transfers.begin() + first,
+                        [=](const auto& transfer) { return transfer.rank == rank; }))
+            continue;
+        std::uint64_t rank_ns = 0;
+        for (const auto& transfer : progress.transfers) {
+            if (transfer.rank != rank) continue;
+            rank_ns = transfer.elapsed_ns > UINT64_MAX - rank_ns ? UINT64_MAX
+                                                                 : rank_ns + transfer.elapsed_ns;
+        }
+        longest_rank_ns = std::max(longest_rank_ns, rank_ns);
+    }
+    cumulative_stats_.actual_context_transfer_seconds += longest_rank_ns * 1.0e-9;
 }
 
 template <class Instance>

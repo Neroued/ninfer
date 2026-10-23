@@ -12,8 +12,9 @@
 namespace ninfer::ops::detail {
 
 template <class G>
-__device__ __forceinline__ std::int64_t bf16_kv_cache_index(int page, int head, int d, int offset) {
-    return kv::page_major_offset<G::kHeadDim, G::KVHeads>(page, head, offset, d);
+__device__ __forceinline__ std::int64_t bf16_kv_cache_index(std::int64_t page_offset, int head,
+                                                            int d, int offset) {
+    return kv::record_offset<G::kHeadDim, 2>(page_offset, head, offset, d);
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
@@ -22,17 +23,16 @@ __device__ __forceinline__ std::int64_t bf16_kv_cache_index(int page, int head, 
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
 template <typename Geometry, class Schedule, typename Element>
 __device__ __forceinline__ void bf16_kv_stage_tile(Element* dst, const Element* cache, int kv_head,
-                                                   int k0, int max_query_abs, int physical_page,
-                                                   int tid) {
+                                                   int k0, int max_query_abs,
+                                                   std::int64_t record_offset, int tid) {
     constexpr int D         = Geometry::kHeadDim;
     constexpr int Bc        = Schedule::kKeyRows;
     constexpr int Threads   = Schedule::kThreads;
     constexpr int VecPerRow = D / 8; // 8 two-byte elements per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
-    const Element* cache_block =
-        cache + kv::page_major_offset<Geometry::kHeadDim, Geometry::KVHeads>(physical_page, kv_head,
-                                                                             k0 & kv::kPageMask, 0);
+    const Element* cache_block = cache + kv::record_offset<Geometry::kHeadDim, sizeof(Element)>(
+                                             record_offset, kv_head, k0 & kv::kPageMask, 0);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {

@@ -20,13 +20,13 @@ CaptureReservation::~CaptureReservation() {
     for (const auto& [handle, role] : points) { owner->checkpoints.cancel(handle); }
 }
 
-bool SessionImpl::reclaim_capture_reservation(ContextResources shortage) {
+bool SessionImpl::reclaim_capture_reservation(const ContextAssessment& assessment) {
     for (auto& request : requests) {
         const auto& ticket = request.capture_reservation;
-        if (!ticket) { continue; }
-        const bool relevant =
-            (shortage.state_slots && state_store->device_resident(ticket->state)) ||
-            (shortage.host_bytes && ticket->host);
+        if (!ticket) continue;
+        const bool relevant = assessment.demand.memory == context::ContextMemory::Device
+                                  ? state_store->device_resident(ticket->state)
+                                  : ticket->host.has_value();
         if (relevant) {
             request.capture_reservation.reset();
             return true;
@@ -35,7 +35,8 @@ bool SessionImpl::reclaim_capture_reservation(ContextResources shortage) {
     return false;
 }
 
-bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier) {
+bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
+                                              std::span<const CheckpointHandle> host_victims) {
     auto& request = requests[lane];
     if (request.capture_reservation) { return request.capture_reservation->frontier == frontier; }
     if (request.next_capture >= request.capture_groups.size()) { return false; }
@@ -55,15 +56,34 @@ bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         }
         ticket->points.emplace_back(*point, role);
     }
-    auto destination = context::reserve_capture_destination(
-        *state_store, directory.host_allocation(), ticket->host);
-    if (!destination) { return false; }
-    ticket->state               = *destination;
+    if (host_victims.empty()) {
+        const auto destination = context::reserve_capture_destination(directory, ticket->host);
+        if (!destination) return false;
+        ticket->state = *destination;
+    } else {
+        const auto released = checkpoint_release_set(host_victims);
+        if (!released) return false;
+        const ContextDemand demand{
+            .new_states = 1, .logical_states = 0, .memory = context::ContextMemory::Host};
+        if (!directory.assess(demand, *released).ready()) return false;
+        const auto destination = state_store->reserve_logical_destination();
+        if (!destination) return false;
+        ticket->state = *destination;
+        for (const auto victim : host_victims)
+            if (!release_checkpoint(victim))
+                throw std::logic_error("capture Host victim changed after assessment");
+        auto backing = directory.reserve(demand);
+        if (!backing || !backing.reservation->ready())
+            throw std::logic_error("capture Host placement changed after assessment");
+        ticket->host.emplace(backing.reservation->take_state());
+    }
     request.capture_reservation = std::move(ticket);
     return true;
 }
 
-std::optional<CapturePreparation> SessionImpl::prepare_capture(SequenceHandle handle) {
+std::optional<CapturePreparation>
+SessionImpl::prepare_capture(SequenceHandle handle,
+                             std::span<const CheckpointHandle> host_victims) {
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
     const auto lane = this->lane(handle);
     auto& request   = requests[lane];
@@ -114,18 +134,17 @@ std::optional<CapturePreparation> SessionImpl::prepare_capture(SequenceHandle ha
             continue;
         }
         if (frontier > request.permit->main_frontier) { return std::nullopt; }
-        if (reserve_capture_destination(lane, frontier)) {
-            return CapturePreparation{.frontier = frontier,
-                                      .reserved = true,
+        if (reserve_capture_destination(lane, frontier, host_victims)) {
+            return CapturePreparation{.frontier       = frontier,
+                                      .reserved       = true,
+                                      .retired_points = {host_victims.begin(), host_victims.end()},
                                       .origin =
                                           request.capture_groups[request.next_capture].origin};
         }
         CapturePreparation result{.frontier = frontier,
                                   .origin   = request.capture_groups[request.next_capture].origin};
-        if (state_store->device_occupied() == state_store->device_capacity()) {
-            result.shortage.state_slots = 1;
-            result.host.state_images    = 1;
-        }
+        result.assessment        = directory.assess(ContextDemand{.new_states = 1});
+        result.host.state_images = 1;
         return result;
     }
     return std::nullopt;

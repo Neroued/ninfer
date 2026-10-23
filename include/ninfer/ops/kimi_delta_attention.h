@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/record_view.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -60,17 +61,17 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
                           CudaExecutionView execution);
 
 /**
- * Scratch-free one-token update for B independent state-pool slots, using the same head mapping.
+ * Scratch-free one-token update for B independent state records, using the same head mapping.
  * q/k BF16 [128,Hqk,1,B], v/g/out BF16 [128,Hv,1,B], beta BF16 [Hv,1,B],
- * A_log FP32 [Hv], dt_bias FP32 [128,Hv], states FP32 [128,128,Hv,Slots], device I32 slots [B].
- * State slots have dense [128,128,Hv] and explicit 16-byte-aligned nb[3]; other operands are
- * contiguous. B is in [1,8]. Caller-provided active slots are valid and distinct. Each row reads
- * and writes its selected state. Inputs, out, selectors and state do not overlap.
+ * A_log FP32 [Hv], dt_bias FP32 [128,Hv], and states selects dense FP32 [128,128,Hv] fields
+ * using device I64 [B] arena-relative byte offsets. Each field is 16-byte aligned and in bounds;
+ * other operands are contiguous. B is in [1,8]. Selected fields are distinct and updated in
+ * place. Inputs, output and metadata do not overlap selected state fields.
  */
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
-                                       Tensor& states, const Tensor& slots, Tensor& out,
+                                       StateFieldView states, Tensor& out,
                                        CudaExecutionView execution);
 
 } // namespace ninfer::ops

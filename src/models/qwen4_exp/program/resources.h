@@ -19,6 +19,8 @@ public:
     Resources(const Resources&)            = delete;
     Resources& operator=(const Resources&) = delete;
 
+    [[nodiscard]] MemorySpan context_backing() { return context_.span(); }
+
     [[nodiscard]] MemorySpan persistent() { return persistent_.span(); }
 
     [[nodiscard]] MemorySpan ingress() { return ingress_.span(); }
@@ -55,7 +57,7 @@ public:
     const ExecutionPlan plan;
 private:
     DeviceContext& device_;
-    DeviceBuffer persistent_, workspace_;
+    DeviceBuffer context_, persistent_, workspace_;
     PinnedHostBuffer ingress_, egress_, sampling_, mtp_ingress_, compute_aux_, context_counts_;
     PinnedHostBuffer host_context_;
     CudaStream ple_stream_;

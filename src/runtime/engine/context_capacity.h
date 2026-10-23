@@ -3,23 +3,27 @@
 #include "runtime/contract/resources.h"
 
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <vector>
 
 namespace ninfer::runtime {
 
 [[nodiscard]] ContextCapacityResolution
-resolve_context_capacity(const KvCapacityPolicy& policy, const ContextCacheOptions& cache,
-                         const ContextCapacityCurve& curve, std::size_t available_runtime_bytes);
+resolve_context_capacity(const ContextCapacityPolicy&, const ContextCapacityPlan&,
+                         std::size_t available_runtime_bytes, std::size_t available_host_bytes,
+                         bool shared_physical_memory, bool owns_control_memory = true);
 
 struct RankCapacityOffer {
-    ContextCapacityCurve curve;
-    std::size_t available_bytes;
+    ContextCapacityPlan plan;
+    std::size_t available_bytes      = 0;
+    std::size_t available_host_bytes = 0;
+    bool shared_physical_memory      = false;
 };
 
-// One logical page/state capacity, with each owner's byte cost evaluated separately.
+// Each rank keeps its own backing capacity. The control owner pays for all directories.
 [[nodiscard]] std::vector<ContextCapacityResolution>
-resolve_group_context_capacity(const KvCapacityPolicy&, const ContextCacheOptions&,
-                               std::span<const RankCapacityOffer>);
+resolve_group_context_capacity(const ContextCapacityPolicy&, std::span<const RankCapacityOffer>,
+                               std::optional<std::size_t> control_memory_owner);
 
 } // namespace ninfer::runtime

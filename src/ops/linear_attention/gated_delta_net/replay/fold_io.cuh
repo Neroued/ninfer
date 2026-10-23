@@ -56,8 +56,6 @@ struct FoldAccess {
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
-    std::int64_t recurrent_slot_stride;
-    std::int64_t conv_slot_stride;
     std::int32_t record_capacity;
     std::int32_t width;
     Rows rows;
@@ -96,15 +94,13 @@ struct FoldAccess {
     __device__ __forceinline__ const float*
     state_read_base(const RecurrentCoordinates& coord) const {
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(fold_row(rows, coord.batch).source_state_slot) *
-                   recurrent_slot_stride +
+               fold_row(rows, coord.batch).source_offset / sizeof(float) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(fold_row(rows, coord.batch).destination_state_slot) *
-                   recurrent_slot_stride +
+               fold_row(rows, coord.batch).destination_offset / sizeof(float) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
@@ -148,14 +144,10 @@ struct FoldAccess {
         const std::int32_t channel = tile_block * 128 + tid;
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(fold_row(rows, coord.batch).source_state_slot) *
-                conv_slot_stride +
-            channel;
+            fold_row(rows, coord.batch).source_offset / sizeof(__nv_bfloat16) + channel;
         __nv_bfloat16* destination_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(fold_row(rows, coord.batch).destination_state_slot) *
-                conv_slot_stride +
-            channel;
+            fold_row(rows, coord.batch).destination_offset / sizeof(__nv_bfloat16) + channel;
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
 

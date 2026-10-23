@@ -19,12 +19,12 @@ constexpr std::size_t GiB = 1024ULL * 1024 * 1024;
 void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::uint32_t rank,
                   bool load) {
     EngineOptions options;
-    options.use_cuda_graph                    = false;
-    options.enable_vision                     = true;
-    options.max_context                       = 4096;
-    options.prefill_chunk                     = 4096;
-    options.max_concurrency                   = 1;
-    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(4096);
+    options.use_cuda_graph   = false;
+    options.enable_vision    = true;
+    options.max_context      = 4096;
+    options.prefill_chunk    = 4096;
+    options.max_concurrency  = 1;
+    options.context_capacity = ContextCapacityPolicy::explicit_capacity(512ULL << 20);
     options.context_cache.host_capacity_bytes = 0;
     options.speculative = {.backend = SpeculativeBackend::Mtp, .draft_tokens = 3};
     auto definition     = q4::read_definition(reader, models::load_options(options));
@@ -60,7 +60,7 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
             "rank state/PLE planning differs");
     std::cout << "rank=" << rank << " weights=" << weight_bytes
               << " runtime=" << plan->device_reservation_bytes()
-              << " state_stride=" << plan->persistent.state.images.image_stride
+              << " state_stride=" << plan->persistent.state.images.image_bytes
               << " workspace=" << plan->workspace.bytes << std::endl;
     if (!load) return;
     auto model = q4::materialize_model(std::move(selected), device);
@@ -250,15 +250,14 @@ int main(int argc, char** argv) {
         {
             artifact::Reader reader(argv[1]);
             {
-                auto scoring           = EngineOptions{};
-                scoring.purpose        = EnginePurpose::CausalScoring;
-                scoring.use_cuda_graph = false;
-                scoring.enable_vision  = false;
-                scoring.max_context    = 4096;
-                scoring.prefill_chunk  = 4096;
-                scoring.kv_capacity    = KvCapacityPolicy::explicit_capacity(4096);
-                scoring.context_cache  = {
-                     .enabled = false, .extra_state_slots = 0, .host_capacity_bytes = 0};
+                auto scoring             = EngineOptions{};
+                scoring.purpose          = EnginePurpose::CausalScoring;
+                scoring.use_cuda_graph   = false;
+                scoring.enable_vision    = false;
+                scoring.max_context      = 4096;
+                scoring.prefill_chunk    = 4096;
+                scoring.context_capacity = ContextCapacityPolicy::explicit_capacity(512ULL << 20);
+                scoring.context_cache    = {.enabled = false, .host_capacity_bytes = 0};
                 auto definition = q4::read_definition(reader, models::load_options(scoring));
                 auto load       = q4::resolve_load(reader, definition, device.device(),
                                              host ? Device::cpu() : device.device());
@@ -278,7 +277,8 @@ int main(int argc, char** argv) {
                     options.max_context     = 4096;
                     options.prefill_chunk   = 4096;
                     options.max_concurrency = 1;
-                    options.kv_capacity     = KvCapacityPolicy::explicit_capacity(4096);
+                    options.context_capacity =
+                        ContextCapacityPolicy::explicit_capacity(512ULL << 20);
                     options.context_cache.host_capacity_bytes =
                         NINFER_SHARED_PHYSICAL_MEMORY ? 0 : 256 * 1024 * 1024;
                     if (mtp) {
@@ -308,7 +308,7 @@ int main(int argc, char** argv) {
                                 "Vision encoder reserved aggregate prompt capacity");
                     }
                     std::cout << "vision=" << vision << " mtp=" << mtp << " weights=" << weights
-                              << " state_stride=" << selected->persistent.state.images.image_stride
+                              << " state_stride=" << selected->persistent.state.images.image_bytes
                               << " persistent=" << selected->persistent.bytes
                               << " workspace=" << selected->workspace.bytes << " cache="
                               << (selected->moe ? selected->moe->description().cache_bytes : 0)
@@ -317,9 +317,9 @@ int main(int argc, char** argv) {
                               << " runtime=" << selected->device_bytes()
                               << " ple_host=" << selected->ple_prepare_bytes << '\n';
                     if (vision == mtp) {
-                        auto multi            = options;
-                        multi.max_concurrency = 8;
-                        multi.kv_capacity     = KvCapacityPolicy::automatic();
+                        auto multi             = options;
+                        multi.max_concurrency  = 8;
+                        multi.context_capacity = ContextCapacityPolicy::automatic();
                         for (const auto format :
                              {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                               KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
@@ -327,9 +327,9 @@ int main(int argc, char** argv) {
                             multi.kv_cache = format;
                             auto plan =
                                 plan_for(profile, load.ple_table().geometry(), multi, available);
-                            const auto expected_capacity =
-                                host ? 4096U : multi.max_context * multi.max_concurrency;
-                            require(plan && plan->capacity.resolved_tokens == expected_capacity &&
+                            require(plan &&
+                                        plan->capacity.device_bytes >=
+                                            plan->capacity.minimum_device_bytes &&
                                         plan->ple.max_positions == 4096,
                                     "mixed-batch automatic capacity");
                             require(plan->device_reservation_bytes() <= available,

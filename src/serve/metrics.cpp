@@ -2,6 +2,7 @@
 #include <chrono>
 
 #include "product/speculative_options.h"
+#include "product/statistics.h"
 
 #include <algorithm>
 #include <chrono>
@@ -204,35 +205,51 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
             "Draft tokens accepted by native verification.");
     COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
             "Speculative fallback steps without drafts.");
-    GAUGE(device_state_occupied_slots, "device_state_used_slots",
-          "Occupied device StateImage slots.");
-    gauge("device_state_capacity_slots", description_.device_state_capacity,
-          "Total device StateImage slots, including resident lanes.");
-    header("device_kv_used_page_groups", "gauge", "Occupied physical KV page groups by pool.");
-    header("device_kv_capacity_page_groups", "gauge", "Physical KV page-group capacity by pool.");
-    for (const auto& pool : stats.kv_pools) {
-        out << "ninfer_device_kv_used_page_groups{pool_id=\"" << pool.id << "\"} "
-            << pool.occupied_page_groups << '\n';
-        out << "ninfer_device_kv_capacity_page_groups{pool_id=\"" << pool.id << "\"} "
-            << pool.capacity_page_groups << '\n';
+    GAUGE(state_objects, "context_state_objects", "Live logical State objects.");
+    GAUGE(history_objects, "context_history_objects", "Live logical histories.");
+    header("context_pool_bytes", "gauge",
+           "Context backing accounting by rank and domain; "
+           "live/reserved/retirement/padding/free/tail are disjoint.");
+    header("context_pool_reserved_detail_bytes", "gauge",
+           "Relocation is part of reserved occupancy; future reservations have no physical target "
+           "yet.");
+    header("context_pool_peak_bytes", "gauge",
+           "Lifetime peak physical Context occupancy by rank and domain.");
+    for (const auto& pool : stats.context_pools) {
+        const auto emit = [&](const char* metric, const char* kind, std::uint64_t bytes) {
+            out << "ninfer_" << metric << "{rank=\"" << pool.rank << "\",domain=\""
+                << product::context_domain_name(pool.domain) << "\",kind=\"" << kind << "\"} "
+                << bytes << '\n';
+        };
+        emit("context_pool_bytes", "capacity", pool.capacity_bytes);
+        emit("context_pool_bytes", "live", pool.live_bytes);
+        emit("context_pool_bytes", "reserved", pool.reserved_bytes);
+        emit("context_pool_bytes", "pending_retirement", pool.pending_retirement_bytes);
+        emit("context_pool_bytes", "padding", pool.padding_bytes);
+        emit("context_pool_bytes", "assigned_free", pool.assigned_free_bytes);
+        emit("context_pool_bytes", "unassigned_free", pool.unassigned_free_bytes);
+        emit("context_pool_bytes", "tail", pool.tail_bytes);
+        emit("context_pool_reserved_detail_bytes", "relocation", pool.relocation_bytes);
+        emit("context_pool_reserved_detail_bytes", "future", pool.future_reserved_bytes);
+        out << "ninfer_context_pool_peak_bytes{rank=\"" << pool.rank << "\",domain=\""
+            << product::context_domain_name(pool.domain) << "\"} " << pool.peak_occupied_bytes
+            << '\n';
     }
-    GAUGE(host_context_occupied_bytes, "host_context_used_bytes",
-          "Occupied Host backing, including reservations.");
-    GAUGE(host_context_reserved_bytes, "host_context_reserved_bytes",
-          "Reserved Host bytes, a subset of used bytes.");
-    gauge("host_context_capacity_bytes", description_.host_context_capacity_bytes,
-          "Shared pinned Host backing capacity.");
-    GAUGE(host_context_peak_occupied_bytes, "host_context_peak_bytes",
-          "Host backing high-water mark, including reservations.");
-    GAUGE(host_state_occupied_slots, "host_state_images",
-          "StateImages in the shared Host backing.");
-    GAUGE(host_kv_occupied_bytes, "host_kv_used_bytes",
-          "KV bytes in the shared Host backing, a subset of used bytes.");
+    gauge("context_metadata_budget_bytes", stats.context_metadata.budget_bytes,
+          "Coordinator budget for Context metadata.");
+    gauge("context_metadata_allocated_bytes", stats.context_metadata.allocated_bytes,
+          "Allocated Context metadata.");
+    gauge("context_metadata_reserved_bytes", stats.context_metadata.reserved_bytes,
+          "Reserved Context metadata.");
+    header("context_kv_page_groups", "gauge", "Live logical KV page groups by history kind.");
+    for (const auto& pool : stats.kv_pools)
+        out << "ninfer_context_kv_page_groups{pool_id=\"" << pool.id << "\"} "
+            << pool.occupied_page_groups << '\n';
 #undef GAUGE
 #undef COUNTER
 
     header("context_transfer_bytes_total", "counter", "Completed context payload transfers.");
-    constexpr std::array directions{"d2h", "h2d", "d2d"};
+    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h"};
     for (std::size_t i = 0; i < directions.size(); ++i) {
         out << "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\""
             << directions[i] << "\"} "
@@ -446,6 +463,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
         allocation("weights", "device", a.device_weights_bytes);
         allocation("weights", "host", a.host_weights_bytes);
         allocation("persistent", "device", a.persistent_device_bytes);
+        allocation("context", "device", a.context_device_bytes);
         allocation("workspace", "device", a.workspace_device_bytes);
         allocation("io", "host_pinned", a.io_pinned_bytes);
         allocation("context", "host_pinned", a.host_context_bytes);

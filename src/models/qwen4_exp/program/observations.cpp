@@ -27,6 +27,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.host_weights_bytes       = weights.host_capacity_bytes;
     a.registered_weights_bytes = weights.registered_host_bytes;
     a.persistent_device_bytes  = plan.persistent.bytes;
+    a.context_device_bytes     = plan.capacity.device_bytes;
     a.workspace_device_bytes   = plan.workspace.bytes;
     a.io_pinned_bytes = plan.pinned_draft_bytes + plan.pinned_io_bytes + plan.pinned_output_bytes +
                         plan.pinned_sampling_bytes + plan.pinned_mtp_bytes +
@@ -48,10 +49,6 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
                                 device_graphs ? device_graphs->workspace_peak() : 0,
                                 commit_graphs ? commit_graphs->workspace_peak() : 0});
     out.workspace   = {resources.workspace.used(), std::max(workspace_lifetime_peak, peak), peak};
-    for (std::uint32_t i = 0; i < resources.pool_count(); ++i) {
-        const auto& pool = resources.pool(i).pages();
-        out.kv_payload_bytes += pool.device_copy_work(1).payload_bytes * pool.capacity_pages();
-    }
     if (plan.workspace.vision) {
         const auto& vision              = *plan.workspace.vision;
         auto& summary                   = out.vision.emplace();

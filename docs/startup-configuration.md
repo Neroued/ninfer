@@ -43,19 +43,17 @@ CLI 的生成参数形成本次请求；serve 的生成参数是 HTTP 请求的�
 | 项目 | CLI 入口默认 | Serve 入口默认 |
 |---|---|---|
 | max_context | 8192 | 8192 |
-| kv_capacity | 最终 max_context | 最终 max_context |
+| context_capacity | auto | auto |
 | max_concurrency | 1 | 1 |
 | 输出上限 | 128 | 8192，HTTP 请求可覆盖 |
 | prefix_reuse | false | true |
-| extra_state_slots | 0 | 最终 max_concurrency |
 | Host cache | 0 B | RTX 5090：8 GiB + 8 个原生 StateImage；Spark：0 B |
 | seed | 0 | 每请求随机 |
 
 入口默认只用于用户未设置或显式恢复默认的字段。CLI `main()` 直接采用解析后的资源设置；
 配置明确要求并发资源或缓存时予以保留，CLI 仍只提交自己的一个请求。
-公共 EngineOptions 与产品的共同引擎默认使用同一来源；其默认 context
-与显式 KV 基础值均为 8192。产品中省略 KV 的跟随规则在完成所有覆盖后解析，直接
-C++ 调用者提供的 KvCapacityPolicy 仍具有明确的显式/自动语义。
+公共 EngineOptions 与产品使用同一默认来源。ContextCapacityPolicy 表达显式字节容量或
+自动预算；单请求的 max_context 默认仍为 8192，与物理 backing 容量独立。
 
 ### 1.2 值类型与恢复默认
 
@@ -130,7 +128,7 @@ HTTP(S)、data URI、绝对路径保持原含义；显式 `--media-root` 的工�
 | `engine.device` | `--device` | 非负 int / 0 | 当前单 rank 的本地 CUDA ordinal |
 | `engine.max_context` | `--max-context` | 正 uint32 / 8192 | 单请求逻辑 context 上限，包含已处理输入和后续生成 |
 | `engine.kv_dtype` | `--kv-dtype` | 枚举 / `bf16` | `bf16/int8/fp8/nvfp4/k8v4`，实际表示支持由消费者判断 |
-| `engine.kv_capacity` | `--kv-capacity` | 正整数、`context`、`auto` / `context` | 共享 Main KV 的 token 容量；其余 pool 由模型计划派生。资源规划检查上下文、并发、页对齐与预算关系 |
+| `engine.context_capacity` | `--context-capacity` | 字节容量或 `auto` / `auto` | 每 rank Device Context 总容量，State 与各 KV history 共用；资源准备验证完整工作集与预算 |
 | `engine.prefill_chunk` | `--prefill-chunk` | 128 的正整数倍或 `default` / `default` | default 为 Qwen4Exp/CPU expert offload 4096，其余 1024；实际窗口还受 context 限制；不接受 `auto` 或 0 |
 | `engine.cuda_graph` | `--cuda-graph` / `--no-cuda-graph` | bool / true | 选择当前已有 Graph 执行路径；Graph 粒度由原生执行计划决定 |
 | `engine.max_concurrency` | `--max-concurrency` | 1..8 / 1 | 启动固定 resident execution lanes；决定活动 State 基础容量 |
@@ -145,7 +143,6 @@ Vision、speculative 及具体格式的可用性不在 parser 建立模型能力
 | TOML 字段 | 命令行 | 类型 / 默认 | 含义与行为 |
 |---|---|---|---|
 | `context_cache.prefix_reuse` | `--prefix-reuse` / `--no-prefix-reuse` | bool 或 `default` / 入口默认 | 控制跨请求历史的读取与保留；暂停/Replay 机制继续可用 |
-| `context_cache.extra_state_slots` | **`--extra-state-slots`** | 非负 uint32 或 `default` / CLI 0、serve C | 活动 C 个 StateImage 之外的额外完整 StateImage 槽位 |
 | `context_cache.host_capacity` | **`--host-cache-capacity`** | 容量或 `default` / 入口与目标默认 | Host State/KV、暂停快照和在途目的区共用的总预算；0 B 不建立该 backing |
 | `context_cache.cost_presets` | `--context-cost-presets` | 路径 / `""` | 现有 context-cost JSON 预设；匹配项覆盖已有成本参数，缺失项沿用原值 |
 | `media.cache_capacity` | `--media-cache-capacity` | 容量 / `1GiB` | 已准备媒体的保留额度；0 B 禁用 retained media reuse |
@@ -166,14 +163,8 @@ Vision、speculative 及具体格式的可用性不在 parser 建立模型能力
 - 将 Host 容量设为 0 后，保留 Device checkpoint 和可行的 Replay 路径；不会据此
   关闭 CPU expert offload。
 
-`extra_state_slots` 的具体约定：
-
-- StateImage 主池总槽数为 `max_concurrency + extra_state_slots`，不是每请求再加一份。
-- 例如 C=4、extra=2，共 6 个完整 images；extra=0 仍有 4 个活动 images。
-- 一个 image 的字段和字节数由模型及未来 ParallelPlan 决定。GDN records、workspace、
-  KV 页及 backend 临时区独立计费，不由这个整数概括。
-- Engine 接口为 `ContextCacheOptions::extra_state_slots`。描述物理总槽数、
-  当前占用量的统计字段分别保留自身含义。
+State 字段与记录大小来自模型布局，不设置独立槽数。固定 backing 中能保留多少 State 或 KV
+由当前对象组合和记录 packing 决定；长期 checkpoint 可以使用活动请求之外的剩余容量。
 
 配置文件覆盖 CLI/serve 的全部用户参数。Engine 内部的
 `purpose`、startup callback、模型 expert-priority 数组、grammar cache 容量和
@@ -288,9 +279,9 @@ model          artifact           /home/neroued/ninfer/out/qwen3_8_flash_next.ni
 engine         context            32,768 tokens
                concurrency        2
                prefill chunk      4,096 tokens
-               KV                 fp8 / 65,536 tokens
+               KV                 fp8
+               context capacity   auto
 context cache  prefix reuse       enabled
-               extra state slots  2  (4 total)
                host capacity      default (target/model)
 speculative    backend            mtp / 3 drafts / full head
 generation     temperature        model default
@@ -310,13 +301,13 @@ server         listen             127.0.0.1:8080
 
 ### 3.2 请求值与实际值
 
-启动前可以确定来源、合并值、路径、明确容量与入口默认；无需设备的派生值可以
-立即计算，例如 extra slots=2、C=2 的总槽数为 4。
+启动前展示来源、合并值、路径、明确容量与入口默认。依赖模型与设备的结果由其 owner
+完成准备后提供。
 
-`prefill_chunk=default`、`kv_capacity=auto`、模型采样默认、原生 StateImage 字节数、
+`prefill_chunk=default`、`context_capacity=auto`、模型采样默认、原生 StateImage 字节数、
 Host default 和 Graph/权重容量等未决事实保持标记。Engine 准备完成后消费实际
 EngineOptions、LoadSummary、MemorySummary 输出 resolved 摘要，展示实际 chunk、
-KV/State/Host 容量及资源规划结果。
+各 rank 的 Context backing、逻辑对象统计及资源规划结果。
 
 ### 3.3 结构化日志
 
@@ -340,8 +331,8 @@ CLI 和 GenerationService 直接将 `launch.engine` 交给 Engine，并绑定自
 
 `src/product/logging/configuration.*` 负责可读展示，serve 的 request log 负责 JSONL。
 `startup_config` 保存启动请求值和来源，`server_start` 保存准备后的实际事实。
-当前 request log schema 为 31；`engine.context_cache.extra_state_slots` 表示额外槽位，
-`total_device_state_slots` 表示总槽位，throughput 的占用量字段保持独立。
+资源日志分别保存 Context backing 容量、各占用类别与控制元数据预算；逻辑 KV pool 和 State
+对象数不再充当独立容量。字段与 Prometheus 输出见 [Serving](serving.md#live-metrics)。
 
 解析器固定为 [toml++ v3.4.0](https://github.com/marzer/tomlplusplus/releases/tag/v3.4.0)，
 MIT 许可证。`third_party/tomlplusplus/` 保存未修改的上游单头文件和许可证。

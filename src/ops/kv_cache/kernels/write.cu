@@ -30,10 +30,10 @@ WriteArguments arguments(const Tensor& k, const Tensor& v, const Tensor& positio
     return {static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data),
-            cache.k_pages.data,
-            cache.v_pages.data,
-            cache.k_scale_pages.data,
-            cache.v_scale_pages.data,
+            cache.k_pages.data(),
+            cache.v_pages.data(),
+            cache.k_scale_pages.data(),
+            cache.v_scale_pages.data(),
             k.ne[2],
             k.ne[3]};
 }
@@ -160,9 +160,10 @@ void geometry_dispatch(int heads, KvCacheStorage storage, PagedWriteInstance ins
 
 void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tensor& v,
                         const Tensor& positions, PagedKVLayerView cache, cudaStream_t stream) {
-    geometry_dispatch(k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
-                      DirectMetadata{static_cast<const std::int32_t*>(cache.block_table.data)},
-                      stream);
+    geometry_dispatch(
+        k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
+        DirectMetadata{static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data)},
+        stream);
 }
 
 void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tensor& v,
@@ -171,9 +172,10 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
                         cudaStream_t stream) {
     const auto launch = [&]<bool Masked>() {
         const BatchMetadata<Masked> metadata{
-            static_cast<const std::int32_t*>(cache.block_tables.data),
+            static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
             static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<const std::int32_t*>(table_rows.data), cache.block_tables.ne[0]};
+            static_cast<const std::int32_t*>(table_rows.data),
+            cache.k_pages.records.page_offsets.ne[0]};
         geometry_dispatch(k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
                           metadata, stream);
     };

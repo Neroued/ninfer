@@ -12,7 +12,7 @@ enum class SparseGqaLoad { Direct, Staged, InPlace };
 
 struct SparseGqaPage {
     const std::uint8_t* data;
-    std::int64_t row, head, page; // Byte strides for both data and scale planes.
+    std::int64_t row, head; // Byte strides within one record.
 };
 
 struct SparseGqaWork {
@@ -23,7 +23,9 @@ struct SparseGqaArguments {
     const __nv_bfloat16 *query, *gate;
     __nv_bfloat16* out;
     SparseGqaPage key, value, key_scale, value_scale;
-    const int *positions, *valid, *table_rows, *tables, *ids, *counts;
+    const int *positions, *valid, *table_rows;
+    const std::int64_t* tables;
+    const int *ids, *counts;
     std::int64_t table_stride;
     float *numerator, *maximum, *sum;
     int tokens, batch, splits, key_rows;

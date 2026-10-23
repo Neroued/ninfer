@@ -83,10 +83,12 @@ void log_configuration(spdlog::logger& logger, const StartupConfigurationView& v
 }
 
 void log_resolved_configuration(spdlog::logger& logger, const EngineDescription& description) {
-    logger.info("resolved       prefill chunk={}  KV={} tokens  StateImages={}  Host={}",
-                description.prefill_chunk, description.kv_capacity,
-                description.device_state_capacity,
-                format_pretty_bytes(description.host_context_capacity_bytes));
+    logger.info("resolved       prefill chunk={}", description.prefill_chunk);
+    for (const auto& pool : description.context_pools)
+        logger.info("context        rank={}  {}={}  block={}", pool.rank,
+                    pool.domain == ContextMemoryDomain::Device ? "device" : "host",
+                    format_pretty_bytes(pool.capacity_bytes),
+                    format_pretty_bytes(pool.block_bytes));
 }
 
 } // namespace ninfer::product

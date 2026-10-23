@@ -73,11 +73,9 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.boolean(o.use_cuda_graph);
     out.boolean(o.observability.gpu_timing);
     out.boolean(o.context_cache.enabled);
-    out.boolean(o.context_cache.extra_state_slots.has_value());
-    if (o.context_cache.extra_state_slots) out.u32(*o.context_cache.extra_state_slots);
     out.u32(o.context_cache.checkpoint_interval);
     out.u64(o.context_cache.host_capacity_bytes.value_or(0));
-    out.u64(std::max(kDefaultKvCapacityHeadroomBytes, o.kv_capacity.automatic_headroom_bytes));
+    out.u64(std::max(kDefaultContextHeadroomBytes, o.context_capacity.automatic_headroom_bytes));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
 }
@@ -116,23 +114,22 @@ RankLoadRequest decode_rank_load(Decoder& in) {
         bank.resize(in.count(4));
         for (auto& e : bank) e = in.u32();
     }
-    auto& o                     = request.options;
-    o.purpose                   = static_cast<EnginePurpose>(in.u8());
-    o.max_context               = in.u32();
-    o.max_concurrency           = in.u32();
-    o.prefill_chunk             = in.u32();
-    o.kv_cache                  = static_cast<KvCacheStorage>(in.u8());
-    o.speculative.backend       = static_cast<SpeculativeBackend>(in.u8());
-    o.speculative.draft_tokens  = in.u32();
-    o.speculative.proposal_head = static_cast<ProposalHead>(in.u8());
-    o.enable_vision             = in.boolean();
-    o.use_cuda_graph            = in.boolean();
-    o.observability.gpu_timing  = in.boolean();
-    o.context_cache.enabled     = in.boolean();
-    if (in.boolean()) o.context_cache.extra_state_slots = in.u32();
+    auto& o                             = request.options;
+    o.purpose                           = static_cast<EnginePurpose>(in.u8());
+    o.max_context                       = in.u32();
+    o.max_concurrency                   = in.u32();
+    o.prefill_chunk                     = in.u32();
+    o.kv_cache                          = static_cast<KvCacheStorage>(in.u8());
+    o.speculative.backend               = static_cast<SpeculativeBackend>(in.u8());
+    o.speculative.draft_tokens          = in.u32();
+    o.speculative.proposal_head         = static_cast<ProposalHead>(in.u8());
+    o.enable_vision                     = in.boolean();
+    o.use_cuda_graph                    = in.boolean();
+    o.observability.gpu_timing          = in.boolean();
+    o.context_cache.enabled             = in.boolean();
     o.context_cache.checkpoint_interval = in.u32();
     o.context_cache.host_capacity_bytes = in.u64();
-    o.kv_capacity                       = KvCapacityPolicy::automatic(in.u64());
+    o.context_capacity                  = ContextCapacityPolicy::automatic(in.u64());
     request.host_reservation_bytes      = in.u64();
     request.control_owner               = in.boolean();
     return request;
@@ -148,33 +145,35 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.boolean(s.cuda_graph);
     out.boolean(s.gpu_timing);
     const auto& c = p.context;
+    out.u64(c.ranks.size());
+    for (const auto& rank : c.ranks) {
+        out.u32(rank.rank);
+        out.u64(rank.device_bytes);
+        out.u64(rank.host_bytes);
+    }
     out.u32(c.state.logical_capacity);
-    out.u32(c.state.device_slots);
-    out.u64(c.state.image_bytes);
-    out.u32(c.host.pool_id);
-    out.u64(c.host.bytes);
-    out.u64(c.host.minimum_bytes);
-    out.u32(c.host.extent_count);
+    out.u64(c.state.layouts.size());
+    for (const auto& layout : c.state.layouts) {
+        out.u32(layout.variant);
+        out.u64(layout.parts.size());
+        for (const auto& part : layout.parts) {
+            out.u32(part.rank);
+            out.u64(part.image_bytes);
+            out.u64(part.alignment);
+        }
+    }
+    out.u64(c.metadata_budget_bytes);
     out.u64(c.pools.size());
     for (const auto& pool : c.pools) {
-        for (auto n : {pool.pool_id, pool.device_pages, pool.logical_pages, pool.histories,
-                       pool.page_capacity, pool.table_rows})
+        for (auto n : {pool.pool_id, pool.logical_pages, pool.histories, pool.page_capacity,
+                       pool.table_rows})
             out.u32(n);
-        const auto& g = pool.geometry;
-        out.u32(g.page_tokens);
-        out.u8(static_cast<std::uint8_t>(g.device_plane_order));
-        out.u64(g.planes.size());
-        for (const auto& plane : g.planes) {
-            out.u8(static_cast<std::uint8_t>(plane.dtype));
-            out.i32(plane.leading_extent);
-            out.i32(plane.head_extent);
-            out.u64(plane.alignment);
-            out.u32(plane.tokens_per_row);
+        out.u64(pool.parts.size());
+        for (const auto& part : pool.parts) {
+            out.u32(part.rank);
+            out.u64(part.record.bytes);
+            out.u64(part.record.alignment);
         }
-        out.u64(pool.transfer.page_payload_bytes);
-        out.u32(pool.transfer.device_copy_operations);
-        out.u64(pool.transfer.host_operations.size());
-        for (auto n : pool.transfer.host_operations) out.u32(n);
     }
     out.u64(p.vision_max_merged_tokens);
     out.u32(p.checkpoint_interval);
@@ -197,26 +196,25 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                in.boolean(),
                in.boolean()};
     auto& c = p.context;
-    c.state = {in.u32(), in.u32(), in.u64()};
-    c.host  = {in.u32(), in.u64(), in.u64(), in.u32()};
-    c.pools.resize(in.count(57));
+    c.ranks.resize(in.count(20));
+    for (auto& rank : c.ranks) rank = {in.u32(), in.u64(), in.u64()};
+    c.state.logical_capacity = in.u32();
+    c.state.layouts.resize(in.count(12));
+    for (auto& layout : c.state.layouts) {
+        layout.variant = in.u32();
+        layout.parts.resize(in.count(20));
+        for (auto& part : layout.parts) part = {in.u32(), in.u64(), in.u64()};
+    }
+    c.metadata_budget_bytes = in.u64();
+    c.pools.resize(in.count(28));
     for (auto& pool : c.pools) {
-        pool.pool_id         = in.u32();
-        pool.device_pages    = in.u32();
-        pool.logical_pages   = in.u32();
-        pool.histories       = in.u32();
-        pool.page_capacity   = in.u32();
-        pool.table_rows      = in.u32();
-        auto& g              = pool.geometry;
-        g.page_tokens        = in.u32();
-        g.device_plane_order = static_cast<PagedKVPlaneOrder>(in.u8());
-        g.planes.resize(in.count(21));
-        for (auto& plane : g.planes)
-            plane = {static_cast<DType>(in.u8()), in.i32(), in.i32(), in.u64(), in.u32()};
-        pool.transfer.page_payload_bytes     = in.u64();
-        pool.transfer.device_copy_operations = in.u32();
-        pool.transfer.host_operations.resize(in.count(4));
-        for (auto& n : pool.transfer.host_operations) n = in.u32();
+        pool.pool_id       = in.u32();
+        pool.logical_pages = in.u32();
+        pool.histories     = in.u32();
+        pool.page_capacity = in.u32();
+        pool.table_rows    = in.u32();
+        pool.parts.resize(in.count(20));
+        for (auto& part : pool.parts) part = {in.u32(), {in.u64(), in.u64()}};
     }
     p.vision_max_merged_tokens = in.u64();
     p.checkpoint_interval      = in.u32();

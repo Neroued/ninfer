@@ -6,6 +6,7 @@
 
 #include "ninfer/ops/softmax_attention.h"
 #include "core/buffer.h"
+#include "../../tools/support/paged_kv_fixture.h"
 #include "ninfer/ops/kv_cache_append.h"
 
 #include "core/device.h"
@@ -321,63 +322,40 @@ Options parse_options(int argc, char** argv) {
 
 std::int32_t align_context(std::int32_t visible) { return ((visible + 127) / 128) * 128; }
 
-std::size_t data_plane_bytes(const Geometry& geometry, const PagedKVVectorLayout& layout,
-                             std::int32_t physical_pages) {
-    return static_cast<std::size_t>(layout.data_leading_extent) * geometry.kv_heads *
-           kPagedKVPageSize * physical_pages * dtype_size(layout.data_dtype);
-}
-
-std::size_t scale_plane_bytes(const Geometry& geometry, const PagedKVVectorLayout& layout,
-                              std::int32_t physical_pages) {
-    return static_cast<std::size_t>(layout.scale_leading_extent) * geometry.kv_heads *
-           kPagedKVPageSize * physical_pages * dtype_size(layout.scale_dtype);
-}
-
-PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
-                                 DeviceBuffer& v_scale, DeviceBuffer& block_table,
-                                 const Geometry& geometry, KvCacheStorage storage,
-                                 std::int32_t padded, std::int32_t physical_pages) {
-    const PagedKVStorageLayout layout = paged_kv_storage_layout(storage, kHeadDim);
-    const std::int32_t logical_pages  = padded / kPagedKVPageSize;
-    return {
-        .k_pages = Tensor(
-            k.span(), layout.key.data_dtype,
-            {layout.key.data_leading_extent, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
-        .v_pages       = Tensor(v.span(), layout.value.data_dtype,
-                                {layout.value.data_leading_extent, kPagedKVPageSize, geometry.kv_heads,
-                                 physical_pages}),
-        .k_scale_pages = layout.key.has_scale()
-                             ? Tensor(k_scale.span(), layout.key.scale_dtype,
-                                      {layout.key.scale_leading_extent, kPagedKVPageSize,
-                                       geometry.kv_heads, physical_pages})
-                             : Tensor(),
-        .v_scale_pages = layout.value.has_scale()
-                             ? Tensor(v_scale.span(), layout.value.scale_dtype,
-                                      {layout.value.scale_leading_extent, kPagedKVPageSize,
-                                       geometry.kv_heads, physical_pages})
-                             : Tensor(),
-        .block_table   = Tensor(block_table.span(), DType::I32, {logical_pages}),
-        .head_dim      = kHeadDim,
-        .num_kv_heads  = geometry.kv_heads,
-        .storage       = storage,
-    };
-}
-
-PagedKVBatchLayerView make_batch_cache_view(const PagedKVLayerView& cache) {
-    return single_row_paged_kv_batch_view(cache);
-}
-
-PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
-                                            DeviceBuffer& v_scale, DeviceBuffer& block_tables,
-                                            const Geometry& geometry, KvCacheStorage storage,
-                                            std::int32_t padded, std::int32_t physical_pages,
-                                            std::int32_t table_rows) {
-    const PagedKVLayerView direct = make_cache_view(k, v, k_scale, v_scale, block_tables, geometry,
-                                                    storage, padded, physical_pages);
-    PagedKVBatchLayerView result  = make_batch_cache_view(direct);
-    result.block_tables =
-        Tensor(block_tables.span(), DType::I32, {padded / kPagedKVPageSize, table_rows});
+KVPageGeometry cache_geometry(const Geometry& geometry, KvCacheStorage storage) {
+    const auto layout = paged_kv_storage_layout(storage, kHeadDim);
+    KVPageGeometry result;
+    result.planes.reserve(4);
+    result.planes.push_back(
+        {layout.key.data_dtype, layout.key.data_leading_extent, geometry.kv_heads});
+    result.planes.push_back(
+        {layout.value.data_dtype, layout.value.data_leading_extent, geometry.kv_heads});
+    if (layout.key.has_scale())
+        result.planes.push_back(
+            {layout.key.scale_dtype, layout.key.scale_leading_extent, geometry.kv_heads});
+    if (layout.value.has_scale())
+        result.planes.push_back(
+            {layout.value.scale_dtype, layout.value.scale_leading_extent, geometry.kv_heads});
     return result;
+}
+
+PagedKVLayerView make_cache_view(tool::PackedKVFixture& packed, const Tensor& offsets,
+                                 const Geometry& geometry, KvCacheStorage storage) {
+    PagedKVLayerView result{.k_pages      = packed.plane(0, offsets),
+                            .v_pages      = packed.plane(1, offsets),
+                            .head_dim     = kHeadDim,
+                            .num_kv_heads = geometry.kv_heads,
+                            .storage      = storage};
+    if (packed.layout().planes.size() > 2) {
+        result.k_scale_pages = packed.plane(2, offsets);
+        result.v_scale_pages = packed.plane(3, offsets);
+    }
+    return result;
+}
+
+PagedKVBatchLayerView make_batch_cache_view(const PagedKVLayerView& direct) {
+    return {direct.k_pages,  direct.v_pages,      direct.k_scale_pages, direct.v_scale_pages,
+            direct.head_dim, direct.num_kv_heads, direct.storage};
 }
 
 std::size_t workspace_capacity(const Geometry& geometry, KvCacheStorage storage,
@@ -415,8 +393,7 @@ public:
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
          std::span<const std::int32_t> table_rows, PageMapping mapping, int envelope_max,
          CudaExecutionView execution)
-        : execution_(execution), storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
-          batch_(static_cast<std::int32_t>(contexts.size())),
+        : execution_(execution), batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
                               [tokens](std::int32_t valid) { return valid != tokens; })),
           visible_(profile_visible(contexts, valid_columns)),
@@ -438,20 +415,10 @@ public:
                          static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
           table_rows_(ninfer::bench::device_context().device(),
                       static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
-          cache_k_(
-              bench::make_zeros(data_plane_bytes(geometry, storage_layout_.key, physical_pages_))),
-          cache_v_(bench::make_zeros(
-              data_plane_bytes(geometry, storage_layout_.value, physical_pages_))),
-          cache_k_scale_(bench::make_zeros(
-              storage_layout_.key.has_scale()
-                  ? scale_plane_bytes(geometry, storage_layout_.key, physical_pages_)
-                  : std::size_t{1})),
-          cache_v_scale_(bench::make_zeros(
-              storage_layout_.value.has_scale()
-                  ? scale_plane_bytes(geometry, storage_layout_.value, physical_pages_)
-                  : std::size_t{1})),
+          packed_(bench::device_context().device(), cache_geometry(geometry, storage),
+                  physical_pages_),
           block_table_(ninfer::bench::device_context().device(),
-                       static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
+                       static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int64_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
           workspace_bytes_(
@@ -466,11 +433,12 @@ public:
           table_rows_tensor_(table_rows_.span(), DType::I32, {batch_}),
           output_tensor_(output_.span(), DType::BF16,
                          {kHeadDim, geometry.query_heads, tokens, batch_}),
-          cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
-                                      block_table_, geometry, storage, padded_, physical_pages_)),
-          batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
-                                                  cache_v_scale_, block_table_, geometry, storage,
-                                                  padded_, physical_pages_, batch_)) {
+          cache_view_(make_cache_view(packed_,
+                                      Tensor(block_table_.span(), DType::I64, {logical_pages_}),
+                                      geometry, storage)),
+          batch_cache_view_(make_batch_cache_view(make_cache_view(
+              packed_, Tensor(block_table_.span(), DType::I64, {logical_pages_, batch_}), geometry,
+              storage))) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch_, 0);
         for (std::int32_t row = 0; row < batch_; ++row) {
             const std::int32_t valid = valid_columns[static_cast<std::size_t>(row)];
@@ -484,12 +452,13 @@ public:
                 host_positions[static_cast<std::size_t>(row) * tokens + token] = padding_position;
             }
         }
-        std::vector<std::int32_t> host_table(static_cast<std::size_t>(logical_pages_) * batch_);
+        std::vector<std::int64_t> host_table(static_cast<std::size_t>(logical_pages_) * batch_);
         for (std::int32_t row = 0; row < batch_; ++row) {
             for (std::int32_t page = 0; page < logical_pages_; ++page) {
                 const std::int32_t linear = row * logical_pages_ + page;
                 host_table[static_cast<std::size_t>(row) * logical_pages_ + page] =
-                    mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
+                    packed_.physical_offset(mapping_ == PageMapping::Identity ? linear
+                                                                              : 2 * linear + 1);
             }
         }
         CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
@@ -515,10 +484,11 @@ public:
                 varied_values(std::size_t(kHeadDim) * geometry.kv_heads * padded_, 311 + row, 1.f);
             Tensor k(initial_k.span(), DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
             Tensor v(initial_v.span(), DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
-            auto row_cache = cache_view_;
-            row_cache.block_table =
-                Tensor(block_table_.span().subspan(std::size_t(row) * logical_pages_ * 4),
-                       DType::I32, {logical_pages_});
+            auto row_cache = make_cache_view(
+                packed_,
+                Tensor(block_table_.span().subspan(std::size_t(row) * logical_pages_ * 8),
+                       DType::I64, {logical_pages_}),
+                geometry, storage);
             ops::kv_cache_append(k, v, positions, row_cache, bench::default_execution());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -550,7 +520,6 @@ public:
 
 private:
     CudaExecutionView execution_;
-    PagedKVStorageLayout storage_layout_;
     std::int32_t batch_;
     bool masked_;
     std::int32_t visible_;
@@ -565,10 +534,7 @@ private:
     DeviceBuffer positions_;
     DeviceBuffer valid_columns_;
     DeviceBuffer table_rows_;
-    DeviceBuffer cache_k_;
-    DeviceBuffer cache_v_;
-    DeviceBuffer cache_k_scale_;
-    DeviceBuffer cache_v_scale_;
+    tool::PackedKVFixture packed_;
     DeviceBuffer block_table_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;

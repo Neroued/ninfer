@@ -7,7 +7,7 @@
 namespace ninfer::runtime {
 
 struct PreparationMemory {
-    std::size_t weight_bytes, headroom_bytes, host_reservation_bytes;
+    std::size_t weight_bytes, host_weight_bytes, headroom_bytes, host_reservation_bytes;
 };
 
 struct RankPreparationReport {
@@ -18,11 +18,12 @@ struct RankPreparationReport {
     double load_seconds                    = 0;
     std::uint64_t device_objects = 0, host_objects = 0;
     bool preparation_required = false;
+    bool control_owner        = false;
     std::string hardware_class, cuda_sync_mode;
 };
 
 struct GroupPreparation {
-    ContextCapacity capacity;
+    std::vector<ContextCapacityResolution> capacities;
     std::uint32_t attempt = 0;
     std::vector<RankPreparationReport> reports;
     std::vector<distributed::wire::Bytes> layouts;
@@ -47,11 +48,9 @@ void encode_preparation_report(distributed::wire::Encoder&, const RankPreparatio
 [[nodiscard]] RankPreparationReport decode_preparation_report(distributed::wire::Decoder&);
 // Rank payloads belong to the native model. Keep requested policies stable across retries;
 // control callbacks may publish resolved options.
-[[nodiscard]] GroupPreparation
-prepare_execution_group(distributed::ExecutionGroup&,
-                        std::span<const distributed::wire::Bytes> rank_payloads, KvCapacityPolicy,
-                        ContextCacheOptions, std::chrono::milliseconds timeout,
-                        ControlPreparation = {});
+[[nodiscard]] GroupPreparation prepare_execution_group(
+    distributed::ExecutionGroup&, std::span<const distributed::wire::Bytes> rank_payloads,
+    ContextCapacityPolicy, std::chrono::milliseconds timeout, ControlPreparation = {});
 void activate_execution_group(distributed::ExecutionGroup&, const GroupPreparation&,
                               std::chrono::milliseconds timeout);
 

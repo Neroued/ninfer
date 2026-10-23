@@ -46,7 +46,7 @@ PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
 | n[b] | 本窗口有效输入前缀长度，Device `valid_columns[B]` |
 | F / F0 | 已执行输入前沿 / 候选窗口基准前沿，均按原 token 计数 |
 | a[b] | 最终采用的输入前缀长度，不等于预取、采样或候选总长度 |
-| State slot | StateImage 的物理槽；独立于 resident lane、batch row 和 KV table row |
+| State record offset | 本 rank Context backing 内的 I64 字节偏移；独立于 resident lane、batch row 和 KV table row |
 
 规范边界下 Main 前沿为 F，启用 MTP 时 Backend 前沿为 `max(F-1,0)`。
 Backend 位置 j 配对 Main conditioning j 与输入 embedding j+1，RoPE 使用位置 j 的坐标。
@@ -61,7 +61,7 @@ HC 的四条 streams 是特征轴，GDN/QSA/MoE 的 token 数不乘四。
 | ModelDefinition | Config、Binding/Use、表示几何、Frontend 资源和 PLE hash controls |
 | ModelShard / Parameters | 本地不可变 Host/GPU 权重、PLE 文件 backing 和实际 Op 参数视图 |
 | Session / ContextDirectory | 请求 continuation、checkpoint、Main/MTP frontiers、RoPE delta、PLE raw-ID tail、state/page/table/Host 范围分配与引用 |
-| RankProgram | StateImage 和 Main/MTP KV 的固定 backing、records、workspace、PLE 服务与上传槽、Graphs；offload 另持有 expert cache/CPU bridge |
+| RankProgram | StateImage 与 Main/MTP KV 共用的固定 Context backing、records、workspace、PLE 服务与上传槽、Graphs；offload 另持有 expert cache/CPU bridge |
 | Ops | 借用的输入输出和 scratch；计算或状态提取，不发布请求状态 |
 | Runtime / Frontend | 请求调度、保留策略、输出 preview/commit 和协议语义 |
 
@@ -97,7 +97,7 @@ Recurrence 使用 `normalize_qk=true`、`scale=1/sqrt(128)`，
 | 路径 | 输入组合 | 状态处理 |
 |---|---|---|
 | Prefill / Replay / scoring | B=1；`linear_split → causal_conv1d_silu_split → gated_delta_net` | 保存整个窗口末端 conv/recurrent state |
-| Ordinary / 单列 control | T=1，B=1..8；`gdn_input_proj_conv_snapshot → gated_delta_net_batch_update` | 写候选 state slot |
+| Ordinary / 单列 control | T=1，B=1..8；`gdn_input_proj_conv_snapshot → gated_delta_net_batch_update` | 写候选 State record |
 | MTP target verify | T=K+1；`gdn_input_proj_conv_record → gated_delta_net_replay_record` | 基准只读，保存实际 records，采用时 exact fold |
 
 Z 绕过卷积，保留到输出 gate。独立 LinearSplit 的 BF16 出口是公共边界；
@@ -349,7 +349,7 @@ Session 在选定 capture 点拆分窗口；QSA/PLE 能提取中间前缀，并�
 
 Snapshot 复制/恢复完整 image、各 pool 前缀和 metadata；Replay 重新执行已接受输入，
 保留原请求身份、输出 ledger 和预算，不重复发布。暂停可以释放 lane，恢复使用新的
-state slot/table row。前缀命中采用公共资源策略，不另建 QSA/PLE 专用匹配或保留算法。
+State record offset/table row。前缀命中采用公共资源策略，不另建 QSA/PLE 专用匹配或保留算法。
 不可变 PLE row cache、expert cache、ticket、scratch 和 draft 工作特征不属于 checkpoint。
 
 ## 8. CUDA Graph 与启动资源

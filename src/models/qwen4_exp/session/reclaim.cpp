@@ -8,221 +8,259 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 namespace {
+
 template <class T>
-void append_unique(std::vector<T>& out, const T& value) {
-    if (std::find(out.begin(), out.end(), value) == out.end()) out.push_back(value);
+void append_unique(std::vector<T>& values, const T& value) {
+    if (std::find(values.begin(), values.end(), value) == values.end()) values.push_back(value);
 }
 
-context::PhysicalReclaim<ContextResources>
-physical_facts(const SessionImpl& program, std::span<const CheckpointHandle> allowed,
-               std::span<const CheckpointHandle> excluded, ContextResources shortage) {
-    std::array<context::ReclaimPool, ContextResources::pool_capacity> pools;
-    for (std::uint16_t i = 0; i < program.directory.pool_count(); ++i) {
-        const auto& pool = program.directory.pool(i);
-        pools[i]         = {&pool.histories(), &pool.pages(), program.pools[i].host_page_stride};
+bool has_host(const SessionImpl& session) {
+    const auto ranks = session.directory.records().ranks();
+    return std::any_of(ranks.begin(), ranks.end(),
+                       [](const auto& rank) { return rank.host_bytes; });
+}
+
+context::PhysicalReclaim physical_facts(const SessionImpl& session,
+                                        std::span<const CheckpointHandle> allowed,
+                                        std::span<const CheckpointHandle> excluded = {}) {
+    std::vector<context::ReclaimPool> pools;
+    for (std::uint16_t i = 0; i < session.directory.pool_count(); ++i) {
+        const auto& pool = session.directory.pool(i);
+        pools.push_back({&pool.histories(), &pool.pages()});
     }
-    return {program.checkpoints,
-            program.directory.states(),
-            program.directory.states().image_bytes(),
-            pools,
-            allowed,
-            excluded,
-            shortage};
+    return {session.checkpoints, session.directory, pools, allowed, excluded};
 }
 
 void seal(Demotion& plan) {
-    const auto& p            = *plan.owner;
-    plan.checkpoint_revision = p.checkpoints.revision();
-    for (const auto image : plan.images)
-        plan.image_epochs.push_back(p.directory.states().content_epoch(image));
-    for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
+    const auto& session = *plan.owner;
+    for (const auto image : plan.images) {
+        plan.image_epochs.push_back(session.directory.states().content_epoch(image));
+    }
+    for (std::uint16_t pool = 0; pool < session.directory.pool_count(); ++pool) {
+        const auto& pages = session.directory.pool(pool).pages();
         for (const auto page : plan.pages[pool]) {
-            const auto& store = p.directory.pool(pool).pages();
             plan.page_versions[pool].push_back(
-                {store.content_epoch(page), store.committed_columns(page)});
-        }
-}
-
-ContextRelease
-quote_release(const SessionImpl& p, const context::PhysicalReclaim<ContextResources>& facts,
-              std::span<const CheckpointHandle> sources,
-              const context::ReleaseInventory<ContextResources>::Selection& selection,
-              ContextResources shortage) {
-    auto proof   = std::make_shared<Release>();
-    proof->owner = &p;
-    for (const auto group : selection.freed())
-        for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-            if (shortage.kv_page_groups[pool])
-                for (const auto& page : facts.groups[group].pages[pool])
-                    if (page.releasable &&
-                        p.directory.pool(pool).pages().device_resident(page.handle))
-                        proof->pages[pool].push_back(page.handle);
-    return {{sources.begin(), sources.end()}, selection.released(), std::move(proof)};
-}
-
-bool valid_demotion(const SessionImpl& p, const Demotion& plan, bool refresh_holders = true) {
-    if (!refresh_holders && plan.checkpoint_revision != p.checkpoints.revision()) return false;
-    for (const auto h : plan.records)
-        if (!p.checkpoints.erasable(h)) return false;
-    ContextResources needed{.state_slots = static_cast<std::uint32_t>(plan.images.size())};
-    for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-        needed.kv_page_groups[pool] = plan.pages[pool].size();
-    std::vector<bool> images;
-    std::array<std::vector<bool>, 2> pages;
-    if (refresh_holders) {
-        const auto facts = physical_facts(p, plan.records, {}, needed);
-        images.resize(p.directory.states().capacity());
-        for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-            pages[pool].resize(p.directory.pool(pool).pages().capacity());
-        for (const auto& group : facts.groups) {
-            for (const auto image : group.states)
-                images[p.directory.states().descriptor_index(image)] = true;
-            for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-                for (const auto& page : group.pages[pool])
-                    pages[pool][p.directory.pool(pool).pages().descriptor_index(page.handle)] =
-                        true;
+                {pages.content_epoch(page), pages.committed_columns(page)});
         }
     }
-    const auto& states = p.directory.states();
+}
+
+bool valid_demotion(const SessionImpl& session, const Demotion& plan) {
+    for (const auto handle : plan.records) {
+        if (!session.checkpoints.erasable(handle)) return false;
+    }
+    const auto facts = physical_facts(session, plan.records);
+    std::unordered_set<std::uint32_t> images;
+    std::array<std::unordered_set<std::uint32_t>, 2> pages;
+    for (const auto& group : facts.groups) {
+        for (const auto image : group.states) images.insert(image.index);
+        for (std::uint16_t pool = 0; pool < session.directory.pool_count(); ++pool) {
+            for (const auto& page : group.pages[pool]) pages[pool].insert(page.handle.index);
+        }
+    }
+    const auto& states = session.directory.states();
     if (plan.images.size() != plan.image_epochs.size()) return false;
     for (std::size_t i = 0; i < plan.images.size(); ++i) {
         const auto image = plan.images[i];
-        if (!states.valid(image) || (refresh_holders && !images[states.descriptor_index(image)]) ||
+        if (!states.valid(image) || !images.contains(image.index) ||
             !states.device_resident(image) || states.content_epoch(image) != plan.image_epochs[i] ||
             states.role(image) != context::StateRole::CheckpointImmutable ||
             !states.can_release_after_checkpoint_references(image,
-                                                            states.checkpoint_references(image)))
+                                                            states.checkpoint_references(image))) {
             return false;
+        }
     }
-    for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool) {
-        const auto& store = p.directory.pool(pool).pages();
+    for (std::uint16_t pool = 0; pool < session.directory.pool_count(); ++pool) {
+        const auto& store = session.directory.pool(pool).pages();
         if (plan.pages[pool].size() != plan.page_versions[pool].size()) return false;
         for (std::size_t i = 0; i < plan.pages[pool].size(); ++i) {
             const auto page    = plan.pages[pool][i];
             const auto version = plan.page_versions[pool][i];
-            if (!store.valid(page) ||
-                (refresh_holders && !pages[pool][store.descriptor_index(page)]) ||
+            if (!store.valid(page) || !pages[pool].contains(page.index) ||
                 !store.device_resident(page) || !store.can_pin_source(page) ||
                 store.source_pins(page) || store.active_history_references(page) ||
                 store.content_epoch(page) != version.epoch ||
-                store.committed_columns(page) != version.columns)
+                store.committed_columns(page) != version.columns) {
                 return false;
+            }
         }
     }
     return true;
 }
+
+std::shared_ptr<Demotion> demotion_for_group(const SessionImpl& session,
+                                             const context::PhysicalReclaim::Group& group,
+                                             const ContextDemand& demand) {
+    struct Candidate {
+        Image image;
+        context::PageId page;
+        ContextReleaseSet released;
+        std::size_t copy_bytes = 0;
+    };
+
+    std::vector<Candidate> candidates;
+    const auto& states = session.directory.states();
+    for (const auto image : group.states) {
+        if (states.role(image) != context::StateRole::CheckpointImmutable ||
+            !states.can_release_after_checkpoint_references(image,
+                                                            states.checkpoint_references(image))) {
+            continue;
+        }
+        auto released =
+            session.directory.state_release(image).replicas(context::ContextMemory::Device);
+        const auto bytes =
+            states.host_resident(image) ? 0 : session.directory.released_bytes(released);
+        candidates.push_back({image, {}, std::move(released), bytes});
+    }
+    for (std::uint16_t pool = 0; pool < session.directory.pool_count(); ++pool) {
+        const auto& pages = session.directory.pool(pool).pages();
+        for (const auto& item : group.pages[pool]) {
+            const auto page = item.handle;
+            if (!pages.device_resident(page) || pages.source_pins(page) ||
+                pages.active_history_references(page) || !pages.can_pin_source(page)) {
+                continue;
+            }
+            auto released =
+                session.directory.page_release(page).replicas(context::ContextMemory::Device);
+            const auto bytes =
+                pages.host_replica_current(page) ? 0 : session.directory.released_bytes(released);
+            candidates.push_back({{}, page, std::move(released), bytes});
+        }
+    }
+    if (candidates.empty()) return {};
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+        return left.copy_bytes < right.copy_bytes;
+    });
+    ContextReleaseSet released;
+    std::vector<std::size_t> ends{0};
+    for (const auto& candidate : candidates) {
+        released.records.insert(released.records.end(), candidate.released.records.begin(),
+                                candidate.released.records.end());
+        ends.push_back(released.records.size());
+    }
+    std::size_t count = candidates.size();
+    if (session.directory.assess(demand, released).feasible()) {
+        std::size_t low = 1, high = count;
+        while (low < high) {
+            const auto middle = low + (high - low) / 2;
+            ContextReleaseSet prefix;
+            prefix.records.assign(released.records.begin(),
+                                  released.records.begin() + ends[middle]);
+            if (session.directory.assess(demand, prefix).feasible())
+                high = middle;
+            else
+                low = middle + 1;
+        }
+        count = low;
+    }
+    auto plan     = std::make_shared<Demotion>();
+    plan->owner   = &session;
+    plan->records = group.sources;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& candidate = candidates[i];
+        if (candidate.image.valid())
+            plan->images.push_back(candidate.image);
+        else
+            plan->pages[candidate.page.pool_id].push_back(candidate.page);
+    }
+    seal(*plan);
+    return plan;
+}
+
 } // namespace
 
 std::vector<Image> SessionImpl::checkpoint_images(std::span<const CheckpointHandle> records) const {
-    std::vector<Image> out;
+    std::vector<Image> images;
     std::unordered_set<std::uint32_t> seen;
-    for (const auto h : records)
-        if (checkpoints.valid(h)) {
-            const auto image = checkpoints.at(h).snapshot.continuation().image;
-            if (seen.insert(directory.states().descriptor_index(image)).second)
-                out.push_back(image);
-        }
-    return out;
+    for (const auto handle : records) {
+        if (!checkpoints.valid(handle)) continue;
+        const auto image = checkpoints.at(handle).snapshot.continuation().image;
+        if (seen.insert(image.index).second) images.push_back(image);
+    }
+    return images;
 }
 
 std::vector<context::PageId>
 SessionImpl::checkpoint_pages(std::span<const CheckpointHandle> records, std::uint32_t pool) const {
-    std::vector<context::PageId> out;
+    std::vector<context::PageId> pages;
     std::unordered_set<std::uint32_t> seen;
-    for (const auto h : records)
-        if (checkpoints.valid(h)) {
-            const auto& prefix = checkpoints.at(h).snapshot.prefix(pool);
-            for (std::uint32_t i = 0; i < (prefix.frontier() + 63) / 64; ++i) {
-                const auto page =
-                    directory.pool(pool).histories().logical_page(prefix.history(), i);
-                if (seen.insert(directory.pool(pool).pages().descriptor_index(page)).second)
-                    out.push_back(page);
-            }
+    for (const auto handle : records) {
+        if (!checkpoints.valid(handle)) continue;
+        const auto& prefix    = checkpoints.at(handle).snapshot.prefix(pool);
+        const auto& histories = directory.pool(pool).histories();
+        for (std::uint32_t i = 0; i < context::kv_pages_for_frontier(prefix.frontier()); ++i) {
+            const auto page = histories.logical_page(prefix.history(), i);
+            if (seen.insert(page.index).second) pages.push_back(page);
         }
-    return out;
+    }
+    return pages;
 }
 
-ContextResources SessionImpl::footprint(std::span<const CheckpointHandle> input,
-                                        bool released) const {
-    if (released &&
-        std::any_of(input.begin(), input.end(), [&](auto h) { return !checkpoints.erasable(h); }))
-        return {};
-    std::vector<CheckpointHandle> records;
-    for (const auto h : input)
-        if (checkpoints.valid(h)) append_unique(records, h);
-    ContextResources out;
-    const auto& states = directory.states();
-    for (const auto image : checkpoint_images(records)) {
-        const auto references = std::count_if(records.begin(), records.end(), [&](auto h) {
-            return checkpoints.at(h).snapshot.continuation().image == image;
-        });
-        if (released && (references != states.checkpoint_references(image) ||
-                         !states.can_release_after_checkpoint_references(image, references)))
-            continue;
-        out.state_slots += states.device_resident(image);
-        if (states.host_resident(image)) out.host_bytes += directory.states().image_bytes();
+ContextReleaseSet SessionImpl::footprint(std::span<const CheckpointHandle> input,
+                                         bool released) const {
+    ContextReleaseSet result;
+    if (released) {
+        if (std::any_of(input.begin(), input.end(),
+                        [&](auto handle) { return !checkpoints.erasable(handle); }))
+            return result;
+        const auto facts = physical_facts(*this, input);
+        auto selected    = facts.inventory->select();
+        auto probe       = selected.probe(input);
+        return selected.released();
     }
+    for (const auto image : checkpoint_images(input)) result.merge(directory.state_release(image));
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
-        const auto& storage = directory.pool(pool);
-        std::vector<context::PageId> pages;
-        if (released) {
-            std::vector<const context::HistoryPrefix*> prefixes;
-            for (const auto h : records)
-                prefixes.push_back(&checkpoints.at(h).snapshot.prefix(pool));
-            pages = storage.histories().released_pages(prefixes);
-        } else
-            pages = checkpoint_pages(records, pool);
-        for (const auto page : pages) {
-            if (released && storage.pages().source_pins(page)) continue;
-            out.kv_page_groups[pool] += storage.pages().device_resident(page);
-            if (storage.pages().host_resident(page)) out.host_bytes += pools[pool].host_page_stride;
-        }
+        for (const auto page : checkpoint_pages(input, pool))
+            result.merge(directory.page_release(page));
     }
-    return out;
+    return result;
 }
 
 std::size_t SessionImpl::host_released(std::span<const CheckpointHandle> records) const {
-    return footprint(records, true).host_bytes;
+    return directory.released_bytes(
+        footprint(records, true).replicas(context::ContextMemory::Host));
 }
 
-std::shared_ptr<Demotion> SessionImpl::demotion(std::span<const CheckpointHandle> records,
-                                                ContextResources shortage) const {
-    if (!directory.host_allocation().capacity_bytes()) return {};
-    auto out   = std::make_shared<Demotion>();
-    out->owner = this;
-    for (const auto h : records)
-        if (checkpoints.valid(h)) append_unique(out->records, h);
-    if (shortage.state_slots)
-        for (const auto image : checkpoint_images(out->records))
-            if (directory.states().device_resident(image) && !directory.states().source_pins(image))
-                out->images.push_back(image);
-    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
-        if (shortage.kv_page_groups[pool]) {
-            const auto& pages = directory.pool(pool).pages();
-            for (const auto page : checkpoint_pages(out->records, pool))
-                if (pages.device_resident(page) && !pages.source_pins(page) &&
-                    !pages.active_history_references(page))
-                    out->pages[pool].push_back(page);
+std::shared_ptr<Demotion> SessionImpl::demotion(std::span<const CheckpointHandle> records) const {
+    if (!has_host(*this)) return {};
+    auto plan   = std::make_shared<Demotion>();
+    plan->owner = this;
+    for (const auto handle : records) {
+        if (checkpoints.valid(handle)) append_unique(plan->records, handle);
+    }
+    for (const auto image : checkpoint_images(plan->records)) {
+        if (directory.states().device_resident(image) && !directory.states().source_pins(image)) {
+            plan->images.push_back(image);
         }
-    seal(*out);
-    return out->empty() ? nullptr : out;
+    }
+    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
+        const auto& pages = directory.pool(pool).pages();
+        for (const auto page : checkpoint_pages(plan->records, pool)) {
+            if (pages.device_resident(page) && !pages.source_pins(page) &&
+                !pages.active_history_references(page))
+                plan->pages[pool].push_back(page);
+        }
+    }
+    seal(*plan);
+    return plan->empty() ? nullptr : plan;
 }
 
 ContextDemotion SessionImpl::describe_demotion(std::shared_ptr<const Demotion> plan) const {
-    ContextDemotion out;
-    out.sources              = plan->records;
-    out.released.state_slots = plan->images.size();
-    for (const auto image : plan->images)
-        if (!directory.states().host_resident(image))
-            out.host_bytes += directory.states().image_bytes();
-    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
-        out.released.kv_page_groups[pool] = plan->pages[pool].size();
-        for (const auto page : plan->pages[pool])
-            if (!directory.pool(pool).pages().host_replica_current(page))
-                out.host_bytes += pools[pool].host_page_stride;
+    ContextDemotion result;
+    result.sources = plan->records;
+    for (const auto image : plan->images) {
+        result.released.merge(
+            directory.state_release(image).replicas(context::ContextMemory::Device));
     }
-    out.impl = std::move(plan);
-    return out;
+    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
+        for (const auto page : plan->pages[pool]) {
+            result.released.merge(
+                directory.page_release(page).replicas(context::ContextMemory::Device));
+        }
+    }
+    result.host_bytes = directory.host_write_bytes(host_requirements(*plan));
+    result.impl       = std::move(plan);
+    return result;
 }
 
 context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& plan) const {
@@ -230,15 +268,18 @@ context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& pl
     write.kv_pages.resize(directory.pool_count());
     for (const auto image : plan.images)
         write.state_images += !directory.states().host_resident(image);
-    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
-        for (const auto page : plan.pages[pool])
+    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
+        for (const auto page : plan.pages[pool]) {
             write.kv_pages[pool] += !directory.pool(pool).pages().host_replica_current(page);
+        }
+    }
     return write;
 }
 
 bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const Demotion& plan,
-                                   context::HostReservations& targets) {
+                                   context::ContextReservation& targets) {
     std::vector<Image> redundant;
+    auto state_targets = targets.take_state();
     for (const auto image : plan.images) {
         auto& states = directory.states();
         if (!states.valid(image) || !states.device_resident(image) || states.source_pins(image))
@@ -246,8 +287,7 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
         if (states.host_resident(image))
             redundant.push_back(image);
         else {
-            auto transfer =
-                states.reserve_device_to_host(image, directory.take_host_image(targets));
+            auto transfer = states.reserve_device_to_host(image, state_targets.split(1));
             if (!transfer) return false;
             migration.add_state_copy(std::move(*transfer), false);
         }
@@ -256,7 +296,7 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
         auto& store = directory.pool(pool).pages();
         std::vector<context::PageId> pages;
-        for (auto page : plan.pages[pool]) {
+        for (const auto page : plan.pages[pool]) {
             if (!store.valid(page) || !store.device_resident(page) || store.source_pins(page) ||
                 store.active_history_references(page))
                 return false;
@@ -265,146 +305,184 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
             else
                 pages.push_back(page);
         }
-        if (!pages.empty()) {
-            if (!migration.add_backups(pool, std::move(pages), targets, true)) return false;
+        if (!pages.empty()) migration.add_backups(pool, pages, targets.take_history(pool), true);
+    }
+    for (const auto image : redundant) {
+        if (!directory.states().drop_device_replica(image)) {
+            throw std::logic_error("State demotion lost exclusivity");
         }
     }
-    for (const auto image : redundant)
-        if (!directory.states().drop_device_replica(image))
-            throw std::logic_error("state demotion lost exclusivity");
-    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
-        for (const auto page : redundant_pages[pool])
-            if (!directory.pool(pool).pages().drop_device_replica(page))
+    for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
+        for (const auto page : redundant_pages[pool]) {
+            if (!directory.pool(pool).pages().drop_device_replica(page)) {
                 throw std::logic_error("KV demotion lost exclusivity");
+            }
+        }
+    }
     return true;
 }
 
-struct DemotionBatch {
-    const SessionImpl* owner;
-    ContextResources shortage;
-    std::optional<runtime::KvPoolId> pool;
-    bool valid;
-    std::vector<std::shared_ptr<const Demotion>> components;
-    std::unordered_set<std::uint32_t> pages;
-};
-
-context::ReleasePlan<ContextRelease, ContextResources>
+context::ReleasePlan<ContextRelease, ContextReleaseSet>
 SessionImpl::plan_releases(std::span<const CheckpointHandle> allowed,
-                           std::span<const CheckpointHandle> excluded,
-                           ContextResources shortage) const {
-    auto facts = detail::physical_facts(*this, allowed, excluded, shortage);
-    context::ReleasePlan<ContextRelease, ContextResources> out{{}, facts.inventory};
-    if (this->operation) return out;
-    auto selection = facts.inventory->select();
+                           std::span<const CheckpointHandle> excluded, const ContextDemand&) const {
+    auto facts = physical_facts(*this, allowed, excluded);
+    context::ReleasePlan<ContextRelease, ContextReleaseSet> result{{}, facts.inventory};
+    if (operation) return result;
+    auto selected = facts.inventory->select();
     for (const auto& group : facts.groups) {
-        auto probe = selection.probe(group.sources);
-        if (selection.released().useful(shortage))
-            out.releases.push_back(
-                detail::quote_release(*this, facts, group.sources, selection, shortage));
+        auto probe = selected.probe(group.sources);
+        if (!selected.released().empty())
+            result.releases.push_back({group.sources, selected.released()});
     }
-    return out;
+    return result;
 }
 
 ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                              std::span<const CheckpointHandle> excluded,
-                                             ContextResources shortage) const {
-    auto& p = *this;
-    ContextReclaimPlan out;
-    out.impl = std::make_shared<detail::Reclaim>(detail::Reclaim{&p, shortage});
-    if (p.operation) return out;
-    auto facts     = detail::physical_facts(p, allowed, excluded, shortage);
-    auto selection = facts.inventory->select();
+                                             const ContextDemand& demand) const {
+    auto facts = physical_facts(*this, allowed, excluded);
+    ContextReclaimPlan result;
+    result.inventory = facts.inventory;
+    if (operation) return result;
+    auto selected = facts.inventory->select();
     for (const auto& group : facts.groups) {
-        auto probe = selection.probe(group.sources);
-        if (selection.released().useful(shortage))
-            out.releases.push_back(
-                detail::quote_release(p, facts, group.sources, selection, shortage));
-        if (shortage.host_bytes || !p.directory.host_allocation().capacity_bytes()) continue;
-        auto plan     = std::make_shared<detail::Demotion>();
-        plan->owner   = &p;
-        plan->records = group.sources;
-        if (shortage.state_slots) {
-            for (const auto image : group.states)
-                if (p.directory.states().role(image) == context::StateRole::CheckpointImmutable &&
-                    p.directory.states().can_release_after_checkpoint_references(
-                        image, p.directory.states().checkpoint_references(image))) {
-                    plan->images.push_back(image);
-                    break;
-                }
-        } else if (const auto pool = shortage.first_kv_deficit()) {
-            const auto& pages = p.directory.pool(pool->index).pages();
-            for (const auto& page : group.pages[pool->index]) {
-                if (!pages.device_resident(page.handle) || pages.source_pins(page.handle) ||
-                    pages.active_history_references(page.handle) ||
-                    !pages.can_pin_source(page.handle))
-                    continue;
-                plan->pages[pool->index].push_back(page.handle);
-                if (plan->pages[pool->index].size() == shortage.kv_page_groups[pool->index]) break;
-            }
+        auto probe = selected.probe(group.sources);
+        if (!selected.released().empty())
+            result.releases.push_back({group.sources, selected.released()});
+        if (demand.memory == context::ContextMemory::Host || !has_host(*this)) continue;
+        if (auto plan = demotion_for_group(*this, group, demand)) {
+            result.demotions.push_back(describe_demotion(std::move(plan)));
         }
-        detail::seal(*plan);
-        if (!plan->empty()) out.demotions.push_back(p.describe_demotion(std::move(plan)));
     }
-    return out;
+    return result;
 }
 
 runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
-                                                std::span<const CheckpointHandle> host_victims) {
-    auto& p = *this;
-    if (p.operation || !quote.impl || quote.impl->owner != &p ||
-        !p.directory.host_allocation().capacity_bytes() || quote.sources != quote.impl->records ||
-        !detail::valid_demotion(p, *quote.impl))
+                                                std::span<const CheckpointHandle> victims) {
+    if (operation || !quote.impl || quote.impl->owner != this || !has_host(*this) ||
+        quote.sources != quote.impl->records || !valid_demotion(*this, *quote.impl)) {
         return runtime::ContextStart::Stale;
-    const auto current = p.describe_demotion(quote.impl);
-    if (current.host_bytes != quote.host_bytes || current.released != quote.released)
-        return runtime::ContextStart::Stale;
-    for (const auto victim : host_victims)
-        if (!p.checkpoints.erasable(victim) ||
-            std::find(quote.sources.begin(), quote.sources.end(), victim) != quote.sources.end())
-            return runtime::ContextStart::Stale;
-    std::optional<context::HostPlacement> placement;
-    if (host_victims.empty()) {
-        placement = p.directory.plan_host(p.host_requirements(*quote.impl));
-    } else {
-        const auto releases = p.plan_releases(host_victims, quote.sources, {.host_bytes = 1});
-        auto selected       = releases.inventory->select();
-        auto probe          = selected.probe(host_victims);
-        placement           = p.directory.plan_host(p.host_requirements(*quote.impl),
-                                                    releases.inventory->host_extents(selected.freed()),
-                                                    releases.inventory->host_pages(selected.freed()));
     }
-    if (!placement) return runtime::ContextStart::Stale;
-    auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
+    const auto current = describe_demotion(quote.impl);
+    if (current.host_bytes != quote.host_bytes || current.released != quote.released) {
+        return runtime::ContextStart::Stale;
+    }
+    for (const auto victim : victims) {
+        if (!checkpoints.erasable(victim) ||
+            std::find(quote.sources.begin(), quote.sources.end(), victim) != quote.sources.end()) {
+            return runtime::ContextStart::Stale;
+        }
+    }
+    const auto demand    = directory.host_demand(host_requirements(*quote.impl));
+    const auto placement = directory.assess(demand, footprint(victims, true));
+    if (!placement.feasible()) return runtime::ContextStart::Stale;
+    if (placement.requires_maintenance() && executor->has_pending_work()) {
+        pending_maintenance = placement;
+        directory.request_maintenance();
+        return runtime::ContextStart::Deferred;
+    }
+    auto execution = executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return runtime::ContextStart::Deferred;
-    for (const auto victim : host_victims)
-        if (!p.checkpoints.erase(victim))
-            throw std::logic_error("prepared Host victim changed before demotion");
-    auto targets = p.directory.host_allocation().reserve(*placement);
-    if (!targets) throw std::logic_error("prepared Host placement changed before demotion");
-    p.operation = std::make_unique<detail::ContextOperation>(
-        p.directory, detail::DemoteOperation{quote.impl}, std::move(*execution));
+    DemoteOperation action{quote.impl, {}};
+    action.sources.reserve(quote.sources.size());
+    for (const auto source : quote.sources) action.sources.push_back(checkpoints.lease(source));
+    for (const auto victim : victims) {
+        if (!checkpoints.erase(victim))
+            throw std::logic_error("Prepared Host victim changed before demotion");
+    }
+    auto reserved = directory.reserve(demand);
+    if (!reserved.reservation)
+        throw std::logic_error("Prepared Host placement changed before demotion");
     try {
-        auto& migration = p.operation->migration;
-        if (!p.prepare_demotion(migration, *quote.impl, *targets))
-            throw std::logic_error("prepared demotion lost its destination");
-        p.submit_context();
+        if (!reserved.reservation->ready()) {
+            auto maintenance = directory.prepare_maintenance(std::move(*reserved.reservation),
+                                                             reserved.assessment);
+            operation        = std::make_unique<ContextOperation>(
+                std::move(maintenance), std::move(action), std::move(*execution));
+            operation->preparing_resources = true;
+        } else {
+            operation = std::make_unique<ContextOperation>(directory, std::move(action),
+                                                           std::move(*execution));
+            if (!prepare_demotion(operation->migration, *quote.impl, *reserved.reservation)) {
+                throw std::logic_error("Prepared demotion lost its destination");
+            }
+        }
+        submit_context();
         return runtime::ContextStart::Started;
     } catch (...) {
-        p.cancel_operation();
+        cancel_operation();
         throw;
     }
+}
+
+runtime::ContextStart SessionImpl::try_pending_maintenance() {
+    if (!pending_maintenance) return runtime::ContextStart::Stale;
+    if (operation || compute || executor->has_pending_work())
+        return runtime::ContextStart::Deferred;
+    auto execution = executor->try_reserve(runtime::FrameKind::Context);
+    if (!execution) return runtime::ContextStart::Deferred;
+    auto migration = directory.prepare_maintenance(*pending_maintenance);
+    if (!migration) {
+        pending_maintenance.reset();
+        return runtime::ContextStart::Stale;
+    }
+    operation = std::make_unique<ContextOperation>(std::move(*migration), MaintenanceOperation{},
+                                                   std::move(*execution));
+    pending_maintenance.reset();
+    try {
+        submit_context();
+    } catch (...) {
+        cancel_operation();
+        throw;
+    }
+    return runtime::ContextStart::Started;
 }
 
 } // namespace ninfer::models::qwen4_exp::detail
 
 namespace ninfer::models::qwen4_exp {
 
-ContextResources Session::checkpoint_footprint(std::span<const CheckpointHandle> h) const {
-    return impl_->footprint(h, false);
+ContextAssessment Session::assess(const ContextDemand& demand,
+                                  const ContextReleaseSet& released) const {
+    return impl_->directory.assess(demand, released);
 }
 
-std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> h) const {
-    return impl_->host_released(h);
+bool Session::releases_metadata(const ContextReleaseSet& released,
+                                const ContextAssessment& assessment) const {
+    return assessment.metadata_contribution(released);
+}
+
+std::uint64_t Session::released_bytes(const ContextReleaseSet& released,
+                                      const ContextAssessment& assessment) const {
+    ContextReleaseSet relevant;
+    for (const auto& record : released.records) {
+        if (std::any_of(assessment.placement.domains.begin(), assessment.placement.domains.end(),
+                        [&](const auto& domain) { return domain.domain == record.domain; })) {
+            relevant.records.push_back(record);
+        }
+    }
+    return impl_->directory.released_bytes(relevant);
+}
+
+std::uint64_t Session::useful_release_bytes(const ContextReleaseSet& released,
+                                            const ContextAssessment& assessment) const {
+    return impl_->directory.useful_release_bytes(released, assessment);
+}
+
+runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
+    auto& session = *impl_;
+    if (session.operation) return runtime::ContextStart::Deferred;
+    if (!session.pending_maintenance) {
+        const auto current = session.directory.assess(assessment.demand);
+        if (!current.requires_maintenance()) return runtime::ContextStart::Stale;
+        session.pending_maintenance = current;
+        session.directory.request_maintenance();
+    }
+    return session.try_pending_maintenance();
+}
+
+std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> records) const {
+    return impl_->host_released(records);
 }
 
 context::RecoveryEvaluation<>
@@ -413,117 +491,35 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
     return impl_->recovery_index.evaluate(advertised);
 }
 
-CheckpointSummary Session::checkpoint_summary(CheckpointHandle h) const {
-    CheckpointSummary out;
-    static_cast<CheckpointMetadata&>(out) = checkpoint_metadata(h);
-    out.key                               = checkpoint_key(h, out.frontier);
-    out.evictable_resources               = impl_->footprint({&h, 1}, true);
-    return out;
+CheckpointSummary Session::checkpoint_summary(CheckpointHandle handle) const {
+    CheckpointSummary result;
+    static_cast<CheckpointMetadata&>(result) = checkpoint_metadata(handle);
+    result.key                               = checkpoint_key(handle, result.frontier);
+    return result;
 }
 
-context::ReleasePlan<ContextRelease, ContextResources>
+context::ReleasePlan<ContextRelease, ContextReleaseSet>
 Session::plan_releases(std::span<const CheckpointHandle> allowed,
                        std::span<const CheckpointHandle> excluded,
-                       ContextResources shortage) const {
-    return impl_->plan_releases(allowed, excluded, shortage);
+                       const ContextDemand& demand) const {
+    return impl_->plan_releases(allowed, excluded, demand);
 }
 
 ContextReclaimPlan Session::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,
-                                         ContextResources shortage) const {
-    return impl_->plan_reclaim(allowed, excluded, shortage);
-}
-
-ContextDemotionBatch ContextReclaimPlan::begin_kv_batch(ContextResources shortage) const {
-    const auto pool = shortage.first_kv_deficit();
-    auto batch      = std::make_shared<detail::DemotionBatch>();
-    batch->owner    = impl->owner;
-    batch->shortage = shortage;
-    batch->pool     = pool;
-    batch->valid    = !shortage.state_slots && !shortage.host_bytes && pool &&
-                   !impl->shortage.state_slots && !impl->shortage.host_bytes &&
-                   impl->shortage.first_kv_deficit() == pool;
-    return ContextDemotionBatch(std::move(batch));
-}
-
-bool ContextDemotionBatch::append(const ContextDemotion& quote) {
-    if (!plan_->valid) return false;
-    const auto pool = plan_->pool->index;
-    if (!quote.impl || quote.impl->owner != plan_->owner || !quote.impl->images.empty() ||
-        quote.sources != quote.impl->records || quote.impl->pages[pool].empty() ||
-        !quote.impl->pages[1 - pool].empty() ||
-        !detail::valid_demotion(*plan_->owner, *quote.impl, false)) {
-        plan_->valid = false;
-        return false;
-    }
-    const auto& store = plan_->owner->directory.pool(pool).pages();
-    for (const auto page : quote.impl->pages[pool])
-        plan_->pages.insert(store.descriptor_index(page));
-    plan_->components.push_back(quote.impl);
-    return true;
-}
-
-bool ContextDemotionBatch::covers(const ContextRelease& release) const {
-    if (!plan_->valid || !release.impl || release.impl->owner != plan_->owner) return false;
-    const auto pool = plan_->pool->index;
-    if (release.impl->pages[pool].empty() || !release.impl->pages[1 - pool].empty()) return false;
-    const auto& store = plan_->owner->directory.pool(pool).pages();
-    return std::all_of(
-        release.impl->pages[pool].begin(), release.impl->pages[pool].end(), [&](auto page) {
-            return store.valid(page) && plan_->pages.contains(store.descriptor_index(page));
-        });
-}
-
-std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
-    if (!plan_->valid || plan_->components.empty()) return {};
-    const auto& p     = *plan_->owner;
-    const auto pool   = plan_->pool->index;
-    const auto& store = p.directory.pool(pool).pages();
-    const auto stride = p.pools[pool].host_page_stride;
-    const auto capacity =
-        p.directory.available_host_pages(pool, plan_->shortage.kv_page_groups[pool]);
-    auto result                 = std::make_shared<detail::Demotion>();
-    result->owner               = &p;
-    result->checkpoint_revision = p.checkpoints.revision();
-    std::unordered_set<std::uint32_t> selected;
-    std::uint32_t missing = 0;
-    bool complete         = false;
-    for (const auto& component : plan_->components) {
-        if (!detail::valid_demotion(p, *component, false)) return {};
-        bool used = false;
-        for (std::size_t i = 0; i < component->pages[pool].size(); ++i) {
-            const auto page = component->pages[pool][i];
-            if (!selected.insert(store.descriptor_index(page)).second) continue;
-            const auto needed = store.host_replica_current(page) ? 0 : stride;
-            if (needed && missing == capacity) {
-                complete = true;
-                break;
-            }
-            missing += needed != 0;
-            result->pages[pool].push_back(page);
-            result->page_versions[pool].push_back(component->page_versions[pool][i]);
-            used = true;
-            if (result->pages[pool].size() == plan_->shortage.kv_page_groups[pool]) {
-                complete = true;
-                break;
-            }
-        }
-        if (used)
-            for (const auto h : component->records) detail::append_unique(result->records, h);
-        if (complete) break;
-    }
-    if (result->empty()) return {};
-    return p.describe_demotion(std::move(result));
+                                         const ContextDemand& demand) const {
+    return impl_->plan_reclaim(allowed, excluded, demand);
 }
 
 runtime::ContextStart Session::start_demote(const ContextDemotion& quote,
-                                            std::span<const CheckpointHandle> host_victims) {
-    return impl_->start_demote(quote, host_victims);
+                                            std::span<const CheckpointHandle> victims) {
+    return impl_->start_demote(quote, victims);
 }
 
 Session::HostRequirement Session::demotion_host_requirements(const ContextDemotion& quote) const {
-    if (!quote.impl || quote.impl->owner != impl_.get())
-        throw std::invalid_argument("demotion quote belongs to another session");
+    if (!quote.impl || quote.impl->owner != impl_.get()) {
+        throw std::invalid_argument("Demotion quote belongs to another Session");
+    }
     return impl_->host_requirements(*quote.impl);
 }
 
@@ -531,48 +527,54 @@ std::size_t Session::host_write_bytes(const HostRequirement& write) const {
     return impl_->directory.host_write_bytes(write);
 }
 
-bool Session::can_place_host(const HostRequirement& write) const {
-    return impl_->directory.plan_host(write).has_value();
+ContextDemand Session::host_demand(const HostRequirement& write) const {
+    return impl_->directory.host_demand(write);
 }
 
 bool Session::can_place_host(const HostRequirement& write,
-                             const context::ReleasePlan<ContextRelease, ContextResources>& releases,
-                             std::span<const std::uint32_t> freed) const {
-    return impl_->directory
-        .plan_host(write, releases.inventory->host_extents(freed),
-                   releases.inventory->host_pages(freed))
-        .has_value();
+                             const ContextReleaseSet& released) const {
+    return impl_->directory.plan_host(write, released).feasible();
 }
 
 std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> keep) {
-    auto& p = *impl_;
-    if (!p.directory.host_allocation().capacity_bytes()) return 0;
-    const auto before = p.directory.host_allocation().occupied_bytes();
-    const auto images = p.checkpoint_images(excluded);
+    auto& session = *impl_;
+    if (!detail::has_host(session)) return 0;
+    const auto protected_images = session.checkpoint_images(excluded);
     std::vector<CheckpointHandle> all;
-    for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i)
-        if (p.checkpoints.valid(p.checkpoints.handle(i))) all.push_back(p.checkpoints.handle(i));
-    for (const auto image : p.checkpoint_images(all)) {
-        if (std::find(images.begin(), images.end(), image) != images.end() ||
-            (keep && p.valid(*keep) && p.sequence(*keep).continuation.image == image))
+    for (std::uint32_t i = 0; i < session.checkpoints.size(); ++i) {
+        const auto handle = session.checkpoints.handle(i);
+        if (session.checkpoints.valid(handle)) all.push_back(handle);
+    }
+    std::size_t released_bytes = 0;
+    for (const auto image : session.checkpoint_images(all)) {
+        if (std::find(protected_images.begin(), protected_images.end(), image) !=
+                protected_images.end() ||
+            (keep && session.valid(*keep) && session.sequence(*keep).continuation.image == image))
             continue;
-        (void)p.directory.states().drop_host_replica(image);
+        const auto records =
+            session.directory.state_release(image).replicas(context::ContextMemory::Host);
+        const auto bytes = session.directory.released_bytes(records);
+        if (session.directory.states().drop_host_replica(image)) released_bytes += bytes;
     }
-    for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool) {
-        const auto protected_pages = p.checkpoint_pages(excluded, pool);
-        auto& store                = p.directory.pool(pool).pages();
-        std::vector<context::PageId> drop;
-        for (const auto page : p.checkpoint_pages(all, pool))
-            if (std::find(protected_pages.begin(), protected_pages.end(), page) ==
-                    protected_pages.end() &&
-                store.host_resident(page) &&
-                store.device_covers(page, store.required_columns(page)) &&
-                p.directory.host().can_release_page_replica(store, page))
-                drop.push_back(page);
-        if (!drop.empty()) (void)p.directory.host().release_page_replicas(store, drop);
+    for (std::uint16_t pool = 0; pool < session.directory.pool_count(); ++pool) {
+        const auto protected_pages = session.checkpoint_pages(excluded, pool);
+        auto& pages                = session.directory.pool(pool).pages();
+        for (const auto page : session.checkpoint_pages(all, pool)) {
+            if (std::find(protected_pages.begin(), protected_pages.end(), page) !=
+                protected_pages.end())
+                continue;
+            const auto records = pages.records(page, context::ContextMemory::Host);
+            for (const auto& record : records) {
+                const auto size = session.directory.records()
+                                      .pool(record.domain)
+                                      .resolve(record.allocation)
+                                      .bytes;
+                if (pages.drop_host_replica(page, record.domain.rank)) released_bytes += size;
+            }
+        }
     }
-    return before - p.directory.host_allocation().occupied_bytes();
+    return released_bytes;
 }
 
 } // namespace ninfer::models::qwen4_exp

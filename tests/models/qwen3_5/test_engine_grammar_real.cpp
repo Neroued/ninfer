@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -150,12 +151,10 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 1024;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
         options.max_concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 2;
         options.enable_vision   = argc > 4 && std::string_view(argv[4]) == "vision";
         options.prefill_chunk   = 128;
         options.kv_cache        = ninfer::KvCacheStorage::Fp8E4M3Row256;
-        options.context_cache.extra_state_slots   = 8;
         options.context_cache.host_capacity_bytes = 128ULL << 20;
         options.use_cuda_graph = argc < 3 || std::string_view(argv[2]) != "eager";
         if (backend == "mtp")
@@ -171,6 +170,7 @@ int main(int argc, char** argv) {
             options.speculative.draft_tokens  = draft_tokens ? std::stoul(draft_tokens) : 3;
             options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
         }
+        ninfer::test::qwen3_5::set_context_capacity(options, 8);
         ninfer::Engine engine(options);
         choice_and_regex(engine, options.max_concurrency, backend != "none");
         const std::string answer =

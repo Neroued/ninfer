@@ -42,9 +42,7 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Bytes> descript
     }
     plan_                                     = plan_group_execution(parallel_, ranks_);
     options.prefill_chunk                     = plan_.session.shape.prefill_chunk;
-    options.context_cache.host_capacity_bytes = plan_.session.context.host.bytes;
-    options.context_cache.extra_state_slots =
-        plan_.session.context.state.device_slots - options.max_concurrency;
+    options.context_cache.host_capacity_bytes = 0;
 }
 
 PreparedSession ParallelStartup::session() const {
@@ -52,7 +50,9 @@ PreparedSession ParallelStartup::session() const {
 }
 
 ParallelStartup::Codec ParallelStartup::codec() const {
-    return {*definition_, ranks_.front(), parallel_.topology};
+    auto description    = ranks_.front();
+    description.session = plan_.session;
+    return {*definition_, description, parallel_.topology};
 }
 
 std::string ParallelStartup::prefill_signature(std::uint32_t chunk) const {

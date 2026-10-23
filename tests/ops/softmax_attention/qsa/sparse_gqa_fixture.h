@@ -26,23 +26,44 @@ inline std::uint16_t half(float x) { return std::bit_cast<std::uint16_t>(_Float1
 inline float unhalf(std::uint16_t x) { return float(std::bit_cast<_Float16>(x)); }
 
 struct Plane {
-    int leading;
     std::int64_t row, head, page;
     std::vector<std::uint16_t> host;
-    GuardedDeviceBuffer device;
+    tool::PackedKVFixture* packed = nullptr;
+    std::size_t plane_index       = 0;
     Tensor view;
 
-    Plane(int pages, DType dtype, int padding, int heads = 2)
-        : leading(padding ? 1 : 0), row(256 + padding), head(64 * row + padding),
-          page(heads * head + padding), host(leading + page * pages), device(host.size() * 2),
-          view(device.span().subspan(leading * 2), dtype, {256, 64, heads, pages}) {
+    Plane(int pages, DType dtype, int heads = 2)
+        : row(256), head(64 * row), page(heads * head), host(page * pages),
+          view(Tensor::metadata(dtype, {256, 64, heads, pages})) {
         view.nb[1] = row * 2;
         view.nb[2] = head * 2;
         view.nb[3] = page * 2;
     }
 
     std::size_t offset(int d, int h, int r, int p) const {
-        return leading + d + h * head + r * row + p * page;
+        return d + h * head + r * row + p * page;
+    }
+
+    void bind(tool::PackedKVFixture& arena, std::size_t index) {
+        packed      = &arena;
+        plane_index = index;
+    }
+
+    void upload() {
+        if (!packed) return;
+        auto source   = view;
+        source.data   = host.data();
+        source.device = Device::cpu();
+        packed->upload_plane(plane_index, source);
+    }
+
+    std::vector<std::uint16_t> download() const {
+        auto result   = host;
+        auto target   = view;
+        target.data   = result.data();
+        target.device = Device::cpu();
+        packed->download_plane(plane_index, target);
+        return result;
     }
 };
 
@@ -52,6 +73,8 @@ struct Fixture {
     int live_limit  = std::numeric_limits<int>::max();
     std::vector<std::uint16_t> qhost, ghost;
     std::vector<int> positions, valid, selectors, tables, ids, counts;
+    std::vector<std::int64_t> table_offsets;
+    std::unique_ptr<tool::PackedKVFixture> packed;
     std::vector<std::vector<int>> visible;
     Plane keys, values;
     KvCacheStorage storage;
@@ -67,33 +90,44 @@ struct Fixture {
             KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false,
             int query_heads = 24)
         : T(tokens), B(batch_size), q_heads(query_heads), kv_heads(query_heads / 12),
-          history(max_history), table_width((history + 63) / 64),
-          table_stride(table_width + (padded ? 3 : 0)), pages(std::min(table_width, 521) * B + 2),
-          qhost(std::size_t(T) * B * (256 * q_heads)), ghost(qhost.size()), positions(T * B),
-          valid(B), selectors(B), tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512),
-          counts(T * B), visible(T * B), keys(pages, DType::BF16, padded ? 1 : 0, kv_heads),
-          values(pages, DType::FP16, padded ? 3 : 0, kv_heads), storage(format),
-          q(qhost.size() * 2), gate(ghost.size() * 2), out(qhost.size() * 2),
-          pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 4),
+          history(max_history), table_width((history + 63) / 64), table_stride(table_width),
+          pages(std::min(table_width, 521) * B + 2), qhost(std::size_t(T) * B * (256 * q_heads)),
+          ghost(qhost.size()), positions(T * B), valid(B), selectors(B),
+          tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512), counts(T * B),
+          visible(T * B), keys(pages, DType::BF16, kv_heads), values(pages, DType::FP16, kv_heads),
+          storage(format), q(qhost.size() * 2), gate(ghost.size() * 2), out(qhost.size() * 2),
+          pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 8),
           selections(ids.size() * 4), sizes(counts.size() * 4) {
         envelope.max_visible_tokens = history;
         query                       = Tensor(q.span(), DType::BF16, {256, q_heads, T, B});
         output_gate                 = Tensor(gate.span(), DType::BF16, {256, q_heads, T, B});
         output                      = Tensor(out.span(), DType::BF16, {256, q_heads, T, B});
-        Tensor bt(table.span(), DType::I32, {table_width, B + 1});
-        bt.nb[1] = table_stride * 4;
-        cache    = {keys.view, values.view, {}, {}, bt, 256, kv_heads, KvCacheStorage::BFloat16};
+        Tensor bt(table.span(), DType::I64, {table_width, B + 1});
+        const auto formats = prepare::cache_encoding(storage);
+        KVPageGeometry geometry;
+        const auto add = [&](DType dtype, int features, std::size_t alignment) {
+            geometry.planes.push_back({dtype, features, kv_heads, alignment, 1});
+        };
+        add(formats.key.data_dtype, formats.key.data_extent, padded ? 2 : 256);
+        add(formats.value.data_dtype, formats.value.data_extent, padded ? 2 : 256);
         if (storage != KvCacheStorage::BFloat16) {
-            const auto formats = prepare::cache_encoding(storage);
-            encoded_key = std::make_unique<EncodedVector>(formats.key, pages, padded, padded_scales,
-                                                          kv_heads);
-            encoded_value       = std::make_unique<EncodedVector>(formats.value, pages, padded,
-                                                                  padded_scales, kv_heads);
-            cache.k_pages       = encoded_key->data.view;
-            cache.v_pages       = encoded_value->data.view;
-            cache.k_scale_pages = encoded_key->scales.view;
-            cache.v_scale_pages = encoded_value->scales.view;
-            cache.storage       = storage;
+            add(formats.key.scale_dtype, formats.key.scale_extent, padded_scales ? 2 : 256);
+            add(formats.value.scale_dtype, formats.value.scale_extent, padded_scales ? 2 : 256);
+        }
+        packed = std::make_unique<tool::PackedKVFixture>(q.device(), geometry, pages);
+        cache  = {packed->plane(0, bt), packed->plane(1, bt), {}, {}, 256, kv_heads, storage};
+        if (storage != KvCacheStorage::BFloat16) {
+            encoded_key   = std::make_unique<EncodedVector>(formats.key, pages, kv_heads);
+            encoded_value = std::make_unique<EncodedVector>(formats.value, pages, kv_heads);
+            encoded_key->data.bind(*packed, 0);
+            encoded_value->data.bind(*packed, 1);
+            encoded_key->scales.bind(*packed, 2);
+            encoded_value->scales.bind(*packed, 3);
+            cache.k_scale_pages = packed->plane(2, bt);
+            cache.v_scale_pages = packed->plane(3, bt);
+        } else {
+            keys.bind(*packed, 0);
+            values.bind(*packed, 1);
         }
         batch    = {Tensor(pos.span(), DType::I32, {T, B}), Tensor(lengths.span(), DType::I32, {B}),
                     Tensor(rows.span(), DType::I32, {B})};
@@ -178,12 +212,13 @@ struct Fixture {
     void upload() {
         q.copy_from_host(qhost.data(), qhost.size() * 2);
         gate.copy_from_host(ghost.data(), ghost.size() * 2);
-        keys.device.copy_from_host(keys.host.data(), keys.host.size() * 2);
-        values.device.copy_from_host(values.host.data(), values.host.size() * 2);
+        keys.upload();
+        values.upload();
         pos.copy_from_host(positions.data(), positions.size() * 4);
         lengths.copy_from_host(valid.data(), valid.size() * 4);
         rows.copy_from_host(selectors.data(), selectors.size() * 4);
-        table.copy_from_host(tables.data(), tables.size() * 4);
+        table_offsets = packed->table_offsets(tables);
+        table.copy_from_host(table_offsets.data(), table_offsets.size() * 8);
         selections.copy_from_host(ids.data(), ids.size() * 4);
         sizes.copy_from_host(counts.data(), counts.size() * 4);
         if (encoded_key) {

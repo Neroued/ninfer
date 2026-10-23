@@ -87,14 +87,14 @@ void RankProgramImpl::progress() {
                             .view({draft.prefill_features.ne[0], width, 1}),
                         draft.prefill_positions.slice(0, 0, width).view({width, 1}),
                         frame.valid_columns.slice(0, 0, 1),
-                        frame.state_destination_slots.slice(0, 0, 1),
+                        frame.state_destination_offsets.slice(0, 0, 1),
                         frame.backend_table_rows.slice(0, 0, 1),
                         {operation.width, operation.width});
                 }
                 const auto source = resources.frame.input_view(static_cast<int>(operation.width), 1)
                                         .hidden.slice(1, static_cast<int>(operation.width - 1), 1);
-                const auto target = resources.state_images.continuation_hidden_slot(
-                    operation.rows[operation.forward_row].state_slots.destination);
+                const auto target = resources.state_images.continuation_hidden(
+                    operation.rows[operation.forward_row].state_offsets.destination);
                 CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
                                            cudaMemcpyDeviceToDevice, device.stream()));
             }

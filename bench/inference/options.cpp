@@ -95,7 +95,7 @@ benchmark:
 Each run starts with the same inputs and sampling seeds; runtime caches stay warm.
 Before each decode run, the first C-1 inputs complete ordinary one-token requests.
 Preparation is outside timing and profiler ranges. Prefix reuse defaults on for decode,
-with native extra state capacity; prefill-only defaults off. Explicit configuration wins.
+using the shared Context capacity; prefill-only defaults off. Explicit configuration wins.
 Decode latency is grouped by actual batch size; a batch with no samples is reported as such.
 Result/resolution/retirement and Host times use existing Engine observations.
 For external profiling, use nsys --capture-range=cudaProfilerApi with --profile-measured.

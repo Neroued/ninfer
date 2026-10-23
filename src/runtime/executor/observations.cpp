@@ -26,17 +26,17 @@ auto fields(T& v) {
                         v.cpu_workspace_bytes, v.uploaded_bytes, v.prefetched_bytes);
     else if constexpr (std::is_same_v<Value, MemoryAllocations>)
         return std::tie(v.device_weights_bytes, v.host_weights_bytes, v.registered_weights_bytes,
-                        v.persistent_device_bytes, v.workspace_device_bytes, v.io_pinned_bytes,
-                        v.host_context_bytes, v.ple_device_bytes, v.ple_pinned_bytes,
-                        v.ple_host_bytes, v.expert_device_bytes, v.expert_pinned_bytes,
-                        v.expert_host_bytes);
+                        v.persistent_device_bytes, v.context_device_bytes, v.workspace_device_bytes,
+                        v.io_pinned_bytes, v.host_context_bytes, v.ple_device_bytes,
+                        v.ple_pinned_bytes, v.ple_host_bytes, v.expert_device_bytes,
+                        v.expert_pinned_bytes, v.expert_host_bytes);
     else if constexpr (std::is_same_v<Value, WorkspaceUsage>)
         return std::tie(v.allocation_cursor_bytes, v.required_peak_bytes, v.measurement_peak_bytes);
     else if constexpr (std::is_same_v<Value, PleReadStats>)
         return std::tie(v.rows, v.cache_hits, v.shared_rows, v.shared_pages, v.reads, v.read_bytes,
                         v.uploaded_bytes);
     else if constexpr (std::is_same_v<Value, RankMemoryUsage>)
-        return std::tie(v.allocations, v.workspace, v.kv_payload_bytes, v.vision, v.experts, v.ple);
+        return std::tie(v.allocations, v.workspace, v.vision, v.experts, v.ple);
     else if constexpr (std::is_same_v<Value, PhysicalMemorySample>)
         return std::tie(v.cuda_total_bytes, v.cuda_free_bytes, v.system_total_bytes,
                         v.system_available_bytes, v.shared_physical_memory, v.sampled_ns);
@@ -61,7 +61,8 @@ auto fields(T& v) {
     else {
         static_assert(std::is_same_v<Value, RankMemoryBudget>);
         return std::tie(v.limit_bytes, v.runtime_reservation_bytes,
-                        v.minimum_runtime_reservation_bytes, v.bytes_per_page_group,
+                        v.minimum_runtime_reservation_bytes, v.context_capacity_bytes,
+                        v.minimum_context_capacity_bytes, v.context_control_budget_bytes,
                         v.available_after_weights_bytes, v.available_after_startup_bytes,
                         v.headroom_bytes, v.planned_slack_bytes, v.retained_bytes, v.graphs);
     }

@@ -11,10 +11,9 @@ bool same_member(const runtime::ExecutionMember& a, const runtime::ExecutionMemb
     return a.sequence == b.sequence && a.residency == b.residency;
 }
 
-void check_selectors(context::StateSelectors slots, std::int32_t count) {
-    if (slots.source < 0 || slots.source >= count || slots.destination < 0 ||
-        slots.destination >= count)
-        throw std::invalid_argument("Qwen4Exp state selectors exceed local storage");
+void check_selectors(context::StateSelectors offsets, const StateImageStorage& storage) {
+    (void)storage.image(offsets.source);
+    (void)storage.image(offsets.destination);
 }
 
 void check_table(context::TableRow row, std::uint32_t pool, const QsaCache& cache) {
@@ -69,7 +68,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     };
     for (const auto& row : work_rows(work)) {
         check_resident(row.member);
-        check_selectors(row.slots, resources.states->storage().slot_count());
+        check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
         check_table(row.main_table, 0, *resources.main);
         if (parameters.mtp) check_table(row.mtp_table, 1, *resources.mtp);
     }
@@ -101,7 +100,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     }
     const auto& actions =
         kind == runtime::FrameKind::Context ? resources.context_actions : resources.compute_actions;
-    actions->validate(work.actions);
+    actions->validate(local_actions(work.actions, parameters.profile->local.rank));
 }
 
 void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
@@ -136,8 +135,9 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  parameters.profile->public_tokens, bool(parameters.mtp), bool(parameters.vision)}
         .validate_commit(frame.request.work, frame.result.rows, commit);
     for (const auto& row : commit.rows)
-        check_selectors(row.slots, resources.states->storage().slot_count());
-    resources.compute_actions->validate(commit.actions);
+        check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
+    resources.compute_actions->validate(
+        local_actions(commit.actions, parameters.profile->local.rank));
 }
 
 bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
@@ -168,8 +168,6 @@ runtime::ExecutionCapacity RankProgram::capacity() const noexcept { return {1, 1
 
 SessionPlan RankProgram::session_plan() const {
     auto plan = plan_session(impl_->resources.plan);
-    for (std::uint32_t i = 0; i < impl_->resources.pool_count(); ++i)
-        plan.context.pools[i].transfer = impl_->resources.pool(i).pages().transfer_profile();
     return plan;
 }
 
@@ -221,20 +219,14 @@ RankMemoryBudget RankProgram::resource_budget() const {
     const auto& plan                         = impl_->resources.plan;
     result.runtime_reservation_bytes         = plan.device_reservation_bytes();
     result.minimum_runtime_reservation_bytes = plan.capacity.minimum_runtime_reservation_bytes;
-    result.bytes_per_page_group = plan.capacity.bytes_per_additional_primary_page_group;
-    result.graphs               = impl_->graph_memory;
+    result.context_capacity_bytes            = plan.capacity.device_bytes;
+    result.minimum_context_capacity_bytes    = plan.capacity.minimum_device_bytes;
+    result.context_control_budget_bytes      = plan.capacity.metadata_budget_bytes;
+    result.graphs                            = impl_->graph_memory;
     return result;
 }
 
 RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_resources(); }
-
-std::vector<context::KVTransferProfile> RankProgram::context_transfer_profiles() const {
-    std::vector<context::KVTransferProfile> profiles;
-    profiles.reserve(impl_->resources.pool_count());
-    for (std::uint32_t i = 0; i < impl_->resources.pool_count(); ++i)
-        profiles.push_back(impl_->resources.pool(i).pages().transfer_profile());
-    return profiles;
-}
 
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 

@@ -42,7 +42,7 @@ public:
     static constexpr EnginePurpose purpose = EnginePurpose::Generation;
 
     using ModelContract      = typename Instance::ModelContract;
-    using ContextResources   = typename ModelContract::Session::ContextResources;
+    using ContextAssessment  = typename ModelContract::Session::ContextAssessment;
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;
     using Checkpoint         = typename ModelContract::CheckpointHandle;
@@ -71,8 +71,7 @@ public:
         }
         cumulative_stats_.context_transfers.kv.resize(instance_.session->kv_pools().size());
         for (const auto& pool : instance_.session->kv_pools()) {
-            cumulative_stats_.kv_pools.push_back(
-                {pool.id.index, std::string(pool.label), 0, pool.device_page_groups});
+            cumulative_stats_.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
         }
         stats_snapshot_             = cumulative_stats_;
         published_snapshot_.runtime = cumulative_stats_;
@@ -224,6 +223,7 @@ public:
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
             request->decode_by_batch.resize(max_concurrency_);
+            request->context_transfers.resize(instance_.session->kv_pools().size() + 1);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -513,10 +513,10 @@ private:
     void resolve_context_progress(typename ModelContract::ContextProgress&& progress,
                                   HostPhaseMeasurement& boundary);
 
-    bool reclaim(ContextResources shortage, bool allow_pause,
-                 std::span<const Checkpoint> excluded               = {},
-                 typename ResourceManagement::ReclaimCursor* cursor = nullptr,
-                 std::optional<std::uint64_t> priority_ticket       = std::nullopt);
+    ReclaimProgress reclaim(const ContextAssessment& assessment, bool allow_pause,
+                            std::span<const Checkpoint> excluded               = {},
+                            typename ResourceManagement::ReclaimCursor* cursor = nullptr,
+                            std::optional<std::uint64_t> priority_ticket       = std::nullopt);
 
     bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket);
 

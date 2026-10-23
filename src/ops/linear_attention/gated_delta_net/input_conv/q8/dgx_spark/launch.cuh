@@ -7,15 +7,16 @@
 namespace ninfer::ops::detail {
 
 void launch_q8_gdn_tma_n16384_k2560_snapshot(const Tensor& x, const Weight& weight,
-                                             const Tensor& convolution, Tensor& history,
-                                             const Tensor& valid, const Tensor& source_slots,
-                                             const Tensor& snapshot_bases, Tensor& query,
-                                             Tensor& key, Tensor& value, Tensor& z,
+                                             const Tensor& convolution,
+                                             const ConstStateFieldView& history,
+                                             const Tensor& valid,
+                                             const gdn_input::HistoryDestination& destination,
+                                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                              cudaStream_t stream);
 
 void launch_q8_gdn_tma_n16384_k2560_record(const Tensor& x, const Weight& weight,
-                                           const Tensor& convolution, const Tensor& history,
-                                           const Tensor& valid, const Tensor& source_slots,
+                                           const Tensor& convolution,
+                                           const ConstStateFieldView& history, const Tensor& valid,
                                            Tensor& record, Tensor& query, Tensor& key,
                                            Tensor& value, Tensor& z, cudaStream_t stream);
 

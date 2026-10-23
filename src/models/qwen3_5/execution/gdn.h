@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 #include "core/device.h"
+#include "core/record_view.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -18,15 +19,13 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
                       MemoryArena& workspace, CudaExecutionView execution);
-void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,
-                             Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slots, const Tensor& destination_slots,
-                             Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                             MemoryArena& workspace, CudaExecutionView execution);
+void gdn_projection_update(const Tensor& hidden, const GdnParameters& parameters,
+                           StateFieldView source, StateFieldView destination,
+                           const Tensor& valid_columns, Tensor& query, Tensor& key, Tensor& value,
+                           Tensor& z, MemoryArena& workspace, CudaExecutionView execution);
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
-                           const Tensor& conv_states, const Tensor& valid_columns,
-                           const Tensor& initial_slots, Tensor& conv_record, Tensor& query,
-                           Tensor& key, Tensor& value, Tensor& z, MemoryArena& workspace,
-                           CudaExecutionView execution);
+                           StateFieldView source, const Tensor& valid_columns, Tensor& conv_record,
+                           Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                           MemoryArena& workspace, CudaExecutionView execution);
 
 } // namespace ninfer::models::qwen3_5::execution

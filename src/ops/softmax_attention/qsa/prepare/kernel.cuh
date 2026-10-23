@@ -21,12 +21,11 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
     const int p = a.positions[m];
     if (p % 4 != 3) return;
     const int base = a.positions[std::int64_t(b) * a.tokens], first = p - 3;
-    const int slot = first < base ? a.slots[b] : 0;
     float pooled[4]{};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int token = first + j;
-        const auto* raw = token < base ? a.tail.at(0, token - (base - base % 4), slot)
+        const auto* raw = token < base ? a.tail.at(0, token - (base - base % 4), b)
                                        : a.ik + (std::int64_t(b) * a.tokens + token - base) * 128;
 #pragma unroll
         for (int c = 0; c < 4; ++c) pooled[c] += 0.25F * __bfloat162float(raw[lane + 32 * c]);
@@ -35,11 +34,11 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
     for (int c = 0; c < 4; ++c) pooled[c] = __bfloat162float(__float2bfloat16_rn(pooled[c]));
     const int axis = lane % 3;
     const int rho =
-        first < base ? *a.first_rope.at(axis, slot) : coordinate(a, first - base, b, axis);
+        first < base ? *a.first_rope.at(axis, 0, b) : coordinate(a, first - base, b, axis);
     const float2 sc = prepare_sincos<BoundedPhase>(a.frequency[lane], rho);
     norm_rotate<128>(pooled, a.wik, a.epsilon, sc, lane);
-    const int page = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
-    auto* out      = a.index_keys.at((p / 4) % 16, 0, page);
+    const auto page = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
+    auto* out       = a.index_keys.at((p / 4) % 16, 0, page);
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[lane + 32 * j] = __float2bfloat16_rn(pooled[j]);
 }

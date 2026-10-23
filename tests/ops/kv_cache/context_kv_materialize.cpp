@@ -1,5 +1,5 @@
 #include "ops/suite.h"
-#include "ops/state_fixture.h"
+#include "../../../tools/support/state_record_fixture.h"
 #include <optional>
 #include "core/weight.h"
 #include "cuda_fixture.h"
@@ -96,14 +96,15 @@ struct LayerStorage {
     DeviceBuffer norm_device;
     GuardedDeviceBuffer cache_k{cache_elements() * sizeof(std::uint16_t)};
     GuardedDeviceBuffer cache_v{cache_elements() * sizeof(std::uint16_t)};
-    std::optional<SlottedStateFixture> key_state, value_state;
 };
 
 struct Fixture {
     std::array<LayerStorage, kLayers> storage;
     std::array<ops::ContextKVMaterializeLayerView, kLayers> views;
+    std::optional<tool::StateRecordFixture> records;
 
     Fixture() {
+        std::vector<Tensor> fields;
         const quantized_weight::PatternedWeightOptions weight_options{
             quantized_weight::RowSplitScalePattern::Tiny};
         for (int layer = 0; layer < kLayers; ++layer) {
@@ -155,32 +156,34 @@ struct Fixture {
                 row_view(target.key_host, 4096),
                 row_view(target.value_host, 5120),
                 Tensor(target.norm_device.span(), DType::BF16, {kHeadDim}),
-                CyclicKVCacheLayerView{
-                    .k               = Tensor(target.cache_k.span(), DType::BF16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
-                    .v               = Tensor(target.cache_v.span(), DType::FP16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
-                    .capacity        = kCapacity,
-                    .padded_capacity = kPaddedCapacity,
-                    .num_kv_heads    = kHeads,
-                    .head_dim        = kHeadDim,
-                    .slot_count      = kLaneCapacity,
-                },
+                {},
             };
-            target.key_state.emplace(views[layer].cache.k, 3);
-            target.value_state.emplace(views[layer].cache.v, 3);
-            views[layer].cache.k = target.key_state->tensor;
-            views[layer].cache.v = target.value_state->tensor;
+            fields.emplace_back(target.cache_k.span(), DType::BF16,
+                                std::initializer_list<std::int32_t>{kHeadDim, kPaddedCapacity,
+                                                                    kHeads, kLaneCapacity});
+            fields.emplace_back(target.cache_v.span(), DType::FP16,
+                                std::initializer_list<std::int32_t>{kHeadDim, kPaddedCapacity,
+                                                                    kHeads, kLaneCapacity});
         }
+        records.emplace(fields, 3);
+    }
+
+    void bind(const Tensor& offsets) {
+        for (int layer = 0; layer < kLayers; ++layer)
+            views[layer].cache = {records->field(2 * layer, offsets),
+                                  records->field(2 * layer + 1, offsets),
+                                  kCapacity,
+                                  kPaddedCapacity,
+                                  kHeads,
+                                  kHeadDim};
     }
 
     void reset_cache() {
         for (LayerStorage& layer : storage) {
             layer.cache_k.fill(0xa5);
             layer.cache_v.fill(0xa5);
-            layer.key_state->upload();
-            layer.value_state->upload();
         }
+        records->upload();
     }
 };
 
@@ -229,10 +232,9 @@ struct Snapshot {
     std::array<std::vector<std::uint16_t>, kLayers> keys, values;
 
     explicit Snapshot(const Fixture& fixture) {
+        fixture.records->copy_back();
         for (int layer = 0; layer < kLayers; ++layer) {
             const auto& source = fixture.storage[layer];
-            source.key_state->copy_back();
-            source.value_state->copy_back();
             keys[layer]   = from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
             values[layer] = from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
         }
@@ -241,11 +243,11 @@ struct Snapshot {
 
 int verify_state_effect(const std::string& label, const Snapshot& snapshot,
                         const std::vector<int>& positions, const std::vector<int>& counts,
-                        const std::vector<int>& state_slots, int width) {
+                        const std::vector<int>& state_records, int width) {
     std::vector<std::set<int>> written_slots(kLaneCapacity);
     for (std::size_t batch = 0; batch < counts.size(); ++batch) {
         for (int index = 0; index < counts[batch]; ++index) {
-            written_slots[static_cast<std::size_t>(state_slots[batch])].insert(
+            written_slots[static_cast<std::size_t>(state_records[batch])].insert(
                 positions[batch * static_cast<std::size_t>(width) + index] & (kCapacity - 1));
         }
     }
@@ -284,7 +286,7 @@ int verify_state_effect(const std::string& label, const Snapshot& snapshot,
 int verify_numeric_samples(const std::string& label, const Fixture& fixture,
                            const Snapshot& snapshot, const std::vector<float>& context,
                            const std::vector<int>& positions, const std::vector<int>& counts,
-                           const std::vector<int>& state_slots, int width) {
+                           const std::vector<int>& state_records, int width) {
     std::vector<std::pair<int, int>> samples;
     for (int batch = 0; batch < static_cast<int>(counts.size()); ++batch) {
         if (counts[static_cast<std::size_t>(batch)] == 0) continue;
@@ -312,7 +314,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
             const int column   = batch * width + local;
             const int position = positions[static_cast<std::size_t>(column)];
             const int slot     = position & (kCapacity - 1);
-            const int lane     = state_slots[static_cast<std::size_t>(batch)];
+            const int lane     = state_records[static_cast<std::size_t>(batch)];
             const float* input = context.data() + static_cast<std::size_t>(column) * kHidden;
             for (const int head : heads) {
                 std::vector<double> head_expected;
@@ -359,7 +361,7 @@ int verify_result(const std::string& label, const Fixture& fixture,
 }
 
 int run_case(Fixture& fixture, const std::string& label, int width, int batch,
-             const std::vector<int>& counts, const std::vector<int>& state_slots,
+             const std::vector<int>& counts, const std::vector<int>& state_records,
              std::vector<int> positions, std::uint32_t input_seed, bool narrow = false,
              bool zero_input = false, std::optional<std::size_t> expected_peak = {}) {
     const int columns          = width * batch;
@@ -368,7 +370,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     DeviceBuffer context_device   = to_device_bf16(context);
     DeviceBuffer positions_device = to_device_i32(positions);
     DeviceBuffer counts_device    = to_device_i32(counts);
-    DeviceBuffer slots_device     = to_device_i32(state_slots);
+    const auto state_offsets      = fixture.records->record_offsets(state_records);
+    DeviceBuffer offsets_device   = to_device(state_offsets);
     const std::size_t workspace_bytes =
         ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
@@ -376,22 +379,24 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     Tensor context_tensor(context_device.span(), DType::BF16, {kHidden, width, batch});
     Tensor positions_tensor(positions_device.span(), DType::I32, {width, batch});
     Tensor counts_tensor(counts_device.span(), DType::I32, {batch});
-    Tensor slots_tensor(slots_device.span(), DType::I32, {batch});
+    Tensor offsets_tensor(offsets_device.span(), DType::I64, {batch});
+    fixture.bind(offsets_tensor);
     const ops::ContextKVMaterializeExecutionEnvelope envelope{
         narrow ? static_cast<std::uint32_t>(*std::min_element(counts.begin(), counts.end())) : 0U,
         narrow ? static_cast<std::uint32_t>(*std::max_element(counts.begin(), counts.end()))
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](CudaExecutionView cuda) {
-        ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, envelope, workspace, cuda);
+        ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, fixture.views,
+                                    envelope, workspace, cuda);
     };
     launch(ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
-    int failures = verify_result(label, fixture, context, positions, counts, state_slots, width);
+    int failures = verify_result(label, fixture, context, positions, counts, state_records, width);
     failures += verify_exact("counts readonly", from_device<int>(counts_device, batch), counts);
     failures +=
         verify_exact("positions readonly", from_device<int>(positions_device, columns), positions);
-    failures += verify_exact("slots readonly", from_device<int>(slots_device, batch), state_slots);
+    failures += verify_exact("offsets readonly", from_device<std::int64_t>(offsets_device, batch),
+                             state_offsets);
     failures += scratch.verify_guards(label + " workspace");
     if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) ++failures;
     if (expected_peak && workspace.peak_used() != *expected_peak) {
@@ -422,7 +427,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                 fixture.reset_cache();
                 cuda_synchronize();
                 counts_device.copy_from_host(next_counts.data(), batch * 4);
-                slots_device.copy_from_host(next_slots.data(), batch * 4);
+                const auto next_offsets = fixture.records->record_offsets(next_slots);
+                offsets_device.copy_from_host(next_offsets.data(), batch * sizeof(std::int64_t));
                 positions_device.copy_from_host(next_positions.data(), columns * 4);
                 executable.launch(stream);
                 cuda_synchronize(stream);
@@ -434,17 +440,17 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                 failures +=
                     verify_exact("replay positions readonly",
                                  from_device<int>(positions_device, columns), next_positions);
-                failures += verify_exact("replay slots readonly",
-                                         from_device<int>(slots_device, batch), next_slots);
+                failures +=
+                    verify_exact("replay offsets readonly",
+                                 from_device<std::int64_t>(offsets_device, batch), next_offsets);
             }
         }
         cuda_check(cudaStreamDestroy(stream), "destroy graph stream");
     }
     failures += verify_exact("context readonly", from_device_bf16(context_device, context.size()),
                              std::vector<double>(context.begin(), context.end()));
+    failures += !fixture.records->guards_intact();
     for (const auto& layer : fixture.storage) {
-        failures += layer.key_state->verify_guards(label + " K image");
-        failures += layer.value_state->verify_guards(label + " V image");
         failures += layer.cache_k.verify_guards(label + " K ring");
         failures += layer.cache_v.verify_guards(label + " V ring");
     }

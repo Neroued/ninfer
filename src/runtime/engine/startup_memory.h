@@ -14,13 +14,16 @@ public:
     StartupMemoryBudget(DeviceMemorySnapshot initial, std::size_t limit, std::size_t headroom,
                         std::size_t host_reservation);
     [[nodiscard]] std::size_t available(DeviceMemorySnapshot current) const;
+    [[nodiscard]] std::size_t available_host(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] bool fits(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] std::int64_t retained(DeviceMemorySnapshot current,
                                         std::size_t owned_bytes) const;
 
     [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
 
-    [[nodiscard]] std::size_t headroom() const noexcept { return headroom_ + host_reservation_; }
+    [[nodiscard]] std::size_t headroom() const noexcept {
+        return headroom_ + (initial_.shared_physical_memory ? host_reservation_ : 0);
+    }
 
 private:
     DeviceMemorySnapshot initial_;

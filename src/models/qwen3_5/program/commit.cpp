@@ -26,9 +26,9 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
             for (std::uint32_t i = 0; i < operation.batch; ++i) {
                 const auto& row    = operation.rows[i];
                 const int accepted = static_cast<int>(value.rows[i].accepted_tokens);
-                frame.host_commit->history_columns[i]         = std::max(accepted - 1, 0);
-                frame.host_commit->state_destination_slots[i] = row.state_slots.destination;
-                frame.host_commit->draft_append_starts[i]     = static_cast<int>(row.main_frontier);
+                frame.host_commit->history_columns[i]           = std::max(accepted - 1, 0);
+                frame.host_commit->state_destination_offsets[i] = row.state_offsets.destination;
+                frame.host_commit->draft_append_starts[i] = static_cast<int>(row.main_frontier);
                 frame.host_commit->draft_append_ends[i] =
                     static_cast<int>(row.main_frontier) +
                     (value.rows[i].terminal && !value.rows[i].discarded ? accepted : 0);
@@ -41,7 +41,7 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
             std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold{};
             for (std::uint32_t i = 0; i < operation.batch; ++i) {
                 const auto& row = operation.rows[i];
-                fold[i]         = {row.state_slots.source, row.state_slots.destination,
+                fold[i]         = {row.state_offsets.source, row.state_offsets.destination,
                                    static_cast<int>(value.rows[i].accepted_tokens)};
             }
             resources.replay_fold->execute(std::span(fold).first(operation.batch),
@@ -68,8 +68,8 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
                 accepted < static_cast<std::uint32_t>(frame.host_egress->counts[i])) {
                 Tensor source = hidden.slice(2, static_cast<int>(i), 1)
                                     .slice(1, static_cast<int>(accepted - 1), 1);
-                Tensor destination = resources.state_images.continuation_hidden_slot(
-                    operation.rows[i].state_slots.destination);
+                Tensor destination = resources.state_images.continuation_hidden(
+                    operation.rows[i].state_offsets.destination);
                 CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, destination.bytes(),
                                            cudaMemcpyDeviceToDevice, device.stream()));
                 device_work = true;

@@ -216,8 +216,8 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
     std::array<UnitDemand, kMaximumConcurrency> demands{};
     std::array<UnitDemand, kMaximumConcurrency> coverage{};
     std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
+    std::array<std::uint32_t, kMaximumConcurrency> add_main{}, add_backend{};
     std::array<bool, kMaximumConcurrency> seen{};
-    std::uint64_t main_needed = 0, backend_needed = 0;
     for (std::size_t index = 0; index < units.size(); ++index) {
         const auto& unit = units[index];
         if (!valid_sequence(unit.sequence)) {
@@ -246,29 +246,34 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
                                                          state.continuation.metadata.text_kv_valid,
                                                          coverage[lane].main_frontier);
         old_main[lane]  = text_kv_histories->reserved_growth_pages(state.kv->text.handle());
-        main_needed += main > old_main[lane] ? main - old_main[lane] : 0;
+        add_main[lane]  = main > old_main[lane] ? main - old_main[lane] : 0;
         if (state.kv->backend) {
             const auto backend = backend_kv_histories->write_pages(state.kv->backend->handle(),
                                                                    backend_kv_valid(state),
                                                                    coverage[lane].backend_frontier);
             old_backend[lane] =
                 backend_kv_histories->reserved_growth_pages(state.kv->backend->handle());
-            backend_needed += backend > old_backend[lane] ? backend - old_backend[lane] : 0;
+            add_backend[lane] = backend > old_backend[lane] ? backend - old_backend[lane] : 0;
         }
     }
-    const auto main_available = text_kv_pages->allocator().available_pages();
-    const auto backend_available =
-        backend_kv_pages ? backend_kv_pages->allocator().available_pages() : 0;
-    if (main_needed > main_available || backend_needed > backend_available) {
-        return {
-            .reserved = false,
-            .shortage = {.kv_page_groups = {
-                             static_cast<std::uint32_t>(
-                                 main_needed > main_available ? main_needed - main_available : 0),
-                             static_cast<std::uint32_t>(backend_needed > backend_available
-                                                            ? backend_needed - backend_available
-                                                            : 0)}}};
+    ContextDemand bundle;
+    for (const auto& unit : units) {
+        const auto lane = this->lane(unit.sequence);
+        if (requests[lane].permit) continue;
+        const auto& state = active_sequence(lane);
+        bundle.add_growth(*text_kv_histories, state.kv->text.handle(), add_main[lane]);
+        if (state.kv->backend)
+            bundle.add_growth(*backend_kv_histories, state.kv->backend->handle(),
+                              add_backend[lane]);
     }
+    auto assessment = directory.assess(bundle);
+    if (!assessment.ready()) return {.assessment = std::move(assessment)};
+    auto reserved = directory.reserve(bundle);
+    if (!reserved) return {.assessment = std::move(reserved.assessment)};
+    auto main_records    = reserved.reservation->take_history(kTextKvPool.index);
+    auto backend_records = backend_kv_histories
+                               ? reserved.reservation->take_history(kBackendKvPool.index)
+                               : context::RecordReservation{};
     std::array<bool, kMaximumConcurrency> added{};
     try {
         for (const auto& unit : units) {
@@ -276,17 +281,13 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             if (requests[lane].permit) { continue; }
             auto& state = active_sequence(lane);
             added[lane] = true;
-            text_kv_histories->reserve_growth(
-                state.kv->text.handle(),
-                text_kv_histories->write_pages(state.kv->text.handle(),
-                                               state.continuation.metadata.text_kv_valid,
-                                               coverage[lane].main_frontier));
+            auto main   = main_records.split(add_main[lane]);
+            text_kv_histories->prepare_growth(state.kv->text.handle(), main);
+            text_kv_histories->adopt_growth(state.kv->text.handle(), std::move(main));
             if (state.kv->backend) {
-                backend_kv_histories->reserve_growth(
-                    state.kv->backend->handle(),
-                    backend_kv_histories->write_pages(state.kv->backend->handle(),
-                                                      backend_kv_valid(state),
-                                                      coverage[lane].backend_frontier));
+                auto backend = backend_records.split(add_backend[lane]);
+                backend_kv_histories->prepare_growth(state.kv->backend->handle(), backend);
+                backend_kv_histories->adopt_growth(state.kv->backend->handle(), std::move(backend));
             }
             requests[lane].permit = demands[lane];
         }
@@ -294,10 +295,9 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             if (!added[lane]) { continue; }
             auto& state = active_sequence(lane);
-            text_kv_histories->reserve_growth(state.kv->text.handle(), old_main[lane]);
+            text_kv_histories->shrink_growth(state.kv->text.handle(), old_main[lane]);
             if (state.kv->backend) {
-                backend_kv_histories->reserve_growth(state.kv->backend->handle(),
-                                                     old_backend[lane]);
+                backend_kv_histories->shrink_growth(state.kv->backend->handle(), old_backend[lane]);
             }
             requests[lane].permit.reset();
         }
@@ -314,7 +314,7 @@ void SessionImpl::release_units(std::span<const SequenceHandle> handles) noexcep
             auto& state   = sequences[l];
             auto& request = requests[l];
             if (state.kv) {
-                text_kv_histories->reserve_growth(
+                text_kv_histories->shrink_growth(
                     state.kv->text.handle(),
                     request.recovery
                         ? text_kv_histories->write_pages(state.kv->text.handle(),
@@ -322,7 +322,7 @@ void SessionImpl::release_units(std::span<const SequenceHandle> handles) noexcep
                                                          request.recovery->coverage.main_frontier)
                         : 0);
                 if (state.kv->backend)
-                    backend_kv_histories->reserve_growth(
+                    backend_kv_histories->shrink_growth(
                         state.kv->backend->handle(),
                         request.recovery ? backend_kv_histories->write_pages(
                                                state.kv->backend->handle(), backend_kv_valid(state),

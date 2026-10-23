@@ -66,6 +66,9 @@ set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_context_pool_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_pool.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)

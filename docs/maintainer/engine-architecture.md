@@ -7,9 +7,10 @@
 ## 1. 产品执行模型
 
 编译目标由 [Build system](build-system.md)定义：`rtx5090` 与 `dgx_spark` 各自选择本地源码和
-优化实现，模型 Config 与 Op 数学接口保持独立。当前产品使用一个 rank、一张 GPU、一个常驻模型，
-启动时固定 `max_concurrency=1..8`。LocalExecutor 在进程内驱动 RankWorker，不创建网络连接或
-collective communicator。
+优化实现，模型 Config 与 Op 数学接口保持独立。一个模型实例由协调侧 Session 和一个或多个
+RankWorker 组成，启动时固定 `max_concurrency=1..8`。单 rank 由 LocalExecutor 在进程内执行；
+多 rank 由 DistributedExecutor 分发统一执行计划，通信与分片由对应模型实现。
+各 rank 独立拥有设备权重、固定执行资源和 Context backing。
 
 Generation 使用有界等待队列，resident 请求按有限执行单元取得资源；压力下可以暂停与恢复。
 紧凑 decode/control 批次与分块 prefill、Replay 共用调度、提交和结果发布机制。
@@ -37,7 +38,7 @@ flowchart LR
     L --> M["ModelShard / Parameters"]
     D --> S["原生 Session / ContextDirectory"]
     M --> P["RankProgram / 固定执行资源"]
-    S --> X["LocalExecutor / RankWorker"]
+    S --> X["Executor / RankWorker"]
     X --> P
 ```
 
@@ -88,7 +89,7 @@ response events 和 availability。Scheduler 决定执行成员、fresh admissio
 prefill 轮转、紧凑批次及抢占/恢复机会。两者不持有设备 Program 或物理页分配器。
 
 SequenceId 标识一条逻辑序列，跨暂停恢复保持；ResidencyId 标识当前 lane 绑定，重新绑定时换代。
-State slot、KV execution row、compact batch row 和 Engine lane 是不同身份。
+State record offset、KV execution row、compact batch row 和 Engine lane 是不同身份。
 每个在途执行冻结 request、sequence、residency、row order 与取消快照，结果不能通过当前 lane 反查旧成员。
 
 请求的输出预算和外部生命周期归 Engine；真实模型账本、Main/backend 前沿、Replay 目标及未决生成事务归
@@ -99,12 +100,12 @@ State slot、KV execution row、compact batch row 和 Engine lane 是不同身�
 ResourceManager 拥有私有 continuation owner、共享前缀索引、session 提示、需求证据、保留等级及回收权限。
 它向原生 Session 查询 checkpoint、恢复成本和有限动作，选择 source 与受害者，再采用 Session 的完成结果。
 
-ContextDirectory 是唯一的逻辑空间和引用账本：State 身份与 slot、各 pool 的物理页编号、history、row、
+ContextDirectory 是唯一的逻辑空间和引用账本：State/Page/History 身份、rank-local records、物理绑定、row、
 Host offset/length、coverage、writer、read leases 和 reservations 都由它管理。Host/Device backing 在 rank，
 rank 不重新选择页号或缓存命中。ResourceManager 的索引不重复拥有物理空间。
 
 StateDirectory 区分预留、初始化、数学写入、冻结和 replica materialization。复制沿用 content epoch，
-数学提交产生新 epoch。不可变来源与活动写入者分开；Both replica 可以把 Device slot 交给新 identity，
+数学提交产生新 epoch。不可变来源与活动写入者分开；Both replica 可以把 Device record 交给新 identity，
 旧 identity 保留 Host 内容。完整 StateImage 连续存放，DFlash local 字段组可以独立复制。
 
 HistoryOwner 是一个 pool 的唯一可写 owner，HistoryPrefix 持有其精确前缀。HistoryDirectory 随引用变化
@@ -117,7 +118,8 @@ CheckpointStore 管理发布、generation 和读者 lease。Main/MTP/DFlash 的�
 ### 2.4 Session、Executor 与 RankProgram
 
 InferenceInstance 持有 ModelDefinition、Frontend、Executor 与原生 Session。
-LocalExecutor 持有一个 RankWorker；RankWorker 持有 DeviceContext、ModelShard、const Parameters 和 RankProgram。
+LocalExecutor 持有一个 RankWorker；DistributedExecutor 协调各 worker 的提交、结果与退休。
+每个 RankWorker 持有 DeviceContext、ModelShard、const Parameters 和 RankProgram。
 DeviceContext 地址从启动到销毁保持稳定，所有借用其 stream 的 owner 先于它销毁。
 
 | 所有者 | 内容 |
@@ -154,8 +156,8 @@ Frontend 的资源由 Definition 拥有，不借用稍后可能被销毁的权�
 权重加载后，用少量物理 KV 页准备完整 Graph 集合，保留真实 context、batch、speculative 配置与拓扑共享关系；
 临时 Host context 容量为零。销毁校准资源并重取可用内存后，扣除 Graph 重建估计，确定正式容量。
 
-正式准备依次建立 RankProgram 和 PreparedSession。RankProgram 导出实际 KVTransferProfile，填入纯控制计划；
-PreparedSession 预建目录、checkpoint catalog 和控制元数据，再检查整个实例是否满足预算。
+正式准备依次建立 RankProgram 和 PreparedSession。模型计划提供 State/KV 记录布局、各 rank
+backing 容量和控制预算；PreparedSession 建立目录与 checkpoint catalog，再检查整个实例预算。
 成功后把这批 owner 移入 Session，不重复分配。容量纠偏先销毁 PreparedSession，再销毁 rank 资源；
 控制侧回收量与 Graph/rank 回收量分别计算，避免漏计或重复扣除统一内存。
 

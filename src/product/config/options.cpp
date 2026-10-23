@@ -334,15 +334,13 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         const auto& limit = assignment(merged, Field::MaxTokens);
         if (limit && std::holds_alternative<std::uint64_t>(limit->value) &&
             std::get<std::uint64_t>(limit->value) == 1) {
-            engine.context_cache.enabled           = false;
-            engine.context_cache.extra_state_slots = 0;
+            engine.context_cache.enabled = false;
         }
     }
     launch.provenance.config_path = command.config_path;
     launch.provenance.argv        = std::move(command.argv);
     engine.deployment             = std::move(file.deployment);
     launch.provenance.fields      = std::move(file.deployment_sources);
-    bool kv_follows_context       = true;
     for (const auto& spec : fields()) {
         const auto& setting = assignment(merged, spec.field);
         if (!setting || !applies_to(spec, entry)) continue;
@@ -380,15 +378,11 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::KvDtype:
             engine.kv_cache = kv_storage(string());
             break;
-        case Field::KvCapacity:
+        case Field::ContextCapacity:
             if (const auto* capacity = std::get_if<std::uint64_t>(&value)) {
-                engine.kv_capacity =
-                    KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(*capacity));
-                kv_follows_context = false;
-            } else if (string() == "auto") {
-                engine.kv_capacity = KvCapacityPolicy::automatic();
-                kv_follows_context = false;
-            }
+                engine.context_capacity = ContextCapacityPolicy::explicit_capacity(*capacity);
+            } else
+                engine.context_capacity = ContextCapacityPolicy::automatic();
             break;
         case Field::PrefillChunk:
             engine.prefill_chunk = u32();
@@ -410,12 +404,6 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
             break;
         case Field::PrefixReuse:
             engine.context_cache.enabled = boolean();
-            break;
-        case Field::ExtraStateSlots:
-            if (std::holds_alternative<std::string>(value))
-                engine.context_cache.extra_state_slots.reset();
-            else
-                engine.context_cache.extra_state_slots = u32();
             break;
         case Field::CheckpointInterval:
             engine.context_cache.checkpoint_interval = u32();
@@ -565,11 +553,6 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
     };
     if (engine.artifact_path.empty())
         throw std::invalid_argument("model.path or a model artifact argument is required");
-    if (kv_follows_context)
-        engine.kv_capacity = KvCapacityPolicy::explicit_capacity(engine.max_context);
-    if (engine.kv_capacity.mode == KvCapacityMode::Explicit &&
-        engine.kv_capacity.explicit_tokens < engine.max_context)
-        fail(Field::KvCapacity, "must be at least engine.max_context");
     try {
         validate_speculative_cli_options(engine.speculative);
     } catch (const std::invalid_argument& error) {
@@ -594,10 +577,7 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
 LaunchOptions default_launch_options(EntryPoint entry) {
     LaunchOptions options;
     if (entry != EntryPoint::Serve) {
-        if (entry == EntryPoint::Cli) {
-            options.engine.context_cache.enabled           = false;
-            options.engine.context_cache.extra_state_slots = 0;
-        }
+        if (entry == EntryPoint::Cli) { options.engine.context_cache.enabled = false; }
         options.engine.context_cache.host_capacity_bytes = 0;
         options.generation.sampling.seed                 = 0;
     } else
@@ -654,8 +634,8 @@ std::string startup_usage_text(std::string_view executable, EntryPoint entry) {
     out << "\nCapacities: bytes or B/KiB/MiB/GiB; durations: milliseconds or ms/s.\n"
         << "Boolean options also accept --flag=true|false.\n"
         << "Default prefill chunk: Qwen4Exp/CPU expert offload 4096, otherwise 1024.\n"
-        << "Context cache defaults: CLI 0 extra slots / 0B Host; serve one extra slot per lane,\n"
-        << "RTX 5090 Host 8GiB + 8 StateImages, Spark Host 0B.\n"
+        << "Context capacity defaults to auto; KV and State share each rank's Device budget.\n"
+        << "Host context: CLI 0B; serve RTX 5090 8GiB + 8 StateImages, Spark 0B.\n"
         << "Environment: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.\n";
     return out.str();
 }

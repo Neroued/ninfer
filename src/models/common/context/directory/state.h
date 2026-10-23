@@ -1,7 +1,8 @@
 #pragma once
 
 #include "core/transfer_work.h"
-#include "models/common/context/directory/allocation.h"
+#include "models/common/context/directory/records.h"
+#include "models/common/context/directory/metadata.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,31 +42,43 @@ enum class StateCopyDirection : std::uint8_t {
 };
 
 struct StateSelectors {
-    std::int32_t source      = -1;
-    std::int32_t destination = -1;
+    std::int64_t source      = -1;
+    std::int64_t destination = -1;
+};
+
+struct StatePartSpec {
+    std::uint32_t rank                          = 0;
+    std::size_t image_bytes                     = 0;
+    std::size_t alignment                       = 256;
+    bool operator==(const StatePartSpec&) const = default;
+};
+
+struct StateLayoutSpec {
+    std::uint32_t variant = 0;
+    std::vector<StatePartSpec> parts;
+    bool operator==(const StateLayoutSpec&) const = default;
 };
 
 struct StateDirectorySpec {
     std::uint32_t logical_capacity = 0;
-    std::uint32_t device_slots     = 0;
-    std::size_t image_bytes        = 0;
-
+    std::vector<StateLayoutSpec> layouts;
     bool operator==(const StateDirectorySpec&) const = default;
 };
+
+[[nodiscard]] std::uint32_t state_record_layout(std::uint32_t variant);
 
 struct StateTransferDescription {
     StateCopyDirection direction = StateCopyDirection::DeviceToHost;
     StateId source{};
     StateId destination{};
-    StateSelectors slots{};
-    HostExtent host{};
-    std::size_t bytes   = 0;
+    ContextRecordBinding source_record;
+    ContextRecordBinding destination_record;
     std::uint64_t epoch = 0;
 };
 
-// Owns logical images, device slot assignments and Host extents. Physical storage and execution
+// Owns logical images and rank-local record replicas. Physical storage and execution
 // are external; callers retain leases and transfers until their device consumers have retired.
-class StateDirectory {
+class StateDirectory : public MetadataOwner {
 public:
     class ReadLease {
     public:
@@ -80,8 +93,8 @@ public:
 
         [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
 
-        [[nodiscard]] std::int32_t device_slot() const;
-        [[nodiscard]] HostExtent host_extent() const;
+        [[nodiscard]] std::int64_t device_offset(std::uint32_t rank = 0) const;
+        [[nodiscard]] ContextRecordBinding host_binding(std::uint32_t rank = 0) const;
         void reset() noexcept;
 
     private:
@@ -106,7 +119,7 @@ public:
 
         [[nodiscard]] StateId image() const noexcept { return image_; }
 
-        [[nodiscard]] StateSelectors begin_write(StateId source);
+        [[nodiscard]] StateSelectors begin_write(StateId source, std::uint32_t rank = 0);
         [[nodiscard]] StateId release() noexcept;
 
     private:
@@ -130,7 +143,8 @@ public:
 
         [[nodiscard]] StateCopyDirection direction() const noexcept { return direction_; }
 
-        [[nodiscard]] StateTransferDescription description() const;
+        [[nodiscard]] StateTransferDescription description(std::uint32_t rank = 0) const;
+        [[nodiscard]] std::vector<std::uint32_t> ranks() const;
         [[nodiscard]] TransferWork work() const;
         void publish(bool keep_source_replica);
 
@@ -143,33 +157,45 @@ public:
         StateCopyDirection direction_ = StateCopyDirection::DeviceToHost;
         ReadLease source_;
         StateId destination_;
-        std::optional<std::int32_t> device_slot_;
-        std::optional<HostAllocation> host_slot_;
+        std::vector<RecordLease> records_;
         friend class StateDirectory;
     };
 
-    StateDirectory(StateDirectorySpec spec, HostAllocator* host);
+    StateDirectory(StateDirectorySpec spec, RecordDomains& records, MetadataBudget& metadata);
+    ~StateDirectory() override = default;
 
-    [[nodiscard]] static std::size_t metadata_bytes(StateDirectorySpec spec) {
-        return sizeof(StateDirectory) +
-               std::size_t(spec.logical_capacity) * (sizeof(Object) + sizeof(std::uint32_t)) +
-               std::size_t(spec.device_slots) * sizeof(std::int32_t);
-    }
+    [[nodiscard]] static std::size_t metadata_bytes(const StateDirectorySpec& spec);
+    [[nodiscard]] static std::size_t object_metadata_bytes(std::size_t parts);
+    [[nodiscard]] std::size_t allocated_metadata_bytes() const;
+    [[nodiscard]] bool reserve_metadata(std::uint32_t count);
+    [[nodiscard]] std::size_t metadata_requirement(std::uint32_t count) const;
+    [[nodiscard]] std::uint32_t available_descriptors() const noexcept;
+    [[nodiscard]] MetadataReservation reserve_descriptors(std::uint32_t count);
+    void release_metadata(std::span<const std::uint32_t> ids) noexcept override;
 
     StateDirectory(const StateDirectory&)            = delete;
     StateDirectory& operator=(const StateDirectory&) = delete;
     StateDirectory(StateDirectory&&)                 = delete;
     StateDirectory& operator=(StateDirectory&&)      = delete;
 
-    [[nodiscard]] std::size_t image_bytes() const noexcept { return image_bytes_; }
+    [[nodiscard]] std::size_t image_bytes(std::uint32_t rank = 0, std::uint32_t variant = 0) const;
+    [[nodiscard]] std::vector<std::uint32_t> ranks(std::uint32_t variant = 0) const;
+    [[nodiscard]] std::uint32_t variant(StateId image) const;
+    [[nodiscard]] std::optional<StateId> image_for_allocation(AllocationId allocation) const;
+    [[nodiscard]] ReadLease pin_binding(StateId image);
+    [[nodiscard]] std::size_t reclaimable_metadata(std::span<const StateId> released = {}) const;
+    [[nodiscard]] std::size_t reclaim_metadata();
 
     [[nodiscard]] std::uint32_t capacity() const noexcept;
     [[nodiscard]] std::uint32_t occupied() const noexcept;
     [[nodiscard]] std::uint32_t device_occupied() const noexcept;
-    [[nodiscard]] std::uint32_t device_capacity() const noexcept;
     [[nodiscard]] std::uint32_t host_occupied() const noexcept;
-    [[nodiscard]] std::optional<StateId> reserve_destination() noexcept;
-    [[nodiscard]] std::optional<StateId> reserve_logical_destination() noexcept;
+    [[nodiscard]] std::optional<StateId> reserve_destination(RecordReservation reservation,
+                                                             std::uint32_t variant = 0);
+    [[nodiscard]] std::optional<StateId> reserve_destination(std::uint32_t variant = 0);
+    [[nodiscard]] std::optional<StateId> reserve_logical_destination(std::uint32_t variant = 0);
+    [[nodiscard]] std::optional<StateId> reserve_logical_destination(RecordReservation& reservation,
+                                                                     std::uint32_t variant = 0);
 
     // Adopting initialized or copied content preserves its epoch; native writes advance it.
     // Publication relies on the caller's execution dependency, not a synchronous device wait.
@@ -184,8 +210,10 @@ public:
     [[nodiscard]] std::uint64_t content_epoch(StateId image) const;
     [[nodiscard]] std::uint32_t source_pins(StateId image) const;
     [[nodiscard]] std::uint32_t checkpoint_references(StateId image) const;
-    [[nodiscard]] std::int32_t physical_slot(StateId image) const;
-    [[nodiscard]] HostExtent host_extent(StateId image) const;
+    [[nodiscard]] std::int64_t physical_offset(StateId image, std::uint32_t rank = 0) const;
+    [[nodiscard]] ContextRecordBinding device_binding(StateId image, std::uint32_t rank = 0) const;
+    [[nodiscard]] ContextRecordBinding host_binding(StateId image, std::uint32_t rank = 0) const;
+    [[nodiscard]] std::vector<RecordRelease> allocations(StateId image) const;
     [[nodiscard]] ReadLease read(StateId image);
 
     void retain_checkpoint_reference(StateId image);
@@ -198,22 +226,24 @@ public:
     [[nodiscard]] bool drop_device_replica(StateId image) noexcept;
     [[nodiscard]] bool drop_host_replica(StateId image) noexcept;
 
-    // A Both source retains its immutable Host identity; the destination adopts its device slot.
+    // A Both source retains its immutable Host identity; the destination adopts its Device records.
     void split_device_replica_identity(StateId source, StateId destination);
 
     void freeze(StateId image);
-    [[nodiscard]] StateSelectors begin_write(StateId source, StateId destination);
+    [[nodiscard]] StateSelectors begin_write(StateId source, StateId destination,
+                                             std::uint32_t rank = 0);
     void complete_write(StateId source, StateId destination);
     void abort_write(StateId source, StateId destination);
     [[nodiscard]] bool can_abort_write(StateId source, StateId destination) const noexcept;
-    [[nodiscard]] StateSelectors selectors(StateId source, StateId destination) const;
+    [[nodiscard]] StateSelectors selectors(StateId source, StateId destination,
+                                           std::uint32_t rank = 0) const;
 
     [[nodiscard]] std::optional<Transfer> reserve_device_to_host(StateId source,
-                                                                 HostAllocation reserved = {});
+                                                                 RecordReservation reserved = {});
 
     [[nodiscard]] std::optional<Transfer> reserve_host_to_device(StateId source);
-    [[nodiscard]] std::optional<Transfer> reserve_host_to_device(StateId source,
-                                                                 StateId destination);
+    [[nodiscard]] std::optional<Transfer>
+    reserve_host_to_device(StateId source, StateId destination, RecordReservation reserved = {});
     [[nodiscard]] bool release(StateId image) noexcept;
     [[nodiscard]] bool can_release(StateId image) const noexcept;
     [[nodiscard]] bool
@@ -221,10 +251,17 @@ public:
 
 private:
     struct Object {
-        std::uint32_t generation    = 1;
+        std::uint32_t generation    = 0;
+        std::uint32_t variant       = 0;
         std::uint64_t content_epoch = 0;
-        std::optional<std::int32_t> device_slot{};
-        std::optional<HostAllocation> host_slot{};
+
+        struct Part {
+            std::uint32_t rank = 0;
+            std::optional<RecordLease> device;
+            std::optional<RecordLease> host;
+        };
+
+        std::vector<Part> parts;
         std::uint64_t transfer_id           = 0;
         std::uint32_t checkpoint_references = 0;
         std::uint32_t source_pins           = 0;
@@ -234,12 +271,17 @@ private:
         StateRole role          = StateRole::Free;
     };
 
+    void validate_records(const std::vector<RecordLease>& records, ContextMemory memory,
+                          std::uint32_t variant) const;
+    [[nodiscard]] const StateLayoutSpec& layout_spec(std::uint32_t variant) const;
     void retire_released_owner(StateId image) noexcept;
     [[nodiscard]] bool can_release_checkpoint_owner(StateId image) const noexcept;
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept;
-    [[nodiscard]] std::optional<StateId> allocate(StateRole role, bool with_device) noexcept;
-    [[nodiscard]] std::optional<std::int32_t> take_device_slot() noexcept;
-    void return_device_slot(std::int32_t slot) noexcept;
+    [[nodiscard]] std::optional<StateId> allocate(std::uint32_t index, StateRole role,
+                                                  std::uint32_t variant,
+                                                  std::vector<RecordLease> records = {});
+    [[nodiscard]] static Object::Part& part(Object&, std::uint32_t rank);
+    [[nodiscard]] static const Object::Part& part(const Object&, std::uint32_t rank);
     [[nodiscard]] std::uint64_t next_epoch() noexcept;
     [[nodiscard]] std::uint64_t next_transfer() noexcept;
     [[nodiscard]] Object& require(StateId image);
@@ -248,17 +290,21 @@ private:
     void validate_transfer(const Transfer& transfer) const;
     void publish_transfer(Transfer& transfer, bool keep_source_replica);
     void abort_transfer(Transfer& transfer) noexcept;
-    void release_host_slot(std::optional<HostAllocation>& slot) noexcept;
     static void consume(Transfer& transfer) noexcept;
 
-    std::size_t image_bytes_;
-    HostAllocator* host_ = nullptr;
-    std::vector<Object> objects_;
+    StateDirectorySpec spec_;
+    RecordDomains* records_ = nullptr;
+    MetadataAccount metadata_account_;
+    MetadataBudget* metadata_budget_;
+    std::size_t max_parts_ = 0;
+    DirectorySlots<Object> objects_;
+    std::uint32_t initialized_objects_ = 0;
+
     std::vector<std::uint32_t> free_objects_;
-    std::vector<std::int32_t> free_device_slots_;
     std::uint32_t free_object_count_  = 0;
-    std::uint32_t free_device_count_  = 0;
+    std::uint32_t device_images_      = 0; // Reserved transfers and published replicas.
     std::uint32_t host_images_        = 0; // Reserved transfers and published replicas.
+    std::uint32_t next_generation_    = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;
 };

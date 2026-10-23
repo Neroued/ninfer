@@ -8,6 +8,8 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail::gated_delta_net {
+inline constexpr std::int32_t kMaximumReplayRows = 8;
+
 enum class FoldGeometryId { Layers48Heads48, Layers30Heads32, Layers36Heads48, Layers36Heads24 };
 
 inline FoldGeometryId select_fold_geometry(const GdnReplayRecordSpec& spec) {
@@ -25,27 +27,26 @@ inline FoldGeometryId select_fold_geometry(const GdnReplayRecordSpec& spec) {
 }
 
 struct alignas(16) GdnReplayFoldKernelRow {
-    std::int32_t source_state_slot;
-    std::int32_t destination_state_slot;
+    std::int64_t source_offset;
+    std::int64_t destination_offset;
     std::int32_t commit_columns;
     std::int32_t reserved = 0;
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[8];
+    GdnReplayFoldKernelRow row[kMaximumReplayRows];
 };
 
 struct GdnReplayFoldDeviceRows {
-    const std::int32_t* sources;
-    const std::int32_t* destinations;
+    const std::int64_t* sources;
+    const std::int64_t* destinations;
     const std::int32_t* columns;
 };
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                             const Tensor& beta, float scale, const Tensor& ssm_states,
-                             const Tensor& valid_columns, const Tensor& initial_state_slots,
-                             Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream);
+                             const Tensor& beta, float scale, ConstStateFieldView initial_state,
+                             const Tensor& valid_columns, Tensor& key_record, Tensor& value_record,
+                             Tensor& gate_record, Tensor& out, cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

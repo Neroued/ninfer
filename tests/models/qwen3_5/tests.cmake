@@ -28,19 +28,19 @@ ninfer_add_test(ninfer_qwen3_5_mtp_history_real_test
 
 ninfer_add_test(ninfer_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_model_execution ninfer_engine)
 
 ninfer_add_test(ninfer_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
-  LIBRARIES ninfer_engine ninfer::json)
+  LIBRARIES ninfer_model_execution ninfer_engine ninfer::json)
 
 ninfer_add_test(ninfer_qwen3_5_grammar_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
-  LIBRARIES ninfer_engine ninfer::json)
+  LIBRARIES ninfer_model_execution ninfer_engine ninfer::json)
 
 ninfer_add_test(ninfer_qwen3_5_tools_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_tools_real.cpp"
-  LIBRARIES ninfer_engine ninfer::json)
+  LIBRARIES ninfer_model_execution ninfer_engine ninfer::json)
 
 ninfer_add_test(ninfer_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
@@ -52,7 +52,7 @@ ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
 
 ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_model_execution ninfer_engine)
 
 ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
@@ -60,7 +60,7 @@ ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
 
 ninfer_add_test(ninfer_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_model_execution ninfer_engine)
 
 add_test(NAME ninfer_qwen3_5_moe_offload_real_test
   COMMAND ninfer_qwen3_5_moe_real_test --offload)
@@ -69,7 +69,7 @@ set_tests_properties(ninfer_qwen3_5_moe_offload_real_test PROPERTIES
 
 ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_model_execution ninfer_engine)
 
 add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
   COMMAND ninfer_qwen3_5_prefix_real_test)

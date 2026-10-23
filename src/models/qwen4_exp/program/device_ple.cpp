@@ -17,14 +17,19 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch) {
         hash.vocab_sizes[i] = controls.vocab_sizes[i];
         hash.offsets[i]     = controls.offsets[i];
     }
-    const auto& io      = resources.plan.persistent.buffers.batch;
-    const auto tail     = packed_tensor(io.raw_tail, {2, batch.batch});
-    const auto slots    = device_tensor(io.row_indices).slice(0, 0, batch.batch);
+    const auto& io     = resources.plan.persistent.buffers.batch;
+    const auto tail    = packed_tensor(io.raw_tail, {2, batch.batch});
+    const auto offsets = device_tensor(io.raw_tail_offsets).slice(0, 0, batch.batch);
+    const StateFieldView tail_field{
+        {{tail.data, tail.bytes(), tail.device}, offsets},
+        {{{0, 2 * sizeof(TokenId), alignof(TokenId)}, DType::I32, {2, 1, 1, 1}},
+         1,
+         2 * sizeof(TokenId)}};
     auto embedding      = device_embedding(batch.tokens, batch.batch);
     const auto producer = resources.ple_transfer();
     ple_inputs.record(cuda.stream());
     ple_inputs.wait(producer.stream());
-    ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail, slots}, hash,
+    ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail_field}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);
     if (parallel) parallel->merge_embedding(embedding, producer);

@@ -1,6 +1,7 @@
 #include "ops/suite.h"
 #include "ops/float_codec.h"
-#include "ops/state_fixture.h"
+#include "../../../tools/support/paged_kv_fixture.h"
+#include "../../../tools/support/state_record_fixture.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -105,30 +106,85 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
     }
 }
 
-PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
-                                 DeviceBuffer& block_table, int table_rows = 1) {
-    return {
-        .k_pages      = Tensor(k.span(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
-        .v_pages      = Tensor(v.span(), DType::FP16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
-        .block_tables = Tensor(block_table.span(), DType::I32, {kLogicalPages, table_rows}),
-        .head_dim     = kHeadDim,
-        .num_kv_heads = kKVHeads,
-        .storage      = KvCacheStorage::BFloat16,
-    };
-}
+class PagedFixture {
+public:
+    PagedFixture(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
+                 std::span<const std::int32_t> mapping)
+        : dense_{Tensor(k.span(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
+                 Tensor(v.span(), DType::FP16, {kHeadDim, kPage, kPhysicalPages, kKVHeads})},
+          packed_(k.span().device,
+                  {kPage, {{DType::BF16, kHeadDim, kKVHeads}, {DType::FP16, kHeadDim, kKVHeads}}},
+                  kPhysicalPages),
+          table_(to_device(packed_.table_offsets(mapping))),
+          offsets_(table_.span(), DType::I64,
+                   {kLogicalPages, static_cast<std::int32_t>(mapping.size()) / kLogicalPages}) {
+        upload();
+    }
 
-CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v, int capacity,
-                                   int slot_count = 1) {
-    return {
-        .k        = Tensor(k.span(), DType::BF16, {kHeadDim, capacity, kKVHeads, slot_count}),
-        .v        = Tensor(v.span(), DType::FP16, {kHeadDim, capacity, kKVHeads, slot_count}),
-        .capacity = static_cast<std::uint32_t>(capacity),
-        .padded_capacity = static_cast<std::uint32_t>(capacity),
-        .num_kv_heads    = kKVHeads,
-        .head_dim        = kHeadDim,
-        .slot_count      = slot_count,
-    };
-}
+    PagedKVBatchLayerView view() {
+        return {packed_.plane(0, offsets_), packed_.plane(1, offsets_), {}, {}, kHeadDim, kKVHeads,
+                KvCacheStorage::BFloat16};
+    }
+
+    void upload() {
+        for (int i = 0; i < 2; ++i) packed_.upload_plane(i, dense_[i], true);
+    }
+
+    void copy_back() {
+        for (int i = 0; i < 2; ++i) packed_.download_plane(i, dense_[i], true);
+    }
+
+    void remap(std::span<const std::int32_t> mapping) {
+        const auto offsets = packed_.table_offsets(mapping);
+        table_.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
+    }
+
+    bool guards_intact() const { return packed_.guards_intact(); }
+private:
+    std::array<Tensor, 2> dense_;
+    tool::PackedKVFixture packed_;
+    DeviceBuffer table_;
+    Tensor offsets_;
+};
+
+class CyclicFixture {
+public:
+    CyclicFixture(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v, int capacity, int records,
+                  std::span<const std::int32_t> selected, int padded = 0)
+        : dense_{Tensor(k.span(), DType::BF16,
+                        {kHeadDim, padded ? padded : capacity, kKVHeads, records}),
+                 Tensor(v.span(), DType::FP16,
+                        {kHeadDim, padded ? padded : capacity, kKVHeads, records})},
+          packed_(dense_, 3), offsets_(to_device(packed_.record_offsets(selected))),
+          table_(offsets_.span(), DType::I64, {static_cast<std::int32_t>(selected.size())}),
+          capacity_(capacity), padded_(padded ? padded : capacity) {}
+
+    CyclicKVCacheLayerView view() const {
+        return {packed_.field(0, table_),
+                packed_.field(1, table_),
+                static_cast<std::uint32_t>(capacity_),
+                static_cast<std::uint32_t>(padded_),
+                kKVHeads,
+                kHeadDim};
+    }
+
+    void upload() const { packed_.upload(); }
+
+    void copy_back() const { packed_.copy_back(); }
+
+    void select(std::span<const std::int32_t> selected) {
+        const auto offsets = packed_.record_offsets(selected);
+        offsets_.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
+    }
+
+    bool guards_intact() const { return packed_.guards_intact(); }
+private:
+    std::array<Tensor, 2> dense_;
+    tool::StateRecordFixture packed_;
+    DeviceBuffer offsets_;
+    Tensor table_;
+    int capacity_, padded_;
+};
 
 int run_case(int tokens, int commit_count, int first_position, bool cyclic,
              std::vector<std::int32_t> mapping = {}, int min_count = 0,
@@ -158,9 +214,6 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({commit_count});
     DeviceBuffer d_selector  = to_device<std::int32_t>({0});
-    DeviceBuffer d_table     = cyclic
-                                   ? DeviceBuffer(ninfer::test::cuda_environment().context.device(), 1)
-                                   : to_device(mapping);
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
@@ -176,13 +229,20 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
         .max_count = static_cast<std::uint32_t>(tokens),
     };
     if (cyclic) {
-        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    cyclic_view(cache_k, cache_v, cyclic_capacity),
+        CyclicFixture fixture(cache_k, cache_v, cyclic_capacity, 1, std::array<std::int32_t, 1>{0});
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope, fixture.view(),
                                     ninfer::test::cuda_environment().default_execution);
+        cuda_synchronize();
+        fixture.copy_back();
+        if (!fixture.guards_intact()) throw std::runtime_error("cyclic guard overwrite");
     } else {
+        PagedFixture fixture(cache_k, cache_v, mapping);
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    paged_view(cache_k, cache_v, d_table),
+                                    fixture.view(),
                                     ninfer::test::cuda_environment().default_execution);
+        cuda_synchronize();
+        fixture.copy_back();
+        if (!fixture.guards_intact()) throw std::runtime_error("paged guard overwrite");
     }
     cuda_synchronize();
 
@@ -224,15 +284,14 @@ int cyclic_graph_replay_case(int capacity, int tokens) {
     DeviceBuffer d_v         = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({0});
-    DeviceBuffer d_lane      = to_device<std::int32_t>({0});
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
     Tensor k(d_k.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
     Tensor v(d_v.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
     Tensor position_tensor(d_positions.span(), DType::I32, {tokens, 1});
     Tensor count_tensor(d_count.span(), DType::I32, {1});
-    Tensor lane_tensor(d_lane.span(), DType::I32, {1});
-    auto cache = cyclic_view(cache_k, cache_v, capacity);
+    CyclicFixture fixture(cache_k, cache_v, capacity, 1, std::array<std::int32_t, 1>{0});
+    auto cache = fixture.view();
 
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
@@ -242,7 +301,7 @@ int cyclic_graph_replay_case(int capacity, int tokens) {
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin kv append capture");
     const ops::KVCacheAppendPrefixExecutionEnvelope envelope{0, static_cast<std::uint32_t>(tokens)};
-    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, lane_tensor, envelope, cache,
+    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope, cache,
                                 stream_execution);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end kv append capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
@@ -252,9 +311,12 @@ int cyclic_graph_replay_case(int capacity, int tokens) {
     for (const int commit_count : std::array{0, 7, tokens}) {
         cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
         cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+        fixture.upload();
         d_count.copy_from_host(&commit_count, sizeof(commit_count));
         cuda_check(cudaGraphLaunch(executable, stream), "launch kv append graph");
         cuda_synchronize(stream);
+        fixture.copy_back();
+        failures += !fixture.guards_intact();
 
         auto expected_k = initial_k;
         auto expected_v = initial_v;
@@ -305,7 +367,6 @@ int paged_graph_replay_case() {
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({0});
     DeviceBuffer d_row       = to_device<std::int32_t>({0});
-    DeviceBuffer d_table     = to_device<std::int32_t>({0, 1, 2});
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
     Tensor k(d_k.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
@@ -313,7 +374,8 @@ int paged_graph_replay_case() {
     Tensor position_tensor(d_positions.span(), DType::I32, {tokens, 1});
     Tensor count_tensor(d_count.span(), DType::I32, {1});
     Tensor row_tensor(d_row.span(), DType::I32, {1});
-    auto cache = paged_view(cache_k, cache_v, d_table);
+    PagedFixture fixture(cache_k, cache_v, std::array<std::int32_t, 3>{0, 1, 2});
+    auto cache = fixture.view();
 
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
@@ -341,9 +403,12 @@ int paged_graph_replay_case() {
         cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
         cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
         d_count.copy_from_host(&commit_count, sizeof(commit_count));
-        d_table.copy_from_host(mapping.data(), mapping.size() * sizeof(std::int32_t));
+        fixture.remap(mapping);
+        fixture.upload();
         cuda_check(cudaGraphLaunch(executable, stream), "launch paged kv append graph");
         cuda_synchronize(stream);
+        fixture.copy_back();
+        failures += !fixture.guards_intact();
 
         auto expected_k = initial_k;
         auto expected_v = initial_v;
@@ -357,8 +422,6 @@ int paged_graph_replay_case() {
         failures +=
             verify_exact((label + " cache v").c_str(),
                          from_device<std::uint16_t>(cache_v.data(), cache_count), expected_v);
-        failures += verify_exact((label + " block table unchanged").c_str(),
-                                 from_device<std::int32_t>(d_table, mapping.size()), mapping);
     }
 
     cudaGraphExecDestroy(executable);
@@ -423,9 +486,6 @@ int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow) {
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_counts    = to_device(counts);
     DeviceBuffer d_selectors = to_device(selectors);
-    DeviceBuffer d_tables    = cyclic
-                                   ? DeviceBuffer(ninfer::test::cuda_environment().context.device(), 1)
-                                   : to_device(tables);
     GuardedDeviceBuffer cache_k(initial_k.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(initial_v.size() * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
@@ -438,13 +498,20 @@ int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow) {
     Tensor selector_tensor(d_selectors.span(), DType::I32, {batch});
     constexpr ops::KVCacheAppendPrefixExecutionEnvelope envelope{0, tokens};
     if (cyclic) {
-        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    cyclic_view(cache_k, cache_v, cyclic_capacity, batch),
+        CyclicFixture fixture(cache_k, cache_v, cyclic_capacity, batch, selectors);
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope, fixture.view(),
                                     ninfer::test::cuda_environment().default_execution);
+        cuda_synchronize();
+        fixture.copy_back();
+        if (!fixture.guards_intact()) throw std::runtime_error("cyclic guard overwrite");
     } else {
+        PagedFixture fixture(cache_k, cache_v, tables);
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    paged_view(cache_k, cache_v, d_tables, batch),
+                                    fixture.view(),
                                     ninfer::test::cuda_environment().default_execution);
+        cuda_synchronize();
+        fixture.copy_back();
+        if (!fixture.guards_intact()) throw std::runtime_error("paged guard overwrite");
     }
     cuda_synchronize();
 
@@ -507,7 +574,6 @@ int cyclic_decode_batch_case(int capacity) {
     DeviceBuffer d_v         = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_counts    = to_device(host_counts);
-    DeviceBuffer d_lanes     = to_device(host_lanes);
     GuardedDeviceBuffer cache_k(initial_k.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(initial_v.size() * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
@@ -517,11 +583,12 @@ int cyclic_decode_batch_case(int capacity) {
     Tensor v(d_v.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
     Tensor position_tensor(d_positions.span(), DType::I32, {tokens, batch});
     Tensor count_tensor(d_counts.span(), DType::I32, {batch});
-    Tensor lane_tensor(d_lanes.span(), DType::I32, {batch});
-    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, lane_tensor, {0, tokens},
-                                cyclic_view(cache_k, cache_v, capacity, batch),
+    CyclicFixture fixture(cache_k, cache_v, capacity, batch, host_lanes);
+    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, {0, tokens}, fixture.view(),
                                 ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
+    fixture.copy_back();
+    if (!fixture.guards_intact()) throw std::runtime_error("cyclic guard overwrite");
 
     const std::string label =
         "kv_cache_append_prefix cyclic decode B=8 capacity=" + std::to_string(capacity);
@@ -573,29 +640,19 @@ public:
         std::vector<std::uint16_t> input_k(elements), input_v(elements);
         std::vector<int> positions(width * batch), counts(batch), lanes(batch);
         GuardedDeviceBuffer dk(elements * 2), dv(elements * 2), dp(positions.size() * 4),
-            dc(batch * 4), dl(batch * 4);
+            dc(batch * 4);
         Tensor k(dk.span(), DType::BF16, {kHeadDim, kKVHeads, width, batch}),
             v(dv.span(), DType::BF16, {kHeadDim, kKVHeads, width, batch}),
-            p(dp.span(), DType::I32, {width, batch}), c(dc.span(), DType::I32, {batch}),
-            l(dl.span(), DType::I32, {batch});
-        CyclicKVCacheLayerView cache{
-            .k        = Tensor(cache_k_.span(), DType::BF16, {kHeadDim, padded_, kKVHeads, Lanes}),
-            .v        = Tensor(cache_v_.span(), DType::FP16, {kHeadDim, padded_, kKVHeads, Lanes}),
-            .capacity = static_cast<std::uint32_t>(capacity_),
-            .padded_capacity = static_cast<std::uint32_t>(padded_),
-            .num_kv_heads    = kKVHeads,
-            .head_dim        = kHeadDim,
-            .slot_count      = Lanes};
-        SlottedStateFixture key_state(cache.k, 3), value_state(cache.v, 3);
-        cache.k = key_state.tensor;
-        cache.v = value_state.tensor;
+            p(dp.span(), DType::I32, {width, batch}), c(dc.span(), DType::I32, {batch});
+        CyclicFixture fixture(cache_k_, cache_v_, capacity_, Lanes, lanes, padded_);
+        const auto cache = fixture.view();
         const ops::KVCacheAppendPrefixExecutionEnvelope envelope{0,
                                                                  static_cast<std::uint32_t>(upper)};
         DeviceContext device;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
         const auto launch = [&] {
-            ops::kv_cache_append_prefix(k, v, p, c, l, envelope, cache, device.execution_view());
+            ops::kv_cache_append_prefix(k, v, p, c, envelope, cache, device.execution_view());
         };
         int failures = 0;
         for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
@@ -644,7 +701,7 @@ public:
             dv.copy_from_host(input_v.data(), input_v.size() * 2);
             dp.copy_from_host(positions.data(), positions.size() * 4);
             dc.copy_from_host(counts.data(), batch * 4);
-            dl.copy_from_host(lanes.data(), batch * 4);
+            fixture.select(lanes);
             cuda_synchronize();
             if (replay && phase == 0) {
                 definition.capture(device.stream(), launch);
@@ -660,9 +717,8 @@ public:
                 " Wc=" + std::to_string(width) + " B=" + std::to_string(batch) +
                 " upper=" + std::to_string(upper) + " kind=" + std::to_string(kind) +
                 (replay ? " graph " : " eager ") + std::to_string(phase);
-            key_state.copy_back();
-            value_state.copy_back();
-            failures += key_state.verify_guards("cyclic K") + value_state.verify_guards("cyclic V");
+            fixture.copy_back();
+            failures += !fixture.guards_intact();
             failures += verify_exact(
                 (label + " cache K").c_str(),
                 from_device<std::uint16_t>(cache_k_.data(), expected_k_.size()), expected_k_);
@@ -677,11 +733,9 @@ public:
                                      from_device<int>(dp.data(), positions.size()), positions);
             failures += verify_exact((label + " counts unchanged").c_str(),
                                      from_device<int>(dc.data(), batch), counts);
-            failures += verify_exact((label + " lanes unchanged").c_str(),
-                                     from_device<int>(dl.data(), batch), lanes);
             failures += cache_k_.verify_guards(label) + cache_v_.verify_guards(label) +
                         dk.verify_guards(label) + dv.verify_guards(label) +
-                        dp.verify_guards(label) + dc.verify_guards(label) + dl.verify_guards(label);
+                        dp.verify_guards(label) + dc.verify_guards(label);
         }
         return failures;
     }
@@ -723,7 +777,7 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
               {{"format", "bf16"}, {"execution", "graph"}});
     suite.add("append/paged/graph/remap", [] { return paged_graph_replay_case(); },
               {{"format", "bf16"}, {"execution", "graph"}});
-    suite.add("append/cyclic/selected_slots/capacity4096",
+    suite.add("append/cyclic/selected_records/capacity4096",
               [] { return batch_selector_case(true, kDFlashWindow); }, {{"format", "bf16"}});
     suite.add("append/paged/table_rows", [] { return batch_selector_case(false); },
               {{"format", "bf16"}});

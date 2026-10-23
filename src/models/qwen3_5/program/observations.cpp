@@ -20,6 +20,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.device_weights_bytes     = weights.device_capacity_bytes;
     a.host_weights_bytes       = weights.host_capacity_bytes;
     a.registered_weights_bytes = weights.registered_host_bytes;
+    a.context_device_bytes     = resources.context.size();
     a.persistent_device_bytes  = resources.persistent.size();
     a.workspace_device_bytes   = resources.workspace_storage.size();
     a.io_pinned_bytes          = resources.frame.host_storage.size() + context_counts.size() +
@@ -31,8 +32,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
         a.expert_pinned_bytes = plan.bridge_pinned_bytes;
         a.expert_host_bytes   = plan.cpu_workspace_bytes;
     }
-    out.kv_payload_bytes = kv_payload_bytes;
-    std::size_t handoff  = 0;
+    std::size_t handoff = 0;
     for (const auto& residency : residencies)
         if (residency.vision) handoff = std::max(handoff, residency.vision->active_handoff_bytes());
     const auto peak = std::max(resources.work.peak_used(), workspace_peak);

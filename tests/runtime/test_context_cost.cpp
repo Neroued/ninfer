@@ -33,8 +33,8 @@ void expect_throw(Function&& function, const char* message) {
     expect(false, message);
 }
 
-std::array<ninfer::runtime::ContextTransferCost, 3> transfer(std::uint64_t batch_ns = 10) {
-    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+std::array<ninfer::runtime::ContextTransferCost, 4> transfer(std::uint64_t batch_ns = 10) {
+    std::array<ninfer::runtime::ContextTransferCost, 4> result;
     for (auto& direction : result) {
         direction = {.batch_ns        = batch_ns,
                      .operation_ns    = 3,
@@ -59,10 +59,11 @@ Json direction_json(const ninfer::runtime::ContextTransferCost& value) {
                 {"ns_per_byte_q32", value.ns_per_byte_q32}};
 }
 
-Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 3>& value) {
+Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 4>& value) {
     return Json{{"d2h", direction_json(value[0])},
                 {"h2d", direction_json(value[1])},
-                {"d2d", direction_json(value[2])}};
+                {"d2d", direction_json(value[2])},
+                {"h2h", direction_json(value[3])}};
 }
 
 Json prefill_json(const ninfer::runtime::ContextPrefillCost& value) {
@@ -136,6 +137,9 @@ void test_exact_evaluation() {
     requirements[1].direction = ninfer::runtime::ContextTransferDirection::HostToDevice;
     expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 26,
            "independent transfer directions were incorrectly coalesced");
+    requirements[1].rank = 1;
+    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 13,
+           "parallel rank transfer costs were added as serial latency");
 
     model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
     expect(model.prefill_ns({.chunks = 2}) == std::numeric_limits<std::uint64_t>::max(),

@@ -55,19 +55,13 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     Tensor source_tensor(device_source.span(), DType::BF16, {rows, source_columns});
     Tensor indices_tensor(device_indices.span(), DType::I32, {source_columns});
     Tensor destination_tensor(device_destination.span(), DType::BF16, {rows, destination_columns});
-    SlottedStateFixture source_state(source_tensor, 1), destination_state(destination_tensor, 1);
-    source_tensor      = source_state.tensor;
-    destination_tensor = destination_state.tensor;
     ops::scatter(source_tensor, indices_tensor, destination_tensor,
                  ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
         "scatter D=" + std::to_string(rows) + " V=" + std::to_string(source_columns);
-    source_state.copy_back();
-    destination_state.copy_back();
-    int failures = source_state.verify_guards("scatter source") +
-                   destination_state.verify_guards("scatter destination");
+    int failures = 0;
     failures += verify_exact(
         label.c_str(), from_device<std::uint16_t>(device_destination.data(), destination.size()),
         expected);
@@ -130,19 +124,23 @@ int continuation_case(int width, int batch) {
     GuardedDeviceBuffer d_hidden(hidden.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer d_destination(initial.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer d_selected(static_cast<std::size_t>(rows) * batch * sizeof(std::uint16_t));
-    DeviceBuffer d_lanes     = to_device(lanes);
+    DeviceBuffer d_lanes     = to_device(std::vector<std::int64_t>(batch));
     DeviceBuffer d_selectors = to_device(selectors);
     d_hidden.copy_from_host(hidden.data(), d_hidden.bytes());
     Tensor h(d_hidden.span(), DType::BF16, {rows, width, batch});
     Tensor selected(d_selected.span(), DType::BF16, {rows, batch});
     Tensor dst(d_destination.span(), DType::BF16, {rows, slots});
-    Tensor indices(d_lanes.span(), DType::I32, {batch}),
+    d_destination.copy_from_host(initial.data(), d_destination.bytes());
+    RecordStateFixture records(dst, 1);
+    const auto offsets = records.record_offsets(lanes);
+    CUDA_CHECK(cudaMemcpy(d_lanes.data(), offsets.data(), d_lanes.size(), cudaMemcpyHostToDevice));
+    Tensor indices(d_lanes.span(), DType::I64, {batch}),
         sel(d_selectors.span(), DType::I32, {batch});
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
         ops::gather_bf16_batch_columns(h, sel, selected, context.execution_view());
-        ops::scatter(selected, indices, dst, context.execution_view());
+        ops::scatter(selected, records.view(indices), context.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -162,19 +160,23 @@ int continuation_case(int width, int batch) {
                                    cudaMemcpyHostToDevice, context.stream()));
         CUDA_CHECK(cudaMemcpyAsync(d_destination.data(), initial.data(), d_destination.bytes(),
                                    cudaMemcpyHostToDevice, context.stream()));
+        context.synchronize();
+        records.upload();
         if (graph.ready())
             graph.launch(context.stream());
         else
             launch();
         context.synchronize();
-        failures += verify_exact("continuation slots",
+        records.copy_back();
+        failures += records.verify_guards("continuation records");
+        failures += verify_exact("continuation records",
                                  from_device<std::uint16_t>(d_destination.data(), expected.size()),
                                  expected);
     }
     failures += verify_exact("continuation input unchanged",
                              from_device<std::uint16_t>(d_hidden.data(), hidden.size()), hidden);
     failures += verify_exact("continuation lanes unchanged",
-                             from_device<std::int32_t>(d_lanes, batch), lanes);
+                             from_device<std::int64_t>(d_lanes, batch), offsets);
     failures += d_hidden.verify_guards("continuation input");
     failures += d_selected.verify_guards("continuation selected");
     failures += d_destination.verify_guards("continuation destination");
@@ -183,31 +185,32 @@ int continuation_case(int width, int batch) {
 
 int shared_image_case() {
     StateImageBuilder builder;
-    const auto source_field      = builder.add(DType::BF16, {8}, 1, "source hidden");
+    const auto source_field      = builder.add(DType::BF16, {8, 4}, 1, "source hidden");
     const auto destination_field = builder.add(DType::BF16, {8}, 1, "destination hidden");
-    LayoutBuilder backing;
-    const auto layout = builder.finish(backing, 4);
-    DeviceBuffer memory(cuda_environment().context.device(), backing.finish());
+    const auto layout            = builder.finish();
+    DeviceBuffer memory(cuda_environment().context.device(), 4 * layout.image_bytes);
     memory.fill(0x5a);
     StateImageStorage images(memory.span(), layout);
-    Tensor source      = images.field(source_field);
-    Tensor destination = images.field(destination_field);
-    const auto input   = bit_pattern(32, 17);
-    CUDA_CHECK(
-        cudaMemcpy2D(source.data, source.nb[1], input.data(), 16, 16, 4, cudaMemcpyHostToDevice));
-    DeviceBuffer selectors = to_device<std::int32_t>({3, 0});
-    const Tensor indices(selectors.span(), DType::I32, {2});
-    ops::scatter(source.slice(1, 0, 2), indices, destination, cuda_environment().default_execution);
+    Tensor source    = images.tensor(source_field, 0);
+    const auto input = bit_pattern(32, 17);
+    CUDA_CHECK(cudaMemcpy(source.data, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
+    DeviceBuffer selectors = to_device<std::int64_t>({std::int64_t(3 * layout.image_bytes), 0});
+    const Tensor offsets(selectors.span(), DType::I64, {2});
+    ops::scatter(source.slice(1, 0, 2), images.field(destination_field, offsets),
+                 cuda_environment().default_execution);
     cuda_synchronize();
     std::vector<std::uint16_t> actual(32), preserved(32), expected(32, 0x5a5a);
     std::copy_n(input.begin(), 8, expected.begin() + 24);
     std::copy_n(input.begin() + 8, 8, expected.begin());
-    CUDA_CHECK(cudaMemcpy2D(actual.data(), 16, destination.data, destination.nb[1], 16, 4,
-                            cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy2D(preserved.data(), 16, source.data, source.nb[1], 16, 4,
-                            cudaMemcpyDeviceToHost));
+    for (int record = 0; record < 4; ++record)
+        CUDA_CHECK(cudaMemcpy(actual.data() + record * 8,
+                              images.tensor(destination_field, record * layout.image_bytes).data,
+                              16, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(preserved.data(), source.data, input.size() * 2, cudaMemcpyDeviceToHost));
     int failures = verify_exact("shared image destination", actual, expected) +
                    verify_exact("shared image source", preserved, input);
+    DeviceBuffer columns = to_device<std::int32_t>({3, 0});
+    const Tensor indices(columns.span(), DType::I32, {2});
     bool rejected = false;
     try {
         ops::scatter(source.slice(1, 0, 2), indices, source, cuda_environment().default_execution);

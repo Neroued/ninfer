@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/program/text_graph.h"
+#include "core/context_pool.h"
 
 namespace ninfer::models::qwen4_exp::detail {
 class RankProgramImpl;
@@ -17,7 +18,9 @@ public:
 
 private:
     RankProgramImpl& owner_;
-    std::vector<std::int32_t> slots_;
+    std::unique_ptr<ContextPool> records_;
+    std::vector<AllocationId> allocations_;
+    std::vector<std::int64_t> state_offsets_;
     std::array<PinnedHostBuffer, 2> mappings_;
 };
 

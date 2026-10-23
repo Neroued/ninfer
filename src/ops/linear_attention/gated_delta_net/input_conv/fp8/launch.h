@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/linear_attention/gated_delta_net/input_conv/operands.h"
+
 #include "core/weight.h"
 #include "core/tensor.h"
 #include "ops/linear/kernels/fp8/fp8_a8_plan.h"
@@ -21,14 +23,14 @@ void launch_fp8_gdn_input_a8(const Tensor& x, const Weight& weight, Tensor& qkv,
                              Fp8A8Workspace workspace, cudaStream_t stream);
 
 void launch_fp8_gdn_snapshot_fused(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                   Tensor& conv_states, const Tensor& valid_columns,
-                                   const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                   Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                   cudaStream_t stream);
+                                   const ConstStateFieldView& conv_states,
+                                   const Tensor& valid_columns,
+                                   const gdn_input::HistoryDestination& destination, Tensor& query,
+                                   Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 
 void launch_fp8_gdn_record_fused(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 const Tensor& conv_states, const Tensor& valid_columns,
-                                 const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                                 const ConstStateFieldView& conv_states,
+                                 const Tensor& valid_columns, Tensor& conv_record, Tensor& query,
                                  Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

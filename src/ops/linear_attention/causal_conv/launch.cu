@@ -194,9 +194,9 @@ void launch_single_token(const Tensor& x, const Tensor& weight, const Tensor& co
 }
 
 template <bool Masked>
-void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight,
+                                      ConstStateFieldView source, Tensor& snapshots,
                                       const Tensor& valid_columns,
-                                      const Tensor& initial_state_slots,
                                       const Tensor& snapshot_base_slots, Tensor& out,
                                       std::int64_t slot_stride, cudaStream_t stream) {
     const std::int32_t C     = x.ne[0];
@@ -207,17 +207,20 @@ void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight, Ten
                     static_cast<unsigned int>(batch));
     causal_conv1d_batched_sequence_snapshot_kernel<Masked><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<__nv_bfloat16*>(conv_states.data),
+        reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<const std::byte*>(source.records.storage.data) +
+            source.field.tensor.region.offset),
+        static_cast<__nv_bfloat16*>(snapshots.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(snapshot_base_slots.data),
         static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
 }
 
 template <bool Masked>
-void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight,
+                                      ConstStateFieldView source, Tensor& snapshots,
                                       const Tensor& valid_columns,
-                                      const Tensor& initial_state_slots,
                                       const Tensor& snapshot_base_slots, Tensor& out,
                                       std::int64_t slot_stride, cudaStream_t stream) {
     const std::int32_t C     = x.ne[0];
@@ -228,23 +231,26 @@ void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight, Ten
                     static_cast<unsigned int>(batch));
     causal_conv1d_batched_snapshot_smallt_kernel<Masked><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<__nv_bfloat16*>(conv_states.data),
+        reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<const std::byte*>(source.records.storage.data) +
+            source.field.tensor.region.offset),
+        static_cast<__nv_bfloat16*>(snapshots.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(snapshot_base_slots.data),
         static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
 }
 
 } // namespace
 
-void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, ConstStateFieldView source,
+                                 Tensor& snapshots, const Tensor& valid_columns,
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  CausalConvSnapshotPlan plan, cudaStream_t stream) {
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const std::int64_t slot_stride =
-        conv_states.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+        snapshots.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 
     if (plan.route == CausalConvSnapshotRoute::Decode) {
         constexpr int kBlock = 256;
@@ -252,8 +258,11 @@ void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                                stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_state_slots.data),
+            reinterpret_cast<const __nv_bfloat16*>(
+                static_cast<const std::byte*>(source.records.storage.data) +
+                source.field.tensor.region.offset),
+            static_cast<__nv_bfloat16*>(snapshots.data),
+            static_cast<const std::int64_t*>(source.records.byte_offsets.data),
             static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, slot_stride);
     } else if (plan.route == CausalConvSnapshotRoute::TokenParallel) {
@@ -262,8 +271,11 @@ void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
         causal_conv1d_snapshot_smallt_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_state_slots.data),
+            reinterpret_cast<const __nv_bfloat16*>(
+                static_cast<const std::byte*>(source.records.storage.data) +
+                source.field.tensor.region.offset),
+            static_cast<__nv_bfloat16*>(snapshots.data),
+            static_cast<const std::int64_t*>(source.records.byte_offsets.data),
             static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
     } else if (plan.route == CausalConvSnapshotRoute::Sequence) {
@@ -272,28 +284,27 @@ void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                                  0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_state_slots.data),
+            reinterpret_cast<const __nv_bfloat16*>(
+                static_cast<const std::byte*>(source.records.storage.data) +
+                source.field.tensor.region.offset),
+            static_cast<__nv_bfloat16*>(snapshots.data),
+            static_cast<const std::int64_t*>(source.records.byte_offsets.data),
             static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
     } else if (plan.route == CausalConvSnapshotRoute::BatchedParallel) {
         if (plan.masked)
-            launch_batched_parallel_snapshot<true>(x, weight, conv_states, valid_columns,
-                                                   initial_state_slots, snapshot_base_slots, out,
-                                                   slot_stride, stream);
+            launch_batched_parallel_snapshot<true>(x, weight, source, snapshots, valid_columns,
+                                                   snapshot_base_slots, out, slot_stride, stream);
         else
-            launch_batched_parallel_snapshot<false>(x, weight, conv_states, valid_columns,
-                                                    initial_state_slots, snapshot_base_slots, out,
-                                                    slot_stride, stream);
+            launch_batched_parallel_snapshot<false>(x, weight, source, snapshots, valid_columns,
+                                                    snapshot_base_slots, out, slot_stride, stream);
     } else {
         if (plan.masked)
-            launch_batched_sequence_snapshot<true>(x, weight, conv_states, valid_columns,
-                                                   initial_state_slots, snapshot_base_slots, out,
-                                                   slot_stride, stream);
+            launch_batched_sequence_snapshot<true>(x, weight, source, snapshots, valid_columns,
+                                                   snapshot_base_slots, out, slot_stride, stream);
         else
-            launch_batched_sequence_snapshot<false>(x, weight, conv_states, valid_columns,
-                                                    initial_state_slots, snapshot_base_slots, out,
-                                                    slot_stride, stream);
+            launch_batched_sequence_snapshot<false>(x, weight, source, snapshots, valid_columns,
+                                                    snapshot_base_slots, out, slot_stride, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

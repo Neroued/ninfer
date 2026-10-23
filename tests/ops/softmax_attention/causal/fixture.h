@@ -11,6 +11,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/suite.h"
+#include "../../../../tools/support/paged_kv_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -327,10 +328,7 @@ private:
     std::size_t v_code_elements_;
     std::size_t k_scale_elements_;
     std::size_t v_scale_elements_;
-    GuardedDeviceBuffer k_;
-    GuardedDeviceBuffer v_;
-    GuardedDeviceBuffer k_scale_;
-    GuardedDeviceBuffer v_scale_;
+    tool::PackedKVFixture packed_;
     GuardedDeviceBuffer block_table_;
 };
 
@@ -375,10 +373,7 @@ private:
     std::size_t v_code_elements_;
     std::size_t k_scale_elements_;
     std::size_t v_scale_elements_;
-    GuardedDeviceBuffer k_;
-    GuardedDeviceBuffer v_;
-    GuardedDeviceBuffer k_scale_;
-    GuardedDeviceBuffer v_scale_;
+    tool::PackedKVFixture packed_;
     GuardedDeviceBuffer block_tables_;
 };
 

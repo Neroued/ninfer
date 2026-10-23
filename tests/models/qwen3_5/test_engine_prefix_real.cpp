@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 #include "kv_cache_storage.h"
 
 #include <cstdint>
@@ -15,51 +16,54 @@ namespace {
 
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path                   = artifact;
-    options.max_context                     = 4096;
-    options.kv_capacity                     = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-    options.prefill_chunk                   = 1024;
-    options.speculative.backend             = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens        = 3;
-    options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
-    options.enable_vision                   = true;
-    options.max_concurrency                 = 1;
-    options.max_pending_requests            = 1;
-    options.context_cache.extra_state_slots = 4;
+    options.artifact_path             = artifact;
+    options.max_context               = 4096;
+    options.prefill_chunk             = 1024;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.enable_vision             = true;
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 1;
+    ninfer::test::qwen3_5::set_context_capacity(options, 4);
     return options;
 }
 
 ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path                     = artifact;
-    options.max_context                       = 512;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(512);
-    options.prefill_chunk                     = 256;
-    options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens          = 3;
-    options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
-    options.max_concurrency                   = 1;
-    options.max_pending_requests              = 1;
-    options.context_cache.extra_state_slots   = 1;
-    options.context_cache.host_capacity_bytes = 256ULL << 20;
+    options.artifact_path             = artifact;
+    options.max_context               = 512;
+    options.prefill_chunk             = 256;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 1;
+    const auto plan                   = ninfer::test::qwen3_5::context_capacity_plan(options);
+    options.context_cache.host_capacity_bytes =
+        ninfer::test::qwen3_5::checkpoint_capacity_bytes(plan, 1, options.max_context);
+    options.context_capacity = ninfer::ContextCapacityPolicy::explicit_capacity(
+        ninfer::test::qwen3_5::context_capacity_bytes(plan));
     return options;
 }
 
 ninfer::EngineOptions anthropic_prefix_regression_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path                   = artifact;
-    options.max_context                     = 2048;
-    options.kv_capacity                     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
-    options.prefill_chunk                   = 512;
-    options.speculative.backend             = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens        = 3;
-    options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
-    options.max_concurrency                 = 1;
-    options.max_pending_requests            = 1;
-    options.context_cache.extra_state_slots = 1;
-    // This 27B workload has a fixed Host budget for four StateImages and 512 MiB of KV;
-    // all contents compete within the same backing allocation.
-    options.context_cache.host_capacity_bytes = 4ULL * 153954304 + (512ULL << 20);
+    options.artifact_path             = artifact;
+    options.max_context               = 2048;
+    options.prefill_chunk             = 512;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 1;
+
+    // Retain four full checkpoints in Host while Device stays at its startup minimum.
+    const auto plan = ninfer::test::qwen3_5::context_capacity_plan(options);
+    options.context_cache.host_capacity_bytes =
+        ninfer::test::qwen3_5::checkpoint_capacity_bytes(plan, 4, options.max_context);
+    options.context_capacity = ninfer::ContextCapacityPolicy::explicit_capacity(
+        ninfer::test::qwen3_5::context_capacity_bytes(plan));
     return options;
 }
 
@@ -67,7 +71,6 @@ ninfer::EngineOptions shared_rewrite_materialization_engine_options(const char* 
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 100000;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(100000);
     options.prefill_chunk                     = 1024;
     options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
     options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
@@ -75,8 +78,8 @@ ninfer::EngineOptions shared_rewrite_materialization_engine_options(const char* 
     options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
-    options.context_cache.extra_state_slots   = 2;
     options.context_cache.host_capacity_bytes = 0;
+    ninfer::test::qwen3_5::set_context_capacity(options, 2);
     return options;
 }
 
@@ -84,13 +87,12 @@ ninfer::EngineOptions explicit_anchor_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 512;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk                     = 256;
     options.speculative.backend               = ninfer::SpeculativeBackend::None;
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
-    options.context_cache.extra_state_slots   = 4;
     options.context_cache.host_capacity_bytes = 0;
+    ninfer::test::qwen3_5::set_context_capacity(options, 4);
     return options;
 }
 
@@ -98,15 +100,14 @@ ninfer::EngineOptions concurrent_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 512;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk                     = 256;
     options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
     options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
     options.max_concurrency                   = 8;
     options.max_pending_requests              = 8;
-    options.context_cache.extra_state_slots   = 16;
     options.context_cache.host_capacity_bytes = 0;
+    ninfer::test::qwen3_5::set_context_capacity(options, 16);
     return options;
 }
 
@@ -399,9 +400,9 @@ int exercise_prefix(ninfer::Engine& engine) {
 int exercise_semantic_captures(const char* artifact) {
     auto configured          = host_restore_engine_options(artifact);
     configured.max_context   = 1024;
-    configured.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(1024);
     configured.prefill_chunk = 128;
     configured.speculative   = {};
+    ninfer::test::qwen3_5::set_context_capacity(configured, 1);
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens = 2;
     request.execution.sampling.temperature    = 0.0F;
@@ -479,49 +480,42 @@ int exercise_host_restore(const char* artifact) {
     const ninfer::GenerationResult pressure_result =
         engine.generate(engine.prepare_tokens(continuation), options(2, false));
     const ninfer::RuntimeStats after_pressure = engine.snapshot().runtime;
-    if (pressure_result.generated_token_ids.size() != 2 ||
-        after_pressure.context_transfers.state[0].images <=
-            before_pressure.context_transfers.state[0].images ||
-        after_pressure.context_transfers.kv[0][0].page_groups <=
-            before_pressure.context_transfers.kv[0][0].page_groups ||
-        after_pressure.context_transfers.kv[1][0].page_groups <=
-            before_pressure.context_transfers.kv[1][0].page_groups) {
-        std::cerr << "Host pressure did not demote the complete MTP checkpoint: state="
-                  << after_pressure.context_transfers.state[0].images
-                  << " main=" << after_pressure.context_transfers.kv[0][0].page_groups
-                  << " backend=" << after_pressure.context_transfers.kv[1][0].page_groups << '\n';
+    const auto transfer_bytes = [](const ninfer::RuntimeStats& stats, std::size_t direction) {
+        auto bytes = stats.context_transfers.state[direction].bytes;
+        for (const auto& history : stats.context_transfers.kv) bytes += history[direction].bytes;
+        return bytes;
+    };
+    const auto backed_up = transfer_bytes(after_pressure, 0) - transfer_bytes(before_pressure, 0);
+    if (pressure_result.generated_token_ids.size() != 2 || backed_up == 0) {
+        std::cerr << "Host pressure did not demote checkpoint records\n";
         return 1;
     }
 
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare_tokens(continuation), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.snapshot().runtime;
+    const auto restored_bytes =
+        transfer_bytes(after_restore, 1) - transfer_bytes(after_pressure, 1);
     if (restored.generated_token_ids.size() != 2 ||
         restored.stats.prefix_reuse_path != ninfer::PrefixReusePath::Checkpoint ||
-        restored.stats.reused_prompt_tokens == 0 ||
-        after_restore.context_transfers.state[1].images <=
-            after_pressure.context_transfers.state[1].images ||
-        restored.stats.reused_prompt_tokens != retained_input.size() ||
-        after_restore.context_transfers.kv[0][1].page_groups <=
-            after_pressure.context_transfers.kv[0][1].page_groups ||
-        after_restore.context_transfers.kv[0][1].page_groups -
-                after_pressure.context_transfers.kv[0][1].page_groups >
-            after_pressure.context_transfers.kv[0][0].page_groups -
-                before_pressure.context_transfers.kv[0][0].page_groups ||
-        after_restore.context_transfers.kv[1][1].page_groups -
-                after_pressure.context_transfers.kv[1][1].page_groups >
-            after_pressure.context_transfers.kv[1][0].page_groups -
-                before_pressure.context_transfers.kv[1][0].page_groups) {
-        // Deficit-sized eviction can move only E's backend suffix; P does not need to read
-        // that suffix back. Native transaction tests separately force a full backend restore.
+        restored.stats.reused_prompt_tokens != retained_input.size() || restored_bytes == 0 ||
+        restored_bytes > transfer_bytes(after_pressure, 0)) {
         std::cerr << "MTP checkpoint did not restore its missing prefix replicas: path="
                   << static_cast<int>(restored.stats.prefix_reuse_path)
                   << " reused=" << restored.stats.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.context_transfers.state[1].images
-                  << " main=" << after_restore.context_transfers.kv[0][1].page_groups
-                  << " backend=" << after_restore.context_transfers.kv[1][1].page_groups << '\n';
+                  << " backed_up=" << backed_up << " restored=" << restored_bytes << '\n';
         return 1;
+    }
+    // State and each history now compete for the same bytes. Only missing replicas are restored;
+    // this test does not require the eviction policy to move every record type to Host.
+    for (std::size_t pool = 0; pool < after_restore.context_transfers.kv.size(); ++pool) {
+        if (after_restore.context_transfers.kv[pool][1].page_groups -
+                after_pressure.context_transfers.kv[pool][1].page_groups >
+            after_pressure.context_transfers.kv[pool][0].page_groups) {
+            std::cerr << "checkpoint restored more pages than its Host history contains\n";
+            return 1;
+        }
     }
 
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
@@ -620,10 +614,9 @@ ninfer::PromptInput nested_tool_prompt(std::vector<std::string> tools, std::stri
 
 int exercise_nested_tool_markers(const char* artifact) {
     auto configured = anthropic_prefix_regression_engine_options(artifact);
-    // Five Device images cover the active writer, two shared points and private R/E;
-    // the fixed Host pool also retains the completed probe histories for this 27B fixture.
-    configured.context_cache.extra_state_slots   = 4;
+    // Keep both shared markers and the private response/end points alongside active work.
     configured.context_cache.host_capacity_bytes = 512ULL << 20;
+    ninfer::test::qwen3_5::set_context_capacity(configured, 4);
     ninfer::Engine engine(std::move(configured));
     const std::string alpha   = nested_tool_definition("alpha", "stable-alpha");
     const std::string bravo   = nested_tool_definition("bravo", "stable-bravo");
@@ -788,7 +781,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     const std::uint64_t branch_prefill =
         after_branch.computed_prefill_tokens - before_branch.computed_prefill_tokens;
 
-    const auto memory = engine.snapshot().ranks.at(0).memory;
+    const auto host =
+        ninfer::test::qwen3_5::context_usage(after_branch, ninfer::ContextMemoryDomain::Host);
     // This sequence also retains the earlier reasoning dialogue and unrelated private fillers.
     // Report optional-prefix eviction under that fixed pressure rather than assuming all of
     // those histories fit. The independent nested-tool-markers scenario verifies both captures.
@@ -799,9 +793,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
               << " branch_prompt=" << branch.prompt.prompt_tokens
               << " branch_computed=" << branch_prefill
               << " branch_ttft_ms=" << branch.stats.timings.first_token_seconds * 1000
-              << " host_peak_bytes=" << after_branch.host_context_peak_occupied_bytes
-              << " host_capacity_bytes=" << engine.description().host_context_capacity_bytes
-              << '\n';
+              << " host_peak_bytes=" << host.peak_occupied_bytes
+              << " host_capacity_bytes=" << host.capacity_bytes << '\n';
     const auto accounted = [](const ninfer::GenerationResult& result) {
         return result.generated_token_ids.size() == 1 &&
                result.finish_reason == ninfer::FinishReason::OutputLimit &&
@@ -813,11 +806,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         !accounted(second_filler) || !accounted(branch) ||
         late_prefill != late.stats.computed_prefill_tokens ||
         branch_prefill != branch.stats.computed_prefill_tokens ||
-        after_branch.host_context_occupied_bytes >
-            engine.description().host_context_capacity_bytes ||
-        after_branch.host_context_peak_occupied_bytes >
-            engine.description().host_context_capacity_bytes ||
-        after_branch.host_context_reserved_bytes > after_branch.host_context_occupied_bytes) {
+        ninfer::test::qwen3_5::occupied_bytes(host) > host.capacity_bytes ||
+        host.peak_occupied_bytes > host.capacity_bytes) {
         std::cerr << "mixed-prefix pressure violated request or physical Host accounting\n";
         return 1;
     }
@@ -1188,12 +1178,11 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
 
 int exercise_agent_continuation(const char* artifact) {
     auto configured = anthropic_prefix_regression_engine_options(artifact);
-    // Retain main and branch R/E plus one writer. Both histories fit within the fixed
-    // 4096-token KV pool; this trajectory exercises ownership rather than eviction.
+    // Keep the main and branch response/end points alongside active work; this trajectory
+    // exercises ownership without intentionally forcing eviction.
     configured.max_context                       = 4096;
-    configured.context_cache.extra_state_slots   = 4;
     configured.context_cache.host_capacity_bytes = 0;
-    configured.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    ninfer::test::qwen3_5::set_context_capacity(configured, 4);
     ninfer::Engine engine(std::move(configured));
     const auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -1314,14 +1303,16 @@ int exercise_agent_continuation(const char* artifact) {
     }
 
     const auto settled = engine.snapshot().runtime;
-    const auto memory  = engine.snapshot().ranks.at(0).memory;
+    const auto host =
+        ninfer::test::qwen3_5::context_usage(settled, ninfer::ContextMemoryDomain::Host);
+    const auto device =
+        ninfer::test::qwen3_5::context_usage(settled, ninfer::ContextMemoryDomain::Device);
     if (settled.running_requests || settled.waiting_requests || settled.paused_requests ||
         settled.replaying_requests || settled.materializing_requests ||
         settled.prefilling_requests || settled.decode_ready_requests ||
         settled.capture_pending_requests || settled.terminal_pending_requests ||
-        settled.host_context_reserved_bytes ||
-        settled.host_context_peak_occupied_bytes >
-            engine.description().host_context_capacity_bytes) {
+        host.reserved_bytes || host.pending_retirement_bytes ||
+        host.peak_occupied_bytes > host.capacity_bytes) {
         std::cerr << "agent continuation left active membership or transfer reservations: running="
                   << settled.running_requests << " waiting=" << settled.waiting_requests
                   << " paused=" << settled.paused_requests
@@ -1331,13 +1322,14 @@ int exercise_agent_continuation(const char* artifact) {
                   << " decode=" << settled.decode_ready_requests
                   << " capture=" << settled.capture_pending_requests
                   << " terminal=" << settled.terminal_pending_requests
-                  << " reserved=" << settled.host_context_reserved_bytes << '\n';
+                  << " reserved=" << host.reserved_bytes << '\n';
         return 1;
     }
     std::cout << "agent continuation: main_rounds=" << rounds << " branches=1"
               << " final_reused=" << previous->stats.reused_prompt_tokens
               << " total_reused=" << total_reused << " total_computed=" << total_computed
-              << " retained_device_states=" << settled.device_state_occupied_slots
+              << " retained_device_bytes=" << device.live_bytes
+              << " retained_state_objects=" << settled.state_objects
               << " retained_main_pages=" << settled.kv_pools[0].occupied_page_groups << '\n';
     return 0;
 }
@@ -1373,8 +1365,8 @@ int exercise_rewrite_branch(const char* artifact) {
         return value;
     };
 
-    ninfer::EngineOptions configured           = engine_options(artifact);
-    configured.context_cache.extra_state_slots = 2;
+    auto configured = engine_options(artifact);
+    ninfer::test::qwen3_5::set_context_capacity(configured, 2);
     ninfer::Engine engine(std::move(configured));
     const ninfer::GenerationResult source =
         engine.generate(engine.prepare(input(false)), options(true));
@@ -1402,8 +1394,8 @@ int exercise_rewrite_branch(const char* artifact) {
 }
 
 int exercise_late_instructions(const char* artifact) {
-    auto configured                            = explicit_anchor_engine_options(artifact);
-    configured.context_cache.extra_state_slots = 1;
+    auto configured = explicit_anchor_engine_options(artifact);
+    ninfer::test::qwen3_5::set_context_capacity(configured);
     ninfer::Engine engine(std::move(configured));
     const auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -1828,8 +1820,8 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 
 int exercise_artifact(const char* artifact) {
     {
-        ninfer::EngineOptions options           = engine_options(artifact);
-        options.context_cache.extra_state_slots = 2;
+        auto options = engine_options(artifact);
+        ninfer::test::qwen3_5::set_context_capacity(options, 2);
         ninfer::Engine engine(std::move(options));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         if (const int result = exercise_artifact_frontend(engine); result != 0) { return result; }
@@ -1884,17 +1876,16 @@ int exercise_attention_integration(const char* artifact) {
     const auto drafts = static_cast<std::uint32_t>(std::stoul(std::string(setting(
         "NINFER_TEST_DRAFT_TOKENS", backend == ninfer::SpeculativeBackend::Mtp ? "3" : "7"))));
     ninfer::EngineOptions options;
-    options.artifact_path                   = artifact;
-    options.kv_cache                        = storage;
-    options.max_context                     = 65536;
-    options.kv_capacity                     = ninfer::KvCapacityPolicy::explicit_capacity(65536);
-    options.prefill_chunk                   = 1024;
-    options.max_concurrency                 = batch;
-    options.max_pending_requests            = batch;
-    options.context_cache.extra_state_slots = batch + 2;
-    options.speculative.backend             = backend;
+    options.artifact_path             = artifact;
+    options.kv_cache                  = storage;
+    options.max_context               = 65536;
+    options.prefill_chunk             = 1024;
+    options.max_concurrency           = batch;
+    options.max_pending_requests      = batch;
+    options.speculative.backend       = backend;
     options.speculative.draft_tokens  = backend == ninfer::SpeculativeBackend::None ? 0 : drafts;
     options.speculative.proposal_head = ninfer::ProposalHead::Full;
+    ninfer::test::qwen3_5::set_context_capacity(options, batch + 2);
     ninfer::Engine engine(options);
     if (engine.description().kv_cache != storage)
         throw std::runtime_error("attention integration selected the wrong KV dtype");
@@ -2010,14 +2001,15 @@ int main() {
     } else if (scenario == "explicit-anchor") {
         result = exercise_explicit_anchor_branch(artifact);
     } else if (scenario == "rewrite-checkpoint") {
-        auto options                            = engine_options(artifact);
-        options.context_cache.extra_state_slots = 2;
+        auto options = engine_options(artifact);
+        ninfer::test::qwen3_5::set_context_capacity(options, 2);
         ninfer::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine);
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;
         options.context_cache = ninfer::ContextCacheOptions{.enabled = false};
+        ninfer::test::qwen3_5::set_context_capacity(options);
         ninfer::Engine engine(std::move(options));
         result = exercise_stream_observations(engine);
     } else {

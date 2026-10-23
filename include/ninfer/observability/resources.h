@@ -8,7 +8,7 @@
 
 namespace ninfer {
 
-enum class KvCapacityMode : std::uint8_t {
+enum class ContextCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
 };
@@ -70,6 +70,7 @@ struct MemoryAllocations {
     std::uint64_t host_weights_bytes       = 0;
     std::uint64_t registered_weights_bytes = 0;
     std::uint64_t persistent_device_bytes  = 0;
+    std::uint64_t context_device_bytes     = 0;
     std::uint64_t workspace_device_bytes   = 0;
     std::uint64_t io_pinned_bytes          = 0;
     std::uint64_t host_context_bytes       = 0;
@@ -81,8 +82,8 @@ struct MemoryAllocations {
     std::uint64_t expert_host_bytes        = 0;
 
     [[nodiscard]] std::uint64_t device_bytes() const noexcept {
-        return device_weights_bytes + persistent_device_bytes + workspace_device_bytes +
-               ple_device_bytes + expert_device_bytes;
+        return device_weights_bytes + persistent_device_bytes + context_device_bytes +
+               workspace_device_bytes + ple_device_bytes + expert_device_bytes;
     }
 
     [[nodiscard]] std::uint64_t host_bytes() const noexcept {
@@ -106,7 +107,6 @@ struct PleReadStats {
 struct RankMemoryUsage {
     MemoryAllocations allocations;
     WorkspaceUsage workspace;
-    std::uint64_t kv_payload_bytes = 0;
     std::optional<VisionWorkspaceMemorySummary> vision;
     std::optional<MoeMemorySummary> experts;
     std::optional<PleReadStats> ple;
@@ -123,13 +123,54 @@ struct RankMemoryBudget {
     std::uint64_t limit_bytes                       = 0;
     std::uint64_t runtime_reservation_bytes         = 0;
     std::uint64_t minimum_runtime_reservation_bytes = 0;
-    std::uint64_t bytes_per_page_group              = 0;
+    std::uint64_t context_capacity_bytes            = 0;
+    std::uint64_t minimum_context_capacity_bytes    = 0;
+    std::uint64_t context_control_budget_bytes      = 0;
     std::uint64_t available_after_weights_bytes     = 0;
     std::uint64_t available_after_startup_bytes     = 0;
     std::uint64_t headroom_bytes                    = 0;
     std::uint64_t planned_slack_bytes               = 0;
     std::int64_t retained_bytes                     = 0;
     std::optional<GraphMemorySummary> graphs;
+};
+
+enum class ContextMemoryDomain : std::uint8_t { Device, Host };
+
+struct ContextPoolCapacity {
+    std::uint32_t rank           = 0;
+    ContextMemoryDomain domain   = ContextMemoryDomain::Device;
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t block_bytes    = 0;
+    friend bool operator==(const ContextPoolCapacity&, const ContextPoolCapacity&) = default;
+};
+
+// These disjoint occupancies account for the complete backing. Relocation destinations are
+// reserved until publication; the old records remain live or pending retirement until then.
+struct ContextPoolUsage {
+    std::uint32_t rank                     = 0;
+    ContextMemoryDomain domain             = ContextMemoryDomain::Device;
+    std::uint64_t capacity_bytes           = 0;
+    std::uint64_t block_bytes              = 0;
+    std::uint64_t live_bytes               = 0;
+    std::uint64_t reserved_bytes           = 0;
+    std::uint64_t pending_retirement_bytes = 0;
+    // Relocation is a subset of reserved bytes; future reservations promise positions
+    // released by maintenance and do not occupy those positions yet.
+    std::uint64_t relocation_bytes                                           = 0;
+    std::uint64_t future_reserved_bytes                                      = 0;
+    std::uint64_t padding_bytes                                              = 0;
+    std::uint64_t assigned_free_bytes                                        = 0;
+    std::uint64_t unassigned_free_bytes                                      = 0;
+    std::uint64_t tail_bytes                                                 = 0;
+    std::uint64_t peak_occupied_bytes                                        = 0;
+    friend bool operator==(const ContextPoolUsage&, const ContextPoolUsage&) = default;
+};
+
+struct ContextMetadataUsage {
+    std::uint64_t budget_bytes                                                       = 0;
+    std::uint64_t allocated_bytes                                                    = 0;
+    std::uint64_t reserved_bytes                                                     = 0;
+    friend bool operator==(const ContextMetadataUsage&, const ContextMetadataUsage&) = default;
 };
 
 struct MediaCacheSummary {

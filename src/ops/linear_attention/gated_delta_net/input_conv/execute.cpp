@@ -38,54 +38,48 @@ void launch_projection(const Tensor& x, const WeightOperands& weights, Projected
 }
 
 void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tensor& conv,
-                     GdnConvSnapshotState state, const Tensor& valid, GdnConvOutputs out,
-                     Batch batch, ConvPlan plan, const Scratch& scratch, cudaStream_t stream) {
+                     ConstStateFieldView state, HistoryDestination destination, const Tensor& valid,
+                     GdnConvOutputs out, Batch batch, ConvPlan plan, const Scratch& scratch,
+                     cudaStream_t stream) {
     const auto& w = *weights.first;
     switch (plan.kernel) {
     case ConvKernel::Q4Q5Fused:
-        launch_q4_q5_gdn_input_conv_snapshot(x, w, *weights.second, conv, state.history, valid,
-                                             state.source_slots, state.snapshot_bases, out.query,
-                                             out.key, out.value, out.z, stream);
+        launch_q4_q5_gdn_input_conv_snapshot(x, w, *weights.second, conv, state, valid, destination,
+                                             out.query, out.key, out.value, out.z, stream);
         return;
     case ConvKernel::Q8Decode:
-        launch_q8_gdn_input_decode_conv_snapshot(x, w, conv, state.history, valid,
-                                                 state.source_slots, state.snapshot_bases,
-                                                 out.query, out.key, out.value, out.z, stream);
+        launch_q8_gdn_input_decode_conv_snapshot(x, w, conv, state, valid, destination, out.query,
+                                                 out.key, out.value, out.z, stream);
         return;
     case ConvKernel::Q8SlicedK:
-        launch_q8_gdn_input_splitk_conv_snapshot(x, w, conv, state.history, valid,
-                                                 state.source_slots, state.snapshot_bases,
-                                                 out.query, out.key, out.value, out.z, stream);
+        launch_q8_gdn_input_splitk_conv_snapshot(x, w, conv, state, valid, destination, out.query,
+                                                 out.key, out.value, out.z, stream);
         return;
     case ConvKernel::Q8Window:
     case ConvKernel::Q8Aggregate:
     case ConvKernel::Q8TmaBatch:
 #if NINFER_TARGET_SPARK
         if (weights.geometry.query_rows == 1024) {
-            launch_q8_gdn_conv_n8192_k2560_snapshot(
-                x, w, conv, state.history, valid, state.source_slots, state.snapshot_bases,
-                out.query, out.key, out.value, out.z, plan.kernel, stream);
+            launch_q8_gdn_conv_n8192_k2560_snapshot(x, w, conv, state, valid, destination,
+                                                    out.query, out.key, out.value, out.z,
+                                                    plan.kernel, stream);
             return;
         }
 #endif
-        launch_q8_gdn_conv_n16384_k2560_snapshot(
-            x, w, conv, state.history, valid, state.source_slots, state.snapshot_bases, out.query,
-            out.key, out.value, out.z, plan.kernel, stream);
+        launch_q8_gdn_conv_n16384_k2560_snapshot(x, w, conv, state, valid, destination, out.query,
+                                                 out.key, out.value, out.z, plan.kernel, stream);
         return;
     case ConvKernel::Fp8Fused:
-        launch_fp8_gdn_snapshot_fused(x, w, conv, state.history, valid, state.source_slots,
-                                      state.snapshot_bases, out.query, out.key, out.value, out.z,
-                                      stream);
+        launch_fp8_gdn_snapshot_fused(x, w, conv, state, valid, destination, out.query, out.key,
+                                      out.value, out.z, stream);
         return;
     case ConvKernel::Nvfp4Decode:
-        launch_nvfp4_gdn_snapshot_decode(x, w, conv, state.history, valid, state.source_slots,
-                                         state.snapshot_bases, out.query, out.key, out.value, out.z,
-                                         stream);
+        launch_nvfp4_gdn_snapshot_decode(x, w, conv, state, valid, destination, out.query, out.key,
+                                         out.value, out.z, stream);
         return;
     case ConvKernel::Nvfp4Window:
-        launch_nvfp4_gdn_snapshot_small_t(x, w, conv, state.history, valid, state.source_slots,
-                                          state.snapshot_bases, out.query, out.key, out.value,
-                                          out.z, stream);
+        launch_nvfp4_gdn_snapshot_small_t(x, w, conv, state, valid, destination, out.query, out.key,
+                                          out.value, out.z, stream);
         return;
     case ConvKernel::Materialized:
         break;
@@ -97,53 +91,48 @@ void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tenso
     const Tensor projected =
         scratch.projected.view({weights.geometry.channels(), batch.tokens, batch.rows});
     if (plan.post != ProjectedConvKernel::Sequential)
-        launch_gdn_projected_conv_parallel_snapshot(
-            projected, conv, state.history, valid, state.source_slots, state.snapshot_bases,
-            out.query, out.key, out.value, plan.post, stream);
+        launch_gdn_projected_conv_parallel_snapshot(projected, conv, state, valid, destination,
+                                                    out.query, out.key, out.value, plan.post,
+                                                    stream);
     else
-        launch_gdn_projected_conv_snapshot(projected, conv, state.history, valid,
-                                           state.source_slots, state.snapshot_bases, out.query,
+        launch_gdn_projected_conv_snapshot(projected, conv, state, valid, destination, out.query,
                                            out.key, out.value, stream);
 }
 
 void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor& conv,
-                   GdnConvSourceState state, const Tensor& valid, GdnConvOutputs out,
+                   ConstStateFieldView state, const Tensor& valid, GdnConvOutputs out,
                    Tensor& record, Batch batch, ConvPlan plan, const Scratch& scratch,
                    cudaStream_t stream) {
     const auto& w = *weights.first;
     switch (plan.kernel) {
     case ConvKernel::Q4Q5Fused:
-        launch_q4_q5_gdn_input_conv_record(x, w, *weights.second, conv, state.history, valid,
-                                           state.source_slots, record, out.query, out.key,
-                                           out.value, out.z, stream);
+        launch_q4_q5_gdn_input_conv_record(x, w, *weights.second, conv, state, valid, record,
+                                           out.query, out.key, out.value, out.z, stream);
         return;
     case ConvKernel::Q8SlicedK:
-        launch_q8_gdn_input_splitk_conv_record(x, w, conv, state.history, valid, state.source_slots,
-                                               record, out.query, out.key, out.value, out.z,
-                                               stream);
+        launch_q8_gdn_input_splitk_conv_record(x, w, conv, state, valid, record, out.query, out.key,
+                                               out.value, out.z, stream);
         return;
     case ConvKernel::Q8Window:
     case ConvKernel::Q8Aggregate:
     case ConvKernel::Q8TmaBatch:
 #if NINFER_TARGET_SPARK
         if (weights.geometry.query_rows == 1024) {
-            launch_q8_gdn_conv_n8192_k2560_record(x, w, conv, state.history, valid,
-                                                  state.source_slots, record, out.query, out.key,
-                                                  out.value, out.z, plan.kernel, stream);
+            launch_q8_gdn_conv_n8192_k2560_record(x, w, conv, state, valid, record, out.query,
+                                                  out.key, out.value, out.z, plan.kernel, stream);
             return;
         }
 #endif
-        launch_q8_gdn_conv_n16384_k2560_record(x, w, conv, state.history, valid, state.source_slots,
-                                               record, out.query, out.key, out.value, out.z,
-                                               plan.kernel, stream);
+        launch_q8_gdn_conv_n16384_k2560_record(x, w, conv, state, valid, record, out.query, out.key,
+                                               out.value, out.z, plan.kernel, stream);
         return;
     case ConvKernel::Fp8Fused:
-        launch_fp8_gdn_record_fused(x, w, conv, state.history, valid, state.source_slots, record,
-                                    out.query, out.key, out.value, out.z, stream);
+        launch_fp8_gdn_record_fused(x, w, conv, state, valid, record, out.query, out.key, out.value,
+                                    out.z, stream);
         return;
     case ConvKernel::Nvfp4Window:
-        launch_nvfp4_gdn_record_small_t(x, w, conv, state.history, valid, state.source_slots,
-                                        record, out.query, out.key, out.value, out.z, stream);
+        launch_nvfp4_gdn_record_small_t(x, w, conv, state, valid, record, out.query, out.key,
+                                        out.value, out.z, stream);
         return;
     case ConvKernel::Q8Decode:
     case ConvKernel::Nvfp4Decode:
@@ -156,12 +145,11 @@ void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor&
                                      out.z.view({weights.geometry.value_rows, batch.columns()})};
     launch_projection(flat_x, weights, projected, plan.projection, scratch, stream);
     if (plan.post != ProjectedConvKernel::Sequential)
-        launch_gdn_projected_conv_parallel_record(record, conv, state.history, valid,
-                                                  state.source_slots, out.query, out.key, out.value,
-                                                  plan.post, stream);
+        launch_gdn_projected_conv_parallel_record(record, conv, state, valid, out.query, out.key,
+                                                  out.value, plan.post, stream);
     else
-        launch_gdn_projected_conv_record(record, conv, state.history, valid, state.source_slots,
-                                         out.query, out.key, out.value, stream);
+        launch_gdn_projected_conv_record(record, conv, state, valid, out.query, out.key, out.value,
+                                         stream);
 }
 
 } // namespace ninfer::ops::detail::gdn_input

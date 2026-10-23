@@ -251,7 +251,7 @@ downsample/merger；复用媒体解码和处理任务池。按完整 segment 分
 
 G4 后先接 ordinary decode Graph，G5 后接 MTP draft/verify/commit；Vision 进入
 已有 prefill 流程，prefill 本轮保持 eager。固定 frame/backing 和 collective 次序，
-按需要的全局/局部 batch 几何准备 Graph，长度、页表、selection 和 slots 通过正式
+按需要的全局/局部 batch 几何准备 Graph，长度、I64 record/page offsets 与 selection 通过正式
 输入或 Op 更新合同变化。避免按每个请求身份组合复制 Graph。
 
 汇合各 Op 的最终优化后，通过 ninfer-bench 和必要的 nsys capture 检查 prefill chunk、

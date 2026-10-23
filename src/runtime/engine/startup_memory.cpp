@@ -25,8 +25,11 @@ StartupMemoryBudget::StartupMemoryBudget(DeviceMemorySnapshot initial, std::size
                                          std::size_t headroom, std::size_t host_reservation)
     : initial_(initial), limit_(std::min(initial.available_bytes(), limit)), headroom_(headroom),
       host_reservation_(host_reservation) {
-    if (limit_ <= headroom_ || host_reservation_ >= limit_ - headroom_)
+    if (limit_ <= headroom_ ||
+        (initial_.shared_physical_memory && host_reservation_ >= limit_ - headroom_))
         throw std::invalid_argument("Device budget is smaller than runtime headroom");
+    if (host_reservation_ > initial_.system_available_bytes)
+        throw std::invalid_argument("Host reservation exceeds available RAM");
 }
 
 std::size_t StartupMemoryBudget::available(DeviceMemorySnapshot current) const {
@@ -38,8 +41,16 @@ std::size_t StartupMemoryBudget::available(DeviceMemorySnapshot current) const {
 }
 
 bool StartupMemoryBudget::fits(DeviceMemorySnapshot current) const noexcept {
-    const auto consumed = device_memory_growth(initial_, current);
-    return consumed <= static_cast<std::int64_t>(limit_ - host_reservation_);
+    const auto consumed       = device_memory_growth(initial_, current);
+    const auto device_reserve = initial_.shared_physical_memory ? host_reservation_ : 0;
+    return consumed <= static_cast<std::int64_t>(limit_ - device_reserve) &&
+           current.system_available_bytes >= host_reservation_;
+}
+
+std::size_t StartupMemoryBudget::available_host(DeviceMemorySnapshot current) const noexcept {
+    return current.system_available_bytes > host_reservation_
+               ? current.system_available_bytes - host_reservation_
+               : 0;
 }
 
 std::int64_t StartupMemoryBudget::retained(DeviceMemorySnapshot current,

@@ -35,8 +35,7 @@ void rejects(Function&& function) {
 void test_resources_and_units() {
     const auto defaults = parse({"ninfer-serve", "model.ninfer"});
     const auto& engine  = defaults.launch.engine;
-    require(engine.context_cache.enabled && !engine.context_cache.extra_state_slots &&
-                !engine.context_cache.host_capacity_bytes,
+    require(engine.context_cache.enabled && !engine.context_cache.host_capacity_bytes,
             "server resource defaults were resolved before model preparation");
     require(defaults.launch.generation.max_tokens == 8192 &&
                 !defaults.launch.generation.sampling.seed &&
@@ -55,39 +54,23 @@ void test_resources_and_units() {
         require(parsed.launch.engine.context_cache.host_capacity_bytes == bytes,
                 "capacity lost exact bytes");
     }
-    const auto controls = parse({"ninfer-serve",
-                                 "--pending-timeout",
-                                 "1.25s",
-                                 "model.ninfer",
-                                 "--stats-interval",
-                                 "0ms",
-                                 "--media-cache-capacity",
-                                 "0B",
-                                 "--max-request-size",
-                                 "1.5MiB",
-                                 "--extra-state-slots",
-                                 "0",
-                                 "--max-concurrency",
-                                 "4",
-                                 "--media-preprocess-threads",
-                                 "auto",
-                                 "--kv-capacity",
-                                 "auto",
-                                 "--checkpoint-interval",
-                                 "16384"});
+    const auto controls =
+        parse({"ninfer-serve", "--pending-timeout", "1.25s", "model.ninfer", "--stats-interval",
+               "0ms", "--media-cache-capacity", "0B", "--max-request-size", "1.5MiB",
+               "--max-concurrency", "4", "--media-preprocess-threads", "auto", "--context-capacity",
+               "auto", "--checkpoint-interval", "16384"});
     require(controls.launch.engine.pending_timeout_ms == 1250 &&
                 controls.launch.logging.stats_interval_ms == 0 &&
                 controls.max_request_bytes == 1572864 &&
-                controls.launch.engine.context_cache.extra_state_slots == 0 &&
                 controls.launch.engine.context_cache.checkpoint_interval == 16384 &&
                 controls.launch.engine.media_cache_bytes == 0 &&
-                controls.launch.engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
+                controls.launch.engine.context_capacity.mode ==
+                    ninfer::ContextCapacityMode::Automatic,
             "unit, zero or automatic controls changed");
-    require(!parse({"ninfer-serve", "model.ninfer", "--extra-state-slots", "auto"})
-                 .launch.engine.context_cache.extra_state_slots,
-            "automatic state capacity was resolved before planning");
     for (const auto& suffix :
          std::vector<std::vector<std::string>>{{"--host-cache-capacity", "18446744073709551616B"},
+                                               {"--context-capacity", "0B"},
+                                               {"--context-capacity", "0.1B"},
                                                {"--host-cache-capacity", "0.1B"},
                                                {"--host-cache-capacity", "-1MiB"},
                                                {"--pending-timeout", "0ms"},

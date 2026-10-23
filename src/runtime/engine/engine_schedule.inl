@@ -43,9 +43,7 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         if (instance_.session->has_context_operation()) { return false; }
         const auto admission = resources_.capture_admission(
             *instance_.session, request->continuation_owner, *request->base_plan, capture->frontier,
-            instance_.session->capture_is_input(*request->sequence) &&
-                !capture->shortage.first_kv_deficit(),
-            capture->origin);
+            instance_.session->capture_is_input(*request->sequence), capture->origin);
         if (!decision || decision->frontier != capture->frontier) {
             decision.emplace(
                 CaptureDecision{*request->sequence, capture->frontier,
@@ -58,17 +56,23 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
             if (const auto victims =
                     resources_.host_victims(*instance_.session, capture->host, std::nullopt, {}, {},
                                             admission, &decision->reclaim)) {
-                resources_.commit_host_victims(*instance_.session, *victims, decision->reclaim);
-                if (!victims->empty()) { scheduler_.capacity_released(); }
-                if (const auto retry = instance_.session->prepare_capture(*request->sequence);
-                    retry && retry->reserved) {
+                const auto loss  = resources_.release_cost(*instance_.session, *victims);
+                const auto retry = instance_.session->prepare_capture(*request->sequence, *victims);
+                if (retry && !retry->retired_points.empty()) {
+                    if (retry->retired_points != *victims)
+                        throw std::logic_error("capture consumed only part of its victim quote");
+                    resources_.adopt_release(*instance_.session, retry->retired_points,
+                                             decision->reclaim, loss);
+                    scheduler_.capacity_released();
+                }
+                if (retry && retry->reserved) {
                     decision.reset();
                     return true;
                 }
             }
         }
         const auto progress =
-            resources_.reclaim(*instance_.session, capture->shortage, {}, decision->reclaim);
+            resources_.reclaim(*instance_.session, capture->assessment, {}, decision->reclaim);
         if (progress == ReclaimProgress::Transferring || progress == ReclaimProgress::Deferred)
             return false;
         if (progress == ReclaimProgress::Retry) continue;
@@ -121,6 +125,11 @@ void EngineCore<Instance>::resolve_context_progress(
     }
     const auto owner = materializing_ ? materializing_->request : context_owner_;
     record_context_work(progress, owner);
+    if (progress.kind == decltype(progress.kind)::Maintenance) {
+        scheduler_.capacity_released();
+        request_admission_check();
+        return;
+    }
     if (owner && progress.kind == decltype(progress.kind)::Pause) {
         owner->speculative_stats = std::move(progress.request_speculative);
     }
@@ -243,45 +252,48 @@ void EngineCore<Instance>::resolve_context_progress(
 }
 
 template <class Instance>
-bool EngineCore<Instance>::reclaim(ContextResources shortage, bool allow_pause,
-                                   std::span<const Checkpoint> excluded,
-                                   typename ResourceManagement::ReclaimCursor* cursor,
-                                   std::optional<std::uint64_t> priority_ticket) {
-    if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes) {
-        return false;
-    }
-    if (instance_.session->reclaim_capture_reservation(shortage)) {
+ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessment, bool allow_pause,
+                                              std::span<const Checkpoint> excluded,
+                                              typename ResourceManagement::ReclaimCursor* cursor,
+                                              std::optional<std::uint64_t> priority_ticket) {
+    if (assessment.ready()) return ReclaimProgress::Retry;
+    if (assessment.waiting()) return ReclaimProgress::Deferred;
+    if (assessment.impossible()) return ReclaimProgress::Blocked;
+    if (instance_.session->reclaim_capture_reservation(assessment)) {
         request_admission_check();
-        return true;
+        return ReclaimProgress::Changed;
     }
-    const auto progress = cursor
-                              ? resources_.reclaim(*instance_.session, shortage, excluded, *cursor)
-                              : resources_.reclaim(*instance_.session, shortage, excluded);
+    const auto progress =
+        cursor ? resources_.reclaim(*instance_.session, assessment, excluded, *cursor)
+               : resources_.reclaim(*instance_.session, assessment, excluded);
     if (progress != ReclaimProgress::Blocked) {
         if (progress == ReclaimProgress::Changed) {
             scheduler_.capacity_released();
             request_admission_check();
         }
-        return true;
+        return progress;
     }
-    if (cursor && cursor->rights.purpose != ReclaimPurpose::Execution) { return false; }
+    if (cursor && cursor->rights.purpose != ReclaimPurpose::Execution)
+        return ReclaimProgress::Blocked;
     for (auto it = paused_.rbegin(); it != paused_.rend(); ++it) {
         auto& request = **it;
         if (!request.suspended || !request.suspended->has_snapshot()) { continue; }
         const auto handle = *request.suspended->snapshot_handle();
         if (std::find(excluded.begin(), excluded.end(), handle) != excluded.end()) { continue; }
-        const auto resources = instance_.session->snapshot_resources(*request.suspended);
-        if (resources.useful(shortage) && instance_.session->revoke_snapshot(*request.suspended)) {
+        if (instance_.session->revoke_snapshot(*request.suspended)) {
             request.recovery_route = GenerationRecoveryRoute::Replay;
             observe_scheduling(*it, GenerationSchedulingTransition::SnapshotRevoked);
             if (admission_decision_ && admission_decision_->request.get() == &request) {
                 admission_decision_.reset();
             }
             request_admission_check();
-            return true;
+            return ReclaimProgress::Changed;
         }
     }
-    return allow_pause && pause_reclaim_victim(priority_ticket);
+    if (allow_pause && pause_reclaim_victim(priority_ticket))
+        return instance_.session->has_context_operation() ? ReclaimProgress::Transferring
+                                                          : ReclaimProgress::Changed;
+    return ReclaimProgress::Blocked;
 }
 
 template <class Instance>
@@ -442,7 +454,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 resources_.begin_reclaim(*instance_.session, std::nullopt, rights)});
         }
         auto& decision = *admission_decision_;
-        ContextResources shortage;
+        ContextAssessment assessment;
         bool deferred = false;
         while (decision.current < decision.sources.size()) {
             auto& choice            = decision.sources[decision.current];
@@ -496,19 +508,23 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 continue;
             }
             if (!reservation) {
-                shortage = reservation.shortage;
+                assessment = reservation.assessment;
                 if (!own_snapshot) { retain_admission_source(request, choice, restoring); }
                 const auto protected_source =
                     own_snapshot ? request->suspended->snapshot_handle() : choice.source.checkpoint;
-                const auto excluded = protected_source
-                                          ? std::span<const Checkpoint>(&*protected_source, 1)
-                                          : std::span<const Checkpoint>{};
-                if (reclaim(shortage, restoring && !has_older_resident(request->id), excluded,
-                            &decision.reclaim,
-                            restoring ? std::optional(request->id) : std::nullopt)) {
-                    if (instance_.session->has_context_operation()) { return true; }
-                    continue;
+                const auto excluded  = protected_source
+                                           ? std::span<const Checkpoint>(&*protected_source, 1)
+                                           : std::span<const Checkpoint>{};
+                const auto reclaimed = reclaim(
+                    assessment, restoring && !has_older_resident(request->id), excluded,
+                    &decision.reclaim, restoring ? std::optional(request->id) : std::nullopt);
+                if (reclaimed == ReclaimProgress::Transferring) return true;
+                if (reclaimed == ReclaimProgress::Deferred) {
+                    deferred = true;
+                    break;
                 }
+                if (reclaimed == ReclaimProgress::Changed || reclaimed == ReclaimProgress::Retry)
+                    continue;
                 // Another waiting reference may be the only obstacle to a Move.
                 // Grant its revocation only when the resulting complete bind succeeds.
                 if (!own_snapshot) {
@@ -590,12 +606,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
         if (admission_check_pending_.load(std::memory_order_acquire)) { return true; }
         if (resident_empty()) {
             throw std::logic_error("isolated request cannot reserve its first legal unit after "
-                                   "context reclamation: state=" +
-                                   std::to_string(shortage.state_slots) + ", kv_pool=" +
-                                   (shortage.first_kv_deficit()
-                                        ? std::to_string(shortage.first_kv_deficit()->index)
-                                        : "none") +
-                                   ", host_bytes=" + std::to_string(shortage.host_bytes));
+                                   "context reclamation");
         }
         if (restoring) {
             scheduler_.restoration_blocked();
@@ -723,17 +734,19 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             }
             if (instance_.session->has_context_operation()) { break; }
             if (!cursor) { cursor.emplace(resources_.begin_reclaim(*instance_.session)); }
-            if (reclaim(result.shortage, false, {}, &*cursor)) {
-                if (!instance_.session->has_context_operation()) { continue; }
+            const auto reclaimed = reclaim(result.assessment, false, {}, &*cursor);
+            if (reclaimed == ReclaimProgress::Transferring ||
+                reclaimed == ReclaimProgress::Deferred)
                 break;
-            }
+            if (reclaimed == ReclaimProgress::Changed || reclaimed == ReclaimProgress::Retry)
+                continue;
             if (recovering == lane) {
                 throw std::logic_error("protected recovery exceeded its Native reservation");
             }
             if (!recovering && oldest == lane) {
                 // Only the oldest required unit can displace younger residents. Other
                 // failed rows wait or yield their own lane; they cannot block ready rows.
-                // The same shortage has already exhausted cache and paused snapshots.
+                // This demand has already exhausted cache and paused-snapshot reclamation.
                 if (pause_reclaim_victim(request->id)) { break; }
                 throw std::logic_error("oldest resident cannot obtain its legal unit");
             }

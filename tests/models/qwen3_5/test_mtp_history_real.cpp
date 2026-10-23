@@ -29,6 +29,13 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+PoolReservation reserve(ContextPool& pool, std::initializer_list<RecordRequest> demand) {
+    auto result = pool.reserve(demand);
+    require(result.reservation && result.reservation->ready(),
+            "oracle Context capacity is insufficient");
+    return std::move(*result.reservation);
+}
+
 template <class T>
 std::vector<T> read(const Tensor& tensor) {
     require(tensor.is_contiguous() && tensor.bytes() % sizeof(T) == 0, "invalid oracle readback");
@@ -67,18 +74,22 @@ public:
         LayoutBuilder builder;
         const auto layout = q35::plan_paged_kv_cache(
             builder, 1, kCapacity, q35::execution::dimension(attention.num_key_value_heads),
-            q35::execution::dimension(attention.head_dim), KvCacheStorage::BFloat16, kBatch, 4,
-            PagedKVPlaneOrder::PageMajor);
+            q35::execution::dimension(attention.head_dim), KvCacheStorage::BFloat16, kBatch);
         backing_ = DeviceBuffer(fixture.device().device(), builder.finish(256, "reference MTP"));
-        backing_.fill();
-        cache_   = std::make_unique<q35::PagedKVCache>(backing_.span(), layout);
-        mapping_ = PinnedHostBuffer(4 * sizeof(std::int32_t));
+        records_ = DeviceBuffer(fixture.device().device(), 4 * layout.pages.page_bytes);
+        records_.fill();
+        const std::array specs{RecordSpec{layout.pages.page_bytes, layout.pages.alignment}};
+        pool_                   = std::make_unique<ContextPool>(0, records_.size(), specs);
+        const auto record_class = pool_->record_class(0);
+        auto reservation        = reserve(*pool_, {{record_class, 4}});
+        cache_   = std::make_unique<q35::PagedKVCache>(records_.span(), backing_.span(), layout);
+        mapping_ = PinnedHostBuffer(4 * sizeof(std::int64_t));
         for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
-            const std::array pages{static_cast<std::int32_t>(lane * 2),
-                                   static_cast<std::int32_t>(lane * 2 + 1)};
+            for (auto& offset : offsets_[lane])
+                offset = pool_->resolve(reservation.materialize(record_class)).offset;
             cache_->tables().publish(
-                lane, 0, pages,
-                mapping_.span().subspan(lane * 2 * sizeof(std::int32_t), 2 * sizeof(std::int32_t)),
+                lane, 0, offsets_[lane],
+                mapping_.span().subspan(lane * 2 * sizeof(std::int64_t), 2 * sizeof(std::int64_t)),
                 fixture.device().execution_view());
         }
         fixture.device().synchronize();
@@ -143,32 +154,37 @@ public:
         fixture_.device().synchronize();
         const auto actual   = fixture_.rank().resources.decoder.mtp_cache()->batch_layer_view(0);
         const auto expected = cache_->batch_layer_view(0);
-        const auto actual_table   = read<std::int32_t>(actual.block_tables.slice(1, lane, 1));
-        const auto expected_table = read<std::int32_t>(expected.block_tables.slice(1, lane, 1));
+        const auto actual_table =
+            read<std::int64_t>(actual.k_pages.records.page_offsets.slice(1, lane, 1));
+        const auto expected_table =
+            read<std::int64_t>(expected.k_pages.records.page_offsets.slice(1, lane, 1));
         for (const auto pair : {std::pair{actual.k_pages, expected.k_pages},
                                 std::pair{actual.v_pages, expected.v_pages}}) {
-            const auto a = read<std::uint16_t>(pair.first), e = read<std::uint16_t>(pair.second);
-            for (std::uint32_t p = 0; p < frontier; ++p)
-                for (int head = 0; head < actual.num_kv_heads; ++head)
-                    for (int d = 0; d < actual.head_dim; ++d) {
-                        const auto offset = [&](int page) {
-                            return d + std::size_t(actual.head_dim) *
-                                           (p % 64 +
-                                            64 * (head + std::size_t(actual.num_kv_heads) * page));
-                        };
-                        if (a[offset(actual_table[p / 64])] != e[offset(expected_table[p / 64])])
-                            throw std::runtime_error("MTP committed KV differs at lane " +
-                                                     std::to_string(lane) + " position " +
-                                                     std::to_string(p));
-                    }
+            for (std::uint32_t page = 0; page * 64 < frontier; ++page) {
+                const auto a = read<std::uint16_t>(pair.first.tensor(actual_table[page]));
+                const auto e = read<std::uint16_t>(pair.second.tensor(expected_table[page]));
+                for (std::uint32_t p = page * 64; p < std::min(frontier, (page + 1) * 64); ++p)
+                    for (int head = 0; head < actual.num_kv_heads; ++head)
+                        for (int d = 0; d < actual.head_dim; ++d) {
+                            const auto offset =
+                                d + std::size_t(actual.head_dim) * (p % 64 + 64 * head);
+                            if (a[offset] != e[offset])
+                                throw std::runtime_error("MTP committed KV differs at lane " +
+                                                         std::to_string(lane) + " position " +
+                                                         std::to_string(p));
+                        }
+            }
         }
         ++checks_;
     }
 
     void clone(std::uint32_t source, std::uint32_t destination) {
         for (std::uint32_t page = 0; page < 2; ++page)
-            cache_->pages().copy_page(source * 2 + page, destination * 2 + page,
-                                      fixture_.device().execution_view());
+            copy_bytes_async(
+                records_.span().subspan(offsets_[destination][page],
+                                        cache_->page_layout().page_bytes),
+                records_.span().subspan(offsets_[source][page], cache_->page_layout().page_bytes),
+                fixture_.device().execution_view());
         fixture_.device().synchronize();
     }
 
@@ -176,30 +192,46 @@ public:
 
 private:
     Native& fixture_;
-    DeviceBuffer workspace_, backing_;
+    DeviceBuffer workspace_, backing_, records_;
     MemoryArena arena_;
     PinnedHostBuffer mapping_;
+    std::unique_ptr<ContextPool> pool_;
     std::unique_ptr<q35::PagedKVCache> cache_;
+    std::array<std::array<std::int64_t, 2>, kBatch> offsets_;
     std::size_t checks_ = 0;
 };
 
 class Cases {
 public:
-    explicit Cases(Native& native) : native_(native), oracle_(native) {
+    explicit Cases(Native& native)
+        : native_(native), oracle_(native), pool_(0, native.rank().resources.context.size(),
+                                                  native.rank().resources.context_records) {
+        const auto state_class = pool_.record_class(0);
+        auto reservation       = reserve(
+            pool_, {{state_class, 4}, {pool_.record_class(1), 4}, {pool_.record_class(2), 4}});
+        for (auto& state : states_) state = pool_.resolve(reservation.materialize(state_class));
+        for (std::uint32_t kind = 0; kind < 2; ++kind)
+            for (auto& page : pages_[kind])
+                page = pool_.resolve(reservation.materialize(pool_.record_class(kind + 1)));
         q35::ContextWork bindings;
         q35::Work work;
         for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
             rows_[lane] = {.member            = {{lane + 1, 1}, {{lane}, 1}},
                            .source_state      = {lane, 1},
                            .destination_state = {lane, 1},
-                           .state_slots       = {static_cast<int>(lane), static_cast<int>(lane)},
+                           .state_offsets     = {static_cast<std::int64_t>(states_[lane].offset),
+                                                 static_cast<std::int64_t>(states_[lane].offset)},
                            .main_table        = {0, lane, 1},
                            .backend_table     = ctx::TableRow{1, lane, 1}};
-            work.context.operations.emplace_back(ctx::StateClear{static_cast<std::int32_t>(lane)});
+            work.context.operations.emplace_back(ctx::RecordClear{range(states_[lane])});
             bindings.bindings.push_back({rows_[lane].member, {}, {}});
             for (std::uint32_t pool = 0; pool < 2; ++pool)
                 work.context.operations.emplace_back(ctx::MappingUpdate{
-                    {pool, lane, 1}, 0, {{pool, lane * 2, 1}, {pool, lane * 2 + 1, 1}}});
+                    pool,
+                    static_cast<std::int32_t>(lane),
+                    0,
+                    {static_cast<std::int64_t>(pages_[pool][lane * 2].offset),
+                     static_cast<std::int64_t>(pages_[pool][lane * 2 + 1].offset)}});
         }
         work.operation = std::move(bindings);
         auto ticket    = submit(std::move(work), runtime::FrameKind::Context);
@@ -295,8 +327,8 @@ public:
         for (int axis = 0; axis < 3; ++axis)
             rows_[lane].tail_rope_position[axis] = input.rope_positions[axis * count + count - 1];
         if (manual) {
-            auto destination = native_.rank().resources.state_images.continuation_hidden_slot(
-                rows_[lane].state_slots.destination);
+            auto destination = native_.rank().resources.state_images.continuation_hidden(
+                rows_[lane].state_offsets.destination);
             auto source =
                 native_.rank().resources.frame.input_view(count, 1).hidden.slice(1, count - 1, 1);
             copy_bytes_async({destination.data, destination.bytes(), destination.device},
@@ -311,21 +343,27 @@ public:
 
     void checkpoint_clone() {
         q35::Work work;
-        work.context.operations.emplace_back(ctx::StateCopy{rows_[0].state_slots.source, 2});
+        work.context.operations.emplace_back(
+            ctx::RecordCopy{range(states_[0]), range(states_[2]), {}, 1});
         for (std::uint32_t pool = 0; pool < 2; ++pool)
             for (std::uint32_t page = 0; page < 2; ++page)
                 work.context.operations.emplace_back(
-                    ctx::PageCopy{{pool, page, 1}, {pool, page + 2, 1}});
+                    ctx::RecordCopy{range(pages_[pool][page]),
+                                    range(pages_[pool][page + 2]),
+                                    {runtime::KvPoolId{static_cast<std::uint16_t>(pool)}},
+                                    0,
+                                    1});
         work.operation = q35::ContextWork{};
         auto ticket    = submit(std::move(work), runtime::FrameKind::Context);
         (void)result(ticket);
         retire(ticket);
         rows_[1].source_state = rows_[1].destination_state = {2, 1};
-        rows_[1].state_slots                               = {2, 2};
-        rows_[1].main_frontier                             = rows_[0].main_frontier;
-        rows_[1].backend_frontier                          = rows_[0].backend_frontier;
-        rows_[1].tail_rope_position                        = rows_[0].tail_rope_position;
-        hidden_[1]                                         = hidden_[0];
+        rows_[1].state_offsets      = {static_cast<std::int64_t>(states_[2].offset),
+                                       static_cast<std::int64_t>(states_[2].offset)};
+        rows_[1].main_frontier      = rows_[0].main_frontier;
+        rows_[1].backend_frontier   = rows_[0].backend_frontier;
+        rows_[1].tail_rope_position = rows_[0].tail_rope_position;
+        hidden_[1]                  = hidden_[0];
         oracle_.clone(0, 1);
         oracle_.compare(1, rows_[1].backend_frontier);
     }
@@ -348,13 +386,14 @@ public:
 
     void reset_for_visual_root() {
         q35::Work work;
-        work.context.operations.emplace_back(ctx::StateClear{3});
+        work.context.operations.emplace_back(ctx::RecordClear{range(states_[3])});
         work.operation    = q35::ContextWork{};
         const auto ticket = submit(std::move(work), runtime::FrameKind::Context);
         (void)result(ticket);
         retire(ticket);
         rows_[1].source_state = rows_[1].destination_state = {3, 1};
-        rows_[1].state_slots                               = {3, 3};
+        rows_[1].state_offsets = {static_cast<std::int64_t>(states_[3].offset),
+                                  static_cast<std::int64_t>(states_[3].offset)};
         rows_[1].main_frontier = rows_[1].backend_frontier = 0;
         rows_[1].tail_rope_position                        = {};
         hidden_[1].clear();
@@ -467,6 +506,11 @@ public:
     std::size_t checks() const { return oracle_.checks(); }
 
 private:
+    static ctx::ContextRange range(const RecordBinding& binding) {
+        return {ctx::ContextMemory::Device, static_cast<std::int64_t>(binding.offset),
+                binding.bytes};
+    }
+
     runtime::ExecutionTicket submit(q35::Work work, runtime::FrameKind kind) {
         auto reservation = native_.executor().try_reserve(kind);
         require(bool(reservation), "native MTP frame is unexpectedly occupied");
@@ -506,6 +550,9 @@ private:
 
     Native& native_;
     HistoryOracle oracle_;
+    ContextPool pool_;
+    std::array<RecordBinding, 4> states_;
+    std::array<std::array<RecordBinding, 4>, 2> pages_;
     std::array<q35::ExecutionRow, 2> rows_;
     std::array<std::vector<std::uint16_t>, 2> hidden_;
     std::array<TokenId, 2> anchors_{198, 199};
@@ -528,18 +575,16 @@ int main() {
         std::shared_ptr<const q35::ModelShard> model = q35::materialize_model(
             q35::resolve_load(reader, definition, loading.device()), loading);
         EngineOptions options;
-        options.max_context              = kCapacity;
-        options.max_concurrency          = kBatch;
-        options.kv_capacity              = KvCapacityPolicy::explicit_capacity(kCapacity * kBatch);
-        options.prefill_chunk            = 128;
-        options.kv_cache                 = KvCacheStorage::BFloat16;
-        options.use_cuda_graph           = use_graph;
-        options.speculative.backend      = SpeculativeBackend::Mtp;
-        options.speculative.draft_tokens = kDrafts;
-        options.context_cache.enabled    = false;
-        options.context_cache.extra_state_slots   = 2;
+        options.max_context                       = kCapacity;
+        options.max_concurrency                   = kBatch;
+        options.prefill_chunk                     = 128;
+        options.kv_cache                          = KvCacheStorage::BFloat16;
+        options.use_cuda_graph                    = use_graph;
+        options.speculative.backend               = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens          = kDrafts;
+        options.context_cache.enabled             = false;
         options.context_cache.host_capacity_bytes = 0;
-        Native fixture(definition, model, profile, options, 4);
+        Native fixture(definition, model, profile, options);
         Cases cases(fixture);
         cases.forward(0, 1, q35::ForwardPurpose::Prefill);
         cases.forward(0, 6, q35::ForwardPurpose::Prefill);

@@ -143,9 +143,13 @@ int chain(DeviceContext& device) {
     kernel.fill(409, .25f);
     norm.fill(419, .4f);
     for (const Words* w : {&history, &after, &kernel, &norm, &y, &z}) w->upload();
-    auto zero = to_device(std::vector<int>{0}), accepted = to_device(std::vector<int>{t});
-    Tensor slot(zero.span(), DType::I32, {1}), count(accepted.span(), DType::I32, {1});
-    const ops::PleConvStateView before{history.tensor, slot}, destination{after.tensor, slot};
+    auto zero     = to_device(std::vector<std::int64_t>{0});
+    auto accepted = to_device(std::vector<int>{t});
+    Tensor offsets(zero.span(), DType::I64, {1}), count(accepted.span(), DType::I32, {1});
+    const ops::PleConvStateView before{
+        history_field(history.tensor, history.device->span(), offsets)};
+    const ops::PleConvStateView destination{
+        history_field(after.tensor, after.device->span(), offsets)};
     cuda_synchronize();
     f.launch(device.execution_view());
     ops::ple_conv_add_norm(f.residual.tensor, f.gated.tensor, kernel.tensor, f.batch_view(), before,

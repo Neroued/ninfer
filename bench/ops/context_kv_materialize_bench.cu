@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -125,13 +126,15 @@ Options parse_options(int argc, char** argv) {
 struct Fixture {
     std::array<bench::PackedQuantizedWeight, kLayers> parents;
     std::array<DeviceBuffer, kLayers> norms;
-    std::array<DeviceBuffer, kLayers> cache_k;
-    std::array<DeviceBuffer, kLayers> cache_v;
+    StateImageLayout state_layout;
+    CyclicKVCacheLayout cache_layout;
+    DeviceBuffer state;
+    std::optional<StateImageStorage> images;
     std::array<ops::ContextKVMaterializeLayerView, kLayers> layers;
     DeviceBuffer context = bench::make_bf16(static_cast<std::size_t>(kHidden) * 2048, 101U);
     DeviceBuffer positions;
     DeviceBuffer counts;
-    DeviceBuffer slots;
+    DeviceBuffer offsets;
     DeviceBuffer direct_workspace;
     MemoryArena direct_arena;
     ops::ContextKVMaterializeExecutionEnvelope envelope{};
@@ -139,49 +142,40 @@ struct Fixture {
     Fixture()
         : positions(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 2048),
           counts(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 8),
-          slots(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 8),
+          offsets(ninfer::bench::device_context().device(), sizeof(std::int64_t) * 8),
           direct_workspace(ninfer::bench::device_context().device(),
                            ops::context_kv_materialize_workspace_capacity_bytes(1, 1, 2048)),
           direct_arena(direct_workspace.span()) {
-        const std::size_t cache_bytes = static_cast<std::size_t>(kHeadDim) * kCapacity * kHeads *
-                                        kLaneCapacity * sizeof(std::uint16_t);
+        StateImageBuilder builder;
+        cache_layout = plan_cyclic_kv_cache(builder, kLayers, kCapacity, kHeads, kHeadDim);
+        state_layout = builder.finish();
+        state        = DeviceBuffer(ninfer::bench::device_context().device(),
+                                    state_layout.image_bytes * kLaneCapacity);
+        images.emplace(state.span(), state_layout);
         for (int layer = 0; layer < kLayers; ++layer) {
             parents[static_cast<std::size_t>(layer)] = bench::make_row_split_weight(
                 QType::Q8_G32_FP16, kParentRows, kHidden, kHidden, 501U + layer);
             norms[static_cast<std::size_t>(layer)] =
                 bench::make_bf16(kHeadDim, 103U + layer, .8F, 1.2F);
-            cache_k[static_cast<std::size_t>(layer)] =
-                DeviceBuffer(ninfer::bench::device_context().device(), cache_bytes);
-            cache_v[static_cast<std::size_t>(layer)] =
-                DeviceBuffer(ninfer::bench::device_context().device(), cache_bytes);
             layers[static_cast<std::size_t>(layer)] = {
                 bench::row_view(parents[static_cast<std::size_t>(layer)].weight, kKeyRow, kRows),
                 bench::row_view(parents[static_cast<std::size_t>(layer)].weight, kValueRow, kRows),
                 Tensor(norms[static_cast<std::size_t>(layer)].span(), DType::BF16, {kHeadDim}),
-                CyclicKVCacheLayerView{
-                    .k        = Tensor(cache_k[static_cast<std::size_t>(layer)].span(), DType::BF16,
-                                       {kHeadDim, kCapacity, kHeads, kLaneCapacity}),
-                    .v        = Tensor(cache_v[static_cast<std::size_t>(layer)].span(), DType::FP16,
-                                       {kHeadDim, kCapacity, kHeads, kLaneCapacity}),
-                    .capacity = kCapacity,
-                    .padded_capacity = kCapacity,
-                    .num_kv_heads    = kHeads,
-                    .head_dim        = kHeadDim,
-                    .slot_count      = kLaneCapacity,
-                },
+                {},
             };
         }
     }
 
     void prepare(int width, int batch, const std::string& mode) {
         direct_arena.reset_peak();
-        std::vector<int> host_positions(width * batch), host_counts(batch), host_slots(batch);
+        std::vector<int> host_positions(width * batch), host_counts(batch);
+        std::vector<std::int64_t> host_offsets(batch);
         for (int b = 0; b < batch; ++b) {
-            host_counts[b] = mode == "zero"     ? 0
-                             : mode == "one"    ? 1
-                             : mode == "ragged" ? (b * 7 + width) % (width + 1)
-                                                : width;
-            host_slots[b]  = 7 - b;
+            host_counts[b]  = mode == "zero"     ? 0
+                              : mode == "one"    ? 1
+                              : mode == "ragged" ? (b * 7 + width) % (width + 1)
+                                                 : width;
+            host_offsets[b] = static_cast<std::int64_t>((7 - b) * state_layout.image_bytes);
             for (int i = 0; i < width; ++i) host_positions[b * width + i] = 262140 + 8192 * b + i;
         }
         envelope = {
@@ -189,15 +183,18 @@ struct Fixture {
             static_cast<std::uint32_t>(*std::max_element(host_counts.begin(), host_counts.end()))};
         positions.copy_from_host(host_positions.data(), host_positions.size() * 4);
         counts.copy_from_host(host_counts.data(), host_counts.size() * 4);
-        slots.copy_from_host(host_slots.data(), host_slots.size() * 4);
+        offsets.copy_from_host(host_offsets.data(), host_offsets.size() * sizeof(std::int64_t));
+        const CyclicKVCacheView cache(*images, cache_layout);
+        const Tensor table(offsets.span(), DType::I64, {batch});
+        for (int layer = 0; layer < kLayers; ++layer)
+            layers[layer].cache = cache.layer_view(layer, table);
     }
 
     void launch(int width, int batch, CudaExecutionView cuda) {
         Tensor x(context.span(), DType::BF16, {kHidden, width, batch});
         Tensor pos(positions.span(), DType::I32, {width, batch});
         Tensor count(counts.span(), DType::I32, {batch});
-        Tensor lane(slots.span(), DType::I32, {batch});
-        ops::context_kv_materialize(x, pos, count, lane, layers, envelope, direct_arena, cuda);
+        ops::context_kv_materialize(x, pos, count, layers, envelope, direct_arena, cuda);
     }
 };
 

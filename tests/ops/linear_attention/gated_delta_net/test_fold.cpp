@@ -14,6 +14,7 @@
 #include "core/weight.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
+#include "ops/state_fixture.h"
 
 #include <cuda_runtime.h>
 
@@ -187,7 +188,6 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           cudaMemcpyHostToDevice),
                "upload gate records");
 
-    LayoutBuilder state_backing_builder;
     StateImageBuilder state_builder;
     const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
         state_builder, {.layers         = static_cast<std::uint32_t>(profile.layers),
@@ -197,8 +197,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                         .value_head_dim = kStateDim,
                         .key_head_dim   = kStateDim,
                         .conv_dtype     = DType::BF16});
-    const auto image_layout       = state_builder.finish(state_backing_builder, slot_count);
-    const std::size_t state_bytes = state_backing_builder.finish(256);
+    const auto image_layout = state_builder.finish();
+    const auto state_offset = [&](int record) {
+        return static_cast<std::int64_t>((image_layout.image_bytes + 256) * record);
+    };
+    const std::size_t state_bytes = static_cast<std::size_t>(state_offset(slot_count));
     DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
                                state_bytes + 2 * kGuardBytes);
     state_storage.fill(0xa5);
@@ -221,8 +224,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                      0.05F);
                 }
             }
-            const Tensor destination = state_pool.conv_slot(
-                static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
+            const Tensor destination =
+                state_pool.conv_tensor(static_cast<std::uint32_t>(layer),
+                                       state_offset(source_slots[static_cast<std::size_t>(row)]));
             cuda_check(cudaMemcpy(destination.data, initial.data(), conv_slot_bytes,
                                   cudaMemcpyHostToDevice),
                        "upload initial conv state");
@@ -289,8 +293,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const Tensor q_tensor(q.span(), DType::BF16, {kStateDim, kQkHeads, width, 1});
     Tensor local_state_tensor(local_state.span(), DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
-    DeviceBuffer reference_slot = to_device(std::vector<std::int32_t>{0});
-    Tensor selected_reference_slot(reference_slot.span(), DType::I32, {1});
+    DeviceBuffer reference_slot = to_device(std::vector<std::int64_t>{0});
+    Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
     Tensor output(out.span(), DType::BF16, {kStateDim, profile.value_heads, width, 1});
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
 
@@ -299,8 +303,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         for (std::int32_t row = 0; row < rows; ++row) {
             const auto initial_recurrent =
                 initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
-            const Tensor actual_initial = state_pool.recurrent_slot(
-                static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
+            const Tensor actual_initial = state_pool.recurrent_tensor(
+                static_cast<std::uint32_t>(layer),
+                state_offset(source_slots[static_cast<std::size_t>(row)]));
             cuda_check(cudaMemcpy(actual_initial.data, initial_recurrent.data(),
                                   recurrent_slot_bytes, cudaMemcpyHostToDevice),
                        "upload initial recurrent state");
@@ -313,8 +318,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 offset_pointer(expected_recurrent.data(),
                                static_cast<std::size_t>(layer * rows + row) * recurrent_slot_bytes);
             if (commit == 0) {
-                const Tensor untouched = state_pool.recurrent_slot(
-                    static_cast<std::uint32_t>(layer), destination_slots[row]);
+                const Tensor untouched = state_pool.recurrent_tensor(
+                    static_cast<std::uint32_t>(layer), state_offset(destination_slots[row]));
                 cuda_check(cudaMemcpy(expected, untouched.data, recurrent_slot_bytes,
                                       cudaMemcpyDeviceToDevice),
                            "save untouched destination recurrent state");
@@ -354,9 +359,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 Tensor output_token =
                     output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
                 ops::gated_delta_net_batch_update(
-                    query, key, value, g_tensor, beta_tensor, kScale, true, local_state_tensor,
-                    selected_reference_slot, selected_reference_slot, output_token,
-                    ninfer::test::cuda_environment().default_execution);
+                    query, key, value, g_tensor, beta_tensor, kScale, true,
+                    dense_record_field(local_state_tensor, 3, selected_reference_slot),
+                    dense_record_field(local_state_tensor, 3, selected_reference_slot),
+                    output_token, ninfer::test::cuda_environment().default_execution);
                 if (token + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.data(), recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr),
@@ -370,16 +376,21 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<ops::GdnReplayFoldRow> fold_rows(static_cast<std::size_t>(rows));
     for (std::int32_t row = 0; row < rows; ++row) {
         fold_rows[static_cast<std::size_t>(row)] = {
-            source_slots[static_cast<std::size_t>(row)],
-            destination_slots[static_cast<std::size_t>(row)],
+            state_offset(source_slots[static_cast<std::size_t>(row)]),
+            state_offset(destination_slots[static_cast<std::size_t>(row)]),
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-    auto device_sources      = to_device(source_slots);
-    auto device_destinations = to_device(destination_slots);
+    std::vector<std::int64_t> source_offsets(rows), destination_offsets(rows);
+    for (int row = 0; row < rows; ++row) {
+        source_offsets[row]      = state_offset(source_slots[row]);
+        destination_offsets[row] = state_offset(destination_slots[row]);
+    }
+    auto device_sources      = to_device(source_offsets);
+    auto device_destinations = to_device(destination_offsets);
     auto device_commits      = to_device(commits);
-    const Tensor source_metadata(device_sources.span(), DType::I32, {rows});
-    const Tensor destination_metadata(device_destinations.span(), DType::I32, {rows});
+    const Tensor source_metadata(device_sources.span(), DType::I64, {rows});
+    const Tensor destination_metadata(device_destinations.span(), DType::I64, {rows});
     const Tensor commit_metadata(device_commits.span(), DType::I32, {rows});
     const auto execute = [&](CudaExecutionView cuda) {
         if (device_rows)
@@ -427,9 +438,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::uint16_t> expected_conv_host(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         for (std::int32_t row = 0; row < rows; ++row) {
-            const Tensor actual_state =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer),
-                                          destination_slots[static_cast<std::size_t>(row)]);
+            const Tensor actual_state = state_pool.recurrent_tensor(
+                static_cast<std::uint32_t>(layer),
+                state_offset(destination_slots[static_cast<std::size_t>(row)]));
             cuda_check(cudaMemcpy(actual_recurrent.data(), actual_state.data, recurrent_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download folded recurrent state");
@@ -446,9 +457,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 return failures + 1;
             }
 
-            const Tensor actual_history =
-                state_pool.conv_slot(static_cast<std::uint32_t>(layer),
-                                     destination_slots[static_cast<std::size_t>(row)]);
+            const Tensor actual_history = state_pool.conv_tensor(
+                static_cast<std::uint32_t>(layer),
+                state_offset(destination_slots[static_cast<std::size_t>(row)]));
             cuda_check(cudaMemcpy(actual_conv.data(), actual_history.data, conv_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download folded conv state");
@@ -466,8 +477,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             if (destination_slots[row] != source_slots[row]) {
                 const auto initial_values =
                     initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
-                const Tensor source_state =
-                    state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), source_slots[row]);
+                const Tensor source_state = state_pool.recurrent_tensor(
+                    static_cast<std::uint32_t>(layer), state_offset(source_slots[row]));
                 const auto source_recurrent =
                     from_device<float>(source_state.data, recurrent_slot_elements);
                 if (std::memcmp(source_recurrent.data(), initial_values.data(),
@@ -486,8 +497,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                          0.05F);
                     }
                 }
-                const Tensor source_history = state_pool.conv_slot(
-                    static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
+                const Tensor source_history = state_pool.conv_tensor(
+                    static_cast<std::uint32_t>(layer),
+                    state_offset(source_slots[static_cast<std::size_t>(row)]));
                 if (from_device<std::uint16_t>(source_history.data, conv_slot_elements) !=
                     initial_conv) {
                     std::cerr << "fold modified convolution source" << suffix << " layer=" << layer
@@ -508,7 +520,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 continue;
             }
             const Tensor recurrent =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), slot);
+                state_pool.recurrent_tensor(static_cast<std::uint32_t>(layer), state_offset(slot));
             cuda_check(cudaMemcpy(inactive_recurrent.data(), recurrent.data, recurrent_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download inactive recurrent state");
@@ -519,7 +531,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           << " slot=" << slot << "\n";
                 return failures + 1;
             }
-            const Tensor conv = state_pool.conv_slot(static_cast<std::uint32_t>(layer), slot);
+            const Tensor conv =
+                state_pool.conv_tensor(static_cast<std::uint32_t>(layer), state_offset(slot));
             cuda_check(cudaMemcpy(inactive_conv.data(), conv.data, conv_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download inactive conv state");
@@ -582,7 +595,6 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
         conv_weight_bits[index] = bf16_pattern(1907U + static_cast<std::uint32_t>(index), 0.02F);
     }
     DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
-    DeviceBuffer device_initial     = to_device(std::vector<std::int32_t>{kInitialSlot});
     DeviceBuffer device_snapshot    = to_device(std::vector<std::int32_t>{kSnapshotBase});
 
     LayoutBuilder record_builder;
@@ -600,7 +612,6 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
     record_storage.fill(0xff);
     GdnReplayRecords records(record_storage.span(), record_layout);
 
-    LayoutBuilder state_backing_builder;
     StateImageBuilder state_builder;
     const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
         state_builder, {.layers         = static_cast<std::uint32_t>(kProfile.layers),
@@ -610,9 +621,12 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
                         .value_head_dim = kStateDim,
                         .key_head_dim   = kStateDim,
                         .conv_dtype     = DType::BF16});
-    const auto image_layout = state_builder.finish(state_backing_builder, kStateSlots);
+    const auto image_layout = state_builder.finish();
+    const auto state_offset = [&](int record) {
+        return static_cast<std::int64_t>((image_layout.image_bytes + 256) * record);
+    };
     DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
-                               state_backing_builder.finish(256));
+                               state_offset(kStateSlots));
     state_storage.fill(0);
     StateImageStorage images(state_storage.span(), image_layout);
     LinearAttentionStateView state_pool(images, state_layout);
@@ -624,8 +638,8 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
     for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
         const float initial_value = signed_pattern(1911U + layer * 47U, 0.01F);
         const std::vector<float> recurrent(recurrent_slot_elements, initial_value);
-        const Tensor recurrent_slot =
-            state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
+        const Tensor recurrent_slot = state_pool.recurrent_tensor(static_cast<std::uint32_t>(layer),
+                                                                  state_offset(kInitialSlot));
         cuda_check(cudaMemcpy(recurrent_slot.data, recurrent.data(), recurrent_slot.bytes(),
                               cudaMemcpyHostToDevice),
                    "upload pair initial recurrent state");
@@ -638,7 +652,7 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
             }
         }
         const Tensor conv_slot =
-            state_pool.conv_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
+            state_pool.conv_tensor(static_cast<std::uint32_t>(layer), state_offset(kInitialSlot));
         cuda_check(
             cudaMemcpy(conv_slot.data, conv.data(), conv_slot.bytes(), cudaMemcpyHostToDevice),
             "upload pair initial conv state");
@@ -664,7 +678,13 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 
     Tensor x(device_x.span(), DType::BF16, {kHidden, kWidth, 1});
     Tensor conv_weight(device_conv_weight.span(), DType::BF16, {kProfile.conv_channels, 4});
-    Tensor initial_selector(device_initial.span(), DType::I32, {1});
+    DeviceBuffer device_initial = to_device(std::vector<std::int64_t>{state_offset(kInitialSlot)});
+    Tensor initial_selector(device_initial.span(), DType::I64, {1});
+    DeviceBuffer conv_snapshots_storage(cuda_environment().context.device(),
+                                        std::size_t(kProfile.conv_channels) * 3 * kWidth *
+                                            kProfile.layers * 2);
+    Tensor conv_snapshots(conv_snapshots_storage.span(), DType::BF16,
+                          {kProfile.conv_channels, 3, kWidth, kProfile.layers});
     Tensor snapshot_selector(device_snapshot.span(), DType::I32, {1});
     Tensor valid;
     Tensor snapshot_query(snapshot_q.span(), DType::BF16, {kQueryRows, kWidth, 1});
@@ -705,10 +725,10 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
         std::max<std::size_t>(256, record_workspace_bytes));
     MemoryArena record_workspace(record_workspace_storage.span());
 
-    std::vector<std::int32_t> source_steps(kWidth), destination_steps(kWidth);
+    std::vector<std::int64_t> source_steps(kWidth), destination_steps(kWidth);
     for (int token = 0; token < kWidth; ++token) {
-        source_steps[token]      = token == 0 ? kInitialSlot : token - 1;
-        destination_steps[token] = token;
+        source_steps[token]      = state_offset(token == 0 ? kInitialSlot : token - 1);
+        destination_steps[token] = state_offset(token);
     }
     DeviceBuffer device_sources      = to_device(source_steps);
     DeviceBuffer device_destinations = to_device(destination_steps);
@@ -727,27 +747,30 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             GdnReplayRecordLayer layer_records = records.layer(layer, 1);
-            Tensor conv_states = state_pool.layer_view(static_cast<std::uint32_t>(layer)).conv;
+            auto conv_states =
+                state_pool.layer_view(static_cast<std::uint32_t>(layer), initial_selector).conv;
+            auto snapshots =
+                conv_snapshots.slice(3, layer, 1).view({kProfile.conv_channels, 3, kWidth});
             if (q8) {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only},
-                    conv_weight, {conv_states, initial_selector, snapshot_selector}, valid,
+                    conv_weight, {conv_states, snapshots, snapshot_selector}, valid,
                     {snapshot_query, snapshot_key, snapshot_value, snapshot_z_tensor},
                     snapshot_workspace, ninfer::test::cuda_environment().default_execution);
                 ops::gdn_input_proj_conv_record(
                     x, ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only},
-                    conv_weight, {conv_states, initial_selector}, valid,
+                    conv_weight, conv_states, valid,
                     {record_query, record_key, record_value, record_z_tensor}, layer_records.conv,
                     record_workspace, ninfer::test::cuda_environment().default_execution);
             } else {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()},
-                    conv_weight, {conv_states, initial_selector, snapshot_selector}, valid,
+                    conv_weight, {conv_states, snapshots, snapshot_selector}, valid,
                     {snapshot_query, snapshot_key, snapshot_value, snapshot_z_tensor},
                     snapshot_workspace, ninfer::test::cuda_environment().default_execution);
                 ops::gdn_input_proj_conv_record(
                     x, ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()},
-                    conv_weight, {conv_states, initial_selector}, valid,
+                    conv_weight, conv_states, valid,
                     {record_query, record_key, record_value, record_z_tensor}, layer_records.conv,
                     record_workspace, ninfer::test::cuda_environment().default_execution);
             }
@@ -759,8 +782,9 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
             Tensor record_q_view = record_query.view({kStateDim, kQkHeads, kWidth, 1});
             Tensor record_k_view = record_key.view({kStateDim, kQkHeads, kWidth, 1});
             Tensor record_v_view = record_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor recurrent_states =
-                state_pool.layer_view(static_cast<std::uint32_t>(layer)).recurrent;
+            auto recurrent_states =
+                state_pool.layer_view(static_cast<std::uint32_t>(layer), initial_selector)
+                    .recurrent;
             // The projection is computed at W once above. Materialize all W recurrent
             // snapshots from those exact q/k/v columns, then select N-1 after folding.
             for (int token = 0; token < kWidth; ++token) {
@@ -769,19 +793,21 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
                 Tensor v_step = snapshot_v_view.slice(2, token, 1);
                 Tensor g_step = g.slice(1, token, 1), beta_step = beta.slice(1, token, 1);
                 Tensor out_step = snapshot_output.slice(2, token, 1);
-                Tensor source(device_sources.span().subspan(std::size_t(token) * 4), DType::I32,
+                Tensor source(device_sources.span().subspan(std::size_t(token) * 8), DType::I64,
                               {1});
-                Tensor destination(device_destinations.span().subspan(std::size_t(token) * 4),
-                                   DType::I32, {1});
+                Tensor destination(device_destinations.span().subspan(std::size_t(token) * 8),
+                                   DType::I64, {1});
+                auto source_state = recurrent_states, destination_state = recurrent_states;
+                source_state.records.byte_offsets      = source;
+                destination_state.records.byte_offsets = destination;
                 ops::gated_delta_net_batch_update(
-                    q_step, k_step, v_step, g_step, beta_step, kScale, true, recurrent_states,
-                    source, destination, out_step,
+                    q_step, k_step, v_step, g_step, beta_step, kScale, true, source_state,
+                    destination_state, out_step,
                     ninfer::test::cuda_environment().default_execution);
             }
             ops::gated_delta_net_replay_record(
                 record_q_view, record_k_view, record_v_view, g, beta, kScale, recurrent_states,
-                valid, initial_selector,
-                {layer_records.key, layer_records.value, layer_records.gate}, record_output,
+                valid, {layer_records.key, layer_records.value, layer_records.gate}, record_output,
                 ninfer::test::cuda_environment().default_execution);
             cuda_synchronize();
 
@@ -810,24 +836,26 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
             if (failures != 0) { return failures; }
         }
 
-        const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, kInitialSlot, commit}};
+        const std::array fold_rows{
+            ops::GdnReplayFoldRow{state_offset(kInitialSlot), state_offset(kInitialSlot), commit}};
         fold_plan.execute(fold_rows, ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            const Tensor folded_recurrent =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-            const Tensor snapshot_recurrent =
-                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), commit - 1);
+            const Tensor folded_recurrent = state_pool.recurrent_tensor(
+                static_cast<std::uint32_t>(layer), state_offset(kInitialSlot));
+            const Tensor snapshot_recurrent = state_pool.recurrent_tensor(
+                static_cast<std::uint32_t>(layer), state_offset(commit - 1));
             if (from_device<std::uint32_t>(folded_recurrent.data, recurrent_slot_elements) !=
                 from_device<std::uint32_t>(snapshot_recurrent.data, recurrent_slot_elements)) {
                 std::cerr << "record-fold recurrent mismatch round=" << round << " layer=" << layer
                           << "\n";
                 return failures + 1;
             }
-            const Tensor folded_conv =
-                state_pool.conv_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
-            const Tensor snapshot_conv =
-                state_pool.conv_slot(static_cast<std::uint32_t>(layer), commit - 1);
+            const Tensor folded_conv   = state_pool.conv_tensor(static_cast<std::uint32_t>(layer),
+                                                                state_offset(kInitialSlot));
+            const Tensor snapshot_conv = conv_snapshots.slice(3, layer, 1)
+                                             .slice(2, commit - 1, 1)
+                                             .view({kProfile.conv_channels, 3});
             if (from_device<std::uint16_t>(folded_conv.data, conv_slot_elements) !=
                 from_device<std::uint16_t>(snapshot_conv.data, conv_slot_elements)) {
                 std::cerr << "record-fold conv mismatch round=" << round << " layer=" << layer

@@ -209,6 +209,5 @@ python3 tools/bench/run_serve_concurrency.py \
   --output profiles/bench/concurrent-corpus
 ```
 
-Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
-pool. A point is intentionally not resumable: combining fragments from separate server processes
-would not preserve either a steady interval or one continuous makespan.
+Use `--context-capacity auto` to resolve the shared KV/State backing from the startup budget.
+Use an explicit byte capacity when comparing cache behavior under a fixed memory allowance.

@@ -22,19 +22,38 @@ Columns<T> columns(const Tensor& t) {
             t.nb[2] / std::int64_t(sizeof(T))};
 }
 
+template <class T>
+struct StateColumns {
+    T* data;
+    const std::int64_t* offsets;
+    std::int64_t column;
+
+    __device__ T* at(int feature, std::int64_t c, int row) const {
+        return data + offsets[row] / std::int64_t(sizeof(T)) + feature + c * column;
+    }
+};
+
+template <class T, class FieldView>
+StateColumns<T> state_columns(const FieldView& view) {
+    return {common::operand::state_field_base<T>(view),
+            static_cast<const std::int64_t*>(view.records.byte_offsets.data),
+            view.field.tensor.shape[0]};
+}
+
 struct TailArguments {
-    Columns<const std::uint16_t> before_raw, record_raw;
-    Columns<std::uint16_t> after_raw;
-    Columns<const std::int32_t> before_rope, record_rope;
-    Columns<std::int32_t> after_rope;
-    const std::int32_t *base, *source, *destination, *accepted;
+    StateColumns<const std::uint16_t> before_raw;
+    Columns<const std::uint16_t> record_raw;
+    StateColumns<std::uint16_t> after_raw;
+    StateColumns<const std::int32_t> before_rope;
+    Columns<const std::int32_t> record_rope;
+    StateColumns<std::int32_t> after_rope;
+    const std::int32_t *base, *accepted;
 };
 
 template <class Word>
 __global__ void tail_extract_kernel(const __grid_constant__ TailArguments args) {
     constexpr int width = sizeof(Word) / 2;
     const int b = blockIdx.x, c = threadIdx.x * width;
-    const int source = args.source[b], destination = args.destination[b];
     const std::int64_t base = args.base[b], frontier = base + args.accepted[b];
     const int length         = frontier % 4;
     const std::int64_t begin = frontier - length;
@@ -44,21 +63,26 @@ __global__ void tail_extract_kernel(const __grid_constant__ TailArguments args) 
     for (int j = 0; j < 3; ++j) {
         if (j < length) {
             // If this block still includes before, its old columns retain their indices.
-            const auto* input = begin + j < base ? args.before_raw.at(c, j, source)
+            const auto* input = begin + j < base ? args.before_raw.at(c, j, b)
                                                  : args.record_raw.at(c, begin + j - base, b);
             values[j]         = *reinterpret_cast<const Word*>(input);
         }
     }
     std::int32_t coordinate = 0;
     if (threadIdx.x < 3 && length != 0) {
-        coordinate = begin < base ? *args.before_rope.at(threadIdx.x, source)
+        coordinate = begin < base ? *args.before_rope.at(threadIdx.x, 0, b)
                                   : *args.record_rope.at(threadIdx.x, begin - base, b);
     }
     // Prepare all source words before writing, including exact in-place state updates.
 #pragma unroll
-    for (int j = 0; j < 3; ++j)
-        *reinterpret_cast<Word*>(args.after_raw.at(c, j, destination)) = values[j];
-    if (threadIdx.x < 3) *args.after_rope.at(threadIdx.x, destination) = coordinate;
+    for (int j = 0; j < 3; ++j) *reinterpret_cast<Word*>(args.after_raw.at(c, j, b)) = values[j];
+    if (threadIdx.x < 3) *args.after_rope.at(threadIdx.x, 0, b) = coordinate;
+}
+
+bool pair_aligned(const ConstStateFieldView& view) {
+    const auto* base = common::operand::state_field_base<const std::byte>(view);
+    return view.field.tensor.region.alignment >= 4 &&
+           reinterpret_cast<std::uintptr_t>(base) % 4 == 0;
 }
 
 bool pair_aligned(const Tensor& t) {
@@ -68,18 +92,16 @@ bool pair_aligned(const Tensor& t) {
     return true;
 }
 
-void launch_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+void launch_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                          const Tensor& accepted, QsaTailStateView after,
                          CudaExecutionView execution) {
-    const TailArguments args{columns<const std::uint16_t>(before.raw_keys),
+    const TailArguments args{state_columns<const std::uint16_t>(before.raw_keys),
                              columns<const std::uint16_t>(records.raw_keys),
-                             columns<std::uint16_t>(after.raw_keys),
-                             columns<const std::int32_t>(before.first_rope),
+                             state_columns<std::uint16_t>(after.raw_keys),
+                             state_columns<const std::int32_t>(before.first_rope),
                              columns<const std::int32_t>(records.rope_positions),
-                             columns<std::int32_t>(after.first_rope),
+                             state_columns<std::int32_t>(after.first_rope),
                              static_cast<const std::int32_t*>(records.base_positions.data),
-                             static_cast<const std::int32_t*>(before.slots.data),
-                             static_cast<const std::int32_t*>(after.slots.data),
                              static_cast<const std::int32_t*>(accepted.data)};
     if (pair_aligned(before.raw_keys) && pair_aligned(records.raw_keys) &&
         pair_aligned(after.raw_keys))
@@ -91,7 +113,7 @@ void launch_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadV
 
 } // namespace
 
-void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& accepted, QsaTailStateView after, CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_tail_extract", execution.device()};
     const int batch = accepted.ne[0], capacity = records.raw_keys.ne[1];
@@ -103,7 +125,7 @@ void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView
     v.state(after, batch);
     v.columns(records.raw_keys, DType::BF16, 128, capacity, batch, "record raw keys");
     v.columns(records.rope_positions, DType::I32, 3, capacity, batch, "record coordinates");
-    // Only Device-selected slots are accessed. Overlapping pool bounds do not imply that
+    // Only Device-selected records are accessed. Overlapping pool bounds do not imply that
     // selected regions overlap; the caller guarantees their cross-row/plane relationships.
     launch_tail_extract(before, records, accepted, after, execution);
 }

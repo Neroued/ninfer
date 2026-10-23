@@ -22,8 +22,8 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
             std::cerr << "[rank " << rank << "] " << message << '\n';
         });
     std::optional<typename Types::PreparedSession> session;
-    auto prepared = prepare_execution_group(*group, setup.requests(options), options.kv_capacity,
-                                            options.context_cache, std::chrono::minutes(30),
+    auto prepared = prepare_execution_group(*group, setup.requests(options),
+                                            options.context_capacity, std::chrono::minutes(30),
                                             {[&](auto descriptions) {
                                                  setup.resolve(descriptions, options);
                                                  session.emplace(setup.session());
@@ -37,15 +37,15 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
                                                   std::move(codec), setup.observations());
     executor->bind_to_current_thread();
     StartupMemorySummary memory;
-    memory.rank_budgets          = setup.memory_budgets();
-    auto& capacity               = memory.context_capacity;
-    capacity.mode                = options.kv_capacity.mode;
-    capacity.device_state_slots  = prepared.capacity.device_state_slots;
-    capacity.primary_page_groups = prepared.capacity.primary_page_groups;
-    capacity.resolved_tokens     = prepared.reports.front().capacity.curve.resolved_tokens(
-        prepared.capacity.primary_page_groups);
-    capacity.maximum_primary_page_groups =
-        prepared.reports.front().capacity.curve.maximum_primary_page_groups;
+    memory.rank_budgets       = setup.memory_budgets();
+    memory.context_capacities = prepared.capacities;
+    for (std::size_t rank = 0; rank < memory.context_capacities.size(); ++rank) {
+        auto& capacity                         = memory.context_capacities[rank];
+        const auto& budget                     = memory.rank_budgets.at(rank);
+        capacity.available_after_weights_bytes = prepared.reports.at(rank).free_after_weights_bytes;
+        capacity.available_after_startup_bytes = budget.available_after_startup_bytes;
+        capacity.automatic_headroom_bytes      = budget.headroom_bytes;
+    }
     LoadSummary load;
     load.architecture        = models::architecture_name(setup.architecture());
     load.model_name          = setup.definition()->info().name;
@@ -60,14 +60,6 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
         load.max_rank_staging_bytes = std::max(load.max_rank_staging_bytes, report.staging_bytes);
         load.device_object_count += report.device_objects;
         load.host_object_count += report.host_objects;
-        capacity.minimum_runtime_reservation_bytes +=
-            report.capacity.curve.minimum_device_reservation_bytes;
-        capacity.bytes_per_additional_primary_page_group +=
-            report.capacity.curve.bytes_per_additional_primary_page_group;
-        capacity.available_after_weights_bytes += report.free_after_weights_bytes;
-        capacity.maximum_primary_page_groups =
-            std::min(capacity.maximum_primary_page_groups,
-                     report.capacity.curve.maximum_primary_page_groups);
         if (!hardware.empty()) hardware += "+";
         hardware += report.hardware_class;
     }

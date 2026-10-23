@@ -9,7 +9,7 @@ using Kind = detail::ComputeTransaction::Kind;
 void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
     auto& tx = *session.compute;
     tx.context.prepare_actions();
-    work.actions = tx.context.actions();
+    work.actions = session.actions(tx.context);
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
     tx.context.mark_submitted();
 }

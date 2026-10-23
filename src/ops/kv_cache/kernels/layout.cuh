@@ -23,17 +23,17 @@ struct D256Geometry {
 };
 
 struct DirectMetadata {
-    const std::int32_t* table;
+    const std::int64_t* table;
 
     __device__ __forceinline__ int valid_tokens(int width) const { return width; }
 
-    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+    __device__ __forceinline__ const std::int64_t* block_table() const { return table; }
 };
 
 template <bool Masked>
 struct BatchMetadata {
     static constexpr bool masked = Masked;
-    const std::int32_t* tables;
+    const std::int64_t* tables;
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
@@ -46,46 +46,31 @@ struct BatchMetadata {
         return width;
     }
 
-    __device__ __forceinline__ const std::int32_t* block_table() const {
+    __device__ __forceinline__ const std::int64_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 
-__device__ __forceinline__ int lookup_page(const std::int32_t* table, int position) {
+__device__ __forceinline__ std::int64_t lookup_page(const std::int64_t* table, int position) {
     return table[position >> kPageShift];
 }
 
-// [leading, page offset, head, physical page].
-template <int Leading, int Heads>
-__device__ __forceinline__ std::int64_t page_major_head_offset(int page, int head) {
-    return static_cast<std::int64_t>(Leading) * kPagedKVPageSize *
-           (head + static_cast<std::int64_t>(Heads) * page);
+// The table stores record byte offsets; each plane base already includes its record-local offset.
+template <int Leading, int ElementBytes>
+__device__ __forceinline__ std::int64_t record_offset(std::int64_t record, int head, int row,
+                                                      int component) {
+    return record / ElementBytes +
+           static_cast<std::int64_t>(Leading) * (kPagedKVPageSize * head + row) + component;
 }
 
-template <int Leading, int Heads>
-__device__ __forceinline__ std::int64_t page_major_offset(int page, int head, int offset,
-                                                          int component) {
-    return page_major_head_offset<Leading, Heads>(page, head) +
-           static_cast<std::int64_t>(Leading) * offset + component;
+template <int Leading, int ElementBytes>
+__device__ __forceinline__ std::int64_t record_offset(const std::int64_t* table, int head,
+                                                      int position, int component) {
+    return record_offset<Leading, ElementBytes>(lookup_page(table, position), head,
+                                                position & kPageMask, component);
 }
 
-template <int Leading, int Heads>
-__device__ __forceinline__ std::int64_t page_major_offset(const std::int32_t* table, int head,
-                                                          int position, int component) {
-    return page_major_offset<Leading, Heads>(lookup_page(table, position), head,
-                                             position & kPageMask, component);
-}
-
-// [leading, page offset, physical page, head].
-template <int Leading>
-__device__ __forceinline__ std::int64_t head_major_offset(int page, int head, int offset,
-                                                          int component, int physical_pages) {
-    return component + static_cast<std::int64_t>(Leading) *
-                           (offset + kPagedKVPageSize *
-                                         (page + static_cast<std::int64_t>(physical_pages) * head));
-}
-
-// One slot: [feature, ring position, head]. The caller applies the explicit state-slot stride.
+// One State field: [feature, ring position, head]. The caller applies its record byte offset.
 template <int Dim, int Capacity>
 __device__ __forceinline__ std::int64_t cyclic_offset(int position, int head, int padded_capacity,
                                                       int component = 0) {
@@ -101,29 +86,27 @@ __device__ __forceinline__ std::int64_t source_offset(int head, int component, i
                            (head + static_cast<std::int64_t>(Geometry::KVHeads) * token);
 }
 
-template <int Heads, int CodeExtent, int ScaleExtent, int ValuesPerCode = 1>
+template <int CodeExtent, int ScaleExtent, int ValuesPerCode = 1, int ScaleBytes = 2>
 struct QuantizedRowLayout {
-    __device__ static __forceinline__ std::int64_t code_offset(int page, int head, int component,
-                                                               int offset) {
-        return page_major_offset<CodeExtent, Heads>(page, head, offset, component / ValuesPerCode);
+    __device__ static __forceinline__ std::int64_t code_offset(std::int64_t record, int head,
+                                                               int component, int offset) {
+        return record_offset<CodeExtent, 1>(record, head, offset, component / ValuesPerCode);
     }
 
-    __device__ static __forceinline__ std::int64_t scale_offset(int page, int head, int group,
+    __device__ static __forceinline__ std::int64_t scale_offset(std::int64_t record, int head,
+                                                                int group, int offset) {
+        return record_offset<ScaleExtent, ScaleBytes>(record, head, offset, group);
+    }
+
+    __device__ static __forceinline__ std::int64_t scale_offset(std::int64_t record, int head,
                                                                 int offset) {
-        return page_major_offset<ScaleExtent, Heads>(page, head, offset, group);
-    }
-
-    __device__ static __forceinline__ std::int64_t scale_offset(int page, int head, int offset) {
         static_assert(ScaleExtent == 1);
-        return scale_offset(page, head, 0, offset);
+        return scale_offset(record, head, 0, offset);
     }
 };
 
-template <int Heads>
-using Int8G64Layout = QuantizedRowLayout<Heads, 256, 4>;
-template <int Heads>
-using Fp8RowLayout = QuantizedRowLayout<Heads, 256, 1>;
-template <int Heads>
-using Nvfp4G16Layout = QuantizedRowLayout<Heads, 128, 16, 2>;
+using Int8G64Layout  = QuantizedRowLayout<256, 4>;
+using Fp8RowLayout   = QuantizedRowLayout<256, 1>;
+using Nvfp4G16Layout = QuantizedRowLayout<128, 16, 2, 1>;
 
 } // namespace ninfer::ops::detail::kv

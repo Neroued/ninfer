@@ -45,13 +45,20 @@ struct Fixture {
           capacity(workspace_capacity()), arena_storage(make_buffer(256 + capacity)),
           arena(arena_storage.span()) {
         (void)arena.alloc_bytes(256);
-        std::vector<int> sources(o.batch), bases(o.batch);
+        std::vector<std::int64_t> sources(o.batch), destinations(o.batch);
+        std::vector<int> bases(o.batch);
         for (int b = 0; b < o.batch; ++b) {
-            sources[b] = columns + b;
-            bases[b]   = b * t;
+            sources[b]      = (columns + b) * 6LL * channels;
+            bases[b]        = b * t;
+            destinations[b] = 6LL * channels * bases[b];
         }
-        source = measurement::make_i32(sources);
-        base   = measurement::make_i32(bases);
+        source = make_buffer(sources.size() * sizeof(std::int64_t));
+        CUDA_CHECK(
+            cudaMemcpy(source.data(), sources.data(), source.size(), cudaMemcpyHostToDevice));
+        destination = make_buffer(destinations.size() * sizeof(std::int64_t));
+        CUDA_CHECK(cudaMemcpy(destination.data(), destinations.data(), destination.size(),
+                              cudaMemcpyHostToDevice));
+        base = measurement::make_i32(bases);
         if (!o.valid.empty()) valid = measurement::make_i32(o.valid);
     }
 
@@ -72,19 +79,29 @@ struct Fixture {
         Tensor input(x.span(), DType::BF16, {options.k, tokens, b}),
             weight(conv.span(), DType::BF16, {channels, 4});
         Tensor state(history.span(), DType::BF16, {channels, 3, slots}),
-            src(source.span(), DType::I32, {b}), dst(base.span(), DType::I32, {b});
+            src(source.span(), DType::I64, {b}), dst(base.span(), DType::I32, {b});
+        const StateFieldView source_view{
+            {history.span(), src},
+            {{{0, std::size_t(channels) * 6, 16}, DType::BF16, {channels, 3, 1, 1}}, 1, 0}};
         Tensor mask;
         if (valid.data()) mask = Tensor(valid.span(), DType::I32, {b});
         ops::GdnConvOutputs out{Tensor(q.span(), DType::BF16, {query_rows, tokens, b}),
                                 Tensor(k.span(), DType::BF16, {query_rows, tokens, b}),
                                 Tensor(v.span(), DType::BF16, {value_rows, tokens, b}),
                                 Tensor(z.span(), DType::BF16, {value_rows, tokens, b})};
-        if (options.op == "snapshot")
-            ops::gdn_input_proj_conv_snapshot(input, weights, weight, {state, src, dst}, mask, out,
-                                              arena, cuda);
-        else {
+        if (options.op == "snapshot") {
+            if (tokens == 1) {
+                auto target                 = source_view;
+                target.records.byte_offsets = Tensor(destination.span(), DType::I64, {b});
+                ops::gdn_input_proj_conv_update(input, weights, weight, source_view, target, mask,
+                                                out, arena, cuda);
+            } else {
+                ops::gdn_input_proj_conv_snapshot(input, weights, weight, {source_view, state, dst},
+                                                  mask, out, arena, cuda);
+            }
+        } else {
             Tensor record(records.span(), DType::BF16, {channels, tokens, b});
-            ops::gdn_input_proj_conv_record(input, weights, weight, {state, src}, mask, out, record,
+            ops::gdn_input_proj_conv_record(input, weights, weight, source_view, mask, out, record,
                                             arena, cuda);
         }
     }
@@ -102,6 +119,7 @@ struct Fixture {
     DeviceBuffer v;
     DeviceBuffer records;
     DeviceBuffer source;
+    DeviceBuffer destination;
     DeviceBuffer base;
     DeviceBuffer valid;
     std::size_t capacity;

@@ -179,22 +179,20 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2) recurrent_bat
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ g,
     const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
     const float* __restrict__ dt_bias, float* __restrict__ states,
-    const std::int32_t* __restrict__ state_slots, __nv_bfloat16* __restrict__ out,
-    std::int32_t qk_heads, std::int32_t heads, std::int64_t state_slot_stride, float lower_bound,
-    float scale) {
+    const std::int64_t* __restrict__ state_offsets, __nv_bfloat16* __restrict__ out,
+    std::int32_t qk_heads, std::int32_t heads, float lower_bound, float scale) {
     __shared__ GateStage gate_stage;
 
-    const int lane       = threadIdx.x;
-    const int warp       = threadIdx.y;
-    const int thread     = warp * common::kWarpSize + lane;
-    const int head       = static_cast<int>(blockIdx.x);
-    const int batch      = static_cast<int>(blockIdx.y);
-    const int state_tile = static_cast<int>(blockIdx.z);
-    const int dv_base    = state_tile * kBlockDv + warp * kDvPerWarp;
-    const int dqk_base   = lane * kQkPerLane;
-    const std::int64_t state_offset =
-        static_cast<std::int64_t>(state_slots[batch]) * state_slot_stride +
-        static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+    const int lane                  = threadIdx.x;
+    const int warp                  = threadIdx.y;
+    const int thread                = warp * common::kWarpSize + lane;
+    const int head                  = static_cast<int>(blockIdx.x);
+    const int batch                 = static_cast<int>(blockIdx.y);
+    const int state_tile            = static_cast<int>(blockIdx.z);
+    const int dv_base               = state_tile * kBlockDv + warp * kDvPerWarp;
+    const int dqk_base              = lane * kQkPerLane;
+    const std::int64_t state_offset = state_offsets[batch] / sizeof(float) +
+                                      static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const std::int64_t vector_offset =
         (static_cast<std::int64_t>(batch) * heads + head) * kStateDim;
 

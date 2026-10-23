@@ -18,10 +18,10 @@ enum class Binding { Separate, InPlace, ShiftedInPlace, SamePool, RawInPlace };
 int run(DeviceContext& device, int batch, int layout, Binding binding, int capacity,
         bool exhaustive = true) {
     const int slots = 2 * batch + 3;
-    Plane<std::uint16_t> before(128, 3, slots, layout), after(128, 3, batch + 2, layout),
-        records(128, capacity, batch, layout);
-    Plane<std::int32_t> first(3, slots, 1, layout),
-        last(3, binding == Binding::RawInPlace ? slots : batch + 2, 1, layout),
+    Plane<std::uint16_t> before(128, 3, slots, layout, true),
+        after(128, 3, batch + 2, layout, true), records(128, capacity, batch, layout);
+    Plane<std::int32_t> first(3, slots, 1, layout, true, true),
+        last(3, binding == Binding::RawInPlace ? slots : batch + 2, 1, layout, true, true),
         positions(3, capacity, batch, layout);
     const bool raw_alias  = binding != Binding::Separate;
     const bool rope_alias = raw_alias && binding != Binding::RawInPlace;
@@ -31,15 +31,22 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         raw_out  = raw_out.slice(2, 1, slots - 1);
         rope_out = rope_out.slice(1, 1, slots - 1);
     }
-    DeviceBuffer source(ninfer::test::cuda_environment().context.device(), batch * 4);
-    DeviceBuffer destination(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer source(ninfer::test::cuda_environment().context.device(), batch * 8);
+    DeviceBuffer source_rope(ninfer::test::cuda_environment().context.device(), batch * 8);
+    DeviceBuffer destination(ninfer::test::cuda_environment().context.device(), batch * 8);
+    DeviceBuffer destination_rope(ninfer::test::cuda_environment().context.device(), batch * 8);
     DeviceBuffer base(ninfer::test::cuda_environment().context.device(), batch * 4);
     DeviceBuffer valid(ninfer::test::cuda_environment().context.device(), batch * 4);
     DeviceBuffer accepted(ninfer::test::cuda_environment().context.device(), batch * 4);
-    const ops::QsaTailStateView input{before.view, first.view,
-                                      Tensor(source.span(), DType::I32, {batch})};
-    const ops::QsaTailStateView output{raw_out, rope_out,
-                                       Tensor(destination.span(), DType::I32, {batch})};
+    const ops::QsaTailStateView input{
+        state_field(before.view, before.device->span(), Tensor(source.span(), DType::I64, {batch})),
+        state_field(first.view, first.device->span(),
+                    Tensor(source_rope.span(), DType::I64, {batch}), true)};
+    const ops::QsaTailStateView output{
+        state_field(raw_out, raw_alias ? before.device->span() : after.device->span(),
+                    Tensor(destination.span(), DType::I64, {batch})),
+        state_field(rope_out, rope_alias ? first.device->span() : last.device->span(),
+                    Tensor(destination_rope.span(), DType::I64, {batch}), true)};
     const ops::QsaRawRecordReadView read{records.view, positions.view,
                                          Tensor(base.span(), DType::I32, {batch}),
                                          Tensor(valid.span(), DType::I32, {batch})};
@@ -103,8 +110,14 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         last.upload();
         records.upload();
         positions.upload();
-        source.copy_from_host(sources.data(), batch * 4);
-        destination.copy_from_host(destinations.data(), batch * 4);
+        const auto source_offsets           = state_offsets(before.view, sources);
+        const auto source_rope_offsets      = state_offsets(first.view, sources, true);
+        const auto destination_offsets      = state_offsets(raw_out, destinations);
+        const auto destination_rope_offsets = state_offsets(rope_out, destinations, true);
+        source.copy_from_host(source_offsets.data(), batch * 8);
+        source_rope.copy_from_host(source_rope_offsets.data(), batch * 8);
+        destination.copy_from_host(destination_offsets.data(), batch * 8);
+        destination_rope.copy_from_host(destination_rope_offsets.data(), batch * 8);
         base.copy_from_host(bases.data(), batch * 4);
         valid.copy_from_host(available.data(), batch * 4);
         accepted.copy_from_host(counts.data(), batch * 4);
@@ -130,9 +143,17 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         failures += last.check(label + " after rope", rope_alias ? last.host : expected_rope);
         failures += records.check(label + " records", records.host) +
                     positions.check(label + " positions", positions.host);
-        failures += verify_exact("source metadata", from_device<int>(source, batch), sources);
-        failures += verify_exact("destination metadata", from_device<int>(destination, batch),
-                                 destinations);
+        failures += verify_exact("source metadata", from_device<std::int64_t>(source, batch),
+                                 source_offsets);
+        failures +=
+            verify_exact("destination metadata", from_device<std::int64_t>(destination, batch),
+                         destination_offsets);
+        failures +=
+            verify_exact("source rope metadata", from_device<std::int64_t>(source_rope, batch),
+                         source_rope_offsets);
+        failures += verify_exact("destination rope metadata",
+                                 from_device<std::int64_t>(destination_rope, batch),
+                                 destination_rope_offsets);
         failures += verify_exact("base metadata", from_device<int>(base, batch), bases);
         failures += verify_exact("valid metadata", from_device<int>(valid, batch), available);
         failures += verify_exact("accepted metadata", from_device<int>(accepted, batch), counts);
@@ -173,17 +194,22 @@ int read_footprint(DeviceContext& device) {
                                   positions.host.data() + positions.index(0, start - f0), 12,
                                   cudaMemcpyHostToDevice),
                        "coordinate upload");
-        auto zero = to_device_i32({0}), base = to_device_i32({f0}),
-             valid = to_device_i32({capacity}), accepted = to_device_i32({a});
+        auto zero = to_device(std::vector<std::int64_t>{0});
+        auto base = to_device_i32({f0}), valid = to_device_i32({capacity}),
+             accepted = to_device_i32({a});
         cuda_synchronize();
         ops::qsa_tail_extract(
-            {before.view, first.view, Tensor(zero.span(), DType::I32, {1})},
+            {state_field(before.view, before.device->span(), Tensor(zero.span(), DType::I64, {1})),
+             state_field(first.view, first.device->span(), Tensor(zero.span(), DType::I64, {1}),
+                         true)},
             {Tensor(raw.span(), DType::BF16, {128, capacity, 1}),
              Tensor(rope.span(), DType::I32, {3, capacity, 1}),
              Tensor(base.span(), DType::I32, {1}), Tensor(valid.span(), DType::I32, {1})},
             Tensor(accepted.span(), DType::I32, {1}),
-            {Tensor(out.span(), DType::BF16, {128, 3, 1}),
-             Tensor(out_rope.span(), DType::I32, {3, 1}), Tensor(zero.span(), DType::I32, {1})},
+            {state_field(Tensor(out.span(), DType::BF16, {128, 3, 1}), out.span(),
+                         Tensor(zero.span(), DType::I64, {1})),
+             state_field(Tensor(out_rope.span(), DType::I32, {3, 1}), out_rope.span(),
+                         Tensor(zero.span(), DType::I64, {1}), true)},
             device.execution_view());
         device.synchronize();
         const auto expected = reference(before, first, records, positions, 0, 0, f0, a);
@@ -213,7 +239,10 @@ int validation(DeviceContext& device) {
     Plane<std::int32_t> rope(3, 3, 1, 0), positions(3, 5, 2, 0);
     DeviceBuffer metadata(ninfer::test::cuda_environment().context.device(), 8);
     const Tensor m(metadata.span(), DType::I32, {2});
-    const ops::QsaTailStateView state{raw.view, rope.view, m};
+    DeviceBuffer selected(ninfer::test::cuda_environment().context.device(), 16);
+    const Tensor offsets(selected.span(), DType::I64, {2});
+    const ops::QsaTailStateView state{state_field(raw.view, raw.device->span(), offsets),
+                                      state_field(rope.view, rope.device->span(), offsets, true)};
     const ops::QsaRawRecordReadView read{records.view, positions.view, m, m};
     int failures             = 0;
     const auto invalid_state = [&](const char* name, auto change) {
@@ -222,20 +251,18 @@ int validation(DeviceContext& device) {
         failures += rejects(
             name, [&] { ops::qsa_tail_extract(s, read, m, state, device.execution_view()); });
     };
-    invalid_state("wrong raw dtype", [](auto& s) { s.raw_keys.dtype = DType::FP16; });
-    invalid_state("wrong tail length", [](auto& s) { s.raw_keys.ne[1] = 4; });
-    invalid_state("state plane capacity mismatch", [](auto& s) { s.first_rope.ne[1] = 2; });
-    invalid_state("empty state pool", [](auto& s) { s.raw_keys.ne[2] = 0; });
-    invalid_state("noncontiguous features", [](auto& s) { s.raw_keys.nb[0] = 4; });
-    invalid_state("overlapping columns", [](auto& s) { s.raw_keys.nb[1] = 128; });
-    invalid_state("overlapping outer axes", [](auto& s) { s.raw_keys.nb[2] = s.raw_keys.nb[1]; });
-    invalid_state("negative stride", [](auto& s) { s.raw_keys.nb[2] = -768; });
-    invalid_state("address overflow",
-                  [](auto& s) { s.raw_keys.nb[2] = std::numeric_limits<std::int64_t>::max() - 1; });
-    invalid_state("unaligned coordinates", [](auto& s) {
-        s.first_rope.data = static_cast<std::byte*>(s.first_rope.data) + 2;
+    invalid_state("wrong raw dtype", [](auto& s) { s.raw_keys.field.tensor.dtype = DType::FP16; });
+    invalid_state("wrong tail length", [](auto& s) { s.raw_keys.field.tensor.shape[1] = 4; });
+    invalid_state("wrong coordinate shape",
+                  [](auto& s) { s.first_rope.field.tensor.shape[0] = 2; });
+    invalid_state("empty state arena", [](auto& s) { s.raw_keys.records.storage.bytes = 0; });
+    invalid_state("truncated field", [](auto& s) { s.raw_keys.field.tensor.region.bytes = 128; });
+    invalid_state("address overflow", [](auto& s) {
+        s.raw_keys.field.tensor.region.offset = std::numeric_limits<std::size_t>::max();
     });
-    invalid_state("strided metadata", [](auto& s) { s.slots.nb[0] = 8; });
+    invalid_state("unaligned coordinates",
+                  [](auto& s) { s.first_rope.field.tensor.region.offset += 2; });
+    invalid_state("strided metadata", [](auto& s) { s.raw_keys.records.byte_offsets.nb[0] = 16; });
     auto bad                 = read;
     bad.rope_positions.ne[1] = 4;
     failures += rejects("record capacity mismatch", [&] {
@@ -255,7 +282,8 @@ int validation(DeviceContext& device) {
     failures += rejects("empty batch", [&] {
         ops::qsa_tail_extract(state, read, count, state, device.execution_view());
     });
-    invalid_state("invalid state device", [](auto& s) { s.slots.device = Device::cpu(); });
+    invalid_state("invalid state device",
+                  [](auto& s) { s.raw_keys.records.byte_offsets.device = Device::cpu(); });
     return failures;
 }
 

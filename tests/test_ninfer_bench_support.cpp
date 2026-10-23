@@ -57,23 +57,16 @@ void options_test() {
     const auto capacity = parse(
         {"bench", "model.ninfer", "--prompt", "x", "--concurrency", "4", "--max-concurrency", "2"});
     expect(capacity.launch.engine.max_concurrency == 2, "explicit engine capacity preserved");
-    expect(capacity.launch.engine.context_cache.enabled &&
-               !capacity.launch.engine.context_cache.extra_state_slots,
-           "decode defaults to native prefix reuse and extra state capacity");
+    expect(capacity.launch.engine.context_cache.enabled, "decode defaults to native prefix reuse");
     const auto prefill = parse({"bench", "model.ninfer", "--prompt", "x", "--max-tokens", "1"});
-    expect(!prefill.launch.engine.context_cache.enabled &&
-               prefill.launch.engine.context_cache.extra_state_slots == 0,
+    expect(!prefill.launch.engine.context_cache.enabled,
            "prefill-only retains its uncached defaults");
-    const auto configured = parse({"bench", "model.ninfer", "--prompt", "x", "--no-prefix-reuse",
-                                   "--extra-state-slots", "0"});
-    expect(!configured.launch.engine.context_cache.enabled &&
-               configured.launch.engine.context_cache.extra_state_slots == 0,
+    const auto configured = parse({"bench", "model.ninfer", "--prompt", "x", "--no-prefix-reuse"});
+    expect(!configured.launch.engine.context_cache.enabled,
            "explicit cache settings are preserved");
-    const auto defaults = parse({"bench", "model.ninfer", "--prompt", "x", "--prefix-reuse=default",
-                                 "--extra-state-slots", "default"});
-    expect(defaults.launch.engine.context_cache.enabled &&
-               !defaults.launch.engine.context_cache.extra_state_slots,
-           "explicit default uses decode defaults");
+    const auto defaults =
+        parse({"bench", "model.ninfer", "--prompt", "x", "--prefix-reuse=default"});
+    expect(defaults.launch.engine.context_cache.enabled, "explicit default uses decode defaults");
     expect(bench::usage_text("bench").find("--kv-dtype") != std::string::npos, "shared help");
     rejects({"bench", "model.ninfer"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--prompt", "b", "--concurrency", "3"});

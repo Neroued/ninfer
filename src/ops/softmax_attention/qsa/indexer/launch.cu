@@ -2,19 +2,18 @@
 #include "ops/common/host/operands.h"
 
 namespace ninfer::ops::detail::qsa {
-void launch_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaBatchView& batch,
-                    IndexerPlan plan, const IndexerWorkspace& scratch, QsaBlockSelection& out,
-                    CudaExecutionView execution) {
+void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                    const QsaBatchView& batch, IndexerPlan plan, const IndexerWorkspace& scratch,
+                    QsaBlockSelection& out, CudaExecutionView execution) {
     const auto i32 = [](const Tensor& t) { return static_cast<const std::int32_t*>(t.data); };
     IndexerArguments a{static_cast<const __nv_bfloat16*>(query.data),
-                       static_cast<const __nv_bfloat16*>(cache.keys.data),
+                       static_cast<const __nv_bfloat16*>(cache.keys.data()),
                        i32(batch.positions),
                        i32(batch.valid_columns),
                        i32(batch.table_rows),
-                       i32(cache.block_tables),
-                       cache.keys.nb[1] / 2,
-                       cache.keys.nb[3] / 2,
-                       cache.block_tables.nb[1] / 4,
+                       static_cast<const std::int64_t*>(cache.keys.records.page_offsets.data),
+                       std::int64_t(cache.keys.row_stride_bytes() / 2),
+                       cache.keys.records.page_offsets.nb[1] / 8,
                        static_cast<float*>(scratch.scores.data),
                        static_cast<std::uint64_t*>(scratch.candidates.data),
                        static_cast<std::int32_t*>(out.block_ids.data),
@@ -25,8 +24,9 @@ void launch_indexer(const Tensor& query, const QsaIndexCacheView& cache, const Q
                        plan.window_tokens,
                        plan.columns,
                        plan.partitions};
-    const bool vector_cache = common::operand::aligned(cache.keys.data, 16) &&
-                              cache.keys.nb[1] % 16 == 0 && cache.keys.nb[3] % 16 == 0;
+    const bool vector_cache = common::operand::aligned(cache.keys.data(), 16) &&
+                              cache.keys.row_stride_bytes() % 16 == 0 &&
+                              cache.keys.plane.tensor.region.alignment % 16 == 0;
     for (std::int64_t begin = 0; begin < a.tokens; begin += plan.window_tokens) {
         a.begin = int(begin);
         a.width = std::min(plan.window_tokens, a.tokens - a.begin);

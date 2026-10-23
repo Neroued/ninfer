@@ -204,6 +204,14 @@ inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
     return 1;
 }
 
+inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
+                            std::span<const std::int64_t> before) {
+    const auto after = from_device<std::int64_t>(device, before.size());
+    if (std::equal(after.begin(), after.end(), before.begin(), before.end())) { return 0; }
+    std::cerr << label << ": I64 input was modified\n";
+    return 1;
+}
+
 inline std::vector<std::uint16_t> bf16_bits(std::span<const float> values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t index = 0; index < values.size(); ++index) {

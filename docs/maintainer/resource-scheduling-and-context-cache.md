@@ -6,7 +6,8 @@
 
 ## 1. 核心思路
 
-当前产品通过 LocalExecutor 在一个 rank、一张 GPU、单常驻模型及启动固定的 1–8 个 resident lanes 上运行。Hybrid 模型复用一个前缀，需要
+Engine 集中产生调度计划，通过 LocalExecutor 或 DistributedExecutor 驱动各 rank，
+启动固定 1–8 个 resident lanes。Hybrid 模型复用一个前缀，需要
 该位置的完整 recurrent state 和连续 KV 覆盖。KV 可以逐页共享，recurrent state 则是某个位置
 的完整恢复镜像。因此，缓存管理同时使用三个单位：
 
@@ -19,7 +20,7 @@
 请求的已提交历史与输出语义跨暂停保存，设备绑定可以重建。
 
 缓存重点服务多轮对话、agent 工具往返、输入重试和共享前缀。保存机会来自输入语义与请求生命周期；
-prefill chunk 仅切分调度工作，不自动保存 state。真实采用和重复计算的需求证据决定热度；
+prefill chunk 切分调度工作；稀疏中间保存由 checkpoint policy 提出。真实采用和重复计算的需求证据决定热度；
 回收在 Native 给出的有限物理动作中，比较实际恢复损失与当前稀缺资源。
 
 <a id="ownership"></a>
@@ -63,56 +64,40 @@ reader lease 保护实际读取的副本直至计算或传输完成；保留等�
 
 ### 3.1 启动容量
 
-Device 按模型的实际布局准备 Main KV、所选 backend KV、StateImage、workspace 和 Graph 空间。
-Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和存储格式决定。
-
-| 配置 | 当前含义 |
+| 配置 | 含义 |
 |---|---|
-| `max_context` | 一个请求的逻辑上下文上限 |
-| `kv_capacity` | Main KV 物理池的 token 等价容量，按页舍入；也可由启动显存预算自动求解 |
+| `max_context` | 单请求逻辑上下文上限 |
+| `context_capacity` | 每 rank Device Context 的总字节容量；`auto` 按启动预算求解 |
 | `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
-| `context_cache.extra_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
-| `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+| `context_cache.host_capacity_bytes` | Host State、KV、暂停快照和在途目的共用的 pinned 字节容量 |
 
-Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
-`C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时
-计算所选后端、state、workspace 和 MoE backing 的布局；Graph 重建开销在权重加载后校准，
-按[启动生命周期](engine-architecture.md#25-实例生命周期与固定执行)从剩余显存中单独扣除。
-显式或自动容量都要落在这条曲线内并满足预算。容量并不平均切给每个 lane。
+State 与各 history 的记录共用 Context backing，容量不预先按用途切分。模型声明记录布局与
+必要工作集，包括单请求最大上下文、并发最小执行、speculative 峰值、恢复及 Graph 准备。
+资源规划按实际记录 packing 验证工作集；权重、workspace、Graph、控制元数据、媒体及其他
+Host 资源另行计费。自动模式使用剩余预算，显式模式使用指定字节数，两者都保留启动 headroom。
+单机与多机采用同一接口，各 rank 的容量和物理 offsets 可以不同。
 
-Session 的 pool 目录在启动时固定，`KvPoolId` 标识具体 pool；目录给出几何、Device 容量与
-Host page stride，名称仅用于诊断。模型内部保留 Text/MTP/Draft Full 角色；Runtime 的需求、
-缺口、占用和释放量使用 `ContextResources<N>`：State slots、按 pool ID 索引的 KV page groups、
-Host allocated bytes。`N` 由原生架构声明，普通执行查询不分配动态容器。
-回收每次针对一个具体缺口；另一个 pool 的空闲页不能满足它。现有容量曲线和恢复许可策略保留。
-传输需求与观测另外记录 image count、page groups、payload bytes、copy operations；前两项
-是内容范围，Host allocated bytes 包含分配对齐，payload bytes 是实际 DMA 量。
+RTX 5090 serve 的 Host 缺省为 `8 GiB + 8 × StateImage 字节数`，CLI 为零；Spark 的 Host
+Context 为零。Host 使用与 Device 相同的记录表示，不改变单请求长度上限。容量从预留开始
+计费，副本发布只改变其状态。上下文预算不限制进程全部 RAM，CPU expert、PLE 表、输入与
+媒体由各自 owner 规划；Spark 的统一内存预算同时计入这些实际 Host 使用。
 
-RTX 5090 的 Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`；DGX Spark 的
-Host 容量固定为零，使用 Device 前缀复用和 Replay。Host pool 是一个共享 backing，State 与
-KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，
-不减少占用。State 副本和传输目的直接持有 Host allocation，capture 预留的 allocation
-直接用于传输。Device 和 Host 的完整 image 使用同一内部布局；复制的对齐间隙计入真实传输
-字节数。Host extent 的分裂、最后引用释放和合并由 allocator 管理。
-
-必要请求输入、token 账本、prepared media、Responses 存储和 Frontend 媒体缓存各有自己的
-生命周期与现有数量、长度或媒体预算约束。Host context 容量不覆盖这些内存，也不限制进程总 RAM。
-物理容量同时约束 Native 元数据规模；空逻辑记录和索引分支及时删除。
-PreparedSession 在最终启动预算检查前建立目录、checkpoint catalog 和控制容器，成功后移交 Session。
-Spark 的统一内存核算包含这些 Host 元数据；容量重建先释放控制 owner，再释放 rank backing，分别观测回收量。
+ContextDirectory 给出完整需求的可行性和释放证据。Runtime 不解释物理块类别，不用 State
+槽数或某个 KV pool 的独立缺口做准入。逻辑 pool ID 仅标识 Main、MTP、Draft Full 等用途。
+记录、元数据与维护合同见 [Context 存储](paged-kv-cache.md)。
 
 ### 3.2 执行与恢复许可
 
 Session 根据实际绑定状态计算 Prefill、Replay、Decode/Verify、Control 或 Normalize 的 typed KV
 覆盖，包含 speculative 峰值与后端需要。State 与缺失副本另外取得；写入冲突所需的尾页 COW 计入绑定或 unit 许可。
-一次 unit 的多个 typed pool 申请共同成功，失败归还本次部分预留并返回具体缺口。
+一次 unit 的所有 rank、State/KV 记录与 History 写入元数据共同预留；失败不留下部分物理占用。
 此外，Executor 为执行取得 frame 和后续 decision/commit/discard 额度。Session 拿到这份完整许可后
 才进入不可撤销的活动目录准备；此后的异常是执行实例失败，不作为普通资源不足回到准入选择。
 
 Engine 按恢复优先、原票号优先取得 resident 单元许可，形成可运行子集；一行暂时不足不会阻止
 其他已许可行执行。Fresh admission 使用余量，不能花掉现存许可。普通 unit 结算释放未用预留，
 后续增长继续按需申请。trim 失去逻辑引用的在途页与 row 仍保留至 DeviceRetired；下一单元所需的
-growth reservation 在这些页实际归还后补足，不为新旧许可暂时占两份容量。算子内部不选择缓存受害者。
+growth reservation 在执行前准备好返回位置，消费者退休后直接接收这些页，不为新旧许可暂时占两份容量。算子内部不选择缓存受害者。
 
 同步回收已经改变容量时，当场重试当前许可；需要等待传输完成时才交回调度周期。
 
@@ -207,10 +192,10 @@ Source provenance、tokenizer 的精确 frontier 和完整媒体范围共同决�
 ### 5.1 保存机会
 
 保存来自实际输入恢复点、显式锚点、共享 marker、正常生成终点，以及实际抢占需要的执行快照。
-Prefill/Replay chunk 结束本身不产生保存机会。
+自动中间 checkpoint 按配置间隔、语义边界和实际 chunk 结束位置提出，不要求精确卡住间隔。
 
 Engine 在跨过语义 frontier 前调用 Native 准备目的 state 与检查点描述。私有输入点可先退休
-本记录已经过时的输入点，再尝试 Device 槽，容量不足时可使用 Host。私有和公共保存都持有
+本记录已经过时的输入点，再尝试 Device 记录，容量不足时可使用 Host。私有和公共保存都持有
 `HistoryPrefix`，只读前缀不复制尾页；同一位置的不同用途记录可以共享同一 StateImage 和 KV 内容。
 
 同点兼有私有与共享用途时，共享部分不足仍可保留私有点。捕获属于可选缓存写入，回收须通过
@@ -241,8 +226,8 @@ flowchart LR
 报价显式考虑本次授权退休、消费的前缀引用，检查可行性不修改原来源。
 
 不可变 state 与 active writer 分开。可独占 E 直接 Move；需要保留来源时，Fork 可由下一次计算
-完成 state 转移，后端必要 local copy 仍执行。Device 槽紧张且有 Host 副本时，可以保留旧身份的
-Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本则先完成 D2H。无法兼顾保存
+完成 state 转移，后端必要 local copy 仍执行。Device 容量紧张且有 Host 副本时，可以保留旧身份的
+Host 内容，将 Device 记录交给新的 active identity；只有 Device 副本则先完成 D2H。无法兼顾保存
 与执行时，允许放弃可选恢复点，reader lease 始终保留。绑定退休旧点腾出的 Host 空间也可用于
 保存输入点。
 
@@ -260,9 +245,9 @@ Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本�
 合法 session 提示、私有用途、较新 publication order 和稳定序号。同一 Native handle、相同
 接管方式与携带点的重复候选合并；独立计算得到的同语义位置仍分别处理。
 
-来源成本模型比较当前恢复传输与剩余计算。KV 的 DMA 工作量来自 rank 准备后导出的无地址
-KVTransferProfile，目录不猜测 pitch 或 plane 合并方式。机器传输与 artifact prefill 校准影响排序，不决定
-内容是否可恢复。缓存回收另用实际恢复覆盖损失，不估计未来请求概率；实际许可由 Native 申请。
+来源成本模型比较恢复传输与剩余计算。记录布局给出实际复制字节，执行器报告完成后的范围合并和
+copy operations。各 rank 的局部工作分别估计，跨 rank 关键路径取最大值。机器传输与 artifact
+prefill 校准影响排序，不决定恢复资格；实际许可仍由 Session 取得。
 
 来源评估只读。Native 计算来源的 Move/Fork、兼容携带点与获准退休的旧点，并根据首个合法单元
 检查 State、缺失 KV、增长页和尾页需求。暂停恢复仍检查完整恢复许可。实际回收可以改变副本与
@@ -310,14 +295,14 @@ Rendering、候选查询、轮询、自己的 Snapshot/Replay 恢复和单纯保
 保留与准入，不增加 cache-hit 或 reused-token 统计，也不持有 State/KV。输入恢复点因这份真实
 重复需求证据提升私有 owner 时，同时把证明位置设为该输入点。
 
-复用段按最近实际采用或重复需求时间排序，以各物理池容量的 3/4 为软目标，降级较老记录。
-计费使用唯一物理 footprint；单个最新的大记录可超过软目标。等级决定回收次序，不承诺永久保留。
+复用段按最近实际采用或重复需求时间排序。等级决定回收次序，不划分固定保护容量，也不承诺
+永久保留。需要空间时根据完整需求和真实释放结果选择动作。
 
 ### 7.2 有限物理动作
 
 Native 根据实际 State/KV 引用枚举有限的降级和删除动作，每个动作携带真实持有者集合、可释放量
 与必要传输。共享内容的所有可选持有者必须一起满足准入；active/transfer reader 另外限制能否
-动它。释放零个当前稀缺资源的动作不参加比较。
+动它。物理副本、逻辑描述符与 catalog 使用不同释放证据；只释放元数据的动作仍可参与元数据压力回收。
 
 Qwen3.5 与 Qwen4Exp 共用恢复评分和物理持有者算法。原生 Session 按 checkpoint 发布、退休与代际
 维护精确前缀森林；相同 identity/frontier 的别名共享语义节点，仍各自持有实际 State/KV 引用。
@@ -334,12 +319,10 @@ Vision/rewrite 身份证明。索引不持有 snapshot、资源引用或 reader 
 时，更深且尚未证明的新后缀可以按普通边际损失处理；过浅的输入点不能代替曾实际采用的深位置。
 独立 Shared 热所有者仍保护涉及它的完整物理动作。降级与删除使用相同的保护判断。
 
-每次按当前处理的 typed 缺口比较；Device 内优先处理 State，再处理 Main/backend KV，Host 目的
-单独预检。Runtime 在这个稀缺单位内排序：
-
-1. 普通内容先于复用内容。
-2. 普通动作比较“边际恢复 token 损失 / 对本次缺口有用的释放量”，同分按保留顺序。
-3. 复用动作按最近真实需求时间，优先处理较旧内容。
+每轮针对整个 ContextDemand 比较：普通内容先于复用内容；普通动作比较边际恢复损失和
+实际释放，复用动作优先考虑较旧的真实需求。收益计分按不足的 rank/domain 计算，最多计到
+分配器给出的本次缺口，不奖励超额释放；不贡献物理或元数据容量的动作不参与回收。
+每加入一个候选都重新评估联合释放集合，只有整组需求可满足时才执行删除。被 reader 占用或需要退休的容量返回等待，不能当作立即可用。
 
 删除损失依据动作后的真实 surviving fallback 计算。令 R 为合法、去重后的待删除句柄，S 为
 已公布且不在 R 中的恢复点，`s ≼ r` 表示 s 是 r 的精确兼容前缀。对每个被删除的语义节点定义：
@@ -372,12 +355,9 @@ Device→Host 降级在排序前固定所需 Host 受害者，完整动作的净
 有完整 Host 副本时直接释放 Device 副本；否则报价并申请 Host 目的。启动动作前重新验证内容和
 引用，完成后重新查询真实缺口。
 
-同一个 KV pool 中，按回收顺序选择的迁移组可以共用一笔事务。若中间删除候选实际能释放的目标
-Device 页已全部被前面选中的迁移覆盖，它不再增加本次容量，可以略过这个备选；判定依据是
-Native 的完整物理页身份，而非检查点名称或名义页数。其他删除动作，以及需要 Host 受害者的
-迁移，结束这批。Runtime 检查每组及完整批次的权限，Native 按实际缺口和 Host 余量裁切严格前缀。
-全部目的与源 lease 预约成功后才提交，已有完整 Host 副本的 Device 页在提交时释放，其余页在
-复制完成后释放。原始候选列表保留，批量预约失败时仍可依次尝试单个迁移和删除备选。
+迁移可以选择满足本次需求的有限记录。动作按真实身份去重；Host 目标同样进行完整预检，
+不会因为 Device 侧可释放而忽略 Host 空间。物理碎片需要维护时关闭新地址借用，待消费者退休
+后完成搬移和映射更新，再继续已预留的操作。维护与复制不会自行改变缓存价值或数学前沿。
 
 ### 7.3 必要执行与可选写入
 
@@ -407,7 +387,7 @@ Host 与 Device 分步删除共用预算，累计已经牺牲的恢复覆盖；�
 
 Host 先释放安全的重复副本，再对有限物理动作作完整预检：实际释放并集足额，且联合持有者都能
 被本次申请替换，才执行删除。Shared 引用的名义大小不重复累加。预检后 allocator 仍须满足
-完整 StateImage 与连续 extent geometry；分配失败可放弃保存，已完成删除不回滚。
+完整 StateImage 与记录放置几何；分配失败可放弃保存，已完成删除不回滚。
 
 <a id="scheduling"></a>
 ## 8. 调度、抢占与恢复
@@ -515,9 +495,9 @@ rank 排空实际 stream 并保留首个错误，再允许控制侧释放 leases
 | agent 采用上轮 E，随后客户端规范化 tool call | 正常续接 Move/Fork E；更深位置失配时，采用 typed R 对应的实际输入恢复点并补算后缀 |
 | 私有输入恢复点与公共 marker 同点 | 一份 state 可有两种用途；私有记录接管前移，公共入口继续按自己的引用和热度存活 |
 | 前缀 α 与 α+β 都有显式 marker，后来请求 α+γ | 两个位置各有保存机会；较浅 α 仍可作为完整来源 |
-| 热前驱产生多个一次性分支 | 各分支携带实际采用时刻，完成不再加热；总 footprint 超过软目标时降级较老记录 |
-| 长输入没有语义保存点 | 按 chunk 让出执行机会，chunk 不保存 state；压力导致暂停时才采用 Snapshot 或 Replay |
-| 只缺几页 Main KV | 比较该稀缺单位的有限物理动作，选择所需页组；backend KV 与 State 不自动全部搬走 |
+| 热前驱产生多个一次性分支 | 各分支携带实际采用时刻，完成不再加热；压力下按实际需求证据回收 |
+| 长输入没有语义保存点 | 按 checkpoint interval 在自然执行边界尝试稀疏保存；压力时采用 Snapshot 或 Replay |
+| 只缺几页 Main KV | 评估完整需求，从共享容量中的适合记录取得空间，不要求只回收 Main KV |
 | Host 为零且 Device state 极少 | 可选输入点/共享保存可能失败；必要执行回收空间，Replay 在完整恢复许可下推进 |
 | 长请求暂停，另有更老 resident | 长请求局部等待；能装入余量的短请求继续进入，更老 resident 结束后按原票号恢复 |
 | 未保留的同一候选被多个请求重新计算 | 新提交观察形成重复需求证据，后续保存可进入复用段，缓存命中统计仍只计实际复用 |
@@ -533,7 +513,7 @@ rank 排空实际 stream 并保留首个错误，再允许控制侧释放 leases
 重算、CPU 调度和协议准备成本。完整命中也可能需要大量 H2D；低 TTFT 也可能伴随长时间暂停后的
 输出空窗。两者分别报告。
 
-有限恢复点无法覆盖任意历史改写。整记录保留、新共享保存的竞争、固定 typed pools、完整恢复
+有限恢复点无法覆盖任意历史改写。整记录保留、新共享保存的竞争、记录 packing、完整恢复
 目的空间、Replay 和 Vision 重编码都可能产生实际成本。吞吐、TTFT、完成时间与最大输出间隔
 共同描述结果；单 sample 只说明该次轨迹，不建立延迟分布保证。
 

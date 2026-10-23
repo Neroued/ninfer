@@ -6,6 +6,7 @@ add_library(ninfer_model_loading STATIC
   glm5next/frontend/processor_config.cpp
   common/bindings.cpp
   common/parallel.cpp
+  common/parallel_weights.cpp
   common/weights.cpp
   common/moe/weights.cpp
   qwen4_exp/ple/parameters.cpp
@@ -78,6 +79,7 @@ endif()
 
 include(qwen3_5/loading_sources.cmake)
 include(qwen4_exp/loading_sources.cmake)
+include(glm5next/loading_sources.cmake)
 include(common/qwen/sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen4_exp/execution_sources.cmake)

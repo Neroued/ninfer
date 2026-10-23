@@ -36,3 +36,15 @@ ninfer_add_test(ninfer_glm5next_protocol_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_protocol.cpp"
   LIBRARIES ninfer_model_control ninfer_serve ninfer::json
   NEEDS_SOURCE_DIR)
+
+add_executable(ninfer_glm5next_loading_test "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp")
+ninfer_test_includes(ninfer_glm5next_loading_test)
+target_link_libraries(ninfer_glm5next_loading_test PRIVATE ninfer_model_loading)
+foreach(mode IN ITEMS host gpu)
+  add_test(NAME ninfer_glm5next_loading_${mode}_test
+    COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_loading.py"
+      $<TARGET_FILE:ninfer_glm5next_loading_test> --${mode})
+  set_tests_properties(ninfer_glm5next_loading_${mode}_test PROPERTIES TIMEOUT 60)
+endforeach()
+set_tests_properties(ninfer_glm5next_loading_gpu_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+set_tests_properties(ninfer_glm5next_loading_host_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")

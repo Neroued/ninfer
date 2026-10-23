@@ -109,6 +109,10 @@ def add_proposal(
 def add_official_proposal(
     recipe: Recipe, *, ranking=DEFAULT_RANKING, rows: int | None = 131072
 ) -> None:
+    if recipe.model.proposal_domain == "full":
+        rows = None
+    elif recipe.model.proposal_domain != "indexed":
+        raise ValueError("unknown architecture proposal domain")
     add_proposal(
         recipe,
         ranking=ranking,

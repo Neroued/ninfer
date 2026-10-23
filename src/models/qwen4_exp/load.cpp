@@ -52,15 +52,16 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
     if (!definition || definition->artifact_id() != reader.artifact_id())
         throw artifact::ArtifactError("rank definition belongs to another artifact");
     auto selection = select_weights(reader, *definition, rank, device);
-    auto storage   = artifact::plan_materialization(reader, selection.requests);
+    auto storage   = artifact::plan_materialization(reader, selection.weights.requests);
     ResolvedLoadPlan out(reader, std::move(definition), std::move(storage), {}, {}, {});
     out.rank_      = std::move(rank);
     out.selection_ = std::move(selection);
     out.parents_.reserve(out.materialization_.tensors.size());
     for (const auto& tensor : out.materialization_.tensors)
         out.parents_.push_back({tensor.geometry, device, nullptr, {}});
-    out.descriptions_ = bind_selected_weights(*out.definition_, *out.selection_,
-                                              out.materialization_.requests, out.parents_);
+    out.descriptions_ =
+        bind_selected_weights(out.definition_->weight_data(), out.selection_->weights,
+                              out.materialization_.requests, out.parents_);
     return out;
 }
 
@@ -79,12 +80,12 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
         out->local_parents_.reserve(parent_count);
         for (std::size_t i = 0; i < parent_count; ++i)
             out->local_parents_.push_back(out->backing_.parent({i}, device.device()));
-        out->bound_ =
-            bind_selected_weights(*definition, *plan.selection_, requests, out->local_parents_);
+        out->bound_ = bind_selected_weights(definition->weight_data(), plan.selection_->weights,
+                                            requests, out->local_parents_);
         const auto parent = [&](std::size_t request) -> const WeightParent& {
             return out->local_parents_.at(requests.at(request).index);
         };
-        for (const auto& bank : plan.selection_->experts) {
+        for (const auto& bank : plan.selection_->weights.experts) {
             std::vector<moe::ResidentExpertEntry> entries;
             for (const auto& e : bank.entries)
                 entries.push_back({e.expert, &parent(e.gate_up), &parent(e.down)});

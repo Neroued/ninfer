@@ -572,7 +572,13 @@ def build_model(
     )
     for c, values in refs.items():
         records[c]["resources"] = values
-    model = Model(records, resources=res, token_count=count, special_token_ids=special)
+    model = Model(
+        records,
+        resources=res,
+        token_count=count,
+        special_token_ids=special,
+        proposal_domain="full",
+    )
     b = Builder(model, base, cfg)
     h = cfg["hidden_size"]
     b.add(

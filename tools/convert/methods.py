@@ -25,6 +25,7 @@ from tools.artifact.formats import (
 from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
+from .quantization.fp8_block import quantize_blocks
 from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix
 from .quantization.stored_scale import quantize_stored_scale
@@ -273,6 +274,45 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def fp8_block_maxabs(request: PrepareRequest) -> PreparedMethod:
+    """Encode independent 128-by-128 blocks with BF16 scales and E4M3FN codes."""
+    if request.target.format != "fp8_e4m3fn_block128x128_bf16" or len(
+        request.target.shape
+    ) not in (2, 3):
+        raise ValueError("fp8_block_maxabs requires a block-scaled FP8 matrix or bank")
+    _preflight(request)
+    n, k = request.target.shape[-2:]
+    matrices = request.target.shape[0] if len(request.target.shape) == 3 else 1
+    if matrices <= 0 or n <= 0 or k <= 0 or n % 128 or k % 128:
+        raise ValueError("block FP8 target matrices require complete 128-by-128 tiles")
+    for item in request.inputs:
+        shape = item.source.shape
+        if (
+            len(shape) not in (2, 3)
+            or shape[-1] != k
+            or shape[-2] % 128
+            or any(extent <= 0 for extent in shape)
+        ):
+            raise ValueError(
+                f"{item.parameter}: block FP8 sources require whole 128-row matrices"
+            )
+    chunk = request.chunk_rows(k * 4, alignment=128)
+
+    def produce(output):
+        for matrix in range(matrices):
+            offset = matrix * n * k
+            read = lambda begin, end: request.values(offset + begin, offset + end)
+            for begin, end, values in request.read_chunks(read, n * k, chunk * k):
+                encoded = quantize_blocks(
+                    values.reshape((end - begin) // k, k).to(device=request.device)
+                )
+                output.write_codes(
+                    begin // k, encoded.codes, encoded.scales, matrix=matrix
+                )
+
+    return request.job(produce=produce)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve FP8/NVFP4 words, with independent divisors for bank matrices."""
     block_fp8 = request.target.format == "fp8_e4m3fn_block128x128_bf16"
@@ -405,6 +445,7 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
+    "fp8_block_maxabs": fp8_block_maxabs,
     "import_encoded": import_encoded,
     "stored_scale_mse": stored_scale_mse,
 }

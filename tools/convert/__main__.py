@@ -16,6 +16,7 @@ from .official_recipes import RECIPES
 from .methods import SOURCE_CACHE_BYTES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
+from .glm5next import build_model as build_glm5next
 from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import build_model as build_qwen4_exp
 from .recipe import Recipe
@@ -181,6 +182,8 @@ def main(argv=None):
         }
         architectures = base.config.get("architectures", [])
         adapters = {
+            "Glm5NextForCausalLM": build_glm5next,
+            "Glm5NextForConditionalGeneration": build_glm5next,
             "Qwen3_5ForCausalLM": build_qwen3_5,
             "Qwen3_5ForConditionalGeneration": build_qwen3_5,
             "Qwen3_5MoeForCausalLM": build_qwen3_5,
@@ -191,7 +194,6 @@ def main(argv=None):
         if len(architectures) != 1 or architectures[0] not in adapters:
             raise ValueError(f"unsupported source architectures: {architectures!r}")
         build_model = adapters[architectures[0]]
-        qwen4_exp = build_model is build_qwen4_exp
         model = build_model(
             base,
             components=components,
@@ -204,7 +206,7 @@ def main(argv=None):
             add_official_proposal(
                 recipe,
                 ranking=args.ranking,
-                rows=None if qwen4_exp else args.proposal_rows,
+                rows=args.proposal_rows,
             )
         if args.override:
             _function(args.override)(model, recipe, sources)
@@ -225,7 +227,10 @@ def main(argv=None):
         }
         if args.override:
             provenance["override"] = args.override
-        if args.proposal and not qwen4_exp:
+        if (
+            args.proposal
+            and model.components["text"]["proposal"]["domain"] == "indexed"
+        ):
             provenance["ranking"] = str(args.ranking)
         report = convert(
             model,

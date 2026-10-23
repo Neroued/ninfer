@@ -30,6 +30,7 @@ public:
     [[nodiscard]] const artifact::ArtifactId& artifact_id() const;
     [[nodiscard]] const artifact::MaterializationStats& resource_stats() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId) const;
+    [[nodiscard]] std::span<const artifact::ParameterReference> parameters() const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId) const;
     [[nodiscard]] std::span<const BoundWeight> weight_data() const;
     [[nodiscard]] std::span<const moe::BankDescription> expert_banks() const;

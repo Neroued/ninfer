@@ -62,6 +62,7 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
   ninfer_add_op_test(ninfer_swiglu_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_swiglu.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_bf16.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_q8.cpp"
     LIBRARIES ninfer_ops ninfer_linear_test_support)
   ninfer_add_op_test(ninfer_sigmoid_route_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sigmoid_route.cpp"

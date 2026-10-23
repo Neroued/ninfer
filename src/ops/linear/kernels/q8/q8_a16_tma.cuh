@@ -25,16 +25,24 @@ namespace ninfer::ops::detail {
 // stored FP16 values into registers. No producer warp or global workspace.
 template <int Rows, int Tokens, int WarpRows, int WarpTokens, int MinBlocks, int RasterRows = 0,
           int StaticK = 0, int BlockK = 64, bool CompactA = false, bool BiasedDecode = false,
-          bool FullRowTiles = false, bool SlideTokenTail = false>
+          bool FullRowTiles = false, bool SlideTokenTail = false, int WeightComponents = 1,
+          int ActivationComponents = 1>
 struct Q8A16TmaMmaSchedule : Q8A16MmaSchedule<Rows, Tokens, BlockK, WarpRows, WarpTokens, 2,
                                               MinBlocks, Q8MmaFragmentPipeline::PingPong, Cache::cg,
                                               Cache::cg, Cache::cg, false, StaticK, 1> {
-    static constexpr int kRasterRows = RasterRows;
+    static constexpr int kRasterRows           = RasterRows;
+    static constexpr int kWeightComponents     = WeightComponents;
+    static constexpr int kActivationComponents = ActivationComponents;
     static constexpr bool kCompactA = CompactA, kBiasedDecode = BiasedDecode;
     static constexpr bool kFullRowTiles   = FullRowTiles;
     static constexpr bool kSlideTokenTail = SlideTokenTail;
     static constexpr int kSharedBytes =
-        ((Rows * BlockK * 4 + 2 * Tokens * BlockK * 2 + 16 + 1023) / 1024) * 1024;
+        ((Rows * BlockK * (2 * WeightComponents + 2) +
+          2 * Tokens * BlockK * 2 * ActivationComponents + 16 + 1023) /
+         1024) *
+        1024;
+    static_assert(WeightComponents == 1 || WeightComponents == 2);
+    static_assert(ActivationComponents == 1 || ActivationComponents == 2);
     static_assert(Rows % 16 == 0 && Tokens % 8 == 0);
     static_assert(Rows <= 256 && Tokens <= 256 && RasterRows >= 0);
     static_assert(BlockK == 64 || BlockK == 128);
@@ -44,8 +52,9 @@ struct Q8A16TmaMmaSchedule : Q8A16MmaSchedule<Rows, Tokens, BlockK, WarpRows, Wa
 
 template <class Cfg>
 struct Q8A16TmaStorage {
-    alignas(1024) __nv_bfloat16 weights[Cfg::kBlockRows * Cfg::kBlockK];
-    alignas(1024) __nv_bfloat16 activations[2][Cfg::kBlockTokens * Cfg::kBlockK];
+    alignas(1024) __nv_bfloat16 weights[Cfg::kWeightComponents * Cfg::kBlockRows * Cfg::kBlockK];
+    alignas(1024)
+        __nv_bfloat16 activations[2][Cfg::kActivationComponents * Cfg::kBlockTokens * Cfg::kBlockK];
     alignas(128) std::uint8_t codes[2][Cfg::kBlockRows * Cfg::kBlockK];
     alignas(8) std::uint64_t ready[2];
 };
@@ -86,6 +95,26 @@ __device__ __forceinline__ uint4 q8_tma_decode_eight(uint2 packed, std::uint16_t
     return decoded.raw;
 }
 
+struct Q8TmaCompensatedBits {
+    uint4 high, low;
+};
+
+__device__ __forceinline__ Q8TmaCompensatedBits
+q8_tma_decode_eight_compensated(uint2 packed, std::uint16_t scale_bits) {
+    const float scale = __half2float(__ushort_as_half(scale_bits));
+    Q8TmaBf16x8Bits high, low;
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const unsigned word  = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
+        const float a        = float(static_cast<std::int8_t>(word)) * scale;
+        const float b        = float(static_cast<std::int8_t>(word >> 8)) * scale;
+        high.pair[pair]      = __floats2bfloat162_rn(a, b);
+        const float2 rounded = __bfloat1622float2(high.pair[pair]);
+        low.pair[pair]       = __floats2bfloat162_rn(a - rounded.x, b - rounded.y);
+    }
+    return {high.raw, low.raw};
+}
+
 struct alignas(128) Q8A16TmaDescriptors {
     CUtensorMap x;
     CUtensorMap codes;
@@ -116,12 +145,14 @@ template <class Schedule>
 inline CUtensorMap q8_tma_activation_map(const Q8LinearOperands& p) {
     if constexpr (Schedule::kBlockK == 64) {
         return q8_a16_tensor_map(const_cast<__nv_bfloat16*>(p.x), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                                 p.k, p.tokens, std::uint64_t(p.k) * 2, 64, Schedule::kBlockTokens,
+                                 p.k, std::uint64_t(p.tokens) * Schedule::kActivationComponents,
+                                 std::uint64_t(p.k) * 2, 64, Schedule::kBlockTokens,
                                  CU_TENSOR_MAP_SWIZZLE_128B);
     } else {
         // A 128-element K tile spans two 128-byte swizzle sectors without repacking X.
         CUtensorMap result{};
-        const std::uint64_t dimensions[]{64, std::uint64_t(p.k / 64), std::uint64_t(p.tokens)};
+        const std::uint64_t dimensions[]{64, std::uint64_t(p.k / 64),
+                                         std::uint64_t(p.tokens) * Schedule::kActivationComponents};
         const std::uint64_t strides[]{128, std::uint64_t(p.k) * 2};
         const std::uint32_t box[]{64, 2, Schedule::kBlockTokens}, steps[]{1, 1, 1};
         const auto status = cuTensorMapEncodeTiled(
@@ -224,13 +255,18 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
     __syncthreads();
     auto issue = [&](int stage, int kt) {
         if (tid == 0) {
-            constexpr int bytes = BN * BK * 2 + BM * BK;
+            constexpr int bytes = BN * BK * 2 * Cfg::kActivationComponents + BM * BK;
             auto* barrier       = &storage.ready[stage];
             common::cta_mbarrier_arrive_expect_tx(barrier, bytes);
-            if constexpr (BK == 64)
-                common::tma_load_2d(Bs[stage], &maps.x, kt * BK, n0, barrier);
-            else
-                common::tma_load_3d(Bs[stage], &maps.x, 0, kt * (BK / 64), n0, barrier);
+#pragma unroll
+            for (int component = 0; component < Cfg::kActivationComponents; ++component) {
+                auto* destination = Bs[stage] + component * BN * BK;
+                const int column  = n0 + component * operands.tokens;
+                if constexpr (BK == 64)
+                    common::tma_load_2d(destination, &maps.x, kt * BK, column, barrier);
+                else
+                    common::tma_load_3d(destination, &maps.x, 0, kt * (BK / 64), column, barrier);
+            }
 #pragma unroll
             for (int panel = 0; panel < BM / RowPolicy::kTmaRowsPerPanel; ++panel) {
                 constexpr int panel_rows = RowPolicy::kTmaRowsPerPanel;
@@ -267,8 +303,15 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
             const int chunk    = item - row * kChunksPerRow;
             const int col      = chunk * 8;
             const uint2 packed = *reinterpret_cast<const uint2*>(&Cr[Slot][row * BK + col]);
-            common::store_vec(&As[row * BK + common::swizzle_xor_64(row, col)],
-                              q8_tma_decode_eight<Cfg::kBiasedDecode>(packed, scale_regs[Slot][v]));
+            auto* destination  = &As[row * BK + common::swizzle_xor_64(row, col)];
+            if constexpr (Cfg::kWeightComponents == 1) {
+                common::store_vec(destination, q8_tma_decode_eight<Cfg::kBiasedDecode>(
+                                                   packed, scale_regs[Slot][v]));
+            } else {
+                const auto decoded = q8_tma_decode_eight_compensated(packed, scale_regs[Slot][v]);
+                common::store_vec(destination, decoded.high);
+                common::store_vec(destination + BM * BK, decoded.low);
+            }
         }
     };
 
@@ -281,15 +324,19 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
         if (tid == 0) common::cta_mbarrier_wait(&storage.ready[Slot], (kt / 2) & 1);
         __syncthreads();
         dequant_w.template operator()<Slot>();
-        unsigned reg_b[KSUB][NT][2];
+        unsigned reg_b[Cfg::kActivationComponents][KSUB][NT][2];
 #pragma unroll
-        for (int ks = 0; ks < KSUB; ++ks) {
+        for (int component = 0; component < Cfg::kActivationComponents; ++component) {
 #pragma unroll
-            for (int ni = 0; ni < NT; ++ni) {
-                const int br = wn * WN + ni * 8 + b_rin, bc = ks * 16 + b_koff;
-                common::ldmatrix_x2(
-                    reg_b[ks][ni][0], reg_b[ks][ni][1],
-                    common::smem_addr(&Bs[Slot][br * BK + q8_tma_activation_col<Cfg>(br, bc)]));
+            for (int ks = 0; ks < KSUB; ++ks) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int br = wn * WN + ni * 8 + b_rin, bc = ks * 16 + b_koff;
+                    common::ldmatrix_x2(
+                        reg_b[component][ks][ni][0], reg_b[component][ks][ni][1],
+                        common::smem_addr(&Bs[Slot][component * BN * BK + br * BK +
+                                                    q8_tma_activation_col<Cfg>(br, bc)]));
+                }
             }
         }
         // Every generic read of Cr/Bs must precede the next async-proxy write.
@@ -301,65 +348,75 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
             issue(Slot, kt + 2);
         }
 
-        if constexpr (Cfg::kCompactA) {
-            // Retain only the current and next row atom, independently of the warp tile height.
-            unsigned af[2][4];
-            const auto load_a = [&](int slot, int mi, int ks) {
-                const int ar = wm * WM + mi * 16 + a_rowoff, ac = ks * 16 + a_coloff;
-                common::ldmatrix_x4(
-                    af[slot][0], af[slot][1], af[slot][2], af[slot][3],
-                    common::smem_addr(&As[ar * BK + common::swizzle_xor_64(ar, ac)]));
-            };
-            load_a(0, 0, 0);
-#pragma unroll
-            for (int fragment = 0; fragment < KSUB * MT; ++fragment) {
-                const int slot = fragment & 1, mi = fragment % MT, ks = fragment / MT;
-                if (fragment + 1 < KSUB * MT)
-                    load_a(slot ^ 1, (fragment + 1) % MT, (fragment + 1) / MT);
-#pragma unroll
-                for (int ni = 0; ni < NT; ++ni)
-                    common::mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                                     af[slot][0], af[slot][1], af[slot][2], af[slot][3],
-                                     reg_b[ks][ni][0], reg_b[ks][ni][1]);
-            }
-        } else {
-            unsigned af[2][MT][4];
-
-            auto load_fragments = [&](int slot, int ks) {
-#pragma unroll
-                for (int mi = 0; mi < MT; ++mi) {
-                    const int ar = wm * WM + mi * 16 + a_rowoff;
-                    const int ac = ks * 16 + a_coloff;
+        const auto accumulate_plane = [&](const __nv_bfloat16* weight_plane, int component) {
+            if constexpr (Cfg::kCompactA) {
+                // Retain only the current and next row atom, independently of the warp tile height.
+                unsigned af[2][4];
+                const auto load_a = [&](int slot, int mi, int ks) {
+                    const int ar = wm * WM + mi * 16 + a_rowoff, ac = ks * 16 + a_coloff;
                     common::ldmatrix_x4(
-                        af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                        common::smem_addr(&As[ar * BK + common::swizzle_xor_64(ar, ac)]));
-                }
-            };
-
-            if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong)
-                load_fragments(0, 0);
+                        af[slot][0], af[slot][1], af[slot][2], af[slot][3],
+                        common::smem_addr(&weight_plane[ar * BK + common::swizzle_xor_64(ar, ac)]));
+                };
+                load_a(0, 0, 0);
 #pragma unroll
-            for (int ks = 0; ks < KSUB; ++ks) {
-                const int slot =
-                    Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong ? ks & 1 : 0;
-                if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::Serial) {
-                    load_fragments(0, ks);
-                }
-                if (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong && ks + 1 < KSUB) {
-                    load_fragments(slot ^ 1, ks + 1);
-                }
+                for (int fragment = 0; fragment < KSUB * MT; ++fragment) {
+                    const int slot = fragment & 1, mi = fragment % MT, ks = fragment / MT;
+                    if (fragment + 1 < KSUB * MT)
+                        load_a(slot ^ 1, (fragment + 1) % MT, (fragment + 1) / MT);
 #pragma unroll
-                for (int mi = 0; mi < MT; ++mi) {
-#pragma unroll
-                    for (int ni = 0; ni < NT; ++ni) {
+                    for (int ni = 0; ni < NT; ++ni)
                         common::mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                         acc[mi][ni][3], af[slot][mi][0], af[slot][mi][1],
-                                         af[slot][mi][2], af[slot][mi][3], reg_b[ks][ni][0],
-                                         reg_b[ks][ni][1]);
+                                         acc[mi][ni][3], af[slot][0], af[slot][1], af[slot][2],
+                                         af[slot][3], reg_b[component][ks][ni][0],
+                                         reg_b[component][ks][ni][1]);
+                }
+            } else {
+                unsigned af[2][MT][4];
+
+                auto load_fragments = [&](int slot, int ks) {
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi) {
+                        const int ar = wm * WM + mi * 16 + a_rowoff;
+                        const int ac = ks * 16 + a_coloff;
+                        common::ldmatrix_x4(
+                            af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                            common::smem_addr(
+                                &weight_plane[ar * BK + common::swizzle_xor_64(ar, ac)]));
+                    }
+                };
+
+                if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong)
+                    load_fragments(0, 0);
+#pragma unroll
+                for (int ks = 0; ks < KSUB; ++ks) {
+                    const int slot =
+                        Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong ? ks & 1 : 0;
+                    if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::Serial) {
+                        load_fragments(0, ks);
+                    }
+                    if (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong &&
+                        ks + 1 < KSUB) {
+                        load_fragments(slot ^ 1, ks + 1);
+                    }
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                        for (int ni = 0; ni < NT; ++ni) {
+                            common::mma_bf16(
+                                acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                                reg_b[component][ks][ni][0], reg_b[component][ks][ni][1]);
+                        }
                     }
                 }
             }
-        }
+        };
+#pragma unroll
+        for (int plane = 0; plane < Cfg::kWeightComponents; ++plane)
+#pragma unroll
+            for (int component = 0; component < Cfg::kActivationComponents; ++component)
+                accumulate_plane(As + plane * BM * BK, component);
     };
 #pragma unroll 1
     for (int kt = 0; kt < nkt; kt += 2) {
@@ -400,8 +457,11 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
 template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class Output,
           class Epilogue>
 void launch_q8_a16_tma_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, int output_tokens = 0) {
     validate_q8_operands(operands);
+    const int tokens = output_tokens ? output_tokens : operands.tokens;
+    if (tokens <= 0 || tokens > operands.tokens)
+        throw std::invalid_argument("Q8 TMA output extent exceeds activation storage");
     if constexpr (Schedule::kFullRowTiles) {
         if (operands.rows % Schedule::kBlockRows != 0)
             throw std::invalid_argument("Q8 A16 TMA schedule requires complete weight-row tiles");
@@ -423,24 +483,23 @@ void launch_q8_a16_tma_mma(const Q8LinearOperands& operands, Output output, Epil
         q8_a16_tensor_map(const_cast<std::uint8_t*>(operands.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                           operands.k, operands.rows, operands.k, Schedule::kBlockK,
                           RowPolicy::kTmaRowsPerPanel, CU_TENSOR_MAP_SWIZZLE_NONE);
-    common::for_each_token_slice(
-        operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-            const dim3 grid(common::div_up(operands.rows / ratio, RowPolicy::kOutputRowsPerCta),
-                            common::div_up(count, Schedule::kBlockTokens));
-            const auto launch = [&]<bool Full>() {
-                constexpr auto kernel =
-                    q8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
-                constexpr int bytes = linear_mma_shared_bytes<Schedule, Epilogue>;
-                static_assert(bytes >= sizeof(Q8A16TmaStorage<Schedule>) && bytes <= 99 * 1024);
-                (void)common::prepare_shared<bytes, kernel>();
-                kernel<<<grid, Schedule::kThreads, bytes, stream>>>(operands, maps, output,
-                                                                    epilogue, offset, count);
-                CUDA_CHECK(cudaGetLastError());
-            };
-            if (operands.rows % Schedule::kBlockRows == 0 && count % Schedule::kBlockTokens == 0)
-                launch.template operator()<true>();
-            else
-                launch.template operator()<false>();
-        });
+    common::for_each_token_slice(tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const dim3 grid(common::div_up(operands.rows / ratio, RowPolicy::kOutputRowsPerCta),
+                        common::div_up(count, Schedule::kBlockTokens));
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel =
+                q8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
+            constexpr int bytes = linear_mma_shared_bytes<Schedule, Epilogue>;
+            static_assert(bytes >= sizeof(Q8A16TmaStorage<Schedule>) && bytes <= 99 * 1024);
+            (void)common::prepare_shared<bytes, kernel>();
+            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(operands, maps, output, epilogue,
+                                                                offset, count);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (operands.rows % Schedule::kBlockRows == 0 && count % Schedule::kBlockTokens == 0)
+            launch.template operator()<true>();
+        else
+            launch.template operator()<false>();
+    });
 }
 } // namespace ninfer::ops::detail

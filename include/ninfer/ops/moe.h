@@ -74,7 +74,8 @@ struct SwiGLUWeights {
 // rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
 // Capacity covers the inclusive extent interval from a 256-byte-aligned arena cursor.
 // No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
-// Supports registered BF16 and NVFP4 profiles with an explicit finite positive clamp limit.
+// Supports registered BF16, Q8-G32/FP16 and NVFP4 profiles with an explicit finite positive clamp
+// limit.
 [[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);

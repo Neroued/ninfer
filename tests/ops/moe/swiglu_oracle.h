@@ -63,4 +63,5 @@ struct Oracle {
 };
 
 void add_bf16_cases(OpSuite&);
+void add_q8_cases(OpSuite&);
 } // namespace ninfer::test::swiglu

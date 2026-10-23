@@ -117,6 +117,50 @@ struct Q8SwiGluProductFragment {
     }
 };
 
+template <class Schedule>
+struct Q8SwiGluInterleavedTmaRows {
+    static constexpr int kOutputRowsPerCta = Schedule::kBlockRows / 2;
+    static constexpr int kTmaRowsPerPanel  = 8;
+
+    __device__ __forceinline__ int weight_row(int row0, int row, int rows) const {
+        return row0 + (row / 16) * 8 + (row & 7) + ((row & 8) ? rows / 2 : 0);
+    }
+};
+
+// Each m16n8 atom contains eight gate/up row pairs, so the warp can apply the
+// product directly to its FP32 registers without a cross-warp shared handoff.
+template <class Product>
+struct Q8SwiGluInterleavedTmaEpilogue {
+    Product product;
+
+    template <class Cfg, bool Full, class Output>
+    __device__ __forceinline__ void finish_tile(Output output, unsigned char*,
+                                                float (&acc)[Cfg::kMmaRows][Cfg::kMmaTokens][4],
+                                                int row0, int token0, int rows, int tokens) const {
+        const int warp = int(threadIdx.x) / 32, lane = int(threadIdx.x) & 31;
+        const int wm = warp / Cfg::kWarpGridTokens, wn = warp % Cfg::kWarpGridTokens;
+#pragma unroll
+        for (int mi = 0; mi < Cfg::kMmaRows; ++mi) {
+            const int row = row0 + wm * (Cfg::kWarpRows / 2) + mi * 8 + lane / 4;
+#pragma unroll
+            for (int ni = 0; ni < Cfg::kMmaTokens; ++ni) {
+                const int token = token0 + wn * Cfg::kWarpTokens + ni * 8 + (lane & 3) * 2;
+                if (Full || (row < rows / 2 && token < tokens))
+                    output.store(row, token, product(acc[mi][ni][0], acc[mi][ni][2]));
+                if (Full || (row < rows / 2 && token + 1 < tokens))
+                    output.store(row, token + 1, product(acc[mi][ni][1], acc[mi][ni][3]));
+            }
+        }
+    }
+};
+
+template <class Schedule, class Output, class Product>
+void launch_q8_swiglu_interleaved_tma(const Q8LinearOperands& p, Output output, Product product,
+                                      cudaStream_t stream) {
+    launch_q8_a16_tma_mma<Schedule, Q8SwiGluInterleavedTmaRows<Schedule>>(
+        p, output, Q8SwiGluInterleavedTmaEpilogue<Product>{product}, stream);
+}
+
 template <class Schedule, int Intermediate, class Output, class Product>
 void launch_q8_swiglu_sliced(const Q8LinearOperands& p, Output output, Product product,
                              cudaStream_t stream) {

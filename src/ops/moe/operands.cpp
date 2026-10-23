@@ -273,9 +273,10 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
 
 void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
     operand::device(w.device, device_, op_, "shared weight");
-    require(w.qtype == type && w.n == rows && w.k == columns && w.ndim == 2 && w.shape[0] == rows &&
-                w.shape[1] == columns && w.shape[2] == 1 && w.shape[3] == 1 &&
-                w.padded_shape[0] == rows && w.padded_shape[1] == columns && !w.qhigh &&
+    require((type == QType::BF16 || type == QType::Q8_G32_FP16) && w.qtype == type && w.n == rows &&
+                w.k == columns && w.ndim == 2 && w.shape[0] == rows && w.shape[1] == columns &&
+                w.shape[2] == 1 && w.shape[3] == 1 && w.padded_shape[0] == rows &&
+                w.padded_shape[1] == columns && !w.qhigh && !w.high_plane_bytes &&
                 operand::aligned(w.qdata, 16),
             "MoE: invalid shared matrix");
     require(type == QType::BF16
@@ -304,10 +305,11 @@ void MoeOperands::unscaled_shared(const SwiGLUWeights& weights, const SwiGLUProf
     prepared.clamp_limit = p.clamp_limit;
     require(prepared == p, "MoE: unscaled shared weights differ from profile");
     for (const Weight* w : {&weights.gate_up.weight, &weights.down.weight})
-        require(w->group == 0 && w->group_size == 0 && w->high_plane_bytes == 0,
-                "MoE: invalid unscaled shared metadata");
-    matrix(weights.gate_up.weight, 2 * p.intermediate, p.hidden, QType::BF16);
-    matrix(weights.down.weight, p.hidden, p.intermediate, QType::BF16);
+        if (w->qtype == QType::BF16)
+            require(w->group == 0 && w->group_size == 0 && w->high_plane_bytes == 0,
+                    "MoE: invalid unscaled BF16 shared metadata");
+    matrix(weights.gate_up.weight, 2 * p.intermediate, p.hidden, p.gate_up_type);
+    matrix(weights.down.weight, p.hidden, p.intermediate, p.down_type);
 }
 
 void MoeOperands::workspace(const MemoryArena& workspace, std::size_t bytes) {

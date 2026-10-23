@@ -15,7 +15,7 @@ struct Options {
     std::vector<int> tokens{1, 6, 16, 32, 128, 512, 2048, 4096};
     std::string format = "nvfp4", distribution = "mixed", placement = "permuted";
     std::string shared_format = "bf16", subset = "local";
-    int hits = -1, side = 0;
+    int hits = -1, side = 0, hot_experts = ep::K;
 };
 
 Options parse(int argc, char** argv) {
@@ -29,6 +29,7 @@ Options parse(int argc, char** argv) {
                    "  --format nvfp4|fp8 --tokens T[,T...]\n"
                    "  --shared-format bf16|q8 --subset local|none\n"
                    "  --distribution mixed|zero|all|skew|sweep --hits 0..8\n"
+                   "  --hot-experts 8..144 (skew distribution)\n"
                    "  --placement permuted|contiguous|interleaved --side 0|1\n"
                    "Semantic traffic counts unique weights and operand I/O; private staging is "
                    "excluded.\n";
@@ -53,6 +54,8 @@ Options parse(int argc, char** argv) {
             o.side = measurement::integer(value, 0, 1);
         else if (flag == "--hits")
             o.hits = measurement::integer(value, 0, 8);
+        else if (flag == "--hot-experts")
+            o.hot_experts = measurement::integer(value, ep::K, ep::Local);
         else
             throw std::invalid_argument("unknown option");
     }
@@ -118,7 +121,7 @@ void run(const Options& o, Fixture& gate_up, Fixture& down) {
                     correction[distribution == "all" ? experts.local_id(j) : experts.remote_id(j)] =
                         2;
             } else if (distribution == "skew") {
-                for (int j = 0; j < ep::K; ++j) correction[experts.local_id(j)] = 2;
+                for (int j = 0; j < o.hot_experts; ++j) correction[experts.local_id(j)] = 2;
             } else {
                 for (int e = 0; e < ep::E; ++e) correction[e] = (e % 17 - 8) * .003f;
             }

@@ -40,7 +40,10 @@ void put(quantized_weight::PackedWeight& w, int row, int col, float value) {
 quantized_weight::PackedWeight control(int recipe) {
     auto w = linear_weights::make_bf16_weight(E, H, 2811);
     std::fill(w.payload.begin(), w.payload.end(), 0);
-    if (recipe != 4)
+    if (recipe == -2) {
+        for (int e = 0; e < E; ++e)
+            for (int p = 0; p < 3; ++p) put(w, e, H - 3 + p, e % 3 == p ? -1 : 1);
+    } else if (recipe != 4)
         for (int e = 0; e < E; ++e) put(w, e, H - 1, (e % 17 - 8) * .125f);
     return w;
 }
@@ -106,6 +109,10 @@ struct Fixture {
                 }
                 std::fill_n(v.begin(), eight ? 128 : 32, 0);
                 v[H - 1] = p == 2 ? 3.5f : .875f;
+                if (rec == -2) {
+                    std::fill(v.end() - 3, v.end(), 0);
+                    v[H - 3 + p] = 2;
+                }
             } else
                 v[H - 1] = 1;
             round_to_bf16(v);
@@ -187,6 +194,8 @@ int run(Fixture& f, const Case& c) {
             const int ordinal = (f.recipe == 4 ? 0 : (c.m * 13 + phase * 17)) + j;
             corrections[j < phase_hits ? f.bank.local_id(ordinal) : f.bank.remote_id(ordinal)] = 2;
         }
+        if (f.recipe == -2 && phase == 1)
+            for (int j = 0; j < ep::Local; ++j) corrections[f.bank.local_id(j)] = 2;
         input.copy_from_host(values.data(), values.size() * 2);
         bias.copy_from_host(corrections.data(), E * 4);
         output.fill(0x7f);
@@ -492,6 +501,14 @@ int main(int argc, char** argv) {
                 return failed + f.verify();
             });
         }
+        suite.add(prefix + "/route-diversity",
+                  [=] {
+                      Fixture f(ep::Placement::Permuted, 0, fp8, -2, true);
+                      int failed = 0;
+                      for (int m : {513, 4097}) failed += run(f, {m, 8, true});
+                      return failed + f.verify();
+                  },
+                  {{"suite", "q8-shared"}, {"format", format}, {"execution", "graph"}});
         for (int recipe : {4, 5})
             suite.add(prefix + "/probe" + std::to_string(recipe),
                       [=] {

@@ -9,6 +9,14 @@ inline constexpr int kHidden = 4096, kIntermediate = 2048, kExperts = 288, kTopK
 
 enum class ExpertLoadRegime { All, ExcludeBroad, OnlyBroad, DenseWhenBroad };
 
+struct Fp8PopulationTuning {
+    static constexpr int kWideDownColumns = 256;
+    int row_window                        = 0;
+    int ordered_expert_limit              = 0;
+    int wide_min_average                  = 0;
+    bool wide_down                        = false;
+};
+
 struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
     // belonging to one expert. The entry policy owns the maximum slice size.
@@ -25,13 +33,16 @@ struct Plan {
     int queued_ctas_per_sm = 6;
     float clamp_limit      = 0;
 
+    Fp8PopulationTuning fp8;
     Nvfp4Tuning nvfp4;
     int group_columns = 0, small_expert_limit = 0;
     Nvfp4LoadSchedule medium, dense, broad;
     int broad_short_limit = 0, broad_long_limit = 0;
 
     int job_columns() const {
-        const int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        if (fp8.wide_down && Fp8PopulationTuning::kWideDownColumns > columns)
+            columns = Fp8PopulationTuning::kWideDownColumns;
         return columns > group_columns ? columns : group_columns;
     }
 };
@@ -42,6 +53,8 @@ struct Groups {
     int* cursors;
     int* job_experts;
     int* job_columns;
+    // Total jobs, maximum jobs per expert; FP8 also publishes active experts and
+    // the maximum assignments per expert, independent of the selected job width.
     int* jobs;
     int* assignments;
     int* inverse;

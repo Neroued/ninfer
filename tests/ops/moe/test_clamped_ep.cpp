@@ -90,6 +90,12 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
                         c.all || t < counts[j] || (t == m - 1 && j == 0) ? w.local_id(j)
                                                                          : w.remote_id(j);
         }
+        if (c.distribution == "population") {
+            const int resident = replay == 0 ? 8 : replay == 1 ? 32 : 16;
+            for (int t = 0; t < m; ++t)
+                for (int j = 0; j < K; ++j)
+                    routes.ids[std::size_t(t) * K + j] = w.local_id((t * 13 + j) % resident);
+        }
         if (replay == 1) {
             for (int t = 0; t < m; ++t) {
                 auto first = routes.ids.begin() + std::size_t(t) * K;
@@ -190,11 +196,12 @@ int metadata(bool fp8) {
                                                               ops::MoeEpilogue::Write, 1, 4097);
         });
     }
-    for (auto [first, last] : std::array<std::pair<int, int>, 13>{{{1, 17},
+    for (auto [first, last] : std::array<std::pair<int, int>, 14>{{{1, 17},
                                                                    {16, 17},
                                                                    {64, 65},
                                                                    {127, 129},
                                                                    {255, 257},
+                                                                   {271, 274},
                                                                    {511, 513},
                                                                    {767, 769},
                                                                    {1023, 1025},
@@ -330,6 +337,9 @@ int main(int argc, char** argv) {
                     if (fp8) {
                         for (int hits = 0; hits <= K; ++hits) add(2, "mixed", hits);
                         add(2, "pair", -1, true);
+                        for (int t : {272, 273}) add(t, "mixed");
+                        for (int t : {512, 513, 4097}) add(t, "population", -1, true, true);
+                        for (int t : {128, 4097}) add(t, "skew", 1, true, true);
                     }
                     add(1024, "jobs2", -1, true);
                     add(1024, "jobs3", -1, true);

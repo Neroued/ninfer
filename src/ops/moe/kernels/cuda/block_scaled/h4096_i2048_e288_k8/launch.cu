@@ -29,25 +29,34 @@ __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const i
     }
 }
 
-// Publish the maximum jobs per expert once, before either contraction consumes groups.
-__device__ void publish_density(Groups g, int jobs, int* maxima) {
+// Publish FP8 population facts once, before either contraction consumes groups.
+__device__ void publish_density(Groups g, int count, int columns, int* maxima, int* actives) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int maximum = jobs;
+    int maximum = count;
 #pragma unroll
     for (int delta = 16; delta; delta /= 2)
         maximum = max(maximum, __shfl_down_sync(0xffffffff, maximum, delta));
-    if (!lane) maxima[warp] = maximum;
+    const int active = __popc(__ballot_sync(0xffffffff, count > 0));
+    if (!lane) {
+        maxima[warp]  = maximum;
+        actives[warp] = active;
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
-        int result = 0;
+        int result = 0, active_total = 0;
 #pragma unroll
-        for (int w = 0; w < (kExperts + 31) / 32; ++w) result = max(result, maxima[w]);
-        g.jobs[1] = result;
+        for (int w = 0; w < (kExperts + 31) / 32; ++w) {
+            result = max(result, maxima[w]);
+            active_total += actives[w];
+        }
+        g.jobs[1] = (result + columns - 1) / columns;
+        g.jobs[2] = active_total;
+        g.jobs[3] = result;
     }
 }
 
 __global__ void scan_assignments(Groups g, int columns, bool density) {
-    __shared__ int scan[kExperts], maxima[(kExperts + 31) / 32];
+    __shared__ int scan[kExperts], maxima[(kExperts + 31) / 32], actives[(kExperts + 31) / 32];
     const int e     = threadIdx.x;
     const int count = g.counts[e];
     publish_load_range<kExperts>(g.load_range, count);
@@ -65,7 +74,7 @@ __global__ void scan_assignments(Groups g, int columns, bool density) {
     if (e == kExperts - 1) { g.offsets[kExperts] = scan[e]; }
     __syncthreads();
     const int jobs = (count + columns - 1) / columns;
-    if (density) publish_density(g, jobs, maxima);
+    if (density) publish_density(g, count, columns, maxima, actives);
     scan[e] = jobs;
     __syncthreads();
 #pragma unroll
@@ -100,7 +109,7 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
 __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
                             int assignments, int columns, bool density) {
     __shared__ int counts[kExperts], ranks[kTopK * 64], scan[kExperts],
-        maxima[(kExperts + 31) / 32];
+        maxima[(kExperts + 31) / 32], actives[(kExperts + 31) / 32];
     const int tid = threadIdx.x;
     counts[tid]   = 0;
     __syncthreads();
@@ -124,7 +133,7 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     g.offsets[tid]  = begin;
     if (tid == kExperts - 1) { g.offsets[kExperts] = scan[tid]; }
     const int jobs = (count + columns - 1) / columns;
-    if (density) publish_density(g, jobs, maxima);
+    if (density) publish_density(g, count, columns, maxima, actives);
     __syncthreads();
     scan[tid] = jobs;
     __syncthreads();

@@ -91,11 +91,15 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
     cp_commit();
 }
 
-template <int Columns, bool Gate, bool Atomic = false>
+enum class PopulationRoute { All, Gate, Down, WideDown };
+
+template <int Columns, bool Gate, bool Atomic = false,
+          PopulationRoute Population = PopulationRoute::All>
 __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const std::uint8_t* input, const float* input_scales, ExpertMatrixDeviceView bank,
     Groups groups, std::uint8_t* product, float* product_scales, float* contributions,
-    const float* coefficients, float* routed_sum, int subtiles, float limit, int dense_blocks) {
+    const float* coefficients, float* routed_sum, int subtiles, float limit, int dense_blocks,
+    Fp8PopulationTuning population = {}, int dense_assignment_threshold = 0) {
     using S = Schedule<Columns, Gate>;
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto& tile              = *reinterpret_cast<TileStorage<S>*>(shared_bytes);
@@ -104,14 +108,61 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const int wm = warp % S::warp_rows, wn = warp / S::warp_rows;
     const int tasks = *groups.jobs * row_tiles * subtiles;
     if (!tasks) return;
-    const int stride = groups.jobs[1] <= 2 ? int(gridDim.x) : dense_blocks;
+    bool few_experts = false;
+    if constexpr (Population != PopulationRoute::All) {
+        few_experts     = groups.jobs[2] <= population.ordered_expert_limit;
+        const bool wide = population.wide_down && !few_experts &&
+                          groups.offsets[kExperts] > groups.jobs[2] * population.wide_min_average;
+        if constexpr (Population == PopulationRoute::Down) {
+            if (wide) return;
+        }
+        if constexpr (Population == PopulationRoute::WideDown) {
+            if (!wide) return;
+        }
+    }
+    const bool sparse = Population == PopulationRoute::All
+                            ? groups.jobs[1] <= 2
+                            : groups.jobs[3] <= dense_assignment_threshold;
+    const int stride  = sparse ? int(gridDim.x) : dense_blocks;
     if (blockIdx.x >= stride) return;
+    // Routes have distinct IDs per token, so one selected expert gives every
+    // live output element exactly one writer, including after job permutation.
+    const bool exclusive_output =
+        Atomic && Population == PopulationRoute::Down && groups.jobs[2] == 1;
     for (int task = blockIdx.x; task < tasks; task += stride) {
-        const int job = task / (row_tiles * subtiles), row0 = (task % row_tiles) * 128;
-        const int subtile = (task / row_tiles) % subtiles;
-        const int expert  = groups.job_experts[job];
-        const int begin   = groups.offsets[expert] + groups.job_columns[job] + subtile * Columns;
-        const int end     = groups.offsets[expert + 1];
+        int job = task / (row_tiles * subtiles), row = task % row_tiles;
+        int subtile = (task / row_tiles) % subtiles;
+        if constexpr (Population == PopulationRoute::Gate || Population == PopulationRoute::Down) {
+            if (few_experts) {
+                const int window = population.row_window;
+                if constexpr (Gate) {
+                    const int e       = groups.job_experts[job];
+                    const int columns = groups.offsets[e + 1] - groups.offsets[e];
+                    const int expert_jobs =
+                        (columns + Columns * subtiles - 1) / (Columns * subtiles);
+                    const int ordinal   = groups.job_columns[job] / (Columns * subtiles);
+                    const int first_job = job - ordinal;
+                    const int flat   = ordinal * row_tiles * subtiles + subtile * row_tiles + row;
+                    const int span   = expert_jobs * subtiles * window;
+                    const int within = flat % span;
+                    row              = flat / span * window + within % window;
+                    const int column_job = within / window;
+                    job                  = first_job + column_job / subtiles;
+                    subtile              = column_job % subtiles;
+                } else {
+                    const int span       = *groups.jobs * subtiles * window;
+                    const int within     = task % span;
+                    row                  = task / span * window + within % window;
+                    const int column_job = within / window;
+                    job                  = column_job / subtiles;
+                    subtile              = column_job % subtiles;
+                }
+            }
+        }
+        const int row0   = row * 128;
+        const int expert = groups.job_experts[job];
+        const int begin  = groups.offsets[expert] + groups.job_columns[job] + subtile * Columns;
+        const int end    = groups.offsets[expert + 1];
         if (begin >= end) { continue; }
         // Only populated8-token atoms read B. Retain zero-fill within the final partial atom.
         const int active_columns = min(Columns, ((end - begin + 7) / 8) * 8);
@@ -134,41 +185,142 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                 Gate ? __bfloat162float(
                            weight.scales[((row0 + kIntermediate) / 128) * (S::k / 128) + kt])
                      : sg;
+            if constexpr (Population == PopulationRoute::All) {
 #pragma unroll
-            for (int n = 0; n < S::mma_columns; ++n) {
-                const int column = wn * S::warp_columns + n * 8;
-                if (begin + column < end) {
-                    float p[2][4] = {};
+                for (int n = 0; n < S::mma_columns; ++n) {
+                    const int column = wn * S::warp_columns + n * 8;
+                    if (begin + column < end) {
+                        float p[2][4] = {};
 #pragma unroll
-                    for (int ki = 0; ki < 4; ++ki) {
-                        unsigned a[2][4], b[2];
+                        for (int ki = 0; ki < 4; ++ki) {
+                            unsigned a[2][4], b[2];
 #pragma unroll
-                        for (int m = 0; m < 2; ++m) {
-                            const int row_base = Gate ? wm * 16 + m * 128 : wm * 32 + m * 16;
-                            const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
-                            const int col      = ki * 32 + (lane >> 4) * 16;
-                            ldmatrix_x4(a[m][0], a[m][1], a[m][2], a[m][3],
-                                        smem_addr(tile.stage.weights[stage] + row * S::bk +
+                            for (int m = 0; m < 2; ++m) {
+                                const int row_base = Gate ? wm * 16 + m * 128 : wm * 32 + m * 16;
+                                const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
+                                const int col      = ki * 32 + (lane >> 4) * 16;
+                                ldmatrix_x4(a[m][0], a[m][1], a[m][2], a[m][3],
+                                            smem_addr(tile.stage.weights[stage] + row * S::bk +
+                                                      swizzle<S>(row, col)));
+                            }
+                            const int row = column + (lane & 7),
+                                      col = ki * 32 + ((lane >> 3) & 1) * 16;
+                            ldmatrix_x2(b[0], b[1],
+                                        smem_addr(tile.stage.input[stage] + row * S::bk +
                                                   swizzle<S>(row, col)));
-                        }
-                        const int row = column + (lane & 7), col = ki * 32 + ((lane >> 3) & 1) * 16;
-                        ldmatrix_x2(b[0], b[1],
-                                    smem_addr(tile.stage.input[stage] + row * S::bk +
-                                              swizzle<S>(row, col)));
 #pragma unroll
-                        for (int m = 0; m < 2; ++m) {
-                            mma_fp8_e4m3(p[m][0], p[m][1], p[m][2], p[m][3], a[m][0], a[m][1],
-                                         a[m][2], a[m][3], b[0], b[1]);
+                            for (int m = 0; m < 2; ++m) {
+                                mma_fp8_e4m3(p[m][0], p[m][1], p[m][2], p[m][3], a[m][0], a[m][1],
+                                             a[m][2], a[m][3], b[0], b[1]);
+                            }
+                        }
+#pragma unroll
+                        for (int v = 0; v < 4; ++v) {
+                            const int source = tile.sources[column + (lane & 3) * 2 + (v & 1)];
+                            const float sx =
+                                source >= 0 ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
+                                            : 0;
+                            acc[0][n][v] = fmaf(p[0][v], sg * sx, acc[0][n][v]);
+                            acc[1][n][v] = fmaf(p[1][v], su * sx, acc[1][n][v]);
                         }
                     }
+                }
+            } else if (few_experts || Population == PopulationRoute::WideDown) {
+                constexpr int cluster = 2 < S::mma_columns ? 2 : S::mma_columns;
 #pragma unroll
-                    for (int v = 0; v < 4; ++v) {
-                        const int source = tile.sources[column + (lane & 3) * 2 + (v & 1)];
-                        const float sx =
-                            source >= 0 ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
-                                        : 0;
-                        acc[0][n][v] = fmaf(p[0][v], sg * sx, acc[0][n][v]);
-                        acc[1][n][v] = fmaf(p[1][v], su * sx, acc[1][n][v]);
+                for (int n0 = 0; n0 < S::mma_columns; n0 += cluster) {
+                    const int first_column = wn * S::warp_columns + n0 * 8;
+                    if (begin + first_column < end) {
+                        float p[2][cluster][4] = {};
+#pragma unroll
+                        for (int ki = 0; ki < 4; ++ki) {
+                            unsigned a[2][4];
+#pragma unroll
+                            for (int m = 0; m < 2; ++m) {
+                                const int row_base = Gate ? wm * 16 + m * 128 : wm * 32 + m * 16;
+                                const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
+                                const int col      = ki * 32 + (lane >> 4) * 16;
+                                ldmatrix_x4(a[m][0], a[m][1], a[m][2], a[m][3],
+                                            smem_addr(tile.stage.weights[stage] + row * S::bk +
+                                                      swizzle<S>(row, col)));
+                            }
+#pragma unroll
+                            for (int n = 0; n < cluster; ++n) {
+                                const int column = first_column + n * 8;
+                                if (begin + column < end) {
+                                    unsigned b[2];
+                                    const int row = column + (lane & 7),
+                                              col = ki * 32 + ((lane >> 3) & 1) * 16;
+                                    ldmatrix_x2(b[0], b[1],
+                                                smem_addr(tile.stage.input[stage] + row * S::bk +
+                                                          swizzle<S>(row, col)));
+#pragma unroll
+                                    for (int m = 0; m < 2; ++m)
+                                        mma_fp8_e4m3(p[m][n][0], p[m][n][1], p[m][n][2], p[m][n][3],
+                                                     a[m][0], a[m][1], a[m][2], a[m][3], b[0],
+                                                     b[1]);
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int n = 0; n < cluster; ++n) {
+                            const int column = first_column + n * 8;
+                            if (begin + column < end) {
+#pragma unroll
+                                for (int v = 0; v < 4; ++v) {
+                                    const int source =
+                                        tile.sources[column + (lane & 3) * 2 + (v & 1)];
+                                    const float sx =
+                                        source >= 0
+                                            ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
+                                            : 0;
+                                    acc[0][n0 + n][v] =
+                                        fmaf(p[0][n][v], sg * sx, acc[0][n0 + n][v]);
+                                    acc[1][n0 + n][v] =
+                                        fmaf(p[1][n][v], su * sx, acc[1][n0 + n][v]);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int n = 0; n < S::mma_columns; ++n) {
+                    const int column = wn * S::warp_columns + n * 8;
+                    if (begin + column < end) {
+                        float p[2][4] = {};
+#pragma unroll
+                        for (int ki = 0; ki < 4; ++ki) {
+                            unsigned a[2][4], b[2];
+#pragma unroll
+                            for (int m = 0; m < 2; ++m) {
+                                const int row_base = Gate ? wm * 16 + m * 128 : wm * 32 + m * 16;
+                                const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
+                                const int col      = ki * 32 + (lane >> 4) * 16;
+                                ldmatrix_x4(a[m][0], a[m][1], a[m][2], a[m][3],
+                                            smem_addr(tile.stage.weights[stage] + row * S::bk +
+                                                      swizzle<S>(row, col)));
+                            }
+                            const int row = column + (lane & 7),
+                                      col = ki * 32 + ((lane >> 3) & 1) * 16;
+                            ldmatrix_x2(b[0], b[1],
+                                        smem_addr(tile.stage.input[stage] + row * S::bk +
+                                                  swizzle<S>(row, col)));
+#pragma unroll
+                            for (int m = 0; m < 2; ++m) {
+                                mma_fp8_e4m3(p[m][0], p[m][1], p[m][2], p[m][3], a[m][0], a[m][1],
+                                             a[m][2], a[m][3], b[0], b[1]);
+                            }
+                        }
+#pragma unroll
+                        for (int v = 0; v < 4; ++v) {
+                            const int source = tile.sources[column + (lane & 3) * 2 + (v & 1)];
+                            const float sx =
+                                source >= 0 ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
+                                            : 0;
+                            acc[0][n][v] = fmaf(p[0][v], sg * sx, acc[0][n][v]);
+                            acc[1][n][v] = fmaf(p[1][v], su * sx, acc[1][n][v]);
+                        }
                     }
                 }
             }
@@ -198,9 +350,12 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                             const int row = row0 + wm * 32 + m * 16 + (lane >> 2) + (v / 2) * 8;
                             if constexpr (Atomic) {
                                 const int assignment = groups.assignments[begin + column];
-                                atomicAdd(routed_sum + std::int64_t(assignment / kTopK) * kHidden +
-                                              row,
-                                          acc[m][n][v] * coefficients[assignment]);
+                                const auto index = std::int64_t(assignment / kTopK) * kHidden + row;
+                                const float value = acc[m][n][v] * coefficients[assignment];
+                                if (exclusive_output)
+                                    routed_sum[index] = value;
+                                else
+                                    atomicAdd(routed_sum + index, value);
                             } else {
                                 contributions[std::int64_t(begin + column) * kHidden + row] =
                                     acc[m][n][v];

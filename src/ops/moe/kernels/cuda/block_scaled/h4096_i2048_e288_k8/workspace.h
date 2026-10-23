@@ -44,7 +44,9 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         g.jobs             = integers(fp8 ? 4 : 2);
         if (plan.dense.gate_columns) g.load_range = integers(2);
         g.assignments = integers(assignments);
-        if (!plan.atomic_output) { g.inverse = integers(assignments); }
+        if (!plan.atomic_output || (fp8 && plan.fp8.dense_down)) {
+            g.inverse = integers(assignments);
+        }
     }
     return out;
 }

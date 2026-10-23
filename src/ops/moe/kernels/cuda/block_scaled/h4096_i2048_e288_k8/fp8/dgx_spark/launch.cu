@@ -1,5 +1,6 @@
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/compute.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/dense_down.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/vector_pair.cuh"
 #include "ops/common/host/launch.h"
 
@@ -60,7 +61,7 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
             static_cast<float*>(s.product_scales),
             static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles,
             plan.clamp_limit, std::min(blocks, execution.multiprocessor_count() * 2), plan.fp8,
-            2 * plan.gate_columns);
+            2 * plan.gate_columns, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -116,6 +117,21 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
     if (plan.fp8.wide_down)
         launch_mma<false, Fp8PopulationTuning::kWideDownColumns, PopulationRoute::WideDown>(
             x, experts, routes, s, plan, execution);
+    if (plan.fp8.dense_down) {
+        constexpr int columns = 64;
+        const int tasks       = (kHidden / 128) * ((x.ne[1] + columns - 1) / columns);
+        const int blocks =
+            std::min(tasks, execution.multiprocessor_count() * plan.queued_ctas_per_sm);
+        const int bytes = common::prepare_shared<sizeof(DenseDownStorage<columns>),
+                                                 dense_eight_down<columns>, true>();
+        dense_eight_down<columns>
+            <<<blocks, Schedule<columns, false>::threads, bytes, execution.stream()>>>(
+                s.product_codes, static_cast<const float*>(s.product_scales), experts.bank.down,
+                s.groups, static_cast<const int*>(routes.ids.data),
+                static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
+                plan.fp8.row_window);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,

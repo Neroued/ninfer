@@ -340,6 +340,7 @@ int main(int argc, char** argv) {
                         for (int t : {9, 272, 273}) add(t, "mixed");
                         for (int t : {512, 513, 4097}) add(t, "population", -1, true, true);
                         for (int t : {128, 4097}) add(t, "skew", 1, true, true);
+                        for (int t : {1024, 4097}) add(t, "skew", 8, true, true);
                     }
                     add(1024, "jobs2", -1, true);
                     add(1024, "jobs3", -1, true);

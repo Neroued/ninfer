@@ -15,6 +15,7 @@ struct Fp8PopulationTuning {
     int ordered_expert_limit              = 0;
     int wide_min_average                  = 0;
     bool wide_down                        = false;
+    bool dense_down                       = false;
 };
 
 struct Plan {

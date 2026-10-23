@@ -22,13 +22,14 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
         plan.clamped.fp8 = {.row_window           = 4,
                             .ordered_expert_limit = kOrderedExperts,
                             .wide_min_average     = kWideAverage,
-                            .wide_down            = t >= kWideStart};
+                            .wide_down            = t >= kWideStart,
+                            .dense_down           = t >= 1024};
     return plan;
 }
 } // namespace
 
 const ShapePolicy& fp8_h4096_i2048_e288_k8() {
-    static constexpr int boundaries[]{2, 3, 9, 17, 33, 65, 257, kWideStart};
+    static constexpr int boundaries[]{2, 3, 9, 17, 33, 65, 257, kWideStart, 1024};
     static const ShapePolicy policy{.select                = select_plan,
                                     .allocation_boundaries = boundaries,
                                     .scaled_shared         = false,

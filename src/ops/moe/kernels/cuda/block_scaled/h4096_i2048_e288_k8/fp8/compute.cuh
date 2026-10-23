@@ -93,12 +93,17 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
 
 enum class PopulationRoute { Gate, Down, WideDown };
 
+__device__ __forceinline__ bool dense_eight(Groups groups, int tokens) {
+    // Distinct route IDs per token make these eight experts present in every token.
+    return groups.jobs[2] == kTopK && groups.offsets[kExperts] == kTopK * tokens;
+}
+
 template <int Columns, bool Gate, PopulationRoute Population>
 __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const std::uint8_t* input, const float* input_scales, ExpertMatrixDeviceView bank,
     Groups groups, std::uint8_t* product, float* product_scales, const float* coefficients,
-    float* routed_sum, int subtiles, float limit, int dense_blocks,
-    Fp8PopulationTuning population = {}, int dense_assignment_threshold = 0) {
+    float* routed_sum, int subtiles, float limit, int dense_blocks, Fp8PopulationTuning population,
+    int dense_assignment_threshold, int tokens) {
     using S = Schedule<Columns, Gate>;
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto& tile              = *reinterpret_cast<TileStorage<S>*>(shared_bytes);
@@ -107,6 +112,9 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const int wm = warp % S::warp_rows, wn = warp / S::warp_rows;
     const int tasks = *groups.jobs * row_tiles * subtiles;
     if (!tasks) return;
+    if constexpr (!Gate) {
+        if (population.dense_down && dense_eight(groups, tokens)) return;
+    }
     const bool few_experts = groups.jobs[2] <= population.ordered_expert_limit;
     const bool wide        = population.wide_down && !few_experts &&
                       groups.offsets[kExperts] > groups.jobs[2] * population.wide_min_average;

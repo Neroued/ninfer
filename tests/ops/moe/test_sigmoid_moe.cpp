@@ -471,6 +471,7 @@ int main(int argc, char** argv) {
                 for (int m : {1, 8, 9, 128, 512, 4096}) cases.push_back({m, 4, true});
                 for (int hits : {0, 1, 8})
                     for (int m : {1, 128, 4096}) cases.push_back({m, hits});
+                if (fp8) cases.push_back({1024, 8, true});
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
                 for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});
                 for (int m : {2, 128, 4097, 8193})

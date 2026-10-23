@@ -10,6 +10,7 @@
 
 #include "common/roofline.h"
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear.h"
 
@@ -23,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -472,6 +474,17 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
 
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     if (qtype == QType::BF16) {
+        if (n == 16384 && k == 1536) {
+            auto direct = bench::make_direct_bf16_weight(20480, k);
+            const std::array parent_shape{std::uint64_t(20480), std::uint64_t(k)};
+            const WeightParent parent{
+                weight_geometry(QType::BF16, QuantLayout::Contiguous, parent_shape),
+                direct.storage.device(), static_cast<const std::byte*>(direct.storage.data())};
+            const auto elements = std::uint64_t(n) * k;
+            const auto prefix =
+                native_weight({{std::uint64_t(n), std::uint64_t(k)}, {{&parent, 0, elements}}});
+            return {std::move(direct.storage), prefix, elements * 2};
+        }
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();
         return {std::move(direct.storage), direct.weight, model_bytes};
@@ -529,6 +542,10 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         return bench::kRoofline.bf16_f32_tflops;
     }
     if (point.qtype == QType::BF16 && point.n == 20480 && point.k == 1536 && point.t > 0) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
+    if (point.qtype == QType::BF16 && point.n == 16384 && point.k == 1536 && point.t > 0) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }

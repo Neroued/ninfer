@@ -342,6 +342,7 @@ void run_bf16_extensions(Suite& suite) {
     using namespace ninfer::test::linear;
     const std::array geometries{
         Geometry{20480, 1536, {16, 32, 64, 128, 256}},
+        Geometry{16384, 1536, {16, 32, 64, 128, 256}},
     };
     for (const auto& geometry : geometries) {
         std::set<int> points{1, 4, 8, 128, 4096, 4097};
@@ -355,15 +356,16 @@ void run_bf16_extensions(Suite& suite) {
         calls.push_back({8, CallForm::A16Convenience});
         calls.push_back({17, CallForm::Policy, ops::LinearPolicy::AllowA8});
         calls.push_back({64, CallForm::Policy, ops::LinearPolicy::AllowA4});
-        const auto seed = std::uint32_t(geometry.n + geometry.k + 431);
+        const auto seed       = std::uint32_t(geometry.n + geometry.k + 431);
+        const int parent_rows = geometry.n == 16384 && geometry.k == 1536 ? 20480 : 0;
         ShapeCase sampled{geometry.n, geometry.k, seed, Comparison::Sampled, true, calls};
-
+        sampled.parent_rows = parent_rows;
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, sampled);
         add_workspace_cases(suite, QType::BF16, geometry.n, geometry.k);
 
         const std::array full{Invocation{1}, Invocation{17}};
         ShapeCase complete{geometry.n, geometry.k, seed + 1, Comparison::Full, true, full};
-
+        complete.parent_rows = parent_rows;
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, complete);
 
         if (geometry.k == 1536) {
@@ -376,7 +378,7 @@ void run_bf16_extensions(Suite& suite) {
                                    true,
                                    calls,
                                    ActivationPattern::Cancellation};
-
+            cancellation.parent_rows = parent_rows;
             add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, cancellation_weight,
                       cancellation);
         }

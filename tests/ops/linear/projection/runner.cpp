@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ops/linear/projection/runner.h"
@@ -231,7 +232,14 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
         shape.comparison == Comparison::Full ? all_indices(shape.n)
         : shape.row_sampler                  ? shape.row_sampler(shape.n)
                                              : evenly_spaced_indices(shape.n);
-    quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
+    quantized_weight::PackedWeight host_weight =
+        generator(shape.parent_rows ? shape.parent_rows : shape.n, shape.k, shape.seed);
+    if (shape.parent_rows) {
+        if (shape.parent_rows <= shape.n || host_weight.weight.qtype != QType::BF16)
+            throw std::invalid_argument("linear test: prefix requires a larger BF16 parent");
+        std::fill(host_weight.payload.begin() + std::size_t(shape.n) * shape.k * 2,
+                  host_weight.payload.end(), 0xff);
+    }
     const std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
     std::vector<std::uint16_t> activation_bits =
@@ -260,7 +268,15 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
     DeviceBuffer device_weight(ninfer::test::cuda_environment().context.device(),
                                host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.size());
-    const Weight weight = host_weight.device_weight(device_weight.span());
+    Weight weight = host_weight.device_weight(device_weight.span());
+    if (shape.parent_rows) {
+        const std::array parent_shape{std::uint64_t(shape.parent_rows), std::uint64_t(shape.k)};
+        const WeightParent parent{
+            weight_geometry(QType::BF16, QuantLayout::Contiguous, parent_shape),
+            device_weight.device(), static_cast<const std::byte*>(device_weight.data())};
+        weight = native_weight({{std::uint64_t(shape.n), std::uint64_t(shape.k)},
+                                {{&parent, 0, std::uint64_t(shape.n) * shape.k}}});
+    }
 
     std::vector<double> full_reference;
     if (shape.comparison == Comparison::Full) {

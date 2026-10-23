@@ -55,6 +55,8 @@ struct ShapeCase {
     IndexSampler row_sampler                 = nullptr;
     IndexSampler column_sampler              = nullptr;
     bool verify_each_invocation              = false;
+    // Bind a native BF16 prefix view into a larger parent with a poisoned unused suffix.
+    std::int32_t parent_rows = 0;
 };
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,

@@ -5,6 +5,10 @@ stream: first output, subsequent output events, completion, errors and cancellat
 structured Serve logs explain cache and scheduling actions. A separate campaign controller starts
 a fresh server for each sample and records its effective configuration.
 
+Global diagnostics preserve startup `ranks` and `total_allocations` in `startup_resources`,
+independently of runtime interval availability. This observation has its own `status`;
+missing or incomplete startup resources are `unavailable` with a reason.
+
 ## Measurement contract
 
 Request JSON and media data URLs are prepared before timing. Each request owns a preconnected

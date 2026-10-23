@@ -8,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
+from tools.bench.serve_log import startup_resource_observation
+
 
 REQUEST_LOG_SCHEMA_VERSION = 31
 
@@ -166,6 +168,17 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    starts = [event for event in events if event.get("event") == "server_start"]
+    startup = starts[0] if len(starts) == 1 else {}
+    return {
+        **_runtime_interval_observations(events),
+        "startup_resources": startup_resource_observation(startup),
+        "startup_engine": startup.get("engine"),
+        "environment": startup.get("environment"),
+    }
+
+
+def _runtime_interval_observations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate server-wide interval deltas, independently of per-request attribution."""
     intervals = [event for event in events if event.get("event") == "throughput"]
     if not intervals:
@@ -270,8 +283,6 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         "observed" if final_intervals == [len(intervals) - 1]
         else "invalid" if final_intervals else "unconfirmed"
     )
-    starts = [event for event in events if event.get("event") == "server_start"]
-    startup = starts[0] if len(starts) == 1 else {}
     return {
         "status": "available", "server_instance_id": next(iter(servers)),
         "scope": "isolated_server_runtime_intervals", "intervals": len(intervals),
@@ -280,9 +291,6 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         "transfers": transfers, "host_work": host_work, "occupancy": occupancy,
         "scheduling": {field: total("scheduling", field) for field in
                        ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
-        "startup_memory": startup.get("memory"),
-        "startup_engine": startup.get("engine"),
-        "environment": startup.get("environment"),
     }
 
 

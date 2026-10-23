@@ -15,6 +15,7 @@ from tools.bench.run_serve_corpus import (
 from tools.bench.run_serve_concurrency import build_points
 from tools.bench import run_serve_corpus as corpus
 from tools.bench import run_serve_concurrency as concurrency
+from tools.bench.ttft.diagnostics import attach_generation_diagnostics
 
 
 @pytest.mark.parametrize(
@@ -71,7 +72,13 @@ def test_steady_throughput_excludes_recovery(section: str, field: str) -> None:
         concurrency.steady_metrics([recovery], 8)
 
 
-def test_result_record_parses_request_host_exposure() -> None:
+@pytest.mark.parametrize(
+    "vision_samples,vision_seconds,expected_vision",
+    [(0, 0.0, None), (1, 0.0, 0.0), (2, 0.125, 0.125)],
+)
+def test_result_record_parses_production_timings(
+    vision_samples: int, vision_seconds: float, expected_vision: float | None,
+) -> None:
     fixture = Fixture(
         name="fixture",
         messages=[],
@@ -110,10 +117,14 @@ def test_result_record_parses_request_host_exposure() -> None:
         },
         "timings_seconds": {
             "prepare": 0.1,
-            "vision": 0.0,
+            "ttft": 0.875,
+            "vision_stream": vision_seconds,
             "prefill": 0.2,
             "decode": 0.4,
-            "total": 0.7,
+            "total": 1.3,
+        },
+        "execution": {
+            "max_rank_gpu_intervals": {"vision_stream": {"count": vision_samples}},
         },
         "speculative": {
             "backend": "mtp",
@@ -128,9 +139,10 @@ def test_result_record_parses_request_host_exposure() -> None:
                 "engine_boundary": 0.001,
                 "session_call": 0.002,
                 "executor_poll": 0.003,
+                "executor_flush": 0.006,
                 "engine_commit_output": 0.004,
                 "engine_maintenance": 0.005,
-                "total": 0.015,
+                "total": 0.021,
             },
             "scheduler_yield_exposed_seconds": 0.3,
             "decode": {
@@ -144,13 +156,96 @@ def test_result_record_parses_request_host_exposure() -> None:
     record = build_result_record(
         spec, "measured-prefill-bindings", payload, response, event
     )
-    assert record["schema_version"] == 8
+    assert record["schema_version"] == 9
     assert record["kv_dtype"] == "fp8"
-    assert record["metrics"]["engine_host_exposed_ms"] == pytest.approx(15.0)
+    assert record["metrics"]["server_ttft_ms"] == pytest.approx(875.0)
+    assert record["metrics"]["vision_stream_seconds"] == expected_vision
+    assert record["metrics"]["vision_stream_samples"] == vision_samples
+    assert record["metrics"]["executor_flush_exposed_seconds"] == pytest.approx(0.006)
+    assert record["metrics"]["engine_host_exposed_ms"] == pytest.approx(21.0)
     assert record["metrics"]["decode_host_us_per_round"] == pytest.approx(5000.0)
     assert record["metrics"]["decode_scheduler_yield_us_per_round"] == pytest.approx(
         100000.0
     )
+
+
+@pytest.mark.parametrize("resource_case", ["single", "pair", "missing", "partial"])
+def test_startup_resources_reach_concurrency_and_ttft_reports(
+    tmp_path: Path, resource_case: str,
+) -> None:
+    ranks = [
+        {
+            "rank": rank,
+            "node": rank,
+            "device": 0,
+            "hardware": "test-gpu",
+            "shared_physical_memory": True,
+            "budget": {"context_capacity_bytes": (rank + 1) * 1024},
+            "resources": {"allocations": {"context_device_bytes": (rank + 1) * 1024}},
+        }
+        for rank in range(1 if resource_case == "single" else 2)
+    ]
+    resources = {
+        "ranks": ranks,
+        "total_allocations": {
+            "context_device_bytes": sum(
+                rank["budget"]["context_capacity_bytes"] for rank in ranks
+            ),
+        },
+    }
+    start = {
+        "artifact_type": "ninfer_serve_request_log",
+        "schema_version": corpus.SERVER_LOG_SCHEMA_VERSION,
+        "event": "server_start",
+        "server_instance_id": "serve-test",
+    }
+    if resource_case != "missing":
+        start["resources"] = resources
+    if resource_case == "partial":
+        del ranks[-1]["resources"]
+
+    fixture = Fixture("fixture", [], False, 2, "test")
+    point = concurrency.Point(
+        "model", "model", tmp_path / "model.ninfer", "mtp0", "none", 0,
+        "full", "greedy", "fp8", "corpus-makespan", 1,
+    )
+    done = {
+        "event": "request_done",
+        "result": {
+            "prompt_tokens": 10, "completion_tokens": 2, "computed_prefill_tokens": 10,
+        },
+        "speculative": {
+            "rounds": 0, "drafted_tokens": 0, "accepted_tokens": 0, "fallback_steps": 0,
+        },
+    }
+    interval = {
+        "event": "throughput",
+        "tokens": {"computed_prefill": 10, "committed_decode": 1},
+        "decode_batch": {"rounds": 1, "row_rounds": 1},
+    }
+    result = concurrency.ClientResult(
+        concurrency.Job(0, 0, fixture, 1, 2), 0.0, 1.0, 10, 2, "output_limit",
+    )
+    log = tmp_path / "server.jsonl"
+    point_report = concurrency.analyze_point(
+        point, [], log, start, "bindings", [done, interval], [result], 0.0, 1.0,
+    )
+    # Startup resources remain usable even when runtime intervals have not been logged yet.
+    log.write_text(json.dumps(start) + "\n")
+    run = {"requests": []}
+    assert attach_generation_diagnostics(run, log) is None
+    observed = run["global_diagnostics"]
+    assert observed["reason"] == "runtime_intervals_missing"
+    if resource_case in ("single", "pair"):
+        expected = {"status": "available", **resources}
+    else:
+        reason = (
+            "startup_resources_missing" if resource_case == "missing"
+            else "startup_resources_invalid"
+        )
+        expected = {"status": "unavailable", "reason": reason}
+    assert point_report["resources"] == expected
+    assert observed["startup_resources"] == expected
 
 
 def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -> None:

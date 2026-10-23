@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
+from tools.bench.serve_log import startup_resource_observation  # noqa: E402
 
 
 SUITES = ("decode-saturation", "corpus-makespan")
@@ -45,7 +46,7 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -767,7 +768,7 @@ def analyze_point(
         "command": list(command),
         "server_log": str(server_log),
         "engine": server_start.get("engine", {}),
-        "memory": server_start.get("memory", {}),
+        "resources": startup_resource_observation(server_start),
         "environment": server_start.get("environment", {}),
         "totals": done_totals,
         "decode_batch": {

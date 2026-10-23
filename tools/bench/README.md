@@ -166,8 +166,11 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 `server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
 category summaries. The output directory is supplied explicitly with `--output`.
 
-Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
+Its schema-v9 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
 exposure, and decode Host/Device-wait time per round received from the schema-v31 serving records.
+Server TTFT uses the logged first-token latency. Vision stream duration is nullable and carries
+its timing sample count. Resuming rejects older result schemas so the former phase-sum TTFT is
+not mixed into the current statistics.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
@@ -185,10 +188,12 @@ Both serving runners disable prefix reuse and set extra Device state and Host co
 MTP points include `mtp0`, `mtp3`, and `mtp5`. Use `--proposal-head full` for full-vocabulary
 proposals, including Qwen4Exp; the default `optimized` selects the model's optimized proposal head.
 
-Schema-v4 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
+Schema-v5 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
 `summary.md`. C=1 corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
 per-request phase summaries in that directory; older campaigns may have only point reports and
 server logs. Historical model pages identify the report directory associated with each table.
+Each point's `resources` retains the production `ranks` and `total_allocations`, with
+`status: available`. Missing or incomplete startup resources are marked `unavailable` with a reason.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \

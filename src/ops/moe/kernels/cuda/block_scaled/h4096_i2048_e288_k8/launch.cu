@@ -152,6 +152,7 @@ template <class Output>
 __global__ void reduce(Storage storage, const float* coefficients, Output output, int elements) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < elements) {
+        if (storage.partial_output && !storage.active_tokens[i / kHidden]) return;
         output.store(i, output.initial(i) +
                             routed_value(i / kHidden, i % kHidden, storage, coefficients));
     }
@@ -238,7 +239,10 @@ void launch_column_jobs(Groups groups, int tokens, int columns, bool preserve_ba
 
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             ExpertSubset subset, MoeEpilogue mode, Tensor& destination, const Plan& plan,
-            const Storage& s, CudaExecutionView execution) {
+            const Storage& storage, CudaExecutionView execution) {
+    auto s = storage;
+    if (s.partial_output && plan.atomic_output)
+        s.routed_sum = static_cast<float*>(destination.data);
     const auto stream = execution.stream();
     if (plan.vector) {
         if (plan.format == QType::NVFP4)
@@ -272,6 +276,9 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         nvfp4::launch_experts(x, experts, routes, plan, s, execution);
     else
         fp8::launch_experts(x, experts, routes, plan, s, execution);
+    // Atomic down already wrote each live FP32 column into the borrowed output.
+    // Inactive columns remain unreadable under the private contribution view.
+    if (s.partial_output && plan.atomic_output) return;
     with_output(destination, mode, [&](auto output) {
         const int elements = x.ne[1] * kHidden;
         reduce<<<(elements + 255) / 256, 256, 0, stream>>>(

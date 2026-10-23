@@ -3,6 +3,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/swiglu/dispatch.h"
+#include "ops/moe/routed_swiglu/cuda/contribution.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -11,6 +12,7 @@ namespace {
 struct WholeStorage {
     ExpertRoutes routes;
     Tensor routed;
+    Tensor valid_tokens;
 };
 
 template <class Arena>
@@ -18,6 +20,9 @@ WholeStorage allocate_whole(Arena& arena, int tokens) {
     WholeStorage s;
     s.routes = {arena.alloc(DType::I32, {8, tokens}), arena.alloc(DType::FP32, {8, tokens})};
     s.routed = arena.alloc(DType::FP32, {4096, tokens});
+    // Child Ops borrow a 256-byte-aligned cursor after this persistent metadata.
+    const auto validity_bytes = (std::size_t(tokens) * sizeof(int) + 255) / 256 * 256;
+    s.valid_tokens            = Tensor(arena.alloc_bytes(validity_bytes), DType::I32, {tokens});
     return s;
 }
 
@@ -30,8 +35,7 @@ void validate(const SigmoidMoeProfile& p, ExpertSubsetKind subset, int first, in
          p.routed.ffn.gate_up_type != QType::FP8_E4M3FN_BLOCK128X128_BF16))
         throw std::invalid_argument("topk_sigmoid_swiglu_moe: unsupported geometry or formats");
     (void)topk_sigmoid_route_workspace_capacity_bytes(p.routing, first, last);
-    (void)routed_swiglu_workspace_capacity_bytes(p.routed, subset, DType::FP32, MoeEpilogue::Write,
-                                                 first, last);
+    (void)detail::moe_routed::contribution_workspace_capacity_bytes(p.routed, subset, first, last);
     (void)swiglu_workspace_capacity_bytes(p.shared, first, last);
 }
 } // namespace
@@ -44,10 +48,10 @@ std::size_t topk_sigmoid_swiglu_moe_workspace_capacity_bytes(const SigmoidMoePro
         return swiglu_workspace_capacity_bytes(p.shared, first, last);
     WorkspaceLayoutBuilder layout;
     (void)allocate_whole(layout, last);
-    const auto work = std::max({topk_sigmoid_route_workspace_capacity_bytes(p.routing, first, last),
-                                routed_swiglu_workspace_capacity_bytes(
-                                    p.routed, subset, DType::FP32, MoeEpilogue::Write, first, last),
-                                swiglu_workspace_capacity_bytes(p.shared, first, last)});
+    const auto work = std::max(
+        {topk_sigmoid_route_workspace_capacity_bytes(p.routing, first, last),
+         detail::moe_routed::contribution_workspace_capacity_bytes(p.routed, subset, first, last),
+         swiglu_workspace_capacity_bytes(p.shared, first, last)});
     (void)layout.alloc_bytes(work);
     return layout.peak_bytes(1);
 }
@@ -79,11 +83,11 @@ void topk_sigmoid_swiglu_moe(const Tensor& x, const SigmoidMoeProfile& p,
     auto scope   = ws.scope();
     auto storage = allocate_whole(ws, tokens);
     topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, ws, execution);
-    routed_swiglu(x, p.routed, w.routed, storage.routes, subset, MoeEpilogue::Write, storage.routed,
-                  ws, execution);
-    detail::swiglu_ffn::launch_a16_ffn_join(x, w.shared, out,
-                                            static_cast<const float*>(storage.routed.data),
-                                            *p.shared.clamp_limit, ws, execution.stream());
+    const auto routed = detail::moe_routed::execute_contribution(
+        x, p.routed, w.routed, storage.routes, subset, storage.routed,
+        static_cast<int*>(storage.valid_tokens.data), ws, execution);
+    detail::swiglu_ffn::launch_a16_ffn_join(x, w.shared, out, routed, *p.shared.clamp_limit, ws,
+                                            execution.stream());
 #endif
 }
 } // namespace ninfer::ops

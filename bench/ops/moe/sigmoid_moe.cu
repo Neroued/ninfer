@@ -195,7 +195,8 @@ void run(const Options& o, Fixture& gate_up, Fixture& down) {
                         : "");
             // Explicit logical write+read minima, separate from operand traffic and DRAM.
             const std::uint64_t staging =
-                8ULL * 1024 * t + (routed ? (16ULL * ep::K + 8ULL * ep::E + 8ULL * ep::H) * t : 0);
+                8ULL * 1024 * t +
+                (routed ? (16ULL * ep::K + 8ULL * ep::E) * t + 8ULL * ep::H * active : 0);
             measurement::Row row;
             row.op     = "topk_sigmoid_swiglu_moe";
             row.format = o.format;

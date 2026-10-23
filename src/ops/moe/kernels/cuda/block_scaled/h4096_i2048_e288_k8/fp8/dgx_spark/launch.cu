@@ -148,6 +148,9 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
         }
         CUDA_CHECK(cudaGetLastError());
     };
-    with_output(destination, mode, down);
+    if (s.partial_output)
+        down(DenseContributionWithValidity{static_cast<float*>(destination.data), s.active_tokens});
+    else
+        with_output(destination, mode, down);
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8

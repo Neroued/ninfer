@@ -38,16 +38,6 @@ void gate_up(const Q8LinearOperands& p, ProductOutput output, float limit, cudaS
     return launch_q8_swiglu_tma<Bulk>(p, output, product, stream);
 }
 
-struct AddRoutedOutput {
-    __nv_bfloat16* destination;
-    const float* routed;
-
-    __device__ void store(int row, int token, float value) const {
-        const auto index   = std::int64_t(token) * 4096 + row;
-        destination[index] = __float2bfloat16_rn(value + routed[index]);
-    }
-};
-
 template <class Output>
 void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float limit,
          MemoryArena& workspace, cudaStream_t stream) {
@@ -90,9 +80,9 @@ void launch_q8_ffn(const Tensor& x, const SwiGLUWeights& weights, Tensor& out, f
 }
 
 void launch_q8_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& out,
-                        const float* routed, float limit, MemoryArena& workspace,
+                        RoutedSwiGLUContribution routed, float limit, MemoryArena& workspace,
                         cudaStream_t stream) {
-    run(x, weights, AddRoutedOutput{static_cast<__nv_bfloat16*>(out.data), routed}, limit,
+    run(x, weights, SwiGluRoutedOutput<4096>{static_cast<__nv_bfloat16*>(out.data), routed}, limit,
         workspace, stream);
 }
 } // namespace ninfer::ops::detail::swiglu_ffn

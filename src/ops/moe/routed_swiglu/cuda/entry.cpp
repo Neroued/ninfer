@@ -4,6 +4,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
+#include "ops/moe/routed_swiglu/cuda/contribution.h"
 #include "ops/moe/workspace.h"
 #include "ops/moe/kernels/cuda/groupwise_int/workspace.h"
 #include "ops/moe/kernels/cuda/block_scaled/workspace.h"
@@ -24,11 +25,13 @@ struct CallStorage {
 
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSubsetKind subset,
-                     int shared_intermediate, bool split_activation) {
+                     int shared_intermediate, bool split_activation, bool partial_output) {
     const bool shared = shared_intermediate != 0;
     if (plan.implementation == impl::Implementation::ClampedBlockScaled)
         return {.clamped = clamped::allocate(arena, plan.clamped, tokens,
-                                             subset != ExpertSubsetKind::None)};
+                                             subset != ExpertSubsetKind::None, partial_output)};
+    if (partial_output)
+        throw std::invalid_argument("routed contribution requires a clamped native profile");
     if (plan.implementation == impl::Implementation::BlockScaled) {
         CallStorage out;
         out.block_scaled =
@@ -47,7 +50,8 @@ CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSub
 }
 
 std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* shared,
-                     ExpertSubsetKind subset, DType type, MoeEpilogue mode, int first, int last) {
+                     ExpertSubsetKind subset, DType type, MoeEpilogue mode, int first, int last,
+                     bool partial_output) {
     const auto& shape = impl::shape_dispatch(profile);
     detail::validate_interval(first, last);
     detail::validate_subset_kind(subset);
@@ -63,7 +67,7 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
             WorkspaceLayoutBuilder layout;
             (void)allocate(layout, shape.select(profile.ffn, tokens, shared_intermediate), tokens,
                            subset, shared_intermediate,
-                           profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+                           profile.ffn.gate_up_type == QType::Q8_G32_FP16, partial_output);
             return layout.peak_bytes(1);
         });
 }
@@ -71,7 +75,7 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
 void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiGLUExperts& experts,
              const ExpertRoutes& routes, ExpertSubset subset, const ScaledSwiGLUTerm* shared,
              MoeEpilogue mode, Tensor& destination, MemoryArena& workspace,
-             CudaExecutionView execution) {
+             CudaExecutionView execution, int* valid_tokens) {
     const auto& shape = impl::shape_dispatch(profile);
     detail::MoeOperands operands("routed_swiglu", execution);
     const int tokens = operands.input(x, profile.ffn.hidden);
@@ -87,8 +91,9 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         operands.shared(shared->weights, *shared_profile);
         operands.coefficient(shared->coefficients, tokens, false);
     }
-    operands.workspace(workspace, capacity(profile, shared_profile ? &*shared_profile : nullptr,
-                                           subset.kind, destination.dtype, mode, tokens, tokens));
+    operands.workspace(workspace,
+                       capacity(profile, shared_profile ? &*shared_profile : nullptr, subset.kind,
+                                destination.dtype, mode, tokens, tokens, valid_tokens != nullptr));
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::RoutedSwiGLU, nvtx::Category::Moe, tokens);
     if (subset.kind == ExpertSubsetKind::None && !shared) {
@@ -111,10 +116,12 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         if (shared) {
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
-        auto scope         = workspace.scope();
-        const auto plan    = shape.select(profile.ffn, count, shared_intermediate);
-        const auto buffers = allocate(workspace, plan, count, subset.kind, shared_intermediate,
-                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+        auto scope      = workspace.scope();
+        const auto plan = shape.select(profile.ffn, count, shared_intermediate);
+        auto buffers =
+            allocate(workspace, plan, count, subset.kind, shared_intermediate,
+                     profile.ffn.gate_up_type == QType::Q8_G32_FP16, valid_tokens != nullptr);
+        if (valid_tokens) buffers.clamped.active_tokens = valid_tokens + offset;
 #if NINFER_TARGET_SPARK
         if (plan.implementation == impl::Implementation::ClampedBlockScaled) {
             clamped::launch(input, experts, selection, subset, mode, output, plan.clamped,
@@ -157,27 +164,52 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
 std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
                                                    ExpertSubsetKind subset, DType type,
                                                    MoeEpilogue mode, int first, int last) {
-    return capacity(profile, nullptr, subset, type, mode, first, last);
+    return capacity(profile, nullptr, subset, type, mode, first, last, false);
 }
 
 std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
                                                    const SwiGLUProfile& shared,
                                                    ExpertSubsetKind subset, DType type,
                                                    MoeEpilogue mode, int first, int last) {
-    return capacity(profile, &shared, subset, type, mode, first, last);
+    return capacity(profile, &shared, subset, type, mode, first, last, false);
 }
 
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, MoeEpilogue mode, Tensor& destination,
                    MemoryArena& workspace, CudaExecutionView execution) {
-    execute(x, profile, experts, routes, subset, nullptr, mode, destination, workspace, execution);
+    execute(x, profile, experts, routes, subset, nullptr, mode, destination, workspace, execution,
+            nullptr);
 }
 
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, const ScaledSwiGLUTerm& shared, MoeEpilogue mode,
                    Tensor& destination, MemoryArena& workspace, CudaExecutionView execution) {
-    execute(x, profile, experts, routes, subset, &shared, mode, destination, workspace, execution);
+    execute(x, profile, experts, routes, subset, &shared, mode, destination, workspace, execution,
+            nullptr);
 }
+
+namespace detail::moe_routed {
+std::size_t contribution_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
+                                                  ExpertSubsetKind subset, int first, int last) {
+    return capacity(profile, nullptr, subset, DType::FP32, MoeEpilogue::Write, first, last, true);
+}
+
+RoutedSwiGLUContribution execute_contribution(const Tensor& x, const RoutedSwiGLUProfile& profile,
+                                              const CudaSwiGLUExperts& experts,
+                                              const ExpertRoutes& routes, ExpertSubset subset,
+                                              Tensor& values, int* valid_tokens,
+                                              MemoryArena& workspace, CudaExecutionView execution) {
+    if (!valid_tokens || subset.kind == ExpertSubsetKind::None || values.dtype != DType::FP32)
+        throw std::invalid_argument("invalid private routed contribution output");
+    const auto& shape       = shape_dispatch(profile);
+    const int tokens        = x.ne[1];
+    const bool dense_vector = tokens > 0 && tokens <= shape.slice_tokens(subset.kind) &&
+                              shape.select(profile.ffn, tokens, 0).clamped.vector;
+    execute(x, profile, experts, routes, subset, nullptr, MoeEpilogue::Write, values, workspace,
+            execution, dense_vector ? nullptr : valid_tokens);
+    return {static_cast<const float*>(values.data), dense_vector ? nullptr : valid_tokens};
+}
+} // namespace detail::moe_routed
 } // namespace ninfer::ops

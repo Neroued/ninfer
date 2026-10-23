@@ -18,7 +18,7 @@ constexpr int H = 4096, I = 1024, E = 288, K = 8;
 
 struct Case {
     int m, hits = 4;
-    bool graph = false, none = false, all = false;
+    bool graph = false, none = false, all = false, zero_then_restore = false;
 };
 
 void put(quantized_weight::PackedWeight& w, int row, int col, float value) {
@@ -181,10 +181,11 @@ int run(Fixture& f, const Case& c) {
         for (int t = 0; t < c.m; ++t)
             for (int k = 0; k < H; ++k)
                 values[std::size_t(t) * H + k] = f.bits[(t % 3) * H + k] ^ (sign ? 0x8000 : 0);
+        const int phase_hits = c.zero_then_restore && phase == 1 ? 0 : c.hits;
         std::vector<float> corrections(E);
         for (int j = 0; j < K; ++j) {
             const int ordinal = (f.recipe == 4 ? 0 : (c.m * 13 + phase * 17)) + j;
-            corrections[j < c.hits ? f.bank.local_id(ordinal) : f.bank.remote_id(ordinal)] = 2;
+            corrections[j < phase_hits ? f.bank.local_id(ordinal) : f.bank.remote_id(ordinal)] = 2;
         }
         input.copy_from_host(values.data(), values.size() * 2);
         bias.copy_from_host(corrections.data(), E * 4);
@@ -238,10 +239,10 @@ int run(Fixture& f, const Case& c) {
             failures +=
                 verify_reduction(label + "/shared-a16", shared_actual, shared_reference, a16) +
                 shared_storage.verify_guards(label + "/shared-a16");
-            if (c.none || (c.hits == 0 && !c.all))
-                failures +=
-                    verify_reduction(label + "/shared-only-a16", actual, shared_reference, a16);
         }
+        if (c.none || (phase_hits == 0 && !c.all))
+            failures += verify_reduction(label + "/shared-only-a16", actual, reference,
+                                         {1.0 / 256, 1.0 / 256, 2.0 / 256});
         failures += verify_reduction(label, actual, reference, f.fp8 ? ep::kA8 : ep::kA4) +
                     input.verify_guards(label) + output.verify_guards(label) +
                     scratch.verify_guards(label) + f.bank.verify_controls();
@@ -463,6 +464,8 @@ int main(int argc, char** argv) {
                     for (int m : {1, 128, 4096}) cases.push_back({m, hits});
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
                 for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});
+                for (int m : {2, 128, 4097, 8193})
+                    cases.push_back({m, 8, true, false, false, true});
             } else {
                 for (int m : {1, 8, 128, 512, 4097}) {
                     cases.push_back({m, 8});
@@ -473,9 +476,10 @@ int main(int argc, char** argv) {
             for (const auto& c : cases)
                 catalogue.push_back({prefix + "/side" + std::to_string(side) + "/T" +
                                          std::to_string(c.m) + "/h" + std::to_string(c.hits) +
-                                         (c.none  ? "/none/"
-                                          : c.all ? "/all/"
-                                                  : "/mask/") +
+                                         (c.zero_then_restore ? "/zero-restore/"
+                                          : c.none            ? "/none/"
+                                          : c.all             ? "/all/"
+                                                              : "/mask/") +
                                          (c.graph ? "graph" : "eager"),
                                      {{"suite", "q8-shared"},
                                       {"format", format},

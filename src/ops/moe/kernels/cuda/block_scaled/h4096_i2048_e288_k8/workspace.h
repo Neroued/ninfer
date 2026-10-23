@@ -5,8 +5,9 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
 
 template <class Arena>
-Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed) {
+Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool partial_output) {
     Storage out;
+    out.partial_output = partial_output && routed;
     if (routed && plan.vector) {
         out.vector_activation =
             static_cast<float*>(arena.alloc(DType::FP32, {kIntermediate, kTopK * tokens}).data);
@@ -26,14 +27,14 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed) {
         out.product_codes      = bytes(std::size_t(assignments) * kIntermediate / packing);
         out.product_scales =
             bytes(std::size_t(assignments) * (kIntermediate / scale_group) * scale_bytes);
-        if (plan.atomic_output) {
+        if (plan.atomic_output && !partial_output) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
-        } else {
+        } else if (!plan.atomic_output) {
             out.contributions =
                 static_cast<float*>(arena.alloc(DType::FP32, {kHidden, assignments}).data);
         }
-        out.active_tokens = integers(tokens);
-        auto& g           = out.groups;
+        if (!partial_output) out.active_tokens = integers(tokens);
+        auto& g = out.groups;
         if (!plan.single_block_grouping) { g.counts = integers(kExperts); }
         g.offsets = integers(kExperts + 1);
         if (!plan.single_block_grouping) { g.cursors = integers(kExperts); }

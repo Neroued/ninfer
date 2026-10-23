@@ -142,7 +142,7 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
 #if NINFER_TARGET_SPARK
 namespace detail::swiglu_ffn {
 void launch_a16_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& output,
-                         const float* routed, float limit, MemoryArena& workspace,
+                         RoutedSwiGLUContribution routed, float limit, MemoryArena& workspace,
                          cudaStream_t stream) {
     switch (weights.gate_up.weight.qtype) {
     case QType::BF16:

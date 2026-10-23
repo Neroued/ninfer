@@ -49,6 +49,7 @@ struct Groups {
 };
 
 struct Storage {
+    bool partial_output         = false;
     std::uint8_t* input_codes   = nullptr;
     void* input_scales          = nullptr;
     std::uint8_t* product_codes = nullptr;

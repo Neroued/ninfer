@@ -1,5 +1,6 @@
 #pragma once
 #include "ninfer/ops/moe.h"
+#include "ops/moe/routed_swiglu/cuda/contribution.h"
 #include <cuda_bf16.h>
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"
 
@@ -18,12 +19,12 @@ void launch_nvfp4_quantized_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, fl
 
 void launch_nvfp4_down(const float* product, const Weight& down, Tensor& output, int tokens,
                        MemoryArena& workspace, cudaStream_t stream);
-void launch_a16_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&, const float* routed,
-                         float limit, MemoryArena&, cudaStream_t);
+void launch_a16_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
+                         RoutedSwiGLUContribution routed, float limit, MemoryArena&, cudaStream_t);
 void launch_q8_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit, MemoryArena&,
                    cudaStream_t);
-void launch_q8_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&, const float* routed,
-                        float limit, MemoryArena&, cudaStream_t);
+void launch_q8_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
+                        RoutedSwiGLUContribution routed, float limit, MemoryArena&, cudaStream_t);
 void launch_bf16_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit, MemoryArena&,
                      cudaStream_t);
 void launch_nvfp4_gu_float(const Tensor&, const Weight&, float*, float limit, MemoryArena&,
@@ -34,7 +35,7 @@ void launch_bf16_gu_compensated(const Tensor&, const Weight&, __nv_bfloat16*, fl
 void launch_nvfp4_down_tma128(const Weight&, Tensor&, Nvfp4A4Workspace, int tokens, cudaStream_t);
 void launch_nvfp4_down_tma256(const Weight&, Tensor&, Nvfp4A4Workspace, int tokens, cudaStream_t);
 
-void launch_bf16_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&, const float* routed,
-                          float limit, MemoryArena&, cudaStream_t);
+void launch_bf16_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
+                          RoutedSwiGLUContribution routed, float limit, MemoryArena&, cudaStream_t);
 
 } // namespace ninfer::ops::detail::swiglu_ffn

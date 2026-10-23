@@ -349,6 +349,7 @@ void run_bf16_extensions(Suite& suite) {
         Geometry{1024, 1024, {1, 8, 16, 32, 64, 256, 384, 768, 1536, 2304}},
         Geometry{8192, 1024, {1, 16, 32, 128, 256, 1024}},
         Geometry{1024, 4096, {1, 8, 16, 32, 64, 128, 256, 384, 768, 1536, 2304}},
+        Geometry{4096, 4096, {1, 16, 32, 192, 256, 512, 2560}},
     };
     for (const auto& geometry : geometries) {
         std::set<int> points{1, 4, 8, 128, 4096, 4097};
@@ -381,7 +382,7 @@ void run_bf16_extensions(Suite& suite) {
                       {geometry.n, geometry.k, seed + 2, Comparison::Sampled, true, tail,
                        ActivationPattern::KTail});
         }
-        if (geometry.k == 1536) {
+        if (geometry.k == 1536 || (geometry.n == 4096 && geometry.k == 4096)) {
             const std::array calls{Invocation{16}, Invocation{33}, Invocation{65}, Invocation{129},
                                    Invocation{257}};
             ShapeCase cancellation{geometry.n,

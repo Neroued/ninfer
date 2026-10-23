@@ -133,11 +133,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     float accum[Schedule::kMmaRows][Schedule::kMmaTokens][4] = {};
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
+            int phase = 0;
+            if constexpr (Schedule::kKPhaseStride > 0)
+                phase =
+                    static_cast<int>((std::int64_t(tile_r) * Schedule::kKPhaseStride) % tiles_k);
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
                 common::cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 common::cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
-                const int k_sector = split_begin / 64 + kt * (BK / 64);
+                // The two operands traverse the same rotated reduction groups.
+                int ordered_kt = kt;
+                if constexpr (Schedule::kKPhaseStride > 0) {
+                    ordered_kt += phase;
+                    if (ordered_kt >= tiles_k) ordered_kt -= tiles_k;
+                }
+                const int k_sector = split_begin / 64 + ordered_kt * (BK / 64);
                 WeightAccess::template load<Schedule>(a + stage * BR * BK, &descriptors.weight,
                                                       k_sector, row_begin, full + stage);
                 bf16_tma_load<Schedule>(b + stage * BT * BK, &descriptors.activation, k_sector,

@@ -350,6 +350,7 @@ void run_bf16_extensions(Suite& suite) {
         Geometry{8192, 1024, {1, 16, 32, 128, 256, 1024}},
         Geometry{1024, 4096, {1, 8, 16, 32, 64, 128, 256, 384, 768, 1536, 2304}},
         Geometry{4096, 4096, {1, 16, 32, 192, 256, 512, 2560}},
+        Geometry{20480, 4096, {1, 16, 32, 64, 192, 256, 512, 2560}},
     };
     for (const auto& geometry : geometries) {
         std::set<int> points{1, 4, 8, 128, 4096, 4097};

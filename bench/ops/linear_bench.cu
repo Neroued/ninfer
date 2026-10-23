@@ -540,7 +540,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         }
     }
     if (point.qtype == QType::Q8_G32_FP16 &&
-        (((point.n == 12288 || point.n == 4096) && point.k == 4096) ||
+        (((point.n == 12288 || point.n == 4096 || point.n == 2048) && point.k == 4096) ||
          (point.n == 2560 && (point.k == 3072 || point.k == 6144)) ||
          (point.n == 6144 && point.k == 2560) || (point.n == 10240 && point.k == 2560) ||
          (point.n == 12288 && point.k == 2560) || (point.n == 16384 && point.k == 2560) ||

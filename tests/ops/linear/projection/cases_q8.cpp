@@ -70,6 +70,11 @@ void q8_a16_conformance(Suite& suite) {
         }
         if (shape.n == 2048 && shape.k == 4096) {
             for (int t : {895, 896, 897}) calls.push_back({t});
+            for (int t : {191, 192, 193, 575, 576, 577, 2047, 2048, 2049, 4096, 4097})
+                calls.push_back({t});
+            for (int t : {49, 65, 129, 577, 2049})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+            add_workspace_cases(suite, ninfer::QType::Q8_G32_FP16, shape.n, shape.k);
         }
         if (shape.n == 4096 && shape.k == 4096) {
             for (int t : {255, 257}) calls.push_back({t});
@@ -204,16 +209,26 @@ void q8_a16_conformance(Suite& suite) {
     }
 #endif
     const std::array full_calls{Invocation{1}, Invocation{4}, Invocation{8}};
-    for (const Geometry shape :
-         {Geometry{2560, 6144, 311U}, Geometry{12288, 2560, 317U}, Geometry{10240, 2560, 337U},
+    for (const Geometry shape : {Geometry{2048, 4096, 977U}, Geometry{2560, 6144, 311U},
+                                 Geometry{12288, 2560, 317U}, Geometry{10240, 2560, 337U},
 #if NINFER_TARGET_SPARK
-          Geometry{2560, 3072, 389U}, Geometry{8192, 2560, 379U}, Geometry{12288, 4096, 919U},
-          Geometry{4096, 4096, 953U},
+                                 Geometry{2560, 3072, 389U}, Geometry{8192, 2560, 379U},
+                                 Geometry{12288, 4096, 919U}, Geometry{4096, 4096, 953U},
 #endif
-          Geometry{6144, 2560, 349U}, Geometry{16384, 2560, 367U}}) {
+                                 Geometry{6144, 2560, 349U}, Geometry{16384, 2560, 367U}}) {
         add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::TokenBlocks,
                   make_q8_g32_fp16_weight,
                   {shape.n, shape.k, shape.seed, Comparison::Full, true, full_calls});
+    }
+
+    {
+        const std::array calls{Invocation{1}, Invocation{17}, Invocation{49}, Invocation{65},
+                               Invocation{2049}};
+        for (auto pattern : {ActivationPattern::KTail, ActivationPattern::Cancellation}) {
+            add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::Hashed,
+                      make_q8_g32_fp16_weight,
+                      {2048, 4096, 1017U, Comparison::Sampled, true, calls, pattern});
+        }
     }
 }
 } // namespace

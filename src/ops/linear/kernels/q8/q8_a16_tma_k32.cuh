@@ -2,12 +2,14 @@
 
 #include "ops/linear/kernels/q8/q8_a16_tma.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail {
 
-// Full 128x128 output tiles, K32 computation, three raw-code/activation stages.
+// 128x128 output tiles with token-tail predication, K32 computation, and three raw stages.
 // K is a multiple of 32; incomplete final three-stage cycles consume only live slots.
 // Stored Q8 codes and FP16 scales are consumed without packing or global scratch.
-template <int RasterRows, int StaticK>
+template <int RasterRows, int StaticK, bool BiasedDecode = false>
 struct Q8A16TmaK32Schedule {
     static constexpr int kBlockRows = 128, kBlockTokens = 128, kBlockK = 32;
     static constexpr int kWarpRows = 64, kWarpTokens = 32;
@@ -15,8 +17,29 @@ struct Q8A16TmaK32Schedule {
     static constexpr int kThreads = 256, kMinBlocksPerSm = 2, kStages = 3;
     static constexpr int kMmaRows = 4, kMmaTokens = 4, kMmaKSteps = 2;
     static constexpr int kRasterRows = RasterRows, kStaticK = StaticK;
+    static constexpr bool kBiasedDecode  = BiasedDecode;
+    static constexpr bool kPrefetchCodes = false;
+    static constexpr int kCodeGroup = 1, kCodeStages = 3, kLookahead = 0;
     static constexpr int kSharedBytes = 45 * 1024;
     static_assert(RasterRows >= 0 && StaticK >= 96 && StaticK % 32 == 0);
+};
+
+// Group raw-code transfers independently of the three K32 activation stages.
+// One K128 code tile retains two resident CTAs while amortizing TMA requests.
+template <int RasterRows, int StaticK, bool BiasedDecode = false, int CodeGroup = 4,
+          int CodeStages = 1, int Lookahead = 4>
+struct Q8A16TmaK32PrefetchSchedule : Q8A16TmaK32Schedule<RasterRows, StaticK, BiasedDecode> {
+    static_assert(CodeGroup == 1 || CodeGroup == 2 || CodeGroup == 4);
+    static_assert(CodeStages >= 1 && CodeStages <= 3 && Lookahead > 0);
+    static_assert(StaticK % (32 * CodeGroup) == 0 && StaticK / (32 * CodeGroup) >= CodeStages);
+    static constexpr bool kPrefetchCodes = true;
+    static constexpr int kCodeGroup = CodeGroup, kCodeStages = CodeStages, kLookahead = Lookahead;
+    static constexpr int kSharedBytes =
+        ((128 * 32 * 2 + 3 * 128 * 32 * 2 + CodeStages * 128 * 32 * CodeGroup + 24 +
+          CodeStages * 8 + 1023) /
+         1024) *
+        1024;
+    static_assert(kSharedBytes <= 99 * 1024);
 };
 
 template <class Cfg>
@@ -27,13 +50,21 @@ struct Q8A16TmaK32Storage {
     alignas(8) std::uint64_t ready[3];
 };
 
+template <class Cfg>
+struct Q8A16TmaK32PrefetchStorage {
+    alignas(1024) __nv_bfloat16 weights[Cfg::kBlockRows * 32];
+    alignas(1024) __nv_bfloat16 activations[3][Cfg::kBlockTokens * 32];
+    alignas(128) std::uint8_t codes[Cfg::kCodeStages][Cfg::kBlockRows * 32 * Cfg::kCodeGroup];
+    alignas(8) std::uint64_t ready[3], codes_ready[Cfg::kCodeStages];
+};
+
 // 64-byte TMA swizzling uses address bits [8:7] to permute 16-byte chunks.
 // Each BF16 row is 64 bytes; two rows form one 128-byte swizzle row.
 __device__ __forceinline__ int q8_tma_swizzle_k32(int row, int column) {
     return column ^ (((row >> 1) & 3) << 3);
 }
 
-template <class Cfg, class Output, class Epilogue>
+template <class Cfg, bool Full, class Output, class Epilogue, class RowPolicy>
 __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tma_k32_kernel(
     Q8LinearOperands operands, const __grid_constant__ Q8A16TmaDescriptors maps, Output output,
     Epilogue epilogue, int token_begin, int token_count) {
@@ -48,10 +79,11 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
     constexpr int MT                = Cfg::kMmaRows;
     constexpr int NT                = Cfg::kMmaTokens;
     constexpr int KSUB              = Cfg::kMmaKSteps;
-    constexpr int kOutputRowsPerCta = BM;
-    constexpr bool Full             = true;
+    constexpr int kOutputRowsPerCta = RowPolicy::kOutputRowsPerCta;
+    const RowPolicy row_policy{};
 
-    using Storage = Q8A16TmaK32Storage<Cfg>;
+    using Storage = std::conditional_t<Cfg::kPrefetchCodes, Q8A16TmaK32PrefetchStorage<Cfg>,
+                                       Q8A16TmaK32Storage<Cfg>>;
     static_assert(sizeof(Storage) == Cfg::kSharedBytes);
     extern __shared__ __align__(1024) unsigned char scratch[];
     auto& storage = *reinterpret_cast<Storage*>(scratch);
@@ -105,16 +137,58 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
 #pragma unroll
         for (int stage = 0; stage < Cfg::kStages; ++stage)
             common::cta_mbarrier_init(&storage.ready[stage], 1);
+        if constexpr (Cfg::kPrefetchCodes)
+            for (int stage = 0; stage < Cfg::kCodeStages; ++stage)
+                common::cta_mbarrier_init(&storage.codes_ready[stage], 1);
         common::cta_mbarrier_fence_init();
     }
     __syncthreads();
     auto issue = [&](int stage, int kt) {
         if (tid == 0) {
-            constexpr int bytes = BN * BK * 2 + BM * BK;
+            constexpr int bytes = BN * BK * 2 + (Cfg::kPrefetchCodes ? 0 : BM * BK);
             auto* barrier       = &storage.ready[stage];
             common::cta_mbarrier_arrive_expect_tx(barrier, bytes);
             common::tma_load_2d(Bs[stage], &maps.x, kt * BK, n0, barrier);
-            common::tma_load_2d(Cr[stage], &maps.codes, kt * BK, m0, barrier);
+            if constexpr (!Cfg::kPrefetchCodes) {
+#pragma unroll
+                for (int panel = 0; panel < BM / RowPolicy::kTmaRowsPerPanel; ++panel) {
+                    constexpr int rows = RowPolicy::kTmaRowsPerPanel;
+                    common::tma_load_2d(Cr[stage] + panel * rows * BK, &maps.codes, kt * BK,
+                                        row_policy.weight_row(m0, panel * rows, m), barrier);
+                }
+            }
+        }
+    };
+
+    constexpr int code_groups = Cfg::kStaticK / (BK * Cfg::kCodeGroup);
+    const auto prefetch_codes = [&](int group) {
+        if constexpr (Cfg::kPrefetchCodes) {
+            if (tid == 0 && group < code_groups) {
+#pragma unroll
+                for (int panel = 0; panel < BM / RowPolicy::kTmaRowsPerPanel; ++panel)
+                    asm volatile(
+                        "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(
+                            &maps.codes),
+                        "r"(group * Cfg::kCodeGroup * BK),
+                        "r"(row_policy.weight_row(m0, panel * RowPolicy::kTmaRowsPerPanel, m))
+                        : "memory");
+            }
+        }
+    };
+    const auto issue_codes = [&](int stage, int group) {
+        if constexpr (Cfg::kPrefetchCodes) {
+            prefetch_codes(group + Cfg::kLookahead);
+            if (tid == 0) {
+                auto* barrier = &storage.codes_ready[stage];
+                common::cta_mbarrier_arrive_expect_tx(barrier, BM * BK * Cfg::kCodeGroup);
+#pragma unroll
+                for (int panel = 0; panel < BM / RowPolicy::kTmaRowsPerPanel; ++panel) {
+                    constexpr int rows = RowPolicy::kTmaRowsPerPanel;
+                    common::tma_load_2d(Cr[stage] + panel * rows * BK * Cfg::kCodeGroup,
+                                        &maps.codes, group * Cfg::kCodeGroup * BK,
+                                        row_policy.weight_row(m0, panel * rows, m), barrier);
+                }
+            }
         }
     };
 
@@ -126,16 +200,13 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
             const int item = tid + v * Cfg::kThreads;
             if (item < BM * (BK / 8)) {
                 const int row = item / (BK / 8), col = (item % (BK / 8)) * 8;
-                const int grow = m0 + row;
-                scale_regs[Slot][v] =
-                    (Full || grow < m)
-                        ? common::load_ldg<std::uint16_t>(
-                              scales + (std::int64_t(grow) * kg + kt * (BK / 32) + col / 32) * 2)
-                        : 0;
+                const int grow      = row_policy.weight_row(m0, row, m);
+                scale_regs[Slot][v] = common::load_ldg<std::uint16_t>(
+                    scales + (std::int64_t(grow) * kg + kt * (BK / 32) + col / 32) * 2);
             }
         }
     };
-    auto dequant_w = [&]<int Slot>() {
+    auto dequant_w = [&]<int Slot>(int kt) {
         constexpr int kChunksPerRow = BK / 8;
 #pragma unroll
         for (int v = 0; v < ScaleVecs; ++v) {
@@ -144,18 +215,16 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
             const int row      = item / kChunksPerRow;
             const int chunk    = item - row * kChunksPerRow;
             const int col      = chunk * 8;
-            const float scale  = __half2float(__ushort_as_half(scale_regs[Slot][v]));
-            const uint2 packed = *reinterpret_cast<const uint2*>(&Cr[Slot][row * BK + col]);
-            Q8TmaBf16x8Bits decoded;
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                const unsigned word = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
-                const int q0        = static_cast<int>(static_cast<std::int8_t>(word & 0xffu));
-                const int q1 = static_cast<int>(static_cast<std::int8_t>((word >> 8) & 0xffu));
-                decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                                           static_cast<float>(q1) * scale);
-            }
-            common::store_vec(&As[row * BK + q8_tma_swizzle_k32(row, col)], decoded.raw);
+            const uint2 packed = [&] {
+                if constexpr (Cfg::kPrefetchCodes)
+                    return *reinterpret_cast<const uint2*>(
+                        &Cr[(kt / Cfg::kCodeGroup) % Cfg::kCodeStages]
+                           [row * BK * Cfg::kCodeGroup + (kt % Cfg::kCodeGroup) * BK + col]);
+                else
+                    return *reinterpret_cast<const uint2*>(&Cr[Slot][row * BK + col]);
+            }();
+            common::store_vec(&As[row * BK + q8_tma_swizzle_k32(row, col)],
+                              q8_tma_decode_eight<Cfg::kBiasedDecode>(packed, scale_regs[Slot][v]));
         }
     };
 
@@ -166,10 +235,19 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
     issue(0, 0);
     issue(1, 1);
     issue(2, 2);
+    if constexpr (Cfg::kPrefetchCodes) {
+        for (int group = 0; group < Cfg::kLookahead; ++group) prefetch_codes(group);
+        for (int stage = 0; stage < Cfg::kCodeStages; ++stage) issue_codes(stage, stage);
+    }
     auto compute = [&]<int Slot>(int kt) {
         if (tid == 0) common::cta_mbarrier_wait(&storage.ready[Slot], (kt / 3) & 1);
+        if constexpr (Cfg::kPrefetchCodes)
+            if (kt % Cfg::kCodeGroup == 0 && tid == 0)
+                common::cta_mbarrier_wait(
+                    &storage.codes_ready[(kt / Cfg::kCodeGroup) % Cfg::kCodeStages],
+                    (kt / (Cfg::kCodeGroup * Cfg::kCodeStages)) & 1);
         __syncthreads();
-        dequant_w.template operator()<Slot>();
+        dequant_w.template operator()<Slot>(kt);
         unsigned reg_b[KSUB][NT][2];
 #pragma unroll
         for (int ks = 0; ks < KSUB; ++ks) {
@@ -188,6 +266,11 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
             stage_scales.template operator()<Slot>(kt + 3);
             issue(Slot, kt + 3);
         }
+        if constexpr (Cfg::kPrefetchCodes)
+            if (kt % Cfg::kCodeGroup == Cfg::kCodeGroup - 1 &&
+                kt / Cfg::kCodeGroup + Cfg::kCodeStages < code_groups)
+                issue_codes((kt / Cfg::kCodeGroup) % Cfg::kCodeStages,
+                            kt / Cfg::kCodeGroup + Cfg::kCodeStages);
 
         // Keep only the current and next A fragment live. The larger output tile
         // needs 64 accumulator registers/thread, so retaining all A fragments
@@ -251,27 +334,44 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_tm
     }
 }
 
-template <class Schedule, class Output, class Epilogue>
+template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class Output,
+          class Epilogue>
 void launch_q8_a16_tma_k32(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                            cudaStream_t stream) {
     validate_q8_operands(operands);
     if (operands.k != Schedule::kStaticK || operands.padded_k != operands.k ||
-        operands.rows % 128 != 0 || operands.tokens % 128 != 0)
-        throw std::invalid_argument("Q8 K32 TMA requires full 128x128 tiles and matching static K");
+        operands.rows % 128 != 0)
+        throw std::invalid_argument("Q8 K32 TMA requires full 128-row tiles and matching static K");
     Q8A16TmaDescriptors maps;
-    maps.x     = q8_a16_tensor_map(const_cast<__nv_bfloat16*>(operands.x),
-                                   CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, operands.k, operands.tokens,
-                                   std::uint64_t(operands.k) * 2, 32, 128, CU_TENSOR_MAP_SWIZZLE_64B);
-    maps.codes = q8_a16_tensor_map(const_cast<std::uint8_t*>(operands.codes),
-                                   CU_TENSOR_MAP_DATA_TYPE_UINT8, operands.k, operands.rows,
-                                   operands.k, 32, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    maps.x = q8_a16_tensor_map(const_cast<__nv_bfloat16*>(operands.x),
+                               CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, operands.k, operands.tokens,
+                               std::uint64_t(operands.k) * 2, 32, 128, CU_TENSOR_MAP_SWIZZLE_64B);
+    maps.codes =
+        q8_a16_tensor_map(const_cast<std::uint8_t*>(operands.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                          operands.k, operands.rows, operands.k, 32 * Schedule::kCodeGroup,
+                          RowPolicy::kTmaRowsPerPanel, CU_TENSOR_MAP_SWIZZLE_NONE);
     common::for_each_token_slice(operands.tokens, 128, [&](int offset, int count) {
-        constexpr auto kernel = q8_a16_tma_k32_kernel<Schedule, Output, Epilogue>;
-        constexpr int bytes   = linear_mma_shared_bytes<Schedule, Epilogue>;
-        static_assert(bytes >= sizeof(Q8A16TmaK32Storage<Schedule>) && bytes <= 48 * 1024);
-        kernel<<<dim3(operands.rows / 128, count / 128), 256, bytes, stream>>>(
-            operands, maps, output, epilogue, offset, count);
-        CUDA_CHECK(cudaGetLastError());
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel =
+                q8_a16_tma_k32_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
+            constexpr int bytes = linear_mma_shared_bytes<Schedule, Epilogue>;
+            using Storage =
+                std::conditional_t<Schedule::kPrefetchCodes, Q8A16TmaK32PrefetchStorage<Schedule>,
+                                   Q8A16TmaK32Storage<Schedule>>;
+            static_assert(bytes >= sizeof(Storage) && bytes <= 99 * 1024);
+            if constexpr (Schedule::kPrefetchCodes) (void)common::prepare_shared<bytes, kernel>();
+            constexpr int ratio = Schedule::kBlockRows / RowPolicy::kOutputRowsPerCta;
+            static_assert(Schedule::kBlockRows % RowPolicy::kOutputRowsPerCta == 0);
+            static_assert(Schedule::kBlockRows % RowPolicy::kTmaRowsPerPanel == 0);
+            kernel<<<dim3(operands.rows / ratio / RowPolicy::kOutputRowsPerCta,
+                          common::div_up(count, 128)),
+                     256, bytes, stream>>>(operands, maps, output, epilogue, offset, count);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (count % 128 == 0)
+            launch.template operator()<true>();
+        else
+            launch.template operator()<false>();
     });
 }
 } // namespace ninfer::ops::detail

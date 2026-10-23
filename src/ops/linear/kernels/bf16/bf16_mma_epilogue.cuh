@@ -27,9 +27,10 @@ private:
     }
 
 protected:
-    template <bool Streaming, class Output>
+    template <bool Streaming, bool TokenWindow = false, class Output>
     __device__ __forceinline__ void store_fragment_impl(const Output& output, int row, int token,
-                                                        float4 v, int tokens) const {
+                                                        float4 v, int tokens,
+                                                        int first_token = 0) const {
         const unsigned lane = threadIdx.x & 31;
         const int rb = row - int(lane >> 2), tb = token - 2 * int(lane & 3);
         const unsigned source = (lane & 3) * 8 + (lane >> 3);
@@ -46,14 +47,14 @@ protected:
         const unsigned ev = ((e0 >> shift) & 0xffffU) | (((e1 >> shift) & 0xffffU) << 16);
         const unsigned od = ((o0 >> shift) & 0xffffU) | (((o1 >> shift) & 0xffffU) << 16);
         const int rr = rb + 2 * int(lane & 7), tt = tb + 2 * int(lane >> 3);
-        if (tt < tokens) {
+        if (tt < tokens && (!TokenWindow || tt >= first_token)) {
             if constexpr (Streaming)
                 asm volatile("st.global.cs.u32 [%0], %1;" ::"l"(pointer(output, rr, tt)), "r"(ev)
                              : "memory");
             else
                 common::store_vec(pointer(output, rr, tt), ev);
         }
-        if (tt + 1 < tokens) {
+        if (tt + 1 < tokens && (!TokenWindow || tt + 1 >= first_token)) {
             if constexpr (Streaming)
                 asm volatile("st.global.cs.u32 [%0], %1;" ::"l"(pointer(output, rr, tt + 1)),
                              "r"(od)
@@ -68,6 +69,49 @@ public:
     __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
                                                    float4 v, int, int tokens) const {
         store_fragment_impl<false>(output, row, token, v, tokens);
+    }
+};
+
+// A CTA made entirely of compute warps, with complete 16-row output atoms.
+template <bool Streaming = false>
+struct Bf16MmaCtaWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {
+private:
+    template <class Schedule, bool TokenWindow, class Output>
+    __device__ __forceinline__ void
+    finish(const Output& output, float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4],
+           int row_begin, int token_begin, int rows, int tokens, int first_token) const {
+        const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+        const int wm = warp / Schedule::kWarpGridTokens, wn = warp % Schedule::kWarpGridTokens;
+        for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+            const int row = row_begin + wm * Schedule::kWarpRows + mi * 16 + (lane >> 2);
+            for (int ni = 0; ni < Schedule::kMmaTokens; ++ni) {
+                const int token =
+                    token_begin + wn * Schedule::kWarpTokens + ni * 8 + 2 * (lane & 3);
+                if (row - (lane >> 2) + 16 <= rows) {
+                    const float* a = accum[mi][ni];
+                    store_fragment_impl<Streaming, TokenWindow>(output, row, token,
+                                                                make_float4(a[0], a[1], a[2], a[3]),
+                                                                tokens, first_token);
+                }
+            }
+        }
+    }
+
+public:
+    template <class Schedule, bool Full, class Output>
+    __device__ __forceinline__ void
+    finish_tile(const Output& output, unsigned char*,
+                float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
+                int token_begin, int rows, int tokens) const {
+        finish<Schedule, false>(output, accum, row_begin, token_begin, rows, tokens, 0);
+    }
+
+    template <class Schedule, bool Full, class Output>
+    __device__ __forceinline__ void
+    finish_token_window(const Output& output, unsigned char*,
+                        float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
+                        int token_begin, int rows, int tokens, int first_token) const {
+        finish<Schedule, true>(output, accum, row_begin, token_begin, rows, tokens, first_token);
     }
 };
 

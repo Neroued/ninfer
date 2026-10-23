@@ -14,6 +14,7 @@
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
 #include "ops/linear/kernels/q8/q8_schedule.cuh"
+#include "ops/linear/kernels/q8/q8_mma_rows.cuh"
 #include "ops/linear/kernels/q8/q8_operands.h"
 
 #include <cuda_bf16.h>
@@ -33,15 +34,6 @@ static_assert(sizeof(Q8Bf16x8Bits) == 16);
 __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
-
-template <class Schedule>
-struct Q8MmaIdentityRows {
-    static constexpr int kOutputRowsPerCta = Schedule::kBlockRows;
-
-    __device__ __forceinline__ int weight_row(int row0, int local_row, int) const {
-        return row0 + local_row;
-    }
-};
 
 template <class Cfg, bool Full, bool FullK, class Output, class Epilogue, class RowPolicy>
 __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mma_kernel(
@@ -142,7 +134,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             const int chunk = item - row * (BK / 16);
             const int grow  = row_policy.weight_row(m0, row, m);
             auto* dst       = &Cr[row * BK + chunk * 16];
-            if constexpr (Full) {
+            if constexpr (Full || Cfg::kFullWeightTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 common::cp_async<16, Cfg::kWeightCache>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
@@ -156,7 +148,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             for (int row = tid; row < BM; row += Cfg::kThreads) {
                 const int grow = row_policy.weight_row(m0, row, m);
                 auto* dst      = &Sr[row * Cfg::kScaleCacheBytes];
-                if constexpr (Full) {
+                if constexpr (Full || Cfg::kFullWeightTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     common::cp_async<16, Cfg::kWeightCache>(dst, &scales[gi * 2]);
                 } else if (kg % 8 == 0) {

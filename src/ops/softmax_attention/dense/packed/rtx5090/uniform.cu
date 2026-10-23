@@ -50,6 +50,12 @@ void launch_uniform_tile(const Tensor& q, const Tensor& k, const Tensor& v,
 void launch_packed_attention_uniform(const Tensor& q, const Tensor& k, const Tensor& v,
                                      std::int32_t segment_length, Tensor& out,
                                      cudaStream_t stream) {
+    if (q.ne[0] == 64) {
+        const int tiles =
+            (q.ne[2] / segment_length) * (segment_length / 64 + (segment_length % 64 != 0));
+        return launch_flash<64, 64, 64, 2, 64>(q, k, v, nullptr, segment_length, tiles, out,
+                                               stream);
+    }
     launch_uniform_tile(q, k, v, segment_length, select_uniform_tile(segment_length), out, stream);
 }
 

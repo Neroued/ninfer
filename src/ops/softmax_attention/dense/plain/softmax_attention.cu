@@ -1,8 +1,8 @@
-#include "ninfer/ops/softmax_attention.h"
-#include "ops/softmax_attention/kernels/noncausal/operands.h"
+#include "ops/softmax_attention/dense/plain/launch.h"
 #include "ops/softmax_attention/kernels/noncausal/kernel.cuh"
+#include "ops/softmax_attention/kernels/noncausal/singleton.cuh"
 
-namespace ninfer::ops {
+namespace ninfer::ops::detail {
 namespace {
 
 std::int32_t select_tile(std::int32_t segment_length) {
@@ -28,24 +28,31 @@ std::int32_t select_tile(std::int32_t segment_length) {
 
 } // namespace
 
-void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                       AttentionHeadGeometry geometry, float scale, MemoryArena& workspace,
-                       Tensor& out, CudaExecutionView execution) {
-    const auto stream         = execution.stream();
-    const std::int32_t tokens = detail::noncausal::validate_qkv(
-        q, k, v, out, geometry, scale, "softmax_attention", execution.device());
-    common::operand::device(workspace.device(), execution.device(), "attention", "workspace");
-    auto scope            = workspace.scope();
+void launch_plain_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
+                            cudaStream_t stream) {
+    const int tokens = q.ne[2];
+    if (q.ne[0] == 64) {
+        if (tokens == 1) return launch_noncausal_singleton64(v, out, stream);
+        if (tokens >= 4096)
+            return launch_flash<128, 128, 64, 2, 64>(
+                q, k, v, nullptr, tokens, tokens / 128 + (tokens % 128 != 0), out, stream);
+        if (tokens <= 16)
+            return launch_flash<16, 16, 64, 4, 64>(q, k, v, nullptr, tokens, 1, out, stream);
+        if (tokens <= 32)
+            return launch_flash<32, 32, 64, 4, 64>(q, k, v, nullptr, tokens, 1, out, stream);
+        return launch_flash<64, 64, 64, 4, 64>(q, k, v, nullptr, tokens,
+                                               tokens / 64 + (tokens % 64 != 0), out, stream);
+    }
     const int tile        = select_tile(tokens);
     const int query_tiles = (tokens + tile - 1) / tile;
     switch (tile) {
     case 16:
-        return detail::launch_flash<16, 16>(q, k, v, nullptr, tokens, query_tiles, out, stream);
+        return launch_flash<16, 16>(q, k, v, nullptr, tokens, query_tiles, out, stream);
     case 32:
-        return detail::launch_flash<32, 32>(q, k, v, nullptr, tokens, query_tiles, out, stream);
+        return launch_flash<32, 32>(q, k, v, nullptr, tokens, query_tiles, out, stream);
     case 64:
-        return detail::launch_flash<64, 64>(q, k, v, nullptr, tokens, query_tiles, out, stream);
+        return launch_flash<64, 64>(q, k, v, nullptr, tokens, query_tiles, out, stream);
     }
 }
 
-} // namespace ninfer::ops
+} // namespace ninfer::ops::detail

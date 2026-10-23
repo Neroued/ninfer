@@ -6,8 +6,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kPackedDescriptorRows = 64;
-
 void launch_packed_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream);

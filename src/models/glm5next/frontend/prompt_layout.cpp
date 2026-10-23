@@ -259,7 +259,6 @@ std::optional<std::size_t> resolve_marker(const RenderedChat& rendered, const La
         marker.after_tool_call_count > message.tool_calls.size() ||
         marker.reasoning_bytes > message.reasoning_content.size())
         throw std::invalid_argument("cache assistant-content marker is outside the message");
-    if (!sources.content) return {};
     const auto prefix  = probes.content_prefix(marker);
     const auto partial = inspect(prefix, messages, continuation);
     const auto end     = message_end(partial, count);

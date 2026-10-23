@@ -19,16 +19,24 @@ struct TextSource {
 
 struct MessageSources {
     std::optional<TextSource> content;
-    // Indexed by the original message's parts; media has no text source.
+    // Indexed by the original message's parts, including canonical media wrappers.
     std::vector<std::optional<TextSource>> parts;
     TextSource reasoning;
     std::vector<std::uint32_t> tool_calls;
+};
+
+struct MediaPlaceholder {
+    std::size_t message;
+    std::size_t part;
+    MediaKind kind;
+    text::ByteSpan bytes;
 };
 
 struct RenderedChat {
     text::TemplateOutput output;
     std::vector<MessageSources> messages;
     std::vector<std::uint32_t> tools;
+    std::vector<MediaPlaceholder> media;
     bool starts_in_reasoning = false;
     std::string continuation_content;
 };

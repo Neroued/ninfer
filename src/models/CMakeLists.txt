@@ -3,6 +3,7 @@ add_library(ninfer_model_loading STATIC
   registry.cpp
   common/frontend/resources.cpp
   glm5next/frontend/resources.cpp
+  glm5next/frontend/processor_config.cpp
   common/bindings.cpp
   common/parallel.cpp
   common/weights.cpp
@@ -27,6 +28,8 @@ add_library(ninfer_model_control STATIC
   common/frontend/output_resources.cpp
   common/frontend/output_session.cpp
   common/frontend/tools.cpp
+  common/frontend/image_transform.cpp
+  glm5next/frontend/processor.cpp
   common/frontend/media_cache.cpp
   common/frontend/digest.cpp
   common/context/directory.cpp

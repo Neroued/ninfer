@@ -42,7 +42,7 @@ SessionImpl::plan_vision(const qwen::PreparedPromptData& prompt) const {
     for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
         const auto& item  = vision.control_plan->items[i];
         const auto& media = input->media_payloads[i];
-        if (!media ||
+        if (!media || media->features_per_patch != config.patch_width() ||
             media->patch_elements != input->vision_items[i].patch_count * config.patch_width())
             throw std::invalid_argument("Vision item has an invalid patch payload");
         if (item.merged_count > plan.vision_max_merged_tokens)

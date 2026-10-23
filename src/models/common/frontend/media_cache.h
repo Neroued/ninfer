@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace ninfer::models::frontend {
@@ -98,9 +99,13 @@ public:
     MediaPreprocessCache& operator=(const MediaPreprocessCache&) = delete;
 
     [[nodiscard]] std::shared_ptr<PreparedMediaPayload>
-    allocate_payload(std::size_t elements, const PreparationControl& control);
+    allocate_payload(std::size_t patch_count, std::uint32_t features_per_patch,
+                     const PreparationControl& control);
 
     [[nodiscard]] MediaPreparationPermit acquire_request(const PreparationControl& control) const;
+
+    // Retains a ready result for request-wide budgeting; a miss starts no work.
+    [[nodiscard]] std::optional<PendingMedia> find_ready(const MediaCacheKey& key);
 
     [[nodiscard]] PendingMedia begin_prepare(const MediaCacheKey& key,
                                              const PreparationControl& control, Builder builder);

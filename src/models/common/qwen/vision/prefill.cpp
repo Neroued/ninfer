@@ -107,6 +107,7 @@ VisionPrefillExecution::VisionPrefillExecution(DeviceContext& device, const Visi
         const std::size_t patch_elements = control.patch_count * patch_width;
         const auto& payload              = input_->media_payloads[use.prepared_item_index];
         if (output.bytes() > workspace_plan_.handoff_capacity_bytes || !payload ||
+            payload->features_per_patch != patch_width ||
             payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision suffix item storage has an invalid shape");
         }

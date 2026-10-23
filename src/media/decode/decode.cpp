@@ -595,7 +595,7 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
     out.duration       = plan.source.duration > 0.0
                              ? plan.source.duration
                              : static_cast<double>(plan.source.total_frames) / plan.source.fps;
-    out.indices        = plan.indices;
+    out.indices.assign(plan.indices.begin(), plan.indices.begin() + scan.sampled_frames);
     return out;
 }
 
@@ -635,9 +635,9 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
         bytes, policy, plan, [&](Decoder& decoder, const AVFrame* frame, int orientation) {
             out.frames.push_back(decoder.rgb(frame, orientation, true));
         });
-    out.width   = scan.first_frame.width;
-    out.height  = scan.first_frame.height;
-    out.indices = plan.indices;
+    out.width  = scan.first_frame.width;
+    out.height = scan.first_frame.height;
+    out.indices.assign(plan.indices.begin(), plan.indices.begin() + out.frames.size());
     return out;
 }
 

@@ -68,6 +68,7 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
     }
     for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
         if (!prompt.media_payloads[i] ||
+            prompt.media_payloads[i]->features_per_patch != qwen::kPreparedVisionPatchFeatures ||
             prompt.media_payloads[i]->patch_elements !=
                 prompt.vision_items[i].patch_count * qwen::kPreparedVisionPatchFeatures) {
             throw std::invalid_argument("prepared prompt media item payload has an invalid shape");

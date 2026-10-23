@@ -193,7 +193,12 @@ struct MediaPreprocessCache::Impl {
     }
 
     [[nodiscard]] std::shared_ptr<PreparedMediaPayload>
-    allocate_payload(std::size_t elements, const PreparationControl& control) {
+    allocate_payload(std::size_t patch_count, std::uint32_t features_per_patch,
+                     const PreparationControl& control) {
+        if (!features_per_patch ||
+            patch_count > std::numeric_limits<std::size_t>::max() / features_per_patch)
+            throw std::invalid_argument("invalid prepared media patch geometry");
+        const auto elements = patch_count * features_per_patch;
         if (elements == 0) {
             throw std::invalid_argument("prepared media patch allocation must be nonzero");
         }
@@ -221,9 +226,10 @@ struct MediaPreprocessCache::Impl {
 
         PreparedMediaPayload* payload = nullptr;
         try {
-            payload                 = new PreparedMediaPayload();
-            payload->patches        = std::make_unique<std::uint16_t[]>(elements);
-            payload->patch_elements = elements;
+            payload                     = new PreparedMediaPayload();
+            payload->patches            = std::make_unique<std::uint16_t[]>(elements);
+            payload->patch_elements     = elements;
+            payload->features_per_patch = features_per_patch;
         } catch (...) {
             delete payload;
             state->account->release(bytes);
@@ -253,8 +259,9 @@ MediaPreprocessCache::MediaPreprocessCache(std::size_t capacity_bytes,
 MediaPreprocessCache::~MediaPreprocessCache() = default;
 
 std::shared_ptr<PreparedMediaPayload>
-MediaPreprocessCache::allocate_payload(std::size_t elements, const PreparationControl& control) {
-    return impl_->allocate_payload(elements, control);
+MediaPreprocessCache::allocate_payload(std::size_t patch_count, std::uint32_t features_per_patch,
+                                       const PreparationControl& control) {
+    return impl_->allocate_payload(patch_count, features_per_patch, control);
 }
 
 MediaPreparationPermit
@@ -268,6 +275,15 @@ MediaPreprocessCache::acquire_request(const PreparationControl& control) const {
         }
         impl_->request_gate->changed.wait_for(lock, std::chrono::milliseconds(10));
     }
+}
+
+std::optional<PendingMedia> MediaPreprocessCache::find_ready(const MediaCacheKey& key) {
+    std::lock_guard lock(impl_->state->mutex);
+    const auto found = impl_->state->ready.find(key);
+    if (found == impl_->state->ready.end()) return {};
+    impl_->state->lru.splice(impl_->state->lru.begin(), impl_->state->lru, found->second.lru);
+    ++impl_->state->hits;
+    return PendingMedia{.ready = found->second.media};
 }
 
 PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,

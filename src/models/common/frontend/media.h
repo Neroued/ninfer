@@ -10,9 +10,10 @@
 namespace ninfer::models::frontend {
 
 struct PreparedMediaPayload {
-    // Exact row-major BF16 input consumed by the Vision patch projection.
+    // BF16 patches, each with contiguous features_per_patch elements.
     std::unique_ptr<std::uint16_t[]> patches;
-    std::size_t patch_elements = 0;
+    std::size_t patch_elements       = 0;
+    std::uint32_t features_per_patch = 0;
 
     [[nodiscard]] std::span<std::uint16_t> mutable_span() noexcept {
         return {patches.get(), patch_elements};

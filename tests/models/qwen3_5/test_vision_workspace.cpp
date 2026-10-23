@@ -49,8 +49,9 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
                 .token_spans = {{.begin = 2 * item + 1, .count = 1}},
             });
             auto payload = std::make_shared<ninfer::models::frontend::PreparedMediaPayload>();
-            payload->patch_elements = patches * config.patch_width();
-            payload->patches        = std::make_unique<std::uint16_t[]>(payload->patch_elements);
+            payload->features_per_patch = config.patch_width();
+            payload->patch_elements     = patches * config.patch_width();
+            payload->patches = std::make_unique<std::uint16_t[]>(payload->patch_elements);
             for (auto& value : payload->mutable_span()) {
                 seed  = seed * 1664525U + 1013904223U;
                 value = static_cast<std::uint16_t>(0x3f00U | ((seed >> 24) & 0x7fU) |

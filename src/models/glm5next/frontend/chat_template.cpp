@@ -84,6 +84,15 @@ struct TemplateInput {
     std::vector<MessageSources> messages;
     std::vector<std::uint32_t> tools;
 
+    struct MediaSource {
+        std::size_t message, part;
+        std::string pointer;
+        MediaKind kind;
+        std::uint32_t tag;
+    };
+
+    std::vector<MediaSource> media;
+
     std::uint32_t tag(std::string pointer) {
         const auto id = static_cast<std::uint32_t>(regions.size() + 1);
         regions.push_back({std::move(pointer), id});
@@ -131,7 +140,10 @@ struct TemplateInput {
                     value["content"].push_back({{"type", "text"}, {"text", part.text}});
                     sources.parts[i] = TextSource{tag(item + "/text"), {0, part.text.size()}};
                     break;
-                case MessagePartKind::Media:
+                case MessagePartKind::Media: {
+                    const auto id = tag(item + "/text");
+                    this->media.push_back({messages.size(), i, item, part.media.kind, id});
+                    sources.parts[i] = TextSource{id, {0, 1}};
                     switch (part.media.kind) {
                     case MediaKind::Image:
                         value["content"].push_back({{"type", "image"}});
@@ -143,6 +155,7 @@ struct TemplateInput {
                         throw std::invalid_argument("invalid media kind");
                     }
                     break;
+                }
                 default:
                     throw std::invalid_argument("invalid message part kind");
                 }
@@ -241,6 +254,73 @@ void finish_continuation(RenderedChat& result, std::string_view content, std::si
     truncate(result.output, end);
 }
 
+std::string_view media_wrapper(MediaKind kind) {
+    return kind == MediaKind::Image ? "<|begin_of_image|><|image|><|end_of_image|>"
+                                    : "<|begin_of_video|><|video|><|end_of_video|>";
+}
+
+void locate_media(RenderedChat& result, const TemplateInput& input,
+                  const models::frontend::ChatTemplate& compiled,
+                  text::TemplateRenderOptions execution) {
+    if (input.media.empty()) return;
+    auto context = input.context;
+    for (const auto& source : input.media) {
+        context[Json::json_pointer(source.pointer)] =
+            Json{{"type", "text"}, {"text", "NInferMedia" + std::to_string(source.tag) + "End"}};
+    }
+    auto probe = compiled.program.render(context, execution);
+
+    struct Located {
+        const TemplateInput::MediaSource* source;
+        text::ByteSpan span;
+    };
+
+    std::vector<Located> located;
+    for (const auto& source : input.media) {
+        const auto region  = models::frontend::unique_output_region(probe, source.tag);
+        const auto locator = "NInferMedia" + std::to_string(source.tag) + "End";
+        if (!region || probe.text.substr(region->begin, region->end - region->begin) != locator)
+            throw std::invalid_argument("GLM template must emit each media item exactly once");
+        located.push_back({&source, *region});
+    }
+    std::sort(located.begin(), located.end(),
+              [](const auto& a, const auto& b) { return a.span.begin < b.span.begin; });
+    text::TemplateOutput restored;
+    std::size_t cursor         = 0;
+    std::size_t literal_cursor = 0;
+    const auto append_literal  = [&](std::size_t begin, std::size_t end) {
+        const auto base = restored.text.size();
+        restored.text.append(probe.text, begin, end - begin);
+        while (literal_cursor < probe.literal_spans.size() &&
+               probe.literal_spans[literal_cursor].end <= begin)
+            ++literal_cursor;
+        for (auto i = literal_cursor;
+             i < probe.literal_spans.size() && probe.literal_spans[i].begin < end; ++i) {
+            const auto literal = probe.literal_spans[i];
+            const auto left = std::max(begin, literal.begin), right = std::min(end, literal.end);
+            if (left < right)
+                restored.literal_spans.push_back({base + left - begin, base + right - begin});
+        }
+    };
+    for (const auto& entry : located) {
+        append_literal(cursor, entry.span.begin);
+        const auto begin = restored.text.size();
+        restored.text += media_wrapper(entry.source->kind);
+        const auto end = restored.text.size();
+        result.media.push_back(
+            {entry.source->message, entry.source->part, entry.source->kind, {begin, end}});
+        result.output.regions.push_back({entry.source->tag, begin, end, std::nullopt});
+        result.output.boundary_mappings.push_back({entry.source->tag, 0, 0, begin});
+        result.output.boundary_mappings.push_back({entry.source->tag, 1, 1, end});
+        cursor = entry.span.end;
+    }
+    append_literal(cursor, probe.text.size());
+    if (restored.text.size() != result.output.text.size() ||
+        !models::frontend::same_prefix(restored, result.output, restored.text.size()))
+        throw std::invalid_argument(
+            "GLM template cannot map media placeholders to their input sources");
+}
+
 RenderedChat render_input(const TemplateInput& input,
                           const models::frontend::ChatTemplate& compiled, bool continuation,
                           const PreparationControl& control) {
@@ -255,6 +335,7 @@ RenderedChat render_input(const TemplateInput& input,
     RenderedChat result{.output   = compiled.program.render(input.context, execution),
                         .messages = input.messages,
                         .tools    = input.tools};
+    locate_media(result, input, compiled, execution);
     const auto body = final_assistant_body(result.output);
     if (continuation)
         finish_continuation(
@@ -325,11 +406,20 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
             const auto index = marker.after_message_count - 1;
             auto& source     = probe.messages[index];
             auto& value      = probe.context["messages"][index];
-            const auto bytes = marker.after_message_part_count
-                                   ? source.parts[marker.after_message_part_count - 1]->bytes.end
-                                   : 0;
-            value["content"].get_ref<std::string&>().resize(bytes);
-            source.content->bytes.end = bytes;
+            if (source.content) {
+                const auto bytes =
+                    marker.after_message_part_count
+                        ? source.parts[marker.after_message_part_count - 1]->bytes.end
+                        : 0;
+                value["content"].get_ref<std::string&>().resize(bytes);
+                source.content->bytes.end = bytes;
+            } else {
+                auto& content = value["content"];
+                content.erase(content.begin() + marker.after_message_part_count, content.end());
+                std::erase_if(probe.media, [&](const auto& media) {
+                    return media.message == index && media.part >= marker.after_message_part_count;
+                });
+            }
             source.parts.resize(marker.after_message_part_count);
             value["reasoning_content"].get_ref<std::string&>().resize(marker.reasoning_bytes);
             source.reasoning.bytes.end = marker.reasoning_bytes;

@@ -2485,7 +2485,7 @@ int test_media_payload_outlives_frontend_cache() {
 
 int test_media_live_bytes_follow_last_payload_reference() {
     ninfer::models::frontend::MediaPreprocessCache cache(0, 1ULL << 20, 1);
-    auto payload = cache.allocate_payload(1536, {});
+    auto payload = cache.allocate_payload(1, 1536, {});
     int failures = check(cache.stats().live_bytes == 1536 * sizeof(std::uint16_t),
                          "media live-byte account did not charge the allocated payload");
     payload.reset();
@@ -2513,7 +2513,7 @@ int test_media_cache_singleflight() {
         const int count = ++builders;
         if (count == 1) { producer_started.set_value(); }
         release_future.wait();
-        auto payload                    = cache->allocate_payload(1536, {});
+        auto payload                    = cache->allocate_payload(1, 1536, {});
         payload->mutable_span().front() = 42;
         ninfer::models::frontend::VisionItem item;
         item.grid = {1, 1, 1};
@@ -2564,7 +2564,7 @@ int test_media_cache_runs_independent_misses_in_parallel() {
                    std::chrono::steady_clock::now() < limit) {
                 std::this_thread::yield();
             }
-            auto payload                    = cache->allocate_payload(1536, {});
+            auto payload                    = cache->allocate_payload(1, 1536, {});
             payload->mutable_span().front() = static_cast<std::uint16_t>(index);
             --active;
             ninfer::models::frontend::VisionItem item;

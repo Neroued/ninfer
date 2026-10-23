@@ -35,6 +35,10 @@ void parse_resources(FrontendResources& resources, std::uint32_t embedding_rows)
         if (!std::isfinite(value))
             throw artifact::ArtifactError("generation defaults must fit finite float values");
     resources.sampling = sampling;
+    resources.processor =
+        resources.processor_config_json.empty()
+            ? std::nullopt
+            : std::optional(parse_processor_config(resources.processor_config_json));
 }
 
 FrontendResources bind_resources(artifact::Binder& binder, std::uint32_t embedding_rows,

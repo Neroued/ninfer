@@ -26,3 +26,8 @@ add_test(NAME ninfer_glm5next_tool_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_GLM_TOOL_PROBE=$<TARGET_FILE:ninfer_glm5next_tool_constraints_test>"
     ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_tool_schema.py")
+
+ninfer_add_test(ninfer_glm5next_media_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_media.cpp"
+  LIBRARIES ninfer_model_control ninfer::json
+  NEEDS_SOURCE_DIR)

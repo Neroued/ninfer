@@ -71,6 +71,7 @@ runtime::InputResource encode_input(std::uint64_t id,
         const auto values =
             owners[i] == rank && payload ? payload->span() : std::span<const std::uint16_t>{};
         out.u64(values.size());
+        out.u32(payload ? payload->features_per_patch : 0);
         resource.parts.push_back(std::as_bytes(values));
     }
     resource.metadata = std::move(out).take();
@@ -167,17 +168,19 @@ std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
             item.patch_begin = data.u64();
             item.patch_count = data.u64();
         }
-        v.media_payloads.resize(data.count(8));
+        v.media_payloads.resize(data.count(12));
         r.parts.resize(v.media_payloads.size());
         r.received.resize(r.parts.size());
         for (std::size_t i = 0; i < r.parts.size(); ++i) {
             const auto elements = data.u64();
+            const auto features = data.u32();
             if (!elements) continue;
             auto payload            = std::make_shared<models::frontend::PreparedMediaPayload>();
             payload->patch_elements = elements;
-            payload->patches        = std::make_unique<std::uint16_t[]>(elements);
-            v.media_payloads[i]     = payload;
-            r.parts[i]              = std::move(payload);
+            payload->features_per_patch = features;
+            payload->patches            = std::make_unique<std::uint16_t[]>(elements);
+            v.media_payloads[i]         = payload;
+            r.parts[i]                  = std::move(payload);
         }
         data.finish();
         if (!receiving_.emplace(id, std::move(r)).second)

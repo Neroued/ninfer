@@ -44,6 +44,12 @@ Published artifact downloads are listed in the [project README](../README.md).
   placement, KDA ReplaySSM, Kpool Sparse MLA, mHC and the existing Op checklist; separates
   decisions, implementation status and retirement of designs after code takes ownership.
 
+## Field reports
+
+| Document | Purpose |
+|---|---|
+| [GB10 field report](gb10-field-report.md) | measurements and feedback from a real dgx_spark machine: hardware record, roofline checks, Flash-Next decode and MTP acceptance data, determinism findings, and open questions |
+
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,

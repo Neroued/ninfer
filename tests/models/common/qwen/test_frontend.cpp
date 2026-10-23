@@ -214,6 +214,14 @@ std::string byte_level_symbol(std::uint8_t target) {
     throw std::logic_error("byte-level test symbol is outside one byte");
 }
 
+std::string tokenizer_resource(nlohmann::json value) {
+    value["normalizer"]    = {{"type", "NFC"}};
+    value["pre_tokenizer"] = nlohmann::json::parse(
+        R"json({"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]})json");
+    value["decoder"] = {{"type", "ByteLevel"}};
+    return value.dump();
+}
+
 FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
@@ -231,11 +239,10 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
         const auto byte                = static_cast<std::uint8_t>(value);
         vocab[byte_level_symbol(byte)] = fixture_byte_token(byte);
     }
-    result.tokenizer_json = nlohmann::json{
+    result.tokenizer_json = tokenizer_resource(nlohmann::json{
         {"model",
          {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
-        {"added_tokens",
-         tokens}}.dump();
+        {"added_tokens", tokens}});
 
     nlohmann::json decoder = nlohmann::json::object();
     for (const nlohmann::json& token : tokens) {
@@ -465,7 +472,7 @@ int test_declared_frontend_semantics() {
              {"/pre_tokenizer/pretokenizers/1/add_prefix_space", true},
              {"/decoder/type", "WordPiece"},
              {"/model/dropout", 0.1},
-             {"/model/ignore_merges", true}}) {
+             {"/model/byte_fallback", true}}) {
         auto changed                                = tokenizer;
         changed[nlohmann::json::json_pointer(path)] = value;
         source.tokenizer_json                       = changed.dump();
@@ -537,7 +544,7 @@ int test_tokenizer_config_merge() {
 }
 
 int test_bpe_merge_order() {
-    const std::string tokenizer_json = nlohmann::json{
+    const std::string tokenizer_json = tokenizer_resource(nlohmann::json{
         {"model",
          {{"type", "BPE"},
           {"vocab",
@@ -546,9 +553,7 @@ int test_bpe_merge_order() {
            nlohmann::json::array(
                {nlohmann::json::array({"a", "a"}), nlohmann::json::array({"aa", "a"}),
                 nlohmann::json::array({"b", "c"}), nlohmann::json::array({"a", "bc"})})}}},
-        {"added_tokens",
-         nlohmann::json::array(
-             {added(8, "<sep>", true)})}}.dump();
+        {"added_tokens", nlohmann::json::array({added(8, "<sep>", true)})}});
     const std::string tokenizer_config_json =
         nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
     const ninfer::text::Tokenizer tokenizer(
@@ -601,14 +606,13 @@ int test_bpe_merge_order() {
 }
 
 int test_boundary_aware_tokenization() {
-    const std::string tokenizer_json = nlohmann::json{
-        {"model",
-         {{"type", "BPE"},
-          {"vocab", {{"a", 0}, {"b", 1}, {"c", 2}, {"bc", 3}, {"ab", 4}}},
-          {"merges", nlohmann::json::array(
-                         {nlohmann::json::array({"b", "c"}), nlohmann::json::array({"a", "b"})})}}},
-        {"added_tokens",
-         nlohmann::json::array()}}.dump();
+    const std::string tokenizer_json = tokenizer_resource(
+        nlohmann::json{{"model",
+                        {{"type", "BPE"},
+                         {"vocab", {{"a", 0}, {"b", 1}, {"c", 2}, {"bc", 3}, {"ab", 4}}},
+                         {"merges", nlohmann::json::array({nlohmann::json::array({"b", "c"}),
+                                                           nlohmann::json::array({"a", "b"})})}}},
+                       {"added_tokens", nlohmann::json::array()}});
     const std::string tokenizer_config_json =
         nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
     const ninfer::text::Tokenizer tokenizer(

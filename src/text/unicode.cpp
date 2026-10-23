@@ -124,6 +124,7 @@ bool is_number(std::int32_t codepoint) noexcept {
 
 bool is_whitespace(std::int32_t codepoint) noexcept {
     if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return is_ascii_whitespace(codepoint); }
+    if (codepoint == 0x85) return true; // NEXT LINE is White_Space but has category Cc.
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ZS:
     case UTF8PROC_CATEGORY_ZL:

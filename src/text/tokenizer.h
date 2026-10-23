@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -55,6 +56,24 @@ struct BpeMergeEntry {
     int rank          = 0;
     int result        = -1;
 };
+
+enum class BpeSplit : std::uint8_t { LetterMarkDigit1, LetterDigit3 };
+
+struct BpePipeline {
+    bool normalize_nfc = false;
+    BpeSplit split     = BpeSplit::LetterMarkDigit1;
+    bool ignore_merges = false;
+};
+
+struct TokenBytesHash {
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view bytes) const noexcept {
+        return std::hash<std::string_view>{}(bytes);
+    }
+};
+
+using TokenBytesMap = std::unordered_map<std::string, int, TokenBytesHash, std::equal_to<>>;
 
 // Merge table of the BPE encoder, open addressed with linear probing.
 //
@@ -131,7 +150,7 @@ public:
     explicit Tokenizer(TokenizerResources resources);
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
-    // Literal spans suppress added-token recognition without splitting ordinary NFC/BPE runs.
+    // Literal spans suppress added-token recognition without splitting normalization/BPE runs.
     BoundaryEncodedText
     encode_with_boundaries(std::string_view text, std::span<const std::size_t> byte_boundaries,
                            EncodeOptions options                         = {},
@@ -151,7 +170,8 @@ private:
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;
-    std::unordered_map<std::string, int> vocab_token_to_id_;
+    BpePipeline pipeline_;
+    TokenBytesMap whole_token_ids_;
     BpeMergeTable bpe_merge_rules_;
     std::array<int, 256> byte_token_ids_{};
     std::vector<AddedToken> added_tokens_;

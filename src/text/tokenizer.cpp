@@ -29,7 +29,10 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-void validate_pipeline(const Json& root, const Json& model) {
+constexpr std::string_view kLetterDigit3Pattern =
+    R"glm((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)glm";
+
+BpePipeline parse_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
@@ -39,10 +42,13 @@ void validate_pipeline(const Json& root, const Json& model) {
     const auto type = [](const Json& value, const char* name) {
         return value.is_object() && value.contains("type") && value["type"] == name;
     };
-    // Omitted descriptions use the supported byte-BPE pipeline defaults.
-    // An explicit description must agree with the implemented transformations.
-    if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
-    if (root.contains("pre_tokenizer")) {
+    BpePipeline pipeline;
+    if (root.contains("normalizer") && !root["normalizer"].is_null()) {
+        require(type(root["normalizer"], "NFC"), "normalizer");
+        pipeline.normalize_nfc = true;
+    }
+    require(root.contains("pre_tokenizer"), "pre_tokenizer");
+    {
         const auto& pre = root["pre_tokenizer"];
         require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
                     pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
@@ -50,15 +56,19 @@ void validate_pipeline(const Json& root, const Json& model) {
         const auto& split = pre["pretokenizers"][0];
         const auto& bytes = pre["pretokenizers"][1];
         require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == kQwenSplitPattern &&
                     split.value("behavior", std::string{}) == "Isolated" &&
                     split.value("invert", Json(false)) == false,
                 "pre_tokenizer.Split");
+        const auto pattern = split["pattern"].value("Regex", std::string{});
+        require(pattern == kQwenSplitPattern || pattern == kLetterDigit3Pattern,
+                "pre_tokenizer.Split.pattern");
+        pipeline.split =
+            pattern == kQwenSplitPattern ? BpeSplit::LetterMarkDigit1 : BpeSplit::LetterDigit3;
         require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
                     bytes.value("use_regex", Json(true)) == false,
                 "pre_tokenizer.ByteLevel");
     }
-    if (root.contains("decoder")) { require(type(root["decoder"], "ByteLevel"), "decoder"); }
+    require(root.contains("decoder") && type(root["decoder"], "ByteLevel"), "decoder");
     if (root.contains("post_processor") && !root["post_processor"].is_null()) {
         require(type(root["post_processor"], "ByteLevel"), "post_processor");
     }
@@ -68,7 +78,12 @@ void validate_pipeline(const Json& root, const Json& model) {
     for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
         require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
     }
-    require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    require(!model.contains("ignore_merges") || model["ignore_merges"].is_boolean(),
+            "model.ignore_merges");
+    pipeline.ignore_merges = model.value("ignore_merges", false);
+    require(!model.contains("unk_token") || model["unk_token"].is_null(), "model.unk_token");
+    require(model.value("byte_fallback", Json(false)) == false, "model.byte_fallback");
+    return pipeline;
 }
 
 struct VocabMetadata {
@@ -285,6 +300,7 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
                                 std::vector<AddedToken>& tokens) {
+    if (!root.contains("added_tokens_decoder")) return;
     const Json& decoder = require_object_field(root, "added_tokens_decoder", label);
     std::unordered_map<int, std::size_t> token_by_id;
     std::unordered_map<std::string, int> token_by_content;
@@ -433,17 +449,20 @@ std::array<std::string, 256> build_byte_level_encoder() {
 
 bool is_newline(std::int32_t codepoint) noexcept { return codepoint == '\r' || codepoint == '\n'; }
 
-bool is_letter_or_mark(std::int32_t codepoint) noexcept {
-    return uni::is_letter(codepoint) || uni::is_mark(codepoint);
+template <BpeSplit Split>
+bool is_word_letter(std::int32_t codepoint) noexcept {
+    return uni::is_letter(codepoint) ||
+           (Split == BpeSplit::LetterMarkDigit1 && uni::is_mark(codepoint));
 }
 
 bool is_non_newline_non_letter_non_number(std::int32_t codepoint) noexcept {
     return !is_newline(codepoint) && !uni::is_letter(codepoint) && !uni::is_number(codepoint);
 }
 
-bool is_non_space_non_letter_mark_number(std::int32_t codepoint) noexcept {
-    return !uni::is_whitespace(codepoint) && !uni::is_letter(codepoint) &&
-           !uni::is_mark(codepoint) && !uni::is_number(codepoint);
+template <BpeSplit Split>
+bool is_symbol(std::int32_t codepoint) noexcept {
+    return !uni::is_whitespace(codepoint) && !is_word_letter<Split>(codepoint) &&
+           !uni::is_number(codepoint);
 }
 
 bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_view suffix) {
@@ -456,16 +475,19 @@ bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_vie
     return true;
 }
 
-uni::CodepointSpan qwen_codepoint_at(std::string_view text, std::size_t offset) {
+uni::CodepointSpan input_codepoint_at(std::string_view text, std::size_t offset) {
     return uni::utf8_codepoint_at(text, offset, "Tokenizer::encode input");
 }
 
-std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
-    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+template <BpeSplit Split>
+std::size_t word_end(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = input_codepoint_at(text, begin);
     const std::size_t after_first  = begin + first.length;
     const std::int32_t cp          = first.value;
 
     if (cp == '\'') {
+        // The regex's Unicode case-insensitive 's also matches LONG S (U+017F).
+        if (text.substr(after_first).starts_with("\xC5\xBF")) return after_first + 2;
         constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
         for (std::string_view suffix : suffixes) {
             if (ascii_ci_matches(text, after_first, suffix)) { return after_first + suffix.size(); }
@@ -473,30 +495,39 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
     }
 
     const bool has_next     = after_first < text.size();
-    const std::int32_t next = has_next ? qwen_codepoint_at(text, after_first).value : 0;
-    if (is_letter_or_mark(cp) ||
-        (is_non_newline_non_letter_non_number(cp) && has_next && is_letter_or_mark(next))) {
-        std::size_t end = is_letter_or_mark(cp) ? begin : after_first;
+    const std::int32_t next = has_next ? input_codepoint_at(text, after_first).value : 0;
+    if (is_word_letter<Split>(cp) ||
+        (is_non_newline_non_letter_non_number(cp) && has_next && is_word_letter<Split>(next))) {
+        std::size_t end = is_word_letter<Split>(cp) ? begin : after_first;
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-            if (!is_letter_or_mark(value.value)) { break; }
+            const uni::CodepointSpan value = input_codepoint_at(text, end);
+            if (!is_word_letter<Split>(value.value)) { break; }
             end += value.length;
         }
         return end;
     }
 
-    if (uni::is_number(cp)) { return after_first; }
+    if (uni::is_number(cp)) {
+        std::size_t end = after_first;
+        if constexpr (Split == BpeSplit::LetterDigit3) {
+            for (int count = 1; count < 3 && end < text.size(); ++count) {
+                const auto value = input_codepoint_at(text, end);
+                if (!uni::is_number(value.value)) break;
+                end += value.length;
+            }
+        }
+        return end;
+    }
 
-    if ((cp == ' ' && has_next && is_non_space_non_letter_mark_number(next)) ||
-        is_non_space_non_letter_mark_number(cp)) {
+    if ((cp == ' ' && has_next && is_symbol<Split>(next)) || is_symbol<Split>(cp)) {
         std::size_t end = cp == ' ' ? after_first : begin;
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-            if (!is_non_space_non_letter_mark_number(value.value)) { break; }
+            const uni::CodepointSpan value = input_codepoint_at(text, end);
+            if (!is_symbol<Split>(value.value)) { break; }
             end += value.length;
         }
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            const uni::CodepointSpan value = input_codepoint_at(text, end);
             if (!is_newline(value.value)) { break; }
             end += value.length;
         }
@@ -509,7 +540,7 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
         std::size_t last_newline_end = std::string_view::npos;
         std::size_t count            = 0;
         while (end < text.size()) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            const uni::CodepointSpan value = input_codepoint_at(text, end);
             if (!uni::is_whitespace(value.value)) { break; }
             last_begin = end;
             end += value.length;
@@ -576,6 +607,7 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
 }
 
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
+                               const BpePipeline& pipeline, const TokenBytesMap& whole_tokens,
                                const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                BpeScratch& scratch, std::vector<std::size_t>* token_ends = nullptr,
@@ -584,8 +616,20 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
     if (ids.size() == max_tokens) { return false; }
 
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = qwen_word_end(normalized, begin);
+        const std::size_t end = pipeline.split == BpeSplit::LetterMarkDigit1
+                                    ? word_end<BpeSplit::LetterMarkDigit1>(normalized, begin)
+                                    : word_end<BpeSplit::LetterDigit3>(normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
+        if (pipeline.ignore_merges) {
+            if (const auto found = whole_tokens.find(word); found != whole_tokens.end()) {
+                ids.push_back(found->second);
+                if (token_ends) token_ends->push_back(end);
+                if (ids.size() == max_tokens) return false;
+                if (word_ends) word_ends->push_back({end, ids.size()});
+                begin = end;
+                continue;
+            }
+        }
         auto& nodes = scratch.nodes;
         nodes.clear();
         nodes.reserve(word.size());
@@ -674,6 +718,7 @@ struct IndexedByteBoundary {
 
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
+                          const BpePipeline& pipeline, const TokenBytesMap& whole_tokens,
                           const BpeMergeTable& merge_rules,
                           const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                           BpeScratch& scratch) {
@@ -686,7 +731,8 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         return true;
     }
 
-    const std::string normalized = uni::normalize_nfc(text);
+    const std::string nfc = pipeline.normalize_nfc ? uni::normalize_nfc(text) : std::string{};
+    const std::string_view normalized = pipeline.normalize_nfc ? std::string_view(nfc) : text;
     const bool has_internal_boundary =
         std::any_of(boundaries.begin(), boundaries.end(), [&](IndexedByteBoundary boundary) {
             const std::size_t local = boundary.offset - text_offset;
@@ -695,8 +741,8 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     std::vector<std::size_t> token_ends;
     std::vector<BpeWordEnd> word_ends;
     if (has_internal_boundary) { token_ends.reserve(normalized.size()); }
-    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, byte_token_ids,
-                                   max_tokens, scratch,
+    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, pipeline, whole_tokens,
+                                   merge_rules, byte_token_ids, max_tokens, scratch,
                                    has_internal_boundary ? &token_ends : nullptr,
                                    has_internal_boundary ? &word_ends : nullptr)) {
         return false;
@@ -712,37 +758,43 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     }
 
     std::vector<std::size_t> normalized_boundaries(boundaries.size());
-    std::string independently_normalized;
-    independently_normalized.reserve(normalized.size());
-    std::size_t raw_begin = 0;
-    for (std::size_t request = 0; request < boundaries.size(); ++request) {
-        const std::size_t raw_end = boundaries[request].offset - text_offset;
-        if (raw_end != raw_begin) {
-            independently_normalized +=
-                uni::normalize_nfc(text.substr(raw_begin, raw_end - raw_begin));
-            raw_begin = raw_end;
-        }
-        normalized_boundaries[request] = independently_normalized.size();
-    }
-    if (raw_begin != text.size()) {
-        independently_normalized += uni::normalize_nfc(text.substr(raw_begin));
-    }
-
-    if (independently_normalized != normalized) {
-        // A requested marker splits a canonical-composition sequence. The full token stream stays
-        // authoritative; conservatively retain only the preceding added-token/ordinary boundary.
-        for (const IndexedByteBoundary boundary : boundaries) {
-            const std::size_t local = boundary.offset - text_offset;
-            if (local == 0 || local == text.size()) {
-                const std::size_t frontier = local == 0 ? token_base : token_end;
-                encoded.boundaries[boundary.index] =
-                    TokenBoundaryResult{.exact_frontier = frontier, .stable_frontier = frontier};
-            } else {
-                encoded.boundaries[boundary.index] = TokenBoundaryResult{
-                    .exact_frontier = std::nullopt, .stable_frontier = token_base};
+    if (!pipeline.normalize_nfc) {
+        for (std::size_t i = 0; i < boundaries.size(); ++i)
+            normalized_boundaries[i] = boundaries[i].offset - text_offset;
+    } else {
+        std::string independently_normalized;
+        independently_normalized.reserve(normalized.size());
+        std::size_t raw_begin = 0;
+        for (std::size_t request = 0; request < boundaries.size(); ++request) {
+            const std::size_t raw_end = boundaries[request].offset - text_offset;
+            if (raw_end != raw_begin) {
+                independently_normalized +=
+                    uni::normalize_nfc(text.substr(raw_begin, raw_end - raw_begin));
+                raw_begin = raw_end;
             }
+            normalized_boundaries[request] = independently_normalized.size();
         }
-        return true;
+        if (raw_begin != text.size()) {
+            independently_normalized += uni::normalize_nfc(text.substr(raw_begin));
+        }
+
+        if (independently_normalized != normalized) {
+            // A requested marker splits a canonical-composition sequence. The full token stream
+            // stays authoritative; conservatively retain only the preceding added-token/ordinary
+            // boundary.
+            for (const IndexedByteBoundary boundary : boundaries) {
+                const std::size_t local = boundary.offset - text_offset;
+                if (local == 0 || local == text.size()) {
+                    const std::size_t frontier         = local == 0 ? token_base : token_end;
+                    encoded.boundaries[boundary.index] = TokenBoundaryResult{
+                        .exact_frontier = frontier, .stable_frontier = frontier};
+                } else {
+                    encoded.boundaries[boundary.index] = TokenBoundaryResult{
+                        .exact_frontier = std::nullopt, .stable_frontier = token_base};
+                }
+            }
+            return true;
+        }
     }
 
     std::size_t token_cursor    = 0;
@@ -781,26 +833,32 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json root = read_json_asset(resources.tokenizer_json, tokenizer_label);
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
+    if (!tokenizer_config.is_object())
+        throw std::invalid_argument("tokenizer_config.json must contain a JSON object");
     const Json& model = require_object_field(root, "model", tokenizer_label);
-    validate_pipeline(root, model);
+    pipeline_         = parse_pipeline(root, model);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
-    vocab_token_to_id_           = std::move(vocab_metadata.token_to_id);
     valid_token_ids_.resize(decoded_token_bytes_.size());
     for (const int id : vocab_metadata.occupied_ids) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
     added_tokens_ = load_added_tokens(root, tokenizer_label, decoded_token_bytes_,
-                                      vocab_metadata.occupied_ids, vocab_token_to_id_);
+                                      vocab_metadata.occupied_ids, vocab_metadata.token_to_id);
     merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, decoded_token_bytes_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+                               vocab_metadata.occupied_ids, vocab_metadata.token_to_id,
+                               added_tokens_);
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
         if (!content.empty()) {
             added_token_candidates_[static_cast<unsigned char>(content.front())].push_back(index);
         }
     }
+    for (auto& candidates : added_token_candidates_)
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t left, std::size_t right) {
+            return added_tokens_[left].content.size() > added_tokens_[right].content.size();
+        });
     if (valid_token_ids_.size() < decoded_token_bytes_.size()) {
         valid_token_ids_.resize(decoded_token_bytes_.size());
     }
@@ -818,8 +876,13 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
                 decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
         }
     }
-    bpe_merge_rules_ = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
-    byte_token_ids_  = load_byte_token_ids(vocab_token_to_id_);
+    bpe_merge_rules_ = load_bpe_merge_rules(model, tokenizer_label, vocab_metadata.token_to_id);
+    byte_token_ids_  = load_byte_token_ids(vocab_metadata.token_to_id);
+    if (pipeline_.ignore_merges) {
+        whole_token_ids_.reserve(vocab_metadata.occupied_ids.size());
+        for (const int id : vocab_metadata.occupied_ids)
+            whole_token_ids_.emplace(decoded_token_bytes_[static_cast<std::size_t>(id)], id);
+    }
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
@@ -865,7 +928,8 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
             append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
                                  std::span<const IndexedByteBoundary>(boundaries)
                                      .subspan(boundary_cursor, request_end - boundary_cursor),
-                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch);
+                                 pipeline_, whole_token_ids_, bpe_merge_rules_, byte_token_ids_,
+                                 options.max_tokens, scratch);
         boundary_cursor = request_end;
         return complete;
     };

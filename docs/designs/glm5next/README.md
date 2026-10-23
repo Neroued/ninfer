@@ -8,6 +8,8 @@
 完整集成从[双 Spark 支持与优化路线](roadmap.md)开始：包含当前代码起点、G0–G7
 阶段、并行 Op 任务包和交接条件。[Linear/MoE 清单](op-checklist.md)按当前主线区分
 已有能力与待补任务，列出 `.50` 执行所需的几何、代码入口和顺序。
+[Frontend 清单](frontend-checklist.md)列出共享基础提取后，GLM 输入输出需要逐项
+实现的能力、方法与完成条件。
 
 阅读实现设计前先读相应长期参考。这里的接口名称和代码片段是待落地合同，不能
 据此宣称已有运行能力；已确认的模型／数值决策不因实现进度或文档迁移而重开。
@@ -31,6 +33,7 @@ GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-stat
 | [mHC](mhc.md) | 五个 C++ 入口、M 列布局、容量查询、两阶段融合与资源归属已明确 | 设计待实现／验收 |
 | [MTP](mtp.md) | 输入移位、stem/residual、共享 Main hidden、provisional 页与 frame、首步采用及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
 | [Vision](vision.md) | GLM processor、patch 顺序、bias/2D norm-RoPE/D64 attention、segment 分配与媒体生命周期已明确 | 输入基础、Op 扩展与模型组合待实现／验收 |
+| [Frontend 清单](frontend-checklist.md) | 资源、tokenizer、模板、缓存边界、thinking/tools/constraints 与媒体准备 | 分阶段实施，进度见清单 |
 | Converter 与模型接入 | 数值规则已定，接入未完成 | block-FP8 编码入口、GLM converter/binding 与运行路径待实现 |
 
 量化格式存在不等于转换方法存在：当前 block-FP8 converter 只有 `import_encoded`，
@@ -63,6 +66,7 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 | 分片、owner、State variants、通信交接与部署预算 | parallel.md |
 | 具体 Op/views、physical layout、写域、alias、融合与验收 | 对应 family 设计 |
 | 执行条目与完成证据 | op-checklist.md |
+| Frontend 接入条目与完成条件 | [Frontend 清单](frontend-checklist.md) |
 | 集成步骤、并行任务与阶段进度 | [实施路线](roadmap.md) |
 | 文档导航与既有设计范围 | 本索引 |
 

@@ -7,9 +7,11 @@
 #include <vector>
 
 namespace ninfer::text {
-// Direct type hints are useful without requiring a strict schema. Domain inspection and local
-// reference resolution consume a schema already validated by prepare_json_schema.
-bool read_schema_types(const nlohmann::ordered_json& schema, SchemaTypes& types);
+// Type hints follow local references and type-bearing assertions without validating a schema
+// or enforcing its value constraints. An unresolved domain returns false.
+bool read_schema_types(const nlohmann::ordered_json& schema, const nlohmann::ordered_json& document,
+                       SchemaTypes& types);
+// Strict domain inspection and root resolution consume prepare_json_schema output.
 std::uint8_t schema_type_domain(const nlohmann::ordered_json& schema,
                                 const nlohmann::ordered_json& document);
 const nlohmann::ordered_json& resolve_schema(const nlohmann::ordered_json& schema,

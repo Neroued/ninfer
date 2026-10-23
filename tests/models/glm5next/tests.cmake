@@ -31,3 +31,8 @@ ninfer_add_test(ninfer_glm5next_media_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_media.cpp"
   LIBRARIES ninfer_model_control ninfer::json
   NEEDS_SOURCE_DIR)
+
+ninfer_add_test(ninfer_glm5next_protocol_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_protocol.cpp"
+  LIBRARIES ninfer_model_control ninfer_serve ninfer::json
+  NEEDS_SOURCE_DIR)

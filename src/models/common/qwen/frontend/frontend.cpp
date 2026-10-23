@@ -492,23 +492,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 
 MediaCacheSummary Frontend::media_cache_summary() const {
     if (impl_ == nullptr || !impl_->media_cache) { return {}; }
-    const models::frontend::MediaCacheStats stats = impl_->media_cache->stats();
-    return MediaCacheSummary{
-        .capacity_bytes      = stats.capacity_bytes,
-        .live_capacity_bytes = stats.live_capacity_bytes,
-        .retained_bytes      = stats.retained_bytes,
-        .live_bytes          = stats.live_bytes,
-        .entries             = stats.entries,
-        .inflight            = stats.inflight,
-        .queued_tasks        = stats.queued_tasks,
-        .active_tasks        = stats.active_tasks,
-        .preprocess_threads  = stats.preprocess_threads,
-        .hits                = stats.hits,
-        .misses              = stats.misses,
-        .singleflight_waits  = stats.singleflight_waits,
-        .evictions           = stats.evictions,
-        .oversize_bypasses   = stats.oversize_bypasses,
-    };
+    return impl_->media_cache->stats().public_stats();
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,

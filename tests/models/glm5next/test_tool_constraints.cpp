@@ -94,6 +94,25 @@ void basic(text::GrammarCompiler& compiler) {
                 accepts(compiler, *bound, call("a"), json) &&
                 !accepts(compiler, *required, "{}", json),
             "combined branch policy differs");
+
+    for (const Json& property :
+         {Json{{"$ref", "#/$defs/text"}}, Json{{"enum", {"123", "456"}}}, Json{{"const", "123"}},
+          Json{{"allOf", {{{"$ref", "#/$defs/text"}}, {{"minLength", 5}}}}}}) {
+        auto hinted             = tool_schema({{"x", property}});
+        hinted["$defs"]["text"] = {{"type", "string"}};
+        const auto basic        = contract(hinted, false);
+        require(accepts(compiler, *basic, call("123")) && decode(*basic, call("123"))["x"] == "123",
+                "basic string type was lost through a reference or assertion");
+        require(accepts(compiler, *basic, call("9")) && decode(*basic, call("9"))["x"] == "9",
+                "basic encoding hints enforced strict value constraints");
+    }
+    for (const Json& property : {Json{{"$ref", "#/$defs/missing"}},
+                                 Json{{"anyOf", {{{"type", "string"}}, Json::object()}}}}) {
+        const auto unknown = contract(tool_schema({{"x", property}}), false);
+        require(accepts(compiler, *unknown, call("123")) &&
+                    decode(*unknown, call("123"))["x"] == 123,
+                "unknown type acquired a speculative encoding");
+    }
 }
 
 void strict(text::GrammarCompiler& compiler) {

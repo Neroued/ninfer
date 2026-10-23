@@ -83,6 +83,16 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
     require(arguments == Json{{"b", 1}, {"a", "007"}, {"extra-key.键", true}},
             "non-strict value normalization changed");
     require(accepts(compiled, *basic, "An ordinary answer."), "default auto forced a call");
+    for (const Json& property : {Json{{"$ref", "#/$defs/text"}}, Json{{"enum", {"123", "456"}}}}) {
+        auto source             = schema(property);
+        source["$defs"]["text"] = {{"type", "string"}};
+        const auto bound        = contract(source, false);
+        require(accepts(compiled, *bound, call("123")), "basic type hint rejected raw string");
+        frontend::ToolCallOutputDecoder decoder(bound, 64);
+        (void)feed(decoder, call("123"));
+        require(Json::parse(finish(decoder).tool_calls.at(0).arguments_json)["x"] == "123",
+                "basic reference or enum lost its string encoding");
+    }
     require(
         !accepts(compiled, *basic, "<tool_call>\n<function=missing>\n</function>\n</tool_call>"),
         "default auto admitted an undeclared function");

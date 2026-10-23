@@ -178,6 +178,14 @@ Frontend make_frontend(const FrontendResources& resources,
 
 std::shared_ptr<const void> Frontend::identity() const noexcept { return impl_; }
 
+ModelSamplingDefaults Frontend::sampling_defaults() const noexcept {
+    return {.thinking = impl_->sampling, .non_thinking = impl_->sampling};
+}
+
+MediaCacheSummary Frontend::media_cache_summary() const {
+    return impl_->processor ? impl_->processor->media_cache_summary() : MediaCacheSummary{};
+}
+
 SamplingPreset Frontend::sampling_for(const PreparedPrompt& prompt) const {
     return PreparedPromptAccess::view(prompt).sampling;
 }

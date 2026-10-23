@@ -49,31 +49,6 @@ bool compile_direct_types(const Json& type_definition, SchemaTypes& types) {
     return types.bits != 0;
 }
 
-bool read_types(const Json& schema, SchemaTypes& types) {
-    if (!schema.is_object()) { return false; }
-    const auto direct = schema.find("type");
-    if (direct != schema.end()) { return compile_direct_types(*direct, types); }
-
-    const auto any_of     = schema.find("anyOf");
-    const auto one_of     = schema.find("oneOf");
-    const bool has_any_of = any_of != schema.end();
-    const bool has_one_of = one_of != schema.end();
-    if (has_any_of == has_one_of) { return false; }
-
-    const Json& alternatives = has_any_of ? *any_of : *one_of;
-    if (!alternatives.is_array() || alternatives.empty()) { return false; }
-
-    SchemaTypes combined;
-    for (const Json& alternative : alternatives) {
-        SchemaTypes branch;
-        if (!read_types(alternative, branch)) { return false; }
-        combined.bits |= branch.bits;
-    }
-    if (combined.bits == 0) { return false; }
-    types = combined;
-    return true;
-}
-
 const Json& resolve(const Json& node, const Json& document, std::set<std::string>& seen) {
     if (!node.is_object()) return node;
     if (node.contains("$ref") && node["$ref"].is_string()) {
@@ -101,41 +76,75 @@ std::uint8_t value_type(const Json& value) {
     return type_bit(integer ? SchemaType::Integer : SchemaType::Number);
 }
 
-std::uint8_t domain(const Json& source, const Json& document, std::set<std::string> seen = {}) {
-    if (source.is_boolean()) return source.get<bool>() ? 0x7f : 0;
-    const Json& node = resolve(source, document, seen);
-    if (!node.is_object()) return node.is_boolean() && !node.get<bool>() ? 0 : 0x7f;
-    std::uint8_t types = 0x7f;
+struct TypeDomain {
+    std::uint8_t bits = 0x7f;
+    bool known        = false;
+
+    void intersect(TypeDomain other) {
+        bits &= other.bits;
+        known |= other.known;
+    }
+};
+
+// Encoding hints inspect only type-bearing assertions. Unknown constraints and unresolved
+// references remain unconstrained; language validation belongs to prepare_json_schema.
+TypeDomain domain(const Json& node, const Json& document, std::set<const Json*> seen = {}) {
+    if (node.is_boolean()) return node.get<bool>() ? TypeDomain{} : TypeDomain{0, true};
+    if (!node.is_object() || !seen.insert(&node).second) return {};
+    TypeDomain result;
+    if (node.contains("$ref") && node["$ref"].is_string()) {
+        const auto ref = node["$ref"].get<std::string>();
+        if (ref == "#" || ref.starts_with("#/")) {
+            try {
+                result.intersect(
+                    domain(document.at(Json::json_pointer(ref.substr(1))), document, seen));
+            } catch (const Json::exception&) {}
+        }
+        // draft-07 ignores assertion siblings of $ref.
+        if (document.is_object() && document.contains("$schema") &&
+            (document["$schema"] == "http://json-schema.org/draft-07/schema#" ||
+             document["$schema"] == "https://json-schema.org/draft-07/schema#"))
+            return result;
+    }
     if (node.contains("type")) {
         SchemaTypes direct;
-        if (!compile_direct_types(node["type"], direct))
-            throw RequestError(RequestErrorKind::InvalidJsonSchema, "invalid parameter type");
-        types = direct.bits;
-        if (types & type_bit(SchemaType::Number)) types |= type_bit(SchemaType::Integer);
+        if (compile_direct_types(node["type"], direct)) {
+            if (direct.bits & type_bit(SchemaType::Number))
+                direct.bits |= type_bit(SchemaType::Integer);
+            result.intersect({direct.bits, true});
+        }
     }
-    if (node.contains("const")) return types & value_type(node["const"]);
+    if (node.contains("const")) result.intersect({value_type(node["const"]), true});
     if (node.contains("enum") && node["enum"].is_array()) {
         std::uint8_t values = 0;
         for (const auto& item : node["enum"]) values |= value_type(item);
-        return types & values;
+        result.intersect({values, true});
     }
     for (const char* key : {"anyOf", "oneOf"}) {
-        if (!node.contains(key) || !node[key].is_array()) continue;
-        std::uint8_t combined = 0;
-        for (const auto& branch : node[key]) combined |= domain(branch, document, seen);
-        types &= combined;
+        if (!node.contains(key) || !node[key].is_array() || node[key].empty()) continue;
+        TypeDomain combined{0, true};
+        for (const auto& branch : node[key]) {
+            const auto candidate = domain(branch, document, seen);
+            combined.bits |= candidate.bits;
+            combined.known &= candidate.known;
+        }
+        result.intersect(combined);
     }
-    if (node.contains("allOf"))
-        for (const auto& branch : node["allOf"]) types &= domain(branch, document, seen);
-    return types;
+    if (node.contains("allOf") && node["allOf"].is_array())
+        for (const auto& branch : node["allOf"]) result.intersect(domain(branch, document, seen));
+    return result;
 }
 
 } // namespace
 
-bool read_schema_types(const Json& schema, SchemaTypes& types) { return read_types(schema, types); }
+bool read_schema_types(const Json& schema, const Json& document, SchemaTypes& types) {
+    const auto result = domain(schema, document);
+    types.bits        = result.known ? result.bits : 0;
+    return types.bits != 0;
+}
 
 std::uint8_t schema_type_domain(const Json& schema, const Json& document) {
-    return domain(schema, document);
+    return domain(schema, document).bits;
 }
 
 const Json& resolve_schema(const Json& schema, const Json& document) {

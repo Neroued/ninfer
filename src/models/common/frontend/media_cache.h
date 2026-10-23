@@ -84,6 +84,8 @@ struct MediaCacheStats {
     std::uint64_t singleflight_waits = 0;
     std::uint64_t evictions          = 0;
     std::uint64_t oversize_bypasses  = 0;
+
+    [[nodiscard]] MediaCacheSummary public_stats() const noexcept;
 };
 
 class MediaPreprocessCache {

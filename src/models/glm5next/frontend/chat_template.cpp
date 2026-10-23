@@ -38,7 +38,11 @@ Json template_parameters(const PromptOptions& options, const Json& tokens) {
         const auto& effort = context["reasoning_effort"];
         if (effort != "low" && effort != "high" && effort != "max")
             throw std::invalid_argument("GLM reasoning_effort must be low, high or max");
-        models::frontend::merge_template_option(context, "enable_thinking", true);
+        if (context.contains("enable_thinking") && !context["enable_thinking"].get<bool>())
+            throw RequestError(RequestErrorKind::ConflictingPromptOptions,
+                               "reasoning_effort conflicts with enable_thinking",
+                               "reasoning_effort");
+        context["enable_thinking"] = true;
     }
     if (!context.contains("enable_thinking") && options.defaults.enable_thinking)
         context["enable_thinking"] = *options.defaults.enable_thinking;

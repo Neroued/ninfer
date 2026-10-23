@@ -12,7 +12,8 @@ inline const auto fixtures =
     std::filesystem::path(NINFER_SOURCE_DIR) / "tests/models/glm5next/fixtures";
 
 inline glm::Frontend output_frontend(const std::filesystem::path& path,
-                                     std::shared_ptr<const ninfer::text::Tokenizer>& tokenizer) {
+                                     std::shared_ptr<const ninfer::text::Tokenizer>& tokenizer,
+                                     const Json& processor = nullptr) {
     const auto encoded = read(path);
     const auto source  = read(fixtures / "chat_template.jinja");
     const auto json    = Json::parse(encoded);
@@ -27,13 +28,19 @@ inline glm::Frontend output_frontend(const std::filesystem::path& path,
             eos.push_back(token["id"].get<TokenId>());
     }
     const auto generation = Json{{"eos_token_id", eos}}.dump();
-    glm::FrontendResources resources{.text = {.tokenizer_json         = encoded,
-                                              .tokenizer_config_json  = "{}",
-                                              .chat_template_jinja    = source,
-                                              .generation_config_json = generation}};
+    const auto config     = processor.is_null() ? std::string{} : processor.dump();
+    glm::FrontendResources resources{.text                  = {.tokenizer_json         = encoded,
+                                                               .tokenizer_config_json  = "{}",
+                                                               .chat_template_jinja    = source,
+                                                               .generation_config_json = generation},
+                                     .processor_config_json = config};
     glm::parse_resources(resources, rows);
     tokenizer = resources.text.tokenizer;
-    return glm::make_frontend(resources, {.vision_enabled = false, .max_context = 16384});
+    return glm::make_frontend(resources, {.vision_enabled           = !processor.is_null(),
+                                          .max_context              = 16384,
+                                          .media_cache_bytes        = 16ULL << 20,
+                                          .media_live_bytes         = 16ULL << 20,
+                                          .media_preprocess_threads = 2});
 }
 
 inline Json tool_schema(Json properties, std::vector<std::string> required = {}) {

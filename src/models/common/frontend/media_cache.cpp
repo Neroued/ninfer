@@ -79,6 +79,23 @@ std::uint32_t resolve_threads(std::uint32_t requested) {
 
 } // namespace
 
+MediaCacheSummary MediaCacheStats::public_stats() const noexcept {
+    return {.capacity_bytes      = capacity_bytes,
+            .live_capacity_bytes = live_capacity_bytes,
+            .retained_bytes      = retained_bytes,
+            .live_bytes          = live_bytes,
+            .entries             = entries,
+            .inflight            = inflight,
+            .queued_tasks        = queued_tasks,
+            .active_tasks        = active_tasks,
+            .preprocess_threads  = preprocess_threads,
+            .hits                = hits,
+            .misses              = misses,
+            .singleflight_waits  = singleflight_waits,
+            .evictions           = evictions,
+            .oversize_bypasses   = oversize_bypasses};
+}
+
 struct MediaCacheFlight {
     std::mutex mutex;
     std::condition_variable changed;

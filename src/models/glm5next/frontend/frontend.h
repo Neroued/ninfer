@@ -39,6 +39,8 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> tokens,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    [[nodiscard]] ModelSamplingDefaults sampling_defaults() const noexcept;
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] std::shared_ptr<const void> identity() const noexcept;
     [[nodiscard]] SamplingPreset sampling_for(const PreparedPrompt& prompt) const;
     [[nodiscard]] models::frontend::OutputSession

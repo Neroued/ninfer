@@ -59,7 +59,7 @@ void prepare_strict_parameters(Contract::Tool& tool) {
                  parameter_path(tool));
         Contract::Parameter parameter;
         parameter.name = name;
-        if (text::read_schema_types(schema, parameter.types))
+        if (text::read_schema_types(schema, document, parameter.types))
             parameter.policy = NormalizationPolicy::DeclaredTypes;
         const auto types  = text::schema_type_domain(schema, document);
         const bool string = (types & type_bit(SchemaType::String)) != 0;
@@ -86,7 +86,7 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
             for (const auto& [name, property] : schema["properties"].items()) {
                 Contract::Parameter parameter;
                 parameter.name = name;
-                if (text::read_schema_types(property, parameter.types)) {
+                if (text::read_schema_types(property, schema, parameter.types)) {
                     parameter.policy = NormalizationPolicy::DeclaredTypes;
                     // Non-strict string unions use raw text; strict mixed encodings are rejected.
                     parameter.encoding = parameter.types.bits & type_bit(SchemaType::String)

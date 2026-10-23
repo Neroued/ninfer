@@ -230,7 +230,7 @@ void validate_sources(std::span<const OwnedMedia* const> sources) {
 
 [[noreturn]] void decode_error(const media::decode::Error& error) {
     if (error.kind() == media::decode::ErrorKind::BudgetExceeded) budget(error.what());
-    throw std::invalid_argument(error.what());
+    throw RequestError(RequestErrorKind::InvalidMedia, error.what());
 }
 } // namespace
 
@@ -265,6 +265,8 @@ std::vector<common::VisionItem> Processor::inspect(std::span<const OwnedMedia* c
     } catch (const media::decode::Error& error) { decode_error(error); }
     return result;
 }
+
+MediaCacheSummary Processor::media_cache_summary() const { return cache_->stats().public_stats(); }
 
 ProcessedMedia Processor::prepare(std::span<const OwnedMedia* const> sources,
                                   common::PrepareStats& stats,

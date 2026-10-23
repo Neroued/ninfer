@@ -60,7 +60,8 @@ Json template_context(std::string_view kwargs, const Json& special_tokens) {
 void merge_template_option(Json& context, std::string_view key, const Json& value) {
     const std::string name(key);
     if (context.contains(name) && !context[name].is_null() && context[name] != value) {
-        throw std::invalid_argument("conflicting chat template parameter: " + name);
+        throw RequestError(RequestErrorKind::ConflictingPromptOptions,
+                           "conflicting chat template parameter: " + name, name);
     }
     context[name] = value;
 }

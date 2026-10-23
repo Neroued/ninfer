@@ -35,6 +35,8 @@ public:
     }
 
     [[nodiscard]] std::uint32_t merge_size() const noexcept { return config_.image.merge_size; }
+
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
 private:
     ProcessorConfig config_;
     models::frontend::Sha256Digest digest_;

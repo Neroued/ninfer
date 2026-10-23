@@ -80,6 +80,13 @@ void add_segmented_cases(Suite& suite) {
           64, 65, 95, 96, 97, 127, 128, 129, 511, 512, 513, 1024, 2048, 4096, 4097}},
     };
 #if NINFER_TARGET_SPARK
+    fixtures.push_back({{1536,
+                         {{QType::BF16, 20480, 379U}},
+                         {16384, 4096},
+                         {{0, 16384, 128}, {16384, 4096, 128}},
+                         a16},
+                        {1,   4,   8,   16,  17,   32,   33,   64,   65,   128, 129,
+                         256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096, 4097}});
     fixtures.push_back({{4096,
                          {{QType::BF16, 288, 373U}},
                          {32, 128, 128},
@@ -113,6 +120,9 @@ void add_segmented_cases(Suite& suite) {
     for (const auto& fixture : fixtures) {
         std::set<int> tokens(fixture.tokens.begin(), fixture.tokens.end());
         std::set<int> graph_tokens{1, 8, 32, 64, 128, 129};
+        const bool w_b =
+            fixture.profile.k == 1536 && fixture.profile.outputs == std::vector<int>{16384, 4096};
+        if (w_b) graph_tokens.insert({17, 65, 257, 4097});
         if (fixture.profile.k == 4096) {
             for (int m = 1; m <= 128; ++m) tokens.insert(m);
             for (int b : {4, 8, 16, 32, 40, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096}) {
@@ -151,7 +161,7 @@ void add_segmented_cases(Suite& suite) {
                              .input_seed   = 317U,
                              .changed_seed = 348U,
                              .columns      = Columns::HeadBoundaries,
-                             .full_rows    = t <= 8,
+                             .full_rows    = t <= 8 || (w_b && (t == 32 || t == 128)),
                              .convenience  = true});
         }
         calls.push_back({.t             = 17,
@@ -161,7 +171,7 @@ void add_segmented_cases(Suite& suite) {
                          .columns       = Columns::HeadBoundaries,
                          .convenience   = true,
                          .shared_output = true});
-        if (fixture.profile.k == 4096) {
+        if (fixture.profile.k == 4096 || w_b) {
             calls.push_back({.t            = 17,
                              .graph        = true,
                              .input_seed   = 317U,

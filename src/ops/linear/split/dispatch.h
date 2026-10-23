@@ -20,6 +20,7 @@ struct SplitShape {
 template <int... Rows>
 inline constexpr std::array kSplitRows{Rows...};
 
+extern const SplitShape kBf16SplitN20480K1536;
 extern const SplitShape kBf16SplitN1152K2560, kBf16SplitN7296K2560;
 extern const SplitShape kBf16SplitN1152K2560ThreeOutput, kBf16SplitN640K2560;
 extern const SplitShape kBf16SplitN288K4096, kBf16SplitN1664K2560, kBf16SplitN13952K2560,

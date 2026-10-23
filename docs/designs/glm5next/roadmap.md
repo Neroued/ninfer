@@ -12,11 +12,12 @@ MLA/Indexer attention DP2；KDA 使用 TP2。
 
 ## 1. 起点与目标组织
 
-2026-10-21 已检查的代码起点：
+用于本路线的已有基础：
 
 | 部分 | 起点 | 后续工作 |
 |---|---|---|
-| Engine、集中调度、分布式 Executor、worker、NCCL、提交与退役 | 主线已有双机 Qwen4Exp 实现 | 复用执行基础，增加模块放置与非对称上下文资源 |
+| Engine、集中调度、分布式 Executor、worker、NCCL、提交与退役 | 主线已有双机 Qwen4Exp 实现 | 复用执行基础，接入 GLM 模块放置与调度 |
+| 统一 Context 池与目录 | 已有 State variants、rank-local history placement、成组预留、搬移和执行视图 | 绑定 GLM 字段／页布局，接入 owner 选择及跨 owner 来源转换 |
 | Artifact、编码权重切片、TP/EP 加载 | 已有通用基础 | GLM converter、绑定、并行物化及容量规划 |
 | 基础 Linear/split、clamped SwiGLU、sigmoid router、本地 EP MoE | 主线已有 GLM 相关实现 | 对照实际调用补缺，迁入剩余优化，不按旧清单的未勾选状态重做 |
 | `.50` 的 `feat/glm5next-dev-reorg` | 另有 NVFP4 MoE vector/load schedules、编译组织与测试整理 | 按主线 family 组织审查迁入 |
@@ -98,7 +99,7 @@ G1/G2/G3 的逻辑开发与 Op 工作并行，G2 的最终资源准备使用实�
 G5 与 G6 可以并行，ordinary decode Graph 在 G4 完成后即可开始。
 
 每个 Op 包先提供正确、完整的可调用实现，再在同一合同下调优，模型组装可先消费
-前者。GPU 性能测量按空闲设备排期；当前精度评测继续运行，由用户监控。
+前者。GPU 性能测量按空闲设备排期。
 
 ## 3. G0：形成可交接的接口与布局
 
@@ -109,7 +110,8 @@ G5 与 G6 可以并行，ordinary decode Graph 在 G4 完成后即可开始。
    TP/EP 局部贡献之间的交接分别见 [MTP](mtp.md) 与 [Vision](vision.md)；执行接入
    继续落实实际 collective 和资源绑定。
 2. **完整上下文**：区分两侧 KDA 分片、owner-local Main/MTP history/tail、conditioning；
-   checkpoint 记录同一次执行的完整前沿，确定各分量的资源域和完成依赖。
+   按[State variants](parallel.md#12-state-variants-与字段布局)绑定公共字段和 owner tails，
+   checkpoint 记录同一次执行的完整前沿，声明各 rank 统一 Context 中的完整需求。
 3. **物理布局**：确认 KDA conv/replay records、MLA page planes、tail/raw records、
    selection、权重 parents 和因子布局；提供共享的类型与布局计算实现。
 4. **输入输出基础**：公共 prepared prompt 的归属、Frontend 合同、tokenizer pipeline、
@@ -124,12 +126,12 @@ G5 与 G6 可以并行，ordinary decode Graph 在 G4 完成后即可开始。
 | 数学与数值 | 公式组合、表示、计算许可、必要舍入、精确提交关系；引用相应权威定义 |
 | 输入输出 | 轴含义、dtype、shape 范围、stride、alignment、有效列和输出写域 |
 | 权重 | 编码及 parent 顺序、切片/view、标量 metadata、source 到本地参数的映射 |
-| 状态 | source/destination、record/selection 行映射、alias、零采用及无效行效果 |
-| 执行资源 | caller-owned workspace 查询、buffer lifetime、Device metadata 和 Graph 使用合同 |
+| 状态 | State 字段／页记录 views、source/destination I64 offsets、frame record/selection 行映射、alias、零采用及无效行效果 |
+| 执行资源 | caller-owned workspace 查询、执行借用、frame lifetime、搬迁后映射更新与 Graph 使用合同 |
 | 工作负载 | 本地几何、T/B/context 范围及重点调优点；区分全局 batch 与 owner-local batch |
 
-先落地共享公共类型、声明和实际布局 helpers，再让消费者依赖；family 内部 helper
-与 kernel 由该包自行组织。不为交接添加占位执行路径。涉及跨包的合同修改先同步
+复用 Core 的 StateFieldView／PagedPlaneView 和布局计算，先落地 family 的读写类型
+与绑定，再让消费者依赖；内部 helper 与 kernel 由该包自行组织。涉及跨包的合同修改先同步
 生产者、消费者和 converter；tile、launch decomposition 和 shape policy 留给实现者。
 
 已有设计入口：[KDA](replayssm-kda.md)、[Kpool MLA](kpool-sparse-mla.md)、
@@ -185,16 +187,17 @@ block-FP8 编码、Q4 proposal head 与源资源封装。按 G0 的布局生成�
 TP/EP 分片及必要组合；模型配置与并行计划是本地几何的共同来源。
 
 声明 Main/MTP/Vision 组件和使用关系，建立 page/state/frame/record/workspace 规划。
-预算分别计入各 rank 权重复制、owner-local MLA 池、两侧 KDA 分片、临时数据与 Graph
-开销。配置和编码可先完成；最终准备接入实际 Op 的容量查询，与 G3 一起确定部署容量。
+每 rank 注册 owner/non-owner State 与 Main/MTP 页记录，规划一份共享 Context backing；
+权重、frame、执行表、workspace 和 Graph 另外计费。最终准备消费实际布局及 Op 容量查询，
+按完整启动工作集检查各候选 owner 的容量，与 G3 一起确定部署预算。
 
 **产出：真实 `.ninfer`，双机按计划加载及准备/销毁资源，实际预算与绑定可检查。**
 
 ### G3：Attention DP、上下文与请求放置
 
-扩展现有资源合同与目录，表达 sharded state 和 owner-local history/state。容量规划
-允许两侧 MLA 池分别使用其预算，同时计入共同需要的 KDA checkpoint 分片；短缺、
-回收和预留针对具体资源域，保留现有 Qwen 的对称分片使用方式。
+使用现有 State variants 与 history placement 表达两侧 KDA 分片、owner-only tails
+和 Main/MTP histories。同一 rank 的全部记录共享 Context 容量；短缺、回收和成组
+预留通过已有目录针对具体 rank／存储域评估，GLM 不另建可用容量账本。
 
 请求来源候选包含 checkpoint 与目标 attention owner。Session 提供合法恢复组合、
 资源需求、传输及重建工作；共享策略结合前缀收益、可用容量和 attention 负载选择。
@@ -202,11 +205,12 @@ TP/EP 分片及必要组合；模型配置与并行计划是本地几何的共�
 行映射在一次执行中固定，KDA/TP/EP 继续处理完整 batch。
 
 先接通同 owner 的共享/COW、capture/restore、暂停恢复和释放，再接 admission 时
-的跨 owner 前缀复制。前缀索引保留不同放置的可恢复实例；热点共享前缀可按成本建立
-另一 owner 的副本。复制包含所需历史与 tail，保留两侧 KDA 的对应恢复点，完成后
-才发布目的。活动请求迁移另有负载证据时再安排。
+的跨 owner 来源转换。前缀索引保留不同放置的可恢复实例；热点共享前缀可按成本建立
+另一 owner 的副本。转换需新建相应 State variant 和 history placement，复制公共
+字段、传输 owner history/tail，全部完成后发布；现有同 variant／placement 恢复
+不能直接执行此转换。活动请求迁移另有负载证据时再安排。
 
-**产出：独立 MLA 容量能用于请求和缓存命中，完整上下文的采用与回收遵循同一事务。**
+**产出：统一 Context 余量可用于请求和前缀缓存，完整上下文的采用与回收遵循同一事务。**
 
 ### G4：完整 eager text
 

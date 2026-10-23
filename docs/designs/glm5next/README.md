@@ -12,6 +12,10 @@
 阅读实现设计前先读相应长期参考。这里的接口名称和代码片段是待落地合同，不能
 据此宣称已有运行能力；已确认的模型／数值决策不因实现进度或文档迁移而重开。
 
+Context 存储采用现有[统一容量、记录视图与执行借用合同](../../maintainer/paged-kv-cache.md)。
+GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-state-variants-与字段布局)
+维护，KDA／Kpool 定义自身字段访问；Main/MTP history 与 State 共享各 rank 的物理容量。
+
 ## 1. 文档与状态
 
 以下区分设计与实现。既有基础 Op 成果按代码和原验证证据确认；新格式需求以
@@ -20,12 +24,12 @@
 | 内容 | 决策状态 | 实施状态／入口 |
 |---|---|---|
 | 架构、源表示、量化与数值政策 | 已确定 | 长期参考；新量化产物尚未生成或做模型精度评测 |
-| [双 Spark 分工与资源](parallel.md) | 模块分工、owner、mHC 复制已确定 | 待通信与模型执行接入；容量为推导，暂无 GLM 双机端到端测量 |
+| [双 Spark 分工与资源](parallel.md) | 模块分工、State variants、owner histories 与统一容量需求已确定 | 通用目录已有对应能力，待 GLM 绑定、通信与执行接入；容量为推导 |
 | [Linear/MoE 清单](op-checklist.md) | Q8 shared 完整链、MLA query/O、Q4 draft head、stem/Vision 纯矩阵与 MoE 优化迁入 | `.50` 工作区按清单逐项实施 |
-| [KDA 计算与 ReplaySSM](replayssm-kda.md) | 输入 update/record、递推 source/destination、五个 record planes、Host/Device fold 接口已明确 | 按现有 GDN 状态组织落地，待实现／验收 |
-| [Kpool Sparse MLA](kpool-sparse-mla.md) | 与 QSA 平行的 family、五个计算入口、冻结 selection、历史与 tail、容量及分阶段实现已明确 | 设计待实现／验收 |
+| [KDA 计算与 ReplaySSM](replayssm-kda.md) | 字段／I64 offsets、source/destination、五个 frame record planes、Host/Device fold 与搬迁后 Graph 使用已明确 | 原位 batch update 已使用字段视图；新增输入链、独立目的及 record/fold 待实现／验收 |
+| [Kpool Sparse MLA](kpool-sparse-mla.md) | 读写 views、多层页组、冻结 selection、Context/frame tail 和五个计算入口已明确 | 设计待实现／验收 |
 | [mHC](mhc.md) | 五个 C++ 入口、M 列布局、容量查询、两阶段融合与资源归属已明确 | 设计待实现／验收 |
-| [MTP](mtp.md) | 输入移位与首列 mask、stem/residual 接口、canonical history、首步采用、head 及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
+| [MTP](mtp.md) | 输入移位、stem/residual、共享 Main hidden、provisional 页与 frame、首步采用及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
 | [Vision](vision.md) | GLM processor、patch 顺序、bias/2D norm-RoPE/D64 attention、segment 分配与媒体生命周期已明确 | 输入基础、Op 扩展与模型组合待实现／验收 |
 | Converter 与模型接入 | 数值规则已定，接入未完成 | block-FP8 编码入口、GLM converter/binding 与运行路径待实现 |
 
@@ -55,7 +59,8 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 |---|---|
 | 模型数学、逻辑角色与历史依赖 | 长期模型参考 |
 | 表示、codec、activation permission、可观察舍入 | 长期数值参考；已有通用格式直接引用 |
-| 分片、owner、通信交接与部署预算 | parallel.md |
+| 通用 Context 容量、记录寻址、借用与搬迁 | [Context 存储合同](../../maintainer/paged-kv-cache.md) |
+| 分片、owner、State variants、通信交接与部署预算 | parallel.md |
 | 具体 Op/views、physical layout、写域、alias、融合与验收 | 对应 family 设计 |
 | 执行条目与完成证据 | op-checklist.md |
 | 集成步骤、并行任务与阶段进度 | [实施路线](roadmap.md) |

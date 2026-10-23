@@ -42,8 +42,8 @@ epsilon 为 `1e-5`；O 使用 Q8 `[4096,4096]`。输出不在本地加入 residu
 | 输入准备 Op | QKV projection/conv/SiLU、最终 conv history 或 conv records |
 | KDA recurrence Op | Q/K normalization、内部 gate、递推/readout、transition records |
 | KDA fold Op | 从 source 重放指定前缀，写 destination 的 recurrent/conv state |
-| RankProgram | frame、workspace、records、prepared fold plan、Op 顺序与 Graph |
-| ModelSession | source/destination 的使用权限、最终采用长度、frontier 和 checkpoint |
+| RankProgram | Context backing、frame、workspace、records、prepared fold plan、Op 顺序与 Graph |
+| ModelSession／ContextDirectory | 完整工作集、source/destination 的权限与执行借用、最终采用长度、frontier 和 checkpoint |
 
 Op 的状态写入是物理效果；完整模型状态的采用由 Session 在执行依赖满足后完成。
 
@@ -58,9 +58,11 @@ Op 的状态写入是物理效果；完整模型状态的采用由 Session 在�
 | recurrent | FP32 `[128,128,Hv]` field | 逻辑 `S[value,key]`，key 轴连续 |
 | conv | BF16 `[C,3]` field | 最近三列卷积前投影，最旧到最新，channels 为 `[Q;K;V]` |
 
-每条 State record 的字段内连续；字段与层偏移由 StateFieldLayout 给出。All-layer view 的 conv 和
-recurrent layer strides 独立，按现有 StateImage field 布局读取。
-初始 image 的这两个字段置零，初始化和存储寿命由现有 context/state 机制负责。
+每条 State record 的字段内连续；字段与层偏移由 `StateFieldLayout` 给出，conv 和
+recurrent 的 layer strides 独立。两字段与其他续算字段组成一份连续 StateImage，
+共享本 rank 的 Context 容量；初始值为零，由显式初始化动作建立。
+GLM 的 owner/non-owner images 使用相同 KDA 字段偏移，见
+[State placement](parallel.md#12-state-variants-与字段布局)。KDA Op 只消费这些字段。
 
 Checkpoint 保存已采用的 recurrent/conv 字段。Records 属于本轮执行 frame；本轮
 完成 fold 后，持久 state 已代表最新采用前沿，不保留跨轮待 fold 的已提交 records。
@@ -112,8 +114,9 @@ words；fold 从 log_decay 重新计算 alpha 的 exp，使用与 update/record 
 第零维连续，token/batch 展平为 `column=t+T*b`。Record row、State record 和
 request 身份分别表达；一轮 record 到 fold 完成期间，physical row 顺序保持不变。
 实际 T/B 是本轮产生 records 时的形状，不能把 backing 直接重解释成更短的窗口。
-持久 state 通过 StateFieldView/ConstStateFieldView 的 Device I64 `[B]` byte offsets 选择，
-相对于本 rank 的 Context backing。字段布局不含容量轴，临时 record rows 仍保持 I32 索引语义。
+持久 state 通过 `StateFieldView`／`ConstStateFieldView` 的 Device I64 `[B]` byte offsets
+选择，相对于 view 的 backing。模型持久字段绑定本 rank 的 Context backing；字段布局
+不含容量轴，记录之间不要求等间距。临时 record rows 仍保持 I32 索引语义。
 存储与借用合同见 [Context 存储](../../maintainer/paged-kv-cache.md)。
 
 ### 3.2 五个 planes
@@ -271,7 +274,8 @@ x 的全部物理列需可读且为有效有限输入，投影可以计算 paddi
 ### 4.3 存储与容量
 
 History 字段内 `[C,3]` 连续，记录偏移由 I64 metadata 给出；字段起点至少 16 B 对齐。
-x、Q/K/V、conv_record、conv weight 连续且至少 16 B 对齐，selectors 至少 4 B 对齐。
+x、Q/K/V、conv_record、conv weight 连续且至少 16 B 对齐；I64 offsets 至少 8 B
+对齐，I32 valid_columns 至少 4 B 对齐。
 QKV 使用原生 Q8 codes/scales 对齐要求。History 的实际数据块与所有非 state
 operands 和当前 scratch disjoint。输出和 records 彼此 disjoint，与输入、权重、
 metadata 和 scratch disjoint；只读 metadata 可以共享 backing。
@@ -310,9 +314,14 @@ outputs 和末端 state。`state_in/state_out` 可以完全同 view 或 disjoint
 state 参数的重载保持同样语义。长 prefill 的 recurrent/chunked 选择和 Spark 调优
 由此入口内部负责；数学参考始终是完整 KDA 转移。
 
-### 5.2 单列 state-pool update
+RankProgram 在本次执行借用内从 State 字段解析连续 Tensor，直到消费者退役后才
+结束借用。解析出的 payload 地址不跨池整理窗口保存；批量和可变记录的 Graph
+路径使用下面的字段／Device offsets 接口。
 
-扩展现有 batch update，对齐 GDN 的独立 source/destination selectors：
+### 5.2 单列 State 字段更新
+
+现有 batch update 已使用 `StateFieldView` 做原位更新；本任务将其扩展为与 GDN
+一致的独立 source/destination 字段：
 
 ```cpp
 namespace ninfer::ops {
@@ -331,7 +340,7 @@ void kimi_delta_attention_batch_update(
 T=1、B=1..8；source/destination views 的 record offsets 为 Device I64 `[B]`。每行从 source 做一次 recurrent 更新，
 写 destination 和 out。允许原位，各行 destinations 互异且不能覆盖其他行 source；
 只读 source 可以重复。只写 recurrent 字段，conv 由输入准备负责。该入口无全局
-workspace。实施时替换旧单 selector 签名及其 callers。
+workspace。实施时替换现有单一可写字段签名及其 callers。
 
 ### 5.3 Recurrent record
 
@@ -380,9 +389,10 @@ Record vectors 至少 16 B 对齐，beta record 至少 4 B 对齐；Core planner
 256 B plane 对齐。
 
 除声明的 state 原位和 K/V record 同 view 外，写入范围与所有其他 operands disjoint。
-只读 operands 可在数学与形状允许时共享 backing。Operands、metadata、workspace
-均属于 execution device。Device offset/length 的合法值由调用者保证，Op 检查公开
-metadata 和地址域；不为验证 device 值增加 Host readback。
+Alias 按实际访问字段判断，同一 arena 内的 disjoint 字段可以共同参与调用；原位指
+实际字段地址相同，不是 offsets 数值相同。只读 operands 可共享 backing。
+Operands、metadata、workspace 均属于 execution device。调用方保证 Device offsets、
+lengths、字段边界与行间写入关系，Op 检查 Host 可见 metadata，不增加 Host readback。
 
 ## 6. Prepared all-layer fold
 
@@ -412,18 +422,20 @@ public:
 } // namespace ninfer::ops
 ```
 
-构造时验证固定 records/state 的几何、dtype、device、strides、alignment、地址域和
-不重叠。Plan 借用稳定 backing，不分配设备存储。State 的 layers、heads、conv
-channels/width 与 records 对应；conv_width=3、Dk=Dv=128。
+构造时验证 records、arena 和 State 字段的固定几何、dtype、device、strides 与
+alignment。Plan 绑定稳定 arena、字段布局和 frame records，不保存某份 State 的
+payload 地址，也不持有长期记录借用或分配设备存储。State 的 layers、heads、conv
+channels/width 与 records 对应；conv_width=3、Dk=Dv=128。Source/destination 共用
+构造时的 arena 和字段布局，每次 execute 提供本轮 offsets。
 
 `rows[b]` 对应 physical record row b，Host rows.size() 或 Device metadata 长度为
-B，`1<=B<=R`。Selectors 是 arena-relative byte offsets，m 在 `[0,T]`；调用者保证 `m[b]<=n[b]`，
-且 source 内容仍是产生该行 records 的原始版本。
+B，`1<=B<=R`。Selectors 是 arena-relative byte offsets，m 在 `[0,T]`；调用者保证
+`m[b]<=n[b]`，正提交行的 source 内容仍是产生该行 records 的原始版本。
 
 All-layer state 的字段、层和记录起点遵循 Core 的 256 B 对齐。Device offsets 为连续、至少
 8 B 对齐的 I64 `[B]`，commit_columns 为至少 4 B 对齐的 I32 `[B]`；metadata 与所选字段及
-records disjoint。Host 形式检查行数、offset、m 和行间写入关系；Device
-形式检查 Tensor metadata/地址域，值与行间关系由调用者保证，不做 Host readback。
+records disjoint。Host 形式检查行数、m，以及正提交行的 offset、字段边界和行间写入
+关系；Device 形式检查 Tensor metadata，值与行间关系由调用者保证，不做 Host readback。
 
 ### 6.1 正提交与零提交
 
@@ -448,8 +460,9 @@ Conv 更新是 words 提取：m=1 取旧末两列加 record[0]；m=2 取旧末�
 m>=3 取 record[m-3:m]。原位时保留所需旧列之后再写。
 
 m=0 是严格 no-op：不读 state/record payload，不写两个字段，即使 source 与
-目的不同也不复制。调用方继续采用原 image。Selectors 仍遵守合法范围与行间关系。
-允许单行原位 fold；destinations 互异，不能覆盖其他活动行的 source。
+目的不同也不复制。调用方继续采用并保护原 image；该行 offsets 可为 `-1`，实现先
+判断 m 再解析地址。允许正提交行原位 fold；其 destinations 互异，不能覆盖其他
+正提交行的 source。
 
 一次调用覆盖本 rank 的全部 KDA layers，只写正提交行的目标字段。Records 只读，
 拒绝后缀不读取；无需全局 workspace，也不要求 Host 按 layer 循环提交。
@@ -495,7 +508,9 @@ Graph 使用规则：
 - Host fold 将 row descriptors 按值提交；capture 后改变 Host vector 不改变图中值。
   全零 Host rows 可直接返回。需要每轮改变 descriptors 的图使用 Device 形式。
 - Plan、records 和 state backing 在引用它们的提交及 Graph 生命周期内保持有效。
-  T、R、几何和布局固定于相应执行 variant；同一 backing 上的下一轮写入等待旧消费者。
+  T、R、几何和布局固定于相应执行 variant；frame records 复用等待旧消费者退役。
+- State 地址借用只覆盖本次执行。池整理等待旧借用结束，后续执行重新取得 offsets；
+  相同 Graph／fold plan 继续使用当前 Device offsets，无须为记录移动重建。
 
 TP2 每 rank 独立处理本地 32 heads 和 34 层，source/destination record offsets 可以不同，
 逻辑 batch 和采用长度一致。模型负责完整输出的归约和状态采用。GLM 的 MTP 层是
@@ -534,9 +549,10 @@ callers、tests/bench 随相应接口一起更新。
 2. Records 的实际 words、同物理 T/B 的 update/record 一致性；K/V 同 view 与独立
    backing 两种合法形式；固定 R 下 B<R 的跨层寻址。
 3. Fold 与逐步 recurrent state/output 的精确关系，覆盖 m=0/1/2/3/完整前缀、混合
-   接受长度、非连续 record offsets、原位和独立目的、显式 state strides。
-4. 固定地址的 Graph 重放改变 inputs、selectors、valid lengths 和 Device commit
-   lengths，检查未使用 record 后缀及非目标 state 字段保持不变。
+   接受长度、非等间距 record offsets、原位和独立目的、显式字段／层偏移；零提交
+   行可用无效 offsets，其他 State 字段保持不变。
+4. 同一 Graph／fold plan 重放改变 inputs、offsets、valid lengths 和 commit lengths；
+   保值搬移 State 后更新 offsets 继续使用，检查未采用后缀与无关记录保持不变。
 
 数值要求按公开数学确定，不随私有 kernel 改精度阈值。精确 replay 检查和完整 KDA
 数学检查分别保留。

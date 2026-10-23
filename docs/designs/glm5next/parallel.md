@@ -30,9 +30,9 @@ MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制
 
 DP 的分配单位是请求。普通执行保持请求的 MLA/Indexer owner 稳定，该请求的全部
 历史由此 owner 消费；不按序列位置拆开一条历史。KDA 仍由两台共同持有分片，并
-处理同一组请求。ModelSession/ContextDirectory 必须同时表达这两种 owner 集合；
-checkpoint 与恢复覆盖各自必需的分片，不能按两台都必须有 MLA cache 的规则预留。
-跨 owner 的 prefix 恢复或迁移策略在后续上下文接口设计中单独收敛。
+处理同一组请求。模型使用 ContextDirectory 的 State variants 与 history placement
+表达两种 owner 集合；checkpoint 与恢复覆盖全部必需分片，只在 attention owner
+预留 MLA history。跨 owner 的恢复按下述独立来源转换处理。
 
 MLA 向后续 TP/EP 计算交付完整的 4096 维 block 输出；KDA、dense/shared 和 routed
 的局部贡献在 Main mHC 或 MTP residual 消费前完成求和。Main MLA owner 的输出
@@ -47,6 +47,50 @@ cache 副本。两台采用一致的输入 words、物理列映射和精度策�
 本地 vLLM 的 `TP=1, DP=2, enable_expert_parallel=true` 会将 KDA、dense/shared、
 head 等非 routed-expert 权重一并复制。它的 MLA 与 KDA 使用同一个 TP group；本节
 采用的是按模块选择的混合分工，不能直接等同于该 vLLM 参数组合。
+
+### 1.1 Context 容量与记录归属
+
+每个 rank 使用一份 Device Context backing，State、Main history 和 MTP history
+共同使用其容量。Spark 不建立重复的 Host Context cache。分配、成组预留、借用、
+搬移和退役遵循[Context 存储合同](../../maintainer/paged-kv-cache.md)。
+
+模型准备时声明 State variants、Main/MTP 页记录与各 rank 的容量；数学层的 history
+pool ID 只区分用途和布局。已有目录支持不等容量、State 分片和 owner-only histories。
+GLM Session 将本轮 State 目的、缺失副本、尾页 COW、增长页及提交峰值组成完整需求，
+通过目录统一评估和预留；不能分别以“KV 够用”和“State 够用”替代成组可行性。
+
+两 rank 分别使用自身容量。准入时结合可恢复来源与完整需求选择 owner，普通执行
+期间保持 owner；另一 rank 的空闲字节不直接成为当前 owner 的可寻址历史。
+启动按每个可选 owner 检查完整工作集，固定 workspace/frame/执行表/Graph 在 Context
+之外计费，算子容量查询不包含持久记录或池管理开销。
+
+### 1.2 State variants 与字段布局
+
+一份逻辑 StateId 包含两个 rank-local images。模型按 attention owner 声明两个
+variants：owner=0 时 rank0 使用 owner image、rank1 使用 non-owner image；owner=1
+时相反。每个 image 连续，字段使用 `StateImageBuilder`，两种布局的公共前缀相同：
+
+| 字段顺序 | 单层形状／层数 | 放置 |
+|---|---|---|
+| KDA conv | BF16 `[12288,3]` × 34 | 每 rank 的本地 head 分片 |
+| KDA recurrent | FP32 `[128,128,32]` × 34 | 每 rank 的本地 head 分片 |
+| Main final hidden | BF16 `[4096]` × 1 | 两 rank 复制；续算与 MTP conditioning 共用 |
+| Main raw K、raw gate | 各 BF16 `[128,3]` × 11 | owner image 末端 |
+| MTP raw K、raw gate | 各 BF16 `[128,3]` × 1 | 启用 MTP 时追加于 owner image 末端 |
+
+每个字段及 layer stride 按 256 B 对齐。Non-owner image 为 **70.398438 MiB**；
+owner image 在无 MTP／有 MTP 时分别为 **70.414551／70.416016 MiB**。
+这些是当前几何的记录大小，最终注册使用布局计算结果。Frontier、pool 相位和 owner
+属于模型 metadata；无 RoPE 的 GLM 不增加 QSA 坐标字段。
+
+KDA views 在两种布局中使用相同公共字段偏移；MLA 仅为 owner 行绑定 tail，临时
+draft tail 则使用 frame 字段。Ops 不读取 variant 或 owner，只接收实际布局与 offsets。
+完整 checkpoint 同时持有两 rank State 分片、owner 上的 Main/MTP history 和输入身份。
+
+同 owner 恢复复用现有目录合同。跨 owner 恢复需要模型安排新的 variant、history
+placement、公共字段复制和 owner-only tail／history 传输，并在全部完成后发布。
+当前普通 `begin_write` 和 history binding 会拒绝不同 variant／placement，不能用整份
+image 的字节复制替代这种转换；该事务随 G3 集成落实，不进入 Op 或分配器。
 
 ## 2. 参数合并与本地几何
 
@@ -125,25 +169,35 @@ Growing cache 合计如下，FP8 列已经包含全部 MLA scales；Indexer 均�
 KDA 的完整 34 层 FP32 state 为 136 MiB，三列 BF16 convolution history 为
 4.78125 MiB；按 KDA heads TP2 后每 rank 分别为 68 MiB、2.390625 MiB。
 
-采用已选定的「MLA/Indexer DP2、KDA TP2」，计入一份本地 KDA state/history 与 tail：
+采用已选定的「MLA/Indexer DP2、KDA TP2」，计入第 1.2 节的一份本地 StateImage：
 
 | 单请求在指定 rank 的占用 | Main | Main＋原生 MTP |
 |---|---:|---:|
-| Owner：FP8 MLA＋BF16 Indexer＋本地 KDA state/history＋tail | 约 6.43 GiB | 约 7.01 GiB |
-| Owner：BF16 MLA＋BF16 Indexer＋本地 KDA state/history＋tail | 约 11.76 GiB | 约 12.82 GiB |
-| 非 owner：该请求的另一份 KDA state/history 分片 | 约 0.069 GiB | 约 0.069 GiB |
+| Owner：FP8 MLA＋BF16 Indexer＋StateImage | 约 6.43 GiB | 约 7.01 GiB |
+| Owner：BF16 MLA＋BF16 Indexer＋StateImage | 约 11.76 GiB | 约 12.82 GiB |
+| 非 owner：本地 StateImage | 约 0.069 GiB | 约 0.069 GiB |
 
 表中按各层均满 1M 计费，真实 Main/MTP 各自 frontier 的有效行数按 family 合同计算。
-不计执行 records/workspace、Graph、额外 StateImage/checkpoint 副本、page tables、
-分配对齐及其他小型状态字段；MTP conditioning 等仍需单独计费。多个无共享前缀的请求
-按各自 owner 和长度累加 growing cache；两台都持有各请求的本地 KDA 分片，其容量
-按状态实例数增加，不随 L 增长。Prefix restore 除 token/latent 前沿外，还要恢复两台
-的 KDA state/convolution history，以及 owner 上的 Indexer tail 和 MTP 状态。
+不计执行 records/workspace、Graph、额外 checkpoint images、执行表与池装载余量。
+Main final hidden 已计入 StateImage，MTP 不再为 conditioning 增加第二份字段。
+多个请求按各自 owner、长度和实际共享关系累加 history；两台都持有各请求的本地
+State 分片，其容量按状态实例数增加，不随 L 增长。恢复来源须覆盖完整 checkpoint。
 
 ### 3.1 Page、Indexer 与 raw records 的补充计费
 
 每层每原 token 的 growing payload 为 BF16 MLA＋BF16 Indexer 的 1088 B，
 或 FP8 MLA＋BF16 Indexer 的 592 B；对应每个 64-token page 为 68 KiB 或 37 KiB。
+
+| 完整页组记录 | BF16 latent | FP8 latent |
+|---|---:|---:|
+| Main 11 层 | 748 KiB | 407 KiB |
+| MTP 1 层 | 68 KiB | 37 KiB |
+
+表中已含当前 planes 的 256 B 对齐；精确大小由 `KVPageLayout` 给出。Context 实际
+需求还包含记录类别的装载余量，使用 `describe_context_pool()` 的几何和成组需求
+计算，不能把上面的 payload 相加当作池容量。执行表按活动 rows 与最大上下文规划，
+与池里保留的 inactive histories 数量分开计费。
+
 每层每有效 raw record column 为 `128*2*2=512 B`，跨层 frame 两个 planes 共
 `512*W*L*R` B，不含 slab 对齐。W、L、R 分别是 raw record 窗口容量、层数和行容量，
 布局按 Kpool 设计；update 出口不要求保留整段 raw records。
@@ -224,8 +278,8 @@ BF16 Q_b 为 48 MiB、BF16 KV_b 因子为 32 MiB、Q8 O 为 68 MiB，每层合�
 12.75 GiB（BF16 MLA），均包含固定的 BF16 Indexer，FP8 列包含全部 FP32 scales。
 去掉副本并扣除两台合计 1.734375 GiB 新增权重后，双机 payload 分别净减少
 5.203125 / 11.015625 GiB。Owner 仍需
-保存完整历史，DP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于固定
-pool 预算、临时数据与通信资源。
+保存完整历史，DP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于各 rank
+统一 Context 容量、临时数据与通信资源。
 
 相对非 routed-expert 全部 DP 的方案，保留 KDA/shared/head TP2 是低并发性能的
 主要预期收益来源。KDA Q/K/V/O 每层 Q8 权重为 136 MiB，TP2 后每台 68 MiB；

@@ -136,21 +136,23 @@ raw K/gate 属于定长 StateImage。两类状态使用相同原 token frontier�
 | pooled index keys | BF16 `[128,16,1]` | 4 |
 
 只实例化所选 latent profile。Plane 基址为 256 B 对齐；页内紧密排列，latent row
-stride 为 1024/512 B，scale row 为 16 B，index row 为 256 B。同一逻辑页的所有层/planes 打包为一份
-256 B 对齐的记录，记录可以离散放置；scales 不插在相邻 latent rows 之间。
+stride 为 1024/512 B，scale row 为 16 B，index row 为 256 B。同一逻辑页的全部层
+按 layer 顺序、每层按表中所选 planes 顺序打包成一份 256 B 对齐记录，scales 不插在
+latent rows 之间。
+记录内偏移和总大小统一由 `plan_kv_page_layout()` 产生；记录之间可以离散放置。
 
-Main 的 11 层共享一个 growing pool，MTP 层使用另一个 growing pool。二者的 page
-namespace、block table、frontier 独立；每个 growing pool 内全部层及 planes 共用
-page-group ID，统一 reserve、保护、截短和释放。这里的 growing pool 与四 token
-的 Kpool 分组是不同概念。
+Main 的 11 层共享一个逻辑 history pool，MTP 层使用另一个。二者的 page namespace、
+执行表、frontier 独立；每个 history pool 内全部层及 planes 共用 page-group ID，
+统一 reserve、保护、截短和释放。它们与 State 共同使用 owner rank 的 Context 容量，
+不各自划定物理配额；四 token 的 Kpool 分组则是 Indexer 的数学分组。
 
 现有 [KVPlaneGeometry](../../../src/core/paged_kv_geometry.h) 的 `tokens_per_row=1/4`
 可承载以上布局。Core 管理存储几何，消费者使用专门的 latent/index typed views。
 
 ### 3.2 四 token 连续读取
 
-page_offsets 为 Device I64 `[logical_pages,table_rows]`，条目是 Context backing 内的 byte offset，
-页项连续，行跨度显式。记录位置不要求连续。选中 logical pool g 时：
+page_offsets 为 Device I64 `[logical_pages,table_rows]`，条目是相对 Context backing
+的 byte offset；页项连续，行跨度显式。选中 logical pool g 时：
 
 ```text
 logical_page  = g / 16
@@ -163,6 +165,8 @@ latent rows   = 4*pool_in_page + {0,1,2,3}
 一次页表寻址定位四条连续 latent，不跨页。四 token payload 为 BF16 4096 B，或
 FP8 codes 2048 B＋另一 plane 的 64 B scales。Selection 保留 pool IDs，消费者直接
 按组加载，不先展开 token IDs 或构造全局 gather buffer。未完成 tail 按有效数 mask。
+实际地址为 `arena + record_offset + plane_offset + row*row_stride + feature_offset`。
+固定层的跨页地址必须读取映射，不能按单层 payload 或整个 backing 容量外推。
 
 ### 3.3 Latent codec
 
@@ -197,11 +201,27 @@ struct KpoolMlaBatchView {
 struct KpoolMlaLatentCacheView {
     PagedPlaneView data;   // Latent field in the packed page record.
     PagedPlaneView scales; // Empty for BF16; FP32 [4,64,1] for FP8.
-    KpoolMlaStorage storage;
+    KpoolMlaStorage storage = KpoolMlaStorage::BFloat16;
 };
 
 struct KpoolIndexCacheView {
     PagedPlaneView keys; // BF16 [128,16,1] in the same record and I64 page-offset table.
+};
+
+struct ConstKpoolMlaLatentCacheView {
+    ConstPagedPlaneView data;
+    ConstPagedPlaneView scales;
+    KpoolMlaStorage storage = KpoolMlaStorage::BFloat16;
+
+    ConstKpoolMlaLatentCacheView() = default;
+    ConstKpoolMlaLatentCacheView(const KpoolMlaLatentCacheView& view);
+};
+
+struct ConstKpoolIndexCacheView {
+    ConstPagedPlaneView keys;
+
+    ConstKpoolIndexCacheView() = default;
+    ConstKpoolIndexCacheView(const KpoolIndexCacheView& view);
 };
 
 struct KpoolMlaCacheView {
@@ -215,8 +235,8 @@ struct KpoolExecutionEnvelope {
 ```
 
 组合 cache 的 planes 必须借用同一 backing 与 I64 page-offset table，页跨度均为 64。
-写入接口使用可写 views；只读 Indexer/MLA 入口使用对应的 ConstPagedPlaneView。
-单独的 Indexer／MLA 只接收自己使用的 cache view。
+Prepare 接收可写 views，Indexer／MLA 分别接收对应的只读 view。上述转换只借用同一
+资源和布局，不复制 payload；单独的 Indexer／MLA 只接收自己使用的 planes。
 
 每个活跃行的 positions 连续、非负；padding 不消耗 ordinal。有效 `p+1` 必须在
 table 可寻址范围和本 Op 支持的上下文域内；Indexer／MLA 还要求它不超过 envelope。
@@ -224,8 +244,9 @@ table 可寻址范围和本 Op 支持的上下文域内；Indexer／MLA 还要�
 零上界只允许所有行无效。
 物理 B 为正；没有本地任务时可不调用，有固定 Graph 行时用零有效长度表达。
 
-State record offset、table row、batch row、record row、selection row 是不同身份。Op 不接收
-request ID 或 rank；调用方提供同一请求、同一层、正确历史的 views 及映射。
+State record offset、table row、batch row、record row、selection row 是不同身份。
+调用方在提交前完成所需页的物化、COW 和映射发布，并保护写权限与执行借用至退役。
+Op 不接收 request ID、rank 或 allocator；只消费已提供的同一请求／层的正确历史。
 
 ### 4.2 Tail 与 records
 
@@ -253,7 +274,7 @@ struct ConstKpoolTailAllLayersView {
 
 struct KpoolTailAllLayersView {
     StateFieldView raw_keys;  // BF16 [128,3] per layer, L layers in the field schema.
-    StateFieldView raw_gates; // Same RecordBatchView and independently described layer offsets.
+    StateFieldView raw_gates; // Same record selection; independent field/layer offsets.
 };
 
 struct KpoolRawRecordReadView {
@@ -276,6 +297,10 @@ Tail 字段内 feature 连续，层偏移由 StateFieldLayout 描述；records �
 不重叠的 strides。持久 source 使用对应 ConstStateFieldView，目的使用可写 view，不能将
 临时 record offsets 的 I32 索引与持久记录的 I64 byte offsets 混用。
 
+Canonical tail 绑定 Context 中的 StateImage 字段；draft 临时 tail 绑定 frame backing
+中的相同字段形状。Before/after 可以使用不同 backing 和字段布局，offsets 分别相对
+各自 backing。Op 检查访问合同，不要求临时 tail 注册为 StateId 或分配完整 image。
+
 ### 4.3 Selection
 
 ```cpp
@@ -290,7 +315,8 @@ Indexer 写 `Nselection=T*B`，行号 `m=t+T*b`。Sparse MLA 接收 Device I32
 `selection_rows[T,B]`，普通执行映射到本列，复用时可以引用先前仍存活的 selection 行。
 
 Selection 保存 logical pool IDs，不保存 physical page IDs。它是 frame 数据，与
-被引用的 cache 历史及 read lease 一起保持有效；不是 checkpoint 或历史身份的替代物。
+被引用的 cache 历史一起保持有效。一次消费者的地址借用覆盖实际执行；历史记录搬迁
+不改变 IDs，后续消费者读取已更新的页表。Selection 不代替 checkpoint 或历史身份。
 
 ## 5. Prepare：投影、norm、pooling 与历史写入
 
@@ -397,7 +423,7 @@ n=0 不写 after，不读取 state、positions、offsets 或 table selectors 的
 ```cpp
 void kpool_indexer(
     const Tensor& index_query, const Tensor& head_coeff,
-    const KpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
+    const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
     KpoolExecutionEnvelope envelope, MemoryArena& workspace,
     KpoolBlockSelection& out, CudaExecutionView execution);
 ```
@@ -436,7 +462,7 @@ struct KpoolMlaFactors {
 
 void kpool_sparse_mla(
     const Tensor& query, const KpoolMlaFactors& factors,
-    const KpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
+    const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
     const KpoolBlockSelection& selected, const Tensor& selection_rows,
     float attention_scale, KpoolExecutionEnvelope envelope,
     MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
@@ -514,8 +540,9 @@ void kpool_tail_extract(
 ```
 
 accepted_columns 为 Device I32 `[B]`，每行 `0<=a<=u<=W`、`0<=F0<=F0+u<=1048576`；
-before 与 records 第零列对应 F0。L/R 匹配实际 views，before/after 各自提供 B 行合法 record offsets。可一次提取
-Main 全部层，或使用 L=1 的 view；Main/MTP 的不同 frontier 不混入同次调用。
+Before 与 records 第零列对应 F0。L/R 匹配实际 views，before/after 各自提供 B 行
+record offsets；正接受行必须选择合法字段。可一次提取 Main 全部层，或使用 L=1
+的 view；Main/MTP 的不同 frontier 不混入同次调用。
 
 a>0 时：
 
@@ -536,7 +563,8 @@ for j in [0,3):
 
 只做 word copy／零填充，不重新计算浮点结果，不读 rejected suffix 或扫描已完成
 pools。零接受是严格 no-op，不读写 state/record payload；即使源目标不同也不复制，
-该行继续采用原 image。其含义与 KDA 提交一致，复用 QSA 机制时须保留此区别。
+该行继续采用原 image，调用方保护其内容，offsets 可为 `-1`。其含义与 KDA 提交
+一致，复用 QSA 机制时须保留此区别。
 
 允许同一行原位提取，先保存所需旧 words 再写。目标不能覆盖其他活动行的 source、
 records 或 metadata；只读 source 可共享。只修改 raw K/gate 字段，不触碰 image 的
@@ -600,21 +628,25 @@ mHC／普通 residual。Op 不携带 rank、world size 或 communicator；并行
 ### 10.1 访问与 alias
 
 Activation、query/output、selection 连续，BF16/FP32 activations 和矩阵基址至少
-16 B 对齐；参数向量与 Device I32 metadata 自然对齐，I64 record/page offsets 至少 8 B 对齐。State/records 的 feature 连续，
-正的显式外层 strides 不重叠；cache 使用第 3 节布局。全部 operands、scratch 与
-execution 位于同一 CUDA device。
+16 B 对齐；参数向量与 Device I32 metadata 自然对齐，I64 record/page offsets 至少
+8 B 对齐。State/records 的 feature 连续，正的显式外层 strides 不重叠；cache 使用
+第 3 节布局。全部 operands、scratch 与 execution 位于同一 CUDA device。
 
 Prepare/update 和 tail_extract 允许同一行对应 tail 字段完全原位或完全 disjoint，
 禁止部分 overlap、跨字段覆盖及目标覆盖其他活动行的 source。目标行之间不能重叠；
 原位调用必须完成全部旧 tail 依赖后才能覆盖。Record 不修改 source。
 
 除上述 tail 原位更新，对外写入的 outputs、cache 区域和 records 彼此 disjoint，
-并与只读 inputs、权重、metadata 和活跃 scratch disjoint。只读 views 可共享 backing。
+并与只读 inputs、权重、metadata 和活跃 scratch disjoint。Alias 按实际访问的记录、
+字段和 plane 判断，共用 arena 本身不构成重叠；原位要求实际字段地址相同。
+只读 views 可共享 backing。
 Record 在同一 Op 内先写后被 pooling 读取是显式生产／消费关系，必须等待对应生产
 阶段完成；它不允许其他输入与 records alias。
 
-Host 校验 dtype、shape、stride、alignment、capacity、device 和固定地址关系；
-Device counts、selectors、合法页及选中地址的权限是调用前提，不回读到 Host 校验。
+Host 校验 dtype、shape、stride、alignment、capacity、device 和可见的固定地址关系；
+Device counts、offsets、字段／页边界与写入分离由调用方保证，不回读到 Host 校验。
+合同规定不访问的行允许使用 `-1` offsets／table selectors；kernel 先检查有效长度、
+接受长度或选择数，再读取对应索引并解析地址。活跃访问不能使用无效 offset。
 参与数学的输入及所需中间结果须有限；codec 的有效域沿用数值文档，不通过
 satfinite 或修改 mask 掩盖 NaN/Inf。
 
@@ -695,9 +727,13 @@ Op 在 caller arena 的 scope 内借用 scratch，结束恢复 cursor，不保�
 
 ### 10.3 Graph
 
-固定 T/B、投影需求、storage、绑定地址及已准备资源时，Graph replay 从 Device
-读取新的 lengths、positions、record offsets、page mappings、selection mappings 和选择内容。
+固定 T/B、投影需求、storage、arena／执行表／frame 地址和字段几何时，Graph replay
+从 Device 读取新的 lengths、positions、record offsets、page mappings、selection mappings
+和选择内容。实际 State/KV payload 地址不固定在 Graph 中。
 短上下文全选、空行与混合长度在 kernels 内处理，不因 Device 值改变 Host launch 拓扑。
+
+执行 ticket 持有本次地址借用，Graph 对象不永久固定某份历史。目录在旧消费者退役后
+完成搬移与映射发布，下次 replay 通过原输入路径取得新 offsets，复用同一个 Graph。
 
 Indexer／MLA 在固定 T/B/profile 下保持节点数量和顺序兼容，Host envelope 可以
 通过已有机制更新 launch 参数，前提是 workspace 和 capture/update 均覆盖新上界。
@@ -730,7 +766,7 @@ Spark 调优策略放在各自 `dgx_spark/` 目录，共同计算体留在适当
 | 机制 | 复用与新增边界 |
 |---|---|
 | BF16 projection | 复用 Linear 的 contraction 基础，Prepare 拥有 FP32 输出与融合分派 |
-| 分页、StateImage | 复用现有容器，增加本 family 的 typed views 和字段绑定 |
+| 分页、StateImage | 复用 KVPageLayout、StateFieldLayout 与执行表；family 提供 typed views，模型按层／owner 绑定 |
 | TopK | 抽取 QSA 中不依赖其工作映射的精确选择计算体；两 family 分别保留评分、jobs 与调优 |
 | Attention | 复用 online softmax、归并、MMA、异步访存基础；新增 latent MLA 核心 |
 | Codec／布局辅助 | Prepare 与 MLA 共享同一实现；通用数值基础继续使用 ops/common |
@@ -839,6 +875,11 @@ storage、普通 selection 和冻结 E。固定 Graph／非 Graph 与热／冷�
 权重及 keys 是否复用；逻辑字节不能当作硬件 DRAM 计数。大 T 计入 scores/candidates、
 raw words 和 softmax partial 的实际读写，小 T 关注带宽、并行度与 launch 开销。
 
+测量使用实际 Main 11 层／MTP 1 层的页组布局和 I64 映射，覆盖代表性的非等间距
+记录。Main 单层每页的 index keys 为 4 KiB，其跨页间距由完整记录和映射决定；
+不能用紧密排列的单层数组代替生产布局。流量按实际访问 planes 计费，不把整页组
+中其他层的 payload 计为本层必读流量；长上下文另关注地址局部性与 TLB 开销。
+
 持久与 frame 容量分别核算：growing cache、tail 的总预算见
 [并行资源](parallel.md#3-1m-上下文的持久状态容量)；raw records 为每层每有效列 512 B，
 selection payload 每行 2056 B，scratch 按查询计费。模型与双机收益在接入后另测。
@@ -857,9 +898,9 @@ selection payload 每行 2056 B，scratch 按查询计费。模型与双机收�
 | Projection、norm、pooling、完整 MLA | 实际表示输入的独立 FP64 数学参考；明确 codec／raw BF16 边界，不以生产 Op 串接作为 oracle |
 | FP8 codec | 给定 FP32 输入的独立精确编码／解码参考，覆盖零、舍入和极小值；与完整 Prepare 的浮点误差分开 |
 | Indexer | 独立 score 参考；负 coefficients、同分、E=2051/2052、最新完整 pool 可被排除；近同分按评分误差解释，TopK 算法本身必须精确 |
-| 历史与 tail | 四种相位、跨 chunk/page、部分接受、零接受、原位／异位；精确复制本轮实际 raw words，rejected suffix 不影响结果 |
-| Producer/consumer | 非连续 physical pages、未来已写 pool 对早期 query 不可见、selection row 重映射、冻结 E 不追加 tail |
-| Graph 与空行 | 改变 Device metadata 后正确重播；混合长短行、零有效行、空 J 的规定读写域 |
+| 历史与 tail | 四种相位、跨 chunk/page、部分接受、零接受、原位／异位；Context 与 frame tail 交接；精确复制本轮 raw words，其他字段不变 |
+| Producer/consumer | 完整多层页组、非等间距 offsets、同 arena 的 disjoint records；未来已写 pool 对早期 query 不可见、冻结 E 不追加 tail |
+| Graph 与空行 | 同一 Graph 在保值搬移并更新页／State offsets 后重播；selection IDs 不变；混合长度、零有效／零接受行与空 J 的读写域 |
 
 测试按可观察数学和状态合同制定，不因私有实现使用更高精度而提高要求，不根据
 候选结果反向放宽标准。实际生产分派边界选择有限样本；copy、codec 和 no-op 按

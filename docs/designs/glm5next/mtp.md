@@ -19,8 +19,8 @@ stem 和 head 是 Linear；历史准备和 attention 属于 Kpool family；MoE �
 | Converter／Definition／Shard | 源参数映射、可选 draft head、加载使用关系、权重 backing |
 | 模型 Parameters | 实际几何、epsilon、Op 权重 views 与数值政策 |
 | 模型 Session | Main/MTP ordinal、canonical frontier、owner、采用列与 checkpoint 关系 |
-| ContextDirectory | 历史前缀、页和 state 身份、COW、读写租约及回收 |
-| RankProgram | frame、临时 history/tail、conditioning、执行和通信顺序、Graph |
+| ContextDirectory | canonical/provisional history、State 身份、成组预留、COW、借用及回收 |
+| RankProgram | Context backing、frame、临时 tail/hidden、执行和通信顺序、Graph |
 | Ops | 显式输入上的数学、写域、数值表示、支持检查与私有分派 |
 
 维度从模型配置和绑定取得。表中的具体数字用于当前 checkpoint 的实现与调优，
@@ -173,13 +173,14 @@ residual_out disjoint，避免把另一个只读输入隐式变成写入目标�
 同设备、自然对齐。初始调优覆盖 D=4096 和 Vision D=1024，其他合法 D 由通用路线处理。
 MTP 的 final norm 同样使用该入口，即使 r2 在此后不再被模型消费。
 
-## 5. 三类数据与 canonical frontier
+## 5. 数据归属与 canonical frontier
 
-| 数据 | 内容 | 生命周期 |
+| 数据 | 内容 | 存储与生命周期 |
 |---|---|---|
-| Canonical MTP context | 已处理真实配对的 latent、pooled index keys、raw tail | 请求与 checkpoint；与 Main history 独立 |
-| Main conditioning | 当前最后一个实际 Main final hidden | 请求 state；两 rank 复制 |
-| 本轮 provisional 数据 | draft history、tail、递归 hidden、selection、Main verify hidden | frame；按本轮采用结果退役 |
+| Canonical／provisional history | 已采用历史、draft 与补齐期间的 latent／pooled keys | Context KV records；目录管理共享、COW、预留、采用与退役 |
+| Canonical tail | 已采用前沿的 raw K/gate | owner StateImage；请求与 checkpoint |
+| Main conditioning | 当前最后一个实际 Main final hidden | 两 rank 的 StateImage；与 Main 续算字段共用 |
+| 本轮临时结果 | 首步／递归 tail、递归 hidden、selection、raw records、Main verify hidden | 执行 frame；最后消费者退役后复用 |
 
 Main 已处理的输入前缀为 [0,F) 时，完整可恢复 checkpoint 应满足：
 
@@ -194,13 +195,21 @@ MTP 的每一列都只依赖 checkpoint 覆盖的实际 token/hidden。Pending a
 F=0 的空来源不读取 conditioning；首次 prefill 建立它。
 
 MTP tail 是 Kpool 已定义的三列 raw K/gate，phase 由 MTP frontier 决定。
-StateImage 增加/绑定本模型的 MTP tail 和 conditioning 字段；完整上下文还包括 Main
-的 KDA 分片及 MLA/Indexer tails。ContextDirectory 按声明保存字段和历史；
-`F→max(F-1,0)` 的解释只属于模型 Session。
+StateImage 使用[公共 hidden 与 owner tail 布局](parallel.md#12-state-variants-与字段布局)，
+完整上下文还包括 Main 的 KDA 分片及 MLA/Indexer tails。ContextDirectory 保存声明的
+记录与历史；`F→max(F-1,0)` 的解释只属于模型 Session。
+
+Stem 的 norm 接口继续接收连续 hidden。准备阶段在有效执行借用内解析保存的 hidden
+字段，使用既有 `copy_bytes_async` 填入连续 frame staging，在同一 stream 中先复制、后计算；
+跨 chunk 的首列也从该字段取得。F=0 不读该字段，按首段配对规则准备输入。递归 draft
+直接消费 frame 中的 hnext。提交最后采用的 Main hidden 使用已有
+`scatter_batch_columns(..., StateFieldView, ...)`；字段选择由 Device I64 offsets 提供。
+这些访问不改变 norm 接口，也不让 normalization 接收 StateId 或 placement。
 
 Provisional history 共享可读 canonical 前缀，并使用已保留的可写后缀；共享尾页需要
-COW 时由目录安排。无需为每个 draft step 复制完整 history。后缀能否复用同一 backing
-取决于读写租约，不能凭逻辑“回退了 frontier”覆盖尚被 Graph 或 selection 读取的数据。
+COW 时由目录安排。其页与 canonical 页共用 Context 容量，临时 tail 则通过相同
+StateFieldView 合同绑定 frame，不为每个 draft step 申请完整 StateImage。
+后缀重写等待旧读者退役；逻辑 frontier 回退不会取消在途 Graph／selection 消费。
 
 ## 6. 各种执行情况
 
@@ -285,6 +294,10 @@ Session 先确定采用范围；RankProgram 在所有旧读者完成后写入目
 再报告完成；目录和 Session 才发布新 frontier/checkpoint。未采用的尾部不对外可见，
 backing 在最后消费者完成后回收或复用。
 
+整轮许可覆盖 Main verify、MTP provisional/COW、canonical 补齐及目标 State 的峰值。
+采用结果确定后，剩余目的位置从原许可取得，不在提交中重新竞争池容量；可复用的
+未采用页按目录合同退回预留，其他记录在消费者退役后释放。
+
 取消或失败不发布半套 Main/MTP 上下文。已提交的设备工作和存储动作按已有执行事务
 退役，不通过提前释放 frame、selection 或 page lease 来取消 CUDA 工作。
 这些依赖使用既有 ticket/stream/event 机制，不在 MTP 新建线程池或提交系统。
@@ -320,10 +333,12 @@ Head 的 global token ID 使用本地词表偏移。Greedy draft 可以只归约
 | 复制的共享 embedding | 1210 MiB；Main/MTP 共用一份 |
 | 复制的 W_eh | 64 MiB |
 | Q4 proposal head 本地分片 | 160.703125 MiB，包含 FP16 scales |
-| 每条请求的一份 conditioning | 8192 B |
+| Main final hidden／conditioning 字段 | 8192 B，已计入 StateImage；另按实际 batch 计 frame staging |
 | 成对 norm/concat 出口 | 16384 B/物理列 |
 | 一个普通 hidden／residual 缓冲 | 8192 B/物理列 |
-| MTP cache、tail、raw records | 按 Kpool 布局与实际本地 owner 行容量计费 |
+| MTP canonical／provisional cache | 按 Kpool 页布局与峰值需求占用 Context |
+| MTP canonical tail | 已计入 owner StateImage |
+| 临时 tail、selection、raw records | 按实际本地 owner 行容量占用 frame |
 
 Recursive hidden、两组 residual/normalized buffers 和 first-step tail 按同时存活范围
 规划。Verify final hidden 至少保留 canonical 补齐所需的真实列及最后 conditioning；
@@ -331,9 +346,11 @@ Recursive hidden、两组 residual/normalized buffers 和 first-step tail 按同
 容量查询，公共 selection/records 不算进临时 arena。
 
 Model Graph 固定调用顺序和物理形状，Device metadata 控制行有效性、ordinal、
-enabled 和选择内容。Norm Ops 不读回 Host；首步 Full、后续 QueryAndHistory、
-canonical History 是明确的模型执行用途，分别进入相应固定执行拓扑。
-Kpool 不因此增加单独的模型子图要求，prefill 仍走 eager。
+enabled、State offsets、页映射和选择内容。Saved hidden 的准备复制在 replay 前提交，
+Graph 读取固定 frame staging；字段写回读取当前 Device offsets。各次执行借用覆盖
+实际消费者，记录搬移后刷新 offsets／映射，不捕获永久 payload 地址。
+Norm Ops 不读回 Host；首步 Full、后续 QueryAndHistory、canonical History 分别进入
+相应固定执行拓扑。Kpool 不增加单独的模型子图要求，prefill 仍走 eager。
 
 ## 9. 文件组织与实施顺序
 

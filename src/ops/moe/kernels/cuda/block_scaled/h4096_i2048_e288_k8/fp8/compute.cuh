@@ -91,14 +91,13 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
     cp_commit();
 }
 
-enum class PopulationRoute { All, Gate, Down, WideDown };
+enum class PopulationRoute { Gate, Down, WideDown };
 
-template <int Columns, bool Gate, bool Atomic = false,
-          PopulationRoute Population = PopulationRoute::All>
+template <int Columns, bool Gate, PopulationRoute Population>
 __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const std::uint8_t* input, const float* input_scales, ExpertMatrixDeviceView bank,
-    Groups groups, std::uint8_t* product, float* product_scales, float* contributions,
-    const float* coefficients, float* routed_sum, int subtiles, float limit, int dense_blocks,
+    Groups groups, std::uint8_t* product, float* product_scales, const float* coefficients,
+    float* routed_sum, int subtiles, float limit, int dense_blocks,
     Fp8PopulationTuning population = {}, int dense_assignment_threshold = 0) {
     using S = Schedule<Columns, Gate>;
     extern __shared__ __align__(16) unsigned char shared_bytes[];
@@ -108,27 +107,21 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     const int wm = warp % S::warp_rows, wn = warp / S::warp_rows;
     const int tasks = *groups.jobs * row_tiles * subtiles;
     if (!tasks) return;
-    bool few_experts = false;
-    if constexpr (Population != PopulationRoute::All) {
-        few_experts     = groups.jobs[2] <= population.ordered_expert_limit;
-        const bool wide = population.wide_down && !few_experts &&
-                          groups.offsets[kExperts] > groups.jobs[2] * population.wide_min_average;
-        if constexpr (Population == PopulationRoute::Down) {
-            if (wide) return;
-        }
-        if constexpr (Population == PopulationRoute::WideDown) {
-            if (!wide) return;
-        }
+    const bool few_experts = groups.jobs[2] <= population.ordered_expert_limit;
+    const bool wide        = population.wide_down && !few_experts &&
+                      groups.offsets[kExperts] > groups.jobs[2] * population.wide_min_average;
+    if constexpr (Population == PopulationRoute::Down) {
+        if (wide) return;
     }
-    const bool sparse = Population == PopulationRoute::All
-                            ? groups.jobs[1] <= 2
-                            : groups.jobs[3] <= dense_assignment_threshold;
+    if constexpr (Population == PopulationRoute::WideDown) {
+        if (!wide) return;
+    }
+    const bool sparse = groups.jobs[3] <= dense_assignment_threshold;
     const int stride  = sparse ? int(gridDim.x) : dense_blocks;
     if (blockIdx.x >= stride) return;
     // Routes have distinct IDs per token, so one selected expert gives every
     // live output element exactly one writer, including after job permutation.
-    const bool exclusive_output =
-        Atomic && Population == PopulationRoute::Down && groups.jobs[2] == 1;
+    const bool exclusive_output = Population == PopulationRoute::Down && groups.jobs[2] == 1;
     for (int task = blockIdx.x; task < tasks; task += stride) {
         int job = task / (row_tiles * subtiles), row = task % row_tiles;
         int subtile = (task / row_tiles) % subtiles;
@@ -185,47 +178,7 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                 Gate ? __bfloat162float(
                            weight.scales[((row0 + kIntermediate) / 128) * (S::k / 128) + kt])
                      : sg;
-            if constexpr (Population == PopulationRoute::All) {
-#pragma unroll
-                for (int n = 0; n < S::mma_columns; ++n) {
-                    const int column = wn * S::warp_columns + n * 8;
-                    if (begin + column < end) {
-                        float p[2][4] = {};
-#pragma unroll
-                        for (int ki = 0; ki < 4; ++ki) {
-                            unsigned a[2][4], b[2];
-#pragma unroll
-                            for (int m = 0; m < 2; ++m) {
-                                const int row_base = Gate ? wm * 16 + m * 128 : wm * 32 + m * 16;
-                                const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
-                                const int col      = ki * 32 + (lane >> 4) * 16;
-                                ldmatrix_x4(a[m][0], a[m][1], a[m][2], a[m][3],
-                                            smem_addr(tile.stage.weights[stage] + row * S::bk +
-                                                      swizzle<S>(row, col)));
-                            }
-                            const int row = column + (lane & 7),
-                                      col = ki * 32 + ((lane >> 3) & 1) * 16;
-                            ldmatrix_x2(b[0], b[1],
-                                        smem_addr(tile.stage.input[stage] + row * S::bk +
-                                                  swizzle<S>(row, col)));
-#pragma unroll
-                            for (int m = 0; m < 2; ++m) {
-                                mma_fp8_e4m3(p[m][0], p[m][1], p[m][2], p[m][3], a[m][0], a[m][1],
-                                             a[m][2], a[m][3], b[0], b[1]);
-                            }
-                        }
-#pragma unroll
-                        for (int v = 0; v < 4; ++v) {
-                            const int source = tile.sources[column + (lane & 3) * 2 + (v & 1)];
-                            const float sx =
-                                source >= 0 ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
-                                            : 0;
-                            acc[0][n][v] = fmaf(p[0][v], sg * sx, acc[0][n][v]);
-                            acc[1][n][v] = fmaf(p[1][v], su * sx, acc[1][n][v]);
-                        }
-                    }
-                }
-            } else if (few_experts || Population == PopulationRoute::WideDown) {
+            if (few_experts || Population == PopulationRoute::WideDown) {
                 constexpr int cluster = 2 < S::mma_columns ? 2 : S::mma_columns;
 #pragma unroll
                 for (int n0 = 0; n0 < S::mma_columns; n0 += cluster) {
@@ -348,18 +301,13 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
 #pragma unroll
                         for (int m = 0; m < 2; ++m) {
                             const int row = row0 + wm * 32 + m * 16 + (lane >> 2) + (v / 2) * 8;
-                            if constexpr (Atomic) {
-                                const int assignment = groups.assignments[begin + column];
-                                const auto index = std::int64_t(assignment / kTopK) * kHidden + row;
-                                const float value = acc[m][n][v] * coefficients[assignment];
-                                if (exclusive_output)
-                                    routed_sum[index] = value;
-                                else
-                                    atomicAdd(routed_sum + index, value);
-                            } else {
-                                contributions[std::int64_t(begin + column) * kHidden + row] =
-                                    acc[m][n][v];
-                            }
+                            const int assignment = groups.assignments[begin + column];
+                            const auto index     = std::int64_t(assignment / kTopK) * kHidden + row;
+                            const float value    = acc[m][n][v] * coefficients[assignment];
+                            if (exclusive_output)
+                                routed_sum[index] = value;
+                            else
+                                atomicAdd(routed_sum + index, value);
                         }
                     }
                 }

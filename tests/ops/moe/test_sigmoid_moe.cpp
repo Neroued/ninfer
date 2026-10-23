@@ -466,9 +466,9 @@ int main(int argc, char** argv) {
         for (int side : {0, 1}) {
             std::vector<Case> cases;
             if (side == 0) {
-                for (int m : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096})
+                for (int m : {1, 2, 4, 8, 9, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096})
                     cases.push_back({m});
-                for (int m : {1, 8, 128, 512, 4096}) cases.push_back({m, 4, true});
+                for (int m : {1, 8, 9, 128, 512, 4096}) cases.push_back({m, 4, true});
                 for (int hits : {0, 1, 8})
                     for (int m : {1, 128, 4096}) cases.push_back({m, hits});
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});

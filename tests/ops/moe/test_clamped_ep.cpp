@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
                     if (fp8) {
                         for (int hits = 0; hits <= K; ++hits) add(2, "mixed", hits);
                         add(2, "pair", -1, true);
-                        for (int t : {272, 273}) add(t, "mixed");
+                        for (int t : {9, 272, 273}) add(t, "mixed");
                         for (int t : {512, 513, 4097}) add(t, "population", -1, true, true);
                         for (int t : {128, 4097}) add(t, "skew", 1, true, true);
                     }

@@ -11,6 +11,11 @@ template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class O
 void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                        cudaStream_t stream, RowPolicy row_policy = {}) {
     validate_q8_operands(operands);
+    if constexpr (Schedule::kFullWeightTiles) {
+        if (operands.rows % Schedule::kBlockRows != 0 || operands.padded_k % 256 != 0)
+            throw std::invalid_argument(
+                "Q8 MMA full-weight schedule requires complete row tiles and scale-cache groups");
+    }
     if constexpr (Schedule::kStaticK > 0) {
         if (operands.k != Schedule::kStaticK || operands.padded_k != Schedule::kStaticK)
             throw std::invalid_argument("Q8 MMA static K requires matching, padding-free operands");

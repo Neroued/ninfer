@@ -519,6 +519,10 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
+    if (point.qtype == QType::Q8_G32_FP16 && point.n == 4096 && point.k == 1024 && point.t > 1) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
     const bool nvfp4_problem =
         (point.n == 12288 && point.k == 4096) || (point.n == 4096 && point.k == 6144) ||
         (point.k == 5120 && (point.n == 14336 || point.n == 16384 || point.n == 34816)) ||

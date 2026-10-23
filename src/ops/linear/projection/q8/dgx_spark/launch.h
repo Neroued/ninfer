@@ -5,6 +5,7 @@
 namespace ninfer::ops::detail {
 
 void launch_q8_n2048_k4096_bulk(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_n4096_k1024_bulk(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_q8_n4096_k4096_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
                                      cudaStream_t stream);

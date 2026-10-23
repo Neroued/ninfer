@@ -24,8 +24,8 @@ struct Geometry {
 
 const std::array kGeometries{
 #if NINFER_TARGET_SPARK
-    Geometry{4096, 4096, 947U},  Geometry{12288, 4096, 911U}, Geometry{2560, 3072, 383U},
-    Geometry{8192, 2560, 373U},
+    Geometry{4096, 1024, 983U},  Geometry{4096, 4096, 947U},  Geometry{12288, 4096, 911U},
+    Geometry{2560, 3072, 383U},  Geometry{8192, 2560, 373U},
 #endif
     Geometry{1024, 2048, 257U},  Geometry{1024, 5120, 223U},  Geometry{2048, 4096, 251U},
     Geometry{2048, 4608, 271U},  Geometry{2048, 16384, 283U}, Geometry{2560, 6144, 307U},
@@ -73,6 +73,15 @@ void q8_a16_conformance(Suite& suite) {
             for (int t : {191, 192, 193, 575, 576, 577, 2047, 2048, 2049, 4096, 4097})
                 calls.push_back({t});
             for (int t : {49, 65, 129, 577, 2049})
+                calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+            add_workspace_cases(suite, ninfer::QType::Q8_G32_FP16, shape.n, shape.k);
+        }
+        if (shape.n == 4096 && shape.k == 1024) {
+            for (int t : {191, 192, 193, 287, 288, 289, 511, 512, 513, 1023, 1025, 4096, 4097})
+                calls.push_back({t});
+            if (shape.k == 1024)
+                for (int t : {575, 576, 577}) calls.push_back({t});
+            for (int t : {4, 17, 49, 129, 577, 1025})
                 calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
             add_workspace_cases(suite, ninfer::QType::Q8_G32_FP16, shape.n, shape.k);
         }
@@ -230,6 +239,27 @@ void q8_a16_conformance(Suite& suite) {
                       {2048, 4096, 1017U, Comparison::Sampled, true, calls, pattern});
         }
     }
+#if NINFER_TARGET_SPARK
+    for (const Geometry shape : {
+             Geometry{4096, 1024, 1031U},
+         }) {
+        const std::array calls{Invocation{1},  Invocation{16},  Invocation{17},  Invocation{49},
+                               Invocation{65}, Invocation{577}, Invocation{1025}};
+        for (auto pattern : {ActivationPattern::KTail, ActivationPattern::Cancellation}) {
+            add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::Hashed,
+                      make_q8_g32_fp16_weight,
+                      {shape.n, shape.k, shape.seed, Comparison::Sampled, true, calls, pattern});
+        }
+        add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::TokenBlocks,
+                  make_q8_g32_fp16_weight,
+                  {shape.n, shape.k, shape.seed + 1, Comparison::Full, true, full_calls});
+    }
+    {
+        const std::array calls{Invocation{41}, Invocation{49}, Invocation{63}};
+        add_shape(suite, ninfer::QType::Q8_G32_FP16, ActivationRecipe::Hashed,
+                  make_q8_g32_fp16_weight, {4096, 1024, 1021U, Comparison::Full, true, calls});
+    }
+#endif
 }
 } // namespace
 

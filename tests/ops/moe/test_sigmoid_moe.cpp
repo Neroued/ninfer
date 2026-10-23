@@ -475,6 +475,9 @@ int main(int argc, char** argv) {
                     cases.push_back({2, 1});
                     cases.push_back({1024, 8, true});
                     cases.push_back({4097, 1, true, false, false, true});
+                } else {
+                    for (int m : {65, 127})
+                        for (int hits : {0, 1, 8}) cases.push_back({m, hits, true});
                 }
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
                 for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});

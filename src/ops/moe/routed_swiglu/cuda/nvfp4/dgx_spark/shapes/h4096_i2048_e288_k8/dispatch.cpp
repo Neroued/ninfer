@@ -12,7 +12,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
                            .gate_columns           = 8,
                            .down_columns           = 8,
                            .vector                 = t == 1,
-                           .atomic_output          = t >= 128,
+                           .atomic_output          = t > 64,
                            .single_block_grouping  = t <= 64,
                            .column_major_down      = t >= 1024,
                            .preserve_balanced_down = true,
@@ -115,7 +115,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
 } // namespace
 
 const ShapePolicy& nvfp4_h4096_i2048_e288_k8() {
-    static constexpr int boundaries[]{2,   17,   33,   65,   128,  129,  257, 512,
+    static constexpr int boundaries[]{2,   17,   33,   65,   129,  257,  512,
                                       769, 1024, 1025, 1537, 2049, 3073, 4097};
     static const ShapePolicy policy{.select                = select_plan,
                                     .allocation_boundaries = boundaries,

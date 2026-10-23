@@ -142,7 +142,10 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
     const auto* mask         = static_cast<const int*>(subset.mask.data);
     const auto* coefficients = static_cast<const float*>(routes.coefficients.data);
     if (x.ne[1] == 2) {
-        pair_gate<<<dim3(kIntermediate / 4, 2 * kTopK), 128, 0, stream>>>(
+        const int blocks =
+            std::min((kIntermediate / kPairGateRowsPerCta) * 2 * kTopK,
+                     execution.multiprocessor_count() * plan.vector_gate_ctas_per_sm);
+        pair_gate<<<blocks, kPairGateRowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), experts.bank.gate_up, ids, subset.kind, mask,
             s.vector_activation, plan.clamp_limit);
     } else {
@@ -153,7 +156,7 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
     CUDA_CHECK(cudaGetLastError());
     const auto down = [&](auto output) {
         if (x.ne[1] == 2) {
-            pair_down<4><<<kHidden / 4, kTopK * 32, 0, stream>>>(
+            pair_down<<<kHidden / kPairDownRowsPerWarp, kTopK * 32, 0, stream>>>(
                 s.vector_activation, experts.bank.down, ids, coefficients, subset.kind, mask,
                 output);
         } else {

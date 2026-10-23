@@ -31,8 +31,9 @@ struct Plan {
     // Keep the original expert-major jobs when every expert has at most two jobs.
     bool preserve_balanced_down = false;
 
-    int queued_ctas_per_sm = 6;
-    float clamp_limit      = 0;
+    int queued_ctas_per_sm      = 6;
+    int vector_gate_ctas_per_sm = 0;
+    float clamp_limit           = 0;
 
     Fp8PopulationTuning fp8;
     Nvfp4Tuning nvfp4;

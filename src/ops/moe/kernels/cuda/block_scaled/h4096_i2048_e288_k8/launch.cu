@@ -92,8 +92,14 @@ __global__ void scan_assignments(Groups g, int columns, bool density) {
     if (e == kExperts - 1) { *g.jobs = scan[e]; }
 }
 
+__device__ bool one_per_token(Groups g, int assignments, bool density) {
+    if (!density) return false;
+    // Distinct IDs give at most one hit per token for one selected expert.
+    return g.jobs[2] == 1 && g.offsets[kExperts] == assignments / kTopK;
+}
+
 __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
-                                  int assignments) {
+                                  int assignments, bool density) {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= assignments) { return; }
     const int expert = ids[a];
@@ -101,7 +107,8 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
-    const int packed      = atomicAdd(g.cursors + expert, 1);
+    const int packed =
+        one_per_token(g, assignments, density) ? a / kTopK : atomicAdd(g.cursors + expert, 1);
     g.assignments[packed] = a;
     if (g.inverse) { g.inverse[a] = packed; }
 }
@@ -150,8 +157,9 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
         g.job_columns[first + j] = j * columns;
     }
     if (tid == kExperts - 1) { *g.jobs = scan[tid]; }
+    const bool single = one_per_token(g, assignments, density);
     for (int a = tid; a < assignments; a += kExperts) {
-        const int packed = ranks[a] >= 0 ? g.offsets[ids[a]] + ranks[a] : -1;
+        const int packed = ranks[a] >= 0 ? (single ? a / kTopK : g.offsets[ids[a]] + ranks[a]) : -1;
         if (g.inverse) { g.inverse[a] = packed; }
         if (packed >= 0) { g.assignments[packed] = a; }
     }
@@ -277,8 +285,9 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
             ids, subset.kind, mask, s.groups.counts, assignments);
         scan_assignments<<<1, kExperts, 0, stream>>>(
             s.groups, plan.job_columns(), plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16);
-        index_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(ids, subset.kind, mask,
-                                                                         s.groups, assignments);
+        index_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
+            ids, subset.kind, mask, s.groups, assignments,
+            plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16);
         CUDA_CHECK(cudaGetLastError());
     }
     if (plan.format == QType::NVFP4)

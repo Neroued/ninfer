@@ -4,28 +4,15 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8 {
 
-// Two-token FP32 accumulation. Match logical experts on the device, retaining
-// each token's original route rank and its unquantized FP32 activation.
-__global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
-                          ExpertSubsetKind kind, const int* mask, float* activation, float limit) {
-    __shared__ int experts[2 * kTopK];
-    if (threadIdx.x < 2 * kTopK) { experts[threadIdx.x] = ids[threadIdx.x]; }
-    // Every thread reaches this barrier before any masked/duplicate CTA returns.
-    __syncthreads();
-    const int assignment = blockIdx.y, expert = experts[assignment];
-    if (!includes(kind, mask, expert)) { return; }
-    int mate = -1;
-#pragma unroll
-    for (int j = 0; j < kTopK; ++j) {
-        if (experts[(assignment < kTopK ? kTopK : 0) + j] == expert) {
-            mate = (assignment < kTopK ? kTopK : 0) + j;
-        }
-    }
-    // Token 0 owns a shared logical expert and writes both original route slots.
-    // A token-1 CTA only computes an expert absent from token 0.
-    if (assignment >= kTopK && mate >= 0) { return; }
+inline constexpr int kPairGateRowsPerCta = 4, kPairDownRowsPerWarp = 4;
+
+// Match logical experts on Device; keep each token's original route rank and
+// unquantized FP32 activation. Only the first token owns a shared expert.
+__device__ __forceinline__ void pair_gate_dot(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
+                                              float* activation, float limit, int assignment,
+                                              int expert, int mate, int row_tile) {
     const auto weight = resolve(bank, expert);
-    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int row = row_tile * kPairGateRowsPerCta + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     float gate = 0, up = 0, mate_gate = 0, mate_up = 0;
     for (int block = 0; block < kHidden / 128; ++block) {
         const int k     = block * 128 + lane * 4;
@@ -41,7 +28,7 @@ __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, c
         gate = fmaf(dot_four(g, input), sg, gate);
         up   = fmaf(dot_four(u, input), su, up);
         if (mate >= 0) {
-            const auto paired = load_vec<uint2>(x + kHidden + k);
+            const auto paired = load_vec<uint2>(x + std::int64_t(mate / kTopK) * kHidden + k);
             const float2 c = bf16x2_bits_to_float2(paired.x), d = bf16x2_bits_to_float2(paired.y);
             const float4 other = make_float4(c.x, c.y, d.x, d.y);
             mate_gate          = fmaf(dot_four(g, other), sg, mate_gate);
@@ -64,26 +51,14 @@ __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, c
     }
 }
 
-template <int Rows, class Output>
-__global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, const int* ids,
-                          const float* coefficients, ExpertSubsetKind kind, const int* mask,
-                          Output output) {
-    __shared__ int experts[2 * kTopK];
-    __shared__ float values[2][kTopK][Rows];
-    const int route = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (threadIdx.x < 2 * kTopK) { experts[threadIdx.x] = ids[threadIdx.x]; }
-    for (int i = threadIdx.x; i < 2 * kTopK * Rows; i += blockDim.x) {
-        reinterpret_cast<float*>(values)[i] = 0;
-    }
-    __syncthreads();
-    // Warp `route` owns token 0's rank. Reuse its weight for the matching rank
-    // of token 1, retaining separate accumulators and coefficient application.
+template <int Rows>
+__device__ __forceinline__ void
+pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float* coefficients,
+              ExpertSubsetKind kind, const int* mask, const int* experts, const int* mates,
+              const int* unmatched, int route, int row0, float (&values)[2][kTopK][Rows]) {
+    const int lane   = threadIdx.x & 31;
     const int expert = experts[route];
-    int mate         = -1;
-#pragma unroll
-    for (int j = 0; j < kTopK; ++j) {
-        if (experts[kTopK + j] == expert) { mate = j; }
-    }
+    const int mate   = mates[route];
     if (includes(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         float sum[Rows] = {}, other[Rows] = {};
@@ -98,7 +73,7 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
             }
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
-                const int row = blockIdx.x * Rows + r;
+                const int row = row0 + r;
                 const unsigned w =
                     load_vec<unsigned>(weight.codes + std::int64_t(row) * kIntermediate + k);
                 const float scale =
@@ -118,10 +93,8 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
         }
     }
     // Token 1's unmatched experts still execute their full original dot product.
-    const int second = experts[kTopK + route];
-    bool matched     = false;
-#pragma unroll
-    for (int j = 0; j < kTopK; ++j) { matched |= experts[j] == second; }
+    const int second   = experts[kTopK + route];
+    const bool matched = !unmatched[route];
     if (!matched && includes(kind, mask, second)) {
         const auto weight = resolve(bank, second);
         float sum[Rows]   = {};
@@ -131,7 +104,7 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
                 load_vec<float4>(activation + std::int64_t(kTopK + route) * kIntermediate + k);
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
-                const int row = blockIdx.x * Rows + r;
+                const int row = row0 + r;
                 const unsigned w =
                     load_vec<unsigned>(weight.codes + std::int64_t(row) * kIntermediate + k);
                 sum[r] = fmaf(
@@ -146,16 +119,98 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
             if (!lane) { values[1][route][r] = reduced; }
         }
     }
-    // Masked ranks remain zero. Publish all ranks before summing each token in
-    // its original rank order; Output retains Write/AddResidual semantics.
+}
+
+// Compact the live assignments once per CTA, then visit each expert's rows in order.
+__global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
+                          ExpertSubsetKind kind, const int* mask, float* activation, float limit) {
+    __shared__ int experts[2 * kTopK], assignments[2 * kTopK], mates[2 * kTopK], active_count;
+    if (threadIdx.x < 32) {
+        const int a = threadIdx.x, e = a < 2 * kTopK ? ids[a] : kExperts + a;
+        const unsigned matches = __match_any_sync(0xffffffff, e);
+        const unsigned other   = matches & (a < kTopK ? 0xff00u : 0xffu);
+        const int mate         = other ? __ffs(other) - 1 : -1;
+        if (a < 2 * kTopK) experts[a] = e;
+        const bool active   = a < 2 * kTopK && includes(kind, mask, e) && (a < kTopK || !other);
+        const unsigned bits = __ballot_sync(0xffffffff, active);
+        if (active) {
+            const int ordinal    = __popc(bits & ((1u << a) - 1));
+            assignments[ordinal] = a;
+            mates[ordinal]       = mate;
+        }
+        if (!a) active_count = __popc(bits);
+    }
     __syncthreads();
-    if (threadIdx.x < 2 * Rows) {
-        const int token = threadIdx.x / Rows, row = threadIdx.x % Rows;
-        float result = 0;
-#pragma unroll
-        for (int j = 0; j < kTopK; ++j) { result += values[token][j][row]; }
-        const int i = token * kHidden + blockIdx.x * Rows + row;
-        output.store(i, output.initial(i) + result);
+    const int count = active_count;
+    if (!count) return;
+
+    constexpr int row_tiles = kIntermediate / kPairGateRowsPerCta;
+    for (int task = blockIdx.x; task < row_tiles * count; task += gridDim.x) {
+        const int ordinal = task / row_tiles, a = assignments[ordinal];
+        pair_gate_dot(x, bank, activation, limit, a, experts[a], mates[ordinal], task % row_tiles);
     }
 }
+
+// Compact route pairs into warps; spare warps compute disjoint output rows.
+template <class Output>
+__global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, const int* ids,
+                          const float* coefficients, ExpertSubsetKind kind, const int* mask,
+                          Output output) {
+    constexpr int Rows = kPairDownRowsPerWarp;
+    __shared__ int experts[2 * kTopK], mates[kTopK], unmatched[kTopK], slots[kTopK], active_count;
+    __shared__ float values[8][2][kTopK][Rows];
+    if (threadIdx.x < 32) {
+        const int rank = threadIdx.x, e = rank < 2 * kTopK ? ids[rank] : kExperts + rank;
+        const unsigned matches        = __match_any_sync(0xffffffff, e);
+        const bool local              = rank < 2 * kTopK && includes(kind, mask, e);
+        const unsigned second_matches = __shfl_down_sync(0xffffffff, matches, 8);
+        const bool second_local       = __shfl_down_sync(0xffffffff, int(local), 8);
+        const bool active = rank < kTopK && (local || (second_local && !(second_matches & 0xffu)));
+        if (rank < 2 * kTopK) experts[rank] = e;
+        if (rank < kTopK) {
+            const unsigned paired = (matches >> 8) & 0xffu;
+            mates[rank]           = paired ? __ffs(paired) - 1 : -1;
+            unmatched[rank]       = !(second_matches & 0xffu);
+        }
+        const unsigned bits = __ballot_sync(0xffffffff, active);
+        if (active) slots[__popc(bits & ((1u << rank) - 1))] = rank;
+        if (!rank) active_count = __popc(bits);
+    }
+    __syncthreads();
+    const int count = active_count;
+    if (!count) {
+        for (int row = blockIdx.x * 32 + threadIdx.x; row < kHidden; row += gridDim.x * 32)
+            if (threadIdx.x < 32) {
+                output.store(row, output.initial(row));
+                output.store(kHidden + row, output.initial(kHidden + row));
+            }
+        return;
+    }
+    const int bits = 32 - __clz(unsigned(count - 1)), capacity = 1 << bits, groups = 8 >> bits;
+    const int warp = threadIdx.x >> 5, ordinal = warp & (capacity - 1), group = warp >> bits;
+    const int row_bits = __ffs(Rows * kTopK) - 1 - bits, tile_rows = 1 << row_bits;
+    for (int tile = blockIdx.x; tile < (kHidden >> row_bits); tile += gridDim.x) {
+        for (int i = threadIdx.x; i < 2 * groups * kTopK * Rows; i += blockDim.x)
+            reinterpret_cast<float*>(values)[i] = 0;
+        __syncthreads();
+        if (ordinal < count)
+            pair_down_dot<Rows>(activation, bank, coefficients, kind, mask, experts, mates,
+                                unmatched, slots[ordinal], tile * tile_rows + group * Rows,
+                                values[group]);
+        __syncthreads();
+        if (threadIdx.x < tile_rows) {
+            const int g = threadIdx.x / Rows, r = threadIdx.x % Rows,
+                      row = tile * tile_rows + threadIdx.x;
+            float first = 0, second = 0;
+            for (int rank = 0; rank < kTopK; ++rank) {
+                first += values[g][0][rank][r];
+                second += values[g][1][rank][r];
+            }
+            output.store(row, output.initial(row) + first);
+            output.store(kHidden + row, output.initial(kHidden + row) + second);
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8

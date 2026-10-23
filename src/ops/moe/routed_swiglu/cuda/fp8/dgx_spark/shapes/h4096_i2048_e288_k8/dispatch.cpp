@@ -10,14 +10,15 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     Plan plan;
     plan.implementation = Implementation::ClampedBlockScaled;
     const int c         = t <= 8 ? 8 : t <= 16 ? 16 : t <= 32 ? 32 : 64;
-    plan.clamped        = {.format                = ffn.gate_up_type,
-                           .gate_columns          = t >= 257 ? 128 : c,
-                           .down_columns          = c,
-                           .vector                = t <= 2,
-                           .atomic_output         = t >= 3,
-                           .single_block_grouping = t <= 64,
-                           .queued_ctas_per_sm    = 6,
-                           .clamp_limit           = *ffn.clamp_limit};
+    plan.clamped        = {.format                  = ffn.gate_up_type,
+                           .gate_columns            = t >= 257 ? 128 : c,
+                           .down_columns            = c,
+                           .vector                  = t <= 2,
+                           .atomic_output           = t >= 3,
+                           .single_block_grouping   = t <= 64,
+                           .queued_ctas_per_sm      = 6,
+                           .vector_gate_ctas_per_sm = t == 2 ? 8 : 0,
+                           .clamp_limit             = *ffn.clamp_limit};
     if (t >= 3)
         plan.clamped.fp8 = {.row_window           = 4,
                             .ordered_expert_limit = kOrderedExperts,

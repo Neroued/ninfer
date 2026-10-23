@@ -108,8 +108,9 @@ RankPlan plan_single_rank(const ModelDefinition& definition) { return rank_plan(
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
     const auto& o   = deployment.parallel;
     const auto size = static_cast<std::uint32_t>(deployment.ranks.size());
-    if ((size != 1 && size != 2) || o.tp != size || o.ep != size || o.dp != 1 || o.pp != 1)
-        throw std::invalid_argument("Qwen4Exp supports one rank or TP2/EP2 with DP1/PP1");
+    if ((size != 1 && size != 2) || o.tp != size || o.ep != size || o.dp != 1 || o.pp != 1 ||
+        o.attention_dp != 1)
+        throw std::invalid_argument("Qwen4Exp supports one rank or TP2/EP2 with DP1/ADP1/PP1");
     ParallelPlan out;
     for (const auto& r : deployment.ranks) {
         out.ranks.push_back(rank_plan(definition, size, r.rank));

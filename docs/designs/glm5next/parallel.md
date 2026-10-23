@@ -8,14 +8,15 @@
 
 ## 1. 首版并行分工
 
-同一组两个 Spark ranks 按模块选择分工：MLA/Indexer DP2、KDA TP2、dense/shared
-MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制。
-总 GPU 数为 2，各模块并行度不相乘。
+一个完整执行实例使用两个 Spark ranks，即 DP1；实例内部 MLA/Indexer ADP2、KDA TP2、
+dense/shared MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制。
+总 GPU 数为 2，各模块并行度不相乘。DP 与 ADP 的命名、两级路由及实例边界统一见
+[Attention DP 设计](../attention-dp-placement.md#11-dp-与-adp)。
 
 | 部分 | 固定的分工 |
 |---|---|
 | Token embedding | 完整 BF16 表在两台复制；每 rank 内 Main/MTP 共享同一对象 |
-| Main 11 层及 MTP 1 层 MLA | 按请求 DP2；Q_a/Q_b/KV_a/KV_b/O 的完整逻辑权重在两台复制；owner 计算该请求的完整 64 heads |
+| Main 11 层及 MTP 1 层 MLA | 按请求 ADP2；Q_a/Q_b/KV_a/KV_b/O 的完整逻辑权重在两台复制；owner 计算该请求的完整 64 heads |
 | Main/MTP Indexer | 与对应 MLA 共用请求 owner；完整投影、32 个 query heads、pooling、评分与 selection 由 owner 计算 |
 | MLA/Indexer 历史 | 一个请求的完整 latent、pooled index cache 和未完成 pool tail 只在 owner 保存；Main 与 MTP 同 owner、不同 pool/frontier |
 | KDA | 按 heads TP2，每台 32 heads；Q/K/V/O、beta、f_b/g_b、卷积及大状态按相应 heads 切分；f_a/g_a 保持复制 |
@@ -28,11 +29,12 @@ MLP TP2、LM head TP2、routed experts EP2，mHC 权重与四流 residual 复制
 | MTP stem／普通 residual／norm | 完整 BF16 stem 和 norms 复制，两台处理同一组物理列；MLA 输出汇集、MoE 局部贡献求和后进入 residual |
 | Vision | 完整 BF16 tower 复制，按独立 temporal-grid attention segment 分配任务；完整 features 在进入 Main 前按原顺序交换 |
 
-DP 的分配单位是请求。普通执行保持请求的 MLA/Indexer owner 稳定，该请求的全部
+ADP 的分配单位是请求。普通执行保持请求的 MLA/Indexer owner 稳定，该请求的全部
 历史由此 owner 消费；不按序列位置拆开一条历史。KDA 仍由两台共同持有分片，并
 处理同一组请求。模型使用 ContextDirectory 的 State variants 与 history placement
 表达两种 owner 集合；checkpoint 与恢复覆盖全部必需分片，只在 attention owner
-预留 MLA history。跨 owner 的恢复按下述独立来源转换处理。
+预留 MLA history。动态 owner 选择、来源恢复与容量压力处理由
+[Attention DP 设计](../attention-dp-placement.md)维护；下文定义转换所需的模型布局。
 
 MLA 向后续 TP/EP 计算交付完整的 4096 维 block 输出；KDA、dense/shared 和 routed
 的局部贡献在 Main mHC 或 MTP residual 消费前完成求和。Main MLA owner 的输出
@@ -90,7 +92,8 @@ draft tail 则使用 frame 字段。Ops 不读取 variant 或 owner，只接收�
 同 owner 恢复复用现有目录合同。跨 owner 恢复需要模型安排新的 variant、history
 placement、公共字段复制和 owner-only tail／history 传输，并在全部完成后发布。
 当前普通 `begin_write` 和 history binding 会拒绝不同 variant／placement，不能用整份
-image 的字节复制替代这种转换；该事务随 G3 集成落实，不进入 Op 或分配器。
+image 的字节复制替代这种转换；该事务随 G3 集成落实。模型声明字段转换，共享
+Context 事务负责预留、复制和发布，Op 与底层分配器不解释 owner 转换的模型语义。
 
 ## 2. 参数合并与本地几何
 
@@ -153,7 +156,7 @@ Indexer    = layers * (L/4) * 128 * 2 B
 | MTP 额外一层 | 1 GiB | 0.5 GiB | 16 MiB | 64 MiB |
 | Main＋MTP | 12 GiB | 6 GiB | 192 MiB | 768 MiB |
 
-这是每份完整 latent cache。第 1 节选定 MLA/Indexer 按请求 DP2，一份请求的完整
+这是每份完整 latent cache。第 1 节选定 MLA/Indexer 按请求 ADP2，一份请求的完整
 latent 只驻留在其 owner rank；单请求的这份容量不除以二。按 heads 做 MLA TP2 的
 对照方案则会在两台各保存一份完整 512 维 latent。
 
@@ -169,7 +172,7 @@ Growing cache 合计如下，FP8 列已经包含全部 MLA scales；Indexer 均�
 KDA 的完整 34 层 FP32 state 为 136 MiB，三列 BF16 convolution history 为
 4.78125 MiB；按 KDA heads TP2 后每 rank 分别为 68 MiB、2.390625 MiB。
 
-采用已选定的「MLA/Indexer DP2、KDA TP2」，计入第 1.2 节的一份本地 StateImage：
+采用已选定的「MLA/Indexer ADP2、KDA TP2」，计入第 1.2 节的一份本地 StateImage：
 
 | 单请求在指定 rank 的占用 | Main | Main＋原生 MTP |
 |---|---:|---:|
@@ -270,7 +273,7 @@ recurrent fold；fold 不重跑权重投影或 readout。
 ## 6. 并行方案的容量与性能判断
 
 以 MLA heads TP2、latent/Indexer 历史两台复制，且 prepare/Indexer 权重保持复制
-为对照，改为本节 DP2 会去掉一份重复历史，同时增加 Q_b/KV_b/O 权重复制。
+为对照，改为本节 ADP2 会去掉一份重复历史，同时增加 Q_b/KV_b/O 权重复制。
 BF16 Q_b 为 48 MiB、BF16 KV_b 因子为 32 MiB、Q8 O 为 68 MiB，每层合计
 148 MiB；TP2 时每 rank 为 74 MiB，Main＋MTP 共增加 **0.8671875 GiB/rank**。
 
@@ -278,13 +281,13 @@ BF16 Q_b 为 48 MiB、BF16 KV_b 因子为 32 MiB、Q8 O 为 68 MiB，每层合�
 12.75 GiB（BF16 MLA），均包含固定的 BF16 Indexer，FP8 列包含全部 FP32 scales。
 去掉副本并扣除两台合计 1.734375 GiB 新增权重后，双机 payload 分别净减少
 5.203125 / 11.015625 GiB。Owner 仍需
-保存完整历史，DP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于各 rank
+保存完整历史，ADP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于各 rank
 统一 Context 容量、临时数据与通信资源。
 
-相对非 routed-expert 全部 DP 的方案，保留 KDA/shared/head TP2 是低并发性能的
+相对非 routed-expert 全部按请求复制计算的方案，保留 KDA/shared/head TP2 是低并发性能的
 主要预期收益来源。KDA Q/K/V/O 每层 Q8 权重为 136 MiB，TP2 后每台 68 MiB；
 4096 维 BF16 block 输出为 8 KiB/token。这个数据量关系支持小 batch 下分摊权重读取
-与计算，但实际收益取决于 kernel 效率、通信延迟和完整层序。MLA DP 的直接目标是
+与计算，但实际收益取决于 kernel 效率、通信延迟和完整层序。MLA ADP 的直接目标是
 减少 cache 重复，不承诺其单请求延迟优于 MLA TP2。尚无 GLM 双机端到端性能结果。
 
 mHC 复制方案保持既有 TP/EP 输出交接。若把 residual 仅放在请求 owner，每个

@@ -45,6 +45,15 @@ struct ContextRecordBinding {
     std::uint64_t binding_epoch = 0;
 };
 
+// Record-relative fields supplied by the layout owner. Copies preserve represented content.
+struct RecordRangeCopy {
+    std::uint32_t source_rank      = 0;
+    std::uint32_t destination_rank = 0;
+    std::size_t source_offset      = 0;
+    std::size_t destination_offset = 0;
+    std::size_t bytes              = 0;
+};
+
 // Owns one rank-local replica. The domain outlives all record owners and reservations.
 class RecordLease {
 public:
@@ -116,6 +125,8 @@ public:
 
     [[nodiscard]] bool ready() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] bool contributes_to(const RecordAssessment&,
+                                      bool metadata_pressure) const noexcept;
     [[nodiscard]] std::uint32_t remaining(std::uint32_t rank) const noexcept;
 
     [[nodiscard]] std::span<const std::uint32_t> ranks() const noexcept { return ranks_; }

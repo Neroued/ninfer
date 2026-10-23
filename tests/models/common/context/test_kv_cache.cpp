@@ -149,6 +149,66 @@ void check_action_batches() {
            "Context batching lost an action or repeated a completed plan");
 }
 
+void check_peer_batches() {
+    context::PeerCopy send{7, true}, receive{3, false};
+    std::vector<std::byte> source(32768), destination(32768, std::byte{0});
+    for (std::size_t i = 0; i < source.size(); ++i) source[i] = std::byte(i % 251);
+    constexpr std::size_t count = context::kContextActionBatchOffsets + 13;
+    for (std::size_t i = 0; i < count; ++i) send.ranges.push_back(device_range(i * 4, 3));
+    receive.ranges = {device_range(11, count * 3 - 17), device_range(20000, 17)};
+    std::array<context::ContextActions, 2> plans;
+    plans[0].operations = {context::RecordClear{device_range(0, 4)}, send};
+    plans[1].operations = {receive, context::RecordClear{device_range(1, 4)}};
+    std::array<context::ContextActionCursor, 2> cursors;
+    const std::array ranks{context::ContextActionBatchSource{3, &plans[0], &cursors[0]},
+                           context::ContextActionBatchSource{7, &plans[1], &cursors[1]}};
+    std::size_t copied = 0;
+    while (!cursors[0].complete(plans[0]) || !cursors[1].complete(plans[1])) {
+        const auto batch = context::take_action_batches(ranks);
+        std::array<std::vector<context::ContextRange>, 2> ranges;
+        for (std::size_t rank = 0; rank < batch.size(); ++rank)
+            for (const auto& action : batch[rank].operations)
+                if (const auto* peer = std::get_if<context::PeerCopy>(&action)) {
+                    expect(peer->ranges.size() <= context::kContextActionBatchOffsets,
+                           "Context peer batch exceeded its descriptor capacity");
+                    ranges[rank] = peer->ranges;
+                }
+        expect(ranges[0].empty() == ranges[1].empty(),
+               "Context peer endpoints were placed in different batches");
+        if (ranges[0].empty()) continue;
+        std::vector<std::byte> payload;
+        for (const auto& range : ranges[0])
+            payload.insert(payload.end(), source.begin() + range.offset,
+                           source.begin() + range.offset + range.bytes);
+        std::size_t offset = 0;
+        for (const auto& range : ranges[1]) {
+            expect(range.bytes <= payload.size() - offset,
+                   "Context peer endpoints have different byte counts");
+            std::copy_n(payload.begin() + offset, range.bytes, destination.begin() + range.offset);
+            offset += range.bytes;
+        }
+        expect(offset == payload.size(), "Context peer batch lost payload bytes");
+        copied += offset;
+    }
+    std::vector<std::byte> expected(destination.size());
+    for (std::size_t i = 0; i < count * 3; ++i) {
+        const auto target = i < count * 3 - 17 ? 11 + i : 20000 + i - (count * 3 - 17);
+        expected[target]  = source[(i / 3) * 4 + i % 3];
+    }
+    expect(copied == count * 3 && destination == expected,
+           "Context peer batching changed logical bytes or untouched ranges");
+
+    plans[0].operations = {send};
+    receive.ranges.front().bytes -= 1;
+    plans[1].operations = {receive};
+    cursors             = {};
+    expect_rejected([&] { (void)context::take_action_batches(ranks); },
+                    "Context peer plan accepted different payload lengths");
+    expect(cursors[0].operation == 0 && cursors[1].operation == 0 && cursors[0].peer_range == 0 &&
+               cursors[1].peer_range == 0,
+           "Rejected Context peer batching advanced a cursor");
+}
+
 void check_record_execution(DeviceContext& device) {
     const auto record = plan_kv_page_layout(mixed_geometry());
     const auto bytes  = record.page_bytes;
@@ -263,6 +323,7 @@ int main() {
     try {
         check_record_geometry();
         check_action_batches();
+        check_peer_batches();
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
         if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver || !devices) {

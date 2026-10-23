@@ -156,6 +156,9 @@ public:
     [[nodiscard]] PageId materialize_transfer_destination(RecordReservation&,
                                                           std::uint32_t committed_columns,
                                                           std::span<const std::uint32_t> ranks);
+    [[nodiscard]] PageId materialize_conversion_destination(RecordReservation&, PageId source,
+                                                            std::uint32_t committed_columns,
+                                                            std::span<const std::uint32_t> ranks);
     void publish_transfer_destination(PageId) noexcept;
     void abort_transfer_destination(PageId, RecordReservation&) noexcept;
 
@@ -191,6 +194,8 @@ public:
     [[nodiscard]] ReadLease pin_binding(PageId, std::uint32_t rank, ContextMemory);
     [[nodiscard]] ReadLease read_device(PageId, std::uint32_t coverage);
     [[nodiscard]] ReadLease read_device(PageId, std::uint32_t rank, std::uint32_t coverage);
+    // Protected prefix bytes remain immutable even when an existing writer appends a suffix.
+    [[nodiscard]] ReadLease read_device_prefix(PageId, std::uint32_t rank, std::uint32_t coverage);
     [[nodiscard]] ReadLease read_host(PageId, std::uint32_t rank, std::uint32_t coverage);
     [[nodiscard]] Restore reserve_device_replica(PageId, std::uint32_t rank, RecordReservation&);
     [[nodiscard]] Backup prepare_host_replica(PageId, std::uint32_t rank, RecordLease);

@@ -557,7 +557,8 @@ private:
                         f.retired[rank] = true;
                         if (std::all_of(f.scope.owners.begin(), f.scope.owners.end(),
                                         [&](auto r) { return f.retired[r]; })) {
-                            if (f.ticket.frame.kind == FrameKind::Context && !f.result_published)
+                            if (f.ticket.frame.kind == FrameKind::Context &&
+                                f.phase != Phase::Discarding && !f.result_published)
                                 throw std::logic_error("context retired before publication");
                             auto observed         = f.clock.finish(observation_time_ns());
                             observed.max_rank_gpu = f.gpu;

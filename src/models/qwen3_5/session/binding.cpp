@@ -74,78 +74,46 @@ void SessionImpl::initialize_replay(std::uint32_t lane) {
             replay.prompt_tokens, prompt.vision_items, prompt.media_payloads, vision});
 }
 
-BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
-                                              const SourceCandidate& candidate, ResumeState* resume,
-                                              ExecutionUnitKind resume_kind,
-                                              std::uint32_t resume_tokens) {
+BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
+                                      const SourceCandidate& candidate, const ResumeState* resume,
+                                      ExecutionUnitKind resume_kind,
+                                      std::uint32_t resume_tokens) const {
     const auto lane = lane_id.value;
-    if (has_context_operation() || lane >= max_concurrency ||
-        requests[lane].lifecycle != Lifecycle::Empty || !base.impl_)
-        throw std::logic_error("binding requires a free lane and context transaction slot");
-    auto execution_reservation = executor().try_reserve(runtime::FrameKind::Context);
-    if (!execution_reservation)
-        return {.assessment = {.status = context::ContextAvailability::Waiting}};
-    if (resume && (!resume->impl_ || resume->impl_->owner != this))
-        throw std::invalid_argument("resume state belongs to another Session");
-    const bool own_snapshot = resume && resume->has_snapshot();
-    const auto source       = own_snapshot ? resume->impl_->snapshot : candidate.checkpoint;
-    if (source &&
-        (!valid_checkpoint(*source) ||
-         (!own_snapshot && (!checkpoint_matches(*source, base) ||
-                            (resume && checkpoint(*source).frontier() > resume->frontier())))))
-        return {.source_valid = false};
-    BindOperation transaction;
+    if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Empty || !base.impl_)
+        throw std::logic_error("binding requires a free lane and request plan");
+    BindingPlan result;
+    const auto actual = inspect_source(base, candidate.checkpoint, candidate.consume_source,
+                                       candidate.private_points, candidate.retired_points,
+                                       candidate.placement, resume);
+    if (!actual) {
+        result.evaluation.source_valid = false;
+        return result;
+    }
+    const auto source            = actual->checkpoint;
+    auto& transaction            = result.operation;
     transaction.lane             = lane;
     transaction.base             = base.impl_;
-    transaction.resume           = resume;
     transaction.source           = source;
-    transaction.reuse_frontier   = source ? checkpoint(*source).frontier() : 0;
+    transaction.reuse_frontier   = actual->reused_tokens;
     transaction.backend_frontier = source ? checkpoint(*source).backend_frontier() : 0;
     transaction.source_tail_hidden =
         source && checkpoint(*source).continuation().metadata.tail_hidden_valid;
-    transaction.resume_snapshot = own_snapshot;
-    const auto select_source    = [&](const SourceCandidate& actual) {
-        transaction.take_private   = candidate.take_private;
-        transaction.carried_points = actual.private_points;
-        if (actual.state_action == StateBindingAction::Move)
+    transaction.resume_snapshot = resume && source && actual->reused_tokens == resume->frontier();
+    transaction.take_private    = candidate.take_private;
+    transaction.carried_points  = actual->private_points;
+    transaction.state_action    = actual->state_action;
+    if (source) {
+        if (actual->state_action == StateBindingAction::Move)
             std::erase(transaction.carried_points, *source);
         transaction.consume_source =
-            actual.consume_source &&
+            actual->consume_source &&
             std::find(transaction.carried_points.begin(), transaction.carried_points.end(),
-                         *source) == transaction.carried_points.end();
-        transaction.state_action = actual.state_action;
-    };
-    if (source && !own_snapshot) {
-        const auto actual = inspect_source(base, source, candidate.consume_source,
-                                           candidate.private_points, candidate.retired_points);
-        if (!actual) return {.source_valid = false};
-        select_source(*actual);
-    } else if (own_snapshot) {
-        transaction.consume_source = true;
-        transaction.take_private   = candidate.take_private;
-        for (auto point : candidate.private_points)
-            if (valid_checkpoint(point) &&
-                checkpoint(point).frontier() <= checkpoint(*source).frontier())
-                transaction.carried_points.push_back(point);
-        const auto image         = checkpoint(*source).continuation().image;
-        transaction.state_action = state_store->device_resident(image)
-                                       ? StateBindingAction::Fork
-                                       : StateBindingAction::Restore;
-        if (checkpoints[source->index].pins == 0 &&
-            state_store->checkpoint_references(image) == 1 &&
-            state_store->source_pins(image) == 0) {
-            transaction.state_action = StateBindingAction::Move;
-        } else if (state_store->device_resident(image) && state_store->host_resident(image) &&
-                   state_store->source_pins(image) == 0 &&
-                   !directory.assess(ContextDemand{.new_states = 1}).ready()) {
-            transaction.state_action = StateBindingAction::Split;
-        }
+                      *source) == transaction.carried_points.end();
     }
-    auto& request = requests[lane];
     UnitDemand first;
     if (!resume)
         first = prefill_unit(base.summary().prompt_tokens, transaction.reuse_frontier);
-    else if (!own_snapshot) {
+    else if (!transaction.resume_snapshot) {
         first                  = {.kind = ExecutionUnitKind::Replay,
                                   .main_frontier =
                                       std::min(transaction.reuse_frontier + prefill_chunk, resume->frontier())};
@@ -172,6 +140,15 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
                            .ledger_tokens = resume->impl_->sequence.ledger.size()};
         transaction.reservation_demand = coverage;
     }
+    ContextReleaseSet releases;
+    if (!candidate.retired_points.empty()) {
+        const auto quoted = checkpoint_release_set(candidate.retired_points);
+        if (!quoted) {
+            result.evaluation.source_valid = false;
+            return result;
+        }
+        releases = *quoted;
+    }
     const auto& coverage       = transaction.reservation_demand;
     const auto* main_source    = source ? &checkpoint(*source).text_prefix() : nullptr;
     const auto* backend_source = source ? checkpoint(*source).backend_prefix() : nullptr;
@@ -196,27 +173,41 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         action == StateBindingAction::Restore ||
         (action == StateBindingAction::Move &&
          !state_store->device_resident(checkpoint(*source).continuation().image));
-    ContextDemand demand{.new_states = static_cast<std::uint32_t>(needs_state),
-                         .logical_states =
-                             static_cast<std::uint32_t>(action != StateBindingAction::Move)};
-    demand.add_history(kTextKvPool.index, main);
-    if (backend_kv_histories) demand.add_history(kBackendKvPool.index, backend);
-    ContextReleaseSet releases;
-    if (!candidate.retired_points.empty()) {
-        const auto quoted = checkpoint_release_set(candidate.retired_points);
-        if (!quoted) return {.source_valid = false};
-        releases = *quoted;
-    }
-    auto assessment = directory.assess(demand, releases);
-    if (!assessment.ready())
-        return {.capacity_possible = !assessment.impossible(), .assessment = std::move(assessment)};
-    const ContextDemand backup_demand{
-        .new_states = 1, .logical_states = 0, .memory = context::ContextMemory::Host};
-    if (action == StateBindingAction::BackupSplit) {
-        auto backup = directory.assess(backup_demand, releases);
-        if (!backup.ready())
-            return {.capacity_possible = !backup.impossible(), .assessment = std::move(backup)};
-    }
+    result.state = result.demand.add_state(
+        {.count         = static_cast<std::uint32_t>(needs_state),
+         .logical_count = static_cast<std::uint32_t>(action != StateBindingAction::Move)});
+    result.main = result.demand.add_history(kTextKvPool.index, main);
+    if (backend_kv_histories)
+        result.backend = result.demand.add_history(kBackendKvPool.index, backend);
+    if (action == StateBindingAction::BackupSplit)
+        result.backup = result.demand.add_state(
+            {.count = 1, .logical_count = 0, .memory = context::ContextMemory::Host});
+    result.evaluation.assessment        = directory.assess(result.demand, releases);
+    result.evaluation.capacity_possible = !result.evaluation.assessment.impossible();
+    return result;
+}
+
+BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
+                                              const SourceCandidate& candidate, ResumeState* resume,
+                                              ExecutionUnitKind resume_kind,
+                                              std::uint32_t resume_tokens) {
+    if (has_context_operation())
+        throw std::logic_error("binding requires a free context transaction slot");
+    auto planned = plan_binding(base, lane_id, candidate, resume, resume_kind, resume_tokens);
+    if (!planned.evaluation.source_valid) return {.source_valid = false};
+    if (!planned.evaluation.assessment.ready())
+        return {.capacity_possible = planned.evaluation.capacity_possible,
+                .assessment        = std::move(planned.evaluation.assessment)};
+    auto execution_reservation = executor().try_reserve(runtime::FrameKind::Context);
+    if (!execution_reservation)
+        return {.assessment = {.status = context::ContextAvailability::Waiting}};
+    const auto lane            = lane_id.value;
+    auto& request              = requests[lane];
+    auto transaction           = std::move(planned.operation);
+    transaction.resume         = resume;
+    const auto source          = transaction.source;
+    const auto* main_source    = source ? &checkpoint(*source).text_prefix() : nullptr;
+    const auto* backend_source = source ? checkpoint(*source).backend_prefix() : nullptr;
     BindingReservation result{.reserved       = true,
                               .retired_points = candidate.retired_points,
                               .consumed_source =
@@ -249,18 +240,11 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             throw std::logic_error("binding retirement changed after its quote");
         transaction.retired_points.push_back(point);
     }
-    auto reserved = directory.reserve(demand);
+    auto reserved = directory.reserve(planned.demand);
     if (!reserved)
         throw std::logic_error("binding placement changed after its accepted assessment");
-    std::optional<context::ContextReservation> backup_reservation;
-    if (action == StateBindingAction::BackupSplit) {
-        auto backup = directory.reserve(backup_demand);
-        if (!backup || !backup.reservation->ready())
-            throw std::logic_error("binding Host placement changed after its accepted assessment");
-        backup_reservation.emplace(std::move(*backup.reservation));
-    }
     auto& destinations = *reserved.reservation;
-    auto state_records = destinations.take_state();
+    auto state_records = destinations.take(planned.state);
     if (source) transaction.source_lease = checkpoints.lease(*source);
     context_operation_   = std::make_unique<PendingContext>(directory, std::move(transaction));
     request              = std::move(prepared);
@@ -280,17 +264,17 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
                 if (const auto clone = reserve_checkpoint())
                     tx.carried_clones.emplace_back(point, *clone);
         }
-        migration.add_binding(kTextKvPool.index,
-                              text_kv_histories->prepare_binding(
-                                  main_source, tx.reuse_frontier,
-                                  tx.reservation_demand.main_frontier, lane,
-                                  destinations.take_history(kTextKvPool.index), tx.consume_source));
+        migration.add_binding(
+            kTextKvPool.index,
+            text_kv_histories->prepare_binding(main_source, tx.reuse_frontier,
+                                               tx.reservation_demand.main_frontier, lane,
+                                               destinations.take(planned.main), tx.consume_source));
         if (backend_kv_histories)
-            migration.add_binding(
-                kBackendKvPool.index,
-                backend_kv_histories->prepare_binding(
-                    backend_source, tx.backend_frontier, tx.reservation_demand.backend_frontier,
-                    lane, destinations.take_history(kBackendKvPool.index), tx.consume_source));
+            migration.add_binding(kBackendKvPool.index,
+                                  backend_kv_histories->prepare_binding(
+                                      backend_source, tx.backend_frontier,
+                                      tx.reservation_demand.backend_frontier, lane,
+                                      destinations.take(planned.backend), tx.consume_source));
         const auto source_image =
             source ? checkpoint(*source).continuation().image : context::StateId{};
         if (tx.state_action != StateBindingAction::Move) {
@@ -325,8 +309,8 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             break;
         }
         case StateBindingAction::BackupSplit: {
-            auto backup =
-                state_store->reserve_device_to_host(source_image, backup_reservation->take_state());
+            auto backup = state_store->reserve_device_to_host(source_image,
+                                                              destinations.take(planned.backup));
             if (!backup) throw std::logic_error("source backup lost its Host reservation");
             migration.add_state_copy(std::move(*backup), true);
             break;
@@ -428,7 +412,7 @@ void SessionImpl::complete_binding(BindOperation& tx, context::ContextTransactio
             throw std::logic_error("consumed checkpoint still has readers");
         tx.retired_points.push_back(old);
         tx.source.reset();
-        if (tx.resume) tx.resume->impl_->snapshot.reset();
+        if (tx.resume && tx.resume->impl_->snapshot == old) tx.resume->impl_->snapshot.reset();
     }
     SequenceKVBundle kv{.text = migration.binding(kTextKvPool.index)->commit()};
     if (auto* backend = migration.binding(kBackendKvPool.index))

@@ -1,6 +1,8 @@
 #include "runtime/observability/execution.h"
 #include "runtime/engine/request_record.h"
+#include "runtime/contract/resources.h"
 
+#include <cmath>
 #include <iostream>
 
 int main() {
@@ -56,5 +58,19 @@ int main() {
     check(measured[0].count == 1 && measured[0].total_ns == 30 && measured[1].count == 0 &&
               measured[2].total_ns == 50,
           "rank max is per execution; unavailable GPU intervals stay unmeasured");
+    GenerationTransferTiming peer_timing;
+    ContextTransferObservation peer{.direction   = ContextTransferDirection::PeerDeviceToDevice,
+                                    .image_count = 1,
+                                    .work        = {4096, 2},
+                                    .elapsed_ns  = 7000,
+                                    .rank        = 0,
+                                    .peer        = ContextPeerTransfer{0, 1}};
+    accumulate_context_transfer(peer_timing, peer);
+    peer.rank       = 1;
+    peer.elapsed_ns = 9000;
+    accumulate_context_transfer(peer_timing, peer);
+    check(peer_timing.bytes == 4096 && peer_timing.images == 1 &&
+              peer_timing.copy_operations == 2 && std::abs(peer_timing.seconds - 0.000016) < 1e-12,
+          "peer payload must count once while both endpoint intervals remain observable");
     return failures ? 1 : 0;
 }

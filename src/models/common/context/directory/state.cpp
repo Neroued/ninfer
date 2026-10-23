@@ -432,6 +432,20 @@ void StateDirectory::complete_initialization(StateId handle) {
     object.role = StateRole::ActiveMutable;
 }
 
+void StateDirectory::complete_conversion(const ReadLease& source, StateId destination) {
+    if (source.directory_ != this || !source.image_.valid())
+        throw std::invalid_argument("State conversion source belongs to another directory");
+    const auto& from = require(source.image_);
+    auto& to         = require(destination);
+    if (source.image_ == destination || from.role != StateRole::CheckpointImmutable ||
+        from.content_epoch != source.epoch_ || !source.epoch_ || !from.source_pins ||
+        to.role != StateRole::ReservedDestination || !device_resident(destination) ||
+        to.content_epoch || to.source_pins || to.destination_pinned || has_pending_replica(to))
+        throw std::logic_error("State conversion has no exclusive destination or current source");
+    to.content_epoch = source.epoch_;
+    to.role          = StateRole::ActiveMutable;
+}
+
 bool StateDirectory::valid(StateId handle) const noexcept {
     return handle.valid() && handle.index < initialized_objects_ &&
            objects_.is_allocated(handle.index) && objects_[handle.index].role != StateRole::Free &&

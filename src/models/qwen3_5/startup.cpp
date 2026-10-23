@@ -15,9 +15,9 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
         const auto& deployment = *options.deployment;
         const auto& parallel   = deployment.parallel;
         if (deployment.ranks.size() != 1 || parallel.tp != 1 || parallel.ep != 1 ||
-            parallel.dp != 1 || parallel.pp != 1)
+            parallel.dp != 1 || parallel.pp != 1 || parallel.attention_dp != 1)
             throw std::invalid_argument(
-                "Qwen3_5 model preparation supports one rank with TP=EP=DP=PP=1");
+                "Qwen3_5 model preparation supports one rank with TP=EP=DP=PP=ADP=1");
     }
     profile       = execution::describe_model(*definition_);
     auto resident = resolve_load(reader_, definition_, device);

@@ -48,28 +48,70 @@ std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle h, const Re
                : 0;
 }
 
+std::span<const runtime::PlacementId> Session::placements(const RequestBasePlan&) const {
+    static constexpr std::array placements{runtime::PlacementId{0}};
+    return placements;
+}
+
+runtime::PlacementId Session::placement(SequenceHandle h) const {
+    (void)impl_->sequence(h);
+    return {};
+}
+
+std::uint64_t Session::load_tokens(SequenceHandle h) const {
+    const auto& sequence = impl_->sequence(h);
+    return std::max(sequence.request->summary.prompt_tokens,
+                    sequence.continuation.metadata.main_frontier);
+}
+
+bool detail::SessionImpl::source_matches(const RequestBasePlan& base, CheckpointHandle handle,
+                                         const ResumeState* resume) const {
+    if (!checkpoints.valid(handle)) return false;
+    const auto& checkpoint = checkpoints.at(handle);
+    const auto& identity   = checkpoint.snapshot.identity();
+    if (resume) {
+        if (!resume->state_ || resume->state_->owner != this || !resume->state_->sequence ||
+            resume->state_->sequence->request != base.plan_)
+            throw std::invalid_argument("resume state belongs to another Session");
+        const auto& previous = resume->state_->sequence->identity;
+        return qwen::recovery_prefix_matches(checkpoint.recovery_identity(),
+                                             {resume->frontier(), previous.tag, previous.tokens,
+                                              previous.positions, previous.digests, &previous});
+    }
+    return base.plan_->reuse && identity.tag == base.plan_->identity->tag &&
+           qwen::prefix_matches(base.plan_->prompt, identity.tokens, identity.positions,
+                                checkpoint.frontier());
+}
+
 std::optional<SourceCandidate>
 Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> h,
                         bool consume, std::span<const CheckpointHandle> carried,
-                        std::span<const CheckpointHandle> retired) const {
+                        std::span<const CheckpointHandle> retired, runtime::PlacementId target,
+                        const ResumeState* resume) const {
     const auto& p = *impl_;
-    if (h && !checkpoint_matches(*h, base)) return {};
+    if (target.value != 0) throw std::invalid_argument("Qwen4Exp has one context placement");
+    if (resume && (!resume->state_ || resume->state_->owner != &p || !resume->state_->sequence ||
+                   resume->state_->sequence->request != base.plan_))
+        throw std::invalid_argument("resume state belongs to another Session");
+    if (h && !p.source_matches(base, *h, resume)) return {};
     SourceCandidate out;
-    out.checkpoint     = h;
-    out.reused_tokens  = h ? p.checkpoints.at(*h).frontier() : 0;
-    out.remaining_work = runtime::make_prefill_work(
-        out.reused_tokens, base.summary().prompt_tokens - out.reused_tokens, 0, 0,
-        p.shape.prefill_chunk);
+    out.checkpoint    = h;
+    out.placement     = target;
+    out.reused_tokens = h ? p.checkpoints.at(*h).frontier() : 0;
+    const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
+    if (out.reused_tokens > end) return {};
+    out.remaining_work = runtime::make_prefill_work(out.reused_tokens, end - out.reused_tokens, 0,
+                                                    0, p.shape.prefill_chunk);
     for (const auto& item : base.plan_->prompt.vision_items)
-        if (item.token_spans.back().begin + item.token_spans.back().count > out.reused_tokens) {
+        if (item.token_spans.back().begin + item.token_spans.back().count > out.reused_tokens &&
+            item.token_spans.front().begin < end) {
             ++out.remaining_work.vision_items;
             out.remaining_work.vision_patches += item.patch_count;
         }
     if (const auto& vision = base.plan_->vision) {
         out.remaining_work.chunks = 0;
-        for (auto cursor = out.reused_tokens; cursor < base.summary().prompt_tokens;) {
-            cursor = vision->plan.window_end(
-                cursor, std::min(base.summary().prompt_tokens, cursor + p.shape.prefill_chunk));
+        for (auto cursor = out.reused_tokens; cursor < end;) {
+            cursor = vision->plan.window_end(cursor, std::min(end, cursor + p.shape.prefill_chunk));
             ++out.remaining_work.chunks;
         }
     }
@@ -80,9 +122,14 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         out.consume_source = consume && p.checkpoints[h->index].pins == 0 &&
                              states.checkpoint_references(image) == 1 && !states.source_pins(image);
         out.transfers = c.snapshot.restore_requirements(p.directory);
+        out.local_device =
+            states.device_resident(image) &&
+            std::none_of(out.transfers.begin(), out.transfers.end(), [](const auto& transfer) {
+                return transfer.direction == runtime::ContextTransferDirection::HostToDevice;
+            });
     }
     for (const auto point : carried)
-        if ((!h || point != *h || !out.consume_source) && checkpoint_matches(point, base) &&
+        if ((!h || point != *h || !out.consume_source) && p.source_matches(base, point, resume) &&
             p.checkpoints.at(point).frontier() <= out.reused_tokens)
             out.private_points.push_back(point);
     for (const auto point : retired)
@@ -90,77 +137,111 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     return out;
 }
 
+detail::BindingPlan
+detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                  const SourceCandidate& candidate, const ResumeState* resume,
+                                  ExecutionUnitKind resume_kind, std::uint32_t tokens) const {
+    if (candidate.placement.value != 0)
+        throw std::invalid_argument("Qwen4Exp has one context placement");
+    if (lane.value >= shape.max_concurrency || sequences[lane.value])
+        throw std::logic_error("binding requires an empty lane");
+    if (resume && (!resume->state_ || resume->state_->owner != this || !resume->state_->sequence ||
+                   resume->state_->sequence->request != base.plan_))
+        throw std::invalid_argument("binding has an invalid resume owner");
+    BindingPlan plan;
+    const auto source = candidate.checkpoint;
+    if (source && !source_matches(base, *source, resume)) {
+        plan.evaluation.source_valid = false;
+        return plan;
+    }
+    const bool own         = source && resume && resume->snapshot_handle() == source;
+    const auto* checkpoint = source ? &checkpoints.at(*source) : nullptr;
+    const auto frontier    = checkpoint ? checkpoint->frontier() : 0;
+    const auto image       = checkpoint ? checkpoint->snapshot.continuation().image : Image{};
+    const auto& states     = directory.states();
+    const bool resident    = checkpoint && states.device_resident(image);
+    const bool consume     = checkpoint && (own || candidate.consume_source) &&
+                         checkpoints[source->index].pins == 0 &&
+                         states.checkpoint_references(image) == 1 && !states.source_pins(image);
+    const bool split = checkpoint && !consume && resident && states.host_resident(image) &&
+                       !states.source_pins(image);
+    const auto target = resume ? resume->frontier() : frontier;
+    const auto requested_peak =
+        resume
+            ? std::uint64_t(target) + (resume_kind == ExecutionUnitKind::Decode
+                                           ? std::min(shape.draft_tokens + 1, std::max(tokens, 1U))
+                                           : tokens)
+            : std::min<std::uint64_t>(base.summary().prompt_tokens,
+                                      std::uint64_t(frontier) + shape.prefill_chunk);
+    auto peak =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(requested_peak, shape.max_context));
+    if (resume && resume_kind == ExecutionUnitKind::Prefill)
+        peak = std::min<std::uint64_t>(base.summary().prompt_tokens,
+                                       std::uint64_t(target) + shape.prefill_chunk);
+    if ((!resume || resume_kind == ExecutionUnitKind::Prefill) && base.plan_->vision)
+        peak = base.plan_->vision->plan.window_end(target, peak);
+    std::array<std::vector<const context::HistoryPrefix*>, 2> retired_prefixes;
+    for (const auto point : candidate.retired_points) {
+        if ((source && point == *source) ||
+            std::find(plan.retired.begin(), plan.retired.end(), point) != plan.retired.end())
+            continue;
+        if (!checkpoints.erasable(point)) {
+            plan.evaluation.source_valid = false;
+            return plan;
+        }
+        plan.retired.push_back(point);
+        for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
+            retired_prefixes[pool].push_back(&checkpoints.at(point).snapshot.prefix(pool));
+    }
+    if (consume)
+        for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
+            retired_prefixes[pool].push_back(&checkpoint->snapshot.prefix(pool));
+    auto& action          = plan.action;
+    action.lane           = lane.value;
+    action.frontier       = frontier;
+    action.target         = target;
+    action.peak           = peak;
+    action.request        = base.plan_;
+    action.source         = source;
+    action.source_image   = image;
+    action.consume_source = consume;
+    action.state_action   = !source     ? StateBindingAction::Root
+                            : !resident ? StateBindingAction::Restore
+                            : consume   ? StateBindingAction::Move
+                            : split     ? StateBindingAction::Split
+                                        : StateBindingAction::Fork;
+    action.state_target   = plan.demand.add_state(
+        {.count         = static_cast<std::uint32_t>(!resident || (!consume && !split)),
+           .logical_count = static_cast<std::uint32_t>(!source || !resident || !consume)});
+    for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
+        const auto* prefix           = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
+        const auto end               = pool == 0 ? peak : mtp_history_frontier(peak);
+        action.history_targets[pool] = plan.demand.add_history(
+            pool, directory.pool(pool).histories().binding_demand(
+                      prefix, prefix ? prefix->frontier() : 0, end, retired_prefixes[pool]));
+    }
+    plan.evaluation.assessment = directory.assess(plan.demand, footprint(plan.retired, true));
+    plan.evaluation.capacity_possible = !plan.evaluation.assessment.impossible();
+    return plan;
+}
+
+BindingEvaluation Session::assess_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                          const SourceCandidate& candidate,
+                                          const ResumeState* resume, ExecutionUnitKind kind,
+                                          std::uint32_t tokens) const {
+    return impl_->plan_binding(base, lane, candidate, resume, kind, tokens).evaluation;
+}
+
 BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                           const SourceCandidate& candidate, ResumeState* resume,
                                           ExecutionUnitKind resume_kind, std::uint32_t tokens) {
     auto& p = *impl_;
-    if (p.directory.maintenance_pending())
-        return {.assessment = {.status = context::ContextAvailability::Waiting}};
-    if (p.operation || lane.value >= p.shape.max_concurrency || p.sequences[lane.value])
-        throw std::logic_error("binding requires an empty lane and transaction slot");
-    if (resume && (!resume->state_ || resume->state_->owner != &p || !resume->state_->sequence))
-        throw std::logic_error("binding has an invalid resume owner");
-    const bool own    = resume && resume->has_snapshot();
-    const auto source = own ? resume->snapshot_handle() : candidate.checkpoint;
-    if (source &&
-        (!p.checkpoints.valid(*source) ||
-         (!own && (!checkpoint_matches(*source, base) ||
-                   (resume && p.checkpoints.at(*source).frontier() > resume->frontier())))))
-        return {.source_valid = false};
-    auto& states           = p.directory.states();
-    const auto* checkpoint = source ? &p.checkpoints.at(*source) : nullptr;
-    const auto f           = checkpoint ? checkpoint->frontier() : 0;
-    const auto image    = checkpoint ? checkpoint->snapshot.continuation().image : detail::Image{};
-    const bool resident = checkpoint && states.device_resident(image);
-    const bool consume  = checkpoint && (own || candidate.consume_source) &&
-                         p.checkpoints[source->index].pins == 0 &&
-                         states.checkpoint_references(image) == 1 && !states.source_pins(image);
-    const bool split = checkpoint && !consume && resident && states.host_resident(image) &&
-                       !states.source_pins(image);
-    const auto target = resume ? resume->frontier() : f;
-    const auto requested_peak =
-        resume ? std::uint64_t(target) +
-                     (resume_kind == ExecutionUnitKind::Decode
-                          ? std::min(p.shape.draft_tokens + 1, std::max(tokens, 1U))
-                          : tokens)
-               : std::min<std::uint64_t>(base.summary().prompt_tokens,
-                                         std::uint64_t(f) + p.shape.prefill_chunk);
-    auto peak =
-        static_cast<std::uint32_t>(std::min<std::uint64_t>(requested_peak, p.shape.max_context));
-    if (resume && resume_kind == ExecutionUnitKind::Prefill)
-        peak = std::min<std::uint64_t>(base.summary().prompt_tokens,
-                                       std::uint64_t(target) + p.shape.prefill_chunk);
-    if ((!resume || resume_kind == ExecutionUnitKind::Prefill) && base.plan_->vision)
-        peak = base.plan_->vision->plan.window_end(target, peak);
-    std::vector<CheckpointHandle> retired;
-    std::array<std::vector<const context::HistoryPrefix*>, 2> retired_prefixes;
-    for (const auto point : candidate.retired_points) {
-        if ((source && point == *source) ||
-            std::find(retired.begin(), retired.end(), point) != retired.end())
-            continue;
-        if (!p.checkpoints.erasable(point)) return {.source_valid = false};
-        retired.push_back(point);
-        for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-            retired_prefixes[pool].push_back(&p.checkpoints.at(point).snapshot.prefix(pool));
-    }
-    if (consume)
-        for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
-            retired_prefixes[pool].push_back(&checkpoint->snapshot.prefix(pool));
-    const auto released = p.footprint(retired, true);
-    ContextDemand demand;
-    demand.new_states     = !resident || (!consume && !split);
-    demand.logical_states = !source || !resident || !consume;
-    for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
-        const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
-        const auto end     = pool == 0 ? peak : mtp_history_frontier(peak);
-        demand.add_history(
-            pool, p.directory.pool(pool).histories().binding_demand(
-                      prefix, prefix ? prefix->frontier() : 0, end, retired_prefixes[pool]));
-    }
-    BindingReservation result;
-    result.assessment        = p.directory.assess(demand, released);
-    result.capacity_possible = !result.assessment.impossible();
-    if (!result.assessment.feasible()) return result;
+    if (p.operation) throw std::logic_error("binding requires a free context transaction slot");
+    auto plan = p.plan_binding(base, lane, candidate, resume, resume_kind, tokens);
+    BindingReservation result{.source_valid      = plan.evaluation.source_valid,
+                              .capacity_possible = plan.evaluation.capacity_possible,
+                              .assessment        = std::move(plan.evaluation.assessment)};
+    if (!result.source_valid || !result.assessment.feasible()) return result;
     if (result.assessment.requires_maintenance() && (p.compute || p.executor->has_pending_work())) {
         p.pending_maintenance = result.assessment;
         p.directory.request_maintenance();
@@ -172,42 +253,30 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
         result.assessment.status = context::ContextAvailability::Waiting;
         return result;
     }
-
-    detail::BindOperation action;
-    action.lane           = lane.value;
-    action.frontier       = f;
-    action.target         = target;
-    action.peak           = peak;
-    action.request        = base.plan_;
-    action.resume         = resume;
-    action.source         = source;
-    action.source_image   = image;
-    action.consume_source = consume;
-    using StateAction     = detail::StateBindingAction;
-    action.state_action   = !source     ? StateAction::Root
-                            : !resident ? StateAction::Restore
-                            : consume   ? StateAction::Move
-                            : split     ? StateAction::Split
-                                        : StateAction::Fork;
-    p.operation = std::make_unique<detail::ContextOperation>(p.directory, std::move(action),
+    plan.action.resume = resume;
+    p.operation = std::make_unique<detail::ContextOperation>(p.directory, std::move(plan.action),
                                                              std::move(*reservation));
     auto& tx    = std::get<detail::BindOperation>(p.operation->action);
+    const auto source  = tx.source;
+    const bool consume = tx.consume_source;
     try {
         if (source) tx.source_lease.emplace(p.checkpoints.lease(*source));
-        tx.retired.reserve(retired.size() + 1);
+        tx.retired.reserve(plan.retired.size() + 1);
         tx.carried.reserve(candidate.private_points.size());
         tx.clones.reserve(candidate.private_points.size());
         tx.carried_leases.reserve(candidate.private_points.size());
-        for (const auto point : retired) {
+        for (const auto point : plan.retired) {
             if (!p.checkpoints.erase(point))
                 throw std::logic_error("binding retirement changed after its reservation");
             tx.retired.push_back(point);
         }
-        auto storage = p.directory.reserve(demand);
+        auto storage = p.directory.reserve(plan.demand);
         if (!storage)
             throw std::logic_error("binding placement changed after its accepted assessment");
+        const bool own = source && resume && resume->snapshot_handle() == source;
         for (const auto point : candidate.private_points) {
-            if (!p.checkpoints.valid(point) || (source && point == *source && (consume || own)))
+            if (!p.checkpoints.valid(point) ||
+                (source && point == *source && (tx.consume_source || own)))
                 continue;
             if (point != source) tx.carried_leases.push_back(p.checkpoints.lease(point));
             if (candidate.take_private)
@@ -229,7 +298,7 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
         }
         p.submit_context();
         result.reserved       = true;
-        result.retired_points = retired;
+        result.retired_points = std::move(plan.retired);
         if (consume) result.consumed_source = source;
         return result;
     } catch (...) {
@@ -374,6 +443,7 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
         detail::Sequence* sequence;
         std::uint32_t end;
         std::array<std::uint32_t, 2> additional{};
+        std::array<context::ContextDemandId, 2> targets;
         std::array<context::RecordReservation, 2> prepared;
     };
 
@@ -396,22 +466,20 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
             const auto pages      = histories.write_pages(history, begin, end);
             const auto held       = histories.reserved_growth_pages(history);
             need.additional[pool] = pages > held ? pages - held : 0;
-            demand.add_growth(histories, history, need.additional[pool]);
+            need.targets[pool]    = demand.add_growth(histories, history, need.additional[pool]);
         }
         needed.push_back(std::move(need));
     }
     auto result = p.directory.reserve(demand);
     if (!result || !result.reservation->ready()) return {.assessment = result.assessment};
-    std::array<context::RecordReservation, 2> reservations;
-    for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
-        reservations[pool] = result.reservation->take_history(pool);
     for (auto& need : needed)
-        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
+        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
+            need.prepared[pool] = result.reservation->take(need.targets[pool]);
             if (need.additional[pool]) {
-                need.prepared[pool] = reservations[pool].split(need.additional[pool]);
                 p.directory.pool(pool).histories().prepare_growth(
                     need.sequence->histories[pool].handle(), need.prepared[pool]);
             }
+        }
     for (std::size_t i = 0; i < units.size(); ++i) {
         auto& sequence = *needed[i].sequence;
         for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)

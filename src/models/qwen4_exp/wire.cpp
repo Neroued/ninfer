@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/wire.h"
 
+#include "models/common/context/wire.h"
+
 #include <stdexcept>
 #include <type_traits>
 
@@ -66,16 +68,6 @@ T slot(Decoder& in) {
     return {in.u32(), in.u32(), in.u32()};
 }
 
-void range(Encoder& out, context::ContextRange range) {
-    out.u8(static_cast<std::uint8_t>(range.memory));
-    out.i64(range.offset);
-    out.u64(range.bytes);
-}
-
-context::ContextRange range(Decoder& in) {
-    return {static_cast<context::ContextMemory>(in.u8()), in.i64(), in.u64()};
-}
-
 void sampling(Encoder& out, const ResolvedSamplingParameters& p) {
     out.f32(p.temperature);
     out.i32(p.top_k);
@@ -88,71 +80,6 @@ void sampling(Encoder& out, const ResolvedSamplingParameters& p) {
 
 ResolvedSamplingParameters sampling(Decoder& in) {
     return {in.f32(), in.i32(), in.f32(), in.f32(), in.f32(), in.f32(), in.u64()};
-}
-
-void actions(Encoder& out, const context::ContextActions& actions) {
-    out.u64(actions.operations.size());
-    for (const auto& operation : actions.operations)
-        std::visit(
-            [&](const auto& action) {
-                using T = std::decay_t<decltype(action)>;
-                if constexpr (std::is_same_v<T, context::RecordClear>) {
-                    out.u8(1);
-                    range(out, action.destination);
-                } else if constexpr (std::is_same_v<T, context::RecordCopy>) {
-                    out.u8(2);
-                    range(out, action.source);
-                    range(out, action.destination);
-                    out.boolean(action.resource.pool.has_value());
-                    if (action.resource.pool) out.u16(action.resource.pool->index);
-                    out.u32(action.image_count);
-                    out.u32(action.page_groups);
-                } else {
-                    out.u8(3);
-                    out.u32(action.pool_id);
-                    out.i32(action.row);
-                    out.u32(action.logical_begin);
-                    out.u64(action.offsets.size());
-                    for (auto offset : action.offsets) out.i64(offset);
-                }
-            },
-            operation);
-}
-
-context::ContextActions actions(Decoder& in) {
-    context::ContextActions actions;
-    const auto count = in.count(1);
-    actions.operations.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        switch (in.u8()) {
-        case 1:
-            actions.operations.emplace_back(context::RecordClear{range(in)});
-            break;
-        case 2: {
-            context::RecordCopy copy;
-            copy.source      = range(in);
-            copy.destination = range(in);
-            if (in.boolean()) copy.resource.pool = runtime::KvPoolId{in.u16()};
-            copy.image_count = in.u32();
-            copy.page_groups = in.u32();
-            actions.operations.emplace_back(copy);
-            break;
-        }
-        case 3: {
-            context::MappingUpdate mapping;
-            mapping.pool_id       = in.u32();
-            mapping.row           = in.i32();
-            mapping.logical_begin = in.u32();
-            mapping.offsets.resize(in.count(8));
-            for (auto& offset : mapping.offsets) offset = in.i64();
-            actions.operations.emplace_back(std::move(mapping));
-            break;
-        }
-        default:
-            throw std::invalid_argument("unknown context action in Qwen4Exp message");
-        }
-    }
-    return actions;
 }
 
 void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
@@ -236,7 +163,7 @@ std::shared_ptr<const qwen::VisionExecutionInput> VisionInputBindings::get(std::
 void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inputs,
                  std::uint32_t rank) {
     out.u32(rank);
-    actions(out, local_actions(work.actions, rank));
+    context::encode_actions(out, local_actions(work.actions, rank));
     std::visit(
         [&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
@@ -280,7 +207,7 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
 Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
-    work.actions.emplace(rank, actions(in));
+    work.actions.emplace(rank, context::decode_actions(in));
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
@@ -339,7 +266,7 @@ void encode_commit(Encoder& out, const Commit& commit, std::uint32_t rank) {
         out.boolean(r.cancelled);
         out.boolean(r.failed);
     }
-    actions(out, local_actions(commit.actions, rank));
+    context::encode_actions(out, local_actions(commit.actions, rank));
 }
 
 Commit decode_commit(Decoder& in) {
@@ -354,7 +281,7 @@ Commit decode_commit(Decoder& in) {
         r.cancelled = in.boolean();
         r.failed    = in.boolean();
     }
-    result.actions.emplace(rank, actions(in));
+    result.actions.emplace(rank, context::decode_actions(in));
     return result;
 }
 
@@ -387,6 +314,11 @@ void encode_result(Encoder& out, const Result& result) {
                     out.u32(t.work.copy_operations);
                     out.u64(t.elapsed_ns);
                     out.u32(t.rank);
+                    out.boolean(t.peer.has_value());
+                    if (t.peer) {
+                        out.u32(t.peer->source_rank);
+                        out.u32(t.peer->destination_rank);
+                    }
                 }
             } else {
                 out.u8(3);
@@ -416,7 +348,7 @@ Result decode_result(Decoder& in) {
     }
     case 2: {
         ContextResult v;
-        v.transfers.resize(in.count(34));
+        v.transfers.resize(in.count(35));
         for (auto& t : v.transfers) {
             if (in.boolean()) t.resource.pool = runtime::KvPoolId{in.u16()};
             t.direction   = static_cast<runtime::ContextTransferDirection>(in.u8());
@@ -425,6 +357,7 @@ Result decode_result(Decoder& in) {
             t.work        = {in.u64(), in.u32()};
             t.elapsed_ns  = in.u64();
             t.rank        = in.u32();
+            if (in.boolean()) t.peer = runtime::ContextPeerTransfer{in.u32(), in.u32()};
         }
         return v;
     }

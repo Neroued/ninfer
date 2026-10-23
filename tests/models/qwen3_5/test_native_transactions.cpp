@@ -113,8 +113,11 @@ public:
         return progress;
     }
 
-    q35::SourceCandidate root(const q35::RequestBasePlan& base) {
-        auto source = program_.inspect_source(base, std::nullopt);
+    q35::SourceCandidate source_for(const q35::RequestBasePlan& base,
+                                    const q35::ResumeState* resume = nullptr) {
+        auto source =
+            program_.inspect_source(base, resume ? resume->snapshot_handle() : std::nullopt,
+                                    resume && resume->has_snapshot(), {}, {}, {0}, resume);
         require(source.has_value(), "fresh request has no root source");
         return std::move(*source);
     }
@@ -123,9 +126,9 @@ public:
                              q35::ResumeState* resume           = nullptr,
                              q35::ExecutionUnitKind resume_kind = q35::ExecutionUnitKind::Decode) {
         const bool needs_replay = resume && !resume->has_snapshot();
-        require(static_cast<bool>(
-                    program_.start_binding(base, {lane}, root(base), resume, resume_kind,
-                                           resume_kind == q35::ExecutionUnitKind::Prefill ? 0 : 1)),
+        require(static_cast<bool>(program_.start_binding(
+                    base, {lane}, source_for(base, resume), resume, resume_kind,
+                    resume_kind == q35::ExecutionUnitKind::Prefill ? 0 : 1)),
                 "request binding could not reserve its first unit");
         auto progress = settle();
         require(progress.published && progress.sequence.has_value() && progress.residency,
@@ -278,11 +281,10 @@ public:
     fill_capacity(models::context::ContextMemory memory,
                   std::optional<std::uint32_t> history = {}) {
         q35::ContextDemand demand;
-        demand.memory = memory;
         if (history)
-            demand.histories.push_back({.pool_id = *history, .count = 1});
+            demand.add_history(*history, 1, memory);
         else
-            demand.new_states = 1;
+            demand.add_state({.count = 1, .memory = memory});
         std::vector<models::context::ContextReservation> held;
         for (;;) {
             auto next = program_.directory.reserve(demand);
@@ -600,7 +602,7 @@ public:
         const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 1}}};
         auto pending = driver_.decode(members, budgets);
         (void)driver_.commit(std::move(pending), accepted);
-        require(program_.start_pause(active_a, false),
+        require(program_.start_pause(active_a, {runtime::PauseKind::ReleaseAndReplay, {0}}),
                 "independent-history fixture could not pause A for replay");
         auto paused = settle();
         require(paused.paused && !paused.paused->has_snapshot() &&
@@ -625,13 +627,13 @@ public:
         const auto replayed = driver_.replay(*rebound.sequence);
         require(replayed.complete && replayed.processed_tokens == 1 && !replayed.capture_ready,
                 "cross-source Replay rebuilt more than A's committed suffix");
-        require(program_.start_pause(*rebound.sequence, true),
+        require(program_.start_pause(*rebound.sequence, {runtime::PauseKind::HostSnapshot, {0}}),
                 "cross-source request could not snapshot its recovered execution");
         auto snapshot = settle();
         require(snapshot.paused && snapshot.paused->has_snapshot(),
                 "cross-source request lost its pause snapshot");
         check_independent();
-        auto snapshot_source = root(base);
+        auto snapshot_source = source_for(base, &*snapshot.paused);
         snapshot_source.private_points.assign(points_a.begin(), points_a.end());
         snapshot_source.take_private = true;
         require(static_cast<bool>(
@@ -913,7 +915,8 @@ public:
             auto base           = request(kPromptTokens);
             const auto sequence = bind(base);
             prefill_prefix(sequence, kPauseFrontier);
-            require(program_.start_pause(sequence, true), "prefill pause was not accepted");
+            require(program_.start_pause(sequence, {runtime::PauseKind::HostSnapshot, {0}}),
+                    "prefill pause was not accepted");
             auto paused = settle(cancel_transfer);
             require(transferred(paused, runtime::ContextTransferDirection::DeviceToHost,
                                 runtime::ContextTransferResource{}) &&
@@ -942,7 +945,8 @@ public:
         const auto original           = bind(base);
         const auto original_residency = *last_binding_;
         prefill_prefix(original, kPauseFrontier);
-        require(program_.start_pause(original, false), "replay-only pause was not accepted");
+        require(program_.start_pause(original, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+                "replay-only pause was not accepted");
         auto first = settle();
         require(first.paused && !first.paused->has_snapshot() &&
                     first.paused->frontier() == kPauseFrontier,
@@ -956,7 +960,7 @@ public:
         const auto partial = driver_.replay(replay);
         require(partial.processed_tokens == kChunk && !partial.complete,
                 "replay did not yield after its first finite chunk");
-        require(program_.start_pause(replay, false),
+        require(program_.start_pause(replay, {runtime::PauseKind::ReleaseAndReplay, {0}}),
                 "partially replayed request could not pause again");
         auto second = settle();
         require(second.paused && !second.paused->has_snapshot() &&
@@ -995,14 +999,16 @@ public:
         // session or resumed lane is needed merely to reclaim a snapshot-free replay record.
         const auto to_cancel = bind(base);
         prefill_prefix(to_cancel, kPauseFrontier);
-        require(program_.start_pause(to_cancel, false), "cancel fixture could not pause prefill");
+        require(program_.start_pause(to_cancel, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+                "cancel fixture could not pause prefill");
         auto saved = settle();
         require(saved.paused.has_value(), "cancel fixture lost its paused prefill record");
         const auto rebuilding = bind(base, 1, &*saved.paused, q35::ExecutionUnitKind::Prefill);
         saved.paused.reset();
         reserve(rebuilding, q35::ExecutionUnitKind::Replay);
         require(!driver_.replay(rebuilding).complete, "cancel fixture replay completed early");
-        require(program_.start_pause(rebuilding, false), "cancel fixture could not pause replay");
+        require(program_.start_pause(rebuilding, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+                "cancel fixture could not pause replay");
         auto cancelled = settle();
         require(cancelled.paused && cancelled.paused->frontier() == kPauseFrontier,
                 "paused replay cancellation lost its request target");
@@ -1190,15 +1196,19 @@ public:
             auto base           = request(kPromptTokens);
             const auto original = bind(base);
             prefill_prefix(original, kPauseFrontier);
-            require(program_.start_pause(original, snapshot), "recovery fixture could not pause");
+            require(program_.start_pause(original, {snapshot ? runtime::PauseKind::HostSnapshot
+                                                             : runtime::PauseKind::ReleaseAndReplay,
+                                                    {0}}),
+                    "recovery fixture could not pause");
             auto paused = settle();
             require(paused.paused && paused.paused->has_snapshot() == snapshot,
                     "recovery fixture did not retain the selected recovery mode");
 
-            auto pressure      = fill_capacity(models::context::ContextMemory::Device, 0);
-            const auto before  = program_.physical_usage();
-            const auto refused = program_.start_binding(base, {0}, root(base), &*paused.paused,
-                                                        q35::ExecutionUnitKind::Prefill, 0);
+            auto pressure     = fill_capacity(models::context::ContextMemory::Device, 0);
+            const auto before = program_.physical_usage();
+            const auto refused =
+                program_.start_binding(base, {0}, source_for(base, &*paused.paused),
+                                       &*paused.paused, q35::ExecutionUnitKind::Prefill, 0);
             require(!refused && !refused.assessment.ready() &&
                         paused.paused->has_snapshot() == snapshot,
                     "recovery admitted work without complete progress capacity");
@@ -1238,7 +1248,10 @@ public:
 
             const auto partial = bind(base);
             prefill_prefix(partial, kChunk);
-            require(program_.start_pause(partial, snapshot), "partial recovery could not pause");
+            require(program_.start_pause(partial, {snapshot ? runtime::PauseKind::HostSnapshot
+                                                            : runtime::PauseKind::ReleaseAndReplay,
+                                                   {0}}),
+                    "partial recovery could not pause");
             auto saved           = settle();
             const auto continued = bind(base, 0, &*saved.paused, q35::ExecutionUnitKind::Prefill);
             saved.paused.reset();
@@ -1260,38 +1273,41 @@ public:
     }
 
     void restore_own_snapshot() {
-        constexpr std::uint32_t frontier = 500;
-        auto base                        = request(frontier);
-        const auto sequence              = bind(base);
-        finish_prefill(sequence, frontier, false);
-        require(program_.start_pause(sequence, true),
-                "snapshot request could not save its snapshot");
-        auto paused = settle();
-        require(paused.paused && paused.paused->has_snapshot() &&
-                    paused.paused->frontier() == frontier,
-                "snapshot request fell back to replay instead of saving its snapshot");
-        const auto saved = program_.physical_usage();
-        {
-            require(
-                static_cast<bool>(program_.start_binding(base, {1}, root(base), &*paused.paused)),
-                "own snapshot could not reserve its complete restore");
-            const auto cancelled = settle(true);
-            require(!cancelled.published && !cancelled.sequence && paused.paused->has_snapshot() &&
+        for (const auto kind : {runtime::PauseKind::HostSnapshot, runtime::PauseKind::KeepDevice}) {
+            constexpr std::uint32_t frontier = 500;
+            auto base                        = request(frontier);
+            const auto sequence              = bind(base);
+            finish_prefill(sequence, frontier, false);
+            require(program_.start_pause(sequence, {kind, {0}}),
+                    "snapshot request could not save its snapshot");
+            auto paused = settle();
+            require(paused.paused && paused.paused->has_snapshot() &&
+                        paused.paused->frontier() == frontier,
+                    "snapshot request fell back to replay instead of saving its snapshot");
+            const auto saved = program_.physical_usage();
+            {
+                require(static_cast<bool>(program_.start_binding(
+                            base, {1}, source_for(base, &*paused.paused), &*paused.paused)),
+                        "own snapshot could not reserve its complete restore");
+                const auto cancelled = settle(true);
+                require(
+                    !cancelled.published && !cancelled.sequence && paused.paused->has_snapshot() &&
                         paused.paused->frontier() == frontier &&
                         cancelled.operations.partial_tail_cow_pages == 0 &&
                         !transferred(cancelled, runtime::ContextTransferDirection::DeviceToDevice,
                                      runtime::ContextTransferResource{q35::kTextKvPool}),
                     "cancelled own restore consumed its snapshot or copied an unnecessary tail");
-            expect_usage(saved, "cancelled own restore retained unpublished records");
-            for (const auto& pool : program_.physical_usage().pools)
-                require(pool.reserved_bytes == 0 && pool.pending_retirement_bytes == 0,
-                        "cancelled own restore retained destination reservations");
+                expect_usage(saved, "cancelled own restore retained unpublished records");
+                for (const auto& pool : program_.physical_usage().pools)
+                    require(pool.reserved_bytes == 0 && pool.pending_retirement_bytes == 0,
+                            "cancelled own restore retained destination reservations");
+            }
+            const auto resumed = bind(base, 0, &*paused.paused);
+            paused.paused.reset();
+            decode_and_finish(resumed);
+            expect_empty("owned snapshot restore retained its transferred checkpoint ownership");
+            next_request();
         }
-        const auto resumed = bind(base, 0, &*paused.paused);
-        paused.paused.reset();
-        decode_and_finish(resumed);
-        expect_empty("owned snapshot restore retained its transferred checkpoint ownership");
-        next_request();
     }
 
     void independent_physical_demotions() {
@@ -1547,7 +1563,8 @@ public:
         auto active_base  = request(kPromptTokens);
         const auto active = bind(active_base);
         prefill_prefix(active, kPauseFrontier);
-        require(program_.start_pause(active, true), "snapshot facts could not pause");
+        require(program_.start_pause(active, {runtime::PauseKind::HostSnapshot, {0}}),
+                "snapshot facts could not pause");
         auto paused = settle();
         require(paused.paused && paused.paused->snapshot_handle(), "pause lost snapshot identity");
         const auto handle = *paused.paused->snapshot_handle();
@@ -1834,7 +1851,8 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
                     ": replay changed committed ledger, E/S or forced execution split");
     };
     check(0, expected_frontier, "after forced control");
-    require(program.start_pause(initial, false), "sampling-count fixture could not pause");
+    require(program.start_pause(initial, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+            "sampling-count fixture could not pause");
     auto paused = settle();
     require(paused.paused && !paused.paused->has_snapshot() &&
                 paused.paused->frontier() == expected_frontier,

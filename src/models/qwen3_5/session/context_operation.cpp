@@ -137,8 +137,8 @@ void SessionImpl::retire_context(runtime::DeviceRetired retired) {
             auto frame = executor().try_reserve(runtime::FrameKind::Context);
             if (!frame) throw std::logic_error("maintenance context frame did not retire");
             if (continuation.demotion) {
-                (void)submit_demotion(*continuation.demotion, std::move(targets),
-                                      std::move(*frame));
+                (void)submit_demotion(*continuation.demotion, std::move(continuation.targets),
+                                      std::move(targets), std::move(*frame));
                 if (context_operation_) {
                     context_operation_->preceding_transfers = std::move(out.transfers);
                 } else {
@@ -150,7 +150,7 @@ void SessionImpl::retire_context(runtime::DeviceRetired retired) {
                 pause_reservation_->targets             = std::move(targets);
                 pause_reservation_->execution           = std::move(*frame);
                 pause_reservation_->preceding_transfers = std::move(out.transfers);
-                if (!continue_pause_ready(*continuation.pause_sequence, continuation.save_snapshot))
+                if (!continue_pause_ready(*continuation.pause_sequence, continuation.pause_action))
                     throw std::logic_error("maintained pause lost its prepared resources");
             }
             return;

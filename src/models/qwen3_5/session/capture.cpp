@@ -24,9 +24,13 @@ bool SessionImpl::reclaim_capture_reservation(const ContextAssessment& assessmen
     for (auto& request : requests) {
         const auto& ticket = request.capture_reservation;
         if (!ticket) continue;
-        const bool relevant = assessment.demand.memory == context::ContextMemory::Device
-                                  ? state_store->device_resident(ticket->state)
-                                  : ticket->host.has_value();
+        const bool relevant =
+            std::any_of(assessment.placement.domains.begin(), assessment.placement.domains.end(),
+                        [&](const auto& item) {
+                            return item.domain.memory == context::ContextMemory::Device
+                                       ? state_store->device_resident(ticket->state)
+                                       : ticket->host.has_value();
+                        });
         if (relevant) {
             request.capture_reservation.reset();
             return true;
@@ -63,8 +67,9 @@ bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
     } else {
         const auto released = checkpoint_release_set(host_victims);
         if (!released) return false;
-        const ContextDemand demand{
-            .new_states = 1, .logical_states = 0, .memory = context::ContextMemory::Host};
+        ContextDemand demand;
+        const auto host = demand.add_state(
+            {.count = 1, .logical_count = 0, .memory = context::ContextMemory::Host});
         if (!directory.assess(demand, *released).ready()) return false;
         const auto destination = state_store->reserve_logical_destination();
         if (!destination) return false;
@@ -75,7 +80,7 @@ bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         auto backing = directory.reserve(demand);
         if (!backing || !backing.reservation->ready())
             throw std::logic_error("capture Host placement changed after assessment");
-        ticket->host.emplace(backing.reservation->take_state());
+        ticket->host.emplace(backing.reservation->take(host));
     }
     request.capture_reservation = std::move(ticket);
     return true;
@@ -143,7 +148,9 @@ SessionImpl::prepare_capture(SequenceHandle handle,
         }
         CapturePreparation result{.frontier = frontier,
                                   .origin   = request.capture_groups[request.next_capture].origin};
-        result.assessment        = directory.assess(ContextDemand{.new_states = 1});
+        ContextDemand demand;
+        demand.add_state({.count = 1});
+        result.assessment        = directory.assess(demand);
         result.host.state_images = 1;
         return result;
     }

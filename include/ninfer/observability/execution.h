@@ -178,6 +178,7 @@ struct GenerationSchedulingStats {
 struct GenerationTransferTiming {
     std::uint64_t bytes = 0;
     // Cumulative copy time across participating ranks, not an operation's wall latency.
+    // Peer payload and operation counts include only the sending endpoint.
     double seconds                                          = 0.0;
     std::uint64_t images                                    = 0;
     std::uint64_t page_groups                               = 0;
@@ -186,10 +187,13 @@ struct GenerationTransferTiming {
                            const GenerationTransferTiming&) = default;
 };
 
-// Directions are D2H, H2D, D2D and H2H. KV entries identify logical history kinds.
+// Directions are D2H, H2D, local D2D, H2H and peer D2D.
+using ContextTransferSeries = std::array<GenerationTransferTiming, 5>;
+
+// KV entries identify logical history kinds.
 struct ContextTransferStats {
-    std::array<GenerationTransferTiming, 4> state{};
-    std::vector<std::array<GenerationTransferTiming, 4>> kv;
+    ContextTransferSeries state{};
+    std::vector<ContextTransferSeries> kv;
     friend bool operator==(const ContextTransferStats&, const ContextTransferStats&) = default;
 };
 

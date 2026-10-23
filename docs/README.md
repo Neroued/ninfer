@@ -43,6 +43,10 @@ Published artifact downloads are listed in the [project README](../README.md).
 - [GLM5Next design and implementation](designs/glm5next/README.md) — selected dual-Spark
   placement, KDA ReplaySSM, Kpool Sparse MLA, mHC and the existing Op checklist; separates
   decisions, implementation status and retirement of designs after code takes ownership.
+- [Attention DP placement and context management](designs/attention-dp-placement.md) — selected
+  boundaries for whole-model DP replicas and instance-local ADP, token-load and cache-affinity
+  policy, joint reservations, cross-owner restoration and pressure handling; first consumer is
+  GLM5Next, implementation pending.
 
 ## Maintainer references
 

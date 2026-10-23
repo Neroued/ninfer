@@ -191,7 +191,10 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             request->model_state        = EngineRequestState::ModelFinished;
             continue;
         }
-        if (!cancelled[row]) { request->budget->commit(accepted); }
+        if (!cancelled[row]) {
+            request->budget->commit(accepted);
+            request->placement_tokens = instance_.session->load_tokens(*request->sequence);
+        }
         request->consumed_by_commit = cancelled[row];
         update_recovery(request, cancelled[row]);
         auto published = request->output.commit_preview();
@@ -427,7 +430,8 @@ void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
         ++request->host_timing.control_units;
         request->committed_decode_tokens += flight.control_stride;
         request->budget->commit(flight.control_stride);
-        auto timing = record_committed_output(request, flight.control_stride);
+        request->placement_tokens = instance_.session->load_tokens(*request->sequence);
+        auto timing               = record_committed_output(request, flight.control_stride);
         append_output(request, request->output.commit_preview(), std::move(timing), &phase);
         if (fail_output(request, flight.lanes[row])) continue;
         update_recovery(request);

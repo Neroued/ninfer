@@ -200,6 +200,9 @@ public:
     // Adopting initialized or copied content preserves its epoch; native writes advance it.
     // Publication relies on the caller's execution dependency, not a synchronous device wait.
     void complete_initialization(StateId image);
+    // The caller owns the completed field mapping and retains the immutable source through copy
+    // retirement. A layout conversion adopts the source epoch without a mathematical write.
+    void complete_conversion(const ReadLease& source, StateId destination);
 
     [[nodiscard]] bool valid(StateId image) const noexcept;
     [[nodiscard]] std::uint32_t descriptor_index(StateId image) const;

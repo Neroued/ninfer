@@ -28,6 +28,38 @@ void rejects(F function) {
     throw std::runtime_error("invalid protocol input was accepted");
 }
 
+void topology_identity() {
+    DeploymentOptions deployment;
+    deployment.control_host = "127.0.0.1";
+    deployment.parallel     = {.tp = 2, .ep = 2, .attention_dp = 2};
+    deployment.nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}};
+    deployment.ranks        = {{0, 0, 0}, {1, 0, 1}};
+    dist::ExecutionTopology topology;
+    topology.plan   = 7;
+    topology.ranks  = {{0, 0, 0, 0, {0, 2}, {0, 2}, {}, {}, {0, 2}},
+                       {1, 0, 1, 1, {1, 2}, {1, 2}, {}, {}, {1, 2}}};
+    topology.groups = {{0, {0, 1}}};
+    topology.roles  = {{"tensor", 0}, {"expert", 0}};
+    topology.validate(deployment);
+
+    wire::Encoder out;
+    wire::encode(out, topology);
+    const auto bytes = std::move(out).take();
+    wire::Decoder in(bytes);
+    auto decoded = wire::decode_topology(in);
+    in.finish();
+    decoded.validate(deployment);
+    const auto& rank = decoded.rank(1);
+    require(rank.adp.rank == 1 && rank.adp.size == 2 && rank.dp.rank == 0 && rank.dp.size == 1 &&
+                dist::process_name(rank).find(":adp1") != std::string::npos &&
+                dist::rank_description(rank).find("ADP=1/2") != std::string::npos,
+            "topology lost independent attention ownership");
+    decoded.ranks[1].adp.rank = 2;
+    rejects([&] { decoded.validate(deployment); });
+    decoded.ranks[1].adp = {0, 1};
+    rejects([&] { decoded.validate(deployment); });
+}
+
 q::WorkRow row() {
     q::WorkRow r;
     r.member            = {{41, 7}, {{1}, 9}};
@@ -204,6 +236,36 @@ void native_work() {
             "result changed in transit");
 }
 
+void context_observations() {
+    q::ContextResult result;
+    result.transfers = {{.direction   = runtime::ContextTransferDirection::PeerDeviceToDevice,
+                         .image_count = 1,
+                         .work        = {4096, 2},
+                         .elapsed_ns  = 7000,
+                         .rank        = 1,
+                         .peer        = runtime::ContextPeerTransfer{0, 1}},
+                        {.resource    = {.pool = runtime::KvPoolId{2}},
+                         .direction   = runtime::ContextTransferDirection::DeviceToDevice,
+                         .page_groups = 3,
+                         .work        = {512, 1},
+                         .elapsed_ns  = 2000,
+                         .rank        = 1}};
+    wire::Encoder out;
+    q::encode_result(out, result);
+    const auto bytes = std::move(out).take();
+    wire::Decoder in(bytes);
+    const auto decoded = std::get<q::ContextResult>(q::decode_result(in));
+    in.finish();
+    require(decoded.transfers.size() == 2 &&
+                decoded.transfers[0].direction ==
+                    runtime::ContextTransferDirection::PeerDeviceToDevice &&
+                decoded.transfers[0].peer == runtime::ContextPeerTransfer{0, 1} &&
+                decoded.transfers[0].rank == 1 && decoded.transfers[0].elapsed_ns == 7000 &&
+                decoded.transfers[0].work.payload_bytes == 4096 && !decoded.transfers[1].peer &&
+                decoded.transfers[1].direction == runtime::ContextTransferDirection::DeviceToDevice,
+            "context observations lost peer endpoints or conflated local and remote copies");
+}
+
 void queues() {
     int sockets[2];
     require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
@@ -314,7 +376,9 @@ void inputs() {
 
 int main() {
     try {
+        topology_identity();
         native_work();
+        context_observations();
         queues();
         inputs();
         RankSnapshot memory;

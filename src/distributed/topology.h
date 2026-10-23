@@ -27,7 +27,7 @@ struct RankIdentity {
     RankId rank        = 0;
     std::uint32_t node = 0, local_rank = 0;
     int device = 0;
-    ParallelCoordinate tp, ep, dp, pp;
+    ParallelCoordinate tp, ep, dp, pp, adp;
 };
 
 struct RoleGroup {

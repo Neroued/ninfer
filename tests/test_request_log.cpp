@@ -581,6 +581,7 @@ int main() {
     first.context_transfers.state[0] = {.bytes = 9007199254740993ULL, .seconds = 0.010};
     first.context_transfers.kv[0][1] = {.bytes = 2113536, .seconds = 0.011};
     first.context_transfers.kv[1][2] = {.bytes = 16384, .seconds = 0.012};
+    first.context_transfers.state[4] = {.bytes = 32768, .seconds = 0.015};
     const Json observed_done =
         Json::parse(format_request_done_json("serve-test", 3001, context, observed));
     const auto& first_json = observed_done.at("first_output_timing");
@@ -687,6 +688,10 @@ int main() {
                      {"bytes", 0},
                      {"seconds", 0.0}},
         "first-output transfer resource, direction or integer precision changed");
+    failures += check(
+        first_json.at("context_transfers").at("state").at("peer_d2d").at("bytes") == 32768 &&
+            first_json.at("context_transfers").at("state").at("peer_d2d").at("seconds") == 0.015,
+        "peer context transfer statistics were lost in request logs");
 
     ThroughputReport window;
     window.interval_seconds                                                                 = 5;

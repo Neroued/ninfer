@@ -47,6 +47,7 @@ int main() {
     running.runtime.kv_pools = {{0, "text", 2}, {1, "draft", 1}, {2, "index", 3}};
     running.runtime.context_transfers.kv.resize(3);
     running.runtime.context_transfers.kv[2][1].bytes = 8192;
+    running.runtime.context_transfers.state[4].bytes = 1024;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("ninfer_execution_units_total{kind=\"decode\"} 2\n") != std::string::npos &&
@@ -81,6 +82,9 @@ int main() {
               live.find("ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"2\","
                         "direction=\"h2d\"} 8192\n") != std::string::npos,
           "pool metrics dropped the third pool or used a model role as its identity");
+    check(live.find("ninfer_context_transfer_bytes_total{resource=\"state\","
+                    "direction=\"peer_d2d\"} 1024\n") != std::string::npos,
+          "peer context transfers were not exposed separately from local copies");
 
     GenerationOutcome outcome;
     outcome.finish_reason                          = FinishReason::OutputLimit;

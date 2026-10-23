@@ -130,7 +130,11 @@ HistoryBinding::HistoryBinding(HistoryBinding&& other) noexcept
       tail_destination_(std::exchange(other.tail_destination_, std::nullopt)),
       tail_source_(other.tail_source_), tail_pinned_(std::exchange(other.tail_pinned_, false)),
       restores_published_(other.restores_published_), write_tail_(other.write_tail_),
-      frontier_(other.frontier_), mapping_prepared_(other.mapping_prepared_) {}
+      frontier_(other.frontier_), mapping_prepared_(other.mapping_prepared_),
+      conversion_pages_(std::move(other.conversion_pages_)),
+      conversion_readers_(std::move(other.conversion_readers_)),
+      conversion_layout_(std::move(other.conversion_layout_)),
+      conversion_prepared_(other.conversion_prepared_) {}
 
 bool HistoryBinding::blocks_writer(HistoryId history) const noexcept {
     return store_ && tail_destination_ && store_->valid(history) &&
@@ -154,7 +158,29 @@ void HistoryBinding::publish_restores() {
     if (!store_ || restores_published_) throw std::logic_error("KV restores already published");
     for (auto& restore : restores_) restore.publish();
     restores_.clear();
+    auto& history = store_->require(this->history());
+    for (const auto& page : conversion_pages_) {
+        store_->pages().publish_transfer_destination(page.destination);
+        ++history.page_count;
+    }
+    conversion_pages_.clear();
+    conversion_readers_.clear();
     restores_published_ = true;
+}
+
+void HistoryBinding::prepare_conversion(ContextTransaction& transaction) {
+    if (!store_ || conversion_prepared_)
+        throw std::logic_error("KV conversion actions are already prepared");
+    for (const auto& page : conversion_pages_) {
+        const auto& ranges = page.columns == kPageTokens ? conversion_layout_.full_page
+                                                         : conversion_layout_.partial_page;
+        for (const auto& field : ranges)
+            transaction.copy_range(
+                store_->pages().physical(page.source, field.source_rank),
+                store_->pages().prepared_physical(page.destination, field.destination_rank), field,
+                {runtime::KvPoolId{static_cast<std::uint16_t>(history().pool_id)}});
+    }
+    conversion_prepared_ = true;
 }
 
 void HistoryBinding::prepare_tail_copy() {
@@ -173,7 +199,8 @@ void HistoryBinding::prepare_mapping(ContextTransaction& transaction) {
     handles.clear();
     const auto& history = store_->require(this->history());
     for (std::uint32_t i = 0; i < page_count(frontier_); ++i)
-        handles.push_back(tail_destination_ && i + 1 == page_count(frontier_)
+        handles.push_back(!conversion_pages_.empty() ? conversion_pages_[i].destination
+                          : tail_destination_ && i + 1 == page_count(frontier_)
                               ? *tail_destination_
                               : store_->membership(history, i));
     store_->update_mapping(row_->handle(), 0, handles, transaction);
@@ -824,6 +851,26 @@ HistoryDirectory::released_pages(std::span<const HistoryPrefix* const> removed) 
     return result;
 }
 
+std::vector<PageId> HistoryDirectory::released_pages(HistoryId owner) const {
+    const auto& history = require(owner);
+    if (!history.owned) throw std::invalid_argument("KV release query has no active owner");
+    std::vector<PageId> result;
+    for (auto i = page_count(history.retained); i < history.page_count; ++i) {
+        const auto page = membership(history, i);
+        if (pages_->history_references(page) == 1 && pages_->source_pins(page) == 0 &&
+            pages_->active_history_references(page) ==
+                static_cast<unsigned>(history.row.has_value()))
+            result.push_back(page);
+    }
+    return result;
+}
+
+std::vector<HistoryId> HistoryDirectory::released_histories(HistoryId owner) const {
+    const auto& history = require(owner);
+    if (!history.owned) throw std::invalid_argument("KV release query has no active owner");
+    return history.prefix_count ? std::vector<HistoryId>{} : std::vector{owner};
+}
+
 void HistoryDirectory::truncate_membership(History& history, std::uint32_t count) {
     if (count == history.page_count) return;
     auto directory = prefix_directory(history, history.directory, directory_capacity_, count);
@@ -916,6 +963,7 @@ HistoryDirectory::binding_demand(const HistoryPrefix* source, std::uint32_t fron
             throw std::invalid_argument("KV history rank placement is invalid");
     }
     HistoryBindingDemand result{.growth_pages = page_count(peak) - page_count(frontier)};
+    result.logical_pages = result.growth_pages;
     for (auto rank : ranks)
         result.records.push_back(
             {pages_->layout_id(), ContextMemory::Device, result.growth_pages, {rank}});
@@ -964,6 +1012,7 @@ HistoryDirectory::binding_demand(const HistoryPrefix* source, std::uint32_t fron
         if (result.tail_copies) result.reuse_history = false;
     }
     for (auto& demand : result.records) demand.count += result.tail_copies;
+    result.logical_pages += result.tail_copies;
     result.metadata = {result.reuse_history ? source->history() : HistoryId{},
                        result.growth_pages + result.tail_copies};
     return result;
@@ -1031,9 +1080,100 @@ HistoryBinding HistoryDirectory::prepare_binding(const HistoryPrefix* source,
     return binding;
 }
 
+HistoryBindingDemand
+HistoryDirectory::conversion_demand(const HistoryPrefix& source, std::uint32_t frontier,
+                                    std::uint32_t peak,
+                                    std::span<const std::uint32_t> placement) const {
+    if (source.store_ != this || !source.valid() || frontier > source.frontier() || frontier > peak)
+        throw std::invalid_argument("KV conversion source does not cover the requested frontier");
+    auto demand          = binding_demand(nullptr, 0, peak, {}, placement);
+    demand.restore_pages = page_count(frontier);
+    demand.growth_pages  = page_count(peak) - demand.restore_pages;
+    return demand;
+}
+
+HistoryBinding HistoryDirectory::prepare_conversion(const HistoryPrefix& source,
+                                                    std::uint32_t frontier, std::uint32_t peak,
+                                                    std::int32_t execution_row,
+                                                    RecordReservation reservation,
+                                                    std::span<const std::uint32_t> placement,
+                                                    HistoryCopyLayout layout) {
+    const auto demand = conversion_demand(source, frontier, peak, placement);
+    if ((frontier >= kPageTokens && layout.full_page.empty()) ||
+        (frontier % kPageTokens &&
+         (layout.partial_columns != frontier % kPageTokens || layout.partial_page.empty())))
+        throw std::invalid_argument("KV conversion layout does not describe its valid coverage");
+    std::vector<std::uint32_t> target_ranks;
+    for (const auto& part : demand.records) target_ranks.push_back(part.ranks.front());
+    const auto source_ranks = this->placement(source.history());
+    const auto validate     = [&](std::span<const RecordRangeCopy> fields) {
+        for (const auto& field : fields) {
+            if (!field.bytes ||
+                std::find(source_ranks.begin(), source_ranks.end(), field.source_rank) ==
+                    source_ranks.end() ||
+                std::find(target_ranks.begin(), target_ranks.end(), field.destination_rank) ==
+                    target_ranks.end())
+                throw std::invalid_argument("KV conversion range names an invalid rank part");
+            const auto& parts = pages_->layout().parts;
+            const auto bytes  = [&](auto rank) {
+                return std::find_if(parts.begin(), parts.end(),
+                                         [&](const auto& part) { return part.rank == rank; })
+                    ->record.bytes;
+            };
+            const auto source_bytes      = bytes(field.source_rank);
+            const auto destination_bytes = bytes(field.destination_rank);
+            if (field.source_offset > source_bytes ||
+                field.bytes > source_bytes - field.source_offset ||
+                field.destination_offset > destination_bytes ||
+                field.bytes > destination_bytes - field.destination_offset)
+                throw std::invalid_argument("KV conversion range exceeds its record layout");
+        }
+    };
+    if (frontier >= kPageTokens) validate(layout.full_page);
+    if (frontier % kPageTokens) validate(layout.partial_page);
+
+    auto history_metadata = reservation.take_metadata_reservation(*this);
+    HistoryBinding binding;
+    binding.store_       = this;
+    binding.frontier_    = frontier;
+    binding.write_tail_  = frontier % kPageTokens;
+    binding.source_      = source;
+    binding.history_     = HistoryOwner(*this, allocate(target_ranks, history_metadata));
+    binding.reservation_ = std::move(reservation);
+    binding.reservation_.reserve_merge_capacity(
+        (std::size_t(page_count(peak)) + 2) * target_ranks.size(), page_count(peak) + 2);
+    binding.row_.emplace(acquire_row(execution_row));
+    binding.conversion_layout_ = std::move(layout);
+    binding.conversion_pages_.reserve(page_count(frontier));
+    binding.conversion_readers_.reserve(std::size_t(page_count(frontier)) * source_ranks.size());
+    pages_->prepare_returns(binding.reservation_, target_ranks, page_count(peak));
+    auto& history = require(binding.history());
+    for (std::uint32_t i = 0; i < page_count(frontier); ++i) {
+        const auto page    = logical_page(source.history(), i);
+        const auto columns = coverage(frontier, i);
+        const auto& fields = columns == kPageTokens ? binding.conversion_layout_.full_page
+                                                    : binding.conversion_layout_.partial_page;
+        for (auto rank : source_ranks)
+            if (std::any_of(fields.begin(), fields.end(),
+                            [rank](const auto& field) { return field.source_rank == rank; }))
+                binding.conversion_readers_.push_back(
+                    pages_->read_device_prefix(page, rank, columns));
+        auto& slot             = directory_slot(history, i);
+        const auto destination = pages_->materialize_conversion_destination(
+            binding.reservation_, page, columns, target_ranks);
+        binding.conversion_pages_.push_back({page, destination, columns});
+        slot = destination;
+    }
+    return binding;
+}
+
 void HistoryDirectory::abort(HistoryBinding& binding) noexcept {
     try {
         binding.row_.reset();
+        binding.conversion_readers_.clear();
+        for (const auto& page : binding.conversion_pages_)
+            pages_->abort_transfer_destination(page.destination, binding.reservation_);
+        binding.conversion_pages_.clear();
         if (binding.tail_pinned_) pages_->unpin_source(binding.tail_source_);
         if (binding.tail_destination_)
             pages_->abort_transfer_destination(*binding.tail_destination_, binding.reservation_);
@@ -1202,6 +1342,16 @@ void HistoryDirectory::release_growth(HistoryId handle) {
     auto& history = require(handle);
     history.reservation.clear();
     trim_prepared_metadata(history, 0);
+}
+
+bool HistoryDirectory::growth_contributes(HistoryId handle, const RecordAssessment& pressure,
+                                          bool metadata_pressure) const {
+    const auto& history = require(handle);
+    if (history.reservation.contributes_to(pressure, metadata_pressure)) return true;
+    if (!metadata_pressure) return false;
+    const auto retained_nodes = (history.prefixes.size() + 4) * tree_depth_;
+    return history.branch_descriptor.remaining() != 0 ||
+           history.spare_nodes.size() > retained_nodes;
 }
 
 void HistoryDirectory::shrink_growth(HistoryId handle, std::uint32_t count) {

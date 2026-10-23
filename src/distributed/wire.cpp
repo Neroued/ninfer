@@ -118,20 +118,35 @@ Header decode_header(std::span<const std::byte> data) {
     return out;
 }
 
+void encode(Encoder& out, const RankIdentity& r) {
+    out.u32(r.rank);
+    out.u32(r.node);
+    out.u32(r.local_rank);
+    out.i32(r.device);
+    for (const auto c : {r.tp, r.ep, r.dp, r.pp, r.adp}) {
+        out.u32(c.rank);
+        out.u32(c.size);
+    }
+}
+
+RankIdentity decode_rank_identity(Decoder& in) {
+    RankIdentity r;
+    r.rank       = in.u32();
+    r.node       = in.u32();
+    r.local_rank = in.u32();
+    r.device     = in.i32();
+    for (auto* c : {&r.tp, &r.ep, &r.dp, &r.pp, &r.adp}) {
+        c->rank = in.u32();
+        c->size = in.u32();
+    }
+    return r;
+}
+
 void encode(Encoder& out, const ExecutionTopology& t) {
     out.u64(t.plan);
     out.u32(t.output_rank);
     out.u64(t.ranks.size());
-    for (const auto& r : t.ranks) {
-        out.u32(r.rank);
-        out.u32(r.node);
-        out.u32(r.local_rank);
-        out.i32(r.device);
-        for (const auto c : {r.tp, r.ep, r.dp, r.pp}) {
-            out.u32(c.rank);
-            out.u32(c.size);
-        }
-    }
+    for (const auto& r : t.ranks) encode(out, r);
     out.u64(t.groups.size());
     for (const auto& g : t.groups) {
         out.u32(g.id);
@@ -149,17 +164,8 @@ ExecutionTopology decode_topology(Decoder& in) {
     ExecutionTopology out;
     out.plan        = in.u64();
     out.output_rank = in.u32();
-    out.ranks.resize(in.count(48));
-    for (auto& r : out.ranks) {
-        r.rank       = in.u32();
-        r.node       = in.u32();
-        r.local_rank = in.u32();
-        r.device     = in.i32();
-        for (auto* c : {&r.tp, &r.ep, &r.dp, &r.pp}) {
-            c->rank = in.u32();
-            c->size = in.u32();
-        }
-    }
+    out.ranks.resize(in.count(56));
+    for (auto& r : out.ranks) r = decode_rank_identity(in);
     out.groups.resize(in.count(12));
     for (auto& g : out.groups) {
         g.id = in.u32();

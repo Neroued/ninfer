@@ -335,6 +335,7 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         append("distributed.parallel.ep", std::uint64_t{d.parallel.ep});
         append("distributed.parallel.dp", std::uint64_t{d.parallel.dp});
         append("distributed.parallel.pp", std::uint64_t{d.parallel.pp});
+        append("distributed.parallel.attention_dp", std::uint64_t{d.parallel.attention_dp});
         for (std::size_t i = 0; i < d.nodes.size(); ++i) {
             const auto key   = "distributed.nodes[" + std::to_string(i) + "].";
             const auto& node = d.nodes[i];

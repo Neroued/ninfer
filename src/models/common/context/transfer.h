@@ -7,7 +7,20 @@
 #include <span>
 #include <vector>
 
+namespace ninfer::distributed {
+class Group;
+}
+
 namespace ninfer::models::context {
+
+// Borrowed startup resources. Every group member uses the same chunk_bytes; staging covers
+// one chunk and is private to this slot. Members map group coordinates to logical ranks.
+struct ContextPeerBinding {
+    const distributed::Group* group = nullptr;
+    std::span<const std::uint32_t> members;
+    MemorySpan staging;
+    std::size_t chunk_bytes = 0;
+};
 
 // One rank-local action slot. Its event and pinned mapping storage are fixed at startup. Compute
 // and independent context migration use separate slots; neither owns directory reservations.
@@ -18,7 +31,7 @@ public:
                      std::size_t copy_segment_capacity     = 0);
     ContextMigration(DeviceContext& device, ContextStorage& storage, CudaExecutionView execution,
                      std::size_t mapping_capacity_elements = 0,
-                     std::size_t copy_segment_capacity     = 0);
+                     std::size_t copy_segment_capacity = 0, ContextPeerBinding peer = {});
     ~ContextMigration();
     ContextMigration(const ContextMigration&)            = delete;
     ContextMigration& operator=(const ContextMigration&) = delete;
@@ -46,10 +59,15 @@ private:
 
     void prepare(const ContextActions& actions);
     void enqueue(const ContextActions& actions, CudaExecutionView execution);
+    [[nodiscard]] std::uint32_t enqueue_peer(const PeerCopy&, CudaExecutionView);
 
     DeviceContext* device_;
     ContextStorage* storage_;
     CudaExecutionView execution_;
+    const distributed::Group* peer_group_ = nullptr;
+    std::vector<std::uint32_t> peer_members_;
+    MemorySpan peer_staging_;
+    std::size_t peer_chunk_bytes_ = 0;
     PinnedHostBuffer mapping_;
     CudaCopyBatch copies_;
     CudaCompletionEvent source_ready_;

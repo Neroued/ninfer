@@ -1,5 +1,7 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include "models/common/context/transfer.h"
+#include "models/common/context/wire.h"
 #include "ninfer/ops/collective.h"
 #include "product/config/options.h"
 #include "runtime/executor/distributed_executor.h"
@@ -8,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <sys/wait.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -19,6 +22,11 @@ using namespace ninfer;
 namespace dist = ninfer::distributed;
 namespace wire = dist::wire;
 namespace rt   = ninfer::runtime;
+namespace ctx  = ninfer::models::context;
+
+constexpr std::size_t kContextBytes   = 16384;
+constexpr std::size_t kPeerChunkBytes = 512;
+constexpr std::array<std::uint32_t, 2> kPeerMembers{0, 1};
 
 enum class Operation : std::uint8_t {
     Sum,
@@ -28,8 +36,42 @@ enum class Operation : std::uint8_t {
     Scatter,
     Broadcast,
     Exchange,
-    State
+    State,
+    ContextCopy,
+    ContextScatter
 };
+
+bool peer_operation(Operation operation) {
+    return operation == Operation::ContextCopy || operation == Operation::ContextScatter;
+}
+
+bool context_operation(Operation operation) {
+    return operation == Operation::State || peer_operation(operation);
+}
+
+std::vector<ctx::ContextRange> peer_ranges(Operation operation, bool source, std::size_t bytes) {
+    using Memory = ctx::ContextMemory;
+    if (operation == Operation::ContextCopy) return {{Memory::Device, source ? 0 : 8192, bytes}};
+    if (source)
+        return {{Memory::Device, 64, 111},
+                {Memory::Device, 512, 602},
+                {Memory::Device, 2048, bytes - 713}};
+    return {{Memory::Device, 8192, 317}, {Memory::Device, 9200, bytes - 317}};
+}
+
+ctx::ContextActions peer_actions(Operation operation, std::size_t bytes, dist::RankId rank) {
+    ctx::ContextActions actions;
+    for (const auto sender : kPeerMembers) {
+        const bool send = sender == rank;
+        actions.operations.emplace_back(
+            ctx::PeerCopy{1 - rank, send, peer_ranges(operation, send, bytes), {}, 1, 0});
+    }
+    return actions;
+}
+
+std::uint8_t context_byte(std::size_t offset, dist::RankId rank) {
+    return static_cast<std::uint8_t>((offset * 37 + rank * 91 + 13) % 251);
+}
 
 struct Work {
     Operation operation = Operation::Sum;
@@ -38,6 +80,8 @@ struct Work {
     bool graph = false, decision = false, delay = false;
     std::int32_t fail_rank = -1;
     std::int32_t only_rank = -1;
+    bool await_cancel      = false;
+    ctx::ContextActions actions;
 };
 
 struct Result {
@@ -69,8 +113,10 @@ struct Codec {
 
     void validate_work(const Work& w, rt::FrameKind kind) const {
         require(w.count && w.count <= 4096, "fixture extent is invalid");
-        require((w.operation == Operation::State) == (kind == rt::FrameKind::Context),
+        require(context_operation(w.operation) == (kind == rt::FrameKind::Context),
                 "fixture frame kind differs");
+        require(w.operation != Operation::ContextScatter || w.count > 713,
+                "scattered fixture payload is too small");
     }
 
     rt::protocol::Scope scope(const Work& work, const dist::ExecutionTopology& topology) const {
@@ -84,7 +130,7 @@ struct Codec {
         return out;
     }
 
-    void encode_work(wire::Encoder& out, const Work& w, dist::RankId) const {
+    void encode_work(wire::Encoder& out, const Work& w, dist::RankId rank) const {
         out.u8(static_cast<std::uint8_t>(w.operation));
         out.u8(static_cast<std::uint8_t>(w.dtype));
         out.u32(w.count);
@@ -93,17 +139,23 @@ struct Codec {
         out.boolean(w.delay);
         out.i32(w.fail_rank);
         out.i32(w.only_rank);
+        out.boolean(w.await_cancel);
+        if (peer_operation(w.operation))
+            ctx::encode_actions(out, peer_actions(w.operation, w.count, rank));
     }
 
     Work decode_work(wire::Decoder& in) const {
-        return {static_cast<Operation>(in.u8()),
-                static_cast<DType>(in.u8()),
-                in.u32(),
-                in.boolean(),
-                in.boolean(),
-                in.boolean(),
-                in.i32(),
-                in.i32()};
+        Work work{static_cast<Operation>(in.u8()),
+                  static_cast<DType>(in.u8()),
+                  in.u32(),
+                  in.boolean(),
+                  in.boolean(),
+                  in.boolean(),
+                  in.i32(),
+                  in.i32(),
+                  in.boolean()};
+        if (peer_operation(work.operation)) work.actions = ctx::decode_actions(in);
+        return work;
     }
 
     void encode_result(wire::Encoder& out, const Result& r) const { out.u64(r.state); }
@@ -141,7 +193,12 @@ public:
     explicit Program(dist::WorkerConnection& connection)
         : connection_(connection), device_(connection.device()),
           group_(connection.communication().group(0)), compute_(device_, 131072),
-          context_(device_, 256), state_(device_.device(), sizeof(std::uint64_t)) {
+          context_(device_, kContextBytes), state_(device_.device(), sizeof(std::uint64_t)),
+          context_stream_(device_), peer_staging_(device_.device(), kPeerChunkBytes),
+          storage_(context_.source.span(), {}, {}, group_.rank()),
+          migration_(device_, storage_, device_.execution_view(context_stream_.stream()), 0, 4,
+                     {&connection.communication().group(1), kPeerMembers, peer_staging_.span(),
+                      kPeerChunkBytes}) {
         state_.fill();
     }
 
@@ -161,11 +218,16 @@ public:
         f.request     = std::move(request);
         f.command     = f.request.command;
         f.phase       = Phase::Running;
+        f.cancelled   = false;
         const auto& w = f.request.work;
         if (w.fail_rank == static_cast<std::int32_t>(group_.rank()))
             throw std::runtime_error("injected rank execution failure");
         f.ready_at = std::chrono::steady_clock::now() +
                      std::chrono::milliseconds(w.delay && group_.rank() == 1 ? 60 : 0);
+        if (peer_operation(w.operation)) {
+            start_peer(f);
+            return;
+        }
         if (w.operation == Operation::State) {
             CUDA_CHECK(cudaMemcpyAsync(f.output.data(), state_.data(), sizeof(std::uint64_t),
                                        cudaMemcpyDeviceToHost, device_.stream()));
@@ -220,6 +282,8 @@ public:
     }
 
     bool can_discard(rt::ExecutionTicket ticket) const {
+        if (ticket.frame.kind == rt::FrameKind::Context)
+            return context_.request.ticket == ticket && context_.phase == Phase::Running;
         return compute_.request.ticket == ticket &&
                (compute_.phase == Phase::Decision || compute_.phase == Phase::Result);
     }
@@ -228,6 +292,10 @@ public:
         auto& f = find(ticket);
         require(can_discard(ticket), "fixture cancelled an unfinished communication stage");
         f.command = command;
+        if (ticket.frame.kind == rt::FrameKind::Context) {
+            f.cancelled = true;
+            return;
+        }
         f.done.record(device_.stream());
         f.phase = Phase::Retiring;
     }
@@ -236,6 +304,7 @@ public:
         for (auto* f : {&compute_, &context_}) {
             if (f->phase == Phase::Empty || f->phase == Phase::Decision ||
                 f->phase == Phase::Result || !f->done.ready() ||
+                (f->request.work.await_cancel && !f->cancelled) ||
                 std::chrono::steady_clock::now() < f->ready_at)
                 continue;
             if (f->phase == Phase::Retiring) {
@@ -245,7 +314,15 @@ public:
                 f->phase = Phase::Empty;
                 continue;
             }
-            if (f->request.work.operation != Operation::State) verify(*f);
+            if (peer_operation(f->request.work.operation)) {
+                verify_peer(*f);
+                migration_.finish();
+            } else if (f->request.work.operation != Operation::State)
+                verify(*f);
+            if (f->cancelled) {
+                f->phase = Phase::Retiring;
+                continue;
+            }
             if (f->phase == Phase::Running && f->request.work.decision) {
                 f->phase = Phase::Decision;
                 events_.emplace_back(rt::DecisionNeeded{f->request.ticket, {0, 32, {{0, {}}}}});
@@ -264,13 +341,17 @@ public:
         return value;
     }
 
-    void drain() { device_.synchronize(); }
+    void drain() {
+        migration_.drain();
+        CUDA_CHECK(cudaStreamSynchronize(context_stream_.stream()));
+        device_.synchronize();
+    }
 
     RankMemoryUsage observe_resources() const {
         RankMemoryUsage result;
         result.allocations.workspace_device_bytes =
             compute_.source.size() + compute_.destination.size() + context_.source.size() +
-            context_.destination.size();
+            context_.destination.size() + peer_staging_.size();
         result.workspace.required_peak_bytes    = std::max(lifetime_peak_, peak_bytes_);
         result.workspace.measurement_peak_bytes = peak_bytes_;
         return result;
@@ -296,7 +377,8 @@ private:
         DecodeGraphExecutable graph;
         rt::ExecutionRequest<Types> request;
         rt::CommandSequence command;
-        Phase phase = Phase::Empty;
+        Phase phase    = Phase::Empty;
+        bool cancelled = false;
         std::chrono::steady_clock::time_point ready_at;
         std::size_t input_bytes = 0, output_bytes = 0;
     };
@@ -307,6 +389,50 @@ private:
         auto& f = frame(ticket.frame);
         require(f.request.ticket == ticket, "stale fixture ticket");
         return f;
+    }
+
+    void start_peer(Frame& f) {
+        auto* input = static_cast<std::uint8_t*>(f.input.data());
+        for (std::size_t i = 0; i < kContextBytes; ++i) input[i] = context_byte(i, group_.rank());
+        CUDA_CHECK(cudaMemcpyAsync(f.source.data(), f.input.data(), kContextBytes,
+                                   cudaMemcpyHostToDevice, device_.stream()));
+        migration_.submit(f.request.work.actions);
+        CUDA_CHECK(cudaMemcpyAsync(f.output.data(), f.source.data(), kContextBytes,
+                                   cudaMemcpyDeviceToHost, context_stream_.stream()));
+        f.done.record(context_stream_.stream());
+    }
+
+    void verify_peer(const Frame& f) {
+        require(migration_.ready(), "Context peer result preceded transfer completion");
+        const auto& work = f.request.work;
+        std::vector<std::uint8_t> expected(kContextBytes);
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            expected[i] = context_byte(i, group_.rank());
+        for (std::size_t i = 0; i < work.count; ++i) {
+            const auto source = work.operation == Operation::ContextCopy ? i
+                                : i < 111                                ? 64 + i
+                                : i < 713                                ? 512 + i - 111
+                                                                         : 2048 + i - 713;
+            const auto destination =
+                work.operation == Operation::ContextCopy || i < 317 ? 8192 + i : 9200 + i - 317;
+            expected[destination] = context_byte(source, 1 - group_.rank());
+        }
+        require(std::memcmp(expected.data(), f.output.data(), expected.size()) == 0,
+                "Context peer copy changed payload or untouched bytes");
+        std::size_t bytes = 0, operations = 0;
+        for (const auto& observed : migration_.observations()) {
+            require(observed.direction == rt::ContextTransferDirection::PeerDeviceToDevice &&
+                        observed.rank == group_.rank() && observed.peer &&
+                        observed.elapsed_ns > 0 &&
+                        observed.peer->source_rank != observed.peer->destination_rank &&
+                        observed.peer->source_rank < 2 && observed.peer->destination_rank < 2,
+                    "Context peer transfer observation lost its endpoints or elapsed time");
+            bytes += observed.work.payload_bytes;
+            operations += observed.work.copy_operations;
+        }
+        require(bytes == 2 * work.count, "Context peer transfer byte accounting differs");
+        require(operations == 2 * (1 + (work.count - 1) / kPeerChunkBytes),
+                "Context peer transfer chunk accounting differs");
     }
 
     void fill(Frame& f) {
@@ -429,6 +555,10 @@ private:
     const dist::Group& group_;
     Frame compute_, context_;
     DeviceBuffer state_;
+    CudaStream context_stream_;
+    DeviceBuffer peer_staging_;
+    ctx::ContextStorage storage_;
+    ctx::ContextMigration migration_;
     std::uint64_t state_value_ = 0;
     std::size_t lifetime_peak_ = 0;
     std::size_t peak_bytes_    = 0;
@@ -458,10 +588,12 @@ using Executor = rt::DistributedExecutor<Types, Codec>;
 
 void run(Executor& executor, Work work, std::uint64_t& expected_state, bool cancel = false) {
     const auto kind =
-        work.operation == Operation::State ? rt::FrameKind::Context : rt::FrameKind::Compute;
-    auto reservation = executor.try_reserve(kind);
+        context_operation(work.operation) ? rt::FrameKind::Context : rt::FrameKind::Compute;
+    work.await_cancel = cancel && kind == rt::FrameKind::Context;
+    auto reservation  = executor.try_reserve(kind);
     require(bool(reservation), "execution frame was not retired");
     const auto ticket = executor.submit(std::move(*reservation), work);
+    require(!executor.try_reserve(kind), "submitted frame was released before retirement");
     if (cancel) executor.discard(ticket);
     bool result = false, retired = false;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -491,6 +623,49 @@ void run(Executor& executor, Work work, std::uint64_t& expected_state, bool canc
     require(cancel || result, "execution retired without a result");
 }
 
+void run_compute_with_context(Executor& executor, std::uint64_t& expected_state) {
+    auto context = executor.try_reserve(rt::FrameKind::Context);
+    auto compute = executor.try_reserve(rt::FrameKind::Compute);
+    require(context && compute, "overlapping execution requires both idle frames");
+    const std::array tickets{
+        executor.submit(std::move(*context), {Operation::ContextScatter, DType::U8, 1537}),
+        executor.submit(std::move(*compute), {Operation::Sum, DType::FP32, 257})};
+    std::array<bool, 2> results{}, retired{};
+    bool committed   = false;
+    const auto index = [&](rt::ExecutionTicket ticket) {
+        require(ticket == tickets[0] || ticket == tickets[1], "unexpected overlapping ticket");
+        return ticket == tickets[0] ? 0U : 1U;
+    };
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!retired[0] || !retired[1]) {
+        require(std::chrono::steady_clock::now() < until,
+                "overlapping compute and Context execution timed out");
+        if (auto event = executor.poll()) {
+            if (const auto* failure = std::get_if<rt::ExecutionFailed>(&*event))
+                throw std::runtime_error(failure->message);
+            if (const auto* output = std::get_if<rt::ResultReady<Types>>(&*event)) {
+                require(output->result.state == expected_state,
+                        "overlapping execution observed inconsistent committed state");
+                results[index(output->ticket)] = true;
+            }
+            if (const auto* completed = std::get_if<rt::DeviceRetired>(&*event)) {
+                const auto slot = index(completed->ticket);
+                require(results[slot], "overlapping execution retired before its result");
+                retired[slot] = true;
+            }
+            // Both operations observe the old fixture state; commit after both rank results.
+            if (!committed && results[0] && results[1]) {
+                (void)executor.commit(tickets[1], {1});
+                ++expected_state;
+                committed = true;
+            }
+        } else
+            std::this_thread::yield();
+    }
+    require(committed && !executor.has_pending_work(),
+            "overlapping execution did not retire both frames");
+}
+
 int coordinator(int argc, char** argv) {
     require(argc == 3 && std::string_view(argv[1]) == "--config",
             "usage: ninfer_distributed_execution_test --config FILE");
@@ -505,7 +680,8 @@ int coordinator(int argc, char** argv) {
         topology.ranks[r.rank] = {r.rank,         r.node,         0,  r.device,
                                   {r.rank, size}, {r.rank, size}, {}, {}};
     topology.groups.push_back({0, {0, 1}});
-    topology.roles = {{"tp", 0}, {"ep", 0}};
+    topology.groups.push_back({1, {0, 1}});
+    topology.roles = {{"tp", 0}, {"ep", 0}, {"context", 1}};
     const std::array<std::string, 1> arguments{"--worker"};
     const auto prepare = [&] {
         auto group = std::make_unique<dist::ExecutionGroup>(
@@ -547,6 +723,12 @@ int coordinator(int argc, char** argv) {
     run(executor, {Operation::Sum, DType::FP32, 64, false, true, true}, state, true);
     run(executor, {Operation::State, DType::U64, 1}, state);
     run(executor, {Operation::State, DType::U64, 1, false, false, false, -1, 1}, state);
+    run(executor, {Operation::ContextCopy, DType::U8, 97}, state);
+    run(executor, {Operation::ContextCopy, DType::U8, 1537}, state);
+    run(executor, {Operation::ContextScatter, DType::U8, 1537}, state);
+    run(executor, {Operation::ContextScatter, DType::U8, 1537, false, false, true}, state, true);
+    run(executor, {Operation::ContextCopy, DType::U8, 97}, state);
+    run_compute_with_context(executor, state);
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::any_of(executor.observations().begin(), executor.observations().end(),
                        [](const auto& r) { return !r.memory.workspace.measurement_peak_bytes; })) {
@@ -555,7 +737,8 @@ int coordinator(int argc, char** argv) {
         std::this_thread::yield();
     }
     for (const auto& rank : executor.observations())
-        require(rank.memory.allocations.workspace_device_bytes == 2 * (131072 + 256),
+        require(rank.memory.allocations.workspace_device_bytes ==
+                    2 * (131072 + kContextBytes) + kPeerChunkBytes,
                 "rank resource observation differs from owned buffers");
     executor.reset_measurement_peaks();
     for (const auto& rank : executor.observations())
@@ -563,11 +746,14 @@ int coordinator(int argc, char** argv) {
                     rank.memory.workspace.required_peak_bytes > 0,
                 "measurement reset erased lifetime peaks or omitted a rank");
     executor.drain();
-    {
+    for (const auto operation : {Operation::Sum, Operation::ContextScatter}) {
         Executor failing(prepare(), {1, 1}, {});
         failing.bind_to_current_thread();
-        auto reservation = failing.try_reserve(rt::FrameKind::Compute);
+        auto reservation = failing.try_reserve(
+            context_operation(operation) ? rt::FrameKind::Context : rt::FrameKind::Compute);
         Work work;
+        work.operation = operation;
+        work.count     = 1537;
         work.fail_rank = 1;
         (void)failing.submit(std::move(*reservation), work);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -599,7 +785,8 @@ int coordinator(int argc, char** argv) {
         require(::waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD,
                 "execution group left an unreaped child after failure");
     }
-    std::cout << "distributed collectives, graph, decisions, delayed commit, cancellation and "
+    std::cout << "distributed collectives, Context peer copies, graph, decisions, delayed commit, "
+                 "cancellation and "
                  "retirement, and failed-rank abort passed\n";
     return 0;
 }

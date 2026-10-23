@@ -65,7 +65,9 @@ void test_rank_local_placement() {
            "one logical State supports independent rank-local physical offsets");
     const auto before_zero = directory.records().pool({0, store::ContextMemory::Device}).usage();
     const auto before_one  = directory.records().pool({1, store::ContextMemory::Device}).usage();
-    const auto rejected    = directory.reserve(store::ContextDemand{.new_states = 2});
+    store::ContextDemand demand;
+    demand.add_state({.count = 2});
+    const auto rejected = directory.reserve(demand);
     expect(!rejected &&
                directory.records().pool({0, store::ContextMemory::Device}).usage().reserved_bytes ==
                    before_zero.reserved_bytes &&
@@ -162,8 +164,10 @@ void test_metadata_admission() {
                                                                 .parts         = {{0, {512, 256}}}}},
                                      .metadata_budget_bytes = 16 * 1024 * 1024};
     store::ContextDirectory probe(spec);
-    store::ContextDemand demand{.new_states = 1};
-    demand.add_history(0, probe.pool(0).histories().binding_demand(nullptr, 0, 128));
+    store::ContextDemand demand;
+    demand.add_state({.count = 1});
+    const auto history_id =
+        demand.add_history(0, probe.pool(0).histories().binding_demand(nullptr, 0, 128));
     const auto quote       = probe.assess(demand);
     const auto core_budget = spec.metadata_budget_bytes - probe.metadata_budget().limit();
     spec.metadata_budget_bytes =
@@ -177,7 +181,7 @@ void test_metadata_admission() {
         expect(exact.metadata_budget().allocated() - before <= quote.metadata_required_bytes,
                "metadata preparation exceeded its quoted peak");
         auto binding = exact.pool(0).histories().prepare_binding(
-            nullptr, 0, 128, 0, reserved.reservation->take_history(0));
+            nullptr, 0, 128, 0, reserved.reservation->take(history_id));
         expect(binding.history().valid(), "pre-reserved history descriptor was not adopted");
     }
     --spec.metadata_budget_bytes;
@@ -198,10 +202,99 @@ void test_metadata_admission() {
     states.freeze(image);
     const auto destroyed = single.state_release(image);
     store::ContextReleaseSet demoted{.records = destroyed.records};
-    expect(!single.assess({.new_states = 1}, demoted).feasible() &&
-               single.assess({.new_states = 1}, destroyed).feasible(),
+    store::ContextDemand state_demand;
+    state_demand.add_state({.count = 1});
+    expect(!single.assess(state_demand, demoted).feasible() &&
+               single.assess(state_demand, destroyed).feasible(),
            "moving a physical replica was mistaken for freeing a logical State descriptor");
     expect(states.release(image), "metadata admission fixture retained State");
+}
+
+void test_mixed_context_demand() {
+    store::ContextDirectory directory(
+        {.ranks = {{0, 8192, 4096}, {1, 8192, 4096}},
+         .state = {16, {{0, {{0, 768, 256}, {1, 512, 256}}}, {1, {{0, 512, 256}, {1, 768, 256}}}}},
+         .pools = {{.pool_id       = 0,
+                    .logical_pages = 32,
+                    .histories     = 8,
+                    .page_capacity = 8,
+                    .table_rows    = 2,
+                    .parts         = {{0, {256, 256}}, {1, {256, 256}}}}},
+         .metadata_budget_bytes = 1024 * 1024});
+    auto& histories = directory.pool(0).histories();
+    const std::array<std::uint32_t, 1> owner_zero{0}, owner_one{1};
+    store::ContextDemand demand;
+    const auto state_zero = demand.add_state({.count = 1, .variant = 0});
+    const auto history_zero =
+        demand.add_history(0, histories.binding_demand(nullptr, 0, 64, {}, owner_zero));
+    const auto state_one = demand.add_state({.count = 1, .variant = 1});
+    const auto history_one =
+        demand.add_history(0, histories.binding_demand(nullptr, 0, 128, {}, owner_one));
+    const auto host = demand.add_history(0, 2, store::ContextMemory::Host, {1});
+    {
+        auto reserved = directory.reserve(demand);
+        expect(reserved && reserved.reservation->ready(),
+               "mixed variants, owners and memory domains must reserve atomically");
+        auto& bundle = *reserved.reservation;
+        const auto zero =
+            directory.states().reserve_destination(bundle.take(state_zero), 0).value();
+        const auto one = directory.states().reserve_destination(bundle.take(state_one), 1).value();
+        expect(directory.states().device_binding(zero, 0).bytes == 768 &&
+                   directory.states().device_binding(one, 0).bytes == 512 &&
+                   directory.states().device_binding(zero, 1).bytes == 512 &&
+                   directory.states().device_binding(one, 1).bytes == 768,
+               "demand identities must preserve State variants");
+        auto zero_records = bundle.take(history_zero);
+        auto one_records  = bundle.take(history_one);
+        expect(zero_records.remaining(0) == 1 && zero_records.remaining(1) == 0 &&
+                   one_records.remaining(0) == 0 && one_records.remaining(1) == 2,
+               "same-pool history demands must retain independent owner counts");
+        const store::RecordAssessment pressure{
+            {{{1, store::ContextMemory::Device}, {.reclaim_bytes = 256}}}};
+        expect(!zero_records.contributes_to(pressure, false) &&
+                   one_records.contributes_to(pressure, false),
+               "reservation release must contribute only to its own pressured domain");
+        auto split        = one_records.split(1);
+        auto materialized = one_records.materialize(1);
+        expect(!one_records.contributes_to(pressure, false) &&
+                   split.contributes_to(pressure, false),
+               "a split reservation must not count another owner's unmaterialized claim");
+        one_records.restore(std::move(materialized));
+        one_records.merge(std::move(split));
+        auto zero_binding = histories.prepare_binding(nullptr, 0, 64, 0, std::move(zero_records),
+                                                      false, owner_zero);
+        auto one_binding =
+            histories.prepare_binding(nullptr, 0, 128, 1, std::move(one_records), false, owner_one);
+        expect(zero_binding.history() != one_binding.history(),
+               "history control metadata must be reserved separately for each binding");
+        auto host_records = bundle.take(host);
+        auto host_page    = host_records.materialize(1);
+        expect(host_page.domain() == store::ContextDomainId{1, store::ContextMemory::Host} &&
+                   host_records.remaining(1) == 1 && host_records.remaining(0) == 0,
+               "Host records must retain their demand's memory domain and owner");
+        bool consumed = false;
+        try {
+            (void)bundle.take(history_zero);
+        } catch (const std::logic_error&) { consumed = true; }
+        expect(consumed && bundle.empty(), "a semantic reservation may only be consumed once");
+        expect(directory.states().release(zero) && directory.states().release(one),
+               "mixed State destinations must release independently");
+    }
+    for (const auto rank : {0U, 1U})
+        for (const auto memory : {store::ContextMemory::Device, store::ContextMemory::Host}) {
+            const auto usage = directory.records().pool({rank, memory}).usage();
+            expect(usage.live_bytes == 0 && usage.reserved_bytes == 0,
+                   "mixed demand cleanup leaked records");
+        }
+    demand.add_history(0, 64, store::ContextMemory::Host, {1});
+    expect(directory.assess(demand).impossible() && !directory.reserve(demand),
+           "Host capacity must be assessed separately from Device capacity");
+    for (const auto rank : {0U, 1U})
+        for (const auto memory : {store::ContextMemory::Device, store::ContextMemory::Host}) {
+            const auto usage = directory.records().pool({rank, memory}).usage();
+            expect(usage.reserved_bytes == 0,
+                   "one deficient domain must not leave partial reservations in another domain");
+        }
 }
 
 void test_state_store(ninfer::DeviceContext& device) {
@@ -569,6 +662,7 @@ int main() {
         test_rank_local_placement();
         test_state_variants_and_metadata();
         test_metadata_admission();
+        test_mixed_context_demand();
         test_state_store(device);
         test_migration_state_fields(device);
         device.synchronize();

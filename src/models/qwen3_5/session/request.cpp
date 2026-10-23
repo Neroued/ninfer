@@ -258,23 +258,21 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
         }
     }
     ContextDemand bundle;
+    std::array<context::ContextDemandId, kMaximumConcurrency> main_ids, backend_ids;
     for (const auto& unit : units) {
         const auto lane = this->lane(unit.sequence);
         if (requests[lane].permit) continue;
         const auto& state = active_sequence(lane);
-        bundle.add_growth(*text_kv_histories, state.kv->text.handle(), add_main[lane]);
+        main_ids[lane] =
+            bundle.add_growth(*text_kv_histories, state.kv->text.handle(), add_main[lane]);
         if (state.kv->backend)
-            bundle.add_growth(*backend_kv_histories, state.kv->backend->handle(),
-                              add_backend[lane]);
+            backend_ids[lane] = bundle.add_growth(*backend_kv_histories,
+                                                  state.kv->backend->handle(), add_backend[lane]);
     }
     auto assessment = directory.assess(bundle);
     if (!assessment.ready()) return {.assessment = std::move(assessment)};
     auto reserved = directory.reserve(bundle);
     if (!reserved) return {.assessment = std::move(reserved.assessment)};
-    auto main_records    = reserved.reservation->take_history(kTextKvPool.index);
-    auto backend_records = backend_kv_histories
-                               ? reserved.reservation->take_history(kBackendKvPool.index)
-                               : context::RecordReservation{};
     std::array<bool, kMaximumConcurrency> added{};
     try {
         for (const auto& unit : units) {
@@ -282,11 +280,11 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             if (requests[lane].permit) { continue; }
             auto& state = active_sequence(lane);
             added[lane] = true;
-            auto main   = main_records.split(add_main[lane]);
+            auto main   = reserved.reservation->take(main_ids[lane]);
             text_kv_histories->prepare_growth(state.kv->text.handle(), main);
             text_kv_histories->adopt_growth(state.kv->text.handle(), std::move(main));
             if (state.kv->backend) {
-                auto backend = backend_records.split(add_backend[lane]);
+                auto backend = reserved.reservation->take(backend_ids[lane]);
                 backend_kv_histories->prepare_growth(state.kv->backend->handle(), backend);
                 backend_kv_histories->adopt_growth(state.kv->backend->handle(), std::move(backend));
             }

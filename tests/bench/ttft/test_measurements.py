@@ -341,7 +341,7 @@ def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
         return {direction: {"bytes": amount if direction == "d2h" else 0,
                             "seconds": 0.001 if direction == "d2h" else 0.0,
                             "images": 1, "page_groups": 1, "copy_operations": 1}
-                for direction in ("d2h", "h2d", "d2d", "h2h")}
+                for direction in ("d2h", "h2d", "d2d", "h2h", "peer_d2d")}
     event["context_cache"]["state_transfers"] = transfers(state_bytes)
     event["context_cache"]["kv_pools"] = [
         {"pool_id": 0, "occupied_page_groups": 8, "transfers": transfers(main_bytes)},
@@ -401,6 +401,7 @@ def test_context_domains_are_matched_by_rank_and_domain(tmp_path):
         0, {**device, "live_bytes": 500, "peak_occupied_bytes": 600},
     )
     second["context_cache"]["state_transfers"]["h2h"].update(bytes=64, seconds=0.002)
+    second["context_cache"]["state_transfers"]["peer_d2d"].update(bytes=128, seconds=0.003)
     summary = summarize_campaign(logged_campaign(tmp_path, [], [first, second]))
     observed = summary["global_runtime_observations"][0]
     pools = {(pool["rank"], pool["domain"]): pool for pool in observed["occupancy"]["pools"]}
@@ -409,6 +410,8 @@ def test_context_domains_are_matched_by_rank_and_domain(tmp_path):
     assert pools[(1, "device")]["peak_occupied_bytes"] == 600
     assert observed["transfers"]["state"]["h2h"]["bytes"] == 64
     assert observed["transfers"]["state"]["h2h"]["seconds"] == pytest.approx(0.002)
+    assert observed["transfers"]["state"]["peer_d2d"]["bytes"] == 128
+    assert observed["transfers"]["state"]["peer_d2d"]["seconds"] == pytest.approx(0.003)
 
 
 def test_unsupported_runtime_schema_is_unavailable(tmp_path):

@@ -7,6 +7,8 @@
 
 namespace ninfer::runtime {
 
+struct ContextTransferObservation;
+
 enum class CoordinatorCall : std::uint8_t { Session, Poll, Flush, Yield };
 
 // Coordinator-local timestamps. The existing execution protocol defines these boundaries;
@@ -27,6 +29,8 @@ void accumulate(ExecutionStatistics&, const ExecutionSample&) noexcept;
 void merge_gpu_intervals(GpuExecutionObservation&, const GpuExecutionObservation&) noexcept;
 void accumulate_gpu(std::array<DurationCounter, 4>&, const GpuExecutionObservation&) noexcept;
 void merge_host_observations(RankHostStatistics&, const RankHostStatistics&) noexcept;
+void accumulate_context_transfer(GenerationTransferTiming&,
+                                 const ContextTransferObservation&) noexcept;
 
 template <class Call>
 decltype(auto) observe_host_call(std::uint64_t& counter, Call&& call) {

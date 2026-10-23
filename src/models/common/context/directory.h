@@ -5,8 +5,10 @@
 #include "ninfer/observability/snapshot.h"
 
 #include <memory>
+#include <limits>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace ninfer::models::context {
@@ -29,26 +31,55 @@ struct ContextDirectorySpec {
     bool operator==(const ContextDirectorySpec&) const = default;
 };
 
-struct HistoryRecordDemand {
-    std::uint32_t pool_id = 0;
+struct ContextDemandId {
+    std::uint32_t index = std::numeric_limits<std::uint32_t>::max();
+
+    [[nodiscard]] bool valid() const noexcept {
+        return index != std::numeric_limits<std::uint32_t>::max();
+    }
+
+    bool operator==(const ContextDemandId&) const = default;
+};
+
+struct StateDemand {
     std::uint32_t count   = 0;
+    std::uint32_t variant = 0;
+    // Device destinations create logical objects by default; Host replicas do not.
+    std::optional<std::uint32_t> logical_count;
+    ContextMemory memory = ContextMemory::Device;
     std::vector<std::uint32_t> ranks;
-    std::optional<std::uint32_t> logical_pages;
+};
+
+struct HistoryDemand {
+    std::uint32_t pool_id = 0;
+    std::vector<RecordDemand> records;
+    std::uint32_t logical_pages = 0;
     std::optional<HistoryMetadataDemand> metadata;
+};
+
+struct HostWriteRequirements;
+
+struct HostDemandIds {
+    ContextDemandId state;
+    // Indexed by pool; zero-sized requests have invalid IDs.
+    std::vector<ContextDemandId> histories;
 };
 
 // Counts refer to semantic objects after the history has resolved reuse, COW and restore.
 // A single quote includes every destination needed through the unit's retirement.
 struct ContextDemand {
-    std::uint32_t new_states    = 0;
-    std::uint32_t state_variant = 0;
-    std::optional<std::uint32_t> logical_states;
-    std::vector<HistoryRecordDemand> histories;
-    ContextMemory memory = ContextMemory::Device;
-    std::vector<std::uint32_t> state_ranks;
-    void add_history(std::uint32_t pool, const HistoryBindingDemand&);
-    void add_growth(const HistoryDirectory&, HistoryId, std::uint32_t pages);
+    std::vector<std::variant<StateDemand, HistoryDemand>> items;
+    ContextDemandId add_state(StateDemand);
+    ContextDemandId add_history(HistoryDemand);
+    ContextDemandId add_history(std::uint32_t pool, const HistoryBindingDemand&);
+    ContextDemandId add_history(std::uint32_t pool, std::uint32_t count,
+                                ContextMemory memory                       = ContextMemory::Device,
+                                std::vector<std::uint32_t> ranks           = {},
+                                std::optional<std::uint32_t> logical_pages = {});
+    ContextDemandId add_growth(const HistoryDirectory&, HistoryId, std::uint32_t pages);
+    HostDemandIds add_host(const HostWriteRequirements&);
     [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] bool uses_memory(ContextMemory) const noexcept;
 };
 
 struct ContextReleaseSet {
@@ -101,19 +132,11 @@ struct ContextAssessment {
 
 class ContextReservation {
 public:
-    [[nodiscard]] RecordReservation take_state();
-    [[nodiscard]] RecordReservation take_history(std::uint32_t pool_id);
+    [[nodiscard]] RecordReservation take(ContextDemandId);
     [[nodiscard]] bool ready() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
 private:
-    RecordReservation state_;
-
-    struct History {
-        std::uint32_t pool_id;
-        RecordReservation records;
-    };
-
-    std::vector<History> histories_;
+    std::vector<std::optional<RecordReservation>> items_;
     friend class ContextDirectory;
 };
 
@@ -234,6 +257,8 @@ public:
     ContextTransaction& operator=(const ContextTransaction&) = delete;
 
     void own_state(StateId);
+    void convert_state(StateId source, std::uint32_t target_variant, RecordReservation,
+                       std::span<const RecordRangeCopy>);
     [[nodiscard]] StateDirectory::Destination& state_destination();
     void add_state_copy(StateDirectory::Transfer, bool keep_source_replica);
     void add_state_group(StateId source, std::size_t offset, std::size_t bytes,
@@ -303,10 +328,29 @@ private:
         bool drop_device;
     };
 
+    struct PendingPeerCopy {
+        std::uint32_t source_rank;
+        std::uint32_t destination_rank;
+        runtime::ContextTransferResource resource;
+        std::vector<ContextRange> source;
+        std::vector<ContextRange> destination;
+        AllocationId last_source;
+        std::uint32_t source_records = 0;
+    };
+
+    struct LocalConversionSource {
+        ContextDomainId domain;
+        runtime::ContextTransferResource resource;
+        AllocationId last_source;
+    };
+
     void require_reserved() const;
     void release_reservations();
     void release_address_borrow() noexcept;
     ContextActions& mutable_actions(std::uint32_t rank);
+    void copy_range(ContextRecordBinding source, ContextRecordBinding destination,
+                    const RecordRangeCopy&, runtime::ContextTransferResource);
+    void prepare_peer_actions();
     ContextDirectory* directory_;
     Stage stage_            = Stage::Reserved;
     bool cancelled_         = false;
@@ -318,6 +362,9 @@ private:
     std::optional<ContextReservation> maintenance_reservation_;
     std::vector<RankActions> actions_;
     std::optional<StateDirectory::Destination> state_;
+    std::optional<StateDirectory::ReadLease> conversion_source_;
+    std::vector<PendingPeerCopy> peer_copies_;
+    std::vector<LocalConversionSource> local_conversion_sources_;
     std::vector<PendingStateCopy> state_copies_;
     std::vector<PendingBinding> bindings_;
     std::vector<PendingBackup> backups_;
@@ -326,6 +373,7 @@ private:
     std::vector<RowLease> retired_rows_;
     std::vector<PendingCommit> commits_;
     friend class ContextDirectory;
+    friend class HistoryBinding;
 };
 
 [[nodiscard]] std::optional<StateId> reserve_capture_destination(ContextDirectory&,

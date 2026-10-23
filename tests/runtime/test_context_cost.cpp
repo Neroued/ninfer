@@ -146,6 +146,44 @@ void test_exact_evaluation() {
            "prefill cost did not saturate");
 }
 
+void test_peer_transfer_cost() {
+    using namespace ninfer::runtime;
+    ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
+    std::vector<ContextTransferRequirement> requirements{
+        {.direction = ContextTransferDirection::PeerDeviceToDevice,
+         .work      = {12, 1},
+         .rank      = 0,
+         .peer      = ContextPeerTransfer{0, 1}},
+        {.direction = ContextTransferDirection::PeerDeviceToDevice,
+         .work      = {12, 1},
+         .rank      = 1,
+         .peer      = ContextPeerTransfer{0, 1}},
+    };
+    expect(!try_price_context_transfer_requirements(model, requirements) &&
+               price_context_transfer_requirements(model, requirements) == UINT64_MAX,
+           "unmeasured peer links inherited local-device costs");
+    model.peer_transfer.push_back({{0, 1}, {20, 2, kContextCostQ32One}});
+    expect(try_price_context_transfer_requirements(model, requirements) == 22,
+           "peer endpoint costs were added as serial latency");
+    requirements.push_back({.resource  = {.pool = KvPoolId{0}},
+                            .direction = ContextTransferDirection::PeerDeviceToDevice,
+                            .work      = {10, 1},
+                            .rank      = 0,
+                            .peer      = ContextPeerTransfer{0, 1}});
+    expect(try_price_context_transfer_requirements(model, requirements) == 24,
+           "peer resource transfers on one link were not coalesced");
+    requirements.push_back(
+        {.direction = ContextTransferDirection::DeviceToDevice, .work = {10, 1}, .rank = 0});
+    expect(try_price_context_transfer_requirements(model, requirements) == 37,
+           "local copies were merged with peer transfer costs");
+    requirements[0].peer = ContextPeerTransfer{1, 0};
+    expect(!try_price_context_transfer_requirements(model, requirements),
+           "peer measurements were reused for an unmeasured directed link");
+    const auto generic = generic_context_machine_cost_model();
+    expect(!generic.prefill_measured && generic.peer_transfer.empty(),
+           "generic local fallback claimed measured model or peer costs");
+}
+
 void test_schema_validation() {
     Json entries = Json::array();
     entries.push_back(prefill_entry("config-and-formats", prefill()));
@@ -214,7 +252,8 @@ void test_resolution_and_atomic_upserts() {
             .hardware_class    = compiled_identity.hardware_class,
             .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
         });
-        expect(measured.summary.prefill_source ==
+        expect(measured.model.prefill_measured && measured.model.peer_transfer.empty() &&
+                   measured.summary.prefill_source ==
                        ninfer::ContextCostPresetSource::CompiledDefault &&
                    measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
                "measured bindings did not select their compiled prefill cost");
@@ -285,6 +324,7 @@ void test_resolution_and_atomic_upserts() {
 
 int main() {
     test_exact_evaluation();
+    test_peer_transfer_cost();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

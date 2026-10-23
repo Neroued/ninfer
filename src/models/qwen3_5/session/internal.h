@@ -225,6 +225,13 @@ struct BindOperation {
     bool source_tail_hidden         = false;
 };
 
+struct BindingPlan {
+    BindingEvaluation evaluation;
+    BindOperation operation;
+    ContextDemand demand;
+    context::ContextDemandId state, main, backend, backup;
+};
+
 struct CaptureOperation {
     static constexpr auto kind     = ContextOperationKind::Capture;
     std::uint32_t lane             = 0;
@@ -237,8 +244,9 @@ struct MaintenanceOperation {
     static constexpr auto kind = ContextOperationKind::Maintenance;
     std::optional<ContextDemotion> demotion;
     std::vector<Checkpoints::Lease> source_leases;
+    context::HostDemandIds targets;
     std::optional<SequenceHandle> pause_sequence;
-    bool save_snapshot = false;
+    runtime::PauseAction pause_action;
 };
 
 struct DemoteOperation {
@@ -297,7 +305,8 @@ public:
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool consume_source                              = false,
                    std::span<const CheckpointHandle> private_points = {},
-                   std::span<const CheckpointHandle> retired_points = {}) const;
+                   std::span<const CheckpointHandle> retired_points = {},
+                   runtime::PlacementId target = {}, const ResumeState* resume = nullptr) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
@@ -314,7 +323,10 @@ public:
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<context::HostWriteRequirements>
         pause_host_requirements(SequenceHandle) const;
-    [[nodiscard]] bool prepare_pause(SequenceHandle, bool save_snapshot,
+    [[nodiscard]] std::vector<PauseOption> pause_options(SequenceHandle) const;
+    [[nodiscard]] bool pause_contributes(SequenceHandle, const PauseOption&,
+                                         const ContextAssessment&) const;
+    [[nodiscard]] bool prepare_pause(SequenceHandle, runtime::PauseAction,
                                      std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] context::HostWriteRequirements
     demotion_host_requirements(const ContextDemotion&) const;
@@ -327,6 +339,9 @@ public:
     [[nodiscard]] runtime::ContextStart start_maintenance(const ContextAssessment&);
     [[nodiscard]] bool reclaim_capture_reservation(const ContextAssessment&);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
+    [[nodiscard]] BindingPlan plan_binding(const RequestBasePlan&, runtime::LaneId,
+                                           const SourceCandidate&, const ResumeState*,
+                                           ExecutionUnitKind, std::uint32_t) const;
     [[nodiscard]] BindingReservation
     start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                   ResumeState* resume           = nullptr,
@@ -348,13 +363,13 @@ public:
     [[nodiscard]] runtime::ContextStart
     start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] runtime::ContextStart submit_demotion(const ContextDemotion&,
+                                                        context::HostDemandIds,
                                                         context::ContextReservation,
                                                         runtime::ExecutionReservation);
-    [[nodiscard]] runtime::ContextStart defer_demotion(const ContextDemotion&,
-                                                       context::ContextReservation,
-                                                       const ContextAssessment&,
-                                                       runtime::ExecutionReservation);
-    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot);
+    [[nodiscard]] runtime::ContextStart
+    defer_demotion(const ContextDemotion&, context::HostDemandIds, context::ContextReservation,
+                   const ContextAssessment&, runtime::ExecutionReservation);
+    [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::PauseAction);
     [[nodiscard]] bool has_context_operation() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
@@ -415,10 +430,12 @@ public:
 
     struct PauseReservation {
         SequenceHandle sequence;
-        bool save_snapshot;
+        runtime::PauseAction action;
         ContextAssessment placement;
+        context::HostDemandIds target_ids;
         context::ContextReservation targets;
         runtime::ExecutionReservation execution;
+        std::optional<runtime::ExecutionReservation> normalization;
         std::vector<runtime::ContextTransferObservation> preceding_transfers;
         PreparedCheckpoint checkpoint;
     };
@@ -527,20 +544,21 @@ public:
     void cancel_context() noexcept;
     [[nodiscard]] bool prepare_backup(context::ContextTransaction&, CheckpointState&,
                                       bool shared_device, bool& preserve_state_device,
-                                      context::ContextReservation&);
+                                      context::ContextReservation&, const context::HostDemandIds&);
     void install_binding(BindOperation&);
     void complete_binding(BindOperation&, context::ContextTransaction&, ContextProgress&);
     void publish_capture(CaptureOperation&, context::ContextTransaction&,
                          runtime::ContextOperationCounts&);
-    [[nodiscard]] bool begin_pause(SequenceHandle, bool save_snapshot);
-    [[nodiscard]] bool continue_pause_ready(SequenceHandle, bool save_snapshot);
+    [[nodiscard]] bool begin_pause(SequenceHandle, runtime::PauseAction);
+    [[nodiscard]] bool continue_pause_ready(SequenceHandle, runtime::PauseAction);
     void continue_pause_after_normalize(SequenceHandle);
     [[nodiscard]] ResumeState complete_pause(PauseOperation&);
     [[nodiscard]] bool submit_context(PendingContext&, ContextWork&&);
     void submit_context_batch(PendingContext&);
     void receive_context_result(runtime::ExecutionTicket, ContextResult&&);
     void retire_context(runtime::DeviceRetired);
-    [[nodiscard]] std::optional<runtime::ExecutionTicket> start_normalize(SequenceHandle);
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+        start_normalize(SequenceHandle, runtime::ExecutionReservation);
 };
 
 } // namespace ninfer::models::qwen3_5::detail

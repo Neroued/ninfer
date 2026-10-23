@@ -3,6 +3,7 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/placement.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/context_cache/types.h"
 #include "runtime/executor/contract.h"
@@ -200,6 +201,8 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<ResidencyId> residency;
     std::optional<SequenceHandle> sequence;
+    std::optional<PlacementId> placement;
+    std::uint64_t placement_tokens = 0;
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
@@ -235,7 +238,7 @@ struct RequestRecord {
     std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;
-    std::vector<std::array<GenerationTransferTiming, 4>> context_transfers;
+    std::vector<ContextTransferSeries> context_transfers;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
 

@@ -3,7 +3,7 @@
 目标：通过公共 Engine、CLI、serve 和 ninfer-bench，在两台 DGX Spark 上完成
 GLM-5.3-Flash 的加载、Text、原生 MTP、Vision、工具调用、约束输出、上下文复用
 和 decode CUDA Graph，并针对实际推理负载优化。并行策略采用 TP2、EP2、
-MLA/Indexer attention DP2；KDA 使用 TP2。
+MLA/Indexer ADP2；KDA 使用 TP2。完整执行副本数为 DP1。
 
 本文维护实施步骤、依赖、任务交接和阶段产出。模型数学与已有数值选择引用
 [模型语义](../../maintainer/glm5next-model.md)、
@@ -195,20 +195,26 @@ TP/EP 分片及必要组合；模型配置与并行计划是本地几何的共�
 
 ### G3：Attention DP、上下文与请求放置
 
+本阶段在一个执行实例内接入 ADP2，完整 DP 副本路由后续实施；命名与所有权边界见
+[DP 与 ADP 合同](../attention-dp-placement.md#11-dp-与-adp)。
+
 使用现有 State variants 与 history placement 表达两侧 KDA 分片、owner-only tails
 和 Main/MTP histories。同一 rank 的全部记录共享 Context 容量；短缺、回收和成组
 预留通过已有目录针对具体 rank／存储域评估，GLM 不另建可用容量账本。
 
+具体合同与实施顺序见 [Attention DP 放置与上下文管理](../attention-dp-placement.md)。
 请求来源候选包含 checkpoint 与目标 attention owner。Session 提供合法恢复组合、
-资源需求、传输及重建工作；共享策略结合前缀收益、可用容量和 attention 负载选择。
+资源需求、传输及重建工作；共享策略先检查完整资源可行性，再按 token 负载与本地
+前缀亲和选择。扩展按需求身份取回的预留合同，支持混合 variant 和 history owner。
 一次请求普通执行期间 owner 稳定，Main/MTP 共用 owner。全局 batch 与 owner-local
 行映射在一次执行中固定，KDA/TP/EP 继续处理完整 batch。
 
 先接通同 owner 的共享/COW、capture/restore、暂停恢复和释放，再接 admission 时
-的跨 owner 来源转换。前缀索引保留不同放置的可恢复实例；热点共享前缀可按成本建立
-另一 owner 的副本。转换需新建相应 State variant 和 history placement，复制公共
-字段、传输 owner history/tail，全部完成后发布；现有同 variant／placement 恢复
-不能直接执行此转换。活动请求迁移另有负载证据时再安排。
+的跨 owner 来源转换及容量压力下的请求转换。前缀索引保留不同放置的可恢复实例，
+副本由实际请求恢复和正常 checkpoint 保存产生。转换需新建相应 State variant 和
+history placement，复制公共字段、传输 owner history/tail，全部参与 rank 退役后
+发布；现有同 variant／placement 恢复不能直接执行此转换。普通 decode 不为负载
+均衡迁移活动请求；峰值无法容纳转换时，沿用有年龄优先级的暂停／Replay 保证进展。
 
 **产出：统一 Context 余量可用于请求和前缀缓存，完整上下文的采用与回收遵循同一事务。**
 

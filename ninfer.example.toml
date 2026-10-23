@@ -106,8 +106,9 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # [distributed.parallel]
 # tp = 2
 # ep = 2
-# dp = 1
+# dp = 1 # Independent full-model replicas.
 # pp = 1
+# attention_dp = 1 # Request-local attention ownership within each replica.
 # [[distributed.nodes]]
 # id = 0
 # worker = "/home/neroued/ninfer/build/dgx-spark-dev/tests/ninfer_distributed_execution_test"

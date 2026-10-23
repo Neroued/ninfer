@@ -383,10 +383,10 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
     };
 }
 
-Json transfer_timings_json(const std::array<ninfer::GenerationTransferTiming, 4>& current,
-                           const std::array<ninfer::GenerationTransferTiming, 4>& previous = {}) {
+Json transfer_timings_json(const ninfer::ContextTransferSeries& current,
+                           const ninfer::ContextTransferSeries& previous = {}) {
     Json result = Json::object();
-    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h"};
+    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h", "peer_d2d"};
     for (std::size_t i = 0; i < directions.size(); ++i) {
         const auto& now       = current[i];
         const auto& before    = previous[i];
@@ -828,7 +828,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     for (const auto& pool : current.kv_pools) {
         const auto before = pool.id < previous.context_transfers.kv.size()
                                 ? previous.context_transfers.kv[pool.id]
-                                : std::array<ninfer::GenerationTransferTiming, 4>{};
+                                : ninfer::ContextTransferSeries{};
         pools.push_back({{"pool_id", pool.id},
                          {"label", pool.label},
                          {"occupied_page_groups", pool.occupied_page_groups},

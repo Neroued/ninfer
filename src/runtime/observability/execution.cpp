@@ -1,6 +1,17 @@
 #include "runtime/observability/execution.h"
+#include "runtime/contract/resources.h"
 
 namespace ninfer::runtime {
+
+void accumulate_context_transfer(GenerationTransferTiming& timing,
+                                 const ContextTransferObservation& transfer) noexcept {
+    timing.seconds += transfer.elapsed_ns * 1.0e-9;
+    if (transfer.peer && transfer.rank != transfer.peer->source_rank) return;
+    timing.bytes += transfer.work.payload_bytes;
+    timing.images += transfer.image_count;
+    timing.page_groups += transfer.page_groups;
+    timing.copy_operations += transfer.work.copy_operations;
+}
 
 void merge_host_observations(RankHostStatistics& into, const RankHostStatistics& from) noexcept {
     for (auto field : {&RankHostStatistics::submit_ns, &RankHostStatistics::progress_ns,

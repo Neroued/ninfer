@@ -103,6 +103,19 @@ bool RecordReservation::empty() const noexcept {
                        [](const auto& metadata) { return metadata.remaining() == 0; });
 }
 
+bool RecordReservation::contributes_to(const RecordAssessment& pressure,
+                                       bool metadata_pressure) const noexcept {
+    if (metadata_pressure && std::any_of(metadata_.begin(), metadata_.end(),
+                                         [](const auto& item) { return item.remaining() != 0; }))
+        return true;
+    for (const auto& claim : claims_) {
+        if (!claim.count || !claim.reservation->valid()) continue;
+        for (const auto& domain : pressure.domains)
+            if (domain.domain == claim.domain && domain.placement.reclaim_bytes) return true;
+    }
+    return false;
+}
+
 std::uint32_t RecordReservation::remaining(std::uint32_t rank) const noexcept {
     std::uint32_t count = 0;
     for (const auto& claim : claims_)

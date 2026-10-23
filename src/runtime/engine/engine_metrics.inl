@@ -240,20 +240,12 @@ void EngineCore<Instance>::record_context_work(
             transfer.resource.is_state()
                 ? cumulative_stats_.context_transfers.state
                 : cumulative_stats_.context_transfers.kv.at(transfer.resource.pool->index);
-        auto& total           = series.at(direction);
-        const auto accumulate = [&](GenerationTransferTiming& timing) {
-            timing.bytes += transfer.work.payload_bytes;
-            timing.seconds += transfer.elapsed_ns * 1.0e-9;
-            timing.images += transfer.image_count;
-            timing.page_groups += transfer.page_groups;
-            timing.copy_operations += transfer.work.copy_operations;
-        };
-        accumulate(total);
+        accumulate_context_transfer(series.at(direction), transfer);
         if (owner) {
             if (!owner->first_output_timing) {
                 auto& observed =
                     owner->context_transfers.at(transfer.resource.index()).at(direction);
-                accumulate(observed);
+                accumulate_context_transfer(observed, transfer);
             }
             if (transfer.direction == ContextTransferDirection::DeviceToHost) {
                 owner->device_to_host_bytes += transfer.work.payload_bytes;

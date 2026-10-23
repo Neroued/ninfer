@@ -39,14 +39,29 @@ struct ContextPrefillCost {
                                                    ContextPrefillCost) noexcept = default;
 };
 
+struct ContextPeerTransferCost {
+    ContextPeerTransfer peer;
+    ContextTransferCost cost;
+
+    friend bool operator==(const ContextPeerTransferCost&,
+                           const ContextPeerTransferCost&) = default;
+};
+
 struct ContextMachineCostModel {
     // Direction order is DeviceToHost, HostToDevice, DeviceToDevice, HostToHost.
     std::array<ContextTransferCost, 4> transfer{};
     ContextPrefillCost prefill;
+    // Supplied for the selected deployment; local machine presets do not price network links.
+    std::vector<ContextPeerTransferCost> peer_transfer;
+    // Only an explicitly matched model measurement permits an economic peer-copy comparison.
+    bool prefill_measured = false;
 
     // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
     [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
                                             TransferWork work) const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t>
+    try_transfer_ns(ContextTransferDirection direction, TransferWork work,
+                    std::optional<ContextPeerTransfer> peer = {}) const noexcept;
     [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept;
 
     [[nodiscard]] friend constexpr bool
@@ -54,6 +69,9 @@ struct ContextMachineCostModel {
 };
 
 [[nodiscard]] std::uint64_t price_context_transfer_requirements(
+    const ContextMachineCostModel& model,
+    std::span<const ContextTransferRequirement> requirements) noexcept;
+[[nodiscard]] std::optional<std::uint64_t> try_price_context_transfer_requirements(
     const ContextMachineCostModel& model,
     std::span<const ContextTransferRequirement> requirements) noexcept;
 
@@ -85,8 +103,8 @@ struct ResolvedContextMachineCost {
 [[nodiscard]] std::vector<ContextCostMachinePreset>
 parse_context_cost_presets(std::string_view json, std::string_view source_name);
 
-// Transfer and prefill are resolved independently. Generic numerical defaults always exist;
-// compiled hardware/model values and then matching external values override them.
+// Local transfer and prefill are resolved independently. Compiled hardware/model values and
+// matching external values override their numerical defaults. Peer costs are deployment-owned.
 [[nodiscard]] ResolvedContextMachineCost
 resolve_context_machine_cost(const ContextCostIdentity& identity,
                              const std::filesystem::path& external_preset_path = {});

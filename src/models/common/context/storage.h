@@ -63,6 +63,8 @@ public:
 
     [[nodiscard]] Device device() const noexcept { return device_arena_.device; }
 
+    [[nodiscard]] std::uint32_t logical_rank() const noexcept { return logical_rank_; }
+
     [[nodiscard]] MemorySpan range(ContextRange range) const;
     [[nodiscard]] const ExecutionTableStorage& tables(std::uint32_t pool_id) const;
     [[nodiscard]] std::size_t mapping_capacity_elements() const noexcept;

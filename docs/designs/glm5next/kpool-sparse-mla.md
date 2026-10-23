@@ -37,7 +37,7 @@ Op 不分配页、不选择请求 owner、不决定接受长度，也不发布�
 | page tokens / 最大原 token 上下文 | 64 / 1048576 |
 | 本轮支持的本地 batch | B=1..8；T 为正物理宽度 |
 | 使用位置 | Main 11 层、MTP 1 层，各层独立历史内容和 selection |
-| 双 Spark 放置 | MLA／Indexer 按请求 DP2，owner 执行完整 heads |
+| 双 Spark 放置 | 一个 DP 副本内 MLA／Indexer 按请求 ADP2，owner 执行完整 heads |
 
 当前为 NoPE，没有 MLA 或 Indexer RoPE。Main/MTP 使用相同 storage profile：
 BF16 latent 或 E4M3FN-G128-FP32-scale latent；Indexer、raw tail、raw records 固定 BF16。
@@ -590,7 +590,7 @@ Checkpoint 同时保留对应 growing prefixes、tail 和其他模型状态。�
 read leases、reservation、table 更新和 frontier 发布由 Session／ContextDirectory
 协调；仅截短 cache 不能恢复非四 token 边界的 raw tail。
 
-## 9. MTP、DP 与模型交接
+## 9. MTP、ADP 与模型交接
 
 Main/MTP history 和 tail 分离、请求 owner 相同。本实例 Main 各 MLA 层独立选择，
 不跨层共享 selection。一轮 MTP draft 的调用为：

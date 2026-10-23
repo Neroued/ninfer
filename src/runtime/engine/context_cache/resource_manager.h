@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/contract/resources.h"
+#include "runtime/contract/placement.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
 #include "runtime/engine/context_cache/types.h"
@@ -24,6 +25,7 @@ template <class Model>
 class ResourceManager {
 public:
     using Session           = typename Model::Session;
+    using ResumeState       = typename Model::ResumeState;
     using ContextDemand     = typename Session::ContextDemand;
     using ContextAssessment = typename Session::ContextAssessment;
     using ContextReleaseSet = typename Session::ContextReleaseSet;
@@ -78,6 +80,7 @@ public:
         OwnerToken owner           = 0;
         std::uint64_t shared_entry = 0;
         bool take_over             = false;
+        bool private_snapshot      = false;
         std::optional<OwnerToken> resume_owner;
         bool session_hint               = false;
         std::uint64_t publication_order = 0;
@@ -90,7 +93,7 @@ public:
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Session& session, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
-               std::uint64_t publication_order = UINT64_MAX) {
+               std::uint64_t publication_order = UINT64_MAX, const ResumeState* resume = nullptr) {
         prune(session);
         std::vector<SourceChoice> result;
         if (enabled_) {
@@ -126,18 +129,74 @@ public:
                 }
             }
         }
+        if (own_resume) {
+            for (const auto handle : points(*own_resume)) {
+                if (!session.valid_checkpoint(handle) ||
+                    session.checkpoint_metadata(handle).frontier > maximum_frontier) {
+                    continue;
+                }
+                result.push_back({.source            = Source{.checkpoint = handle},
+                                  .owner             = *own_resume,
+                                  .take_over         = true,
+                                  .resume_owner      = own_resume,
+                                  .publication_order = find_owner(*own_resume)->publication_order,
+                                  .ordinal           = *own_resume});
+            }
+        }
+        if (resume && resume->snapshot_handle() &&
+            session.valid_checkpoint(*resume->snapshot_handle()) &&
+            session.checkpoint_metadata(*resume->snapshot_handle()).frontier <= maximum_frontier) {
+            result.push_back({.source       = Source{.checkpoint = resume->snapshot_handle()},
+                              .resume_owner = own_resume});
+        }
         result.push_back({.source = Source{}, .resume_owner = own_resume});
         if (const auto* waiting = find_waiting(request);
             waiting && waiting->choice.source.checkpoint &&
             contains(waiting->held, *waiting->choice.source.checkpoint)) {
             result.push_back(waiting->choice);
         }
-        std::erase_if(
-            result, [&](auto& choice) { return !prepare_source(session, base, choice, request); });
-        const auto cost = [&](const Source& source) {
-            const auto transfer = price_context_transfer_requirements(costs_, source.transfers);
+        std::vector<SourceChoice> expanded;
+        const auto placements = session.placements(base);
+        for (const auto& choice : result) {
+            for (const auto placement : placements) {
+                auto candidate             = choice;
+                candidate.source.placement = placement;
+                if (prepare_source(session, base, candidate, request, std::nullopt, resume)) {
+                    expanded.push_back(std::move(candidate));
+                }
+            }
+        }
+        result              = std::move(expanded);
+        const auto raw_cost = [&](const Source& source) {
+            const auto transfer = try_price_context_transfer_requirements(costs_, source.transfers);
             const auto prefill  = costs_.prefill_ns(source.remaining_work);
-            return transfer > UINT64_MAX - prefill ? UINT64_MAX : transfer + prefill;
+            return !transfer || *transfer > UINT64_MAX - prefill ? UINT64_MAX : *transfer + prefill;
+        };
+        const auto remote = [](const Source& source) {
+            return std::any_of(source.transfers.begin(), source.transfers.end(),
+                               [](const auto& transfer) { return transfer.peer.has_value(); });
+        };
+        std::vector<std::pair<PlacementId, std::uint64_t>> local_costs;
+        for (const auto placement : placements) {
+            std::uint64_t best = UINT64_MAX;
+            for (const auto& choice : result) {
+                if (choice.source.placement == placement && !remote(choice.source)) {
+                    best = std::min(best, raw_cost(choice.source));
+                }
+            }
+            local_costs.emplace_back(placement, best);
+        }
+        const auto cost = [&](const Source& source) {
+            const auto price = raw_cost(source);
+            if (!remote(source)) { return price; }
+            if (!costs_.prefill_measured || price == UINT64_MAX) { return UINT64_MAX; }
+            const auto local =
+                std::find_if(local_costs.begin(), local_costs.end(),
+                             [&](const auto& entry) { return entry.first == source.placement; });
+            if (local == local_costs.end() || local->second == UINT64_MAX) { return price; }
+            // Only measured immediate savings justify an optional peer copy. A remote source
+            // remains available when local plans cannot reserve the required context.
+            return price < local->second ? price : UINT64_MAX;
         };
         const auto bytes = [](const Source& source) {
             std::uint64_t total = 0;
@@ -169,8 +228,11 @@ public:
             const auto duplicate =
                 std::any_of(unique.begin(), unique.end(), [&](const auto& prior) {
                     return prior.source.checkpoint == choice.source.checkpoint &&
+                           prior.source.placement == choice.source.placement &&
                            prior.source.consume_source == choice.source.consume_source &&
-                           prior.source.private_points == choice.source.private_points;
+                           prior.source.take_private == choice.source.take_private &&
+                           prior.source.private_points == choice.source.private_points &&
+                           prior.source.retired_points == choice.source.retired_points;
                 });
             if (!duplicate) { unique.push_back(std::move(choice)); }
         }
@@ -181,7 +243,8 @@ public:
     // complete binding before applying these grants in its ownership handoff.
     [[nodiscard]] bool prepare_source(Session& session, const Base& base, SourceChoice& choice,
                                       std::uint64_t request                   = 0,
-                                      std::optional<ReclaimRights> revocation = std::nullopt) {
+                                      std::optional<ReclaimRights> revocation = std::nullopt,
+                                      const ResumeState* resume               = nullptr) {
         const auto selected = choice.source.checkpoint;
         if (selected && !session.valid_checkpoint(*selected)) { return false; }
         auto* owner = find_owner(choice.owner);
@@ -205,25 +268,32 @@ public:
         }
         auto carried = points(choice.resume_owner.value_or(choice.owner));
         if (const auto* waiting = find_waiting(request);
-            waiting && waiting->choice.source.checkpoint == selected) {
+            waiting && waiting->choice.source.checkpoint == selected &&
+            waiting->choice.source.placement == choice.source.placement) {
             carried = waiting->choice.source.private_points;
             std::erase_if(carried, [&](auto point) { return !contains(waiting->held, point); });
         }
         const auto private_owner =
             choice.resume_owner.value_or(choice.take_over ? choice.owner : 0);
-        const bool consume = selected && consumable(*selected, private_owner, request, revocation);
-        auto inspected     = session.inspect_source(base, selected, consume, carried, retired);
+        const bool private_snapshot = resume && selected && resume->snapshot_handle() == selected;
+        const bool consume = selected && (private_snapshot || consumable(*selected, private_owner,
+                                                                         request, revocation));
+        auto inspected     = session.inspect_source(base, selected, consume, carried, retired,
+                                                    choice.source.placement, resume);
         if (!inspected) { return false; }
         inspected->take_private =
             std::all_of(inspected->private_points.begin(), inspected->private_points.end(),
                         [&](auto point) { return consumable(point, private_owner, request); });
-        choice.source = std::move(*inspected);
+        choice.source           = std::move(*inspected);
+        choice.private_snapshot = private_snapshot;
         return true;
     }
 
     void retain_source(Session& session, std::uint64_t request, const SourceChoice& choice) {
         std::vector<Handle> held;
-        if (choice.source.checkpoint) { held.push_back(*choice.source.checkpoint); }
+        if (choice.source.checkpoint && !choice.private_snapshot) {
+            held.push_back(*choice.source.checkpoint);
+        }
         for (const auto point : choice.source.private_points) {
             if (!contains(held, point)) { held.push_back(point); }
         }
@@ -351,7 +421,7 @@ public:
             for (auto& entry : shared_) {
                 if (entry.handle == handle) return;
                 const auto prior = session.checkpoint_metadata(entry.handle);
-                if (prior.frontier != summary.frontier ||
+                if (prior.placement != summary.placement || prior.frontier != summary.frontier ||
                     session.checkpoint_key(entry.handle, prior.frontier) !=
                         session.checkpoint_key(handle, summary.frontier))
                     continue;
@@ -421,14 +491,16 @@ public:
     }
 
     [[nodiscard]] bool retain_shared_checkpoint(Session& session, const Base& base,
-                                                std::uint32_t frontier, CheckpointOrigin origin) {
+                                                std::uint32_t frontier, CheckpointOrigin origin,
+                                                PlacementId placement = {}) {
         prune(session);
         const auto key = base.prefix_shortlist_key(frontier);
         if (!key) return false;
         for (auto& entry : shared_) {
-            if (session.checkpoint_metadata(entry.handle).frontier == frontier &&
+            if (session.checkpoint_metadata(entry.handle).placement == placement &&
+                session.checkpoint_metadata(entry.handle).frontier == frontier &&
                 session.checkpoint_key(entry.handle, frontier) == *key &&
-                session.inspect_source(base, entry.handle, false, {}, {})) {
+                session.inspect_source(base, entry.handle, false, {}, {}, placement)) {
                 if (origin == CheckpointOrigin::Semantic) entry.origin = origin;
                 return true;
             }

@@ -97,12 +97,12 @@ void SessionImpl::prepare_binding_resources(context::ContextReservation& reserve
                               directory.pool(pool).histories().prepare_binding(
                                   prefix, prefix ? prefix->frontier() : 0,
                                   pool ? mtp_history_frontier(bind.peak) : bind.peak, bind.lane,
-                                  reserved.take_history(pool), bind.consume_source));
+                                  reserved.take(bind.history_targets[pool]), bind.consume_source));
     }
     if (bind.state_action == StateBindingAction::Move) return;
     const bool materialize = bind.state_action == StateBindingAction::Root ||
                              bind.state_action == StateBindingAction::Fork;
-    auto state_records     = reserved.take_state();
+    auto state_records     = reserved.take(bind.state_target);
     const auto destination = materialize ? states.reserve_destination(std::move(state_records))
                                          : states.reserve_logical_destination(state_records);
     if (!destination) throw std::logic_error("binding lost its State metadata reservation");
@@ -125,14 +125,18 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
     sequence.recovery_peak   = 0;
     settle(sequence);
     if (sequence.phase == Phase::Replay) sequence.phase = sequence.resume_phase;
-    if (pause.save_snapshot)
+    if (pause.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        clear(sequence);
+    } else {
         pause.paused->snapshot =
             detach(sequence, runtime::CheckpointRole::Continuation, std::move(pause.checkpoint));
-    if (!pause.paused->snapshot) clear(sequence);
+        if (!pause.paused->snapshot)
+            throw std::logic_error("prepared pause lost its checkpoint reservation");
+    }
     pause.paused->sequence = std::move(sequences[pause.lane]);
-    if (pause.paused->snapshot) {
+    if (pause.paused->snapshot && pause.action.kind == runtime::PauseKind::HostSnapshot) {
         const auto plan = demotion({&*pause.paused->snapshot, 1});
-        if (plan && !prepare_demotion(operation->migration, *plan, targets))
+        if (plan && !prepare_demotion(operation->migration, *plan, targets, pause.targets))
             throw std::logic_error("prepared pause lost its reserved Host targets");
     }
 }
@@ -151,7 +155,7 @@ void SessionImpl::resume_context(context::ContextReservation targets) {
     } else if (std::holds_alternative<PauseOperation>(operation->action)) {
         prepare_pause_resources(targets);
     } else if (const auto* demote = std::get_if<DemoteOperation>(&operation->action)) {
-        if (!prepare_demotion(operation->migration, *demote->plan, targets))
+        if (!prepare_demotion(operation->migration, *demote->plan, targets, demote->targets))
             throw std::logic_error("reserved demotion changed during Context maintenance");
     } else {
         throw std::logic_error("Context maintenance has no continuation");
@@ -181,12 +185,17 @@ void SessionImpl::submit_context() {
         }
         Work work;
         transaction.final_batch = true;
+        std::vector<context::ContextActionBatchSource> sources;
+        sources.reserve(plan.context.ranks.size());
         for (const auto& rank : plan.context.ranks) {
             const auto& actions = transaction.migration.actions(rank.rank);
             auto& cursor        = transaction.cursors[rank.rank];
-            auto batch          = context::take_action_batch(actions, cursor);
-            if (!batch.empty()) work.actions.emplace(rank.rank, std::move(batch));
-            transaction.final_batch &= cursor.complete(actions);
+            sources.push_back({rank.rank, &actions, &cursor});
+        }
+        auto batches = context::take_action_batches(sources);
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+            if (!batches[i].empty()) work.actions.emplace(sources[i].rank, std::move(batches[i]));
+            transaction.final_batch &= sources[i].cursor->complete(*sources[i].actions);
         }
         work.operation = transaction.final_batch ? std::move(transaction.residency) : ContextWork{};
         transaction.ticket = executor->submit(std::move(transaction.reservation), std::move(work));

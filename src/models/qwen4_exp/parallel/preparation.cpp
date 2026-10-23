@@ -20,7 +20,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     in.finish();
     if (request.rank.rank != identity.rank || request.rank.size != identity.tp.size ||
         identity.tp.rank != identity.rank || identity.ep.size != request.rank.size ||
-        identity.ep.rank != identity.rank || identity.dp.size != 1 || identity.pp.size != 1)
+        identity.ep.rank != identity.rank || identity.dp.size != 1 || identity.pp.size != 1 ||
+        identity.adp.size != 1)
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");

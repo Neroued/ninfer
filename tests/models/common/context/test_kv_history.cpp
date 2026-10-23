@@ -129,11 +129,11 @@ struct Fixture {
     context::RecordReservation reserve_history(const context::HistoryBindingDemand& demand,
                                                std::uint32_t pool) {
         context::ContextDemand whole;
-        whole.add_history(pool, demand);
+        const auto id    = whole.add_history(pool, demand);
         auto reservation = directory->reserve(whole);
         if (!reservation) throw std::bad_alloc();
         expect(reservation.reservation->ready(), "fixture unexpectedly requires pool maintenance");
-        return reservation.reservation->take_history(pool);
+        return reservation.reservation->take(id);
     }
 
     context::HistoryBinding prepare(const context::HistoryPrefix* source, std::uint32_t frontier,
@@ -165,10 +165,10 @@ struct Fixture {
     void grow(context::HistoryId owner, std::uint32_t count) {
         auto& histories = history(owner.pool_id);
         context::ContextDemand demand;
-        demand.add_growth(histories, owner, count);
+        const auto id    = demand.add_growth(histories, owner, count);
         auto reservation = directory->reserve(demand);
         if (!reservation) throw std::bad_alloc();
-        auto records = reservation.reservation->take_history(owner.pool_id);
+        auto records = reservation.reservation->take(id);
         histories.prepare_growth(owner, records);
         histories.adopt_growth(owner, std::move(records));
     }
@@ -210,11 +210,11 @@ struct Fixture {
     }
 
     context::RecordReservation host_reservation(std::uint32_t count, std::uint32_t pool = 0) {
-        context::ContextDemand demand{.histories = {{pool, count, {}}},
-                                      .memory    = context::ContextMemory::Host};
+        context::ContextDemand demand;
+        const auto id = demand.add_history(pool, count, context::ContextMemory::Host);
         auto reserved = directory->reserve(demand);
         if (!reserved) throw std::bad_alloc();
-        return reserved.reservation->take_history(pool);
+        return reserved.reservation->take(id);
     }
 
     void backup(std::span<const context::PageId> records, bool drop_device = false) {
@@ -397,7 +397,14 @@ void reservations_and_host(DeviceContext& device) {
     expect(rejected && f.histories->reserved_growth_pages(a.handle()) == 4 &&
                f.histories->reserved_growth_pages(b.handle()) == 0,
            "failed growth mutated an existing permit");
+    const context::RecordAssessment pressure{
+        {{{0, context::ContextMemory::Device}, {.reclaim_bytes = f.page_layout.page_bytes}}}};
+    expect(f.histories->growth_contributes(a.handle(), pressure, false),
+           "unused growth permit was absent from pause capacity contribution");
     f.histories->release_growth(a.handle());
+    expect(!f.histories->growth_contributes(a.handle(), pressure, false) &&
+               !f.histories->growth_contributes(a.handle(), {}, true),
+           "released growth still advertised record or metadata contribution");
     f.grow(a.handle(), 3);
     f.grow(b.handle(), 4);
     expect(f.reserved_pages() == 7, "retry lost released shared capacity");

@@ -221,7 +221,8 @@ public:
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     youngest_victim(const Slots& slots, std::uint32_t concurrency,
-                    std::optional<std::uint64_t> priority_ticket = std::nullopt) const noexcept {
+                    std::optional<std::uint64_t> priority_ticket = std::nullopt,
+                    std::span<const std::uint32_t> excluded      = {}) const noexcept {
         std::optional<std::uint32_t> oldest;
         std::optional<std::uint32_t> youngest;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
@@ -231,6 +232,7 @@ public:
             }
             if (!oldest || request->id < slots[*oldest]->id) { oldest = lane; }
             if (!request->recovery_pending &&
+                std::find(excluded.begin(), excluded.end(), lane) == excluded.end() &&
                 (!priority_ticket || request->id > *priority_ticket) &&
                 (!youngest || request->id > slots[*youngest]->id)) {
                 youngest = lane;

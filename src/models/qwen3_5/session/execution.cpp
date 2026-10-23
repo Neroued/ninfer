@@ -215,13 +215,12 @@ SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<co
     }
 }
 
-std::optional<runtime::ExecutionTicket> SessionImpl::start_normalize(SequenceHandle handle) {
+std::optional<runtime::ExecutionTicket>
+SessionImpl::start_normalize(SequenceHandle handle, runtime::ExecutionReservation reservation) {
     if (execution) return {};
     const auto l = lane(handle);
     auto& state  = sequences[l];
     require_unit(l, ExecutionUnitKind::Normalize);
-    auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
-    if (!reservation) return {};
     try {
         Execution pending{.kind = OperationKind::Normalize};
         pending.members     = {handle};
@@ -233,7 +232,7 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_normalize(SequenceHan
             has_backend_pool() ? state.continuation.metadata.execution_frontier : 0,
             *pending.preparation);
         NormalizeWork work{{execution_row(state)}};
-        return submit_execution(std::move(pending), std::move(*reservation),
+        return submit_execution(std::move(pending), std::move(reservation),
                                 Work{.operation = std::move(work)});
     } catch (const std::exception& error) {
         executor().fail(error.what());

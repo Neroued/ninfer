@@ -317,9 +317,11 @@ context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& pl
 }
 
 bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const Demotion& plan,
-                                   context::ContextReservation& targets) {
+                                   context::ContextReservation& targets,
+                                   const context::HostDemandIds& target_ids) {
     std::vector<Image> redundant;
-    auto state_targets = targets.take_state();
+    auto state_targets =
+        target_ids.state.valid() ? targets.take(target_ids.state) : context::RecordReservation{};
     for (const auto image : plan.images) {
         auto& states = directory.states();
         if (!states.valid(image) || !states.device_resident(image) || states.source_pins(image))
@@ -345,7 +347,8 @@ bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const
             else
                 pages.push_back(page);
         }
-        if (!pages.empty()) migration.add_backups(pool, pages, targets.take_history(pool), true);
+        if (!pages.empty())
+            migration.add_backups(pool, pages, targets.take(target_ids.histories.at(pool)), true);
     }
     for (const auto image : redundant) {
         if (!directory.states().drop_device_replica(image)) {
@@ -384,12 +387,13 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
     ContextReclaimPlan result;
     result.inventory = facts.inventory;
     if (operation) return result;
-    auto selected = facts.inventory->select();
+    const bool needs_device = demand.empty() || demand.uses_memory(context::ContextMemory::Device);
+    auto selected           = facts.inventory->select();
     for (const auto& group : facts.groups) {
         auto probe = selected.probe(group.sources);
         if (!selected.released().empty())
             result.releases.push_back({group.sources, selected.released()});
-        if (demand.memory == context::ContextMemory::Host || !has_host(*this)) continue;
+        if (!needs_device || !has_host(*this)) continue;
         if (auto plan = demotion_for_group(*this, group, demand)) {
             result.demotions.push_back(describe_demotion(std::move(plan)));
         }
@@ -413,8 +417,9 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
             return runtime::ContextStart::Stale;
         }
     }
-    const auto demand    = directory.host_demand(host_requirements(*quote.impl));
-    const auto placement = directory.assess(demand, footprint(victims, true));
+    ContextDemand demand;
+    const auto target_ids = demand.add_host(host_requirements(*quote.impl));
+    const auto placement  = directory.assess(demand, footprint(victims, true));
     if (!placement.feasible()) return runtime::ContextStart::Stale;
     if (placement.requires_maintenance() && executor->has_pending_work()) {
         pending_maintenance = placement;
@@ -423,7 +428,7 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
     }
     auto execution = executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return runtime::ContextStart::Deferred;
-    DemoteOperation action{quote.impl, {}};
+    DemoteOperation action{quote.impl, {}, target_ids};
     action.sources.reserve(quote.sources.size());
     for (const auto source : quote.sources) action.sources.push_back(checkpoints.lease(source));
     for (const auto victim : victims) {
@@ -443,7 +448,8 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
         } else {
             operation = std::make_unique<ContextOperation>(directory, std::move(action),
                                                            std::move(*execution));
-            if (!prepare_demotion(operation->migration, *quote.impl, *reserved.reservation)) {
+            if (!prepare_demotion(operation->migration, *quote.impl, *reserved.reservation,
+                                  target_ids)) {
                 throw std::logic_error("Prepared demotion lost its destination");
             }
         }

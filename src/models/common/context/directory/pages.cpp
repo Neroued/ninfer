@@ -215,6 +215,17 @@ PageDirectory::ReadLease PageDirectory::read_host(PageId handle, std::uint32_t r
     return ReadLease(*this, handle, rank, ContextMemory::Host, coverage);
 }
 
+PageDirectory::ReadLease PageDirectory::read_device_prefix(PageId handle, std::uint32_t rank,
+                                                           std::uint32_t coverage) {
+    auto& page  = require(handle);
+    auto& local = part(page, rank);
+    if (!coverage || coverage > page.protected_columns || !device_covers(handle, rank, coverage) ||
+        local.restoring || page.destination_pinned || page.readers() == UINT32_MAX)
+        throw std::logic_error("KV prefix reader lacks protected Device coverage");
+    ++local.device_readers;
+    return ReadLease(*this, handle, rank, ContextMemory::Device, coverage);
+}
+
 PageDirectory::Restore::Restore(PageDirectory& store, ReadLease source,
                                 RecordLease destination) noexcept
     : store_(&store), source_(std::move(source)), destination_(std::move(destination)) {}
@@ -537,6 +548,17 @@ PageId PageDirectory::materialize_transfer_destination(RecordReservation& reserv
     page.references         = 0;
     page.destination_pinned = true;
     return handle;
+}
+
+PageId PageDirectory::materialize_conversion_destination(RecordReservation& reservation,
+                                                         PageId source, std::uint32_t columns,
+                                                         std::span<const std::uint32_t> ranks) {
+    const auto epoch = content_epoch(source);
+    if (columns > committed_columns(source))
+        throw std::invalid_argument("KV conversion exceeds committed source coverage");
+    const auto destination = materialize_transfer_destination(reservation, columns, ranks);
+    require(destination).content_epoch = epoch;
+    return destination;
 }
 
 void PageDirectory::publish_transfer_destination(PageId handle) noexcept {

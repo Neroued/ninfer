@@ -323,14 +323,30 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
 
 std::uint64_t ContextMachineCostModel::transfer_ns(ContextTransferDirection direction,
                                                    TransferWork work) const noexcept {
+    return try_transfer_ns(direction, work).value_or(std::numeric_limits<std::uint64_t>::max());
+}
+
+std::optional<std::uint64_t>
+ContextMachineCostModel::try_transfer_ns(ContextTransferDirection direction, TransferWork work,
+                                         std::optional<ContextPeerTransfer> peer) const noexcept {
     if (work.payload_bytes == 0 && work.copy_operations == 0) { return 0; }
-    const std::size_t index = direction_index(direction);
-    if (index >= transfer.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-    const ContextTransferCost& cost = transfer[index];
-    const std::uint64_t operation_limited =
-        saturating_add(cost.batch_ns, saturating_product(cost.operation_ns, work.copy_operations));
+    const ContextTransferCost* cost = nullptr;
+    if (direction == ContextTransferDirection::PeerDeviceToDevice) {
+        if (!peer || peer->source_rank == peer->destination_rank) return {};
+        const auto found = std::find_if(peer_transfer.begin(), peer_transfer.end(),
+                                        [&](const auto& entry) { return entry.peer == *peer; });
+        if (found == peer_transfer.end()) return {};
+        cost = &found->cost;
+        if (!cost->batch_ns && !cost->operation_ns && !cost->ns_per_byte_q32) return {};
+    } else {
+        const std::size_t index = direction_index(direction);
+        if (peer || index >= transfer.size()) return {};
+        cost = &transfer[index];
+    }
+    const std::uint64_t operation_limited = saturating_add(
+        cost->batch_ns, saturating_product(cost->operation_ns, work.copy_operations));
     const std::uint64_t bandwidth_limited =
-        q32_product_ns(cost.ns_per_byte_q32, work.payload_bytes);
+        q32_product_ns(cost->ns_per_byte_q32, work.payload_bytes);
     return std::max(operation_limited, bandwidth_limited);
 }
 
@@ -348,6 +364,13 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
 std::uint64_t price_context_transfer_requirements(
     const ContextMachineCostModel& model,
     std::span<const ContextTransferRequirement> requirements) noexcept {
+    return try_price_context_transfer_requirements(model, requirements)
+        .value_or(std::numeric_limits<std::uint64_t>::max());
+}
+
+std::optional<std::uint64_t> try_price_context_transfer_requirements(
+    const ContextMachineCostModel& model,
+    std::span<const ContextTransferRequirement> requirements) noexcept {
     constexpr std::array directions{
         ContextTransferDirection::DeviceToHost,
         ContextTransferDirection::HostToDevice,
@@ -363,8 +386,9 @@ std::uint64_t price_context_transfer_requirements(
         std::array<TransferWork, directions.size()> coalesced{};
         for (const auto& requirement : requirements) {
             if (requirement.rank != rank) continue;
+            if (requirement.direction == ContextTransferDirection::PeerDeviceToDevice) continue;
             const auto index = direction_index(requirement.direction);
-            if (index >= coalesced.size()) return std::numeric_limits<std::uint64_t>::max();
+            if (requirement.peer || index >= coalesced.size()) return {};
             auto& work         = coalesced[index];
             work.payload_bytes = saturating_add(work.payload_bytes, requirement.work.payload_bytes);
             const auto operations =
@@ -376,6 +400,36 @@ std::uint64_t price_context_transfer_requirements(
         for (std::size_t index = 0; index < coalesced.size(); ++index)
             serial_work =
                 saturating_add(serial_work, model.transfer_ns(directions[index], coalesced[index]));
+        for (std::size_t peer_first = 0; peer_first < requirements.size(); ++peer_first) {
+            const auto& first_peer = requirements[peer_first];
+            if (first_peer.rank != rank ||
+                first_peer.direction != ContextTransferDirection::PeerDeviceToDevice)
+                continue;
+            if (!first_peer.peer ||
+                (rank != first_peer.peer->source_rank && rank != first_peer.peer->destination_rank))
+                return {};
+            if (std::any_of(requirements.begin(), requirements.begin() + peer_first,
+                            [&](const auto& prior) {
+                                return prior.rank == rank &&
+                                       prior.direction == first_peer.direction &&
+                                       prior.peer == first_peer.peer;
+                            }))
+                continue;
+            TransferWork work;
+            for (const auto& requirement : requirements) {
+                if (requirement.rank != rank || requirement.direction != first_peer.direction ||
+                    requirement.peer != first_peer.peer)
+                    continue;
+                work.payload_bytes =
+                    saturating_add(work.payload_bytes, requirement.work.payload_bytes);
+                work.copy_operations = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    std::uint64_t(work.copy_operations) + requirement.work.copy_operations,
+                    std::numeric_limits<std::uint32_t>::max()));
+            }
+            const auto cost = model.try_transfer_ns(first_peer.direction, work, first_peer.peer);
+            if (!cost) return {};
+            serial_work = saturating_add(serial_work, *cost);
+        }
         longest_rank = std::max(longest_rank, serial_work);
     }
     return longest_rank;
@@ -511,6 +565,7 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
         }
     }
 
+    model.prefill_measured = prefill_source != ContextCostPresetSource::GenericDefault;
     return ResolvedContextMachineCost{
         .model = model,
         .summary =

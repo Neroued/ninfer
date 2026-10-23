@@ -212,6 +212,22 @@ bool ContextStorage::uses_cuda(const ContextActions& actions) noexcept {
 }
 
 runtime::ContextTransferObservation ContextStorage::describe(const ContextAction& action) const {
+    if (const auto* peer = std::get_if<PeerCopy>(&action)) {
+        std::size_t bytes = 0;
+        for (const auto& value : peer->ranges) {
+            if (value.bytes > SIZE_MAX - bytes)
+                throw std::overflow_error("Context peer payload size overflow");
+            bytes += value.bytes;
+        }
+        return {.resource    = peer->resource,
+                .direction   = runtime::ContextTransferDirection::PeerDeviceToDevice,
+                .image_count = peer->image_count,
+                .page_groups = peer->page_groups,
+                .work        = {bytes, bytes ? 1U : 0U},
+                .rank        = logical_rank_,
+                .peer        = runtime::ContextPeerTransfer{peer->send ? logical_rank_ : peer->peer,
+                                                     peer->send ? peer->peer : logical_rank_}};
+    }
     const auto* copy = std::get_if<RecordCopy>(&action);
     if (!copy || copy->source == copy->destination || copy->source.bytes == 0) return {};
     using Direction = runtime::ContextTransferDirection;
@@ -247,6 +263,18 @@ void ContextStorage::validate(const ContextActions& actions, ConstMemorySpan sta
                     validate_copy(value.source, value.destination);
                 } else if constexpr (std::is_same_v<T, MappingUpdate>) {
                     tables(value.pool_id).validate(value.row, value.logical_begin, value.offsets);
+                } else if constexpr (std::is_same_v<T, PeerCopy>) {
+                    if (value.peer == logical_rank_ || value.ranges.empty() ||
+                        value.ranges.size() > kContextActionBatchOffsets)
+                        throw std::invalid_argument(
+                            "Context peer action has invalid endpoints or ranges");
+                    for (const auto& local : value.ranges) {
+                        if (local.memory != ContextMemory::Device || local.bytes == 0)
+                            throw std::invalid_argument(
+                                "Context peer ranges require nonempty Device storage");
+                        (void)range(local);
+                    }
+                    (void)describe(action);
                 }
             },
             action);
@@ -285,6 +313,8 @@ std::size_t ContextStorage::execute(const ContextAction& action, MemorySpan stag
                 tables(value.pool_id)
                     .publish(value.row, value.logical_begin, value.offsets, staging, execution);
                 return value.offsets.size() * sizeof(std::int64_t);
+            } else if constexpr (std::is_same_v<T, PeerCopy>) {
+                throw std::logic_error("Context peer action requires a prepared migration slot");
             }
             return 0;
         },

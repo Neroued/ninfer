@@ -17,6 +17,9 @@
 Context 存储采用现有[统一容量、记录视图与执行借用合同](../../maintainer/paged-kv-cache.md)。
 GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-state-variants-与字段布局)
 维护，KDA／Kpool 定义自身字段访问；Main/MTP history 与 State 共享各 rank 的物理容量。
+[Attention DP 放置与上下文管理](../attention-dp-placement.md)定义动态 owner 选择、
+来源恢复、混合 placement 预留和容量压力下的转换，并明确完整 DP 副本与实例内 ADP
+的边界。GLM 首版为 DP1 / ADP2；共享策略与模型布局分别维护。
 
 ## 1. 文档与状态
 
@@ -27,6 +30,7 @@ GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-stat
 |---|---|---|
 | 架构、源表示、量化与数值政策 | 已确定 | 长期参考；新量化产物尚未生成或做模型精度评测 |
 | [双 Spark 分工与资源](parallel.md) | 模块分工、State variants、owner histories 与统一容量需求已确定 | 通用目录已有对应能力，待 GLM 绑定、通信与执行接入；容量为推导 |
+| [Attention DP 放置与上下文管理](../attention-dp-placement.md) | token 负载、缓存亲和、完整预留、跨 owner 恢复及压力处理已确定 | 共享合同扩展与 GLM 接入待实施 |
 | [Linear/MoE 清单](op-checklist.md) | Q8 shared 完整链、MLA query/O、Q4 draft head、stem/Vision 纯矩阵与 MoE 优化迁入 | `.50` 工作区按清单逐项实施 |
 | [KDA 计算与 ReplaySSM](replayssm-kda.md) | 字段／I64 offsets、source/destination、五个 frame record planes、Host/Device fold 与搬迁后 Graph 使用已明确 | 原位 batch update 已使用字段视图；新增输入链、独立目的及 record/fold 待实现／验收 |
 | [Kpool Sparse MLA](kpool-sparse-mla.md) | 读写 views、多层页组、冻结 selection、Context/frame tail 和五个计算入口已明确 | 设计待实现／验收 |
@@ -48,7 +52,7 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 
 仍需设计或落实的工作：
 
-- 跨模块 collective、pack/unpack、通算融合、模型 Graph 和跨 owner 前缀恢复。
+- 设计跨模块 collective、pack/unpack、通算融合与模型 Graph；按 Attention DP 设计落实放置和跨 owner 恢复。
 - 按 MTP/Vision 设计落实执行、媒体输入与资源交接；连接分片 logits、采样、acceptance 和 scoring。
 - KDA 输入准备、record/fold 的实现与 Spark 调优；输出复用 sigmoid gated RMSNorm，长 prefill 由完整窗口入口内部选择算法。
 - Converter、artifact binding、模型加载／Frontend／Engine 接入和完整状态组合。
@@ -64,6 +68,7 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 | 表示、codec、activation permission、可观察舍入 | 长期数值参考；已有通用格式直接引用 |
 | 通用 Context 容量、记录寻址、借用与搬迁 | [Context 存储合同](../../maintainer/paged-kv-cache.md) |
 | 分片、owner、State variants、通信交接与部署预算 | parallel.md |
+| 动态放置、来源选择、联合预留与跨 owner 生命周期 | [Attention DP 设计](../attention-dp-placement.md) |
 | 具体 Op/views、physical layout、写域、alias、融合与验收 | 对应 family 设计 |
 | 执行条目与完成证据 | op-checklist.md |
 | Frontend 接入条目与完成条件 | [Frontend 清单](frontend-checklist.md) |

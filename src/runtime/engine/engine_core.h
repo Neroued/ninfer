@@ -6,6 +6,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
+#include "runtime/engine/context_cache/placement_policy.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/executor/contract.h"
@@ -83,6 +84,7 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 instance_.executor->bind_to_current_thread();
+                publish_runtime_stats();
                 startup.set_value();
             } catch (...) {
                 startup.set_exception(std::current_exception());
@@ -518,9 +520,15 @@ private:
                             typename ResourceManagement::ReclaimCursor* cursor = nullptr,
                             std::optional<std::uint64_t> priority_ticket       = std::nullopt);
 
-    bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket);
+    bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket,
+                              const ContextAssessment&);
 
-    bool pause_resident(std::uint32_t lane);
+    enum class PauseGoal { YieldLane, ReleaseCapacity, RecoverCapacity, RelocateOnly };
+    bool pause_resident(std::uint32_t lane, PauseGoal goal = PauseGoal::YieldLane,
+                        const ContextAssessment* pressure = nullptr);
+
+    void order_binding_sources(const std::shared_ptr<Request>&, LaneId,
+                               std::vector<typename ResourceManagement::SourceChoice>&);
 
     void finish_source_wait(const std::shared_ptr<Request>& request,
                             Clock::time_point now) noexcept;
@@ -585,6 +593,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
+    PlacementId next_placement_tie_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

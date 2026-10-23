@@ -249,7 +249,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
 #undef COUNTER
 
     header("context_transfer_bytes_total", "counter", "Completed context payload transfers.");
-    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h"};
+    constexpr std::array directions{"d2h", "h2d", "d2d", "h2h", "peer_d2d"};
     for (std::size_t i = 0; i < directions.size(); ++i) {
         out << "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\""
             << directions[i] << "\"} "

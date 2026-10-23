@@ -87,6 +87,13 @@ enum class ContextTransferDirection : std::uint8_t {
     HostToDevice,
     DeviceToDevice,
     HostToHost,
+    PeerDeviceToDevice,
+};
+
+struct ContextPeerTransfer {
+    std::uint32_t source_rank = 0, destination_rank = 0;
+
+    friend constexpr bool operator==(ContextPeerTransfer, ContextPeerTransfer) noexcept = default;
 };
 
 struct ContextTransferObservation {
@@ -97,6 +104,8 @@ struct ContextTransferObservation {
     TransferWork work;
     std::uint64_t elapsed_ns = 0;
     std::uint32_t rank       = 0;
+    // Both endpoints report their own elapsed time. Payload is counted at the source only.
+    std::optional<ContextPeerTransfer> peer;
 };
 
 struct ContextTransferRequirement {
@@ -106,6 +115,7 @@ struct ContextTransferRequirement {
     std::uint32_t page_groups          = 0;
     TransferWork work;
     std::uint32_t rank = 0;
+    std::optional<ContextPeerTransfer> peer;
 
     [[nodiscard]] friend constexpr bool operator==(ContextTransferRequirement,
                                                    ContextTransferRequirement) noexcept = default;

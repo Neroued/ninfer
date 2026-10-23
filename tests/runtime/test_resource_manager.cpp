@@ -61,8 +61,9 @@ struct Assessment {
     bool impossible() const { return exceeds_capacity; }
 };
 
-using Key  = std::vector<std::uint32_t>;
-using Role = ninfer::runtime::CheckpointRole;
+using Key         = std::vector<std::uint32_t>;
+using Role        = ninfer::runtime::CheckpointRole;
+using PlacementId = ninfer::runtime::PlacementId;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -98,11 +99,20 @@ struct Base {
     }
 };
 
+struct ResumeState {
+    Key tokens;
+    std::optional<Handle> snapshot;
+
+    [[nodiscard]] std::optional<Handle> snapshot_handle() const { return snapshot; }
+};
+
 struct Source {
     std::optional<Handle> checkpoint;
+    PlacementId placement;
     std::uint32_t reused_tokens = 0;
     ninfer::runtime::PrefillWork remaining_work;
     std::vector<ninfer::runtime::ContextTransferRequirement> transfers;
+    bool local_device   = false;
     bool consume_source = false;
     bool take_private   = false;
     std::vector<Handle> retired_points;
@@ -126,11 +136,13 @@ struct Program {
         bool leased              = false;
         bool release_blocked     = false;
         bool demotion_blocked    = false;
+        bool fork_device_copy    = false;
         std::uint32_t main_pages = 1;
         std::optional<std::uint32_t> demotion_page_limit;
         std::optional<std::size_t> demotion_bytes;
         Role role                                = Role::SharedPrefix;
         ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
+        PlacementId placement;
     };
 
     struct HostBlock {
@@ -143,6 +155,7 @@ struct Program {
         Role role;
         bool leased;
         ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
+        PlacementId placement;
     };
 
     struct Summary {
@@ -160,6 +173,7 @@ struct Program {
     };
 
     std::size_t host_capacity;
+    std::vector<PlacementId> available_placements{{0}};
     std::vector<Content> contents;
     std::vector<HostBlock> blocks;
     std::vector<Handle> released;
@@ -198,14 +212,19 @@ struct Program {
     }
 
     Handle add(Key tokens, std::vector<std::size_t> host_blocks = {},
-               Role role = Role::SharedPrefix) {
+               Role role = Role::SharedPrefix, PlacementId placement = {}) {
         const Handle handle{static_cast<std::uint32_t>(contents.size())};
         contents.push_back({std::move(tokens), std::move(host_blocks)});
         ++checkpoint_revision;
-        contents.back().role = role;
+        contents.back().role      = role;
+        contents.back().placement = placement;
         require(physical_usage().occupied.host_bytes <= host_capacity,
                 "fixture exceeded its physical Host capacity");
         return handle;
+    }
+
+    [[nodiscard]] std::span<const PlacementId> placements(const Base&) const {
+        return available_placements;
     }
 
     [[nodiscard]] bool references(const Content& content, std::size_t block) const {
@@ -286,7 +305,7 @@ struct Program {
         const auto& content = contents.at(handle.index);
         require(content.alive, "cache queried a released checkpoint");
         return {static_cast<std::uint32_t>(content.tokens.size()), content.role, content.leased,
-                content.origin};
+                content.origin, content.placement};
     }
 
     [[nodiscard]] Summary checkpoint_summary(Handle handle) const {
@@ -353,12 +372,16 @@ struct Program {
         return true;
     }
 
-    [[nodiscard]] std::optional<Source> inspect_source(const Base& base,
-                                                       std::optional<Handle> handle,
-                                                       bool consume                    = false,
-                                                       std::span<const Handle> carried = {},
-                                                       std::span<const Handle> retired = {}) const {
-        Source source{.checkpoint = handle};
+    [[nodiscard]] std::optional<Source>
+    inspect_source(const Base& base, std::optional<Handle> handle, bool consume = false,
+                   std::span<const Handle> carried = {}, std::span<const Handle> retired = {},
+                   PlacementId target = {}, const ResumeState* resume = nullptr) const {
+        if (std::find(available_placements.begin(), available_placements.end(), target) ==
+            available_placements.end()) {
+            return std::nullopt;
+        }
+        const auto& tokens = resume ? resume->tokens : base.tokens;
+        Source source{.checkpoint = handle, .placement = target};
         source.consume_source = consume;
         source.take_private   = consume;
         source.retired_points.assign(retired.begin(), retired.end());
@@ -372,8 +395,13 @@ struct Program {
         }
         if (handle) {
             const auto summary = checkpoint_summary(*handle);
-            if (base.prefix_shortlist_key(summary.frontier) != summary.key) { return std::nullopt; }
+            if (summary.frontier > tokens.size() ||
+                !std::equal(summary.key.begin(), summary.key.end(), tokens.begin())) {
+                return std::nullopt;
+            }
             source.reused_tokens = summary.frontier;
+            const auto& content  = contents.at(handle->index);
+            source.local_device  = content.placement == target && content.host_blocks.empty();
             const auto footprint = checkpoint_footprint({&*handle, 1});
             if (footprint.host_bytes) {
                 source.transfers.push_back({
@@ -381,8 +409,14 @@ struct Program {
                     .work      = {.payload_bytes = footprint.host_bytes},
                 });
             }
+            if (source.local_device && content.fork_device_copy) {
+                source.transfers.push_back({
+                    .direction = ninfer::runtime::ContextTransferDirection::DeviceToDevice,
+                    .work      = {.payload_bytes = footprint.device_bytes},
+                });
+            }
         }
-        source.remaining_work.tokens = base.tokens.size() - source.reused_tokens;
+        source.remaining_work.tokens = tokens.size() - source.reused_tokens;
         return source;
     }
 
@@ -627,6 +661,7 @@ struct Program {
 
 struct Model {
     using Session          = ::Program;
+    using ResumeState      = ::ResumeState;
     using RequestBasePlan  = Base;
     using CheckpointHandle = Handle;
     using SourceCandidate  = Source;
@@ -754,6 +789,157 @@ void test_shared_publication_deduplicates_complete_snapshots() {
             "shared capture lookup accepted a position without a complete state");
     require(f.cache.candidates(f.program, request).size() == 2,
             "duplicate shared publication left an extra source");
+}
+
+void test_shared_publication_preserves_distinct_placements() {
+    Fixture f(0);
+    f.program.available_placements = {{0}, {1}};
+    const auto first               = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {0});
+    f.publish(first);
+    const Base request{.tokens = {1, 2, 3, 4}};
+    const auto origin = ninfer::runtime::CheckpointOrigin::Semantic;
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
+                !f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+            "a remote checkpoint suppressed a local shared capture");
+
+    const auto second = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {1});
+    f.publish(second);
+    const auto duplicate = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {1});
+    f.publish(duplicate);
+    require(f.program.valid_checkpoint(first) && f.program.valid_checkpoint(second) &&
+                !f.program.valid_checkpoint(duplicate),
+            "shared publication did not distinguish placement from same-side duplication");
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
+                f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+            "shared capture lookup lost one placement's complete snapshot");
+    require(f.cache.erase(f.program, first) &&
+                !f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
+                f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+            "retiring one placement removed another placement's recovery point");
+}
+
+void test_candidates_expand_sources_and_target_placements() {
+    Fixture f(0);
+    f.program.available_placements = {{0}, {1}};
+    const auto first               = f.program.add({1, 2}, {}, Role::SharedPrefix, {0});
+    const auto second              = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {1});
+    f.program.contents[first.index].fork_device_copy = true;
+    f.publish(first);
+    f.publish(second);
+    const Base base{.tokens = {1, 2, 3, 4}};
+    const auto candidates = f.cache.candidates(f.program, base);
+    require(candidates.size() == 6, "source enumeration lost a target or cold candidate");
+    for (const auto& candidate : candidates) {
+        const auto& source = candidate.source;
+        const bool local =
+            source.checkpoint &&
+            f.program.contents[source.checkpoint->index].placement == source.placement;
+        require(source.local_device == local,
+                "candidate locality did not preserve the model's checkpoint placement");
+        if (source.checkpoint == first && local) {
+            require(source.local_device && source.transfers.size() == 1 &&
+                        source.transfers.front().direction ==
+                            ninfer::runtime::ContextTransferDirection::DeviceToDevice,
+                    "a local Device fork lost locality because it required a copy");
+        }
+    }
+    for (const auto target : f.program.available_placements) {
+        for (const auto source : {std::optional<Handle>{first}, std::optional<Handle>{second},
+                                  std::optional<Handle>{}}) {
+            require(std::count_if(candidates.begin(), candidates.end(),
+                                  [&](const auto& candidate) {
+                                      return candidate.source.checkpoint == source &&
+                                             candidate.source.placement == target;
+                                  }) == 1,
+                    "source and target placement did not identify an independent candidate");
+        }
+    }
+    const auto bounded = f.cache.candidates(f.program, base, 2);
+    require(bounded.size() == 4 && std::none_of(bounded.begin(), bounded.end(),
+                                                [&](const auto& candidate) {
+                                                    return candidate.source.checkpoint == second;
+                                                }),
+            "recovery frontier filtering lost a legal target or retained a deeper source");
+    require(f.program.released.empty(), "candidate inspection modified checkpoint ownership");
+}
+
+void test_private_resume_snapshot_uses_committed_recovery_target() {
+    Fixture f(0);
+    f.program.available_placements = {{0}, {1}};
+    const Base base{.tokens = {1, 2}};
+    const auto owner    = f.begin(base);
+    const auto snapshot = f.program.add({1, 2, 3}, {}, Role::Continuation, {1});
+    const ResumeState resume{.tokens = {1, 2, 3, 4}, .snapshot = snapshot};
+    auto candidates = f.cache.candidates(f.program, base, UINT32_MAX, owner, 10, 1, &resume);
+    require(candidates.size() == 4, "private resume snapshot was omitted from target enumeration");
+    for (auto& candidate : candidates) {
+        require(candidate.resume_owner == owner, "resume candidate lost its continuation owner");
+        if (candidate.source.checkpoint) {
+            require(candidate.source.checkpoint == snapshot && candidate.source.consume_source &&
+                        candidate.source.reused_tokens == 3 &&
+                        candidate.source.remaining_work.tokens == 1,
+                    "private resume used prompt length or public-catalog consumption rights");
+            require(f.cache.prepare_source(f.program, base, candidate, 10, std::nullopt, &resume) &&
+                        candidate.source.consume_source &&
+                        candidate.source.remaining_work.tokens == 1,
+                    "binding preparation lost the resume intent");
+            f.cache.retain_source(f.program, 10, candidate);
+            f.cache.release_source(f.program, 10);
+            require(f.program.valid_checkpoint(snapshot),
+                    "waiting-source release destroyed a snapshot owned by ResumeState");
+        } else {
+            require(candidate.source.remaining_work.tokens == 4,
+                    "cold resume did not include the committed generated tokens");
+        }
+    }
+    const auto public_candidates = f.cache.candidates(f.program, base);
+    require(public_candidates.size() == 2 &&
+                std::none_of(public_candidates.begin(), public_candidates.end(),
+                             [](const auto& candidate) { return candidate.source.checkpoint; }),
+            "private resume snapshot became a public source");
+    require(f.program.valid_checkpoint(snapshot) && f.program.released.empty(),
+            "resume inspection consumed a checkpoint before binding");
+}
+
+void test_resume_waiting_retains_private_points_but_borrows_snapshot() {
+    for (const bool replace : {false, true}) {
+        Fixture f(0);
+        const Base base{.tokens = {1, 2}};
+        const auto owner    = f.begin(base);
+        const auto anchor   = f.program.add({1, 2, 3}, {}, Role::LongAnchor);
+        const auto snapshot = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
+        f.cache.publish(f.program, owner, anchor);
+        const ResumeState resume{.tokens = {1, 2, 3, 4, 5}, .snapshot = snapshot};
+        const auto choices = f.cache.candidates(f.program, base, UINT32_MAX, owner, 10, 1, &resume);
+        const auto source  = std::find_if(choices.begin(), choices.end(), [&](const auto& choice) {
+            return choice.source.checkpoint == snapshot;
+        });
+        require(source != choices.end() &&
+                    source->source.private_points == std::vector<Handle>{anchor},
+                "resume snapshot did not carry its compatible private checkpoint");
+        require(std::any_of(choices.begin(), choices.end(),
+                            [&](const auto& choice) {
+                                return choice.source.checkpoint == anchor &&
+                                       choice.source.reused_tokens == 3 &&
+                                       choice.source.remaining_work.tokens == 2;
+                            }),
+                "resume omitted an owned checkpoint beyond the original prompt");
+
+        f.cache.retain_source(f.program, 10, *source);
+        f.cache.abandon(f.program, owner);
+        require(f.program.valid_checkpoint(anchor) && f.program.valid_checkpoint(snapshot),
+                "waiting resume lost its carried checkpoint when catalog ownership ended");
+        if (replace) {
+            const auto cold = std::find_if(choices.begin(), choices.end(), [](const auto& choice) {
+                return !choice.source.checkpoint;
+            });
+            require(cold != choices.end(), "resume did not provide a cold fallback");
+            f.cache.retain_source(f.program, 10, *cold);
+        }
+        f.cache.release_source(f.program, 10);
+        require(!f.program.valid_checkpoint(anchor) && f.program.valid_checkpoint(snapshot),
+                "waiting cleanup confused retained private points with the borrowed snapshot");
+    }
 }
 
 void test_intermediate_capture_preserves_semantic_history() {
@@ -2079,6 +2265,10 @@ void test_preservation_batches_only_until_complete_admission() {
 int main() {
     try {
         test_shared_publication_deduplicates_complete_snapshots();
+        test_shared_publication_preserves_distinct_placements();
+        test_candidates_expand_sources_and_target_placements();
+        test_private_resume_snapshot_uses_committed_recovery_target();
+        test_resume_waiting_retains_private_points_but_borrows_snapshot();
         test_execution_dependency_does_not_become_empty_payload_reclaim();
         test_preservation_batches_only_until_complete_admission();
         test_intermediate_capture_preserves_semantic_history();

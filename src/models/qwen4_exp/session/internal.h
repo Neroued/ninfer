@@ -137,6 +137,15 @@ struct BindOperation {
     Image source_image;
     StateBindingAction state_action = StateBindingAction::Root;
     bool consume_source             = false;
+    context::ContextDemandId state_target;
+    std::array<context::ContextDemandId, 2> history_targets;
+};
+
+struct BindingPlan {
+    BindingEvaluation evaluation;
+    BindOperation action;
+    ContextDemand demand;
+    std::vector<CheckpointHandle> retired;
 };
 
 struct CaptureOperation {
@@ -150,14 +159,16 @@ struct PauseOperation {
     static constexpr auto kind = ContextOperationKind::Pause;
     std::uint32_t lane;
     std::unique_ptr<Suspended> paused;
-    bool save_snapshot = false;
+    runtime::PauseAction action;
     PreparedCheckpoint checkpoint;
+    context::HostDemandIds targets;
 };
 
 struct DemoteOperation {
     static constexpr auto kind = ContextOperationKind::Demote;
     std::shared_ptr<const Demotion> plan;
     std::vector<Checkpoints::Lease> sources;
+    context::HostDemandIds targets;
 };
 
 struct MaintenanceOperation {
@@ -227,8 +238,9 @@ class SessionImpl {
 public:
     struct PauseReservation {
         SequenceHandle sequence;
-        bool save_snapshot;
+        runtime::PauseAction action;
         ContextDemand demand;
+        context::HostDemandIds targets;
         runtime::ExecutionReservation execution;
         PreparedCheckpoint checkpoint;
     };
@@ -245,6 +257,11 @@ public:
     [[nodiscard]] std::uint32_t window_end(const Sequence&, std::uint32_t begin,
                                            std::uint32_t end) const;
     [[nodiscard]] std::uint32_t unit_end(const Sequence&, ExecutionUnitKind, std::uint32_t) const;
+    [[nodiscard]] BindingPlan plan_binding(const RequestBasePlan&, runtime::LaneId,
+                                           const SourceCandidate&, const ResumeState*,
+                                           ExecutionUnitKind, std::uint32_t) const;
+    [[nodiscard]] bool source_matches(const RequestBasePlan&, CheckpointHandle,
+                                      const ResumeState*) const;
     void complete_write(Sequence&);
     void clear(Sequence&) noexcept;
     void settle(Sequence&);
@@ -302,7 +319,7 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
     [[nodiscard]] context::HostWriteRequirements host_requirements(const Demotion&) const;
     bool prepare_demotion(context::ContextTransaction&, const Demotion&,
-                          context::ContextReservation&);
+                          context::ContextReservation&, const context::HostDemandIds&);
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;

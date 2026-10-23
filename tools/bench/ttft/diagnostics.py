@@ -24,7 +24,7 @@ MECHANISM_COUNTERS = {
 }
 
 TRANSFER_RESOURCES = ("state",)
-TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d", "h2h")
+TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d", "h2h", "peer_d2d")
 POOL_USAGE_FIELDS = (
     "capacity_bytes", "block_bytes", "live_bytes", "reserved_bytes",
     "pending_retirement_bytes", "relocation_bytes", "future_reserved_bytes",

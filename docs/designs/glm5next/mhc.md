@@ -392,7 +392,7 @@ ReplaySSM。投机执行只需要管理下游 KDA/MLA 状态和最终 Main hidde
 
 当前双 Spark 计划在两 rank 上复制 mHC。KDA/FFN 的局部结果归约、MLA owner 输出
 汇集完成后，再向 mHC 传入完整 BF16 y；具体通信与行序见
-[并行分工](parallel.md#1-首版并行分工)。mHC 不接收 communicator，不判断 TP/DP/EP。
+[并行分工](parallel.md#1-首版并行分工)。mHC 不接收 communicator，不判断 TP/EP/ADP 或完整 DP 副本。
 
 ## 6. 实施与验证
 

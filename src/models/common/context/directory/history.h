@@ -114,6 +114,14 @@ private:
     friend class HistoryDirectory;
 };
 
+// Layout-owned ranges for a complete page and for exactly partial_columns of its final page.
+// Partial ranges must exclude every invalid column, including compressed/scale-plane suffixes.
+struct HistoryCopyLayout {
+    std::vector<RecordRangeCopy> full_page;
+    std::vector<RecordRangeCopy> partial_page;
+    std::uint32_t partial_columns = 0;
+};
+
 // Owns all binding reservations. Copies must complete before publishing or releasing a binding.
 class HistoryBinding {
 public:
@@ -141,6 +149,7 @@ public:
     void publish_restores();
     void prepare_tail_copy();
     void prepare_mapping(ContextTransaction& transaction);
+    void prepare_conversion(ContextTransaction& transaction);
     [[nodiscard]] HistoryOwner commit();
 
 private:
@@ -157,6 +166,17 @@ private:
     bool write_tail_         = false;
     std::uint32_t frontier_  = 0;
     bool mapping_prepared_   = false;
+
+    struct ConversionPage {
+        PageId source;
+        PageId destination;
+        std::uint32_t columns;
+    };
+
+    std::vector<ConversionPage> conversion_pages_;
+    std::vector<PageDirectory::ReadLease> conversion_readers_;
+    HistoryCopyLayout conversion_layout_;
+    bool conversion_prepared_ = false;
     friend class HistoryDirectory;
 };
 
@@ -169,6 +189,7 @@ struct HistoryMetadataDemand {
 struct HistoryBindingDemand {
     std::uint32_t restore_pages = 0;
     std::uint32_t growth_pages  = 0;
+    std::uint32_t logical_pages = 0;
     std::vector<RecordDemand> records;
     std::uint32_t tail_copies = 0;
     bool reuse_history        = false;
@@ -221,6 +242,10 @@ public:
     released_pages(std::span<const HistoryPrefix* const> removed) const;
     [[nodiscard]] std::vector<HistoryId>
     released_histories(std::span<const HistoryPrefix* const> removed) const;
+    // Physical/logical objects released by dropping this active owner, after its work retires.
+    // Surviving prefixes, other history owners and source readers retain their objects.
+    [[nodiscard]] std::vector<PageId> released_pages(HistoryId owner) const;
+    [[nodiscard]] std::vector<HistoryId> released_histories(HistoryId owner) const;
 
     [[nodiscard]] HistoryBindingDemand
     binding_demand(const HistoryPrefix* source, std::uint32_t frontier, std::uint32_t peak_frontier,
@@ -231,6 +256,14 @@ public:
                     std::uint32_t peak_frontier, std::int32_t execution_row,
                     RecordReservation reservation, bool consume_source = false,
                     std::span<const std::uint32_t> placement = {});
+    [[nodiscard]] HistoryBindingDemand
+    conversion_demand(const HistoryPrefix& source, std::uint32_t frontier,
+                      std::uint32_t peak_frontier, std::span<const std::uint32_t> placement) const;
+    [[nodiscard]] HistoryBinding
+    prepare_conversion(const HistoryPrefix& source, std::uint32_t frontier,
+                       std::uint32_t peak_frontier, std::int32_t execution_row,
+                       RecordReservation reservation, std::span<const std::uint32_t> placement,
+                       HistoryCopyLayout layout);
     // These mutations belong to an accepted execution reservation. Their actions must execute
     // through retirement even after cancellation; discarding them does not roll back the directory.
     void deactivate(HistoryId history, ContextTransaction& transaction);
@@ -240,6 +273,8 @@ public:
     [[nodiscard]] HistoryMetadataDemand growth_metadata_demand(HistoryId history,
                                                                std::uint32_t pages) const;
     void release_growth(HistoryId history);
+    [[nodiscard]] bool growth_contributes(HistoryId, const RecordAssessment&,
+                                          bool metadata_pressure) const;
     void shrink_growth(HistoryId history, std::uint32_t pages);
     void settle_reservation(HistoryId history, std::uint32_t retain_through);
     // Replenishes the requested growth only after trimmed pages retire in this transaction.

@@ -25,7 +25,8 @@ constexpr ContextPrefillCost kNvfp4Fp8Prefill{
 
 const std::array<ContextTransferCost, 4>& generic_context_transfer_cost() {
     // Conservative but useful on an unmeasured machine. These values preserve numerical ranking;
-    // they are not a switch that disables the cost model.
+    // they are not a switch that disables the local cost model. Peer links require independent
+    // deployment-specific measurements and have no generic or local-machine fallback.
     static constexpr std::array<ContextTransferCost, 4> value{
         ContextTransferCost{
             .batch_ns = 100'000, .operation_ns = 12'000, .ns_per_byte_q32 = 107'374'182},

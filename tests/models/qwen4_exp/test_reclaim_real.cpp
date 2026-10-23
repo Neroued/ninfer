@@ -79,8 +79,9 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     {
         auto bindings = p.directory.begin_transaction();
         context::ContextDemand demand;
+        std::array<context::ContextDemandId, 2> targets;
         for (std::uint16_t pool = 0; pool < 2; ++pool) {
-            demand.add_history(
+            targets[pool] = demand.add_history(
                 pool, p.directory.pool(pool).histories().binding_demand(nullptr, 0, 256U - pool));
         }
         auto reserved = p.directory.reserve(demand);
@@ -88,7 +89,7 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
         for (std::uint16_t pool = 0; pool < 2; ++pool) {
             bindings.add_binding(
                 pool, p.directory.pool(pool).histories().prepare_binding(
-                          nullptr, 0, 256U - pool, 0, reserved.reservation->take_history(pool)));
+                          nullptr, 0, 256U - pool, 0, reserved.reservation->take(targets[pool])));
         }
         execute(executor, bindings);
         for (std::uint16_t pool = 0; pool < 2; ++pool)
@@ -141,7 +142,10 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     p.checkpoints.publish(alias, p.checkpoints.at(shallow));
     const std::array all{shallow, deep, alias};
     for (auto& owner : owners) owner.reset();
-    const context::ContextDemand demand{.new_states = 1};
+    context::ContextDemand demand;
+    demand.add_state({.count = 1});
+    require(!p.plan_reclaim(all, {}, {}).demotions.empty(),
+            "unrestricted reclamation omitted available Host migrations");
     const auto plan = p.plan_reclaim(all, {}, demand);
     const auto tail =
         std::find_if(plan.demotions.begin(), plan.demotions.end(),
@@ -222,7 +226,9 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     require(p.start_demote(whole, {}) == runtime::ContextStart::Started,
             "complete State/Main/MTP demotion refused its reserved destination");
     settle();
-    auto host = p.plan_releases(all, {}, {.new_states = 1, .memory = context::ContextMemory::Host});
+    context::ContextDemand host_demand;
+    host_demand.add_state({.count = 1, .memory = context::ContextMemory::Host});
+    auto host         = p.plan_releases(all, {}, host_demand);
     auto selected     = host.inventory->select();
     auto probe        = selected.probe(all);
     auto host_records = selected.released();

@@ -292,6 +292,8 @@ void EngineCore<Instance>::release_planning_state(
     }
     request->suspended.reset();
     request->base_plan.reset();
+    request->placement.reset();
+    request->placement_tokens = 0;
 }
 
 template <class Instance>

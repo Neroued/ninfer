@@ -127,7 +127,6 @@ namespace {
 void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& group,
                       std::span<const CheckpointHandle> excluded, const ContextDemand& demand,
                       std::vector<ContextDemotion>& output) {
-    if (!session.host_context_enabled || demand.memory != context::ContextMemory::Device) return;
     const auto make_plan = [&] {
         auto plan     = std::make_shared<DemotionPlan>();
         plan->owner   = &session;
@@ -220,9 +219,11 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
     result.impl_     = std::make_shared<ReclaimPlan>(*this, allowed, excluded, demand);
     result.inventory = result.impl_->facts.inventory;
     if (has_context_operation()) return result;
+    const bool demote = host_context_enabled &&
+                        (demand.empty() || demand.uses_memory(context::ContextMemory::Device));
     auto selection = result.inventory->select();
     for (const auto& group : result.impl_->facts.groups) {
-        append_demotions(*this, group, excluded, demand, result.demotions);
+        if (demote) append_demotions(*this, group, excluded, demand, result.demotions);
         if (auto quote = quote_release(result.impl_, group.sources, selection))
             result.releases.push_back(std::move(*quote));
     }
@@ -363,22 +364,27 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
     for (const auto victim : host_victims)
         if (!release_checkpoint(victim))
             throw std::logic_error("prepared Host victim changed before demotion");
-    auto reserved = directory.reserve(directory.host_demand(write));
+    ContextDemand demand;
+    auto target_ids = demand.add_host(write);
+    auto reserved   = directory.reserve(demand);
     if (!reserved) throw std::logic_error("prepared Host placement changed before demotion");
     if (!reserved.reservation->ready()) {
-        return defer_demotion(quote, std::move(*reserved.reservation), reserved.assessment,
-                              std::move(*frame));
+        return defer_demotion(quote, std::move(target_ids), std::move(*reserved.reservation),
+                              reserved.assessment, std::move(*frame));
     }
-    return submit_demotion(quote, std::move(*reserved.reservation), std::move(*frame));
+    return submit_demotion(quote, std::move(target_ids), std::move(*reserved.reservation),
+                           std::move(*frame));
 }
 
 runtime::ContextStart SessionImpl::defer_demotion(const ContextDemotion& quote,
+                                                  context::HostDemandIds target_ids,
                                                   context::ContextReservation targets,
                                                   const ContextAssessment& assessment,
                                                   runtime::ExecutionReservation frame) {
     auto maintenance   = directory.prepare_maintenance(std::move(targets), assessment);
-    context_operation_ = std::make_unique<PendingContext>(std::move(maintenance),
-                                                          MaintenanceOperation{.demotion = quote});
+    context_operation_ = std::make_unique<PendingContext>(
+        std::move(maintenance),
+        MaintenanceOperation{.demotion = quote, .targets = std::move(target_ids)});
     context_operation_->reservation.emplace(std::move(frame));
     try {
         (void)submit_context(*context_operation_, ContextWork{});
@@ -390,13 +396,15 @@ runtime::ContextStart SessionImpl::defer_demotion(const ContextDemotion& quote,
 }
 
 runtime::ContextStart SessionImpl::submit_demotion(const ContextDemotion& quote,
+                                                   context::HostDemandIds target_ids,
                                                    context::ContextReservation targets,
                                                    runtime::ExecutionReservation frame) {
     const auto& plan = *quote.impl;
     auto transaction = std::make_unique<PendingContext>(directory, DemoteOperation{});
     transaction->reservation.emplace(std::move(frame));
-    auto& migration    = transaction->transaction;
-    auto state_targets = targets.take_state();
+    auto& migration = transaction->transaction;
+    auto state_targets =
+        target_ids.state.valid() ? targets.take(target_ids.state) : context::RecordReservation{};
     for (const auto& state : plan.states) {
         if (state.host_resident) {
             if (!state_store->drop_device_replica(state.handle))
@@ -413,7 +421,7 @@ runtime::ContextStart SessionImpl::submit_demotion(const ContextDemotion& quote,
         for (auto entry = plan.pages[pool].rbegin(); entry != plan.pages[pool].rend(); ++entry)
             if (!entry->host_covers_prefix) missing.push_back(entry->handle);
         if (!missing.empty())
-            migration.add_backups(pool, missing, targets.take_history(pool), true);
+            migration.add_backups(pool, missing, targets.take(target_ids.histories.at(pool)), true);
         for (const auto& page : plan.pages[pool])
             if (page.host_covers_prefix && !pages.drop_device_replica(page.handle))
                 throw std::logic_error("quoted redundant Device page changed during demotion");

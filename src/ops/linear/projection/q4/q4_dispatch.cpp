@@ -1,5 +1,6 @@
 #include "ops/linear/projection/q4/q4_dispatch.h"
 #include "ops/linear/projection/q4/q4_shapes.h"
+#include "core/platform.h"
 #include <array>
 #include <stdexcept>
 
@@ -11,6 +12,9 @@ struct ShapeEntry {
 };
 
 constexpr std::array kShapes{
+#if NINFER_TARGET_SPARK
+    ShapeEntry{77440, 4096, select_q4_n77440_k4096},
+#endif
     ShapeEntry{1024, 5120, select_q4_n1024_k5120},
     ShapeEntry{4096, 5120, select_q4_n4096_k5120},
     ShapeEntry{5120, 6144, select_q4_n5120_k6144},

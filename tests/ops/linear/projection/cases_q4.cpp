@@ -1,4 +1,5 @@
 #include "ops/linear/projection/runner.h"
+#include "core/platform.h"
 
 #include <array>
 #include <exception>
@@ -20,6 +21,28 @@ constexpr Invocation graph(std::int32_t t) {
 }
 
 void q4_a16_conformance(Suite& suite) {
+#if NINFER_TARGET_SPARK
+    const std::array head_calls{
+        convenience(1), graph(2),   a16(3),     graph(4),    graph(5),    a16(8),    a16(9),
+        a16(15),        graph(16),  graph(17),  a16(31),     graph(32),   graph(33), a16(63),
+        graph(64),      graph(65),  a16(95),    graph(96),   graph(97),   a16(127),  graph(128),
+        graph(129),     a16(191),   graph(192), graph(193),  a16(255),    a16(256),  a16(257),
+        a16(511),       graph(512), a16(513),   a16(1023),   graph(1024), a16(1025), a16(2047),
+        graph(2048),    a16(2049),  a16(4095),  graph(4096), a16(4097)};
+    add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, make_q4_g64_fp16_weight,
+              {77440, 4096, 1031U, Comparison::Sampled, true, head_calls});
+    const std::array head_full{a16(1), a16(4), a16(8)};
+    add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::TokenBlocks, make_q4_g64_fp16_weight,
+              {77440, 4096, 1033U, Comparison::Full, true, head_full});
+    const std::array head_stress{a16(1),    a16(2),    a16(3),    a16(4),     a16(8),
+                                 graph(33), graph(65), graph(97), graph(129), a16(193)};
+    for (auto pattern : {ActivationPattern::KTail, ActivationPattern::Cancellation}) {
+        add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, make_q4_g64_fp16_weight,
+                  {77440, 4096, 1039U, Comparison::Sampled, true, head_stress, pattern});
+    }
+    add_workspace_cases(suite, QType::Q4_G64_FP16, 77440, 4096);
+#endif
+
     const std::array vocabulary_calls{
         convenience(1), graph(4), a16(8),     graph(9), a16(16),  a16(17),   a16(32),   a16(33),
         a16(64),        a16(65),  graph(128), a16(129), a16(512), a16(1024), a16(2048), a16(4096)};

@@ -4,6 +4,8 @@
 
 namespace ninfer::ops::detail {
 
+[[nodiscard]] Q4Launch select_q4_n77440_k4096(std::int32_t tokens);
+
 [[nodiscard]] Q4Launch select_q4_n1024_k5120(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n4096_k5120(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n5120_k6144(std::int32_t tokens);

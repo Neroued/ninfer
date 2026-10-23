@@ -15,7 +15,11 @@ target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ni
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC
   common/frontend/chat_template.cpp
+  common/frontend/prompt.cpp
   glm5next/frontend/chat_template.cpp
+  glm5next/frontend/prompt_layout.cpp
+  glm5next/frontend/frontend.cpp
+  glm5next/prefix_identity.cpp
   common/frontend/output_session.cpp
   common/frontend/tools.cpp
   common/frontend/media_cache.cpp

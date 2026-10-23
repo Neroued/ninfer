@@ -17,21 +17,9 @@
 
 namespace ninfer::models::qwen {
 
-enum class RewriteCheckpointKind : std::uint8_t {
-    TurnClosure,
-    ResponseReplay,
-};
-
-struct RewriteCheckpointSpec {
-    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
-    std::uint32_t frontier     = 0;
-    // The actual state to retain; restoring it recomputes any closing structure before frontier.
-    std::uint32_t recovery_frontier = 0;
-};
-
 struct PromptIdentity {
     bool reusable = true;
-    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<models::frontend::RewriteCheckpointSpec> rewrite_checkpoint;
     // Exact token frontiers at which this serialization can agree with a typed rewrite captured
     // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
     // same chunk decomposition; they are not capture requests by themselves.

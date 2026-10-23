@@ -819,7 +819,7 @@ EncodedChat encode_rendered_chat(const text::Tokenizer& tokenizer, const Rendere
         const text::TokenBoundaryResult& recovery = tokenized.boundaries.at(boundary_index++);
         if (boundary.exact_frontier && *boundary.exact_frontier > 0) {
             const auto frontier = to_frontier(*boundary.exact_frontier, "rewrite checkpoint");
-            encoded.rewrite_checkpoint = RewriteCheckpointSpec{
+            encoded.rewrite_checkpoint = models::frontend::RewriteCheckpointSpec{
                 .kind              = rendered.rewrite_checkpoint->kind,
                 .frontier          = frontier,
                 .recovery_frontier = recovery.exact_frontier && *recovery.exact_frontier > 0 &&

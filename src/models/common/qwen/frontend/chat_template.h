@@ -98,8 +98,9 @@ struct ChatRenderOptions {
 };
 
 struct RewriteCheckpointByteSpec {
-    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
-    std::size_t offset         = 0;
+    models::frontend::RewriteCheckpointKind kind =
+        models::frontend::RewriteCheckpointKind::TurnClosure;
+    std::size_t offset = 0;
     // A proven earlier content boundary may share the input recovery state with Shared.
     // offset remains the typed rewrite boundary in the serialized conversation.
     std::size_t recovery_offset = 0;

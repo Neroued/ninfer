@@ -205,130 +205,30 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
                       std::span<const models::frontend::VisionItem> vision_items,
                       std::optional<std::size_t> engine_tool_marker_index,
                       std::optional<std::uint32_t> leading_boundary) {
-    if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
-        throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
-    }
-    if (cache_boundaries.size() != rendered_markers.size()) {
+    models::frontend::validate_context_cache_hints(hints, message_count);
+    if (cache_boundaries.size() != rendered_markers.size())
         throw std::logic_error("rendered cache marker count changed during preparation");
+    std::vector<std::uint32_t> semantic, structural;
+    for (const auto boundary : message_boundaries)
+        if (boundary && exact_vision_frontier(*boundary, vision_items))
+            semantic.push_back(*boundary);
+    std::vector<std::optional<std::uint32_t>> explicit_frontiers;
+    for (std::size_t i = 0; i < hints.markers.size(); ++i) {
+        const auto frontier = cache_boundaries[i];
+        explicit_frontiers.push_back(
+            frontier && exact_vision_frontier(*frontier, vision_items) ? frontier : std::nullopt);
     }
-
-    models::frontend::PreparedContextCache out;
-    out.automatic_checkpoints = hints.allow_engine_automatic_shared_prefixes;
-    if (out.automatic_checkpoints) {
-        for (const auto boundary : message_boundaries)
-            if (boundary && *boundary && exact_vision_frontier(*boundary, vision_items))
-                out.semantic_boundaries.push_back(*boundary);
-        std::sort(out.semantic_boundaries.begin(), out.semantic_boundaries.end());
-        out.semantic_boundaries.erase(
-            std::unique(out.semantic_boundaries.begin(), out.semantic_boundaries.end()),
-            out.semantic_boundaries.end());
+    if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size()) {
+        const auto frontier = cache_boundaries[*engine_tool_marker_index];
+        if (frontier && exact_vision_frontier(*frontier, vision_items))
+            structural.push_back(*frontier);
     }
-    if (hints.session_key) {
-        if (hints.session_key->empty() ||
-            hints.session_key->size() > models::frontend::kPreparedSessionKeyCapacity) {
-            throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
-        }
-        models::frontend::PreparedSessionKey key;
-        key.size = static_cast<std::uint16_t>(hints.session_key->size());
-        std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
-        out.session_key = key;
+    if (leading_boundary && *leading_boundary < message_boundaries.size()) {
+        const auto frontier = message_boundaries[*leading_boundary];
+        if (frontier && exact_vision_frontier(*frontier, vision_items))
+            structural.push_back(*frontier);
     }
-    out.update_session_index = hints.update_session_index;
-
-    for (const PromptCacheMarker marker : hints.markers) {
-        switch (marker.kind) {
-        case PromptCacheMarkerKind::SharedStablePrefix:
-        case PromptCacheMarkerKind::PrivateLongAnchor:
-            break;
-        default:
-            throw std::invalid_argument("context cache marker kind is invalid");
-        }
-        if (marker.location != PromptCacheMarkerLocation::MessageContentBoundary &&
-            (marker.after_tool_call_count || marker.reasoning_bytes))
-            throw std::invalid_argument("content coordinates require a message-content marker");
-        switch (marker.location) {
-        case PromptCacheMarkerLocation::MessageBoundary:
-            if (marker.after_message_count > message_count ||
-                marker.leading_instruction_bytes != 0 || marker.after_tool_count != 0 ||
-                marker.after_message_part_count != 0) {
-                throw std::invalid_argument("context cache message marker is invalid");
-            }
-            break;
-        case PromptCacheMarkerLocation::MessageContentBoundary:
-            if (!marker.after_message_count || marker.after_message_count > message_count ||
-                marker.leading_instruction_bytes || marker.after_tool_count)
-                throw std::invalid_argument("context cache message-content marker is invalid");
-            break;
-        case PromptCacheMarkerLocation::MessagePartBoundary:
-            if (marker.after_message_count == 0 || marker.after_message_count > message_count ||
-                marker.after_message_part_count == 0 || marker.leading_instruction_bytes != 0 ||
-                marker.after_tool_count != 0) {
-                throw std::invalid_argument("context cache message-part marker is invalid");
-            }
-            break;
-        case PromptCacheMarkerLocation::LeadingInstructionBoundary:
-            if (marker.after_message_count != 0 || marker.leading_instruction_bytes == 0 ||
-                marker.after_tool_count != 0 || marker.after_message_part_count != 0) {
-                throw std::invalid_argument("context cache leading-instruction marker is invalid");
-            }
-            break;
-        case PromptCacheMarkerLocation::ToolBoundary:
-            if (marker.after_message_count != 0 || marker.leading_instruction_bytes != 0 ||
-                marker.after_tool_count == 0 || marker.after_message_part_count != 0) {
-                throw std::invalid_argument("context cache tool marker is invalid");
-            }
-            break;
-        default:
-            throw std::invalid_argument("context cache marker location is invalid");
-        }
-        if (marker.kind == PromptCacheMarkerKind::SharedStablePrefix &&
-            marker.evidence == SharedCandidateEvidence::None) {
-            throw std::invalid_argument("shared context cache marker evidence is empty");
-        }
-    }
-
-    out.opportunities.reserve(7U);
-    const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
-                                     std::uint32_t frontier, std::uint32_t input_order) {
-        if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
-        const auto duplicate = std::find_if(
-            out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
-                return existing.kind == kind && existing.frontier == frontier;
-            });
-        if (duplicate == out.opportunities.end()) {
-            out.opportunities.push_back(
-                models::frontend::PreparedCacheOpportunity{.kind        = kind,
-                                                           .evidence    = evidence,
-                                                           .frontier    = frontier,
-                                                           .input_order = input_order});
-        } else if (kind == PromptCacheMarkerKind::SharedStablePrefix) {
-            duplicate->evidence |= evidence;
-        }
-    };
-
-    for (std::size_t index = 0; index < hints.markers.size(); ++index) {
-        const PromptCacheMarker marker = hints.markers[index];
-        const auto resolved            = cache_boundaries[index];
-        if (!resolved) { continue; }
-        add_opportunity(marker.kind, marker.evidence, *resolved, static_cast<std::uint32_t>(index));
-    }
-
-    std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
-    if (hints.allow_engine_automatic_shared_prefixes) {
-        if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size() &&
-            cache_boundaries[*engine_tool_marker_index]) {
-            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                            SharedCandidateEvidence::EngineStructural,
-                            *cache_boundaries[*engine_tool_marker_index], engine_order++);
-        }
-        if (leading_boundary && *leading_boundary < message_boundaries.size() &&
-            message_boundaries[*leading_boundary]) {
-            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                            SharedCandidateEvidence::EngineStructural,
-                            *message_boundaries[*leading_boundary], engine_order++);
-        }
-    }
-    return out;
+    return models::frontend::prepare_context_cache(hints, explicit_frontiers, semantic, structural);
 }
 
 } // namespace
@@ -403,23 +303,7 @@ PromptSummary PreparedPrompt::summary() const {
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     if (data_ == nullptr) { return {}; }
-    const models::frontend::PrepareStats& stats = data_->prepare;
-    return PromptPreparationStats{
-        .seconds                       = stats.seconds,
-        .media_preprocess_seconds      = stats.media_preprocess_seconds,
-        .media_preprocess_work_seconds = stats.media_preprocess_work_seconds,
-        .tokenize_seconds              = stats.tokenize_seconds,
-        .media_items                   = stats.media_items,
-        .media_bytes                   = stats.media_bytes,
-        .raw_patches                   = stats.raw_patches,
-        .vision_tokens                 = stats.vision_tokens,
-        .patch_bytes                   = stats.patch_bytes,
-        .media_cache_hits              = stats.media_cache_hits,
-        .media_cache_misses            = stats.media_cache_misses,
-        .media_singleflight_waits      = stats.media_singleflight_waits,
-        .built_patch_bytes             = stats.built_patch_bytes,
-        .reused_patch_bytes            = stats.reused_patch_bytes,
-    };
+    return data_->prepare.public_stats();
 }
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }

@@ -71,7 +71,7 @@ struct ProcessedInput {
     std::vector<models::frontend::VisionItem> vision_items;
     // One immutable row-major [raw_patches, 1536] payload per Vision item.
     std::vector<std::shared_ptr<const models::frontend::PreparedMediaPayload>> media_payloads;
-    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<models::frontend::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
@@ -91,7 +91,7 @@ struct EncodedChat {
     };
 
     std::vector<MediaTokenRun> media_token_runs;
-    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<models::frontend::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;

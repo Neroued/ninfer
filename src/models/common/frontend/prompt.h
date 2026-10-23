@@ -6,10 +6,20 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::models::frontend {
+
+enum class RewriteCheckpointKind : std::uint8_t { TurnClosure, ResponseReplay };
+
+struct RewriteCheckpointSpec {
+    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
+    std::uint32_t frontier     = 0;
+    // The retained input state; restoring it recomputes the structure before frontier.
+    std::uint32_t recovery_frontier = 0;
+};
 
 inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
 
@@ -68,7 +78,18 @@ struct PrepareStats {
     std::size_t media_singleflight_waits = 0;
     std::size_t built_patch_bytes        = 0;
     std::size_t reused_patch_bytes       = 0;
+
+    [[nodiscard]] PromptPreparationStats public_stats() const noexcept;
 };
+
+void validate_context_cache_hints(const ContextCacheHints& hints, std::size_t message_count);
+
+// Frontiers have already been resolved and filtered by the model's serialization semantics.
+PreparedContextCache
+prepare_context_cache(const ContextCacheHints& hints,
+                      std::span<const std::optional<std::uint32_t>> marker_frontiers,
+                      std::span<const std::uint32_t> semantic_frontiers,
+                      std::span<const std::uint32_t> structural_frontiers);
 
 struct PromptData {
     std::vector<TokenId> token_ids;

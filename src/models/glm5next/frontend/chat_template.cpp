@@ -1,4 +1,5 @@
 #include "models/glm5next/frontend/chat_template.h"
+#include "models/glm5next/frontend/prompt_layout.h"
 
 #include "models/common/frontend/media_cache.h"
 #include "text/unicode.h"
@@ -239,11 +240,54 @@ void finish_continuation(RenderedChat& result, std::string_view content, std::si
     }
     truncate(result.output, end);
 }
+
+RenderedChat render_input(const TemplateInput& input,
+                          const models::frontend::ChatTemplate& compiled, bool continuation,
+                          const PreparationControl& control) {
+    std::vector<std::string> control_variables;
+    for (const auto& item : compiled.special_tokens.items())
+        control_variables.push_back(item.key());
+    const text::TemplateRenderOptions execution{
+        .checkpoint =
+            [&] { models::frontend::check_preparation_control(control, "GLM chat template"); },
+        .regions           = input.regions,
+        .control_variables = control_variables};
+    RenderedChat result{.output   = compiled.program.render(input.context, execution),
+                        .messages = input.messages,
+                        .tools    = input.tools};
+    const auto body = final_assistant_body(result.output);
+    if (continuation)
+        finish_continuation(
+            result, input.context["messages"].back()["content"].get_ref<const std::string&>(),
+            body);
+    else {
+        if (find_control(result.output, "</think>", body + 7) != std::string::npos)
+            throw std::invalid_argument("GLM generation prefix must leave reasoning open");
+        result.starts_in_reasoning = true;
+    }
+    return result;
+}
 } // namespace
 
 RenderedChat CompiledChatTemplate::render(std::span<const ChatMessage> messages,
                                           const PromptOptions& options,
                                           const PreparationControl& control) const {
+    return render_impl(messages, options, {}, nullptr, control);
+}
+
+RenderedChat CompiledChatTemplate::render(std::span<const ChatMessage> messages,
+                                          const PromptOptions& options,
+                                          std::span<const PromptCacheMarker> markers,
+                                          PromptBoundaries& boundaries,
+                                          const PreparationControl& control) const {
+    return render_impl(messages, options, markers, &boundaries, control);
+}
+
+RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> messages,
+                                               const PromptOptions& options,
+                                               std::span<const PromptCacheMarker> markers,
+                                               PromptBoundaries* boundaries,
+                                               const PreparationControl& control) const {
     models::frontend::check_preparation_control(control, "GLM chat template");
     if (messages.empty()) throw std::invalid_argument("chat requires at least one message");
     bool continuation = false;
@@ -273,26 +317,54 @@ RenderedChat CompiledChatTemplate::render(std::span<const ChatMessage> messages,
         input.tools.push_back(input.tag("/tools/" + std::to_string(input.tools.size())));
         input.context["tools"].push_back(std::move(tool));
     }
-    std::vector<std::string> control_variables;
-    for (const auto& item : compiled_.special_tokens.items())
-        control_variables.push_back(item.key());
-    const text::TemplateRenderOptions execution{
-        .checkpoint =
-            [&] { models::frontend::check_preparation_control(control, "GLM chat template"); },
-        .regions           = input.regions,
-        .control_variables = control_variables};
-    RenderedChat result{.output   = compiled_.program.render(input.context, execution),
-                        .messages = std::move(input.messages),
-                        .tools    = std::move(input.tools)};
-    const auto body = final_assistant_body(result.output);
-    if (continuation) {
-        finish_continuation(
-            result, input.context["messages"].back()["content"].get_ref<const std::string&>(),
-            body);
-    } else {
-        if (find_control(result.output, "</think>", body + 7) != std::string::npos)
-            throw std::invalid_argument("GLM generation prefix must leave reasoning open");
-        result.starts_in_reasoning = true;
+    auto result = render_input(input, compiled_, continuation, control);
+    if (boundaries) {
+        PromptProbes probes;
+        probes.content_prefix = [&](const PromptCacheMarker& marker) {
+            auto probe       = input;
+            const auto index = marker.after_message_count - 1;
+            auto& source     = probe.messages[index];
+            auto& value      = probe.context["messages"][index];
+            const auto bytes = marker.after_message_part_count
+                                   ? source.parts[marker.after_message_part_count - 1]->bytes.end
+                                   : 0;
+            value["content"].get_ref<std::string&>().resize(bytes);
+            source.content->bytes.end = bytes;
+            source.parts.resize(marker.after_message_part_count);
+            value["reasoning_content"].get_ref<std::string&>().resize(marker.reasoning_bytes);
+            source.reasoning.bytes.end = marker.reasoning_bytes;
+            if (value.contains("tool_calls")) {
+                auto& calls = value["tool_calls"];
+                calls.erase(calls.begin() + marker.after_tool_call_count, calls.end());
+            }
+            source.tool_calls.resize(marker.after_tool_call_count);
+            return render_input(probe, compiled_, continuation, control);
+        };
+        probes.next_turn = [&] {
+            bool has_response = false;
+            for (const auto& message : messages) {
+                if (message.role == ChatRole::User)
+                    has_response = false;
+                else if (message.role == ChatRole::Assistant)
+                    has_response = true;
+            }
+            auto probe = input;
+            std::optional<RenderedChat> synthetic;
+            if (!has_response) {
+                probe.append_message(ChatMessage{.role              = ChatRole::Assistant,
+                                                 .parts             = {{.text = "response"}},
+                                                 .reasoning_content = "reasoning"});
+                synthetic = render_input(probe, compiled_, false, control);
+            }
+            const auto& before = synthetic ? *synthetic : result;
+            const auto end =
+                final_assistant_body(before.output) - std::string_view("<|assistant|>").size();
+            probe.append_message(ChatMessage{.role = ChatRole::User, .parts = {{.text = ""}}});
+            auto after         = render_input(probe, compiled_, false, control);
+            const auto retains = models::frontend::same_prefix(before.output, after.output, end);
+            return TurnProbe{retains, std::move(after.output)};
+        };
+        *boundaries = resolve_prompt_boundaries(result, messages, continuation, markers, probes);
     }
     return result;
 }

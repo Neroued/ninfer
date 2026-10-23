@@ -9,6 +9,8 @@
 
 namespace ninfer::models::glm5next {
 
+struct PromptBoundaries;
+
 // Byte coordinates refer to the tagged template input, before trimming or serialization.
 struct TextSource {
     std::uint32_t tag = 0;
@@ -42,7 +44,16 @@ public:
                                       const PromptOptions& options      = {},
                                       const PreparationControl& control = {}) const;
 
+    [[nodiscard]] RenderedChat render(std::span<const ChatMessage> messages,
+                                      const PromptOptions& options,
+                                      std::span<const PromptCacheMarker> markers,
+                                      PromptBoundaries& boundaries,
+                                      const PreparationControl& control = {}) const;
+
 private:
+    RenderedChat render_impl(std::span<const ChatMessage> messages, const PromptOptions& options,
+                             std::span<const PromptCacheMarker> markers,
+                             PromptBoundaries* boundaries, const PreparationControl& control) const;
     models::frontend::ChatTemplate compiled_;
 };
 

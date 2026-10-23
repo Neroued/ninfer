@@ -383,18 +383,19 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
     if (generation_begin && *generation_begin > 0) {
         result.rewrite_checkpoint = RewriteCheckpointByteSpec{
-            .kind   = continuation || retain_open_turn ? RewriteCheckpointKind::ResponseReplay
-                                                       : RewriteCheckpointKind::TurnClosure,
-            .offset = *generation_begin,
+            .kind            = continuation || retain_open_turn
+                                   ? models::frontend::RewriteCheckpointKind::ResponseReplay
+                                   : models::frontend::RewriteCheckpointKind::TurnClosure,
+            .offset          = *generation_begin,
             .recovery_offset = *generation_begin};
     }
     if (!continuation && !retain_open_turn && first_tail_assistant) {
         const auto begin = layout.messages[*first_tail_assistant].begin;
         if (begin > 0)
-            result.rewrite_checkpoint =
-                RewriteCheckpointByteSpec{.kind            = RewriteCheckpointKind::TurnClosure,
-                                          .offset          = begin,
-                                          .recovery_offset = begin};
+            result.rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind            = models::frontend::RewriteCheckpointKind::TurnClosure,
+                .offset          = begin,
+                .recovery_offset = begin};
     }
     const auto part_boundary = [&](std::size_t message,
                                    std::size_t part) -> std::optional<std::size_t> {

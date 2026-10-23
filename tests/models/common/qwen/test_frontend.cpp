@@ -858,7 +858,7 @@ int test_selected_template_instruction_prefix() {
     const std::size_t header           = generated.text.rfind(assistant_header);
     failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
                           generated.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                              ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
                           generated.rewrite_checkpoint->offset == header &&
                           generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
                       "late system was not included before the generation rewrite boundary");
@@ -906,7 +906,7 @@ int test_assistant_continuation() {
     failures +=
         check(rendered.rewrite_checkpoint &&
                   rendered.rewrite_checkpoint->kind ==
-                      ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                      ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
                   rendered.rewrite_checkpoint->offset == expected.find("<|im_start|>assistant"),
               "assistant continuation did not retain its replayable opener boundary");
 
@@ -950,7 +950,7 @@ int test_rewrite_checkpoint_trace() {
     int failures =
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
-                      ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                      ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
                   open.rewrite_checkpoint->offset == first_header,
               "tool loop did not retain the stable prefix before its first assistant turn");
     const auto initial = render_chat({tool_loop.front()});
@@ -969,7 +969,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t preserved_header = preserved.text.rfind(assistant_header);
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                              ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
                           preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.rewrite_checkpoint->recovery_offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
@@ -980,7 +980,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
     failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                              ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
                       "non-thinking response replay did not checkpoint before its generation "
@@ -992,7 +992,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t final_header = next.text.rfind(assistant_header);
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                              ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
                           next.rewrite_checkpoint->offset == final_header,
                       "new user turn did not move the rewrite boundary before its generation "
                       "opener");
@@ -1006,7 +1006,7 @@ int test_rewrite_checkpoint_trace() {
     failures += check(
         source.rewrite_checkpoint &&
             source.rewrite_checkpoint->kind ==
-                ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
             branch.text.starts_with(source.text.substr(0, source.rewrite_checkpoint->offset)) &&
             !branch.text.starts_with(
                 source.text.substr(0, source.rewrite_checkpoint->offset + assistant_header.size())),
@@ -1033,7 +1033,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
     failures += check(wrapped.rewrite_checkpoint &&
                           wrapped.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                              ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
                           wrapped.rewrite_checkpoint->offset == wrapped_first,
                       "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
@@ -1248,7 +1248,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                              ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
                           text_data.identity.rewrite_checkpoint->frontier == 9 &&
                           text_data.identity.rewrite_checkpoint->recovery_frontier == 7 &&
                           text_data.output.starts_in_reasoning && !text_data.has_media(),
@@ -1269,7 +1269,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                              ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
                           preserved_data.identity.rewrite_checkpoint->frontier == 9 &&
                           preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
@@ -1288,7 +1288,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen::RewriteCheckpointKind::ResponseReplay &&
+                              ninfer::models::frontend::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier == 9 &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
@@ -1344,7 +1344,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
-                ninfer::models::qwen::RewriteCheckpointKind::TurnClosure &&
+                ninfer::models::frontend::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&

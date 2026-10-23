@@ -302,6 +302,8 @@ public:
     [[nodiscard]] bool prepare_pause(SequenceHandle, bool save_snapshot,
                                      std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] HostRequirement demotion_host_requirements(const ContextDemotion&) const;
+    // Combine disjoint quotes from one synchronous reclaim plan; start_demote revalidates them.
+    [[nodiscard]] ContextDemotion combine_demotions(std::span<const ContextDemotion>) const;
     [[nodiscard]] std::size_t host_write_bytes(const HostRequirement&) const;
     [[nodiscard]] ContextDemand host_demand(const HostRequirement&) const;
     [[nodiscard]] bool can_place_host(const HostRequirement&, const ContextReleaseSet& = {}) const;

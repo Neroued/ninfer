@@ -39,11 +39,10 @@ struct PageDemotion {
 
 struct DemotionPlan {
     const SessionImpl* owner = nullptr;
-    runtime::ContextTransferResource resource;
     std::vector<CheckpointHandle> allowed;
     std::vector<CheckpointHandle> excluded;
-    std::optional<StateDemotion> state;
-    std::vector<PageDemotion> pages;
+    std::vector<StateDemotion> states;
+    std::array<std::vector<PageDemotion>, 2> pages;
 };
 
 struct ReclaimPlan {
@@ -111,11 +110,15 @@ SessionImpl::checkpoint_release_set(std::span<const CheckpointHandle> handles) c
         if (image.references == state_store->checkpoint_references(image.image) &&
             state_store->can_release_after_checkpoint_references(image.image, image.references))
             append(directory.state_release(image.image));
-    for (const auto page : text_kv_histories->released_pages(main))
-        append(directory.page_release(page));
+    const auto append_page = [&](context::PageId page) {
+        const auto facts = directory.page_release(page);
+        result.records.insert(result.records.end(), facts.records.begin(), facts.records.end());
+        result.pages.push_back(page);
+    };
+    for (const auto page : text_kv_histories->released_pages(main)) append_page(page);
     if (backend_kv_histories)
-        for (const auto page : backend_kv_histories->released_pages(backend))
-            append(directory.page_release(page));
+        for (const auto page : backend_kv_histories->released_pages(backend)) append_page(page);
+    result.normalize();
     return result;
 }
 
@@ -140,16 +143,16 @@ void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& gr
             continue;
         auto plan       = make_plan();
         const bool host = states.host_resident(image);
-        plan->state     = StateDemotion{image, states.content_epoch(image), host};
+        plan->states.push_back({image, states.content_epoch(image), host});
         output.push_back(
             {group.sources, host ? 0 : states.image_bytes(),
              session.directory.state_release(image).replicas(context::ContextMemory::Device),
              std::move(plan)});
     }
     for (std::uint32_t pool = 0; pool < group.pages.size(); ++pool) {
-        const auto& pages   = session.directory.pool(pool).pages();
-        auto plan           = make_plan();
-        plan->resource.pool = runtime::KvPoolId{static_cast<std::uint16_t>(pool)};
+        const auto& pages = session.directory.pool(pool).pages();
+        auto plan         = make_plan();
+        auto& selected    = plan->pages[pool];
         ContextDemotion candidate;
         candidate.sources = group.sources;
         std::vector<std::size_t> record_ends;
@@ -159,8 +162,8 @@ void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& gr
                 pages.source_pins(page) || !pages.can_pin_source(page))
                 continue;
             const bool host = pages.host_replica_current(page);
-            plan->pages.push_back({page, entry.position, pages.content_epoch(page),
-                                   pages.committed_columns(page), host});
+            selected.push_back({page, entry.position, pages.content_epoch(page),
+                                pages.committed_columns(page), host});
             const auto records =
                 session.directory.page_release(page).replicas(context::ContextMemory::Device);
             candidate.released.records.insert(candidate.released.records.end(),
@@ -168,9 +171,9 @@ void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& gr
             record_ends.push_back(candidate.released.records.size());
             if (!host) candidate.host_bytes += pages.layout().parts.front().record.bytes;
         }
-        if (!plan->pages.empty()) {
+        if (!selected.empty()) {
             if (session.directory.assess(demand, candidate.released).feasible()) {
-                std::size_t low = 1, high = plan->pages.size();
+                std::size_t low = 1, high = selected.size();
                 while (low < high) {
                     const auto middle = low + (high - low) / 2;
                     ContextReleaseSet prefix;
@@ -182,10 +185,10 @@ void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& gr
                     else
                         low = middle + 1;
                 }
-                plan->pages.resize(low);
+                selected.resize(low);
                 candidate.released.records.resize(record_ends[low - 1]);
                 candidate.host_bytes =
-                    std::count_if(plan->pages.begin(), plan->pages.end(),
+                    std::count_if(selected.begin(), selected.end(),
                                   [](const auto& page) { return !page.host_covers_prefix; }) *
                     pages.layout().parts.front().record.bytes;
             }
@@ -247,12 +250,46 @@ SessionImpl::demotion_host_requirements(const ContextDemotion& quote) const {
     const auto& plan = *quote.impl;
     context::HostWriteRequirements write;
     write.kv_pages.resize(directory.pool_count());
-    if (plan.state)
-        write.state_images = !plan.state->host_resident;
-    else
-        for (const auto& page : plan.pages)
-            if (!page.host_covers_prefix) ++write.kv_pages[plan.resource.pool->index];
+    for (const auto& state : plan.states) write.state_images += !state.host_resident;
+    for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+        for (const auto& page : plan.pages[pool]) write.kv_pages[pool] += !page.host_covers_prefix;
     return write;
+}
+
+ContextDemotion SessionImpl::combine_demotions(std::span<const ContextDemotion> quotes) const {
+    auto plan   = std::make_shared<DemotionPlan>();
+    plan->owner = this;
+    ContextDemotion result;
+    std::unordered_set<std::uint32_t> states;
+    std::array<std::unordered_set<std::uint32_t>, 2> pages;
+    const auto append_sources = [](auto& target, const auto& values) {
+        for (const auto handle : values)
+            if (std::find(target.begin(), target.end(), handle) == target.end())
+                target.push_back(handle);
+    };
+    for (const auto& quote : quotes) {
+        if (!quote.impl || quote.impl->owner != this)
+            throw std::invalid_argument("demotion quote belongs to another session");
+        const auto& part = *quote.impl;
+        append_sources(plan->allowed, part.allowed);
+        append_sources(plan->excluded, part.excluded);
+        for (const auto& state : part.states) {
+            if (!states.insert(state.handle.index).second)
+                throw std::invalid_argument("demotion batch contains overlapping State records");
+            plan->states.push_back(state);
+        }
+        for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+            for (const auto& page : part.pages[pool]) {
+                if (!pages[pool].insert(page.handle.index).second)
+                    throw std::invalid_argument("demotion batch contains overlapping KV records");
+                plan->pages[pool].push_back(page);
+            }
+        result.host_bytes += quote.host_bytes;
+        result.released.merge(quote.released);
+    }
+    result.sources = plan->allowed;
+    result.impl    = std::move(plan);
+    return result;
 }
 
 runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
@@ -266,16 +303,18 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
             std::find(plan.excluded.begin(), plan.excluded.end(), source) != plan.excluded.end())
             return runtime::ContextStart::Stale;
     const auto facts = physical_facts(*this, plan.allowed, plan.excluded);
-    const auto group =
-        std::find_if(facts.groups.begin(), facts.groups.end(),
-                     [&](const auto& value) { return value.sources == plan.allowed; });
-    if (group == facts.groups.end()) return runtime::ContextStart::Stale;
+    std::unordered_set<std::uint32_t> states;
+    std::array<std::unordered_set<std::uint32_t>, 2> eligible_pages;
+    for (const auto& group : facts.groups) {
+        for (const auto state : group.states) states.insert(state.index);
+        for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+            for (const auto& page : group.pages[pool])
+                eligible_pages[pool].insert(page.handle.index);
+    }
     ContextReleaseSet actual;
     std::size_t host_bytes = 0;
-    if (plan.state) {
-        const auto& expected = *plan.state;
-        if (std::find(group->states.begin(), group->states.end(), expected.handle) ==
-                group->states.end() ||
+    for (const auto& expected : plan.states) {
+        if (!state_store->valid(expected.handle) || !states.contains(expected.handle.index) ||
             state_store->role(expected.handle) != context::StateRole::CheckpointImmutable ||
             !state_store->device_resident(expected.handle) ||
             state_store->content_epoch(expected.handle) != expected.content_epoch ||
@@ -283,14 +322,15 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
             !state_store->can_release_after_checkpoint_references(
                 expected.handle, state_store->checkpoint_references(expected.handle)))
             return runtime::ContextStart::Stale;
-        actual = directory.state_release(expected.handle).replicas(context::ContextMemory::Device);
-        host_bytes = expected.host_resident ? 0 : state_store->image_bytes();
-    } else {
-        const auto pool   = plan.resource.pool->index;
+        actual.merge(
+            directory.state_release(expected.handle).replicas(context::ContextMemory::Device));
+        host_bytes += expected.host_resident ? 0 : state_store->image_bytes();
+    }
+    for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool) {
         const auto& pages = directory.pool(pool).pages();
-        for (const auto& expected : plan.pages) {
-            if (std::none_of(group->pages.at(pool).begin(), group->pages.at(pool).end(),
-                             [&](const auto& value) { return value.handle == expected.handle; }) ||
+        for (const auto& expected : plan.pages[pool]) {
+            if (!pages.valid(expected.handle) ||
+                !eligible_pages[pool].contains(expected.handle.index) ||
                 !pages.device_resident(expected.handle) ||
                 pages.active_history_references(expected.handle) ||
                 pages.source_pins(expected.handle) || !pages.can_pin_source(expected.handle) ||
@@ -298,8 +338,10 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
                 pages.committed_columns(expected.handle) != expected.committed_columns ||
                 pages.host_replica_current(expected.handle) != expected.host_covers_prefix)
                 return runtime::ContextStart::Stale;
-            actual.merge(
-                directory.page_release(expected.handle).replicas(context::ContextMemory::Device));
+            const auto records =
+                directory.page_release(expected.handle).replicas(context::ContextMemory::Device);
+            actual.records.insert(actual.records.end(), records.records.begin(),
+                                  records.records.end());
             if (!expected.host_covers_prefix)
                 host_bytes += pages.layout().parts.front().record.bytes;
         }
@@ -353,29 +395,30 @@ runtime::ContextStart SessionImpl::submit_demotion(const ContextDemotion& quote,
     const auto& plan = *quote.impl;
     auto transaction = std::make_unique<PendingContext>(directory, DemoteOperation{});
     transaction->reservation.emplace(std::move(frame));
-    auto& migration = transaction->transaction;
-    if (plan.state) {
-        if (plan.state->host_resident) {
-            if (!state_store->drop_device_replica(plan.state->handle))
+    auto& migration    = transaction->transaction;
+    auto state_targets = targets.take_state();
+    for (const auto& state : plan.states) {
+        if (state.host_resident) {
+            if (!state_store->drop_device_replica(state.handle))
                 throw std::logic_error("prepared State replica could not be released");
-            return runtime::ContextStart::Started;
+            continue;
         }
-        auto transfer =
-            state_store->reserve_device_to_host(plan.state->handle, targets.take_state());
+        auto transfer = state_store->reserve_device_to_host(state.handle, state_targets.split(1));
         if (!transfer) throw std::logic_error("prepared State demotion lost its destination");
         migration.add_state_copy(std::move(*transfer), false);
-    } else {
-        const auto pool = plan.resource.pool->index;
-        auto& pages     = directory.pool(pool).pages();
+    }
+    for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool) {
+        auto& pages = directory.pool(pool).pages();
         std::vector<context::PageId> missing;
-        for (auto entry = plan.pages.rbegin(); entry != plan.pages.rend(); ++entry)
+        for (auto entry = plan.pages[pool].rbegin(); entry != plan.pages[pool].rend(); ++entry)
             if (!entry->host_covers_prefix) missing.push_back(entry->handle);
-        migration.add_backups(pool, missing, targets.take_history(pool), true);
-        for (const auto& page : plan.pages)
+        if (!missing.empty())
+            migration.add_backups(pool, missing, targets.take_history(pool), true);
+        for (const auto& page : plan.pages[pool])
             if (page.host_covers_prefix && !pages.drop_device_replica(page.handle))
                 throw std::logic_error("quoted redundant Device page changed during demotion");
-        if (!migration.spill_page_groups()) return runtime::ContextStart::Started;
     }
+    if (quote.host_bytes == 0) return runtime::ContextStart::Started;
     context_operation_ = std::move(transaction);
     try {
         (void)submit_context(*context_operation_, ContextWork{});

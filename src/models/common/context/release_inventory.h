@@ -129,11 +129,12 @@ public:
                 handles_.pop_back();
                 selected_[handle.index] = false;
                 for (const auto object : inventory_->objects_by_handle_[handle.index]) {
-                    if (!remaining_[object]++)
+                    if (!remaining_[object]++ && size != 0)
                         subtract_resources(released_, inventory_->objects_[object].released);
                 }
             }
             freed_.resize(freed);
+            if (size == 0) released_ = {};
         }
 
         const ReleaseInventory* inventory_;

@@ -164,8 +164,9 @@ struct Program {
     std::vector<HostBlock> blocks;
     std::vector<Handle> released;
     std::vector<Handle> demoted;
-    std::size_t device_capacity = 4096;
-    bool transfer_in_progress   = false;
+    std::size_t demotion_submissions = 0;
+    std::size_t device_capacity      = 4096;
+    bool transfer_in_progress        = false;
     std::vector<Handle> placement_holders;
     std::uint64_t checkpoint_revision = 1;
     mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index;
@@ -395,6 +396,7 @@ struct Program {
         std::vector<Handle> sources;
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
+        std::vector<std::pair<Handle, std::size_t>> state_parts;
     };
 
     struct Release {
@@ -547,6 +549,25 @@ struct Program {
 
     std::size_t demotion_host_requirements(const Demotion& plan) const { return plan.host_bytes; }
 
+    Demotion combine_demotions(std::span<const Demotion> quotes) const {
+        Demotion result{};
+        for (const auto& quote : quotes) {
+            result.host_bytes += quote.host_bytes;
+            result.released.merge(quote.released);
+            for (const auto handle : quote.sources)
+                if (std::find(result.sources.begin(), result.sources.end(), handle) ==
+                    result.sources.end())
+                    result.sources.push_back(handle);
+            result.main_parts.insert(result.main_parts.end(), quote.main_parts.begin(),
+                                     quote.main_parts.end());
+            result.state_parts.insert(result.state_parts.end(), quote.state_parts.begin(),
+                                      quote.state_parts.end());
+            if (quote.main_parts.empty() && quote.state_parts.empty())
+                result.state_parts.emplace_back(quote.handle, quote.host_bytes);
+        }
+        return result;
+    }
+
     std::size_t host_write_bytes(std::size_t bytes) const { return bytes; }
 
     bool can_place_host(std::size_t bytes) const {
@@ -579,12 +600,19 @@ struct Program {
         if (!can_place_host(plan.host_bytes, released)) return ContextStart::Stale;
         for (const auto victim : victims)
             require(release_checkpoint(victim), "prepared Host victim was not releasable");
-        if (!plan.main_parts.empty()) {
+        ++demotion_submissions;
+        if (!plan.main_parts.empty() || !plan.state_parts.empty()) {
             for (const auto& [handle, pages] : plan.main_parts) {
                 auto& content    = contents.at(handle.index);
                 const auto bytes = *content.demotion_bytes * pages;
                 if (bytes) { content.host_blocks.push_back(host_block(bytes)); }
                 content.main_pages -= pages;
+                demoted.push_back(handle);
+            }
+            for (const auto& [handle, bytes] : plan.state_parts) {
+                auto& content = contents.at(handle.index);
+                if (bytes) content.host_blocks.push_back(host_block(bytes));
+                content.device_state = false;
                 demoted.push_back(handle);
             }
         } else {
@@ -1967,9 +1995,9 @@ void test_host_placement_overrides_aggregate_free_bytes() {
     const auto second                             = f.program.add({2}, {f.program.host_block(8)});
     const auto incoming                           = f.program.add(tokens(100, 1000));
     f.program.contents[first.index].device_state  = false;
-    f.program.contents[first.index].main_pages        = 0;
+    f.program.contents[first.index].main_pages    = 0;
     f.program.contents[second.index].device_state = false;
-    f.program.contents[second.index].main_pages       = 0;
+    f.program.contents[second.index].main_pages   = 0;
     f.program.contents[incoming.index].demotion_bytes = 8;
     f.program.placement_holders                       = {first, second};
     f.publish(first);
@@ -2017,12 +2045,42 @@ void test_execution_dependency_does_not_become_empty_payload_reclaim() {
                 f.program.released.empty() && f.program.demoted.empty(),
             "execution dependency was reinterpreted as an immediately retryable empty demand");
 }
+
+void test_preservation_batches_only_until_complete_admission() {
+    Fixture f(128);
+    for (int i = 0; i < 3; ++i) {
+        const auto h                           = f.program.add({static_cast<std::uint32_t>(i + 1)});
+        f.program.contents[h.index].main_pages = 0;
+        f.program.contents[h.index].demotion_bytes = 8;
+        f.publish(h);
+    }
+    const auto demand = f.program.pressure(2).demand;
+    require(
+        f.cache.reclaim(f.program, f.program.assess(demand)) ==
+                ninfer::runtime::ReclaimProgress::Changed &&
+            f.program.assess(demand).feasible() && f.program.demotion_submissions == 1 &&
+            f.program.demoted.size() == 2 && f.program.released.empty(),
+        "preservation should admit the whole demand in one transfer without moving extra sources");
+
+    Fixture limited(8);
+    for (int i = 0; i < 2; ++i) {
+        const auto h = limited.program.add({static_cast<std::uint32_t>(i + 1)});
+        limited.program.contents[h.index].main_pages     = 0;
+        limited.program.contents[h.index].demotion_bytes = 8;
+        limited.publish(h);
+    }
+    require(limited.cache.reclaim(limited.program, limited.program.pressure(2)) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                limited.program.demoted.size() == 1 && limited.program.released.empty(),
+            "a batch must reserve all Host destinations and must not introduce Host evictions");
+}
 } // namespace
 
 int main() {
     try {
         test_shared_publication_deduplicates_complete_snapshots();
         test_execution_dependency_does_not_become_empty_payload_reclaim();
+        test_preservation_batches_only_until_complete_admission();
         test_intermediate_capture_preserves_semantic_history();
         test_host_selection_against_full_rescoring();
         test_reclaim_assesses_combined_device_and_host_demand();

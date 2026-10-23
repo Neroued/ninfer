@@ -202,8 +202,8 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
         }
     };
     auto current = p.plan_reclaim(all, {}, demand);
-    require(!current.demotions.empty(), "demotion quote missing");
-    const auto quote           = current.demotions.front();
+    require(current.demotions.size() > 1, "independent demotion quotes missing");
+    const auto quote           = p.combine_demotions(current.demotions);
     const auto device_before   = live_bytes(ContextMemoryDomain::Device);
     const auto host_before     = live_bytes(ContextMemoryDomain::Host);
     const auto released_device = p.directory.released_bytes(quote.released);
@@ -256,8 +256,8 @@ int main() {
         options.prefill_chunk    = 256;
         options.max_concurrency  = 1;
         options.context_capacity = ContextCapacityPolicy::explicit_capacity(1024ULL * 1024 * 1024);
-        options.speculative.backend               = SpeculativeBackend::Mtp;
-        options.speculative.draft_tokens          = 1;
+        options.speculative.backend      = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 1;
         // Two State records and the Main/MTP record classes need four Context blocks.
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
         artifact::Reader reader(path);

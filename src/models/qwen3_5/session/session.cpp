@@ -236,6 +236,10 @@ Session::HostRequirement Session::demotion_host_requirements(const ContextDemoti
     return impl_->demotion_host_requirements(plan);
 }
 
+ContextDemotion Session::combine_demotions(std::span<const ContextDemotion> quotes) const {
+    return impl_->combine_demotions(quotes);
+}
+
 std::size_t Session::host_write_bytes(const HostRequirement& write) const {
     return impl_->directory.host_write_bytes(write);
 }

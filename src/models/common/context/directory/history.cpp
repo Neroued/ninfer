@@ -798,29 +798,29 @@ HistoryDirectory::released_pages(std::span<const HistoryPrefix* const> removed) 
         touched.emplace(prefix->history().index, prefix->history());
     }
 
-    struct RemovedPage {
-        PageId page;
-        std::uint32_t references = 0;
-    };
-
-    std::map<std::uint32_t, RemovedPage> candidates;
+    std::vector<PageId> candidates;
     for (const auto& [index, handle] : touched) {
         const auto& history = require(handle);
         if (history.owned) continue;
         const auto retained = retained_after(handle, removed);
         for (auto i = page_count(retained); i < history.page_count; ++i) {
-            auto page   = membership(history, i);
-            auto& entry = candidates[pages_->descriptor_index(page)];
-            entry.page  = page;
-            ++entry.references;
+            const auto page = membership(history, i);
+            (void)pages_->descriptor_index(page);
+            candidates.push_back(page);
         }
     }
     std::vector<PageId> result;
-    for (const auto& [index, entry] : candidates)
-        if (entry.references == pages_->history_references(entry.page) &&
-            pages_->active_history_references(entry.page) == 0 &&
-            pages_->source_pins(entry.page) == 0)
-            result.push_back(entry.page);
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto a, const auto b) { return a.index < b.index; });
+    for (std::size_t begin = 0; begin < candidates.size();) {
+        auto end = begin + 1;
+        while (end < candidates.size() && candidates[end] == candidates[begin]) ++end;
+        const auto page = candidates[begin];
+        if (end - begin == pages_->history_references(page) &&
+            pages_->active_history_references(page) == 0 && pages_->source_pins(page) == 0)
+            result.push_back(page);
+        begin = end;
+    }
     return result;
 }
 

@@ -435,6 +435,59 @@ struct ContextPool::Impl {
         return result;
     }
 
+    // Project counts and whole-block releases without constructing a placement. Only a
+    // feasible, fragmented layout needs the relocation planner.
+    std::optional<PoolAssessment>
+    projected_assessment(std::span<const std::size_t> counts,
+                         std::span<const AllocationId> releases) const {
+        PoolAssessment result{PoolAvailability::Ready, revision};
+        if (maintenance) {
+            result.status = PoolAvailability::MaintenanceInProgress;
+            return result;
+        }
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> removed;
+        removed.reserve(releases.size());
+        for (const auto allocation : releases) {
+            const auto& e = require(allocation);
+            if (e.state != State::Live && e.state != State::Reserved)
+                throw std::invalid_argument(
+                    "ContextPool: projected release is not immediately releasable");
+            removed.emplace_back(e.block, allocation.index);
+        }
+        std::sort(removed.begin(), removed.end());
+        removed.erase(std::unique(removed.begin(), removed.end()), removed.end());
+        std::vector<std::size_t> released(classes.size()), emptied(classes.size());
+        auto empty = free_blocks.size();
+        for (std::size_t begin = 0; begin < removed.size();) {
+            auto end = begin + 1;
+            while (end < removed.size() && removed[end].first == removed[begin].first) ++end;
+            const auto& block = blocks[removed[begin].first];
+            released[block.record_class] += end - begin;
+            if (end - begin == block.occupied()) {
+                ++emptied[block.record_class];
+                ++empty;
+            }
+            begin = end;
+        }
+        std::size_t minimum = 0, needed = 0;
+        for (std::size_t c = 0; c < classes.size(); ++c) {
+            const auto per_block = geometry.classes[c].records_per_block;
+            const auto occupied  = classes[c].blocks * per_block - classes[c].free_records;
+            minimum              = checked_add(
+                minimum, ceil_div(checked_add(occupied - released[c], counts[c]), per_block));
+            const auto available = classes[c].free_records + released[c] - emptied[c] * per_block;
+            if (counts[c] > available)
+                needed = checked_add(needed, ceil_div(counts[c] - available, per_block));
+        }
+        if (minimum > blocks.size()) {
+            result.status        = PoolAvailability::InsufficientCapacity;
+            result.reclaim_bytes = checked_multiply(minimum - blocks.size(), geometry.block_bytes);
+            return result;
+        }
+        if (needed <= empty) return result;
+        return std::nullopt;
+    }
+
     Plan plan(std::span<const std::size_t> counts, std::span<const AllocationId> releases,
               bool ignore_retirement = false) const {
         Plan result;
@@ -793,8 +846,14 @@ PoolAssessment ContextPool::assess(std::span<const RecordRequest> demand,
         const auto direct = impl_->direct_assessment(counts);
         if (direct.status != PoolAvailability::InsufficientCapacity) return direct;
     }
-    auto result = impl_->plan(counts, releases).assessment;
+    const auto projected = impl_->projected_assessment(counts, releases);
+    auto result          = projected ? *projected : impl_->plan(counts, releases).assessment;
     if (result.status == PoolAvailability::InsufficientCapacity &&
+        std::any_of(
+            impl_->classes.begin(), impl_->classes.end(),
+            [](const auto& c) {
+                return c.records[static_cast<std::size_t>(Impl::State::PendingRetirement)] != 0;
+            }) &&
         impl_->plan(counts, releases, true).assessment.feasible())
         result.status = PoolAvailability::WaitingForRetirement;
     return result;

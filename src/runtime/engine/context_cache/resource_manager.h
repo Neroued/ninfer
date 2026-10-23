@@ -623,7 +623,6 @@ public:
         struct Action {
             std::optional<Demotion> demotion;
             std::optional<Release> release;
-            HostRequirement host{};
             std::vector<Handle> host_victims;
             std::optional<Admission> preservation;
             ActionRank rank;
@@ -670,7 +669,6 @@ public:
                  host_rank.priority.last_demand > rank.priority.last_demand))
                 rank.priority = host_rank.priority;
             actions.push_back({.demotion     = std::move(plan),
-                               .host         = std::move(host),
                                .host_victims = std::move(*victims),
                                .preservation = std::move(preservation),
                                .rank         = rank});
@@ -689,21 +687,39 @@ public:
         std::stable_sort(actions.begin(), actions.end(),
                          [](const auto& a, const auto& b) { return less_rank(a.rank, b.rank); });
         auto selection = plans.inventory->select();
-        for (const auto& action : actions) {
+        for (std::size_t i = 0; i < actions.size(); ++i) {
+            const auto& action = actions[i];
             if (action.demotion) {
                 // Earlier tentative deletions remain uncommitted. A preservation action
                 // uses the current directory, including all of those surviving sources.
-                const auto& plan       = *action.demotion;
+                auto plan = *action.demotion;
+                // Consecutive preservation actions with free Host destinations can share one
+                // native transaction. Stop as soon as the complete demand fits; Host eviction
+                // remains an individually ranked decision.
+                if (action.host_victims.empty()) {
+                    for (auto next = i + 1;
+                         next < actions.size() &&
+                         !session.assess(current.demand, plan.released).feasible();
+                         ++next) {
+                        if (!actions[next].demotion || !actions[next].host_victims.empty()) break;
+                        const std::array parts{plan, *actions[next].demotion};
+                        auto combined = session.combine_demotions(parts);
+                        if (!session.can_place_host(session.demotion_host_requirements(combined)))
+                            break;
+                        plan = std::move(combined);
+                    }
+                }
+                const auto host        = session.demotion_host_requirements(plan);
                 auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
                 const auto victims = host_victims_in_order(
-                    session, action.host, action.preservation->checkpoint, {}, protected_sources,
+                    session, host, action.preservation->checkpoint, {}, protected_sources,
                     action.preservation, cursor, evaluation);
                 if (!victims || *victims != action.host_victims) continue;
                 if (!may_revoke(action.host_victims, cursor.rights))
                     throw std::logic_error("demotion lacks Host victim revocation rights");
-                const auto host_assessment = session.assess(session.host_demand(action.host));
+                const auto host_assessment = session.assess(session.host_demand(host));
                 if (host_assessment.requires_maintenance()) {
                     const auto maintenance = session.start_maintenance(host_assessment);
                     if (maintenance == ContextStart::Started)
@@ -1362,7 +1378,7 @@ private:
                           const ReclaimCursor& cursor, Evaluation& evaluation) const {
         const auto demand     = session.host_demand(write);
         const auto assessment = session.assess(demand);
-        if (session.can_place_host(write)) return std::vector<Handle>{};
+        if (assessment.feasible()) return std::vector<Handle>{};
         if (assessment.impossible() || assessment.waiting()) return std::nullopt;
         if (!admission && incoming) {
             admission = preservation_admission(

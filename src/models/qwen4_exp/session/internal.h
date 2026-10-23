@@ -290,6 +290,7 @@ public:
     [[nodiscard]] std::size_t host_released(std::span<const CheckpointHandle>) const;
     [[nodiscard]] std::shared_ptr<Demotion> demotion(std::span<const CheckpointHandle>) const;
     [[nodiscard]] ContextDemotion describe_demotion(std::shared_ptr<const Demotion>) const;
+    [[nodiscard]] ContextDemotion combine_demotions(std::span<const ContextDemotion>) const;
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   const ContextDemand&) const;

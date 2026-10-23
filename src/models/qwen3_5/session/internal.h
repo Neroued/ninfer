@@ -318,6 +318,7 @@ public:
                                      std::span<const CheckpointHandle> host_victims);
     [[nodiscard]] context::HostWriteRequirements
     demotion_host_requirements(const ContextDemotion&) const;
+    [[nodiscard]] ContextDemotion combine_demotions(std::span<const ContextDemotion>) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);

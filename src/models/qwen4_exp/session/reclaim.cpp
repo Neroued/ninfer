@@ -210,9 +210,13 @@ ContextReleaseSet SessionImpl::footprint(std::span<const CheckpointHandle> input
     }
     for (const auto image : checkpoint_images(input)) result.merge(directory.state_release(image));
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
-        for (const auto page : checkpoint_pages(input, pool))
-            result.merge(directory.page_release(page));
+        for (const auto page : checkpoint_pages(input, pool)) {
+            const auto facts = directory.page_release(page);
+            result.records.insert(result.records.end(), facts.records.begin(), facts.records.end());
+            result.pages.push_back(page);
+        }
     }
+    result.normalize();
     return result;
 }
 
@@ -254,12 +258,48 @@ ContextDemotion SessionImpl::describe_demotion(std::shared_ptr<const Demotion> p
     }
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
         for (const auto page : plan->pages[pool]) {
-            result.released.merge(
-                directory.page_release(page).replicas(context::ContextMemory::Device));
+            const auto records =
+                directory.page_release(page).replicas(context::ContextMemory::Device);
+            result.released.records.insert(result.released.records.end(), records.records.begin(),
+                                           records.records.end());
         }
     }
+    result.released.normalize();
     result.host_bytes = directory.host_write_bytes(host_requirements(*plan));
     result.impl       = std::move(plan);
+    return result;
+}
+
+ContextDemotion SessionImpl::combine_demotions(std::span<const ContextDemotion> quotes) const {
+    auto plan   = std::make_shared<Demotion>();
+    plan->owner = this;
+    ContextDemotion result;
+    std::unordered_set<std::uint32_t> images;
+    std::array<std::unordered_set<std::uint32_t>, 2> pages;
+    for (const auto& quote : quotes) {
+        if (!quote.impl || quote.impl->owner != this)
+            throw std::invalid_argument("demotion quote belongs to another session");
+        const auto& part = *quote.impl;
+        for (const auto source : part.records) append_unique(plan->records, source);
+        for (std::size_t i = 0; i < part.images.size(); ++i) {
+            if (!images.insert(part.images[i].index).second)
+                throw std::invalid_argument("demotion batch contains overlapping State records");
+            plan->images.push_back(part.images[i]);
+            plan->image_epochs.push_back(part.image_epochs[i]);
+        }
+        for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+            for (std::size_t i = 0; i < part.pages[pool].size(); ++i) {
+                const auto page = part.pages[pool][i];
+                if (!pages[pool].insert(page.index).second)
+                    throw std::invalid_argument("demotion batch contains overlapping KV records");
+                plan->pages[pool].push_back(page);
+                plan->page_versions[pool].push_back(part.page_versions[pool][i]);
+            }
+        result.host_bytes += quote.host_bytes;
+        result.released.merge(quote.released);
+    }
+    result.sources = plan->records;
+    result.impl    = std::move(plan);
     return result;
 }
 
@@ -525,6 +565,10 @@ Session::HostRequirement Session::demotion_host_requirements(const ContextDemoti
 
 std::size_t Session::host_write_bytes(const HostRequirement& write) const {
     return impl_->directory.host_write_bytes(write);
+}
+
+ContextDemotion Session::combine_demotions(std::span<const ContextDemotion> quotes) const {
+    return impl_->combine_demotions(quotes);
 }
 
 ContextDemand Session::host_demand(const HostRequirement& write) const {

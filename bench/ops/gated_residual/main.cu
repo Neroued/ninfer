@@ -1,6 +1,6 @@
 #include "fixture.cuh"
 #include "mix_fixture.cuh"
-#include "conditioning.cuh"
+#include "common/gpu_activity.cuh"
 #include "common/roofline.h"
 
 using namespace ninfer;
@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
                     const auto result = measurement::measure(
                         [&](CudaExecutionView cuda) { f.launch(cuda); },
                         [&](CudaExecutionView cuda) {
-                            hc::condition(cuda, options.condition_us);
+                            condition_gpu(cuda, options.condition_us);
                             f.restore(cuda);
                         },
                         flush, device.execution_view(), options.timing, execution, cache);

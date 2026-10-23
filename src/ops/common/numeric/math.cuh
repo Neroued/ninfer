@@ -60,6 +60,12 @@ __device__ __forceinline__ float exp2_approx_ftz(float x) {
 
 __device__ __forceinline__ float exp_approx_ftz(float x) { return exp2_approx_ftz(x * kLog2E); }
 
+__device__ __forceinline__ float rcp_approx_ftz(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
 template <bool TanhApprox>
 __device__ __forceinline__ float gelu(float value) {
     constexpr float kInvSqrt2 = 0.70710678118654752440f;

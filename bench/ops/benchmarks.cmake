@@ -72,6 +72,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/benchmarks.c
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gated_residual/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/mhc/benchmarks.cmake")
 
 ninfer_add_op_bench(ninfer_moe_ep_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/ep.cu"

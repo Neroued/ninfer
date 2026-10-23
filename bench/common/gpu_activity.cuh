@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 
-namespace ninfer::bench::hc {
+namespace ninfer::bench {
 namespace detail {
 __device__ inline unsigned long long global_nanoseconds() {
     unsigned long long value;
@@ -23,10 +23,10 @@ static __global__ void condition_kernel(unsigned long long nanoseconds) {
 }
 } // namespace detail
 
-inline void condition(CudaExecutionView execution, int microseconds) {
+inline void condition_gpu(CudaExecutionView execution, int microseconds) {
     if (!microseconds) return;
     detail::condition_kernel<<<2 * execution.multiprocessor_count(), 256, 0, execution.stream()>>>(
         static_cast<unsigned long long>(microseconds) * 1000);
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::bench::hc
+} // namespace ninfer::bench

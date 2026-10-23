@@ -7,6 +7,7 @@ template <class Schedule>
 struct SwiGluRowMajorMmaRows {
     static constexpr bool kPaired          = true;
     static constexpr int kOutputRowsPerCta = Schedule::kBlockRows / 2;
+    static constexpr int kTmaRowsPerPanel  = Schedule::kBlockRows / 2;
 
     __device__ __forceinline__ int weight_row(int row0, int local_row, int rows) const {
         return row0 + local_row % kOutputRowsPerCta +

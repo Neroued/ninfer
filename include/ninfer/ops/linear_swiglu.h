@@ -45,8 +45,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, M
                    CudaExecutionView execution);
 
 // Explicit clamped product: SiLU(min(gate, limit)) * clamp(up, -limit, limit).
-// limit must be finite and positive. Clamping is supported by registered BF16 and NVFP4
-// geometries; unsupported combinations throw. Other operands/effects follow linear_swiglu.
+// limit must be finite and positive. Clamping is supported by registered BF16, Q8-G32/FP16 and
+// NVFP4 geometries; unsupported combinations throw. Gate/up accumulators feed the product without
+// an intermediate BF16 rounding boundary. Other operands/effects follow linear_swiglu.
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, float limit,
                    LinearPolicy policy, MemoryArena& ws, CudaExecutionView execution);
 

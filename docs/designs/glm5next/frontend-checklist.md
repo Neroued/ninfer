@@ -36,18 +36,19 @@ F7 媒体准备可以独立推进，随后并入 F8。文本链路可先用真�
 
 ## F2：GLM chat template 与公共选项转换
 
-- [ ] 完成 GLM 消息序列化、生成前缀和公共选项转换。
+- [x] 完成 GLM 消息序列化、生成前缀和公共选项转换。
 
 **方法：**
 
 - 复用 Jinja 执行器，按源模板处理 `[gMASK]<sop>`、GLM 角色标记、工具历史和媒体占位。
   用实际模板核对语言功能；需要的通用语法补在 Jinja 层。
 - 源模板的 reasoning effort 为 `low/high/max`，默认 `max`。
-  明确其他公共 effort 值的映射或拒绝，不能无意落入模板的默认 `max` 分支。
+  其他公共 effort 值明确拒绝，不落入模板的默认 `max` 分支。
 - 将 `preserve_thinking` 转换为源模板的 `clear_thinking` 语义，保留其关于最后一条
-  user 消息前后历史的规则。明确 developer 角色和工具错误结果的 GLM 表达。
-- 源模板固定以 `<|assistant|><think>` 开始生成；关闭思考和 assistant continuation
-  需要定义实际字节前缀并实现，不能仅传入模板未使用的 `enable_thinking=false`。
+  user 消息前后历史的规则。developer 原位转换为 system；工具错误正文加 `[tool_error]\n`。
+- 新一轮固定以 `<|assistant|><think>` 开始生成，拒绝关闭思考及 `add_vision_id=true`。
+  assistant continuation 从最后一条纯文本 assistant 的正文末尾继续，可以携带已完成的
+  reasoning，不追加新的思考段。
 - 保留来源定位和 literal spans，区分用户文本中的标记与模板产生的控制标记。
 
 **完成条件：**正常对话、工具历史、思考选项和续写的模板字节与预期一致；

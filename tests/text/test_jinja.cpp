@@ -103,6 +103,24 @@ int origins_and_requests() {
     failures += check(clipped.regions.size() == 1 && clipped.regions[0].source_offset == 1 &&
                           clipped.regions[0].end == 6,
                       "Unicode slice lost byte origin mapping");
+    const std::vector<ninfer::text::TemplateInputRegion> nested_regions{{"/obj", 10},
+                                                                        {"/obj/b", 11}};
+    const auto nested =
+        JinjaTemplate("{% for k,v in obj.items() %}{{ k }}={{ v }};{% endfor %}", "object-origins")
+            .render({{"obj", {{"a", "x"}, {"b", "é"}}}}, {.regions = nested_regions});
+    bool inherited = false, exact_child = false;
+    for (const auto& region : nested.regions) {
+        if (region.tag == 10) {
+            inherited = true;
+            failures +=
+                check(!region.source_offset, "object origin invented exact child byte coordinates");
+        }
+        if (region.tag == 11)
+            exact_child = region.source_offset == 0 &&
+                          nested.text.substr(region.begin, region.end - region.begin) == "é";
+    }
+    failures += check(nested.text == "a=x;b=é;" && inherited && exact_child,
+                      "object origin inheritance or explicit child precedence failed");
     std::vector<std::future<bool>> workers;
     for (int worker = 0; worker < 8; ++worker) {
         workers.push_back(std::async(std::launch::async, [&] {

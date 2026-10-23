@@ -135,4 +135,8 @@ bool is_whitespace(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_python_whitespace(std::int32_t codepoint) noexcept {
+    return (codepoint >= 0x1c && codepoint <= 0x1f) || is_whitespace(codepoint);
+}
+
 } // namespace ninfer::text::unicode_internal

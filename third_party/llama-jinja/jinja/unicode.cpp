@@ -54,7 +54,7 @@ std::size_t length(std::string_view text) {
 }
 
 bool whitespace(std::int32_t cp) {
-    return (cp >= 0x1c && cp <= 0x1f) || cp == 0x85 || utf8::is_whitespace(cp);
+    return utf8::is_python_whitespace(cp);
 }
 
 bool is_upper(std::string_view text) {

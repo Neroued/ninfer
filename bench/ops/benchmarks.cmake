@@ -8,7 +8,7 @@ ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
 ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_add_bench.cu")
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention_bench.cu")
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_attention/kimi_delta_attention/main.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/add_bias_bench.cu")

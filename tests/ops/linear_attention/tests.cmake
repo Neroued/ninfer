@@ -1,5 +1,13 @@
 ninfer_add_op_test(ninfer_kimi_delta_attention_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention.cpp"
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/recurrence.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_kda_replay_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/replay.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_kda_input_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/input_conv.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_causal_conv1d_silu_test

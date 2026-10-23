@@ -337,6 +337,53 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
     }
 }
 
+#if NINFER_TARGET_SPARK
+void run_bf16_extensions(Suite& suite) {
+    using namespace ninfer::test::linear;
+    const std::array geometries{
+        Geometry{20480, 1536, {16, 32, 64, 128, 256}},
+    };
+    for (const auto& geometry : geometries) {
+        std::set<int> points{1, 4, 8, 128, 4096, 4097};
+        for (int boundary : geometry.boundaries)
+            for (int t : {boundary - 1, boundary, boundary + 1})
+                if (t > 0) points.insert(t);
+        std::vector<Invocation> calls;
+        for (int t : points) calls.push_back({t});
+        for (int t : {1, 17, 129, 4097})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        calls.push_back({8, CallForm::A16Convenience});
+        calls.push_back({17, CallForm::Policy, ops::LinearPolicy::AllowA8});
+        calls.push_back({64, CallForm::Policy, ops::LinearPolicy::AllowA4});
+        const auto seed = std::uint32_t(geometry.n + geometry.k + 431);
+        ShapeCase sampled{geometry.n, geometry.k, seed, Comparison::Sampled, true, calls};
+
+        add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, sampled);
+        add_workspace_cases(suite, QType::BF16, geometry.n, geometry.k);
+
+        const std::array full{Invocation{1}, Invocation{17}};
+        ShapeCase complete{geometry.n, geometry.k, seed + 1, Comparison::Full, true, full};
+
+        add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, complete);
+
+        if (geometry.k == 1536) {
+            const std::array calls{Invocation{16}, Invocation{33}, Invocation{65}, Invocation{129},
+                                   Invocation{257}};
+            ShapeCase cancellation{geometry.n,
+                                   geometry.k,
+                                   seed + 3,
+                                   Comparison::Sampled,
+                                   true,
+                                   calls,
+                                   ActivationPattern::Cancellation};
+
+            add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, cancellation_weight,
+                      cancellation);
+        }
+    }
+}
+#endif
+
 void run_bf16(Suite& suite) {
 
     struct ProjectionFixture {
@@ -350,6 +397,9 @@ void run_bf16(Suite& suite) {
     }
     { run_selector_linear(suite); }
     for (const auto& shape : kNewGeometries) { run_new_bf16_geometry(suite, shape); }
+#if NINFER_TARGET_SPARK
+    run_bf16_extensions(suite);
+#endif
 }
 
 } // namespace

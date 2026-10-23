@@ -17,8 +17,8 @@ using Json                = nlohmann::json;
 using Contract            = ToolCallOutputContract;
 using FallbackReason      = ToolCallParseFallbackReason;
 using NormalizationPolicy = Contract::NormalizationPolicy;
-using SchemaType          = Contract::SchemaType;
-using TypeSet             = Contract::TypeSet;
+using SchemaType          = text::SchemaType;
+using TypeSet             = text::SchemaTypes;
 
 enum class JsonValueKind : std::uint8_t {
     Null,

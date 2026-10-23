@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/frontend/prompt.h"
+#include "models/common/frontend/output_session.h"
 #include "ninfer/types.h"
 
 #include <memory>
@@ -40,6 +41,12 @@ public:
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] std::shared_ptr<const void> identity() const noexcept;
     [[nodiscard]] SamplingPreset sampling_for(const PreparedPrompt& prompt) const;
+    [[nodiscard]] models::frontend::OutputSession
+    make_output_session(const PreparedPrompt& prompt, const StopPolicy& stop,
+                        const OutputOptions& output, const ThinkingControlOptions& thinking,
+                        const std::optional<OutputConstraint>& constraint,
+                        const ToolChoice& choice) const;
+    [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 private:
     class Impl;
 

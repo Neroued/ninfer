@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/glm5next/frontend/frontend.h"
+#include "models/glm5next/frontend/output.h"
 #include "models/glm5next/prefix_identity.h"
 
 namespace ninfer::models::glm5next {
@@ -10,13 +11,6 @@ struct PromptIdentity {
     std::optional<models::frontend::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> execution_frontiers;
     std::vector<MediaInputIdentity> media;
-};
-
-struct PreparedOutput {
-    bool starts_in_reasoning = false;
-    bool has_tool_history    = false;
-    std::string continuation_content;
-    std::vector<std::string> tool_jsons;
 };
 
 struct PreparedPromptData : models::frontend::PromptData {

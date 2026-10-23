@@ -19,7 +19,12 @@ add_library(ninfer_model_control STATIC
   glm5next/frontend/chat_template.cpp
   glm5next/frontend/prompt_layout.cpp
   glm5next/frontend/frontend.cpp
+  glm5next/frontend/output.cpp
+  glm5next/frontend/tool_contract.cpp
+  glm5next/frontend/tool_decoder.cpp
+  glm5next/frontend/tool_grammar.cpp
   glm5next/prefix_identity.cpp
+  common/frontend/output_resources.cpp
   common/frontend/output_session.cpp
   common/frontend/tools.cpp
   common/frontend/media_cache.cpp

@@ -105,17 +105,26 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
 struct PrefixExecutionTracker {
     const ReasoningFormat* format = nullptr;
     std::size_t matched           = 0;
+    std::size_t content_matched   = 0;
     bool tracking                 = false;
 
     [[nodiscard]] std::optional<std::size_t> feed(std::string_view bytes) noexcept {
         if (!tracking || !format || format->execution_boundary.empty()) return {};
         const auto& boundary = format->execution_boundary;
         for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
-            const char byte = bytes[offset];
+            const char byte  = bytes[offset];
+            bool content_end = false;
+            if (!format->content_open.empty()) {
+                const auto& open = format->content_open;
+                while (content_matched && byte != open[content_matched])
+                    content_matched = format->content_failure[content_matched - 1];
+                if (byte == open[content_matched]) ++content_matched;
+                content_end = content_matched == open.size();
+            }
             while (matched && byte != boundary[matched])
                 matched = format->boundary_failure[matched - 1];
             if (byte == boundary[matched]) ++matched;
-            if (matched != boundary.size()) continue;
+            if (matched != boundary.size() && !content_end) continue;
             tracking = false;
             matched  = 0;
             return offset + 1;
@@ -131,6 +140,7 @@ struct DecoderState {
     bool in_reasoning          = false;
     bool strip_content_leading = false;
     std::string_view reasoning_close;
+    std::string_view content_open;
     bool strip_after_reasoning     = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
@@ -147,19 +157,40 @@ struct SemanticThinkingState {
     bool control_pending                = false;
     bool applied                        = false;
     std::string_view reasoning_close;
+    std::string_view content_open;
 };
+
+struct ReasoningEnd {
+    std::size_t offset;
+    std::size_t content_offset;
+};
+
+std::optional<ReasoningEnd> reasoning_end(std::string_view bytes, std::string_view close,
+                                          std::string_view content_open) {
+    const auto end  = bytes.find(close);
+    const auto open = content_open.empty() ? std::string_view::npos : bytes.find(content_open);
+    if (end != std::string_view::npos && end <= open) return ReasoningEnd{end, end + close.size()};
+    if (open != std::string_view::npos) return ReasoningEnd{open, open};
+    return {};
+}
+
+std::size_t reasoning_hold(std::string_view bytes, std::string_view close,
+                           std::string_view content_open) {
+    return std::max(longest_suffix_prefix(bytes, close, true),
+                    longest_suffix_prefix(bytes, content_open, true));
+}
 
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
     state.close_pending.append(bytes);
     const std::string_view close = state.reasoning_close;
-    if (state.close_pending.find(close) != std::string::npos) {
+    if (reasoning_end(state.close_pending, close, state.content_open)) {
         state.close_pending.clear();
         state.in_reasoning    = false;
         state.control_pending = false;
         return;
     }
-    const std::size_t hold = longest_suffix_prefix(state.close_pending, close, true);
+    const std::size_t hold = reasoning_hold(state.close_pending, close, state.content_open);
     state.close_pending.erase(0, state.close_pending.size() - hold);
 }
 
@@ -256,13 +287,13 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
 
     state.think_marker_pending.append(text);
     const std::string_view close = state.reasoning_close;
-    const std::size_t marker     = state.think_marker_pending.find(close);
-    if (marker != std::string::npos) {
+    const auto marker = reasoning_end(state.think_marker_pending, close, state.content_open);
+    if (marker) {
         feed_channel(state, OutputChannel::Reasoning,
-                     std::string_view(state.think_marker_pending).substr(0, marker), policy,
+                     std::string_view(state.think_marker_pending).substr(0, marker->offset), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + close.size());
+        std::string content = state.think_marker_pending.substr(marker->content_offset);
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
         state.strip_content_leading = state.strip_after_reasoning;
@@ -270,7 +301,7 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, close, true);
+    const std::size_t hold = reasoning_hold(state.think_marker_pending, close, state.content_open);
     const std::size_t safe = state.think_marker_pending.size() - hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
@@ -339,11 +370,14 @@ public:
         saw_content           = options.has_content_prefix;
         state.in_reasoning    = split_reasoning;
         state.reasoning_close = reasoning ? std::string_view(reasoning->close) : std::string_view{};
+        state.content_open =
+            reasoning ? std::string_view(reasoning->content_open) : std::string_view{};
         state.strip_after_reasoning = reasoning && reasoning->strip_content_leading;
         prefix_execution.format     = reasoning.get();
         prefix_execution.tracking   = options.starts_in_reasoning;
         semantic.budget             = options.thinking.budget;
         semantic.reasoning_close    = state.reasoning_close;
+        semantic.content_open       = state.content_open;
         semantic.in_reasoning = options.starts_in_reasoning && options.thinking.budget.has_value();
     }
 
@@ -385,16 +419,20 @@ OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 ReasoningFormat::ReasoningFormat(std::string close_, std::string execution_boundary_,
                                  std::shared_ptr<const std::vector<TokenId>> control_tokens_,
-                                 bool strip_content_leading_)
+                                 bool strip_content_leading_, std::string content_open_)
     : close(std::move(close_)), execution_boundary(std::move(execution_boundary_)),
-      boundary_failure(execution_boundary.size()), control_tokens(std::move(control_tokens_)),
+      boundary_failure(execution_boundary.size()), content_open(std::move(content_open_)),
+      content_failure(content_open.size()), control_tokens(std::move(control_tokens_)),
       strip_content_leading(strip_content_leading_) {
-    for (std::size_t i = 1, matched = 0; i < execution_boundary.size(); ++i) {
-        while (matched && execution_boundary[i] != execution_boundary[matched])
-            matched = boundary_failure[matched - 1];
-        if (execution_boundary[i] == execution_boundary[matched]) ++matched;
-        boundary_failure[i] = matched;
-    }
+    const auto build_failure = [](std::string_view marker, std::vector<std::size_t>& failure) {
+        for (std::size_t i = 1, matched = 0; i < marker.size(); ++i) {
+            while (matched && marker[i] != marker[matched]) matched = failure[matched - 1];
+            if (marker[i] == marker[matched]) ++matched;
+            failure[i] = matched;
+        }
+    };
+    build_failure(execution_boundary, boundary_failure);
+    build_failure(content_open, content_failure);
 }
 
 OutputSession::OutputSession(OutputSessionOptions options, std::unique_ptr<BodyDecoder> body,

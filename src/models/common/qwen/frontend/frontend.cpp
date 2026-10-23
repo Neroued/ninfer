@@ -550,6 +550,8 @@ Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& ca
                                      thinking, constraint, tool_choice);
 }
 
-const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->output->defaults; }
+const StopPolicy& Frontend::default_stop_policy() const noexcept {
+    return impl_->output->text.defaults;
+}
 
 } // namespace ninfer::models::qwen

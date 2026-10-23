@@ -229,7 +229,7 @@ struct StopPolicy {
 };
 
 struct ThinkingControlOptions {
-    // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
+    // Positive maximum accepted model-origin tokens while the model thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
@@ -245,7 +245,7 @@ struct ExecutionOptions {
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
-    // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
+    // Presentation constraint supplied by the protocol adapter. It bounds the model's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
 };

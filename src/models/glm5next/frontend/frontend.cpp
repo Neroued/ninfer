@@ -90,7 +90,8 @@ public:
     Impl(const FrontendResources& resources, models::frontend::FrontendOptions options)
         : chat(models::frontend::load_chat_template(resources.text, options.chat_template_path)),
           tokenizer(resources.text.tokenizer), sampling(resources.sampling),
-          max_context(options.max_context), vision_enabled(options.vision_enabled) {
+          output(resources.text, options.grammar_cache_bytes), max_context(options.max_context),
+          vision_enabled(options.vision_enabled) {
         if (!tokenizer) throw std::invalid_argument("GLM frontend requires parsed text resources");
         if (!max_context) throw std::invalid_argument("frontend max_context must be nonzero");
     }
@@ -98,6 +99,7 @@ public:
     CompiledChatTemplate chat;
     std::shared_ptr<const text::Tokenizer> tokenizer;
     SamplingPreset sampling;
+    OutputResources output;
     std::uint32_t max_context;
     bool vision_enabled;
 };
@@ -159,13 +161,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     models::frontend::check_preparation_control(control, "GLM tokenization");
     data->output.starts_in_reasoning  = rendered.starts_in_reasoning;
     data->output.continuation_content = std::move(rendered.continuation_content);
-    data->output.tool_jsons           = std::move(input.options.tool_jsons);
-    data->output.has_tool_history =
-        std::any_of(input.messages.begin(), input.messages.end(), [](const auto& message) {
-            return message.role == ChatRole::Tool || !message.tool_calls.empty();
-        });
-    data->sampling        = impl_->sampling;
-    data->prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    data->output.tools                = build_tool_call_output_contract(input.options.tool_jsons);
+    data->sampling                    = impl_->sampling;
+    data->prepare.seconds             = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(data));
 }
 
@@ -198,6 +196,19 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> tokens,
 
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
+}
+
+models::frontend::OutputSession
+Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& stop,
+                              const OutputOptions& output, const ThinkingControlOptions& thinking,
+                              const std::optional<OutputConstraint>& constraint,
+                              const ToolChoice& choice) const {
+    return create_output_session(impl_->output, PreparedPromptAccess::view(prompt).output, stop,
+                                 output, thinking, constraint, choice);
+}
+
+const StopPolicy& Frontend::default_stop_policy() const noexcept {
+    return impl_->output.text.defaults;
 }
 
 } // namespace ninfer::models::glm5next

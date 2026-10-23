@@ -12,7 +12,7 @@ import struct
 from typing import Mapping
 
 from .model import Model, Parameter
-from .resources import load_resources
+from .qwen_resources import load_qwen_resources
 from .sources.logical import LogicalSource, select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
@@ -939,7 +939,7 @@ def build_model(
                 "config": draft_config(companions[backend].config, config, backend),
                 "target": "text",
             }
-    refs, resources, count, special = load_resources(
+    refs, resources, count, special = load_qwen_resources(
         base.root,
         vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,

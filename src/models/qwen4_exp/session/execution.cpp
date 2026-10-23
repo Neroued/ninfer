@@ -164,7 +164,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
             throw std::logic_error("forced control row is not executable");
     }
     for (const auto id : tokens)
-        if (id < 0 || std::uint32_t(id) >= p.definition->resources().public_token_count)
+        if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("forced token is outside vocabulary");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};

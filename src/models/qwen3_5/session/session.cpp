@@ -19,8 +19,8 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
     return impl_ != nullptr ? impl_->summary : empty;
 }
 
-const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    static const qwen::PreparedContextCache empty;
+const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
+    static const models::frontend::PreparedContextCache empty;
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 

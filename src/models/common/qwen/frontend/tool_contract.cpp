@@ -1,7 +1,6 @@
 #include "models/common/qwen/frontend/tool_contract.h"
 #include "models/common/qwen/frontend/tool_format.h"
 #include "text/json_schema.h"
-#include "text/json_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -191,52 +190,26 @@ std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
     if (tool_jsons.empty()) return {};
     auto result = std::make_shared<Contract>();
-    std::set<std::string> names;
-    for (std::size_t i = 0; i < tool_jsons.size(); ++i) {
-        try {
-            const auto parsed       = text::parse_json_numbers(tool_jsons[i]);
-            const auto& declaration = parsed.value;
-            const auto& function    = declaration.at("function");
-            Contract::Tool tool;
-            tool.name = function.at("name").get<std::string>();
-            if (tool.name.empty() || !names.insert(tool.name).second)
-                fail("tool names must be nonempty and unique", "/" + std::to_string(i));
-            tool.strict = function.value("strict", false);
-            if (tool.strict) {
-                if (const auto pointer =
-                        text::inexact_schema_number(parsed, "/function/parameters"))
-                    throw RequestError(
-                        RequestErrorKind::UnsupportedJsonSchema,
-                        "numeric schema value cannot be preserved by the JSON number "
-                        "representation",
-                        "/" + std::to_string(i) + "/parameters" +
-                            pointer->substr(std::string_view("/function/parameters").size()),
-                        RequestErrorSource::Tools);
-            }
-            const Json schema = function.value(
-                "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
-            tool.schema_json       = schema.dump();
-            tool.declaration_index = i;
-            // Encoding is selected before generation, never guessed from a value prefix.
-            if (schema.is_object() && schema.contains("properties") &&
-                schema["properties"].is_object()) {
-                for (const auto& [name, property] : schema["properties"].items()) {
-                    Contract::Parameter parameter;
-                    parameter.name = name;
-                    if (compile_schema_types(property, parameter.types)) {
-                        parameter.policy = NormalizationPolicy::DeclaredTypes;
-                        // The established non-strict normalization of a string union is raw text.
-                        parameter.encoding = parameter.types.bits & type_bit(SchemaType::String)
-                                                 ? Contract::Encoding::RawString
-                                                 : Contract::Encoding::JsonValue;
-                    }
-                    tool.parameters.push_back(std::move(parameter));
+    for (auto& declaration : models::frontend::parse_tool_declarations(tool_jsons)) {
+        Contract::Tool tool{std::move(declaration), {}};
+        const auto schema = Json::parse(tool.schema_json);
+        // Encoding is selected before generation, never guessed from a value prefix.
+        if (schema.is_object() && schema.contains("properties") &&
+            schema["properties"].is_object()) {
+            for (const auto& [name, property] : schema["properties"].items()) {
+                Contract::Parameter parameter;
+                parameter.name = name;
+                if (compile_schema_types(property, parameter.types)) {
+                    parameter.policy = NormalizationPolicy::DeclaredTypes;
+                    // The established non-strict normalization of a string union is raw text.
+                    parameter.encoding = parameter.types.bits & type_bit(SchemaType::String)
+                                             ? Contract::Encoding::RawString
+                                             : Contract::Encoding::JsonValue;
                 }
+                tool.parameters.push_back(std::move(parameter));
             }
-            result->tools.push_back(std::move(tool));
-        } catch (const Json::exception& error) {
-            fail(std::string("invalid tool declaration: ") + error.what(), "/" + std::to_string(i));
         }
+        result->tools.push_back(std::move(tool));
     }
     return result;
 }
@@ -244,41 +217,18 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
 std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,
                           const ToolChoice& choice) {
-    if (choice.allowed_names) {
-        for (const auto& name : *choice.allowed_names) {
-            if (!declarations ||
-                std::none_of(declarations->tools.begin(), declarations->tools.end(),
-                             [&](const auto& tool) { return tool.name == name; }))
-                fail("tool choice refers to undeclared tool: " + name);
-        }
-    }
-    if (declarations && choice.mode == ToolChoiceMode::Auto && choice.parallel &&
-        !choice.allowed_names && choice.constraints == ToolConstraintMode::Automatic &&
-        std::none_of(declarations->tools.begin(), declarations->tools.end(),
-                     [](const auto& tool) { return tool.strict; }))
+    const auto tools = declarations ? std::span<const Contract::Tool>(declarations->tools)
+                                    : std::span<const Contract::Tool>{};
+    auto selection   = models::frontend::select_tools(tools, choice);
+    if (!selection.constrained && declarations && selection.indices.size() == tools.size())
         return declarations;
-    auto selected      = std::make_shared<Contract>();
-    selected->required = choice.mode == ToolChoiceMode::Required;
-    selected->parallel = choice.parallel;
-    if (declarations && choice.mode != ToolChoiceMode::None) {
-        for (const auto& tool : declarations->tools) {
-            if (!choice.allowed_names ||
-                std::find(choice.allowed_names->begin(), choice.allowed_names->end(), tool.name) !=
-                    choice.allowed_names->end())
-                selected->tools.push_back(tool);
-        }
-    }
-    if (selected->tools.empty()) {
-        if (selected->required) fail("required tool choice has no callable tools");
-        if (!declarations || declarations->tools.empty()) return {};
-        selected->constrained = true;
-        return selected;
-    }
-    selected->constrained = selected->required || !selected->parallel ||
-                            choice.allowed_names.has_value() ||
-                            choice.constraints == ToolConstraintMode::Basic ||
-                            std::any_of(selected->tools.begin(), selected->tools.end(),
-                                        [](const auto& tool) { return tool.strict; });
+    if (tools.empty()) return {};
+    auto selected         = std::make_shared<Contract>();
+    selected->required    = selection.required;
+    selected->parallel    = selection.parallel;
+    selected->constrained = selection.constrained;
+    selected->tools.reserve(selection.indices.size());
+    for (auto i : selection.indices) selected->tools.push_back(tools[i]);
     if (selected->constrained) {
         for (auto& tool : selected->tools) {
             if (!tool.strict) continue;

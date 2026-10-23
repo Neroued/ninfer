@@ -1,8 +1,8 @@
 #include "models/common/qwen/frontend/processor.h"
 
 #include "media/decode/decode.h"
-#include "models/common/qwen/frontend/digest.h"
-#include "models/common/qwen/frontend/media_cache.h"
+#include "models/common/frontend/digest.h"
+#include "models/common/frontend/media_cache.h"
 
 #include <algorithm>
 #include <array>
@@ -55,8 +55,8 @@ struct Size {
 };
 
 struct Prepared {
-    VisionItem item;
-    std::shared_ptr<PreparedMediaPayload> payload;
+    models::frontend::VisionItem item;
+    std::shared_ptr<models::frontend::PreparedMediaPayload> payload;
 };
 
 static_assert(kPatchFeatures == static_cast<int>(kPreparedVisionPatchFeatures));
@@ -172,7 +172,7 @@ void resize_bicubic(media::decode::Image& input, Size size, const PreparationCon
     const Coefficients vertical   = coefficients(input.height, size.h);
     std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);
     for (int y = 0; y < input.height; ++y) {
-        if (y % 16 == 0) { check_preparation_control(control); }
+        if (y % 16 == 0) { models::frontend::check_preparation_control(control); }
         for (int x = 0; x < size.w; ++x) {
             const int first        = horizontal.offsets[static_cast<std::size_t>(x)];
             const int last         = horizontal.offsets[static_cast<std::size_t>(x + 1)];
@@ -200,7 +200,7 @@ void resize_bicubic(media::decode::Image& input, Size size, const PreparationCon
     out.height = size.h;
     out.rgb.resize(static_cast<std::size_t>(size.h) * size.w * 3);
     for (int y = 0; y < size.h; ++y) {
-        if (y % 16 == 0) { check_preparation_control(control); }
+        if (y % 16 == 0) { models::frontend::check_preparation_control(control); }
         const int first        = vertical.offsets[static_cast<std::size_t>(y)];
         const int last         = vertical.offsets[static_cast<std::size_t>(y + 1)];
         const int source_begin = vertical.starts[static_cast<std::size_t>(y)];
@@ -269,7 +269,7 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
     cursor += local;
 }
 
-void add_budget(PreprocessStats& stats, const VisionItem& item);
+void add_budget(PreprocessStats& stats, const models::frontend::VisionItem& item);
 void enforce_media_item_resource_limits(const PreprocessStats& stats);
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
@@ -280,7 +280,7 @@ class ConcurrentMediaBudget {
 public:
     explicit ConcurrentMediaBudget(const ProcessorOptions& options) : options_(options) {}
 
-    void claim(const VisionItem& item) {
+    void claim(const models::frontend::VisionItem& item) {
         std::lock_guard lock(mutex_);
         add_budget(stats_, item);
         enforce_media_resource_limits(stats_, options_);
@@ -293,7 +293,8 @@ private:
 };
 
 Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, MediaPreprocessCache& cache,
+                       const media::decode::Policy& policy,
+                       models::frontend::MediaPreprocessCache& cache,
                        ConcurrentMediaBudget& request_budget, const PreparationControl& control) {
     media::decode::Image image = media::decode::decode_image(bytes, policy);
     const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
@@ -301,7 +302,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     const int gh    = size.h / kPatch;
     const int gw    = size.w / kPatch;
     Prepared out;
-    out.item.modality = Modality::Image;
+    out.item.modality = models::frontend::Modality::Image;
     out.item.grid     = {1, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
@@ -313,7 +314,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     std::size_t cursor = 0;
     const std::vector<const media::decode::Image*> frames{&image, &image};
     for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
-        check_preparation_control(control);
+        models::frontend::check_preparation_control(control);
         for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
             for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
                 for (int merge_x = 0; merge_x < kMerge; ++merge_x) {
@@ -343,11 +344,41 @@ std::vector<double> video_timestamps(std::span<const int> indices, int temporal_
     return timestamps;
 }
 
+std::vector<int> sample_indices(int total, double source_fps, double target_fps, int min_frames,
+                                int max_frames) {
+    if (total <= 0 || source_fps <= 0.0 || target_fps <= 0.0 || min_frames <= 0 ||
+        max_frames < min_frames) {
+        throw std::invalid_argument("invalid video sampling configuration");
+    }
+    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
+    count     = std::min({std::max(count, min_frames), max_frames, total});
+    std::vector<int> indices(static_cast<std::size_t>(count));
+    if (count == 1) {
+        indices[0] = 0;
+        return indices;
+    }
+    for (int i = 0; i < count; ++i) {
+        const double value                   = static_cast<double>(i) * (total - 1) / (count - 1);
+        indices[static_cast<std::size_t>(i)] = static_cast<int>(std::nearbyint(value));
+    }
+    return indices;
+}
+
+media::decode::VideoSelection select_video_frames(std::span<const std::uint8_t> bytes,
+                                                  const media::decode::Policy& policy,
+                                                  const ProcessorOptions& options) {
+    auto source  = media::decode::probe_video(bytes, policy);
+    auto indices = sample_indices(source.total_frames, source.fps, options.video_fps,
+                                  options.video_min_frames, options.video_max_frames);
+    return {source, std::move(indices), std::min(options.video_min_frames, source.total_frames)};
+}
+
 Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, MediaPreprocessCache& cache,
+                       const media::decode::Policy& policy,
+                       models::frontend::MediaPreprocessCache& cache,
                        ConcurrentMediaBudget& request_budget, const PreparationControl& control) {
-    media::decode::Video video = media::decode::decode_video(
-        bytes, policy, options.video_fps, options.video_min_frames, options.video_max_frames);
+    media::decode::Video video =
+        media::decode::decode_video(bytes, policy, select_video_frames(bytes, policy, options));
     const Size size =
         smart_resize_video(static_cast<int>(video.frames.size()), video.height, video.width,
                            options.video_min_pixels, options.video_max_pixels);
@@ -356,7 +387,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     const int gh            = size.h / kPatch;
     const int gw            = size.w / kPatch;
     Prepared out;
-    out.item.modality = Modality::Video;
+    out.item.modality = models::frontend::Modality::Video;
     out.item.grid     = {gt, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
@@ -369,7 +400,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.timestamps = video_timestamps(video.indices, gt, video.fps);
     std::size_t cursor  = 0;
     for (int t = 0; t < gt; ++t) {
-        check_preparation_control(control);
+        models::frontend::check_preparation_control(control);
         const std::vector<const media::decode::Image*> frames{
             &video.frames[static_cast<std::size_t>(2 * t)],
             &video.frames[static_cast<std::size_t>(2 * t + 1)]};
@@ -428,13 +459,14 @@ std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
     return options.max_encoded_media_bytes - remaining;
 }
 
-VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                              const media::decode::Policy& policy) {
+models::frontend::VisionItem inspect_image_item(std::span<const std::uint8_t> bytes,
+                                                const ProcessorOptions& options,
+                                                const media::decode::Policy& policy) {
     const media::decode::ImageInfo image = media::decode::inspect_image(bytes, policy);
     const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
                                          options.image_max_pixels);
-    VisionItem item;
-    item.modality = Modality::Image;
+    models::frontend::VisionItem item;
+    item.modality = models::frontend::Modality::Image;
     item.grid     = {1, size.h / kPatch, size.w / kPatch};
     return item;
 }
@@ -457,15 +489,16 @@ void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& o
     }
 }
 
-VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
-                              const media::decode::Policy& policy) {
-    const media::decode::VideoInfo video = media::decode::inspect_video(
-        bytes, policy, options.video_fps, options.video_min_frames, options.video_max_frames);
+models::frontend::VisionItem inspect_video_item(std::span<const std::uint8_t> bytes,
+                                                const ProcessorOptions& options,
+                                                const media::decode::Policy& policy) {
+    const media::decode::VideoInfo video =
+        media::decode::inspect_video(bytes, policy, select_video_frames(bytes, policy, options));
     const Size size = smart_resize_video(video.sampled_frames, video.height, video.width,
                                          options.video_min_pixels, options.video_max_pixels);
     const int gt    = (video.sampled_frames + kTemporal - 1) / kTemporal;
-    VisionItem item;
-    item.modality   = Modality::Video;
+    models::frontend::VisionItem item;
+    item.modality   = models::frontend::Modality::Video;
     item.grid       = {gt, size.h / kPatch, size.w / kPatch};
     item.timestamps = video_timestamps(video.indices, gt, video.fps);
     return item;
@@ -479,8 +512,8 @@ void append_repeated(std::string& out, std::string_view value, std::uint64_t cou
 }
 
 void append_media_token_run(std::string& out, std::string_view pad, std::uint64_t count,
-                            Modality modality, std::size_t item_index, std::size_t frame_index,
-                            std::vector<MediaTokenRunByteSpec>& runs) {
+                            models::frontend::Modality modality, std::size_t item_index,
+                            std::size_t frame_index, std::vector<MediaTokenRunByteSpec>& runs) {
     const std::size_t begin = out.size();
     append_repeated(out, pad, count);
     runs.push_back(MediaTokenRunByteSpec{
@@ -491,12 +524,13 @@ void append_media_token_run(std::string& out, std::string_view pad, std::uint64_
     });
 }
 
-void append_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
-                        std::vector<MediaTokenRunByteSpec>& runs) {
+void append_placeholder(std::string& out, const models::frontend::VisionItem& item,
+                        std::size_t item_index, std::vector<MediaTokenRunByteSpec>& runs) {
     const std::uint64_t frame_tokens =
         static_cast<std::uint64_t>(item.grid.height / kMerge) * (item.grid.width / kMerge);
-    if (item.modality == Modality::Image) {
-        append_media_token_run(out, kImagePad, frame_tokens, Modality::Image, item_index, 0, runs);
+    if (item.modality == models::frontend::Modality::Image) {
+        append_media_token_run(out, kImagePad, frame_tokens, models::frontend::Modality::Image,
+                               item_index, 0, runs);
         return;
     }
     if (item.timestamps.size() != static_cast<std::size_t>(item.grid.temporal)) {
@@ -507,8 +541,8 @@ void append_placeholder(std::string& out, const VisionItem& item, std::size_t it
         time << '<' << std::fixed << std::setprecision(1) << item.timestamps[frame] << " seconds>";
         out += time.str();
         out += kVisionStart;
-        append_media_token_run(out, kVideoPad, frame_tokens, Modality::Video, item_index, frame,
-                               runs);
+        append_media_token_run(out, kVideoPad, frame_tokens, models::frontend::Modality::Video,
+                               item_index, frame, runs);
         out += kVisionEnd;
     }
 }
@@ -538,7 +572,8 @@ std::size_t map_expanded_boundary(std::size_t boundary, std::size_t source_size,
     return completed.rendered_end + boundary - completed.source_end;
 }
 
-RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
+RenderedChat expand_placeholders(RenderedChat rendered,
+                                 const std::vector<models::frontend::VisionItem>& items) {
     if (!rendered.media_token_runs.empty()) {
         throw std::logic_error("rendered chat media placeholders were already expanded");
     }
@@ -552,12 +587,13 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
     expansions.reserve(items.size());
     std::size_t source_cursor = 0;
     for (std::size_t index = 0; index < items.size(); ++index) {
-        const VisionItem& item                     = items[index];
+        const models::frontend::VisionItem& item   = items[index];
         const MediaPlaceholderByteSpec placeholder = rendered.media_placeholders[index];
         if (placeholder.item_index != index || placeholder.modality != item.modality) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
-        const std::string_view needle = item.modality == Modality::Image ? kImagePad : kVideoPad;
+        const std::string_view needle =
+            item.modality == models::frontend::Modality::Image ? kImagePad : kVideoPad;
         if (placeholder.bytes.begin < source_cursor || placeholder.bytes.end > source.size() ||
             placeholder.bytes.end - placeholder.bytes.begin != needle.size() ||
             source.compare(placeholder.bytes.begin, needle.size(), needle) != 0) {
@@ -600,7 +636,7 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
     return rendered;
 }
 
-void add_budget(PreprocessStats& stats, const VisionItem& item) {
+void add_budget(PreprocessStats& stats, const models::frontend::VisionItem& item) {
     const std::uint64_t spatial = checked_mul(static_cast<std::uint64_t>(item.grid.height),
                                               item.grid.width, "vision spatial grid");
     const std::uint64_t patches =
@@ -664,12 +700,12 @@ void assign_positions(ProcessedInput& output,
         if (run.item_index >= output.vision_items.size()) {
             throw std::logic_error("encoded media token run references no Vision item");
         }
-        VisionItem& item = output.vision_items[run.item_index];
+        models::frontend::VisionItem& item = output.vision_items[run.item_index];
         if (item.modality != run.modality || run.frame_index != next_frame[run.item_index]) {
             throw std::logic_error("encoded media token run identity is inconsistent");
         }
         const std::size_t expected_frames =
-            item.modality == Modality::Image ? 1 : item.grid.temporal;
+            item.modality == models::frontend::Modality::Image ? 1 : item.grid.temporal;
         if (run.frame_index >= expected_frames) {
             throw std::logic_error("encoded media token run exceeds its temporal grid");
         }
@@ -701,8 +737,9 @@ void assign_positions(ProcessedInput& output,
     assign_text(cursor, length);
 
     for (std::size_t index = 0; index < output.vision_items.size(); ++index) {
-        const VisionItem& item     = output.vision_items[index];
-        const std::size_t expected = item.modality == Modality::Image ? 1 : item.grid.temporal;
+        const models::frontend::VisionItem& item = output.vision_items[index];
+        const std::size_t expected =
+            item.modality == models::frontend::Modality::Image ? 1 : item.grid.temporal;
         if (next_frame[index] != expected || item.token_spans.size() != expected) {
             throw std::invalid_argument("media grid count does not match placeholder runs");
         }
@@ -710,7 +747,7 @@ void assign_positions(ProcessedInput& output,
     output.rope_delta = maximum + 1 - static_cast<std::int32_t>(length);
 }
 
-int media_token_id(const Tokenizer& tokenizer, std::string_view text) {
+int media_token_id(const text::Tokenizer& tokenizer, std::string_view text) {
     const std::vector<int> ids = tokenizer.encode(text);
     if (ids.size() != 1) {
         throw std::invalid_argument("Vision placeholder must encode to one tokenizer token: " +
@@ -737,7 +774,7 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+EncodedChat encode_rendered_chat(const text::Tokenizer& tokenizer, const RenderedChat& rendered,
                                  std::size_t maximum_tokens) {
     if (!rendered.media_placeholders.empty()) {
         throw std::logic_error("rendered chat contains unexpanded media placeholders");
@@ -765,8 +802,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.end);
     }
 
-    BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
-        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
+    text::BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
+        rendered.text, byte_boundaries, text::EncodeOptions{.max_tokens = maximum_tokens},
         rendered.literal_spans);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
@@ -778,8 +815,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         return static_cast<std::uint32_t>(frontier);
     };
     if (rendered.rewrite_checkpoint) {
-        const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
-        const TokenBoundaryResult& recovery = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& recovery = tokenized.boundaries.at(boundary_index++);
         if (boundary.exact_frontier && *boundary.exact_frontier > 0) {
             const auto frontier = to_frontier(*boundary.exact_frontier, "rewrite checkpoint");
             encoded.rewrite_checkpoint = RewriteCheckpointSpec{
@@ -794,7 +831,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.rewrite_execution_frontiers.reserve(rendered.rewrite_execution_boundaries.size());
     for (std::size_t remaining = rendered.rewrite_execution_boundaries.size(); remaining != 0;
          --remaining) {
-        const TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
         const std::optional<std::uint32_t> frontier =
             result.exact_frontier ? std::optional<std::uint32_t>(to_frontier(
                                         *result.exact_frontier, "rewrite execution boundary"))
@@ -808,7 +845,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.message_boundaries.resize(rendered.message_boundaries.size());
     for (std::size_t index = 0; index < rendered.message_boundaries.size(); ++index) {
         if (rendered.message_boundaries[index]) {
-            const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+            const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
             if (boundary.exact_frontier) {
                 encoded.message_boundaries[index] =
                     to_frontier(*boundary.exact_frontier, "message boundary");
@@ -818,7 +855,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.cache_boundaries.resize(rendered.cache_boundaries.size());
     for (std::size_t index = 0; index < rendered.cache_boundaries.size(); ++index) {
         if (rendered.cache_boundaries[index]) {
-            const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+            const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
             if (boundary.exact_frontier)
                 encoded.cache_boundaries[index] =
                     to_frontier(*boundary.exact_frontier, "cache boundary");
@@ -826,23 +863,24 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     encoded.media_token_runs.reserve(rendered.media_token_runs.size());
     for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
-        const TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
-        const TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
         if (!begin.exact_frontier || !end.exact_frontier ||
             *begin.exact_frontier >= *end.exact_frontier) {
             throw std::logic_error("media token run is not an exact nonempty token span");
         }
         const std::size_t token_begin = *begin.exact_frontier;
         const std::size_t token_end   = *end.exact_frontier;
-        const int expected_token =
-            media_token_id(tokenizer, run.modality == Modality::Image ? kImagePad : kVideoPad);
+        const int expected_token      = media_token_id(
+            tokenizer, run.modality == models::frontend::Modality::Image ? kImagePad : kVideoPad);
         if (!std::all_of(encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin),
                          encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_end),
                          [expected_token](int token) { return token == expected_token; })) {
             throw std::logic_error("media token run contains a non-media token");
         }
         encoded.media_token_runs.push_back(EncodedChat::MediaTokenRun{
-            .tokens      = TokenSpan{.begin = token_begin, .count = token_end - token_begin},
+            .tokens =
+                models::frontend::TokenSpan{.begin = token_begin, .count = token_end - token_begin},
             .modality    = run.modality,
             .item_index  = run.item_index,
             .frame_index = run.frame_index,
@@ -854,8 +892,9 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     return encoded;
 }
 
-Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
-                     ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache)
+Processor::Processor(const text::Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
+                     ProcessorOptions options,
+                     std::shared_ptr<models::frontend::MediaPreprocessCache> media_cache)
     : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)),
       media_cache_(std::move(media_cache)) {
     if (options_.max_encoded_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
@@ -876,29 +915,31 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
 std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                     ChatRenderOptions render_options,
                                     const PreparationControl& control) const {
-    check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
     (void)validate_media_inputs(parts, options_);
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options), control);
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    models::frontend::MediaPreparationPermit request_permit =
+        media_cache_->acquire_request(control);
     const media::decode::Policy policy{
         .max_bytes                  = options_.max_encoded_media_bytes,
         .max_decoded_pixels         = options_.max_decoded_pixels,
         .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
         .max_video_source_frames    = options_.max_video_source_frames,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
-        .checkpoint                 = [&control] { check_preparation_control(control); },
+        .checkpoint = [&control] { models::frontend::check_preparation_control(control); },
     };
-    std::vector<VisionItem> items;
+    std::vector<models::frontend::VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;
     try {
         for (const ChatPart* part : parts) {
-            check_preparation_control(control);
+            models::frontend::check_preparation_control(control);
             enforce_image_resize_policy(*part, options_, policy);
-            VisionItem item = part->kind == ChatPartKind::Image
-                                  ? inspect_image_item(part->media.bytes, options_, policy)
-                                  : inspect_video_item(part->media.bytes, options_, policy);
+            models::frontend::VisionItem item =
+                part->kind == ChatPartKind::Image
+                    ? inspect_image_item(part->media.bytes, options_, policy)
+                    : inspect_video_item(part->media.bytes, options_, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
             enforce_media_item_resource_limits(item_stats);
@@ -909,7 +950,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
     rendered                = expand_placeholders(std::move(rendered), items);
     const std::size_t count = encode_rendered_chat(tokenizer_, rendered).input_ids.size();
-    check_preparation_control(control, "tokenization");
+    models::frontend::check_preparation_control(control, "tokenization");
     return count;
 }
 
@@ -917,7 +958,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
                                   const PreparationControl& control,
                                   std::size_t maximum_prompt_tokens) const {
-    check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
     const std::size_t media_bytes      = validate_media_inputs(parts, options_);
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options), control);
@@ -931,19 +972,20 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         const std::size_t preliminary_tokens =
             tokenizer_
                 .encode_with_boundaries(rendered.text, {},
-                                        EncodeOptions{.max_tokens = encode_limit},
+                                        text::EncodeOptions{.max_tokens = encode_limit},
                                         rendered.literal_spans)
                 .input_ids.size();
         preliminary_tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - preliminary_started).count();
-        check_preparation_control(control, "tokenization");
+        models::frontend::check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
                                  "prepared prompt exceeds Engine max_context " +
                                      std::to_string(maximum_prompt_tokens));
         }
     }
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    models::frontend::MediaPreparationPermit request_permit =
+        media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
@@ -956,35 +998,38 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
         .max_video_source_frames    = options_.max_video_source_frames,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
-        .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
+        .checkpoint =
+            [&worker_control] { models::frontend::check_preparation_control(worker_control); },
     };
     try {
         for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
-    std::vector<VisionItem> items;
+    std::vector<models::frontend::VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;
     stats.media_items      = parts.size();
     stats.media_bytes      = media_bytes;
     stats.tokenize_seconds = preliminary_tokenize_seconds;
 
-    std::vector<PendingMedia> pending_items;
+    std::vector<models::frontend::PendingMedia> pending_items;
     pending_items.reserve(parts.size());
     ConcurrentMediaBudget request_budget(options_);
     std::exception_ptr preparation_error;
     const auto media_phase_started = Clock::now();
     for (ChatPart* part : parts) {
         try {
-            check_preparation_control(control);
-            const auto digest =
-                sha256(part->media.bytes, [&control] { check_preparation_control(control); });
+            models::frontend::check_preparation_control(control);
+            const auto digest       = models::frontend::sha256(part->media.bytes, [&control] {
+                models::frontend::check_preparation_control(control);
+            });
             const ChatPartKind kind = part->kind;
-            const MediaCacheKey key{
+            const models::frontend::MediaCacheKey key{
                 .digest   = digest,
-                .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
+                .modality = kind == ChatPartKind::Image ? models::frontend::Modality::Image
+                                                        : models::frontend::Modality::Video,
             };
-            PendingMedia pending = media_cache_->begin_prepare(
+            models::frontend::PendingMedia pending = media_cache_->begin_prepare(
                 key, worker_control,
                 [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
                     Prepared built =
@@ -994,7 +1039,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                             : prepare_video(part->media.bytes, options_, policy, *media_cache_,
                                             request_budget, worker_control);
                     built.item.content_digest = digest;
-                    return PreparedMedia{std::move(built.item), std::move(built.payload)};
+                    return models::frontend::PreparedMedia{std::move(built.item),
+                                                           std::move(built.payload)};
                 });
             pending_items.push_back(std::move(pending));
         } catch (...) {
@@ -1003,10 +1049,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             break;
         }
     }
-    MediaCacheRequestStats cache_stats;
+    models::frontend::MediaCacheRequestStats cache_stats;
     std::size_t patch_cursor = 0;
-    for (PendingMedia& pending : pending_items) {
-        PreparedMedia media;
+    for (models::frontend::PendingMedia& pending : pending_items) {
+        models::frontend::PreparedMedia media;
         try {
             media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
                                         cache_stats);
@@ -1015,7 +1061,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                 preparation_error = std::current_exception();
                 stop_preparation.store(true, std::memory_order_relaxed);
             }
-            MediaCacheRequestStats discarded;
+            models::frontend::MediaCacheRequestStats discarded;
             try {
                 (void)media_cache_->await(pending, {}, discarded);
             } catch (...) {}
@@ -1028,9 +1074,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             stop_preparation.store(true, std::memory_order_relaxed);
             continue;
         }
-        VisionItem item  = media.item;
-        item.patch_begin = patch_cursor;
-        item.patch_count = media.payload->patch_elements / kPatchFeatures;
+        models::frontend::VisionItem item = media.item;
+        item.patch_begin                  = patch_cursor;
+        item.patch_count                  = media.payload->patch_elements / kPatchFeatures;
         patch_cursor += item.patch_count;
         try {
             PreprocessStats item_stats;
@@ -1060,18 +1106,19 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         std::chrono::duration<double>(Clock::now() - media_phase_started).count();
     request_permit.reset();
 
-    check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     rendered                    = expand_placeholders(std::move(rendered), items);
     const auto tokenize_started = Clock::now();
     EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered, encode_limit);
     stats.tokenize_seconds +=
         std::chrono::duration<double>(Clock::now() - tokenize_started).count();
-    check_preparation_control(control, "tokenization");
+    models::frontend::check_preparation_control(control, "tokenization");
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
                              "prepared prompt exceeds Engine max_context " +
                                  std::to_string(maximum_prompt_tokens));
     }
+    output.enable_thinking             = rendered.enable_thinking;
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.continuation_content        = rendered.continuation_content;
     output.input_ids                   = std::move(encoded.input_ids);
@@ -1091,7 +1138,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
     assign_positions(output, encoded.media_token_runs);
-    check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     output.stats = stats;
     return output;
 }

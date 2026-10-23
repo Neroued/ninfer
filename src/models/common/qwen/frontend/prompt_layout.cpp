@@ -26,39 +26,8 @@ std::size_t find_marker(const text::TemplateOutput& output, std::string_view mar
 
 } // namespace
 
-std::optional<text::ByteSpan> unique_output_region(const text::TemplateOutput& output,
-                                                   std::uint32_t tag) {
-    std::optional<text::ByteSpan> result;
-    for (const auto& region : output.regions) {
-        if (region.tag != tag) continue;
-        if (result) return std::nullopt;
-        result = text::ByteSpan{region.begin, region.end};
-    }
-    return result;
-}
-
-std::optional<std::size_t> source_boundary(const text::TemplateOutput& output, std::uint32_t tag,
-                                           std::size_t offset) {
-    std::optional<std::size_t> result;
-    for (const auto& region : output.regions) {
-        if (region.tag != tag || !region.source_offset) continue;
-        const auto begin = *region.source_offset;
-        if (offset < begin || offset - begin > region.end - region.begin) continue;
-        const auto mapped = region.begin + offset - begin;
-        if (result && *result != mapped) return std::nullopt;
-        result = mapped;
-    }
-    for (const auto& mapping : output.boundary_mappings) {
-        if (mapping.tag != tag || offset < mapping.source_begin || offset > mapping.source_end)
-            continue;
-        if (result && *result != mapping.offset) return std::nullopt;
-        result = mapping.offset;
-    }
-    return result;
-}
-
 PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
-                                   std::span<const Modality> media) {
+                                   std::span<const models::frontend::Modality> media) {
     PromptLayout result;
     const std::string_view source = output.text;
     for (auto pos = find_marker(output, kStart, 0); pos != std::string::npos;) {
@@ -125,9 +94,10 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
         const auto video = find_marker(output, "<|video_pad|>", pos);
         const auto pad   = std::min(image, video);
         if (pad == std::string::npos) break;
-        const auto modality = pad == image ? Modality::Image : Modality::Video;
+        const auto modality =
+            pad == image ? models::frontend::Modality::Image : models::frontend::Modality::Video;
         const std::string_view token =
-            modality == Modality::Image ? "<|image_pad|>" : "<|video_pad|>";
+            modality == models::frontend::Modality::Image ? "<|image_pad|>" : "<|video_pad|>";
         if (pad < kVisionStart.size() ||
             source.substr(pad - kVisionStart.size(), kVisionStart.size()) != kVisionStart ||
             source.substr(pad + token.size(), kVisionEnd.size()) != kVisionEnd ||

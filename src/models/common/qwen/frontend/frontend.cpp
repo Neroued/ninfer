@@ -1,29 +1,22 @@
 #include "models/common/qwen/frontend/frontend.h"
 
-#include "models/common/qwen/frontend/resources.h"
-#include "models/common/qwen/frontend/prepared_prompt.h"
-
+#include "models/common/frontend/media_cache.h"
 #include "models/common/qwen/frontend/chat_template.h"
-#include "models/common/qwen/frontend/media_cache.h"
+#include "models/common/qwen/frontend/output.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/common/qwen/frontend/processor.h"
+#include "models/common/qwen/frontend/resources.h"
 #include "models/common/qwen/frontend/test_access.h"
-#include "models/common/qwen/frontend/tokenizer.h"
 #include "models/common/qwen/frontend/tool_contract.h"
-#include "models/common/qwen/frontend/tool_grammar.h"
-#include "text/unicode.h"
-#include "text/grammar.h"
-#include <mutex>
+#include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -40,16 +33,6 @@ using Json   = nlohmann::json;
 using Clock  = std::chrono::steady_clock;
 namespace fi = frontend;
 
-constexpr std::string_view kThinkClose = "</think>";
-constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
-    "thinking directly now.\n</think>\n\n";
-static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
-constexpr double kRescaleFactor = 1.0 / 255.0;
-constexpr double kVideoFps      = 2.0;
-constexpr int kVideoMinFrames   = 4;
-constexpr int kVideoMaxFrames   = 768;
-
 Json parse_resource_json(std::string_view bytes, std::string_view name) {
     try {
         Json result = Json::parse(bytes);
@@ -62,129 +45,9 @@ Json parse_resource_json(std::string_view bytes, std::string_view name) {
     }
 }
 
-std::int64_t require_integer(const Json& object, std::string_view field,
-                             std::string_view resource) {
-    const std::string key(field);
-    if (!object.contains(key) || !object.at(key).is_number_integer()) {
-        throw std::invalid_argument(std::string(resource) + "." + key + " must be an integer");
-    }
-    return object.at(key).get<std::int64_t>();
-}
-
-double require_number(const Json& object, std::string_view field, std::string_view resource) {
-    const std::string key(field);
-    if (!object.contains(key) || !object.at(key).is_number()) {
-        throw std::invalid_argument(std::string(resource) + "." + key + " must be a number");
-    }
-    return object.at(key).get<double>();
-}
-
-double number_or_default(const Json& object, std::string_view field, std::string_view resource,
-                         double default_value) {
-    const std::string key(field);
-    return object.contains(key) ? require_number(object, field, resource) : default_value;
-}
-
-std::int64_t integer_or_default(const Json& object, std::string_view field,
-                                std::string_view resource, std::int64_t default_value) {
-    const std::string key(field);
-    return object.contains(key) ? require_integer(object, field, resource) : default_value;
-}
-
-const Json& require_object(const Json& object, std::string_view field, std::string_view resource) {
-    const std::string key(field);
-    if (!object.contains(key) || !object.at(key).is_object()) {
-        throw std::invalid_argument(std::string(resource) + "." + key + " must be an object");
-    }
-    return object.at(key);
-}
-
-std::uint64_t positive_u64(std::int64_t value, std::string_view field) {
-    if (value <= 0) { throw std::invalid_argument(std::string(field) + " must be positive"); }
-    return static_cast<std::uint64_t>(value);
-}
-
-void validate_pixel_pipeline(const Json& config, std::string_view resource) {
-    for (const char* flag : {"do_resize", "do_rescale", "do_normalize", "do_convert_rgb"}) {
-        if (config.contains(flag) && (!config[flag].is_boolean() || !config[flag].get<bool>())) {
-            throw std::invalid_argument(std::string(resource) + "." + flag +
-                                        " must be enabled for the compiled pixel pipeline");
-        }
-    }
-    if (config.contains("resample") &&
-        (!config["resample"].is_number_integer() || config["resample"].get<int>() != 3)) {
-        throw std::invalid_argument(std::string(resource) +
-                                    ".resample must select bicubic interpolation");
-    }
-    if (require_integer(config, "patch_size", resource) != 16 ||
-        require_integer(config, "temporal_patch_size", resource) != 2 ||
-        require_integer(config, "merge_size", resource) != 2) {
-        throw std::invalid_argument(std::string(resource) +
-                                    " does not match the compiled Vision patch geometry");
-    }
-    const auto require_half_triplet = [&](std::string_view field) {
-        const std::string key(field);
-        if (!config.contains(key) || !config.at(key).is_array() || config.at(key).size() != 3) {
-            throw std::invalid_argument(std::string(resource) + "." + key +
-                                        " must contain three values");
-        }
-        for (const Json& value : config.at(key)) {
-            if (!value.is_number() || value.get<double>() != 0.5) {
-                throw std::invalid_argument(std::string(resource) + "." + key +
-                                            " does not match the compiled normalization");
-            }
-        }
-    };
-    require_half_triplet("image_mean");
-    require_half_triplet("image_std");
-    if (number_or_default(config, "rescale_factor", resource, kRescaleFactor) != kRescaleFactor) {
-        throw std::invalid_argument(std::string(resource) +
-                                    ".rescale_factor does not match the compiled normalization");
-    }
-}
-
-fi::ProcessorOptions processor_options(const FrontendResources& resources) {
-    const Json image =
-        parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
-    const Json video = parse_resource_json(resources.video_preprocessor_config_json,
-                                           "video_preprocessor_config.json");
-    validate_pixel_pipeline(image, "preprocessor_config.json");
-    validate_pixel_pipeline(video, "video_preprocessor_config.json");
-
-    const Json& image_size = require_object(image, "size", "preprocessor_config.json");
-    const Json& video_size = require_object(video, "size", "video_preprocessor_config.json");
-
-    fi::ProcessorOptions options;
-    options.image_min_pixels =
-        positive_u64(require_integer(image_size, "shortest_edge", "preprocessor_config.json.size"),
-                     "image shortest_edge");
-    options.image_max_pixels =
-        positive_u64(require_integer(image_size, "longest_edge", "preprocessor_config.json.size"),
-                     "image longest_edge");
-    options.video_min_pixels = positive_u64(
-        require_integer(video_size, "shortest_edge", "video_preprocessor_config.json.size"),
-        "video shortest_edge");
-    options.video_max_pixels = positive_u64(
-        require_integer(video_size, "longest_edge", "video_preprocessor_config.json.size"),
-        "video longest_edge");
-    options.video_fps =
-        number_or_default(video, "fps", "video_preprocessor_config.json", kVideoFps);
-    options.video_min_frames = static_cast<int>(
-        integer_or_default(video, "min_frames", "video_preprocessor_config.json", kVideoMinFrames));
-    options.video_max_frames = static_cast<int>(
-        integer_or_default(video, "max_frames", "video_preprocessor_config.json", kVideoMaxFrames));
-    if (options.video_fps != kVideoFps || options.video_min_frames != kVideoMinFrames ||
-        options.video_max_frames != kVideoMaxFrames) {
-        throw std::invalid_argument(
-            "video_preprocessor_config.json does not match registered sampling defaults");
-    }
-
-    return options;
-}
-
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
-        parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
+        parse_resource_json(resources.text.tokenizer_config_json, "tokenizer_config.json");
     if (tokenizer_config.value("add_bos_token", true) ||
         tokenizer_config.value("add_prefix_space", true)) {
         throw std::invalid_argument(
@@ -200,37 +63,8 @@ void validate_tokenizer_config(const FrontendResources& resources) {
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
                                                const std::filesystem::path& override_path) {
     validate_tokenizer_config(resources);
-    nlohmann::ordered_json tokens = nlohmann::ordered_json::object();
-    const auto config             = nlohmann::ordered_json::parse(resources.tokenizer_config_json);
-    for (const char* key : {"bos_token", "eos_token", "pad_token", "unk_token", "sep_token",
-                            "cls_token", "mask_token"}) {
-        if (!config.contains(key) || config[key].is_null()) continue;
-        const auto& value = config[key];
-        if (value.is_string())
-            tokens[key] = value;
-        else if (value.is_object() && value.contains("content"))
-            tokens[key] = value.at("content");
-    }
-    if (config.contains("additional_special_tokens"))
-        tokens["additional_special_tokens"] = config["additional_special_tokens"];
-    std::string source(resources.chat_template_jinja);
-    std::string name = "artifact:chat_template.jinja";
-    if (!override_path.empty()) {
-        name = override_path.string();
-        std::ifstream file(override_path, std::ios::binary | std::ios::ate);
-        if (!file) throw std::invalid_argument("cannot read chat template: " + name);
-        const auto size = file.tellg();
-        if (size <= 0 || size > 16 * 1024 * 1024) {
-            throw std::invalid_argument(
-                "chat template must be a nonempty UTF-8 source file up to 16 MiB: " + name);
-        }
-        source.resize(static_cast<std::size_t>(size));
-        file.seekg(0);
-        if (!file.read(source.data(), static_cast<std::streamsize>(source.size()))) {
-            throw std::invalid_argument("cannot read chat template: " + name);
-        }
-    }
-    return fi::CompiledChatTemplate::resolve(source, std::move(name), std::move(tokens));
+    return fi::CompiledChatTemplate(
+        models::frontend::load_chat_template(resources.text, override_path));
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -255,9 +89,10 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     result.reserve(messages.size());
     for (ChatMessage& source : messages) {
         fi::ChatMessage target;
-        target.role              = source.role;
-        target.reasoning_content = std::move(source.reasoning_content);
-        target.tool_call_id      = std::move(source.tool_call_id);
+        target.role                 = source.role;
+        target.reasoning_content    = std::move(source.reasoning_content);
+        target.tool_call_id         = std::move(source.tool_call_id);
+        target.tool_result_is_error = source.tool_result_is_error;
         target.tool_calls.reserve(source.tool_calls.size());
         for (ToolCall& call : source.tool_calls) {
             target.tool_calls.push_back(
@@ -310,6 +145,7 @@ fi::ChatRenderOptions render_options(const PromptOptions& options,
                                    .chat_template_kwargs_json = options.chat_template_kwargs_json,
                                    .add_vision_id             = options.add_vision_id,
                                    .tool_jsons                = options.tool_jsons};
+    rendered.defaults = options.defaults;
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
 }
@@ -339,38 +175,6 @@ void assign_text_positions(PreparedPromptData& prompt) {
     prompt.rope_delta = 0;
 }
 
-StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& caller) {
-    StopPolicy result;
-    result.publish_stop_token = caller.publish_stop_token;
-    const auto append_token   = [&](TokenId token) {
-        if (!tokenizer.is_valid_token(token)) {
-            throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
-                                          std::to_string(token));
-        }
-        if (std::find(result.token_ids.begin(), result.token_ids.end(), token) ==
-            result.token_ids.end()) {
-            result.token_ids.push_back(token);
-        }
-    };
-    if (caller.include_model_defaults) {
-        for (const int token : tokenizer.default_stop_token_ids()) { append_token(token); }
-    }
-    for (const TokenId token : caller.token_ids) { append_token(token); }
-
-    result.strings.reserve(caller.strings.size());
-    for (const StopString& stop : caller.strings) {
-        if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
-        (void)ninfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
-        const auto duplicate = std::find_if(
-            result.strings.begin(), result.strings.end(), [&](const StopString& existing) {
-                return existing.text == stop.text && existing.channel == stop.channel &&
-                       existing.include_in_output == stop.include_in_output;
-            });
-        if (duplicate == result.strings.end()) { result.strings.push_back(stop); }
-    }
-    return result;
-}
-
 std::optional<std::uint32_t> leading_instruction_boundary(std::span<const ChatRole> roles) {
     std::uint32_t leading = 0;
     while (leading < roles.size() &&
@@ -380,11 +184,12 @@ std::optional<std::uint32_t> leading_instruction_boundary(std::span<const ChatRo
     return leading != 0 ? std::optional<std::uint32_t>(leading) : std::nullopt;
 }
 
-bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> items) {
-    for (const VisionItem& item : items) {
+bool exact_vision_frontier(std::uint32_t frontier,
+                           std::span<const models::frontend::VisionItem> items) {
+    for (const models::frontend::VisionItem& item : items) {
         if (item.token_spans.empty()) { return false; }
-        const TokenSpan& first = item.token_spans.front();
-        const TokenSpan& last  = item.token_spans.back();
+        const models::frontend::TokenSpan& first = item.token_spans.front();
+        const models::frontend::TokenSpan& last  = item.token_spans.back();
         if (last.count > std::numeric_limits<std::size_t>::max() - last.begin) { return false; }
         const std::size_t end = last.begin + last.count;
         if (first.begin < frontier && frontier < end) { return false; }
@@ -392,12 +197,12 @@ bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> i
     return true;
 }
 
-PreparedContextCache
+models::frontend::PreparedContextCache
 prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
                       std::span<const std::optional<std::uint32_t>> message_boundaries,
                       std::span<const PromptCacheMarker> rendered_markers,
                       std::span<const std::optional<std::uint32_t>> cache_boundaries,
-                      std::span<const VisionItem> vision_items,
+                      std::span<const models::frontend::VisionItem> vision_items,
                       std::optional<std::size_t> engine_tool_marker_index,
                       std::optional<std::uint32_t> leading_boundary) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
@@ -407,7 +212,7 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
         throw std::logic_error("rendered cache marker count changed during preparation");
     }
 
-    PreparedContextCache out;
+    models::frontend::PreparedContextCache out;
     out.automatic_checkpoints = hints.allow_engine_automatic_shared_prefixes;
     if (out.automatic_checkpoints) {
         for (const auto boundary : message_boundaries)
@@ -419,10 +224,11 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
             out.semantic_boundaries.end());
     }
     if (hints.session_key) {
-        if (hints.session_key->empty() || hints.session_key->size() > kPreparedSessionKeyCapacity) {
+        if (hints.session_key->empty() ||
+            hints.session_key->size() > models::frontend::kPreparedSessionKeyCapacity) {
             throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
         }
-        PreparedSessionKey key;
+        models::frontend::PreparedSessionKey key;
         key.size = static_cast<std::uint16_t>(hints.session_key->size());
         std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
         out.session_key = key;
@@ -437,6 +243,9 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
         default:
             throw std::invalid_argument("context cache marker kind is invalid");
         }
+        if (marker.location != PromptCacheMarkerLocation::MessageContentBoundary &&
+            (marker.after_tool_call_count || marker.reasoning_bytes))
+            throw std::invalid_argument("content coordinates require a message-content marker");
         switch (marker.location) {
         case PromptCacheMarkerLocation::MessageBoundary:
             if (marker.after_message_count > message_count ||
@@ -444,6 +253,11 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
                 marker.after_message_part_count != 0) {
                 throw std::invalid_argument("context cache message marker is invalid");
             }
+            break;
+        case PromptCacheMarkerLocation::MessageContentBoundary:
+            if (!marker.after_message_count || marker.after_message_count > message_count ||
+                marker.leading_instruction_bytes || marker.after_tool_count)
+                throw std::invalid_argument("context cache message-content marker is invalid");
             break;
         case PromptCacheMarkerLocation::MessagePartBoundary:
             if (marker.after_message_count == 0 || marker.after_message_count > message_count ||
@@ -482,10 +296,11 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
                 return existing.kind == kind && existing.frontier == frontier;
             });
         if (duplicate == out.opportunities.end()) {
-            out.opportunities.push_back(PreparedCacheOpportunity{.kind        = kind,
-                                                                 .evidence    = evidence,
-                                                                 .frontier    = frontier,
-                                                                 .input_order = input_order});
+            out.opportunities.push_back(
+                models::frontend::PreparedCacheOpportunity{.kind        = kind,
+                                                           .evidence    = evidence,
+                                                           .frontier    = frontier,
+                                                           .input_order = input_order});
         } else if (kind == PromptCacheMarkerKind::SharedStablePrefix) {
             duplicate->evidence |= evidence;
         }
@@ -520,11 +335,11 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
 
 class Frontend::Impl {
 public:
-    Impl(const FrontendResources& resources, FrontendOptions options,
+    Impl(const FrontendResources& resources, models::frontend::FrontendOptions options,
          ModelSamplingDefaults sampling_defaults)
         : chat_template(compile_chat_template(resources, options.chat_template_path)),
-          tokenizer(resources.tokenizer),
-          processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
+          tokenizer(resources.text.tokenizer),
+          processor(options.vision_enabled ? resources.processor.value() : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -540,72 +355,26 @@ public:
                 throw std::invalid_argument(
                     "media live-byte capacity cannot hold the maximum supported Vision prompt");
             }
-            media_cache = std::make_shared<fi::MediaPreprocessCache>(
+            media_cache = std::make_shared<models::frontend::MediaPreprocessCache>(
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
-        if (!tokenizer || resources.public_token_count != tokenizer->vocab_size()) {
+        if (!tokenizer || resources.text.public_token_count != tokenizer->vocab_size()) {
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
-        sampling            = sampling_defaults;
-        grammar_cache_bytes = options.grammar_cache_bytes;
-        for (const int token : tokenizer->default_stop_token_ids()) {
-            if (!tokenizer->is_valid_token(token)) {
-                throw std::invalid_argument(
-                    "generation_config.json contains a stop token outside the vocabulary");
-            }
-            defaults.token_ids.push_back(token);
-        }
-        std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
-        if (encoded.empty()) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot encode the canonical thinking control suffix");
-        }
-        const std::string exact =
-            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
-        const std::string presented =
-            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
-        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot present the canonical thinking control suffix");
-        }
-        for (const TokenId token : encoded) {
-            if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
-                defaults.token_ids.end()) {
-                throw std::invalid_argument(
-                    "canonical thinking control suffix contains a default terminal token");
-            }
-        }
-        thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        sampling = sampling_defaults;
+        output = std::make_shared<fi::OutputResources>(resources.text, options.grammar_cache_bytes);
     }
 
     fi::CompiledChatTemplate chat_template;
-    std::shared_ptr<const fi::Tokenizer> tokenizer;
+    std::shared_ptr<const text::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
-    std::shared_ptr<fi::MediaPreprocessCache> media_cache;
-    StopPolicy defaults;
+    std::shared_ptr<models::frontend::MediaPreprocessCache> media_cache;
     ModelSamplingDefaults sampling;
-    std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool vision_enabled             = true;
-    std::uint32_t max_context       = 0;
-    std::size_t grammar_cache_bytes = 0;
-    mutable std::once_flag grammar_once;
-    mutable std::unique_ptr<text::GrammarCompiler> grammar_compiler;
-
-    text::GrammarCompiler& grammars() const {
-        std::call_once(grammar_once, [&] {
-            std::vector<std::string> vocab(tokenizer->vocab_size());
-            for (std::size_t id = 0; id < vocab.size(); ++id) {
-                if (!tokenizer->is_valid_token(static_cast<TokenId>(id))) { continue; }
-                const auto decoded = tokenizer->decoded_token(static_cast<TokenId>(id));
-                if (!decoded.special) { vocab[id] = decoded.bytes; }
-            }
-            grammar_compiler = std::make_unique<text::GrammarCompiler>(
-                std::move(vocab), defaults.token_ids, grammar_cache_bytes);
-        });
-        return *grammar_compiler;
-    }
+    std::shared_ptr<const fi::OutputResources> output;
+    bool vision_enabled       = true;
+    std::uint32_t max_context = 0;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -627,14 +396,14 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.starts_in_reasoning = data_->starts_in_reasoning,
+    return PromptSummary{.starts_in_reasoning = data_->output.starts_in_reasoning,
                          .prompt_tokens       = checked_token_count(data_->token_ids.size()),
                          .has_media           = data_->has_media()};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     if (data_ == nullptr) { return {}; }
-    const PrepareStats& stats = data_->prepare;
+    const models::frontend::PrepareStats& stats = data_->prepare;
     return PromptPreparationStats{
         .seconds                       = stats.seconds,
         .media_preprocess_seconds      = stats.media_preprocess_seconds,
@@ -667,8 +436,15 @@ const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
 }
 
-Frontend make_frontend(const FrontendResources& resources, FrontendOptions options,
-                       ModelSamplingDefaults sampling) {
+std::shared_ptr<const void> Frontend::identity() const noexcept { return impl_; }
+
+SamplingPreset Frontend::sampling_for(const PreparedPrompt& prompt) const {
+    if (!prompt.data_) throw std::invalid_argument("prepared prompt is empty");
+    return prompt.data_->sampling;
+}
+
+Frontend make_frontend(const FrontendResources& resources,
+                       models::frontend::FrontendOptions options, ModelSamplingDefaults sampling) {
     return Frontend(
         std::make_shared<const Frontend::Impl>(resources, std::move(options), sampling));
 }
@@ -689,7 +465,7 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
-    fi::check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     const auto start              = Clock::now();
     const PromptOptions options   = input.options;
     ContextCacheHints cache_hints = std::move(input.context_cache);
@@ -724,7 +500,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
-    result.tool_call_output    = tool_call_output;
+    result.output.tools        = tool_call_output;
+    result.output.has_tool_history =
+        std::any_of(messages.begin(), messages.end(), [](const auto& m) {
+            return m.role == ChatRole::Tool || !m.tool_calls.empty();
+        });
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -737,8 +517,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                   control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
-        result.starts_in_reasoning              = processed.starts_in_reasoning;
-        result.continuation_content             = std::move(processed.continuation_content);
+        result.output.enable_thinking           = processed.enable_thinking;
+        result.output.starts_in_reasoning       = processed.starts_in_reasoning;
+        result.output.continuation_content      = std::move(processed.continuation_content);
         result.token_types                      = std::move(processed.token_types);
         result.positions                        = std::move(processed.positions);
         result.rope_delta                       = processed.rope_delta;
@@ -767,14 +548,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
-        result.starts_in_reasoning  = rendered.starts_in_reasoning;
-        result.continuation_content = rendered.continuation_content;
-        const auto tokenize_started = Clock::now();
-        fi::EncodedChat encoded     = fi::encode_rendered_chat(
+        result.output.enable_thinking      = rendered.enable_thinking;
+        result.output.starts_in_reasoning  = rendered.starts_in_reasoning;
+        result.output.continuation_content = rendered.continuation_content;
+        const auto tokenize_started        = Clock::now();
+        fi::EncodedChat encoded            = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
-        fi::check_preparation_control(control, "tokenization");
+        models::frontend::check_preparation_control(control, "tokenization");
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
         }
@@ -792,11 +574,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    result.sampling =
+        result.output.starts_in_reasoning ? impl_->sampling.thinking : impl_->sampling.non_thinking;
     return PreparedPrompt(std::move(prepared));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
-    fi::check_preparation_control(control);
+    models::frontend::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
@@ -810,7 +594,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
             impl_->chat_template.render(messages, render_options(options), control);
         const std::uint32_t count = checked_token_count(
             fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids.size());
-        fi::check_preparation_control(control, "tokenization");
+        models::frontend::check_preparation_control(control, "tokenization");
         return count;
     }
 
@@ -824,7 +608,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 
 MediaCacheSummary Frontend::media_cache_summary() const {
     if (impl_ == nullptr || !impl_->media_cache) { return {}; }
-    const fi::MediaCacheStats stats = impl_->media_cache->stats();
+    const models::frontend::MediaCacheStats stats = impl_->media_cache->stats();
     return MediaCacheSummary{
         .capacity_bytes      = stats.capacity_bytes,
         .live_capacity_bytes = stats.live_capacity_bytes,
@@ -863,6 +647,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.update_session_index = false;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    result.sampling        = impl_->sampling.thinking;
     return PreparedPrompt(std::move(prepared));
 }
 
@@ -871,73 +656,16 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
-OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
-                                            const StopPolicy& caller_stop,
-                                            const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking,
-                                            const std::optional<OutputConstraint>& constraint,
-                                            const ToolChoice& tool_choice) const {
-    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
-    if (output.raw) { policy.publish_stop_token = true; }
-    auto tool_contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
-    if (constraint && tool_contract && tool_contract->tools.empty()) tool_contract.reset();
-    const bool combined = constraint && tool_contract && !tool_contract->tools.empty();
-    if (combined) {
-        if (constraint->kind != OutputConstraintKind::JsonObject &&
-            constraint->kind != OutputConstraintKind::JsonSchema)
-            throw RequestError(text::constraint_error_kind(constraint->kind),
-                               "active tools can be combined with JSON output constraints");
-        if (!tool_contract->constrained) {
-            auto structured         = std::make_shared<fi::ToolCallOutputContract>(*tool_contract);
-            structured->constrained = true;
-            tool_contract           = std::move(structured);
-        }
-    }
-    const bool tool_constraint = tool_contract && tool_contract->constrained;
-    std::unique_ptr<text::GrammarSession> matcher;
-    if (constraint || tool_constraint) {
-        if (impl_->defaults.token_ids.empty() || !caller_stop.token_ids.empty() ||
-            !caller_stop.strings.empty() || !caller_stop.include_model_defaults ||
-            caller_stop.publish_stop_token || output.raw || output.preserve_special_tokens) {
-            throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
-                                               : text::constraint_error_kind(constraint->kind),
-                               "constraints require default EOS, text output, no custom stops, and "
-                               "one output language");
-        }
-        try {
-            const auto close = prompt.data_->starts_in_reasoning
-                                   ? fi::kCanonicalReasoningCloseSerialization
-                                   : std::string_view{};
-            if (tool_constraint) {
-                for (const auto& tool : tool_contract->tools) {
-                    if (tool.name.size() > output.tool_name_max_length ||
-                        !std::all_of(tool.name.begin(), tool.name.end(), [](unsigned char c) {
-                            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                   (c >= '0' && c <= '9') || c == '_' || c == '-';
-                        }))
-                        throw RequestError(RequestErrorKind::InvalidToolConstraint,
-                                           "tool name is outside the output contract: " +
-                                               tool.name);
-                }
-                matcher = fi::compile_tool_grammar(impl_->grammars(), *tool_contract, close,
-                                                   prompt.data_->continuation_content, constraint);
-            } else {
-                matcher = impl_->grammars().compile(*constraint, close,
-                                                    prompt.data_->continuation_content);
-            }
-        } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
-            throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
-                                               : text::constraint_error_kind(constraint->kind),
-                               error.what());
-        }
-    }
-    return OutputSession(impl_->tokenizer, std::move(policy), output,
-                         prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, std::move(tool_contract),
-                         std::move(matcher), prompt.data_->continuation_content, combined);
+models::frontend::OutputSession
+Frontend::make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
+                              const OutputOptions& output, const ThinkingControlOptions& thinking,
+                              const std::optional<OutputConstraint>& constraint,
+                              const ToolChoice& tool_choice) const {
+    if (!prompt.data_) throw std::invalid_argument("prepared prompt is empty");
+    return fi::create_output_session(*impl_->output, prompt.data_->output, caller_stop, output,
+                                     thinking, constraint, tool_choice);
 }
 
-const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->output->defaults; }
 
 } // namespace ninfer::models::qwen

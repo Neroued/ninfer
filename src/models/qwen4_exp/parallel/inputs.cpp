@@ -19,13 +19,13 @@ std::vector<std::int32_t> integers(wire::Decoder& in) {
     return values;
 }
 
-void grid(wire::Encoder& out, const qwen::VisionGrid& g) {
+void grid(wire::Encoder& out, const models::frontend::VisionGrid& g) {
     out.i32(g.temporal);
     out.i32(g.height);
     out.i32(g.width);
 }
 
-qwen::VisionGrid grid(wire::Decoder& in) { return {in.i32(), in.i32(), in.i32()}; }
+models::frontend::VisionGrid grid(wire::Decoder& in) { return {in.i32(), in.i32(), in.i32()}; }
 
 runtime::InputResource encode_input(std::uint64_t id,
                                     const std::shared_ptr<const qwen::VisionExecutionInput>& input,
@@ -144,7 +144,7 @@ std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
         control->prepared_item_begin = data.u32();
         control->items.resize(data.count(65));
         for (auto& c : control->items) {
-            c.modality               = static_cast<qwen::Modality>(data.u8());
+            c.modality               = static_cast<models::frontend::Modality>(data.u8());
             c.grid                   = grid(data);
             c.patch_begin            = data.u64();
             c.patch_count            = data.u64();
@@ -162,7 +162,7 @@ std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
         for (auto& use : v.plan.uses) use = {data.u32(), data.u32(), data.u32(), data.u32()};
         v.vision_items.resize(data.count(29));
         for (auto& item : v.vision_items) {
-            item.modality    = static_cast<qwen::Modality>(data.u8());
+            item.modality    = static_cast<models::frontend::Modality>(data.u8());
             item.grid        = grid(data);
             item.patch_begin = data.u64();
             item.patch_count = data.u64();
@@ -173,7 +173,7 @@ std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
         for (std::size_t i = 0; i < r.parts.size(); ++i) {
             const auto elements = data.u64();
             if (!elements) continue;
-            auto payload            = std::make_shared<qwen::PreparedMediaPayload>();
+            auto payload            = std::make_shared<models::frontend::PreparedMediaPayload>();
             payload->patch_elements = elements;
             payload->patches        = std::make_unique<std::uint16_t[]>(elements);
             v.media_payloads[i]     = payload;

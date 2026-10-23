@@ -13,8 +13,8 @@ struct RuntimeTypes {
     using Profile           = execution::ModelProfile;
     using Frontend          = qwen::Frontend;
     using PreparedPrompt    = qwen::PreparedPrompt;
-    using OutputSession     = qwen::OutputSession;
-    using PublishedOutput   = qwen::PublishedOutput;
+    using OutputSession     = models::frontend::OutputSession;
+    using PublishedOutput   = models::frontend::PublishedOutput;
     using SequencePlanner   = qwen3_5::SequencePlanner;
     using SequencePlan      = qwen3_5::SequencePlan;
     using RequestBasePlan   = qwen3_5::RequestBasePlan;
@@ -41,6 +41,6 @@ struct RuntimeTypes {
     using SessionEvent      = qwen3_5::SessionEvent;
     using ControlComplete   = qwen3_5::ControlComplete;
     using ScoreComplete     = qwen3_5::ScoreComplete;
-    using CacheSessionKey   = qwen::PreparedSessionKey;
+    using CacheSessionKey   = models::frontend::PreparedSessionKey;
 };
 } // namespace ninfer::models::qwen3_5

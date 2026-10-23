@@ -1,4 +1,4 @@
-#include "models/common/qwen/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 
 #include "text/unicode.h"
 
@@ -18,7 +18,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::models::qwen::frontend {
+namespace ninfer::text {
 namespace {
 
 using Json    = nlohmann::json;
@@ -33,13 +33,13 @@ void validate_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
-                                        " is not supported by the Qwen tokenizer");
+                                        " is not supported by the tokenizer");
         }
     };
     const auto type = [](const Json& value, const char* name) {
         return value.is_object() && value.contains("type") && value["type"] == name;
     };
-    // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
+    // Omitted descriptions use the supported byte-BPE pipeline defaults.
     // An explicit description must agree with the implemented transformations.
     if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
     if (root.contains("pre_tokenizer")) {
@@ -336,29 +336,6 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
     }
     std::sort(tokens.begin(), tokens.end(),
               [](const AddedToken& lhs, const AddedToken& rhs) { return lhs.id < rhs.id; });
-}
-
-std::vector<int> load_default_stop_token_ids(std::string_view contents) {
-    constexpr std::string_view label = "generation_config.json";
-    const Json root                  = read_json_asset(contents, label);
-    if (!root.is_object() || !root.contains("eos_token_id")) {
-        throw std::invalid_argument("missing field eos_token_id in generation_config.json");
-    }
-
-    const Json& eos = root.at("eos_token_id");
-    if (eos.is_number_integer()) { return {parse_token_id(eos, "eos_token_id", label)}; }
-    if (eos.is_array()) {
-        if (eos.empty()) {
-            throw std::invalid_argument(
-                "field eos_token_id must not be empty in generation_config.json");
-        }
-        std::vector<int> ids;
-        ids.reserve(eos.size());
-        for (const Json& item : eos) { ids.push_back(parse_token_id(item, "eos_token_id", label)); }
-        return ids;
-    }
-    throw std::invalid_argument(
-        "field eos_token_id must be integer or array in generation_config.json");
 }
 
 std::uint64_t merge_pair_key(int left, int right) noexcept {
@@ -796,8 +773,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
 } // namespace
 
 Tokenizer::Tokenizer(TokenizerResources resources) {
-    if (resources.tokenizer_json.empty() || resources.tokenizer_config_json.empty() ||
-        resources.generation_config_json.empty()) {
+    if (resources.tokenizer_json.empty() || resources.tokenizer_config_json.empty()) {
         throw std::invalid_argument("embedded tokenizer resources are empty");
     }
     constexpr std::string_view tokenizer_label        = "tokenizer.json";
@@ -842,9 +818,8 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
                 decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
         }
     }
-    bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
-    byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
-    default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+    bpe_merge_rules_ = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
+    byte_token_ids_  = load_byte_token_ids(vocab_token_to_id_);
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
@@ -997,4 +972,4 @@ bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
                valid_token_ids_.end();
 }
 
-} // namespace ninfer::models::qwen::frontend
+} // namespace ninfer::text

@@ -117,7 +117,7 @@ std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& p
     auto out           = std::make_shared<ModelProfile>();
     out->config        = plan.config();
     out->options       = plan.options();
-    out->public_tokens = plan.resources().public_token_count;
+    out->public_tokens = plan.resources().text.public_token_count;
     const Describe describe(plan);
     const auto& w         = plan.weights();
     out->text.output_head = describe.linear(w.text.output_head_use);

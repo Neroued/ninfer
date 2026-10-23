@@ -1,6 +1,7 @@
 #pragma once
 
-#include "models/common/qwen/frontend/processor.h"
+#include "models/common/frontend/media.h"
+#include "ninfer/types.h"
 
 #include <array>
 #include <cstddef>
@@ -9,7 +10,7 @@
 #include <memory>
 #include <string_view>
 
-namespace ninfer::models::qwen::frontend {
+namespace ninfer::models::frontend {
 
 struct MediaCacheKey {
     std::array<std::uint8_t, 32> digest{};
@@ -120,4 +121,4 @@ private:
 void check_preparation_control(const PreparationControl& control,
                                std::string_view stage = "preparation");
 
-} // namespace ninfer::models::qwen::frontend
+} // namespace ninfer::models::frontend

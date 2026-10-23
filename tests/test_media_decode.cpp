@@ -128,10 +128,12 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 299, 199, blue, 3);
     expect_pixel(image, 150, 100, yellow, 4);
 
+    const ninfer::media::decode::VideoSelection selection{
+        ninfer::media::decode::probe_video(encoded, {}), {0}, 1};
     const ninfer::media::decode::VideoInfo video_info =
-        ninfer::media::decode::inspect_video(encoded, {}, 2.0, 4, 16);
+        ninfer::media::decode::inspect_video(encoded, {}, selection);
     const ninfer::media::decode::Video video =
-        ninfer::media::decode::decode_video(encoded, {}, 2.0, 4, 16);
+        ninfer::media::decode::decode_video(encoded, {}, selection);
     if (video_info.width != video.width || video_info.height != video.height ||
         video_info.sampled_frames != static_cast<int>(video.frames.size()) ||
         video_info.indices != video.indices) {
@@ -185,7 +187,8 @@ void test_jpeg_orientation() {
 void test_ffmpeg_odd_width() {
     const auto& fixture = jpeg_fixtures::cases[0];
     const auto encoded  = decode_base64(fixture.encoded);
-    const auto video    = ninfer::media::decode::decode_video(encoded, {}, 2.0, 1, 1);
+    const auto video    = ninfer::media::decode::decode_video(
+        encoded, {}, {ninfer::media::decode::probe_video(encoded, {}), {0}, 1});
     if (video.frames.size() != 1 || video.width != fixture.width ||
         video.height != fixture.height) {
         throw std::runtime_error("odd-width JPEG video geometry mismatch");

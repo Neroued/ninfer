@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
             if (host_only) {
                 std::cout << path.filename().string() << ": Host binding passed, architecture="
                           << architecture_name(plan.definition().config().text.architecture)
-                          << " V=" << plan.definition().resources().public_token_count
+                          << " V=" << plan.definition().resources().text.public_token_count
                           << " device_bytes=" << plan.materialization().device_capacity_bytes
                           << '\n';
                 return 0;
@@ -354,10 +354,10 @@ int main(int argc, char** argv) {
         require(visited.size() == samples.size(),
                 "some resident parents are not reachable from model weights");
         check_native_inputs(*model);
-        const auto ids = definition->resources().tokenizer->encode("Hello");
-        require(definition->resources().tokenizer->decode(ids) == "Hello",
+        const auto ids = definition->resources().text.tokenizer->encode("Hello");
+        require(definition->resources().text.tokenizer->decode(ids) == "Hello",
                 "tokenizer did not survive Reader destruction");
-        require(!definition->resources().chat_template_jinja.empty(),
+        require(!definition->resources().text.chat_template_jinja.empty(),
                 "template bytes were lost after loading");
         rusage usage{};
         getrusage(RUSAGE_SELF, &usage);
@@ -368,11 +368,11 @@ int main(int argc, char** argv) {
                   << " h2d_bytes=" << model->storage_stats().h2d_bytes
                   << " materialization_seconds=" << model->storage_stats().upload_seconds
                   << " peak_rss_kib=" << usage.ru_maxrss
-                  << " V=" << definition->resources().public_token_count << '\n';
+                  << " V=" << definition->resources().text.public_token_count << '\n';
         model.reset();
         device->synchronize();
-        require(definition->resources().tokenizer->decode(ids) == "Hello" &&
-                    !definition->resources().chat_template_jinja.empty(),
+        require(definition->resources().text.tokenizer->decode(ids) == "Hello" &&
+                    !definition->resources().text.chat_template_jinja.empty(),
                 "definition resources did not survive local weight release");
         return 0;
     } catch (const std::exception& error) {

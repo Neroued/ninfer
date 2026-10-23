@@ -171,9 +171,20 @@ bool is_server_tool_block(std::string_view type) {
 }
 
 void append_turn(ChatTurn& target, ChatTurn turn) {
-    if (target.cache_boundary_after && !target.content.empty()) {
-        target.content.back().cache_boundary_after = target.cache_boundary_after;
+    if (target.cache_boundary_after) {
+        if (target.tool_calls.empty() && !target.content.empty())
+            target.content.back().cache_boundary_after = target.cache_boundary_after;
+        else
+            target.content_boundaries.push_back({target.content.size(), target.tool_calls.size(),
+                                                 target.reasoning_content.size(),
+                                                 target.cache_boundary_after});
         target.cache_boundary_after.reset();
+    }
+    for (auto& boundary : turn.content_boundaries) {
+        boundary.parts += target.content.size();
+        boundary.tool_calls += target.tool_calls.size();
+        boundary.reasoning_bytes += target.reasoning_content.size();
+        target.content_boundaries.push_back(std::move(boundary));
     }
     target.content.insert(target.content.end(), std::make_move_iterator(turn.content.begin()),
                           std::make_move_iterator(turn.content.end()));
@@ -330,9 +341,11 @@ ChatTurn parse_assistant_blocks(const Json& content) {
             if (const auto ttl = cache_boundary(block, "messages")) {
                 if (index + 1U == content.size()) {
                     assistant.cache_boundary_after = explicit_cache_boundary(*ttl);
+                } else {
+                    assistant.content_boundaries.push_back(
+                        {assistant.content.size(), assistant.tool_calls.size(),
+                         assistant.reasoning_content.size(), explicit_cache_boundary(*ttl)});
                 }
-                // A valid non-terminal tool_use breakpoint cannot be represented by the Qwen
-                // flattened assistant turn. It is advisory, so execution continues without it.
             }
         } else if (is_server_tool_block(type)) {
             bad_request("server tool content blocks require an executor that NInfer does not "
@@ -951,6 +964,9 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
         }
     }
     for (ChatTurn& turn : request.messages) {
+        for (auto& boundary : turn.content_boundaries)
+            if (boundary.cache_boundary_after)
+                explicit_boundaries.push_back(&boundary.cache_boundary_after);
         for (ContentPart& part : turn.content) {
             if (part.cache_boundary_after) {
                 explicit_boundaries.push_back(&part.cache_boundary_after);

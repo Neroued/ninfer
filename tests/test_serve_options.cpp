@@ -94,25 +94,26 @@ void test_request_defaults() {
                "0", "--thinking-budget", "37", "--no-thinking", "--preserve-thinking"});
     GenerationRequest request;
     request.max_tokens = 1;
-    auto semantics     = resolve_prompt_semantics(request, options);
-    auto execution     = to_request_options(request, options, semantics, true);
-    require(execution.execution.sampling.temperature == 0 &&
-                execution.execution.sampling.seed == 0 && !execution.execution.thinking.budget &&
-                execution.execution.allow_prefix_reuse,
-            "startup defaults did not reach the request");
+    auto semantics     = collect_prompt_options(request, options);
+    auto execution     = to_request_options(request, options, true);
+    require(
+        execution.execution.sampling.temperature == 0 && execution.execution.sampling.seed == 0 &&
+            execution.execution.thinking.budget == 37 && !semantics.enable_thinking &&
+            semantics.defaults.enable_thinking == false && execution.execution.allow_prefix_reuse,
+        "startup defaults did not reach the request");
     request.sampling.temperature = 1.1;
     request.sampling.seed        = 42;
     request.enable_thinking      = true;
     request.preserve_thinking    = false;
-    semantics                    = resolve_prompt_semantics(request, options);
-    execution                    = to_request_options(request, options, semantics, false);
+    semantics                    = collect_prompt_options(request, options);
+    execution                    = to_request_options(request, options, false);
     require(execution.execution.sampling.temperature == 1.1F &&
                 execution.execution.sampling.seed == 42 &&
                 execution.execution.thinking.budget == 37 &&
                 !execution.execution.allow_prefix_reuse && semantics.preserve_thinking == false,
             "explicit request fields did not override startup defaults");
     request.thinking_budget = 9;
-    require(to_request_options(request, options, semantics, true).execution.thinking.budget == 9,
+    require(to_request_options(request, options, true).execution.thinking.budget == 9,
             "request thinking budget did not override the default");
     const auto large  = parse({"ninfer-serve", "model.ninfer", "--max-tokens", "4294967295"});
     const auto parsed = parse_chat_completion_request(

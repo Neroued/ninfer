@@ -15,18 +15,19 @@ namespace ninfer::serve {
 // target frontend sees it.
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
-struct ResolvedPromptSemantics {
+struct PromptOptionInputs {
     std::optional<bool> enable_thinking;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
+    PromptDefaults defaults;
 };
 
-ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
-                                                 const product::ServeOptions& server);
+PromptOptionInputs collect_prompt_options(const GenerationRequest& req,
+                                          const product::ServeOptions& server);
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
-                                    const ResolvedPromptSemantics& semantics,
+                                    const PromptOptionInputs& semantics,
                                     const MediaAcquirer& acquire_media);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The
@@ -36,7 +37,6 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
 // operational requests do not inherit the external-traffic policy.
 ninfer::RequestOptions to_request_options(const GenerationRequest& req,
                                           const product::ServeOptions& server,
-                                          const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse);
 
 } // namespace ninfer::serve

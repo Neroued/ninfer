@@ -171,11 +171,6 @@ struct EngineOptions {
     StartupObserver startup_observer;
 };
 
-enum class SamplingMode : std::uint8_t {
-    Thinking,
-    NonThinking,
-};
-
 // Immutable model-owned values used when a request does not override a sampling field. Seed is
 // deliberately excluded: it is an execution choice rather than a model recommendation.
 struct SamplingPreset {
@@ -190,10 +185,6 @@ struct SamplingPreset {
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
-
-    [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
-        return mode == SamplingMode::Thinking ? thinking : non_thinking;
-    }
 };
 
 // Public request-side overrides. std::nullopt means "use the registered model/mode default";
@@ -409,6 +400,7 @@ struct ChatMessage {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    bool tool_result_is_error = false;
 };
 
 enum class ReasoningEffort : std::uint8_t {
@@ -446,6 +438,11 @@ enum class PromptContinuationMode : std::uint8_t {
     ContinueFinalAssistant,
 };
 
+struct PromptDefaults {
+    std::optional<bool> enable_thinking;
+    std::optional<bool> preserve_thinking;
+};
+
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     std::optional<bool> enable_thinking;
@@ -455,6 +452,7 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    PromptDefaults defaults;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {
@@ -490,6 +488,7 @@ constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
 enum class PromptCacheMarkerLocation : std::uint8_t {
     MessageBoundary,
     MessagePartBoundary,
+    MessageContentBoundary,
     LeadingInstructionBoundary,
     ToolBoundary,
 };
@@ -505,6 +504,9 @@ struct PromptCacheMarker {
     // For MessagePartBoundary, after_message_count identifies the containing message using a
     // one-based count and this value identifies the number of serialized parts within it.
     std::uint32_t after_message_part_count = 0;
+    // MessageContentBoundary addresses the complete semantic prefix of an assistant message.
+    std::uint32_t after_tool_call_count = 0;
+    std::uint32_t reasoning_bytes       = 0;
 
     [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
                                                    PromptCacheMarker) noexcept = default;
@@ -528,6 +530,9 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    ConflictingPromptOptions,
+    UnsupportedPromptContinuation,
+    UnsupportedOutputCombination,
     InvalidToolConstraint,
     InvalidToolOutput,
     InvalidGrammar,

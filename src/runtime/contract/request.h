@@ -7,8 +7,7 @@
 
 namespace ninfer::runtime {
 
-// Engine has already selected the model/mode preset, applied every explicit override,
-// and validated these values before constructing the runtime request.
+// Engine has applied explicit overrides to the Frontend-selected preset and validated the result.
 struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;

@@ -10,8 +10,8 @@
 namespace ninfer::models::qwen {
 
 struct VisionItemControl {
-    Modality modality = Modality::Image;
-    VisionGrid grid;
+    models::frontend::Modality modality = models::frontend::Modality::Image;
+    models::frontend::VisionGrid grid;
     std::size_t patch_begin     = 0;
     std::size_t patch_count     = 0;
     std::size_t merged_count    = 0;
@@ -58,8 +58,8 @@ struct VisionPrefillPlan {
 
 struct VisionExecutionInput {
     std::uint32_t prompt_tokens = 0;
-    std::vector<VisionItem> vision_items;
-    std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
+    std::vector<models::frontend::VisionItem> vision_items;
+    std::vector<std::shared_ptr<const models::frontend::PreparedMediaPayload>> media_payloads;
     VisionPrefillPlan plan;
 };
 

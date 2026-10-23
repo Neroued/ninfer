@@ -38,7 +38,7 @@ public:
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
-    std::vector<VisionItem> vision_items_;
+    std::vector<models::frontend::VisionItem> vision_items_;
     std::vector<std::uint32_t> rewrite_execution_frontiers_;
     // Exact proof for the initial text run: type zero and position[axis][i] = origin[axis] + i.
     std::size_t regular_prefix_ = 0;

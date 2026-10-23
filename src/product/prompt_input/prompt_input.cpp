@@ -187,7 +187,7 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
     for (auto field = item.begin(); field != item.end(); ++field) {
         if (field.key() != "role" && field.key() != "content" &&
             field.key() != "reasoning_content" && field.key() != "tool_calls" &&
-            field.key() != "tool_call_id") {
+            field.key() != "tool_call_id" && field.key() != "tool_result_is_error") {
             throw std::invalid_argument("message " + std::to_string(index) +
                                         " contains unsupported field: " + field.key());
         }
@@ -217,6 +217,12 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
             throw std::invalid_argument("tool_call_id must be a string on a tool message");
         }
         message.tool_call_id = item.at("tool_call_id").get<std::string>();
+    }
+    if (item.contains("tool_result_is_error")) {
+        if (message.role != ChatRole::Tool || !item.at("tool_result_is_error").is_boolean()) {
+            throw std::invalid_argument("tool_result_is_error must be a boolean on a tool message");
+        }
+        message.tool_result_is_error = item.at("tool_result_is_error").get<bool>();
     }
     if (message.parts.empty() && message.tool_calls.empty()) {
         throw std::invalid_argument("message " + std::to_string(index) + " has empty content");

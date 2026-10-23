@@ -96,6 +96,13 @@ struct ToolCall {
 using ToolChoiceMode = ninfer::ToolChoiceMode;
 using ToolChoice     = ninfer::ToolChoice;
 
+struct MessageContentBoundary {
+    std::size_t parts           = 0;
+    std::size_t tool_calls      = 0;
+    std::size_t reasoning_bytes = 0;
+    std::optional<CacheBoundary> cache_boundary_after;
+};
+
 struct ChatTurn {
     ChatRole role = ChatRole::User;
     std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
@@ -108,6 +115,7 @@ struct ChatTurn {
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
     std::optional<CacheBoundary> cache_boundary_after;
+    std::vector<MessageContentBoundary> content_boundaries;
 };
 
 // Sampling overrides that have an executable Engine meaning. Protocol-only

@@ -180,11 +180,18 @@ def main(argv=None):
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
         architectures = base.config.get("architectures", [])
-        qwen4_exp = architectures in (
-            ["Qwen4ExpForConditionalGeneration"],
-            ["Qwen4ExpForCausalLM"],
-        )
-        build_model = build_qwen4_exp if qwen4_exp else build_qwen3_5
+        adapters = {
+            "Qwen3_5ForCausalLM": build_qwen3_5,
+            "Qwen3_5ForConditionalGeneration": build_qwen3_5,
+            "Qwen3_5MoeForCausalLM": build_qwen3_5,
+            "Qwen3_5MoeForConditionalGeneration": build_qwen3_5,
+            "Qwen4ExpForCausalLM": build_qwen4_exp,
+            "Qwen4ExpForConditionalGeneration": build_qwen4_exp,
+        }
+        if len(architectures) != 1 or architectures[0] not in adapters:
+            raise ValueError(f"unsupported source architectures: {architectures!r}")
+        build_model = adapters[architectures[0]]
+        qwen4_exp = build_model is build_qwen4_exp
         model = build_model(
             base,
             components=components,

@@ -1,6 +1,6 @@
 #include "models/qwen3_5/measurement.h"
 
-#include "models/common/qwen/frontend/digest.h"
+#include "models/common/frontend/digest.h"
 #include "models/qwen3_5/program/planning/moe.h"
 
 #include <nlohmann/json.hpp>
@@ -20,7 +20,7 @@ std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe
                {"architecture", architecture_name(t.architecture)},
                {"hidden_size", t.hidden_size},
                {"vocab_size", t.vocab_size},
-               {"public_token_count", model.resources().public_token_count},
+               {"public_token_count", model.resources().text.public_token_count},
                {"num_hidden_layers", t.num_hidden_layers},
                {"rms_norm_eps", t.rms_norm_eps},
                {"layer_types", t.layer_types}};
@@ -95,7 +95,7 @@ std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe
         }
         inventory.push_back(std::move(item));
     }
-    return qwen::frontend::sha256_hex(qwen::frontend::sha256(facts.dump()));
+    return models::frontend::sha256_hex(models::frontend::sha256(facts.dump()));
 }
 
 } // namespace ninfer::models::qwen3_5

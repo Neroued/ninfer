@@ -60,7 +60,7 @@ private:
 
     struct ReceivingInput {
         std::shared_ptr<qwen::VisionExecutionInput> input;
-        std::vector<std::shared_ptr<qwen::PreparedMediaPayload>> parts;
+        std::vector<std::shared_ptr<models::frontend::PreparedMediaPayload>> parts;
         std::vector<std::size_t> received;
     };
 

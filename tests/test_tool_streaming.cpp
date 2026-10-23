@@ -143,9 +143,10 @@ void json_parameters_and_errors() {
             partial.accept(bad.feed("<tool_call>\n<function=write>\n" + body));
             require(bad.error().has_value(),
                     "malformed committed tool did not report a request error");
-            require(bad.error()->kind == (constrained
-                                              ? fi::ToolOutputErrorKind::ContractViolation
-                                              : fi::ToolOutputErrorKind::InvalidModelOutput),
+            require(bad.error()->kind ==
+                        (constrained
+                             ? ninfer::models::frontend::ToolOutputErrorKind::ContractViolation
+                             : ninfer::models::frontend::ToolOutputErrorKind::InvalidModelOutput),
                     "constrained decoder disagreement was classified as ordinary model output");
             require(partial.text.empty() && partial.calls[0].status == ToolCallStatus::Incomplete,
                     "failed call was retracted or marked complete");

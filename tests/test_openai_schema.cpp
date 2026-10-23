@@ -51,9 +51,9 @@ Json base_request() {
 
 OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, limits()); }
 
-ResolvedPromptSemantics semantics(const GenerationRequest& request) {
+PromptOptionInputs semantics(const GenerationRequest& request) {
     ServeOptions server;
-    return resolve_prompt_semantics(request, server);
+    return collect_prompt_options(request, server);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -62,7 +62,7 @@ ninfer::PromptInput prompt(const GenerationRequest& request) {
 
 ninfer::RequestOptions options(const GenerationRequest& request) {
     ServeOptions server;
-    return to_request_options(request, server, semantics(request), true);
+    return to_request_options(request, server, true);
 }
 
 Json parse_sse(const std::string& event) {
@@ -322,8 +322,9 @@ int test_constrained_decoding_extensions() {
                           options(parsed.generation).constraint == parsed.generation.constraint,
                       "GBNF must survive protocol-to-Engine translation");
     body["stop"] = "yes";
-    failures += check(api_error([&] { (void)parse(body); }).param == "structured_outputs.grammar",
-                      "grammar with custom stops accepted");
+    failures +=
+        check(parse(body).generation.constraint && !parse(body).generation.stop_strings.empty(),
+              "grammar/custom-stop request did not reach the Frontend");
     for (const auto& value : {Json{{"grammar", ""}}, Json{{"json", Json::object()}}, Json("bad")}) {
         body                       = base_request();
         body["structured_outputs"] = value;

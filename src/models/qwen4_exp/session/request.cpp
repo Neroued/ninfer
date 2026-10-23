@@ -61,7 +61,7 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
     return plan_->summary;
 }
 
-const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
+const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
     return plan_->prompt.context_cache;
 }
 
@@ -84,7 +84,7 @@ RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
         throw std::invalid_argument("prepared prompt media payload is incomplete");
     if (input.has_media()) plan->vision = p.plan_vision(input);
     for (const auto id : input.token_ids)
-        if (id < 0 || std::uint32_t(id) >= p.definition->resources().public_token_count)
+        if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
     std::uint32_t previous = 0;
     for (const auto f : input.identity.rewrite_execution_frontiers) {

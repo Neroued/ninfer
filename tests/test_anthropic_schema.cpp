@@ -62,10 +62,10 @@ std::string api_param(const std::function<void()>& action) {
     return {};
 }
 
-ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default_thinking = true) {
+PromptOptionInputs semantics(const GenerationRequest& request, bool default_thinking = true) {
     ServeOptions options;
     options.launch.generation.enable_thinking = default_thinking;
-    return resolve_prompt_semantics(request, options);
+    return collect_prompt_options(request, options);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -299,10 +299,24 @@ int test_tool_history() {
                                                             normalized.messages[3].content[0].text == "continue",
                                                         "valid out-of-order tool results were not associated by ID");
     const ninfer::PromptInput normalized_prompt = prompt(normalized);
-    failures += check(normalized_prompt.messages[2].parts.size() == 2 &&
-                          normalized_prompt.messages[2].parts[0].text == "[tool_error]\n" &&
-                          normalized_prompt.messages[2].parts[1].text == "result B",
+    failures += check(normalized_prompt.messages[2].parts.size() == 1 &&
+                          normalized_prompt.messages[2].tool_result_is_error &&
+                          normalized_prompt.messages[2].parts[0].text == "result B",
                       "tool result error state did not follow its ID during normalization");
+
+    body["messages"][0]["content"][0]["cache_control"] = Json{{"type", "ephemeral"}};
+    const auto marked_prompt                           = prompt(parse(body).generation);
+    const auto boundary                                = std::find_if(
+        marked_prompt.context_cache.markers.begin(), marked_prompt.context_cache.markers.end(),
+        [](const auto& marker) {
+            return marker.location == ninfer::PromptCacheMarkerLocation::MessageContentBoundary;
+        });
+    failures +=
+        check(boundary != marked_prompt.context_cache.markers.end() &&
+                  boundary->after_message_count == 1 && boundary->after_message_part_count == 0 &&
+                  boundary->after_tool_call_count == 1 && boundary->reasoning_bytes == 0,
+              "non-terminal tool-use breakpoint lost its semantic position");
+    body["messages"][0]["content"][0].erase("cache_control");
 
     body["messages"][1]["content"] =
         Json::array({tool_result("toolu_unknown", "wrong"), tool_result("toolu_a", "A")});
@@ -384,8 +398,7 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
     failures += check(request.constrains_tools() &&
-                          !to_request_options(request, {}, semantics(request), true)
-                               .output.preserve_special_tokens,
+                          !to_request_options(request, {}, true).output.preserve_special_tokens,
                       "ordinary Anthropic tools did not select constrained output");
 
     body["tools"] = Json::array({ordinary_tool(true)});
@@ -469,8 +482,7 @@ int test_thinking_and_count_tokens() {
     const GenerationRequest enabled = parse(body).generation;
     ServeOptions server;
     server.launch.generation.thinking_budget = 777;
-    const ninfer::RequestOptions options =
-        to_request_options(enabled, server, semantics(enabled), true);
+    const ninfer::RequestOptions options     = to_request_options(enabled, server, true);
     int failures = check(enabled.enable_thinking == true && enabled.thinking_budget == 1024 &&
                              options.execution.thinking.budget == 1024,
                          "request Thinking budget did not reach Engine options");
@@ -498,9 +510,8 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
                       "disabled-Thinking assistant prefill was rejected");
     body.erase("thinking");
-    failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
-                          "assistant_prefill_not_supported",
-                      "Thinking-on assistant prefill was not rejected at capability resolution");
+    failures += check(semantics(parse(body).generation).defaults.enable_thinking == true,
+                      "assistant prefill lost the model-owned thinking default");
     return failures;
 }
 
@@ -808,8 +819,7 @@ int test_constrained_decoding() {
     for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
         body["structured_outputs"] = value;
         const auto request         = parse(body).generation;
-        const auto constraint =
-            to_request_options(request, {}, semantics(request), true).constraint;
+        const auto constraint      = to_request_options(request, {}, true).constraint;
         failures += check(constraint == (value.contains("choice")
                                              ? ninfer::OutputConstraint::choice({"yes", "no"})
                                              : ninfer::OutputConstraint::regex("[a-z]+")),
@@ -817,19 +827,19 @@ int test_constrained_decoding() {
     }
     body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
     const auto request         = parse(body);
-    failures +=
-        check(to_request_options(request.generation, {}, semantics(request.generation), true)
-                      .constraint->source == "root ::= \"yes\"",
-              "Anthropic GBNF extension was lost in Engine translation");
+    failures += check(to_request_options(request.generation, {}, true).constraint->source ==
+                          "root ::= \"yes\"",
+                      "Anthropic GBNF extension was lost in Engine translation");
     body["tools"] = Json::array({ordinary_tool()});
-    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
-                      "grammar admitted active tools");
+    failures += check(parse(body).generation.constraint && parse(body).generation.uses_tools(),
+                      "grammar/tools request did not reach the Frontend");
     body["tool_choice"] = Json{{"type", "none"}};
     failures += check(parse(body).generation.constraint->source == "root ::= \"yes\"",
                       "inactive tools blocked grammar");
     body["stop_sequences"] = Json::array({"yes"});
-    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
-                      "grammar admitted custom stop sequences");
+    failures +=
+        check(parse(body).generation.constraint && !parse(body).generation.stop_strings.empty(),
+              "grammar/custom-stop request did not reach the Frontend");
     body = base_request();
     body["output_config"] =
         Json{{"format", {{"type", "json_schema"}, {"schema", {{"type", "object"}}}}}};

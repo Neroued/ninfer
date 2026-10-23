@@ -37,7 +37,7 @@ struct CaptureGroup {
 struct RequestBasePlanImpl {
     std::shared_ptr<const qwen::PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
-    qwen::PreparedContextCache context_cache;
+    models::frontend::PreparedContextCache context_cache;
     ResolvedSamplingParameters sampling;
     std::shared_ptr<const qwen::VisionControlPlan> vision_control_plan;
     std::vector<CaptureGroup> capture_groups;

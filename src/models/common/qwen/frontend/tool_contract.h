@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/common/frontend/tools.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,12 +42,8 @@ struct ToolCallOutputContract {
         Encoding encoding = Encoding::BufferedNormalize;
     };
 
-    struct Tool {
-        std::string name;
+    struct Tool : models::frontend::ToolDeclaration {
         std::vector<Parameter> parameters;
-        std::string schema_json;
-        std::size_t declaration_index = 0;
-        bool strict                   = false;
     };
 
     std::vector<Tool> tools;

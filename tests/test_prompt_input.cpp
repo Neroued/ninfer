@@ -51,14 +51,18 @@ int main() {
                << "],\"messages\":[{\"role\":\"user\",\"content\":\"probe\"},"
                   "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\","
                   "\"type\":\"function\",\"function\":{\"name\":\"probe\",\"arguments\":"
-               << arguments << "}}]}]}";
+               << arguments
+               << "}}]},"
+                  "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"failed\","
+                  "\"tool_result_is_error\":true}]}";
     }
 
     const ninfer::PromptInput prompt =
         ninfer::product::prompt_from_messages(input_file.path(), false, false);
     if (prompt.options.tool_jsons != std::vector<std::string>{tool} ||
-        prompt.messages.size() != 2 || prompt.messages[1].tool_calls.size() != 1 ||
-        prompt.messages[1].tool_calls.front().arguments_json != arguments) {
+        prompt.messages.size() != 3 || prompt.messages[1].tool_calls.size() != 1 ||
+        prompt.messages[1].tool_calls.front().arguments_json != arguments ||
+        !prompt.messages[2].tool_result_is_error || prompt.messages[2].parts[0].text != "failed") {
         std::cerr << "local messages JSON changed prompt-bearing object member order\n";
         return 1;
     }

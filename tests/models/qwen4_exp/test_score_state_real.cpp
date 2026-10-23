@@ -221,7 +221,7 @@ int main() {
         runtime::LocalExecutor<ObservedTypes> executor(std::move(worker), {1});
         q4::Session session(q4::prepare_session(definition, std::move(plan)), executor);
         const auto empty = session.physical_usage();
-        models::qwen::FrontendOptions frontend_options;
+        ninfer::models::frontend::FrontendOptions frontend_options;
         frontend_options.vision_enabled = false;
         frontend_options.max_context    = options.max_context;
         auto frontend = models::qwen::make_frontend(definition->resources(), frontend_options, {});

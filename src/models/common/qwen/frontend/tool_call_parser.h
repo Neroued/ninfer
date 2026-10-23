@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/common/qwen/frontend/tool_contract.h"
-#include "models/common/qwen/frontend/tool_output_error.h"
+#include "models/common/frontend/output_session.h"
 
 #include <memory>
 #include <optional>
@@ -25,21 +25,23 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
 // Consumes committed model text exactly once. A recognized tool header commits the interpretation;
 // subsequent model-format errors are request-local failures, never a retraction into ordinary text.
 // Arguments and aggregate calls share the same append-only JSON encoding.
-class ToolCallOutputDecoder {
+class ToolCallOutputDecoder final : public models::frontend::BodyDecoder {
 public:
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                          std::size_t max_tool_name_length);
+                          std::size_t max_tool_name_length, bool combined = false);
     ~ToolCallOutputDecoder();
     ToolCallOutputDecoder(ToolCallOutputDecoder&&) noexcept;
     ToolCallOutputDecoder& operator=(ToolCallOutputDecoder&&) noexcept;
 
     [[nodiscard]] bool in_tool_region() const noexcept;
-    [[nodiscard]] std::vector<OutputEvent> feed(std::string_view text);
+    [[nodiscard]] ConstraintOutputBranch branch() const noexcept override;
+    [[nodiscard]] std::vector<OutputEvent> feed(std::string_view text) override;
     void initialize_continuation(std::string_view prefix);
-    [[nodiscard]] std::vector<OutputEvent> finish(FinishReason reason = FinishReason::StopToken);
-    [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
-    [[nodiscard]] ToolCallParseDiagnostics diagnostics() const noexcept;
-    [[nodiscard]] std::optional<ToolOutputError> error() const;
+    [[nodiscard]] std::vector<OutputEvent>
+    finish(FinishReason reason = FinishReason::StopToken) override;
+    [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept override;
+    [[nodiscard]] ToolCallParseDiagnostics diagnostics() const noexcept override;
+    [[nodiscard]] std::optional<models::frontend::ToolOutputError> error() const override;
 
 private:
     class Impl;

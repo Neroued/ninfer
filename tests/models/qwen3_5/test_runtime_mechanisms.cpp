@@ -163,25 +163,24 @@ void test_visual_embedding_windows() {
 void test_vision_control() {
     ninfer::models::qwen::PreparedPromptData prompt;
     prompt.token_ids.resize(7);
-    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
-                          0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Video),
-                          0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Video),
+    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image),
+                          0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Video),
+                          0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Video),
                           0};
     prompt.prepare.media_items   = 2;
     prompt.prepare.raw_patches   = 12;
     prompt.prepare.vision_tokens = 3;
     prompt.vision_items          = {
-        ninfer::models::qwen::VisionItem{.modality    = ninfer::models::qwen::Modality::Image,
-                                                  .grid        = {.temporal = 1, .height = 2, .width = 2},
-                                                  .patch_begin = 0,
-                                                  .patch_count = 4,
-                                                  .token_spans = {{.begin = 1, .count = 1}}},
-        ninfer::models::qwen::VisionItem{
-                     .modality    = ninfer::models::qwen::Modality::Video,
-                     .grid        = {.temporal = 2, .height = 2, .width = 2},
-                     .patch_begin = 4,
-                     .patch_count = 8,
-                     .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
+        {.modality    = ninfer::models::frontend::Modality::Image,
+                  .grid        = {.temporal = 1, .height = 2, .width = 2},
+                  .patch_begin = 0,
+                  .patch_count = 4,
+                  .token_spans = {{.begin = 1, .count = 1}}},
+        {.modality    = ninfer::models::frontend::Modality::Video,
+                  .grid        = {.temporal = 2, .height = 2, .width = 2},
+                  .patch_begin = 4,
+                  .patch_count = 8,
+                  .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
     const ninfer::models::qwen::VisionControlPlan plan = ninfer::models::qwen::plan_vision_control(
@@ -218,15 +217,16 @@ void test_vision_control() {
 ninfer::models::qwen::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     ninfer::models::qwen::PreparedPromptData prompt;
     prompt.token_ids   = {10, 248056, 248056, 11};
-    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
-                          static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image), 0};
+    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image),
+                          static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image), 0};
     prompt.positions   = {0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 2, 3};
     prompt.rope_delta  = 0;
-    ninfer::models::qwen::VisionItem item{.modality    = ninfer::models::qwen::Modality::Image,
-                                          .grid        = {.temporal = 1, .height = 2, .width = 4},
-                                          .patch_begin = 0,
-                                          .patch_count = 8,
-                                          .token_spans = {{.begin = 1, .count = 2}}};
+    auto item =
+        ninfer::models::frontend::VisionItem{.modality = ninfer::models::frontend::Modality::Image,
+                                             .grid     = {.temporal = 1, .height = 2, .width = 4},
+                                             .patch_begin = 0,
+                                             .patch_count = 8,
+                                             .token_spans = {{.begin = 1, .count = 2}}};
     item.content_digest.fill(digest_byte);
     prompt.vision_items.push_back(std::move(item));
     return prompt;

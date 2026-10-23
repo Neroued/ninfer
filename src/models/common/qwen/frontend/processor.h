@@ -1,26 +1,27 @@
 #pragma once
 
 #include "models/common/qwen/frontend/chat_template.h"
-#include "models/common/qwen/frontend/tokenizer.h"
-
 #include "models/common/qwen/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/resources.h"
+#include "text/tokenizer.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <span>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen::frontend {
-
+namespace ninfer::models::frontend {
 class MediaPreprocessCache;
+}
 
+namespace ninfer::models::qwen::frontend {
 enum class ProcessorErrorKind {
     BudgetExceeded,
     ContextLengthExceeded,
@@ -58,26 +59,8 @@ struct PreprocessStats {
     [[nodiscard]] std::string summary() const;
 };
 
-struct ProcessorOptions {
-    std::uint64_t image_min_pixels = 32ULL * 32ULL;
-    std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
-    std::uint64_t video_min_pixels = 128ULL * 32ULL * 32ULL;
-    std::uint64_t video_max_pixels = 4ULL * 1024ULL * 1024ULL;
-    // Encoded bytes are aggregate per prompt. Decode limits are per item; the fixed worker pool
-    // bounds concurrently decoded media.
-    std::size_t max_encoded_media_bytes    = kMaximumPromptMediaBytes;
-    std::uint64_t max_decoded_pixels       = 64ULL * 1024ULL * 1024ULL;
-    std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
-    int max_video_source_frames            = 100'000;
-    double max_video_duration_seconds      = 600.0;
-    std::uint64_t max_raw_patches          = kMaximumPromptVisionRawPatches;
-    std::uint64_t max_vision_tokens        = kMaximumPromptVisionTokens;
-    double video_fps                       = 2.0;
-    int video_min_frames                   = 4;
-    int video_max_frames                   = 768;
-};
-
 struct ProcessedInput {
+    std::optional<bool> enable_thinking;
     bool starts_in_reasoning = false;
     std::string continuation_content;
     std::vector<int> input_ids;
@@ -85,9 +68,9 @@ struct ProcessedInput {
     // Axis-major [3, input_ids.size()] in temporal, height, width order.
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
-    std::vector<VisionItem> vision_items;
+    std::vector<models::frontend::VisionItem> vision_items;
     // One immutable row-major [raw_patches, 1536] payload per Vision item.
-    std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
+    std::vector<std::shared_ptr<const models::frontend::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
@@ -101,10 +84,10 @@ struct EncodedChat {
     std::vector<int> input_ids;
 
     struct MediaTokenRun {
-        TokenSpan tokens;
-        Modality modality       = Modality::Image;
-        std::size_t item_index  = 0;
-        std::size_t frame_index = 0;
+        models::frontend::TokenSpan tokens;
+        models::frontend::Modality modality = models::frontend::Modality::Image;
+        std::size_t item_index              = 0;
+        std::size_t frame_index             = 0;
     };
 
     std::vector<MediaTokenRun> media_token_runs;
@@ -115,13 +98,14 @@ struct EncodedChat {
 };
 
 EncodedChat
-encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+encode_rendered_chat(const text::Tokenizer& tokenizer, const RenderedChat& rendered,
                      std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max());
 
 class Processor {
 public:
-    Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
-              ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
+    Processor(const text::Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
+              ProcessorOptions options,
+              std::shared_ptr<models::frontend::MediaPreprocessCache> media_cache);
 
     [[nodiscard]] std::size_t count_tokens(std::vector<ChatMessage> messages,
                                            ChatRenderOptions render_options  = {},
@@ -133,10 +117,10 @@ public:
             std::size_t maximum_prompt_tokens = std::numeric_limits<std::size_t>::max()) const;
 
 private:
-    const Tokenizer& tokenizer_;
+    const text::Tokenizer& tokenizer_;
     const CompiledChatTemplate& chat_template_;
     ProcessorOptions options_;
-    std::shared_ptr<MediaPreprocessCache> media_cache_;
+    std::shared_ptr<models::frontend::MediaPreprocessCache> media_cache_;
 };
 
 } // namespace ninfer::models::qwen::frontend

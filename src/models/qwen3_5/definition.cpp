@@ -88,10 +88,10 @@ std::shared_ptr<const ModelDefinition> read_definition(const artifact::Reader& r
             throw artifact::ArtifactError("selected proposal head is absent from artifact");
         }
         out->weights.proposal = loading::bind_proposal(bindings, *proposal, text, options,
-                                                       out->resources.public_token_count);
+                                                       out->resources.text.public_token_count);
         if (out->config.draft && out->config.draft->dflash2) {
             const auto domain =
-                proposal->indexed ? proposal->rows : out->resources.public_token_count;
+                proposal->indexed ? proposal->rows : out->resources.text.public_token_count;
             if (out->config.draft->dflash2->selector_top_k > domain) {
                 throw artifact::ArtifactError(
                     "proposal domain is smaller than DFlash2 selector_top_k");

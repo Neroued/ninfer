@@ -82,8 +82,8 @@ VisionPrefillExecution::VisionPrefillExecution(DeviceContext& device, const Visi
             (previous_item && use.prepared_item_index <= *previous_item)) {
             throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
         }
-        const VisionItemControl& control = plan.control->items[use.control_index];
-        const VisionItem& source         = input_->vision_items[use.prepared_item_index];
+        const VisionItemControl& control           = plan.control->items[use.control_index];
+        const models::frontend::VisionItem& source = input_->vision_items[use.prepared_item_index];
         if (control.scatter_indices.empty() ||
             use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
             (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&

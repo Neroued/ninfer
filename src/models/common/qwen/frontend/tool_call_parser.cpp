@@ -274,9 +274,10 @@ public:
     }
 
     bool fail(std::string message) {
-        failure = ToolOutputError{contract->constrained ? ToolOutputErrorKind::ContractViolation
-                                                        : ToolOutputErrorKind::InvalidModelOutput,
-                                  std::move(message)};
+        failure = models::frontend::ToolOutputError{
+            contract->constrained ? models::frontend::ToolOutputErrorKind::ContractViolation
+                                  : models::frontend::ToolOutputErrorKind::InvalidModelOutput,
+            std::move(message)};
         end_call(ToolCallStatus::Incomplete);
         state = State::Failed;
         pending.clear();
@@ -632,6 +633,8 @@ public:
     State state = State::Text;
     Codec codec = Codec::BufferedNormalize;
     std::string pending, preamble, parameter_name, buffered_value, value_tail;
+    bool combined                        = false;
+    ConstraintOutputBranch output_branch = ConstraintOutputBranch::Undecided;
     const Contract::Tool* tool           = nullptr;
     const Contract::Parameter* parameter = nullptr;
     std::unordered_set<std::string> names;
@@ -642,12 +645,14 @@ public:
     std::vector<GeneratedToolCall> calls;
     std::vector<OutputEvent> events, seed;
     ToolCallParseDiagnostics diagnostic;
-    std::optional<ToolOutputError> failure;
+    std::optional<models::frontend::ToolOutputError> failure;
 };
 
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const Contract> contract,
-                                             std::size_t max_tool_name_length)
-    : impl_(std::make_unique<Impl>(std::move(contract), max_tool_name_length)) {}
+                                             std::size_t max_tool_name_length, bool combined)
+    : impl_(std::make_unique<Impl>(std::move(contract), max_tool_name_length)) {
+    impl_->combined = combined;
+}
 
 ToolCallOutputDecoder::~ToolCallOutputDecoder()                                           = default;
 ToolCallOutputDecoder::ToolCallOutputDecoder(ToolCallOutputDecoder&&) noexcept            = default;
@@ -658,11 +663,25 @@ bool ToolCallOutputDecoder::in_tool_region() const noexcept {
            (impl_->state == Impl::State::Text && impl_->pending.find('<') != std::string::npos);
 }
 
+ConstraintOutputBranch ToolCallOutputDecoder::branch() const noexcept {
+    if (impl_->combined) return impl_->output_branch;
+    return in_tool_region() ? ConstraintOutputBranch::Tools : ConstraintOutputBranch::Undecided;
+}
+
 std::vector<OutputEvent> ToolCallOutputDecoder::feed(std::string_view text) {
+    if (impl_->combined && impl_->output_branch == ConstraintOutputBranch::Undecided &&
+        !text.empty())
+        impl_->output_branch =
+            text.front() == '<' ? ConstraintOutputBranch::Tools : ConstraintOutputBranch::Content;
+    if (impl_->combined && impl_->output_branch == ConstraintOutputBranch::Content)
+        return text.empty() ? std::vector<OutputEvent>{}
+                            : std::vector<OutputEvent>{
+                                  OutputDelta{OutputChannel::Content, std::string(text)}};
     return impl_->feed(text);
 }
 
 std::vector<OutputEvent> ToolCallOutputDecoder::finish(FinishReason reason) {
+    if (impl_->combined && impl_->output_branch == ConstraintOutputBranch::Content) return {};
     return impl_->finish(reason);
 }
 
@@ -674,9 +693,16 @@ ToolCallParseDiagnostics ToolCallOutputDecoder::diagnostics() const noexcept {
     return impl_->diagnostic;
 }
 
-std::optional<ToolOutputError> ToolCallOutputDecoder::error() const { return impl_->failure; }
+std::optional<models::frontend::ToolOutputError> ToolCallOutputDecoder::error() const {
+    return impl_->failure;
+}
 
 void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
+    if (impl_->combined && !prefix.empty()) {
+        impl_->output_branch =
+            prefix.front() == '<' ? ConstraintOutputBranch::Tools : ConstraintOutputBranch::Content;
+        if (impl_->output_branch == ConstraintOutputBranch::Content) return;
+    }
     auto events = impl_->feed(prefix);
     if (impl_->failure ||
         std::any_of(impl_->calls.begin(), impl_->calls.end(),

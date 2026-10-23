@@ -34,21 +34,21 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     const auto make_prompt = [&](std::uint32_t seed) {
         ninfer::models::qwen::PreparedPromptData prompt;
         prompt.token_ids.resize(5);
-        prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
-                              0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
-                              0};
+        prompt.token_types = {
+            0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image), 0,
+            static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image), 0};
         prompt.prepare.media_items   = 2;
         prompt.prepare.raw_patches   = 2 * patches;
         prompt.prepare.vision_tokens = 2;
         for (std::size_t item = 0; item != 2; ++item) {
-            prompt.vision_items.push_back(ninfer::models::qwen::VisionItem{
-                .modality    = ninfer::models::qwen::Modality::Image,
+            prompt.vision_items.push_back(ninfer::models::frontend::VisionItem{
+                .modality    = ninfer::models::frontend::Modality::Image,
                 .grid        = {.temporal = 1, .height = merge, .width = merge},
                 .patch_begin = item * patches,
                 .patch_count = patches,
                 .token_spans = {{.begin = 2 * item + 1, .count = 1}},
             });
-            auto payload = std::make_shared<ninfer::models::qwen::PreparedMediaPayload>();
+            auto payload = std::make_shared<ninfer::models::frontend::PreparedMediaPayload>();
             payload->patch_elements = patches * config.patch_width();
             payload->patches        = std::make_unique<std::uint16_t[]>(payload->patch_elements);
             for (auto& value : payload->mutable_span()) {

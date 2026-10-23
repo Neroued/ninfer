@@ -179,8 +179,8 @@ void logical_data_and_instances() {
     require(plan->config().text.architecture == Architecture::Qwen3_5 &&
                 plan->config().text.hidden_size == 128,
             "binding chose a checkpoint-specific geometry");
-    require(plan->resources().public_token_count == 265 &&
-                plan->resources().tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
+    require(plan->resources().text.public_token_count == 265 &&
+                plan->resources().text.tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
             "tokenizer_config added tokens were not included in the public domain");
     const auto& attention = std::get<q35::AttentionWeights>(plan->weights().text.layers[0].mixer);
     const auto& query     = plan->parameter(attention.query);

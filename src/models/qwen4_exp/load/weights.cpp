@@ -147,10 +147,10 @@ qwen::FrontendResources bind_resources(artifact::Binder& binder, const Config& c
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };
     qwen::FrontendResources out;
-    out.tokenizer_json         = resource("text", "tokenizer.json");
-    out.tokenizer_config_json  = resource("text", "tokenizer_config.json");
-    out.generation_config_json = resource("text", "generation_config.json");
-    out.chat_template_jinja    = resource("text", "chat_template.jinja");
+    out.text.tokenizer_json         = resource("text", "tokenizer.json");
+    out.text.tokenizer_config_json  = resource("text", "tokenizer_config.json");
+    out.text.generation_config_json = resource("text", "generation_config.json");
+    out.text.chat_template_jinja    = resource("text", "chat_template.jinja");
     std::optional<qwen::MediaGeometry> media;
     if (c.vision) {
         out.preprocessor_config_json       = resource("vision", "preprocessor_config.json");

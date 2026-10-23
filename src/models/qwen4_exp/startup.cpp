@@ -1,5 +1,5 @@
 #include "models/qwen4_exp/startup.h"
-#include "models/common/qwen/frontend/digest.h"
+#include "models/common/frontend/digest.h"
 
 #include <nlohmann/json.hpp>
 
@@ -54,7 +54,8 @@ qwen::Frontend Startup::frontend(const EngineOptions& o) const {
 }
 
 qwen::Frontend create_frontend(const ModelDefinition& definition, const EngineOptions& o) {
-    const auto generation = nlohmann::json::parse(definition.resources().generation_config_json);
+    const auto generation =
+        nlohmann::json::parse(definition.resources().text.generation_config_json);
     SamplingPreset preset;
     preset.temperature = generation.value("temperature", 1.0F);
     preset.top_k       = generation.value("top_k", 20);
@@ -131,7 +132,7 @@ std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe
     if (moe)
         facts["moe"] = {moe->description().cache_bytes, moe->description().fixed_bytes,
                         moe->description().window_count, moe->description().cpu_workers};
-    return qwen::frontend::sha256_hex(qwen::frontend::sha256(facts.dump()));
+    return models::frontend::sha256_hex(models::frontend::sha256(facts.dump()));
 }
 
 std::string Startup::prefill_signature(const ExecutionPreparation& preparation,

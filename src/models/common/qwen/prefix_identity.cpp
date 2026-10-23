@@ -37,34 +37,38 @@ void validate_generated(std::size_t begin, std::size_t count, std::int32_t rope_
         throw std::invalid_argument("generated execution split is outside the appended span");
 }
 
-bool same_grid(const VisionGrid& left, const VisionGrid& right) {
+bool same_grid(const models::frontend::VisionGrid& left,
+               const models::frontend::VisionGrid& right) {
     return left.temporal == right.temporal && left.height == right.height &&
            left.width == right.width;
 }
 
-bool same_spans(const std::vector<TokenSpan>& left, const std::vector<TokenSpan>& right) {
-    return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
-                                                     [](const TokenSpan& a, const TokenSpan& b) {
-                                                         return a.begin == b.begin &&
-                                                                a.count == b.count;
-                                                     });
+bool same_spans(const std::vector<models::frontend::TokenSpan>& left,
+                const std::vector<models::frontend::TokenSpan>& right) {
+    return left.size() == right.size() &&
+           std::equal(
+               left.begin(), left.end(), right.begin(),
+               [](const models::frontend::TokenSpan& a, const models::frontend::TokenSpan& b) {
+                   return a.begin == b.begin && a.count == b.count;
+               });
 }
 
-bool same_item(const VisionItem& left, const VisionItem& right) {
+bool same_item(const models::frontend::VisionItem& left,
+               const models::frontend::VisionItem& right) {
     return left.modality == right.modality && same_grid(left.grid, right.grid) &&
            left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
            left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
            same_spans(left.token_spans, right.token_spans);
 }
 
-bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
+bool prefix_item_count(const std::vector<models::frontend::VisionItem>& items, std::size_t tokens,
                        std::size_t* count) {
     *count          = 0;
     bool saw_suffix = false;
-    for (const VisionItem& item : items) {
+    for (const models::frontend::VisionItem& item : items) {
         if (item.token_spans.empty()) { return false; }
-        const TokenSpan& first = item.token_spans.front();
-        const TokenSpan& last  = item.token_spans.back();
+        const models::frontend::TokenSpan& first = item.token_spans.front();
+        const models::frontend::TokenSpan& last  = item.token_spans.back();
         if (first.count == 0 || last.count == 0 ||
             last.begin > std::numeric_limits<std::size_t>::max() - last.count) {
             return false;
@@ -102,7 +106,7 @@ void mix_digest(DigestPair& digest, std::uint64_t value) noexcept {
     }
 }
 
-void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
+void mix_vision_item(DigestPair& digest, const models::frontend::VisionItem& item) noexcept {
     mix_digest(digest, kVisionDigestDomain);
     mix_digest(digest, static_cast<std::uint8_t>(item.modality));
     mix_digest(digest, static_cast<std::uint32_t>(item.grid.temporal));
@@ -116,7 +120,7 @@ void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
         mix_digest(digest, std::bit_cast<std::uint64_t>(timestamp));
     }
     mix_digest(digest, item.token_spans.size());
-    for (const TokenSpan& span : item.token_spans) {
+    for (const models::frontend::TokenSpan& span : item.token_spans) {
         mix_digest(digest, span.begin);
         mix_digest(digest, span.count);
     }
@@ -144,12 +148,13 @@ void append_digest(std::vector<DigestPair>& digests, TokenId token, std::uint8_t
     digests.push_back(digest);
 }
 
-std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens) {
+std::size_t checked_vision_end(const models::frontend::VisionItem& item,
+                               std::size_t prompt_tokens) {
     if (item.token_spans.empty()) {
         throw std::invalid_argument("Vision shortlist item has no token spans");
     }
     std::size_t previous_end = 0;
-    for (const TokenSpan& span : item.token_spans) {
+    for (const models::frontend::TokenSpan& span : item.token_spans) {
         if (span.count == 0 || span.begin > prompt_tokens ||
             span.count > prompt_tokens - span.begin || span.begin < previous_end) {
             throw std::invalid_argument("Vision shortlist item has invalid token spans");

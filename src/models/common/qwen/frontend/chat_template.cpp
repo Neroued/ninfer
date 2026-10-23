@@ -1,6 +1,6 @@
 #include "models/common/qwen/frontend/chat_template.h"
 
-#include "models/common/qwen/frontend/media_cache.h"
+#include "models/common/frontend/media_cache.h"
 #include "models/common/qwen/frontend/prompt_layout.h"
 #include "text/unicode.h"
 
@@ -39,42 +39,26 @@ struct ContentSource {
     std::uint32_t reasoning_tag = 0;
 };
 
-void merge_option(Json& context, std::string_view key, const Json& value) {
-    const std::string name(key);
-    if (context.contains(name) && !context[name].is_null() && context[name] != value) {
-        throw std::invalid_argument("conflicting chat template parameter: " + name);
-    }
-    context[name] = value;
-}
-
 Json template_parameters(const ChatRenderOptions& options, const Json& special_tokens) {
-    Json context = options.chat_template_kwargs_json.empty()
-                       ? Json::object()
-                       : Json::parse(options.chat_template_kwargs_json);
-    if (!context.is_object()) throw std::invalid_argument("chat_template_kwargs must be an object");
-    for (const auto& item : context.items()) {
-        const auto& key = item.key();
-        if (key == "messages" || key == "tools" || key == "add_generation_prompt" ||
-            key == "continue_final_message" || key == "bos_token" || key == "eos_token" ||
-            key == "pad_token" || key == "unk_token" || key == "sep_token" || key == "cls_token" ||
-            key == "mask_token" || key == "additional_special_tokens" ||
-            special_tokens.contains(key)) {
-            throw std::invalid_argument("chat_template_kwargs cannot override " + key);
-        }
-    }
+    Json context =
+        models::frontend::template_context(options.chat_template_kwargs_json, special_tokens);
     for (const char* name :
          {"enable_thinking", "preserve_thinking", "reasoning_effort", "add_vision_id"}) {
         if (context.contains(name) && context[name].is_null()) context.erase(name);
     }
-    if (options.enable_thinking) merge_option(context, "enable_thinking", *options.enable_thinking);
+    if (options.enable_thinking)
+        models::frontend::merge_template_option(context, "enable_thinking",
+                                                *options.enable_thinking);
     if (options.preserve_thinking)
-        merge_option(context, "preserve_thinking", *options.preserve_thinking);
+        models::frontend::merge_template_option(context, "preserve_thinking",
+                                                *options.preserve_thinking);
     if (options.reasoning_effort) {
         const auto name = reasoning_effort_name(*options.reasoning_effort);
         if (name.empty()) throw std::invalid_argument("invalid reasoning effort");
-        merge_option(context, "reasoning_effort", name);
+        models::frontend::merge_template_option(context, "reasoning_effort", name);
     }
-    if (options.add_vision_id) merge_option(context, "add_vision_id", true);
+    if (options.add_vision_id)
+        models::frontend::merge_template_option(context, "add_vision_id", true);
     for (const char* name : {"enable_thinking", "preserve_thinking", "add_vision_id"}) {
         if (context.contains(name) && !context[name].is_boolean()) {
             throw std::invalid_argument(std::string(name) + " must be a boolean");
@@ -89,11 +73,16 @@ Json template_parameters(const ChatRenderOptions& options, const Json& special_t
         }
         const bool thinking = effort != "none";
         if (context.contains("enable_thinking") && context["enable_thinking"] != thinking) {
-            throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
+            throw RequestError(RequestErrorKind::ConflictingPromptOptions,
+                               "reasoning_effort conflicts with enable_thinking",
+                               "reasoning_effort");
         }
-        // The protocol's 'none' is an explicit disable. Other efforts retain template defaults.
-        if (!thinking) context["enable_thinking"] = false;
+        context["enable_thinking"] = thinking;
     }
+    if (!context.contains("enable_thinking") && options.defaults.enable_thinking)
+        context["enable_thinking"] = *options.defaults.enable_thinking;
+    if (!context.contains("preserve_thinking") && options.defaults.preserve_thinking)
+        context["preserve_thinking"] = *options.defaults.preserve_thinking;
     context.update(special_tokens);
     return context;
 }
@@ -104,22 +93,6 @@ std::optional<std::size_t> containing_message(const PromptLayout& layout, text::
         if (region.begin >= message.content_begin && region.end <= message.content_end) return i;
     }
     return std::nullopt;
-}
-
-// Equal text alone does not prove equal control-token interpretation.
-bool same_prefix(const text::TemplateOutput& lhs, const text::TemplateOutput& rhs,
-                 std::size_t size) {
-    if (lhs.text.size() < size || rhs.text.size() < size ||
-        std::string_view(lhs.text).substr(0, size) != std::string_view(rhs.text).substr(0, size))
-        return false;
-    for (std::size_t i = 0;; ++i) {
-        const bool left  = i < lhs.literal_spans.size() && lhs.literal_spans[i].begin < size;
-        const bool right = i < rhs.literal_spans.size() && rhs.literal_spans[i].begin < size;
-        if (!left || !right) return left == right;
-        const auto a = lhs.literal_spans[i];
-        const auto b = rhs.literal_spans[i];
-        if (a.begin != b.begin || std::min(a.end, size) != std::min(b.end, size)) return false;
-    }
 }
 
 bool real_user(const ChatMessage& message) {
@@ -142,23 +115,25 @@ bool ChatMessage::has_media() const noexcept {
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source, std::string source_name,
                                                    Json special_tokens) {
-    return CompiledChatTemplate(text::JinjaTemplate(std::string(source), std::move(source_name)),
-                                std::move(special_tokens));
+    return CompiledChatTemplate({text::JinjaTemplate(std::string(source), std::move(source_name)),
+                                 std::move(special_tokens)});
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options,
                                           const PreparationControl& control) const {
     if (messages.empty()) throw std::invalid_argument("chat requires at least one message");
-    check_preparation_control(control, "chat template");
+    models::frontend::check_preparation_control(control, "chat template");
     const bool continuation =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;
-    Json context = template_parameters(options, special_tokens_);
+    Json context = template_parameters(options, compiled_.special_tokens);
     if (continuation) {
+        if (context.value("enable_thinking", false))
+            throw RequestError(RequestErrorKind::UnsupportedPromptContinuation,
+                               "assistant prefill cannot be combined with enabled thinking");
         const auto& final = messages.back();
         if (final.role != ChatRole::Assistant || final.has_media() ||
-            !final.reasoning_content.empty() || !final.tool_calls.empty() ||
-            context.value("enable_thinking", false)) {
+            !final.reasoning_content.empty() || !final.tool_calls.empty()) {
             throw std::invalid_argument("assistant continuation requires a final text-only "
                                         "assistant message and disabled thinking");
         }
@@ -174,7 +149,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         return id;
     };
     std::vector<ContentSource> sources(messages.size());
-    std::vector<Modality> media;
+    std::vector<models::frontend::Modality> media;
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const auto& message = messages[i];
         if (instruction(message.role) &&
@@ -187,6 +162,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         auto& origin       = sources[i];
         if (!message.has_media()) {
             std::string content;
+            if (message.role == ChatRole::Tool && message.tool_result_is_error)
+                content = "[tool_error]\n";
             for (const auto& part : message.parts) {
                 content += part.text;
                 origin.part_ends.push_back(content.size());
@@ -195,9 +172,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             origin.tag       = tag(pointer + "/content");
         } else {
             value["content"] = Json::array();
+            if (message.role == ChatRole::Tool && message.tool_result_is_error)
+                value["content"].push_back({{"type", "text"}, {"text", "[tool_error]\n"}});
             for (std::size_t j = 0; j < message.parts.size(); ++j) {
                 const auto& part = message.parts[j];
-                const auto item  = pointer + "/content/" + std::to_string(j);
+                const auto item  = pointer + "/content/" + std::to_string(value["content"].size());
                 if (part.kind == ChatPartKind::Text) {
                     value["content"].push_back({{"type", "text"}, {"text", part.text}});
                     origin.part_tags.push_back(tag(item + "/text"));
@@ -206,7 +185,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                     const bool image = part.kind == ChatPartKind::Image;
                     value["content"].push_back({{"type", image ? "image" : "video"}});
                     origin.part_media.push_back(media.size());
-                    media.push_back(image ? Modality::Image : Modality::Video);
+                    media.push_back(image ? models::frontend::Modality::Image
+                                          : models::frontend::Modality::Video);
                     origin.part_tags.push_back(0);
                 }
             }
@@ -240,16 +220,18 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     std::vector<std::string> control_variables;
-    for (const auto& item : special_tokens_.items()) control_variables.push_back(item.key());
+    for (const auto& item : compiled_.special_tokens.items())
+        control_variables.push_back(item.key());
     text::TemplateRenderOptions execution{
-        .checkpoint        = [&] { check_preparation_control(control, "chat template"); },
+        .checkpoint =
+            [&] { models::frontend::check_preparation_control(control, "chat template"); },
         .regions           = regions,
         .control_variables = control_variables};
-    auto output = compiled_.render(context, execution);
+    auto output = compiled_.program.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
     std::string continuation_content;
     if (continuation) {
-        const auto content = unique_output_region(output, sources.back().tag);
+        const auto content = models::frontend::unique_output_region(output, sources.back().tag);
         if (!content || layout.messages.empty())
             throw std::invalid_argument(
                 "chat template does not expose the final assistant content for continuation");
@@ -272,6 +254,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         layout = inspect_prompt_layout(output, media);
     }
     RenderedChat result;
+    if (context.contains("enable_thinking"))
+        result.enable_thinking = context["enable_thinking"].get<bool>();
     result.continuation_content         = std::move(continuation_content);
     result.starts_in_reasoning          = layout.starts_in_reasoning;
     result.media_placeholders           = layout.media_placeholders;
@@ -290,8 +274,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                 probe["messages"].end());
         probe["add_generation_prompt"] = false;
         try {
-            const auto rendered = compiled_.render(probe, execution);
-            if (same_prefix(output, rendered, rendered.text.size()))
+            const auto rendered = compiled_.program.render(probe, execution);
+            if (models::frontend::same_prefix(output, rendered, rendered.text.size()))
                 boundary = rendered.text.size();
         } catch (const RequestError&) {
             throw;
@@ -390,9 +374,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         auto probe_options             = execution;
         probe_options.regions          = {};
         try {
-            const auto next_turn     = compiled_.render(probe, probe_options);
+            const auto next_turn     = compiled_.program.render(probe, probe_options);
             const auto history_bytes = generation_begin.value_or(output.text.size());
-            retain_open_turn         = same_prefix(next_turn, output, history_bytes);
+            retain_open_turn = models::frontend::same_prefix(next_turn, output, history_bytes);
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument&) {
             retain_open_turn = false;
         }
@@ -416,10 +400,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                    std::size_t part) -> std::optional<std::size_t> {
         const auto& origin = sources[message];
         if (part < origin.part_ends.size())
-            return source_boundary(output, origin.tag, origin.part_ends[part]);
+            return models::frontend::source_boundary(output, origin.tag, origin.part_ends[part]);
         if (part < origin.part_tags.size()) {
             if (origin.part_tags[part]) {
-                if (const auto region = unique_output_region(output, origin.part_tags[part]))
+                if (const auto region =
+                        models::frontend::unique_output_region(output, origin.part_tags[part]))
                     return region->end;
             } else if (origin.part_media[part]) {
                 return layout.media_placeholders[*origin.part_media[part]].bytes.end +
@@ -476,16 +461,60 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             break;
         case PromptCacheMarkerLocation::LeadingInstructionBoundary:
             if (instruction(messages.front().role))
-                result.cache_boundaries[i] =
-                    source_boundary(output, sources.front().tag, marker.leading_instruction_bytes);
+                result.cache_boundaries[i] = models::frontend::source_boundary(
+                    output, sources.front().tag, marker.leading_instruction_bytes);
             break;
         case PromptCacheMarkerLocation::ToolBoundary:
             if (marker.after_tool_count && marker.after_tool_count <= tool_tags.size()) {
-                if (const auto region =
-                        unique_output_region(output, tool_tags[marker.after_tool_count - 1]))
+                if (const auto region = models::frontend::unique_output_region(
+                        output, tool_tags[marker.after_tool_count - 1]))
                     result.cache_boundaries[i] = region->end;
             }
             break;
+        case PromptCacheMarkerLocation::MessageContentBoundary: {
+            if (!marker.after_message_count || marker.after_message_count > messages.size()) break;
+            const auto index    = marker.after_message_count - 1U;
+            const auto& message = messages[index];
+            if (message.role != ChatRole::Assistant || message.has_media() ||
+                marker.after_message_part_count > message.parts.size() ||
+                marker.after_tool_call_count > message.tool_calls.size() ||
+                marker.reasoning_bytes > message.reasoning_content.size())
+                break;
+            Json probe  = context;
+            auto& turns = probe["messages"];
+            turns.erase(turns.begin() + index + 1U, turns.end());
+            auto& tail = turns[index];
+            std::string content;
+            for (std::size_t part = 0; part < marker.after_message_part_count; ++part)
+                content += message.parts[part].text;
+            tail["content"] = std::move(content);
+            if (tail.contains("reasoning_content"))
+                tail["reasoning_content"] =
+                    message.reasoning_content.substr(0, marker.reasoning_bytes);
+            if (tail.contains("tool_calls")) {
+                auto& calls = tail["tool_calls"];
+                calls.erase(calls.begin() + marker.after_tool_call_count, calls.end());
+            }
+            probe["add_generation_prompt"] = false;
+            try {
+                const auto partial      = compiled_.program.render(probe, execution);
+                std::size_t media_count = 0;
+                for (std::size_t i = 0; i <= index; ++i)
+                    media_count +=
+                        std::count_if(sources[i].part_media.begin(), sources[i].part_media.end(),
+                                      [](const auto& item) { return item.has_value(); });
+                const auto partial_layout = inspect_prompt_layout(
+                    partial, std::span<const models::frontend::Modality>(media).first(media_count));
+                if (!partial_layout.messages.empty()) {
+                    const auto& last = partial_layout.messages.back();
+                    if (last.role == ChatRole::Assistant && last.closed &&
+                        models::frontend::same_prefix(output, partial, last.content_end))
+                        result.cache_boundaries[i] = last.content_end;
+                }
+            } catch (const RequestError&) { throw; } catch (const std::invalid_argument&) {
+            }
+            break;
+        }
         case PromptCacheMarkerLocation::MessagePartBoundary:
             if (marker.after_message_count && marker.after_message_count <= sources.size() &&
                 marker.after_message_part_count) {

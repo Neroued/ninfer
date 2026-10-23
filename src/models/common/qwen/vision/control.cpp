@@ -46,7 +46,7 @@ VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
     std::size_t patch_cursor    = 0;
     std::size_t token_cursor    = 0;
     std::size_t next_span_begin = 0;
-    for (const VisionItem& item : prompt.vision_items) {
+    for (const models::frontend::VisionItem& item : prompt.vision_items) {
         const std::int32_t t = item.grid.temporal;
         const std::int32_t h = item.grid.height;
         const std::int32_t w = item.grid.width;
@@ -63,12 +63,12 @@ VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
             throw std::invalid_argument("vision control patch ranges are not canonical");
         }
         const std::size_t expected_spans =
-            item.modality == Modality::Video ? static_cast<std::size_t>(t) : 1;
+            item.modality == models::frontend::Modality::Video ? static_cast<std::size_t>(t) : 1;
         if (item.token_spans.size() != expected_spans) {
             throw std::invalid_argument("vision control token spans do not match modality grid");
         }
         std::size_t item_tokens = 0;
-        for (const TokenSpan& span : item.token_spans) {
+        for (const models::frontend::TokenSpan& span : item.token_spans) {
             if (span.count == 0 || span.begin > prompt.token_types.size() ||
                 span.count > prompt.token_types.size() - span.begin) {
                 throw std::invalid_argument("vision control token span exceeds prompt");
@@ -123,12 +123,12 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
     out.items.reserve(prompt.vision_items.size() - prepared_item_begin);
     for (std::size_t item_index = prepared_item_begin; item_index < prompt.vision_items.size();
          ++item_index) {
-        const VisionItem& item             = prompt.vision_items[item_index];
-        const VisionItemControlPlan& input = plan.items[item_index];
-        const std::int32_t t               = item.grid.temporal;
-        const std::int32_t h               = item.grid.height;
-        const std::int32_t w               = item.grid.width;
-        const std::size_t item_patches     = item.patch_count;
+        const models::frontend::VisionItem& item = prompt.vision_items[item_index];
+        const VisionItemControlPlan& input       = plan.items[item_index];
+        const std::int32_t t                     = item.grid.temporal;
+        const std::int32_t h                     = item.grid.height;
+        const std::int32_t w                     = item.grid.width;
+        const std::size_t item_patches           = item.patch_count;
 
         VisionItemControl control;
         control.modality       = item.modality;
@@ -146,7 +146,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
         control.position_table_weights.reserve(
             checked_mul(item_patches, 4, "position table weight count"));
         const auto expected = static_cast<std::uint8_t>(item.modality);
-        for (const TokenSpan& span : item.token_spans) {
+        for (const models::frontend::TokenSpan& span : item.token_spans) {
             if (!std::all_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
                              prompt.token_types.begin() +
                                  static_cast<std::ptrdiff_t>(span.begin + span.count),

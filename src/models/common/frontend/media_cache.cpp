@@ -1,4 +1,4 @@
-#include "models/common/qwen/frontend/media_cache.h"
+#include "models/common/frontend/media_cache.h"
 
 #include "core/cpu/task_pool.h"
 
@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace ninfer::models::qwen::frontend {
+namespace ninfer::models::frontend {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -424,4 +424,4 @@ MediaCacheStats MediaPreprocessCache::stats() const {
     return out;
 }
 
-} // namespace ninfer::models::qwen::frontend
+} // namespace ninfer::models::frontend

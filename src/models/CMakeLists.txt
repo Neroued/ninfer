@@ -1,6 +1,7 @@
 # Definitions and immutable weights are independent of execution ownership.
 add_library(ninfer_model_loading STATIC
   registry.cpp
+  common/frontend/resources.cpp
   common/bindings.cpp
   common/parallel.cpp
   common/weights.cpp
@@ -12,6 +13,11 @@ target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ni
 
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC
+  common/frontend/chat_template.cpp
+  common/frontend/output_session.cpp
+  common/frontend/tools.cpp
+  common/frontend/media_cache.cpp
+  common/frontend/digest.cpp
   common/context/directory.cpp
   common/context/directory/records.cpp
   common/context/directory/state.cpp

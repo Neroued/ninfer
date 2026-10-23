@@ -32,8 +32,8 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
         header + 4 + compute_actions + 128 + batch * (200 + 24 * context) + 4ULL * s.prefill_chunk;
     const auto context_work = header + 4 + context_actions + 32 + batch * (88 + 4 * context);
     const auto commit       = header + 4 + 8 + batch * 51 + commit_actions;
-    const auto words        = (std::size_t(definition.resources().public_token_count) + 31) / 32;
-    const auto decision     = header + 12 + batch * (20 + 4 * words * positions);
+    const auto words    = (std::size_t(definition.resources().text.public_token_count) + 31) / 32;
+    const auto decision = header + 12 + batch * (20 + 4 * words * positions);
     // Generated and verification tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
     wire::Encoder completion;
@@ -99,7 +99,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const RankExecutionDescription& rank,
                                const distributed::ExecutionTopology& topology)
     : contract_{rank.session.shape, definition.config().text.vocabulary,
-                definition.resources().public_token_count, definition.options().mtp(),
+                definition.resources().text.public_token_count, definition.options().mtp(),
                 definition.options().vision} {
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);

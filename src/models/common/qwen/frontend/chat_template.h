@@ -1,8 +1,6 @@
 #pragma once
 
-#include "models/common/qwen/frontend/tokenizer.h"
-#include "text/jinja.h"
-
+#include "models/common/frontend/chat_template.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include <ninfer/types.h>
 
@@ -15,9 +13,6 @@
 #include <vector>
 
 namespace ninfer::models::qwen::frontend {
-
-inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
-
 struct ToolCall {
     std::string id;
     std::string name;
@@ -32,15 +27,15 @@ enum class ChatPartKind {
 
 struct MediaPlaceholderByteSpec {
     text::ByteSpan bytes;
-    Modality modality      = Modality::Image;
-    std::size_t item_index = 0;
+    models::frontend::Modality modality = models::frontend::Modality::Image;
+    std::size_t item_index              = 0;
 };
 
 struct MediaTokenRunByteSpec {
     text::ByteSpan bytes;
-    Modality modality       = Modality::Image;
-    std::size_t item_index  = 0;
-    std::size_t frame_index = 0;
+    models::frontend::Modality modality = models::frontend::Modality::Image;
+    std::size_t item_index              = 0;
+    std::size_t frame_index             = 0;
 };
 
 struct MediaData {
@@ -82,6 +77,7 @@ struct ChatMessage {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    bool tool_result_is_error = false;
 
     [[nodiscard]] bool has_media() const noexcept;
 };
@@ -96,6 +92,7 @@ struct ChatRenderOptions {
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
+    PromptDefaults defaults;
     std::vector<std::string> tool_jsons;
     std::vector<PromptCacheMarker> cache_markers;
 };
@@ -109,6 +106,7 @@ struct RewriteCheckpointByteSpec {
 };
 
 struct RenderedChat {
+    std::optional<bool> enable_thinking;
     std::string text;
     std::string continuation_content;
     std::vector<text::ByteSpan> literal_spans;
@@ -134,12 +132,11 @@ public:
                                       ChatRenderOptions options         = {},
                                       const PreparationControl& control = {}) const;
 
-private:
-    CompiledChatTemplate(text::JinjaTemplate compiled, nlohmann::ordered_json special_tokens)
-        : compiled_(std::move(compiled)), special_tokens_(std::move(special_tokens)) {}
+    explicit CompiledChatTemplate(models::frontend::ChatTemplate compiled)
+        : compiled_(std::move(compiled)) {}
 
-    text::JinjaTemplate compiled_;
-    nlohmann::ordered_json special_tokens_;
+private:
+    models::frontend::ChatTemplate compiled_;
 };
 
 } // namespace ninfer::models::qwen::frontend

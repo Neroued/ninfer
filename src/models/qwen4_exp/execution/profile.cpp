@@ -111,7 +111,7 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
     out->local.gdn.value_heads = rank.gdn_values.size;
     out->local.qsa.query_heads = rank.qsa_queries.size;
     out->local.qsa.kv_heads    = rank.qsa_kv.size;
-    out->public_tokens         = source.resources().public_token_count;
+    out->public_tokens         = source.resources().text.public_token_count;
     const Describe d(source, weights);
     const auto& w = source.weights();
     for (const auto& layer : w.text.layers) out->text.layers.push_back(d.block(layer, false));

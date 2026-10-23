@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::models::qwen::frontend {
+namespace ninfer::text {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
@@ -43,7 +43,6 @@ struct DecodedTokenView {
 struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
-    std::string_view generation_config_json;
 };
 
 struct BpeMergeRule {
@@ -142,10 +141,6 @@ public:
     [[nodiscard]] std::string_view decode_token_bytes(int id,
                                                       bool skip_special_tokens = false) const;
 
-    [[nodiscard]] const std::vector<int>& default_stop_token_ids() const noexcept {
-        return default_stop_token_ids_;
-    }
-
     [[nodiscard]] std::size_t vocab_size() const noexcept { return decoded_token_bytes_.size(); }
 
     [[nodiscard]] bool is_special_token(int id) const noexcept;
@@ -161,7 +156,6 @@ private:
     std::array<int, 256> byte_token_ids_{};
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
-    std::vector<int> default_stop_token_ids_;
 };
 
-} // namespace ninfer::models::qwen::frontend
+} // namespace ninfer::text

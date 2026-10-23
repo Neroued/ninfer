@@ -9,9 +9,8 @@
 namespace ninfer {
 
 struct ParallelOptions {
-    std::uint32_t tp = 1, ep = 1, dp = 1, pp = 1;
-    // Full-model replicas use dp; attention ownership within a replica uses attention_dp.
-    std::uint32_t attention_dp = 1;
+    // dp counts full-model replicas; adp counts attention DP owners within a replica.
+    std::uint32_t tp = 1, ep = 1, dp = 1, pp = 1, adp = 1;
 };
 
 struct DeploymentNode {

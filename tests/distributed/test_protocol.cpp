@@ -31,7 +31,7 @@ void rejects(F function) {
 void topology_identity() {
     DeploymentOptions deployment;
     deployment.control_host = "127.0.0.1";
-    deployment.parallel     = {.tp = 2, .ep = 2, .attention_dp = 2};
+    deployment.parallel     = {.tp = 2, .ep = 2, .adp = 2};
     deployment.nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}};
     deployment.ranks        = {{0, 0, 0}, {1, 0, 1}};
     dist::ExecutionTopology topology;

@@ -90,13 +90,12 @@ public:
         out.connect_timeout_ms  = duration(t, "connect_timeout", out.connect_timeout_ms);
         out.shutdown_timeout_ms = duration(t, "shutdown_timeout", out.shutdown_timeout_ms);
         if (const auto* p = t.get("parallel")) {
-            const auto& values =
-                table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "attention_dp"});
-            out.parallel.tp           = number(values, "tp", "distributed.parallel", 1);
-            out.parallel.ep           = number(values, "ep", "distributed.parallel", 1);
-            out.parallel.dp           = number(values, "dp", "distributed.parallel", 1);
-            out.parallel.pp           = number(values, "pp", "distributed.parallel", 1);
-            out.parallel.attention_dp = number(values, "attention_dp", "distributed.parallel", 1);
+            const auto& values = table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "adp"});
+            out.parallel.tp    = number(values, "tp", "distributed.parallel", 1);
+            out.parallel.ep    = number(values, "ep", "distributed.parallel", 1);
+            out.parallel.dp    = number(values, "dp", "distributed.parallel", 1);
+            out.parallel.pp    = number(values, "pp", "distributed.parallel", 1);
+            out.parallel.adp   = number(values, "adp", "distributed.parallel", 1);
         }
         const auto& nodes = array(t, "nodes");
         for (std::size_t i = 0; i < nodes.size(); ++i) {

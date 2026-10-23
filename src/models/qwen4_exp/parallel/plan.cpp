@@ -109,7 +109,7 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     const auto& o   = deployment.parallel;
     const auto size = static_cast<std::uint32_t>(deployment.ranks.size());
     if ((size != 1 && size != 2) || o.tp != size || o.ep != size || o.dp != 1 || o.pp != 1 ||
-        o.attention_dp != 1)
+        o.adp != 1)
         throw std::invalid_argument("Qwen4Exp supports one rank or TP2/EP2 with DP1/ADP1/PP1");
     ParallelPlan out;
     for (const auto& r : deployment.ranks) {

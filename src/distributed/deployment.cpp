@@ -15,8 +15,7 @@ void validate_deployment(const DeploymentOptions& options) {
     if (!options.connect_timeout_ms || !options.shutdown_timeout_ms)
         fail("connection and shutdown timeouts must be positive");
     const auto& p = options.parallel;
-    if (!p.tp || !p.ep || !p.dp || !p.pp || !p.attention_dp)
-        fail("parallel sizes must be positive");
+    if (!p.tp || !p.ep || !p.dp || !p.pp || !p.adp) fail("parallel sizes must be positive");
     std::set<std::uint32_t> nodes;
     for (const auto& node : options.nodes) {
         if (!nodes.insert(node.id).second) fail("duplicate node ID");

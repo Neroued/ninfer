@@ -286,7 +286,7 @@ device = 0
             "entry lost deployment configuration");
     const auto& d = *cli.launch.engine.deployment;
     require(d.coordinator_node == 10 && d.parallel.tp == 2 && d.parallel.ep == 2 &&
-                d.parallel.dp == 1 && d.parallel.attention_dp == 1 && d.ranks.size() == 2 &&
+                d.parallel.dp == 1 && d.parallel.adp == 1 && d.ranks.size() == 2 &&
                 d.connect_timeout_ms == 15000 && d.shutdown_timeout_ms == 2000 &&
                 d.control_port == 0 &&
                 d.nodes[1].environment.at("NCCL_SOCKET_IFNAME") == "=enp1s0f0np0",
@@ -295,25 +295,23 @@ device = 0
         ninfer::product::format_configuration(ninfer::product::configuration_view(cli));
     require(printed.find("nodes[1].ssh") != std::string::npos &&
                 printed.find("192.168.100.50") != std::string::npos &&
-                printed.find("parallel.attention_dp") != std::string::npos,
+                printed.find("parallel.adp") != std::string::npos,
             "deployment is missing from startup display");
-    auto attention_source                        = source;
-    constexpr std::string_view attention_setting = "attention_dp = 2\n";
-    attention_source.insert(attention_source.find("[[distributed.nodes]]"), attention_setting);
-    const auto attention_path   = files.write(attention_source);
-    const auto attention_cli    = parse({"ninfer", "--config", attention_path.string()});
-    const auto attention_server = serve({"ninfer-serve", "--config", attention_path.string()});
-    require(attention_cli.launch.engine.deployment->parallel.attention_dp == 2 &&
-                attention_server.launch.engine.deployment->parallel.attention_dp == 2 &&
-                attention_cli.launch.engine.deployment->parallel.dp == 1,
-            "attention parallelism was not preserved independently of full-model replicas");
-    attention_source.replace(attention_source.find(attention_setting), attention_setting.size(),
-                             "attention_dp = 0\n");
-    const auto invalid_attention = files.write(attention_source);
-    const auto attention_error =
-        rejection([&] { parse({"ninfer", "--config", invalid_attention.string()}); });
-    require(attention_error.find(invalid_attention.string() + ":") != std::string::npos,
-            "attention parallelism diagnostic lost its source location");
+    auto adp_source                        = source;
+    constexpr std::string_view adp_setting = "adp = 2\n";
+    adp_source.insert(adp_source.find("[[distributed.nodes]]"), adp_setting);
+    const auto adp_path   = files.write(adp_source);
+    const auto adp_cli    = parse({"ninfer", "--config", adp_path.string()});
+    const auto adp_server = serve({"ninfer-serve", "--config", adp_path.string()});
+    require(adp_cli.launch.engine.deployment->parallel.adp == 2 &&
+                adp_server.launch.engine.deployment->parallel.adp == 2 &&
+                adp_cli.launch.engine.deployment->parallel.dp == 1,
+            "attention DP was not preserved independently of full-model replicas");
+    adp_source.replace(adp_source.find(adp_setting), adp_setting.size(), "adp = 0\n");
+    const auto invalid_adp = files.write(adp_source);
+    const auto adp_error = rejection([&] { parse({"ninfer", "--config", invalid_adp.string()}); });
+    require(adp_error.find(invalid_adp.string() + ":") != std::string::npos,
+            "attention DP diagnostic lost its source location");
     for (const auto& [before, after] :
          std::vector<std::pair<std::string, std::string>>{{"rank = 1", "rank = 0"},
                                                           {"node = 20", "node = 99"},

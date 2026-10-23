@@ -41,7 +41,7 @@ ADP 作用于哪些模块由模型定义：GLM 是 MLA/Indexer，KDA 仍按 head
 也可独立设计 ADP 路线，继续保留其他模块的 TP/EP。当前 QSA 的 KV 已按 heads TP
 切分，因此 ADP 的容量收益需按实际布局计算，不能照搬 MLA 去除重复 latent 的收益。
 
-配置合同保留 `ParallelOptions::dp` 表示完整副本数，新增独立的 `attention_dp`，默认 1；
+配置合同保留 `ParallelOptions::dp` 表示完整副本数，新增独立的 `adp`，默认 1；
 rank 身份保留 `dp` 坐标并增加 `adp` 坐标。配置层只解析，拓扑层校验成员和坐标，
 模型计划声明支持的内部组合。本文不复用现有 `dp` 字段承载 ADP。
 
@@ -493,7 +493,7 @@ Prefill 继续沿用集中分块调度；attention DP 本身不额外引入一�
 
 | 位置 | 需要落地的内容 |
 |---|---|
-| `include/ninfer/deployment.h`、`distributed/topology.*` | 独立的 attention_dp 配置与 adp 坐标，保留 dp 的完整副本语义 |
+| `include/ninfer/deployment.h`、`distributed/topology.*` | 独立的 adp 配置与 adp 坐标，保留 dp 的完整副本语义 |
 | `runtime/contract/placement.h` | PlacementId、负载摘要、选择原因等跨模块纯值合同 |
 | `runtime/engine/context_cache/placement_policy.{h,cpp}` | S/E 计算和固定排序；输入候选摘要，输出选择，不持有模型/目录 |
 | `runtime/engine/context_cache/resource_manager.h` | 来源×目标候选、placement-aware 共享发布/查询、等待引用和回收 |

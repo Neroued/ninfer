@@ -45,7 +45,7 @@ void ExecutionTopology::validate(const DeploymentOptions& deployment) const {
                 throw std::invalid_argument("invalid parallel coordinate");
         const auto& p = deployment.parallel;
         if (actual.tp.size != p.tp || actual.ep.size != p.ep || actual.dp.size != p.dp ||
-            actual.pp.size != p.pp || actual.adp.size != p.attention_dp)
+            actual.pp.size != p.pp || actual.adp.size != p.adp)
             throw std::invalid_argument("topology differs from requested parallel sizes");
     }
     std::set<GroupId> ids;

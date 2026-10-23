@@ -18,8 +18,9 @@ namespace ninfer::ops {
  *   head_dim=rotary_dim=128; phi=positions[t]*theta^(-2*i/rotary_dim).
  * - Text MRoPE: positions I32 [T,3], head_dim=256, rotary_dim=64; pair i uses axis i%3 with
  *   the same frequency as Text 1-D.
- * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=72; pairs 0..17 use axis 0 and pairs
- *   18..35 use axis 1, each with local frequency theta^(-2*(i%18)/36).
+ * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=D in {64,72}; the first D/4
+ *   pairs use axis 0 and the remaining pairs use axis 1, with local frequency
+ *   theta^(-2*(i%(D/4))/(D/2)). Positions are stored as two contiguous coordinate axes.
  *
  * positions is contiguous and theta is positive and finite. Q/K tensors are BF16
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional

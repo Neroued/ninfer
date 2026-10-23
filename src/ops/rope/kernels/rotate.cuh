@@ -206,10 +206,10 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
 
 __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, int rotary_dim,
                                                        int pair, int* axis, float* exponent) {
-    if (axes == 2 && head_dim == 72 && rotary_dim == 72) {
-        *axis           = pair / 18;
-        const int local = pair % 18;
-        *exponent       = -2.0F * static_cast<float>(local) / 36.0F;
+    if (axes == 2) {
+        *axis           = pair / (head_dim / 4);
+        const int local = pair % (head_dim / 4);
+        *exponent       = -2.0F * static_cast<float>(local) / (head_dim / 2);
     } else {
         *axis     = axes == 3 ? pair % 3 : 0;
         *exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);

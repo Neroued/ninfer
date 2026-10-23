@@ -47,6 +47,12 @@ Selection select_rope(const RopeArguments& a, int multiprocessors) {
     const int first_heads  = a.first.ne[1];
     const int second_heads = a.second ? a.second->ne[1] : 0;
 
+    if (axes == 2 && a.rotary_dim == 64) {
+        if (tokens <= 2) return {launch_rope_axial64<2>, 32};
+        if ((tokens >= 32 && tokens <= 64) || tokens >= 8192) return {launch_rope_axial64<16>, 256};
+        return {launch_rope_axial64<8>, 128};
+    }
+
     if (axes == 1 && a.first.ne[0] == 128 && a.rotary_dim == 128 && a.theta == 1.0e7F) {
         if (first_heads == 32 && second_heads == 8) {
             if (tokens <= 16) return {launch_rope_split<5, 32, 8>, 160};

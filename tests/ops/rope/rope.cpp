@@ -90,8 +90,10 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                 int axis        = 0;
                 double exponent = 0.0;
                 if (geometry.axes == 2) {
-                    axis     = pair / 18;
-                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
+                    const int pairs_per_axis = geometry.head_dim / 4;
+                    axis                     = pair / pairs_per_axis;
+                    exponent =
+                        -2.0 * static_cast<double>(pair % pairs_per_axis) / (geometry.head_dim / 2);
                 } else {
                     axis     = geometry.axes == 3 ? pair % 3 : 0;
                     exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
@@ -525,6 +527,12 @@ void add_rope_cases(ninfer::test::OpSuite& suite) {
                                                 true);
               },
               {{"execution", "graph"}});
+
+    for (int tokens : {1, 7, 32, 128, 4097})
+        pair({"vision D64", 64, 64, 2, tokens, kVisionTheta}, 16, 16, 5, 0, 0, 0, tokens == 7);
+    pair({"vision D64 packed", 64, 64, 2, 17, kVisionTheta}, 16, 16, -2, 2048, 2048);
+    pair({"vision D64 odd heads/stride", 64, 64, 2, 3, 5700.F}, 5, 3, 41, 1, 1);
+    single({"vision D64 single", 64, 64, 2, 13, kVisionTheta}, 16, 7, 4);
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     pair({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);

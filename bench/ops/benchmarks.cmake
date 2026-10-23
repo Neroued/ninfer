@@ -11,6 +11,7 @@ ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_attention/kimi_delta_attention/main.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
+ninfer_add_op_bench(ninfer_axial_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/axial_rope_bench.cu")
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/add_bias_bench.cu")
 ninfer_add_op_bench(ninfer_gelu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gelu_bench.cu")
 ninfer_add_op_bench(ninfer_layer_norm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/layer_norm_bench.cu")

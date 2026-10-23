@@ -573,6 +573,10 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
+    if (point.qtype == QType::BF16 && point.n == 4096 && point.k == 10240 && point.t > 1) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
     if (point.qtype == QType::BF16 && point.n == 1024 && point.k == 1024 && point.t > 1) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;

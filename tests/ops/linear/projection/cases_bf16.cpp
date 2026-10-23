@@ -344,6 +344,7 @@ void run_bf16_extensions(Suite& suite) {
         Geometry{20480, 1536, {16, 32, 64, 128, 256}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256}},
         Geometry{4096, 8192, {1, 8, 32, 128, 256, 512, 1024}},
+        Geometry{1024, 1176, {1, 16, 32, 128, 192, 256, 512, 1536, 2304}},
     };
     for (const auto& geometry : geometries) {
         std::set<int> points{1, 4, 8, 128, 4096, 4097};
@@ -369,6 +370,13 @@ void run_bf16_extensions(Suite& suite) {
         complete.parent_rows = parent_rows;
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, complete);
 
+        if (geometry.k == 1176) {
+            const std::array tail{Invocation{1}, Invocation{16}, Invocation{32}, Invocation{193},
+                                  Invocation{2305}};
+            add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
+                      {geometry.n, geometry.k, seed + 2, Comparison::Sampled, true, tail,
+                       ActivationPattern::KTail});
+        }
         if (geometry.k == 1536) {
             const std::array calls{Invocation{16}, Invocation{33}, Invocation{65}, Invocation{129},
                                    Invocation{257}};

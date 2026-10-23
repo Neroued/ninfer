@@ -6,16 +6,17 @@
 
 namespace ninfer::ops::detail::swiglu_ffn {
 namespace {
-using Small  = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
-                                       Q8ActivationStage::PaddedZero, 4096>;
-using Hot    = Q8A16SlicedKMmaSchedule<32, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
-                                       Q8ActivationStage::PaddedZero, 4096>;
-using S48    = Q8A16SlicedKMmaSchedule<48, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
-                                       Q8ActivationStage::PaddedZero, 4096>;
-using T64    = Q8A16TmaMmaSchedule<16, 64, 16, 16, 3, 8, 4096, 64, true, false, true, false, 2>;
-using Medium = Q8A16TmaMmaSchedule<64, 64, 64, 16, 2, 8, 4096, 64, true, false, true, false, 2>;
-using T96    = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 4096, 64, true, false, true, false, 2>;
-using T128   = Q8A16TmaMmaSchedule<32, 128, 32, 32, 2, 8, 4096, 64, true, false, true, false, 2>;
+using Small     = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                          Q8ActivationStage::PaddedZero, 4096>;
+using Hot       = Q8A16SlicedKMmaSchedule<32, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                          Q8ActivationStage::PaddedZero, 4096>;
+using S48       = Q8A16SlicedKMmaSchedule<48, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                          Q8ActivationStage::PaddedZero, 4096>;
+using T64       = Q8A16TmaMmaSchedule<16, 64, 16, 16, 3, 8, 4096, 64, true, false, true, false, 2>;
+using T64Rows32 = Q8A16TmaMmaSchedule<32, 64, 32, 16, 3, 8, 4096, 64, true, false, true, false, 2>;
+using Medium    = Q8A16TmaMmaSchedule<64, 64, 64, 16, 2, 8, 4096, 64, true, false, true, false, 2>;
+using T96       = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 4096, 64, true, false, true, false, 2>;
+using T128      = Q8A16TmaMmaSchedule<32, 128, 32, 32, 2, 8, 4096, 64, true, false, true, false, 2>;
 using Bulk   = Q8A16TmaMmaSchedule<128, 128, 64, 32, 1, 8, 4096, 64, true, false, true, false, 2>;
 using Down   = Q8A16TmaMmaSchedule<64, 64, 32, 16, 2, 8, 1024, 64, true, true, true, false, 1, 2>;
 using Down8  = Q8A16TmaMmaSchedule<32, 8, 16, 8, 2, 8, 1024, 128, true, true, true, false, 1, 2>;
@@ -31,7 +32,7 @@ void gate_up(const Q8LinearOperands& p, ProductOutput output, float limit, cudaS
     if (p.tokens <= 32) return launch_q8_swiglu_sliced<Hot, 1024>(p, output, product, stream);
     if (p.tokens <= 48) return launch_q8_swiglu_sliced<S48, 1024>(p, output, product, stream);
     if (p.tokens <= 64) return launch_q8_swiglu_interleaved_tma<T64>(p, output, product, stream);
-    if (p.tokens <= 128) return launch_q8_swiglu_tma<T128>(p, output, product, stream);
+    if (p.tokens <= 128) return launch_q8_swiglu_tma<T64Rows32>(p, output, product, stream);
     if (p.tokens <= 192) return launch_q8_swiglu_tma<Medium>(p, output, product, stream);
     if (p.tokens <= 288) return launch_q8_swiglu_tma<T96>(p, output, product, stream);
     if (p.tokens <= 1024) return launch_q8_swiglu_tma<T128>(p, output, product, stream);

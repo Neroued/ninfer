@@ -86,11 +86,11 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
     auto& shared =
         *reinterpret_cast<SharedStorage*>(common::shared_storage<sizeof(SharedStorage)>());
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int gid  = lane >> 2;
-    const int lid  = lane & 3;
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
+    const int gid     = lane >> 2;
+    const int lid     = lane & 3;
     const int k_split = warp;
 
     const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
@@ -143,13 +143,15 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     };
 
     const auto stage_codes = [&](int slot, int group_k0) {
-        auto& code_shared  = shared.staging[slot].codes;
-        auto& scale_shared = shared.staging[slot].scales;
+        auto& code_shared          = shared.staging[slot].codes;
+        auto& scale_shared         = shared.staging[slot].scales;
+        constexpr int loader_warps = kWarps > kRowsPerCta ? kWarps / kRowsPerCta : 1;
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
-            const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
+            const int row        = (warp / loader_warps) * Schedule::kRowsPerLoaderWarp + row_item;
             const int weight_row = row_policy.weight_row(cta_row0, row);
-            for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
+            for (int chunk = lane + (warp % loader_warps) * 32; chunk < kGroupK / 16;
+                 chunk += loader_warps * 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
                 auto* dst                = &code_shared[row][swizzled_chunk * 16];
                 if (FullWeights ||
@@ -206,8 +208,20 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0, 0);
-    stage_x(0, 0);
+    // Rotate complete K groups together with their scales and matching activations.
+    // The default retains the original reduction order and address arithmetic.
+    const int first_group =
+        Schedule::kKPhaseStride == 0
+            ? 0
+            : static_cast<int>((std::int64_t(blockIdx.x) * Schedule::kKPhaseStride) % kGroups);
+    const auto group_k = [&](int index) {
+        if constexpr (Schedule::kKPhaseStride == 0)
+            return index * kGroupK;
+        else
+            return ((index + first_group) % kGroups) * kGroupK;
+    };
+    stage_codes(0, group_k(0));
+    stage_x(0, group_k(0));
     common::cp_commit();
     common::cp_wait<0>();
     __syncthreads();
@@ -216,15 +230,15 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
         Schedule::kStaticK > 0 && Schedule::kStaticK <= 6144 ? Schedule::kStaticK / kGroupK : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
-        const int group_k0 = group_index * kGroupK;
+        const int group_k0 = group_k(group_index);
         const int slot     = group_index % Schedule::kStages;
         auto& code_shared  = shared.staging[slot].codes;
         auto& b_shared     = shared.staging[slot].activations;
         auto& scale_shared = shared.staging[slot].scales;
         if constexpr (Schedule::kStages == 2) {
             if (group_index + 1 < kGroups) {
-                stage_codes(slot ^ 1, group_k0 + kGroupK);
-                stage_x(slot ^ 1, group_k0 + kGroupK);
+                stage_codes(slot ^ 1, group_k(group_index + 1));
+                stage_x(slot ^ 1, group_k(group_index + 1));
                 common::cp_commit();
             }
         }
@@ -267,9 +281,12 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
                 const unsigned af0 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col));
-                const unsigned af1 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
-                const unsigned af2 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
-                const unsigned af3 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
+                const unsigned af1 =
+                    common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
+                const unsigned af2 =
+                    common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
+                const unsigned af3 =
+                    common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -303,8 +320,8 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
         if (group_index + 1 < kGroups) {
             __syncthreads();
             if constexpr (Schedule::kStages == 1) {
-                stage_codes(0, group_k0 + kGroupK);
-                stage_x(0, group_k0 + kGroupK);
+                stage_codes(0, group_k(group_index + 1));
+                stage_x(0, group_k(group_index + 1));
                 common::cp_commit();
             }
             common::cp_wait<0>();

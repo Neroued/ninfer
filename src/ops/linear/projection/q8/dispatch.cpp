@@ -22,9 +22,9 @@ constexpr ShapeEntry shape(ShapeSelector select) {
 
 constexpr std::array kShapes{
 #if NINFER_TARGET_SPARK
-    shape<Q8N4096K1024>(select_q8_n4096_k1024),   shape<Q8N4096K4096>(select_q8_n4096_k4096),
-    shape<Q8N12288K4096>(select_q8_n12288_k4096), shape<Q8N2560K3072>(select_q8_n2560_k3072),
-    shape<Q8N8192K2560>(select_q8_n8192_k2560),
+    shape<Q8N4096K16384>(select_q8_n4096_k16384), shape<Q8N4096K1024>(select_q8_n4096_k1024),
+    shape<Q8N4096K4096>(select_q8_n4096_k4096),   shape<Q8N12288K4096>(select_q8_n12288_k4096),
+    shape<Q8N2560K3072>(select_q8_n2560_k3072),   shape<Q8N8192K2560>(select_q8_n8192_k2560),
 #endif
     shape<Q8N1024K2048>(select_q8_n1024_k2048),   shape<Q8N1024K5120>(select_q8_n1024_k5120),
     shape<Q8N2048K4096>(select_q8_n2048_k4096),   shape<Q8N2048K4608>(select_q8_n2048_k4608),

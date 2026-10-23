@@ -25,8 +25,7 @@ void validate(const SigmoidMoeProfile& p, ExpertSubsetKind subset, int first, in
     detail::validate_subset_kind(subset);
     if (p.routing.route.hidden != 4096 || p.routed.ffn.hidden != 4096 || p.shared.hidden != 4096 ||
         p.routed.experts != p.routing.route.experts || p.routed.top_k != p.routing.route.top_k ||
-        p.shared.intermediate != 1024 || p.shared.gate_up_type != QType::BF16 ||
-        p.shared.down_type != QType::BF16 ||
+        p.shared.intermediate != 1024 ||
         (p.routed.ffn.gate_up_type != QType::NVFP4 &&
          p.routed.ffn.gate_up_type != QType::FP8_E4M3FN_BLOCK128X128_BF16))
         throw std::invalid_argument("topk_sigmoid_swiglu_moe: unsupported geometry or formats");
@@ -82,9 +81,9 @@ void topk_sigmoid_swiglu_moe(const Tensor& x, const SigmoidMoeProfile& p,
     topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, ws, execution);
     routed_swiglu(x, p.routed, w.routed, storage.routes, subset, MoeEpilogue::Write, storage.routed,
                   ws, execution);
-    detail::swiglu_ffn::launch_bf16_ffn_join(x, w.shared, out,
-                                             static_cast<const float*>(storage.routed.data),
-                                             *p.shared.clamp_limit, ws, execution.stream());
+    detail::swiglu_ffn::launch_a16_ffn_join(x, w.shared, out,
+                                            static_cast<const float*>(storage.routed.data),
+                                            *p.shared.clamp_limit, ws, execution.stream());
 #endif
 }
 } // namespace ninfer::ops

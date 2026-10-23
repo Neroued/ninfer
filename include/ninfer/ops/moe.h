@@ -177,7 +177,7 @@ struct SigmoidMoeWeights {
 
 // Complete local contribution: routed_swiglu(topk_sigmoid_route(x),subset,x)+shared(x).
 // Shared is unscaled, exactly once, including zero routed hits. Only final output is BF16.
-// Supports registered block-scaled routed and native BF16 shared profiles,
+// Supports registered block-scaled routed and native BF16 or Q8-G32/FP16 shared profiles,
 // both with explicit finite positive clamp limits.
 // Destination is contiguous BF16[H,T], Write; no residual, rank, communication or shared gate.
 // Router, native bank/subset and shared semantics follow the profiles above; all matrices and

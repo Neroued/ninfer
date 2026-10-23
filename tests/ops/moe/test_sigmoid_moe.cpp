@@ -8,6 +8,7 @@
 #include "ops/linear_common.h"
 #include <array>
 #include <map>
+#include "ops/float_codec.h"
 
 namespace ninfer::test::sigmoid_moe {
 namespace {
@@ -21,8 +22,19 @@ struct Case {
 };
 
 void put(quantized_weight::PackedWeight& w, int row, int col, float value) {
-    const auto b = f32_to_bf16(value);
-    std::memcpy(w.payload.data() + (std::size_t(row) * w.weight.k + col) * 2, &b, 2);
+    if (w.weight.qtype == QType::BF16) {
+        const auto b = f32_to_bf16(value);
+        std::memcpy(w.payload.data() + (std::size_t(row) * w.weight.k + col) * 2, &b, 2);
+    } else {
+        const float scale                              = value == 0 ? 1.f : std::abs(value) / 64;
+        w.payload[std::size_t(row) * w.weight.k + col] = static_cast<std::uint8_t>(value < 0   ? -64
+                                                                                   : value > 0 ? 64
+                                                                                               : 0);
+        const auto b                                   = float_codec::f32_to_f16_bits(scale);
+        std::memcpy(w.payload.data() + w.scale_plane_offset +
+                        (std::size_t(row) * (w.weight.k / 32) + col / 32) * 2,
+                    &b, 2);
+    }
 }
 
 quantized_weight::PackedWeight control(int recipe) {
@@ -33,20 +45,26 @@ quantized_weight::PackedWeight control(int recipe) {
     return w;
 }
 
-quantized_weight::PackedWeight shared(bool down, int recipe) {
-    auto w = linear_weights::make_bf16_weight(down ? H : 2 * I, down ? I : H, down ? 2813 : 2815);
+quantized_weight::PackedWeight shared(bool down, int recipe, bool q8 = false) {
+    auto w =
+        q8 ? linear_weights::make_q8_g32_fp16_weight(down ? H : 2 * I, down ? I : H,
+                                                     down ? 2813 : 2815)
+           : linear_weights::make_bf16_weight(down ? H : 2 * I, down ? I : H, down ? 2813 : 2815);
     if (recipe < 0) return w;
     std::fill(w.payload.begin(), w.payload.end(), 0);
     if (recipe == 4) {
+        const int tail = q8 ? 32 : 1;
         if (!down) {
             put(w, 0, H - 1, 1);
-            put(w, 1, H - 1, 1);
+            put(w, tail, H - 1, 1);
             put(w, I, H - 1, 1);
-            put(w, I + 1, H - 1, 1.f / 32);
+            put(w, I + tail, H - 1, 1.f / 32);
         } else
             for (int r = 0; r < H; ++r) {
-                put(w, r, 0, r % 13 ? (r % 2 ? 2.5f : -2.5f) : 0);
-                put(w, r, 1, 1.f / 256);
+                // Keep noncancelling norm anchors when the routed contraction may quantize
+                // its private activation. The T=1 subset below still checks the join seam.
+                put(w, r, 0, r % 13 ? (r % 2 ? 2.5f : -2.5f) : (q8 ? 2.5f : 0));
+                put(w, r, tail, 1.f / 256);
             }
     } else if (recipe == 5) {
         if (!down) {
@@ -68,11 +86,13 @@ struct Fixture {
     std::map<std::pair<int, int>, std::vector<double>> shared_cache;
     bool fp8;
     int recipe;
+    bool q8_shared;
 
-    Fixture(ep::Placement placement, int side, bool eight, int rec = -1)
+    Fixture(ep::Placement placement, int side, bool eight, int rec = -1, bool q8 = false)
         : bank(cuda_environment().context.device(), placement, side, eight), router(control(rec)),
-          gu(shared(false, rec)), dn(shared(true, rec)), bits(3 * H),
-          shared_ref(gu.host, dn.host, bits, rec == 5 ? 3 : 10), fp8(eight), recipe(rec) {
+          gu(shared(false, rec, q8)), dn(shared(true, rec, q8)), bits(3 * H),
+          shared_ref(gu.host, dn.host, bits, rec == 5 ? 3 : 10), fp8(eight), recipe(rec),
+          q8_shared(q8) {
         if (rec >= 0 && rec <= 4) bank.clamp_probe(rec);
         for (int p = 0; p < 3; ++p) {
             auto& v = patterns[p];
@@ -200,9 +220,41 @@ int run(Fixture& f, const Case& c) {
         const auto label = "whole/" + std::string(f.fp8 ? "fp8" : "nvfp4") + "/M" +
                            std::to_string(c.m) + "/hits" + std::to_string(c.hits) + "/recipe" +
                            std::to_string(f.recipe) + "/phase" + std::to_string(phase);
+        if (f.q8_shared) {
+            constexpr ReductionCriterion a16{1.0 / 256, 1.0 / 256, 2.0 / 256};
+            GuardedDeviceBuffer shared_storage(std::size_t(H) * c.m * 2);
+            shared_storage.fill(0x7f);
+            Tensor shared_output(shared_storage.span(), DType::BF16, {H, c.m});
+            ops::swiglu(x, p.shared, w.shared, shared_output, ws, execution);
+            cuda_synchronize(execution.stream());
+            const auto shared_actual =
+                from_device_bf16(shared_storage.data(), std::size_t(H) * c.m);
+            std::vector<double> shared_reference(shared_actual.size());
+            for (int t = 0; t < c.m; ++t) {
+                const auto& values = f.reference_shared(t % 3, sign);
+                std::copy(values.begin(), values.end(),
+                          shared_reference.begin() + std::size_t(t) * H);
+            }
+            failures +=
+                verify_reduction(label + "/shared-a16", shared_actual, shared_reference, a16) +
+                shared_storage.verify_guards(label + "/shared-a16");
+            if (c.none || (c.hits == 0 && !c.all))
+                failures +=
+                    verify_reduction(label + "/shared-only-a16", actual, shared_reference, a16);
+        }
         failures += verify_reduction(label, actual, reference, f.fp8 ? ep::kA8 : ep::kA4) +
                     input.verify_guards(label) + output.verify_guards(label) +
                     scratch.verify_guards(label) + f.bank.verify_controls();
+        if (f.q8_shared && f.recipe == 4 && c.m == 1) {
+            std::vector<double> cancelling_actual, cancelling_reference;
+            for (int h = 0; h < H; ++h)
+                if (h % 13) {
+                    cancelling_actual.push_back(actual[h]);
+                    cancelling_reference.push_back(reference[h]);
+                }
+            failures += verify_reduction(label + "/join-cancellation", cancelling_actual,
+                                         cancelling_reference, f.fp8 ? ep::kA8 : ep::kA4);
+        }
         if (ws.used() != 256 || ws.peak_used() > cap + 256) {
             std::cerr << label << " workspace mismatch\n";
             ++failures;
@@ -219,8 +271,8 @@ int run(Fixture& f, const Case& c) {
     return failures;
 }
 
-int metadata(bool fp8) {
-    Fixture f(ep::Placement::Permuted, 0, fp8);
+int metadata(bool fp8, bool q8 = false) {
+    Fixture f(ep::Placement::Permuted, 0, fp8, -1, q8);
     auto p            = f.profile();
     int failures      = 0;
     const auto reject = [&](auto&& fn) {
@@ -281,7 +333,8 @@ int metadata(bool fp8) {
         auto bad = w;
         if (field == 0) bad.shared.gate_up.policy = ops::LinearPolicy::AllowA8;
         if (field == 1) bad.shared.down.weight.payload_bytes -= 16;
-        if (field == 2) bad.shared.gate_up.weight.scales = bad.shared.gate_up.weight.qdata;
+        if (field == 2)
+            bad.shared.gate_up.weight.scales = q8 ? nullptr : bad.shared.gate_up.weight.qdata;
         if (field == 3) bad.shared.down.weight.qhigh = bad.shared.down.weight.qdata;
         if (field == 4) bad.shared.gate_up.weight.group = 16;
         if (field == 5) bad.shared.gate_up.weight.group_size = 16;
@@ -395,6 +448,58 @@ int main(int argc, char** argv) {
                       },
                       {{"format", format}, {"execution", "graph"}});
     }
+    for (bool fp8 : {false, true}) {
+        const std::string format = fp8 ? "fp8" : "nvfp4";
+        const std::string prefix = "whole/q8-shared/" + format;
+        suite.add(prefix + "/metadata", [fp8] { return metadata(fp8, true); },
+                  {{"suite", "q8-shared"}, {"format", format}});
+        for (int side : {0, 1}) {
+            std::vector<Case> cases;
+            if (side == 0) {
+                for (int m : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096})
+                    cases.push_back({m});
+                for (int m : {1, 8, 128, 512, 4096}) cases.push_back({m, 4, true});
+                for (int hits : {0, 1, 8})
+                    for (int m : {1, 128, 4096}) cases.push_back({m, hits});
+                for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
+                for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});
+            } else {
+                for (int m : {1, 8, 128, 512, 4097}) {
+                    cases.push_back({m, 8});
+                    cases.push_back({m, 4, true});
+                }
+            }
+            std::vector<OpCase> catalogue;
+            for (const auto& c : cases)
+                catalogue.push_back({prefix + "/side" + std::to_string(side) + "/T" +
+                                         std::to_string(c.m) + "/h" + std::to_string(c.hits) +
+                                         (c.none  ? "/none/"
+                                          : c.all ? "/all/"
+                                                  : "/mask/") +
+                                         (c.graph ? "graph" : "eager"),
+                                     {{"suite", "q8-shared"},
+                                      {"format", format},
+                                      {"execution", c.graph ? "graph" : "eager"}}});
+            suite.add(std::move(catalogue), [=](auto selected) {
+                Fixture f(side ? ep::Placement::Interleaved : ep::Placement::Permuted, side, fp8,
+                          -1, true);
+                int failed = 0;
+                for (auto i : selected) failed += run(f, cases[i]);
+                return failed + f.verify();
+            });
+        }
+        for (int recipe : {4, 5})
+            suite.add(prefix + "/probe" + std::to_string(recipe),
+                      [=] {
+                          Fixture f(ep::Placement::Permuted, 0, fp8, recipe, true);
+                          int failed = 0;
+                          for (int m : {1, 128, 4097})
+                              failed += run(f, {m, recipe == 5 ? 0 : 8, m != 4097});
+                          return failed + f.verify();
+                      },
+                      {{"suite", "q8-shared"}, {"format", format}, {"execution", "graph"}});
+    }
+
 #endif
     return suite.main(argc, argv);
 }

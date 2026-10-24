@@ -23,15 +23,17 @@ constexpr Invocation graph(std::int32_t t) {
 void q4_a16_conformance(Suite& suite) {
 #if NINFER_TARGET_SPARK
     const std::array head_calls{
-        convenience(1), graph(2),   a16(3),     graph(4),    graph(5),    a16(8),    a16(9),
-        a16(15),        graph(16),  graph(17),  a16(31),     graph(32),   graph(33), a16(63),
-        graph(64),      graph(65),  a16(95),    graph(96),   graph(97),   a16(127),  graph(128),
-        graph(129),     a16(191),   graph(192), graph(193),  a16(255),    a16(256),  a16(257),
-        a16(511),       graph(512), a16(513),   a16(1023),   graph(1024), a16(1025), a16(2047),
-        graph(2048),    a16(2049),  a16(4095),  graph(4096), a16(4097)};
+        convenience(1), graph(2),    a16(3),     graph(4),    graph(5),    a16(8),      a16(9),
+        a16(15),        graph(16),   graph(17),  a16(31),     graph(32),   graph(33),   a16(47),
+        graph(48),      graph(49),   a16(63),    graph(64),   graph(65),   a16(95),     graph(96),
+        graph(97),      a16(127),    graph(128), graph(129),  a16(191),    graph(192),  graph(193),
+        a16(255),       a16(256),    a16(257),   a16(511),    graph(512),  a16(513),    a16(640),
+        graph(641),     graph(769),  a16(1023),  graph(1024), a16(1025),   graph(1089), graph(1152),
+        a16(2047),      graph(2048), a16(2049),  a16(3071),   graph(3072), graph(3073), a16(4095),
+        graph(4096),    a16(4097)};
     add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, make_q4_g64_fp16_weight,
               {77440, 4096, 1031U, Comparison::Sampled, true, head_calls});
-    const std::array head_full{a16(1), a16(4), a16(8)};
+    const std::array head_full{a16(1), a16(4), a16(8), graph(769)};
     add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::TokenBlocks, make_q4_g64_fp16_weight,
               {77440, 4096, 1033U, Comparison::Full, true, head_full});
     const std::array head_stress{a16(1),    a16(2),    a16(3),    a16(4),     a16(8),

@@ -478,6 +478,8 @@ int main(int argc, char** argv) {
                 } else {
                     for (int m : {65, 127})
                         for (int hits : {0, 1, 8}) cases.push_back({m, hits, true});
+                    for (int hits : {0, 1, 8}) cases.push_back({9, hits, true});
+                    cases.push_back({16, 8, true});
                 }
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
                 for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});
@@ -488,6 +490,7 @@ int main(int argc, char** argv) {
                     cases.push_back({m, 8});
                     cases.push_back({m, 4, true});
                 }
+                if (!fp8) cases.push_back({16, 8, true});
             }
             std::vector<OpCase> catalogue;
             for (const auto& c : cases)

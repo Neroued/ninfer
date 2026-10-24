@@ -22,6 +22,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     using kernel::block_scaled::Nvfp4Pipeline;
     p.nvfp4.pipeline = Nvfp4Pipeline::K256Deep;
     p.nvfp4.cache    = Nvfp4CachePolicy::BypassWeightL1;
+    if (t > 8 && t <= 16) p.gate_columns = p.down_columns = 16;
     if (t > 16 && t <= 64) {
         p.gate_columns = p.down_columns = 16;
         p.nvfp4.cache                   = Nvfp4CachePolicy::BypassL1;
@@ -115,7 +116,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
 } // namespace
 
 const ShapePolicy& nvfp4_h4096_i2048_e288_k8() {
-    static constexpr int boundaries[]{2,   17,   33,   65,   129,  257,  512,
+    static constexpr int boundaries[]{2,   9,    17,   33,   65,   129,  257, 512,
                                       769, 1024, 1025, 1537, 2049, 3073, 4097};
     static const ShapePolicy policy{.select                = select_plan,
                                     .allocation_boundaries = boundaries,

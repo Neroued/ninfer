@@ -45,6 +45,7 @@ struct Case {
     bool weak_decay       = false;
     bool small_beta       = false;
     bool collinear_cancel = false;
+    int capacity_tokens   = 0;
 
     int qheads() const { return qk_heads == 0 ? heads : qk_heads; }
 };
@@ -187,7 +188,9 @@ struct Views {
           out(out_data, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
           scratch(std::max<std::size_t>(
               256, ops::kimi_delta_attention_workspace_capacity_bytes(
-                       test_case.qheads(), test_case.heads, test_case.tokens, test_case.tokens))),
+                       test_case.qheads(), test_case.heads,
+                       test_case.capacity_tokens ? 1 : test_case.tokens,
+                       test_case.capacity_tokens ? test_case.capacity_tokens : test_case.tokens))),
           workspace(scratch.span()) {
         scratch.fill(0xff);
     }
@@ -738,6 +741,12 @@ int main(int argc, char** argv) {
         c.qk_heads = 1;
         distinct(c, 90000U + t);
     }
+    for (int t : {255, 256, 257}) {
+        Case c{"workspace interval", 32, t};
+        c.capacity_tokens = 4096;
+        distinct(c, 45200U + t);
+    }
+    inplace({"windowed state alias", 32, 513}, 44513U);
     Case weak{"weak decay long", 3, 16385};
     weak.qk_heads   = 1;
     weak.weak_decay = true;

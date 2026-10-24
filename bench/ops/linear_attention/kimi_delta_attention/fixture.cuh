@@ -40,7 +40,10 @@ struct Fixture {
         if (o.op == "update" && t != 1) throw std::invalid_argument("update requires T=1");
         if (o.op == "core" && o.valid != "dense")
             throw std::invalid_argument("core consumes every physical token");
-        if (o.commits == "dense") commit_counts = valid_counts;
+        if (o.commits == "dense") {
+            commit_counts = valid_counts;
+            commits.copy_from_host(commit_counts.data(), commit_counts.size() * sizeof(int));
+        }
         for (int i = 0; i < b; ++i)
             if (commit_counts[i] > valid_counts[i])
                 throw std::invalid_argument("commit exceeds valid input");
@@ -77,10 +80,12 @@ struct Fixture {
             weight      = make_row_split_weight(QType::Q8_G32_FP16, 12288, 4096, 4096, 101);
             input       = make_bf16(std::size_t(4096) * t * b, 103, -0.01F, 0.01F);
             conv_weight = make_f32(12288 * 4, 105, -0.1F, 0.1F);
-            capacity    = ops::kda_input_proj_conv_update_workspace_capacity_bytes(
-                {QType::Q8_G32_FP16, 12288, 4096, ops::LinearPolicy::A16Only,
-                    QuantLayout::RowSplit},
-                b, t, t);
+            const ops::LinearProfile profile{QType::Q8_G32_FP16, 12288, 4096,
+                                             ops::LinearPolicy::A16Only, QuantLayout::RowSplit};
+            capacity =
+                o.op == "input-update"
+                    ? ops::kda_input_proj_conv_update_workspace_capacity_bytes(profile, b, t, t)
+                    : ops::kda_input_proj_conv_record_workspace_capacity_bytes(profile, b, t, t);
         }
         scratch   = make_buffer(std::max<std::size_t>(256, capacity));
         workspace = std::make_unique<MemoryArena>(scratch.span());
@@ -164,44 +169,6 @@ struct Fixture {
                                       al, db, -5, 0.08838834764831845F, *workspace, si, sd, y,
                                       cuda);
         }
-    }
-
-    // The chunk consumer's captured grid gives the actual value-stripe replication count.
-    // This accounting inspects launches, without invoking a private entry or duplicating dispatch.
-    std::uint64_t workspace_reads() {
-        if (!capacity) return 0;
-        if (o.op != "core") {
-            std::uint64_t columns = 0;
-            for (int n : valid_counts)
-                columns +=
-                    n + 3 * ((n + 3) / 4 - 1) + (o.op == "input-update" ? std::min(n, 3) : 0);
-            return 4ULL * channels * columns;
-        }
-        auto cuda = device_context().execution_view();
-        launch(cuda);
-        device_context().synchronize();
-        cudaGraph_t gr;
-        CUDA_CHECK(cudaStreamBeginCapture(cuda.stream(), cudaStreamCaptureModeThreadLocal));
-        launch(cuda);
-        CUDA_CHECK(cudaStreamEndCapture(cuda.stream(), &gr));
-        std::size_t n = 0;
-        CUDA_CHECK(cudaGraphGetNodes(gr, nullptr, &n));
-        std::vector<cudaGraphNode_t> nodes(n);
-        CUDA_CHECK(cudaGraphGetNodes(gr, nodes.data(), &n));
-        std::uint64_t reads = 0;
-        for (auto node : nodes) {
-            cudaGraphNodeType type;
-            CUDA_CHECK(cudaGraphNodeGetType(node, &type));
-            std::size_t dependents = 0;
-            CUDA_CHECK(cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &dependents));
-            if (type == cudaGraphNodeTypeKernel && !dependents) {
-                cudaKernelNodeParams params;
-                CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
-                reads = std::uint64_t(capacity) * (params.gridDim.x / h);
-            }
-        }
-        CUDA_CHECK(cudaGraphDestroy(gr));
-        return reads;
     }
 };
 } // namespace ninfer::bench::kda

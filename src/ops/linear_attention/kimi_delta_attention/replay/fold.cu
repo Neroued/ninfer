@@ -1,4 +1,6 @@
 #include "ops/linear_attention/kimi_delta_attention/replay/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/plan.h"
+#include "core/platform.h"
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
 #include "ops/common/host/operands.h"
 
@@ -23,20 +25,20 @@ struct FoldArguments {
     int qk_heads, value_heads, conv_channels, width, capacity;
 };
 
-template <class Rows, int Warps>
+template <class Rows, int Warps, int Values>
 __global__ __launch_bounds__(32 * Warps, 1) void fold_kernel(FoldArguments a, Rows rows) {
-    constexpr int kBlockDv = Warps * kDvPerWarp;
+    constexpr int kBlockDv = Warps * Values;
     const auto row         = select_row(rows, blockIdx.y);
     if (!row.commit_columns) return;
     const int head = blockIdx.x / (kStateDim / kBlockDv);
     const int tile = blockIdx.x % (kStateDim / kBlockDv), layer = blockIdx.z;
     const int lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
-    const int dv = tile * kBlockDv + warp * kDvPerWarp, dk = lane * kQkPerLane;
+    const int dv = tile * kBlockDv + warp * Values, dk = lane * kQkPerLane;
     const auto base = static_cast<std::int64_t>(layer) * a.recurrent_stride +
                       static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto record_begin =
         (static_cast<std::int64_t>(layer) * a.capacity + blockIdx.y) * a.width;
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    __align__(16) float state[Values][kQkPerLane];
     load_state(state, a.recurrent + base + row.source_offset / sizeof(float), dv, dk);
     for (int t = 0; t < row.commit_columns; ++t) {
         const auto column = record_begin + t;
@@ -48,7 +50,7 @@ __global__ __launch_bounds__(32 * Warps, 1) void fold_kernel(FoldArguments a, Ro
         common::store_vec(decay, common::load_vec<float4>(a.log_decay + vo + dk));
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) alpha[c] = common::exp_approx_ftz(decay[c]);
-        const float value = lane < kDvPerWarp ? __bfloat162float(a.value[vo + dv + lane]) : 0.0F;
+        const float value = lane < Values ? __bfloat162float(a.value[vo + dv + lane]) : 0.0F;
         apply_transition(state, key, alpha, value, a.beta[column * a.value_heads + head]);
     }
     store_state(state, a.recurrent + base + row.destination_offset / sizeof(float), dv, dk);
@@ -89,18 +91,28 @@ void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, cons
                           r.spec.conv_channels,
                           r.spec.width,
                           r.spec.record_capacity};
-    const auto submit = [&]<int Warps>() {
-        fold_kernel<Rows, Warps>
-            <<<dim3(r.spec.value_heads * (kStateDim / (Warps * kDvPerWarp)), batch, r.spec.layers),
+    const auto submit = [&]<int Warps, int Values>() {
+        fold_kernel<Rows, Warps, Values>
+            <<<dim3(r.spec.value_heads * (kStateDim / (Warps * Values)), batch, r.spec.layers),
                dim3(32, Warps), 0, stream>>>(a, rows);
     };
-    const auto head_rows = static_cast<std::int64_t>(r.spec.layers) * r.spec.value_heads * batch;
-    if (head_rows < 2LL * multiprocessors)
-        submit.template operator()<4>();
-    else if (r.spec.width <= 8)
-        submit.template operator()<16>();
+    const auto schedule = select_fold_schedule(r.spec.layers, r.spec.value_heads, r.spec.width,
+                                               batch, multiprocessors);
+#if NINFER_TARGET_SPARK
+    if (schedule.values == 8)
+        submit.template operator()<4, 8>();
+    else if (schedule.values == 2)
+        submit.template operator()<16, 2>();
     else
-        submit.template operator()<8>();
+        submit.template operator()<4, 4>();
+#else
+    if (schedule.warps == 16)
+        submit.template operator()<16, 4>();
+    else if (schedule.warps == 8)
+        submit.template operator()<8, 4>();
+    else
+        submit.template operator()<4, 4>();
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace

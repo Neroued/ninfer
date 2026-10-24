@@ -1,4 +1,6 @@
 #include "ops/linear_attention/kimi_delta_attention/recurrent.cuh"
+#include "ops/linear_attention/kimi_delta_attention/plan.h"
+#include "core/platform.h"
 #include "ops/linear_attention/kimi_delta_attention/kernels/record.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
@@ -25,9 +27,17 @@ void launch_record(const Arguments& args, const std::int64_t* sources, const std
                                        dim3(common::kWarpSize, kNumWarps), 0, stream>>>(
             args, sources, nullptr, valid, records);
     } else {
-        staged_record_kernel<4, kDvPerWarp>
-            <<<dim3(args.value_heads, batch, kStateDim / kBlockDv),
-               dim3(common::kWarpSize, kNumWarps), 0, stream>>>(args, sources, valid, records);
+        const auto submit = [&]<int Rows>() {
+            staged_record_kernel<4, Rows>
+                <<<dim3(args.value_heads, batch, kStateDim / (kNumWarps * Rows)),
+                   dim3(common::kWarpSize, kNumWarps), 0, stream>>>(args, sources, valid, records);
+        };
+#if NINFER_TARGET_SPARK
+        if (select_record_rows(args.value_heads, args.tokens, batch) == 8)
+            submit.template operator()<8>();
+        else
+#endif
+            submit.template operator()<4>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

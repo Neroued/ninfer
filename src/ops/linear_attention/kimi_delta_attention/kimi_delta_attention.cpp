@@ -33,7 +33,7 @@ kda::Arguments arguments(const Tensor& q, const Tensor& k, const Tensor& v, cons
 std::size_t kimi_delta_attention_workspace_capacity_bytes(int qk, int value, int first, int last) {
     if (!kda::valid_heads(qk, value) || first < 1 || last < first)
         throw std::invalid_argument("kimi_delta_attention workspace: invalid heads or interval");
-    return kda::recurrence_workspace_bytes(value, last);
+    return kda::recurrence_workspace_capacity(value, first, last);
 }
 
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -80,8 +80,19 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
           static_cast<const Tensor*>(&state_out), static_cast<const Tensor*>(&out)})
         common::operand::disjoint(common::operand::range(packets, plan.workspace_bytes, op),
                                   common::operand::range(*tensor, op), op);
-    kda::launch_prepare(args, packets, execution.stream());
-    kda::launch_chunk_recurrence(args, packets, plan.value_tile, execution.stream());
+    for (std::int64_t begin = 0; begin < p.tokens; begin += plan.window_tokens) {
+        auto window   = args;
+        window.tokens = std::min<std::int64_t>(plan.window_tokens, p.tokens - begin);
+        window.q += begin * p.qk_heads * kda::kStateDim;
+        window.k += begin * p.qk_heads * kda::kStateDim;
+        window.v += begin * p.value_heads * kda::kStateDim;
+        window.g += begin * p.value_heads * kda::kStateDim;
+        window.beta += begin * p.value_heads;
+        window.out += begin * p.value_heads * kda::kStateDim;
+        if (begin) window.state_in = args.state_out;
+        kda::launch_prepare(window, packets, execution.stream());
+        kda::launch_chunk_recurrence(window, packets, plan.value_tile, execution.stream());
+    }
 }
 
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,

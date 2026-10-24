@@ -13,7 +13,7 @@ constexpr int C = 12288, H = 4096;
 // Q8 A16 reconstruction and the BF16 public result: two unit roundoffs, with a gross cap.
 constexpr ReductionCriterion criterion{2.0 / 256, 1.0 / 256, 2.0 / 256};
 
-int run_case(int width, int batch, bool in_place, bool graph) {
+int run_case(int width, int batch, bool in_place, bool graph, int capacity_last = 0) {
     input_projection::DevicePackedWeight weight(
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, C, H, 1201));
     const ops::SingleProjectionWeight projection{weight.view(), ops::LinearPolicy::A16Only};
@@ -39,8 +39,11 @@ int run_case(int width, int batch, bool in_place, bool graph) {
     auto sob = to_device(so), dsb = to_device(ds), vb = to_device(valid);
     Tensor st(sob.span(), DType::I64, {batch}), dt(dsb.span(), DType::I64, {batch}),
         vt(vb.span(), DType::I32, {batch});
-    const auto bytes = ops::kda_input_proj_conv_record_workspace_capacity_bytes(
-        linear_profile(projection), batch, width, width);
+    const int first = capacity_last ? 1 : width, last = capacity_last ? capacity_last : width;
+    const auto bytes = std::max(ops::kda_input_proj_conv_record_workspace_capacity_bytes(
+                                    linear_profile(projection), batch, first, last),
+                                ops::kda_input_proj_conv_update_workspace_capacity_bytes(
+                                    linear_profile(projection), batch, first, last));
     GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
     MemoryArena workspace(scratch.span());
     std::array<GuardedDeviceBuffer, 3> record_outputs{
@@ -173,7 +176,9 @@ int main(int argc, char** argv) {
     suite.add("kda/input/batched_materialized", [] { return run_case(8, 8, false, true); });
     suite.add("kda/input/materialized", [] { return run_case(9, 2, true, false); });
     suite.add("kda/input/prefill", [] { return run_case(129, 1, false, true); });
-    for (int width : {63, 64, 65, 255, 256, 257})
+    suite.add("kda/input/workspace_interval", [] { return run_case(32, 1, false, false, 4096); });
+    for (int width :
+         {31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 257, 511, 512, 513, 2047, 2048, 2049})
         suite.add("kda/input/prefill_t" + std::to_string(width),
                   [width] { return run_case(width, 1, false, false); });
     return suite.main(argc, argv);

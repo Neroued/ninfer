@@ -1,4 +1,5 @@
 #include "traffic.h"
+#include "common/gpu_activity.cuh"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -36,7 +37,8 @@ int main(int argc, char** argv) {
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
                     const auto r =
-                        measurement::measure([&](auto cuda) { f.launch(cuda); }, [](auto) {}, flush,
+                        measurement::measure([&](auto cuda) { f.launch(cuda); },
+                                             [](auto cuda) { condition_gpu(cuda, 200); }, flush,
                                              device.execution_view(), o.timing, execution, cache);
                     row.workspace_peak = f.workspace->peak_used();
                     csv.write(row, r, execution, cache, bytes.csv(r.gpu.median_us));

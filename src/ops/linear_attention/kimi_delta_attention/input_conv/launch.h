@@ -16,5 +16,23 @@ struct Arguments {
     int width, batch;
 };
 
-void launch(const Tensor&, const Weight&, const Arguments&, float* projected, cudaStream_t);
+inline constexpr int kTiledTokens = 128;
+
+struct TiledWorkspace {
+    std::size_t edge_words;
+    std::size_t bytes;
+};
+
+inline TiledWorkspace tiled_workspace(int width, int batch, bool update) {
+    const auto columns = std::int64_t(width) * batch;
+    const auto edges =
+        std::size_t((columns + kTiledTokens - 1) / kTiledTokens) * 6 * kProjectionFeatures;
+    return {edges, edges * sizeof(float) + (update ? std::size_t(batch) * 3 * kProjectionFeatures *
+                                                         sizeof(__nv_bfloat16)
+                                                   : 0)};
+}
+
+std::size_t workspace_capacity(int batch, int first, int last, bool update);
+
+void launch(const Tensor&, const Weight&, const Arguments&, float* scratch, cudaStream_t);
 } // namespace ninfer::ops::detail::kda_input

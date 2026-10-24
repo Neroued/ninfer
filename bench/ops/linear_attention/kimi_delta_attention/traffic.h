@@ -7,24 +7,23 @@
 namespace ninfer::bench::kda {
 struct Traffic {
     std::uint64_t read = 0, write = 0, state_read = 0, state_write = 0, record_read = 0,
-                  record_write   = 0;
-    std::uint64_t workspace_read = 0, workspace_write = 0;
-    double projection_flops = 0;
+                  record_write = 0;
+    double projection_flops    = 0;
 
     std::string csv(double us) const {
         const auto bytes = read + write;
         std::ostringstream s;
         s << read << ',' << write << ',' << state_read << ',' << state_write << ',' << record_read
-          << ',' << record_write << ',' << workspace_read << ',' << workspace_write << ','
-          << bytes / (us * 1000) << ',' << kRoofline.memory_gbs << ','
-          << bytes / (kRoofline.memory_gbs * 1000) << ',' << projection_flops << ',';
+          << ',' << record_write << ',' << bytes / (us * 1000) << ','
+          << kRoofline.sustained_read_gbs << ',' << bytes / (kRoofline.sustained_read_gbs * 1000)
+          << ',' << projection_flops << ',';
         if (projection_flops) s << projection_flops / (kRoofline.bf16_f32_tflops * 1e6);
         return s.str();
     }
 
     static constexpr const char* columns =
         "logical_read_bytes,logical_write_bytes,state_read_bytes,state_write_bytes,record_read_"
-        "bytes,record_write_bytes,workspace_read_requests,workspace_write_requests,logical_GBps,"
+        "bytes,record_write_bytes,logical_GBps,"
         "memory_roofline_GBps,streaming_memory_reference_us,projection_flops,bf16_projection_"
         "reference_us";
 };
@@ -77,8 +76,6 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
                    out.state_read;
         out.write = 2ULL * 128 * f.h * f.t * f.b + out.state_write + out.record_write;
     }
-    out.workspace_write = f.capacity;
-    out.workspace_read  = f.workspace_reads();
     return out;
 }
 } // namespace ninfer::bench::kda

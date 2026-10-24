@@ -17,22 +17,20 @@ void validate_profile(const LinearProfile& p) {
         throw std::invalid_argument("KDA input: unsupported projection profile");
 }
 
-std::size_t capacity(const LinearProfile& p, int batch, int first, int last) {
+std::size_t capacity(const LinearProfile& p, int batch, int first, int last, bool update) {
     validate_profile(p);
     if (batch < 1 || batch > 8 || first < 1 || last < first)
         throw std::invalid_argument("KDA input: invalid batch or token interval");
     if (last > std::numeric_limits<int>::max() / batch)
         throw std::overflow_error("KDA input: flattened token extent exceeds int32");
-    return last <= 8 && last * batch <= 32
-               ? 0
-               : Tensor::metadata(DType::FP32, {channels, last, batch}).bytes();
+    return detail::kda_input::workspace_capacity(batch, first, last, update);
 }
 
 void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& weights,
              ConstStateFieldView source, StateFieldView destination, const Tensor& valid,
              KdaConvOutputs out, Tensor records, MemoryArena& workspace, CudaExecutionView cuda) {
     const int width = x.ne[1], batch = x.ne[2];
-    const auto bytes = capacity(linear_profile(qkv), batch, width, width);
+    const auto bytes = capacity(linear_profile(qkv), batch, width, width, !records.data);
     const auto& w    = qkv.weight;
     common::operand::device(w.device, cuda.device(), op, "weight");
     common::operand::device(workspace.device(), cuda.device(), op, "workspace");
@@ -82,10 +80,10 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         common::operand::disjoint(
             range, common::operand::range(w.scales, std::size_t(channels) * hidden / 16, op), op);
     }
-    auto scope       = workspace.scope();
-    float* projected = bytes ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
-    if (projected) {
-        const auto scratch = common::operand::range(projected, bytes, op);
+    auto scope          = workspace.scope();
+    float* scratch_data = bytes ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
+    if (scratch_data) {
+        const auto scratch = common::operand::range(scratch_data, bytes, op);
         for (const auto* tensor : inputs)
             if (tensor->data)
                 common::operand::disjoint(scratch, common::operand::range(*tensor, op), op);
@@ -110,18 +108,18 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         static_cast<__nv_bfloat16*>(records.data),
         width,
         batch};
-    detail::kda_input::launch(x, w, a, projected, cuda.stream());
+    detail::kda_input::launch(x, w, a, scratch_data, cuda.stream());
 }
 } // namespace
 
 std::size_t kda_input_proj_conv_update_workspace_capacity_bytes(const LinearProfile& p, int b,
                                                                 int first, int last) {
-    return capacity(p, b, first, last);
+    return capacity(p, b, first, last, true);
 }
 
 std::size_t kda_input_proj_conv_record_workspace_capacity_bytes(const LinearProfile& p, int b,
                                                                 int first, int last) {
-    return capacity(p, b, first, last);
+    return capacity(p, b, first, last, false);
 }
 
 void kda_input_proj_conv_update(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w,

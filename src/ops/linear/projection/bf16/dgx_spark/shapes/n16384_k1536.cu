@@ -1,6 +1,7 @@
 #include "ops/linear/projection/bf16/bf16_shapes.h"
 #include "ops/linear/projection/bf16/bf16_launch.cuh"
 #include "ops/linear/kernels/bf16/bf16_mma_epilogue.cuh"
+#include "ops/linear/kernels/bf16/bf16_a16_tma_register_b.cuh"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -17,10 +18,18 @@ using M32 =
                                   Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>>;
 using T64  = Predicated<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 16, 3, 2>>;
 using T128 = Predicated<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1>>;
+using Bulk = Predicated<Bf16A16TmaRegisterBSchedule<128, 128, 64, 64, 32>>;
 
 template <class Schedule>
 void warp(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_tma_mma<Schedule>(
+        bf16_a16_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        Bf16MmaWarpStoreEpilogue{}, stream);
+}
+
+void bulk(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    launch_bf16_a16_tma_register_b<Bulk>(
         bf16_a16_operands(x, weight),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
         Bf16MmaWarpStoreEpilogue{}, stream);
@@ -33,6 +42,7 @@ Bf16Launch select_bf16_n16384_k1536(std::int32_t tokens) {
     if (tokens <= 64) return launch_bf16_mma<M64>;
     if (tokens <= 128) return launch_bf16_mma<M32>;
     if (tokens <= 256) return launch_bf16_tma_mma<T64>;
-    return warp<T128>;
+    if (tokens < 1024) return warp<T128>;
+    return bulk;
 }
 } // namespace ninfer::ops::detail

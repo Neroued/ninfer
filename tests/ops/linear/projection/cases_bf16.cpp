@@ -341,7 +341,7 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
 void run_bf16_extensions(Suite& suite) {
     using namespace ninfer::test::linear;
     const std::array geometries{
-        Geometry{20480, 1536, {16, 32, 64, 128, 256}},
+        Geometry{20480, 1536, {16, 32, 64, 128, 256, 1024}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256}},
         Geometry{4096, 8192, {1, 8, 32, 128, 256, 512, 1024}},
         Geometry{1024, 1176, {1, 16, 32, 128, 192, 256, 512, 1536, 2304}},
@@ -362,6 +362,8 @@ void run_bf16_extensions(Suite& suite) {
         for (int t : points) calls.push_back({t});
         for (int t : {1, 17, 129, 4097})
             calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        if (geometry.n == 20480 && geometry.k == 1536)
+            calls.push_back({1025, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         calls.push_back({8, CallForm::A16Convenience});
         calls.push_back({17, CallForm::Policy, ops::LinearPolicy::AllowA8});
         calls.push_back({64, CallForm::Policy, ops::LinearPolicy::AllowA4});

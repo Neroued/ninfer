@@ -252,11 +252,7 @@ q/k 基址至少 4 B 对齐，weights 自然对齐，positions 按 I32 对齐；
 ```cpp
 void linear_bias(
     const Tensor& x, const Weight& weight, const Tensor& bias,
-    Tensor& out, MemoryArena& workspace, CudaExecutionView execution);
-
-std::size_t linear_bias_workspace_capacity_bytes(
-    const LinearProfile& weight,
-    std::int32_t min_columns, std::int32_t max_columns);
+    Tensor& out, CudaExecutionView execution);
 ```
 
 `Y[n,t]=RN_BF16(sum_k W[n,k]*X[k,t]+bias[n])`。
@@ -274,12 +270,7 @@ x/out 连续 BF16 [K,M]/[N,M]，bias 连续 BF16 [N]；
 ```cpp
 void linear_split(
     const Tensor& x, const Weight& weight, const Tensor& bias,
-    std::span<const Tensor> outputs,
-    MemoryArena& workspace, CudaExecutionView execution);
-
-std::size_t linear_split_bias_workspace_capacity_bytes(
-    const LinearProfile& weight, std::span<const std::int32_t> output_rows,
-    std::int32_t min_columns, std::int32_t max_columns);
+    std::span<const Tensor> outputs, CudaExecutionView execution);
 ```
 
 输出是 parent 连续行段，bias [N] 与 parent 行序相同。
@@ -288,8 +279,7 @@ std::size_t linear_split_bias_workspace_capacity_bytes(
 分别可 view 为连续 [64,16,Npatch]。不物化 packed parent 再拆分/复制。
 
 输入、权重及 bias 保持不变，所有 outputs 彼此 disjoint 并与输入 disjoint。
-输出大小和布局遵循现有 LinearSplit 的连续矩阵合同；bias 形式拥有自己的容量查询，
-不能依据无 bias 形式的私有路线推断 scratch。
+输出大小和布局遵循现有 LinearSplit 的连续矩阵合同。
 
 ### 5.3 带 bias 的 clamped LinearSwiGLU
 
@@ -298,12 +288,7 @@ std::size_t linear_split_bias_workspace_capacity_bytes(
 ```cpp
 void linear_swiglu(
     const Tensor& x, const Weight& gate_up_weight, const Tensor& bias,
-    Tensor& out, float limit, LinearPolicy policy,
-    MemoryArena& workspace, CudaExecutionView execution);
-
-std::size_t linear_swiglu_bias_workspace_capacity_bytes(
-    const LinearProfile& weight,
-    std::int32_t min_columns, std::int32_t max_columns);
+    Tensor& out, float limit, CudaExecutionView execution);
 ```
 
 Weight [2I,K]、bias [2I] 的顺序均为 [gate;up]，out 为 BF16 [I,M]。
@@ -318,9 +303,8 @@ out = RN_BF16(SiLU(min(g,limit)) * clamp(u,-limit,limit))
 GU 是内部值，不强制先存 BF16。当前 block 使用 I=4096、K=1024、limit=10。
 Merger 的 I=10240、K=4096 使用既有无 bias clamped 入口，增加对应几何即可。
 
-所有输出与只读输入 disjoint。各容量查询覆盖闭区间内的所有合法列数及有限正 limit，
-不读取设备数据，包含内部阶段和对齐间隙，零表示合法零 scratch；从 256 B 对齐的
-call-local arena cursor 计量。执行不隐藏分配、持久保留 scratch 或重打包权重。
+所有输出与只读输入 disjoint。这三个 BF16/A16 bias 接口无需 workspace，因此不传入
+arena、不提供容量查询；执行不隐藏设备分配或权重重打包，支持 CUDA Graph replay。
 现有无 bias 接口和数值语义保留，不新增“是否有 bias”的模型侧分派表。
 
 ## 6. Dense attention 与既有 Op 复用

@@ -51,4 +51,18 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, M
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, float limit,
                    LinearPolicy policy, MemoryArena& ws, CudaExecutionView execution);
 
+/**
+ * g = W_gate*x + bias_gate; u = W_up*x + bias_up;
+ * out[i,t] = SiLU(min(g[i,t],limit)) * clamp(u[i,t],-limit,limit).
+ *
+ * Registered contiguous BF16 [2*M,K] weights and naturally aligned BF16 bias [2*M]
+ * both use [gate;up] row order. Uses A16 computation with finite positive limit.
+ * The projection and bias feed the product without intermediate BF16 rounding.
+ * x/out follow linear_swiglu's matrix and alias requirements; out also overlaps no bias.
+ * Inputs are preserved. No workspace, hidden allocation or persistent state;
+ * supports CUDA Graph replay.
+ */
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const Tensor& bias, Tensor& out,
+                   float limit, CudaExecutionView execution);
+
 } // namespace ninfer::ops

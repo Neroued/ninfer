@@ -45,22 +45,30 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                     const float* gate_acc = acc[mi][ni];
                     const float* up_acc   = acc[mi + kGateMt][ni];
                     if constexpr (Full) {
-                        output_tile.store(r0, c0, product(gate_acc[0], up_acc[0]));
-                        output_tile.store(r0, c1, product(gate_acc[1], up_acc[1]));
-                        output_tile.store(r1, c0, product(gate_acc[2], up_acc[2]));
-                        output_tile.store(r1, c1, product(gate_acc[3], up_acc[3]));
+                        output_tile.store(r0, c0,
+                                          swiglu_product(product, r0, gate_acc[0], up_acc[0]));
+                        output_tile.store(r0, c1,
+                                          swiglu_product(product, r0, gate_acc[1], up_acc[1]));
+                        output_tile.store(r1, c0,
+                                          swiglu_product(product, r1, gate_acc[2], up_acc[2]));
+                        output_tile.store(r1, c1,
+                                          swiglu_product(product, r1, gate_acc[3], up_acc[3]));
                     } else {
                         if (r0 < m / 2 && c0 < n) {
-                            output_tile.store(r0, c0, product(gate_acc[0], up_acc[0]));
+                            output_tile.store(r0, c0,
+                                              swiglu_product(product, r0, gate_acc[0], up_acc[0]));
                         }
                         if (r0 < m / 2 && c1 < n) {
-                            output_tile.store(r0, c1, product(gate_acc[1], up_acc[1]));
+                            output_tile.store(r0, c1,
+                                              swiglu_product(product, r0, gate_acc[1], up_acc[1]));
                         }
                         if (r1 < m / 2 && c0 < n) {
-                            output_tile.store(r1, c0, product(gate_acc[2], up_acc[2]));
+                            output_tile.store(r1, c0,
+                                              swiglu_product(product, r1, gate_acc[2], up_acc[2]));
                         }
                         if (r1 < m / 2 && c1 < n) {
-                            output_tile.store(r1, c1, product(gate_acc[3], up_acc[3]));
+                            output_tile.store(r1, c1,
+                                              swiglu_product(product, r1, gate_acc[3], up_acc[3]));
                         }
                     }
                 }
@@ -106,22 +114,30 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                         const float up10      = up_shared[local_r1 * BN + local_c0];
                         const float up11      = up_shared[local_r1 * BN + local_c1];
                         if constexpr (Full) {
-                            output_tile.store(r0, c0, product(gate_acc[0], up00));
-                            output_tile.store(r0, c1, product(gate_acc[1], up01));
-                            output_tile.store(r1, c0, product(gate_acc[2], up10));
-                            output_tile.store(r1, c1, product(gate_acc[3], up11));
+                            output_tile.store(r0, c0,
+                                              swiglu_product(product, r0, gate_acc[0], up00));
+                            output_tile.store(r0, c1,
+                                              swiglu_product(product, r0, gate_acc[1], up01));
+                            output_tile.store(r1, c0,
+                                              swiglu_product(product, r1, gate_acc[2], up10));
+                            output_tile.store(r1, c1,
+                                              swiglu_product(product, r1, gate_acc[3], up11));
                         } else {
                             if (r0 < m / 2 && c0 < n) {
-                                output_tile.store(r0, c0, product(gate_acc[0], up00));
+                                output_tile.store(r0, c0,
+                                                  swiglu_product(product, r0, gate_acc[0], up00));
                             }
                             if (r0 < m / 2 && c1 < n) {
-                                output_tile.store(r0, c1, product(gate_acc[1], up01));
+                                output_tile.store(r0, c1,
+                                                  swiglu_product(product, r0, gate_acc[1], up01));
                             }
                             if (r1 < m / 2 && c0 < n) {
-                                output_tile.store(r1, c0, product(gate_acc[2], up10));
+                                output_tile.store(r1, c0,
+                                                  swiglu_product(product, r1, gate_acc[2], up10));
                             }
                             if (r1 < m / 2 && c1 < n) {
-                                output_tile.store(r1, c1, product(gate_acc[3], up11));
+                                output_tile.store(r1, c1,
+                                                  swiglu_product(product, r1, gate_acc[3], up11));
                             }
                         }
                     }
@@ -138,7 +154,7 @@ struct BasicSwiGluPairEpilogue {
     template <class Output>
     __device__ __forceinline__ void apply_pair(Output output, int row, int token, float gate,
                                                float up) const {
-        output.store(row, token, product(gate, up));
+        output.store(row, token, swiglu_product(product, row, gate, up));
     }
 };
 
@@ -146,8 +162,8 @@ template <class Product>
 struct BasicSwiGluTokenMajorMmaEpilogue {
     Product product{};
 
-    __device__ __forceinline__ float apply_pair(int, int, float gate, float up) const {
-        return product(gate, up);
+    __device__ __forceinline__ float apply_pair(int row, int, float gate, float up) const {
+        return swiglu_product(product, row, gate, up);
     }
 
     template <class Schedule>
@@ -177,12 +193,14 @@ struct BasicSwiGluTokenMajorMmaEpilogue {
                     const auto& gate = acc[mt][mr];
                     const auto& up   = acc[mt][mr + gate_fragments];
                     if (Full || token < token_end) {
-                        output.store(row, token, product(gate[0], up[0]));
-                        output.store(row + 1, token, product(gate[1], up[1]));
+                        output.store(row, token, swiglu_product(product, row, gate[0], up[0]));
+                        output.store(row + 1, token,
+                                     swiglu_product(product, row + 1, gate[1], up[1]));
                     }
                     if (Full || token + 8 < token_end) {
-                        output.store(row, token + 8, product(gate[2], up[2]));
-                        output.store(row + 1, token + 8, product(gate[3], up[3]));
+                        output.store(row, token + 8, swiglu_product(product, row, gate[2], up[2]));
+                        output.store(row + 1, token + 8,
+                                     swiglu_product(product, row + 1, gate[3], up[3]));
                     }
                 }
             }
@@ -217,9 +235,13 @@ struct BasicSwiGluTokenMajorMmaEpilogue {
                     const auto& gate = acc[mt][mr];
                     const auto& up   = acc[mt][mr + gate_fragments];
                     *reinterpret_cast<__nv_bfloat162*>(final_tile + token * stride + row) =
-                        __floats2bfloat162_rn(product(gate[0], up[0]), product(gate[1], up[1]));
+                        __floats2bfloat162_rn(
+                            swiglu_product(product, row_begin + row, gate[0], up[0]),
+                            swiglu_product(product, row_begin + row + 1, gate[1], up[1]));
                     *reinterpret_cast<__nv_bfloat162*>(final_tile + (token + 8) * stride + row) =
-                        __floats2bfloat162_rn(product(gate[2], up[2]), product(gate[3], up[3]));
+                        __floats2bfloat162_rn(
+                            swiglu_product(product, row_begin + row, gate[2], up[2]),
+                            swiglu_product(product, row_begin + row + 1, gate[3], up[3]));
                 }
             }
             synchronize();

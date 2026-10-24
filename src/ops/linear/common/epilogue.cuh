@@ -10,6 +10,14 @@ struct LinearIdentityEpilogue {
     __device__ __forceinline__ float apply(int, int, float value) const { return value; }
 };
 
+struct LinearBiasEpilogue {
+    const __nv_bfloat16* bias;
+
+    __device__ __forceinline__ float apply(int row, int, float value) const {
+        return value + __bfloat162float(bias[row]);
+    }
+};
+
 struct LinearResidualAddEpilogue {
     LinearBf16InputView residual;
 

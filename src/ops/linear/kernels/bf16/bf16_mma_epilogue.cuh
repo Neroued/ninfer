@@ -72,6 +72,21 @@ public:
     }
 };
 
+struct Bf16BiasWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {
+    const __nv_bfloat16* bias;
+
+    template <class Output>
+    __device__ __forceinline__ void store_fragment(const Output& output, int row, int token,
+                                                   float4 value, int, int tokens) const {
+        const float first  = __bfloat162float(bias[row]);
+        const float second = __bfloat162float(bias[row + 8]);
+        store_fragment_impl<false>(
+            output, row, token,
+            make_float4(value.x + first, value.y + first, value.z + second, value.w + second),
+            tokens);
+    }
+};
+
 // A CTA made entirely of compute warps, with complete 16-row output atoms.
 template <bool Streaming = false>
 struct Bf16MmaCtaWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {

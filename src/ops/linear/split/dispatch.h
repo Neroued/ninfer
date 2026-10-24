@@ -33,6 +33,9 @@ extern const SplitShape kQ4Q5SplitN7168N7168K5120, kQ4Q5SplitN4096N12288K5120;
 extern const SplitShape kFp8SplitN14336K5120, kFp8SplitN16384K5120;
 extern const SplitShape kNvfp4SplitN14336K5120, kNvfp4SplitN16384K5120;
 
+void launch_bf16_bias_n3072_k1024(const Tensor& x, const Weight& weight, const Tensor& bias,
+                                  std::span<const Tensor> outputs, cudaStream_t stream);
+
 const SplitShape& select_split_shape(ProjectionProfile weights,
                                      std::span<const std::int32_t> output_rows);
 const SplitShape& select_split_shape(ProjectionProfile weights, std::span<const Tensor> outputs);

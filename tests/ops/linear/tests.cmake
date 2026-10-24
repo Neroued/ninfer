@@ -51,3 +51,8 @@ ninfer_linear_format_tests(pair q8)
 
 ninfer_linear_suite(topk test.cpp)
 ninfer_linear_format_tests(topk q4 q8 fp8)
+
+ninfer_linear_suite(bias test.cpp)
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_linear_format_tests(bias bf16)
+endif()

@@ -24,8 +24,8 @@ struct SwiGluBf16FragmentEpilogue {
     __device__ void store_fragment(Output out, int row, int token, float4 v, int,
                                    int tokens) const {
         const int r = (row / 16) * 8 + row % 8;
-        if (token < tokens) out.store(r, token, product(v.x, v.z));
-        if (token + 1 < tokens) out.store(r, token + 1, product(v.y, v.w));
+        if (token < tokens) out.store(r, token, swiglu_product(product, r, v.x, v.z));
+        if (token + 1 < tokens) out.store(r, token + 1, swiglu_product(product, r, v.y, v.w));
     }
 };
 
@@ -72,7 +72,7 @@ __global__ __launch_bounds__(128) void swiglu_bf16_paired_gemv(const __nv_bfloat
     }
     const float g = common::warp_reduce_sum((gate[0] + gate[1]) + (gate[2] + gate[3]));
     const float u = common::warp_reduce_sum((up[0] + up[1]) + (up[2] + up[3]));
-    if (lane == 0) out.store(row, 0, product(g, u));
+    if (lane == 0) out.store(row, 0, swiglu_product(product, row, g, u));
 }
 
 template <class Product>

@@ -17,6 +17,25 @@ struct ClampedSwiGluProduct {
     }
 };
 
+struct BiasedClampedSwiGluProduct {
+    const __nv_bfloat16* bias;
+    int rows;
+    float limit;
+
+    __device__ __forceinline__ float operator()(int row, float gate, float up) const {
+        return ClampedSwiGluProduct{limit}(gate + __bfloat162float(bias[row]),
+                                           up + __bfloat162float(bias[row + rows]));
+    }
+};
+
+template <class Product>
+__device__ __forceinline__ float swiglu_product(const Product& product, int row, float gate,
+                                                float up) {
+    if constexpr (requires { product(row, gate, up); })
+        return product(row, gate, up);
+    else
+        return product(gate, up);
+}
 
 template <int RowsPerBranch, int IntermediateRows = 0>
 struct SwiGluBranchRows {

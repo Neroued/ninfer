@@ -21,6 +21,13 @@ quantized_weight::PackedWeight clamp_weight(int recipe) {
 
 void add_bf16_cases(Suite& suite) {
 #if NINFER_TARGET_SPARK
+    add_profile(suite, {QType::BF16, 20480, 4096, 10240, 2201U, ops::LinearPolicy::A16Only, 10.f},
+                std::array{1,   4,   7,   8,    9,    15,   16,   17,   31,   32,
+                           33,  63,  64,  65,   127,  128,  129,  255,  256,  257,
+                           511, 512, 513, 1024, 2048, 2559, 2560, 2561, 4096, 4097},
+                std::array{8, 129, 513});
+    add_profile(suite, {QType::BF16, 20480, 4096, 10240, 2203U, ops::LinearPolicy::A16Only},
+                std::array{1, 8, 17, 33, 65, 129, 513}, std::array{33});
     constexpr std::array tokens{1,   2,   6,   8,   16,  17,   32,   64,  128,
                                 129, 256, 257, 512, 513, 2048, 4096, 4097};
     add_profile(suite, {QType::BF16, 2048, 4096, 1024, 2101U, ops::LinearPolicy::A16Only, 10.f},

@@ -1,4 +1,5 @@
 target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/bias.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n34816_k5120/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/linear_swiglu.cpp"
@@ -20,6 +21,9 @@ target_sources(ninfer_ops_non_rdc PRIVATE
 )
 
 if(NINFER_TARGET STREQUAL "dgx_spark")
+  target_sources(ninfer_ops_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/bf16/dgx_spark/shapes/n8192_k1024_bias.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/bf16/dgx_spark/shapes/n20480_k4096.cu")
   target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/q8/dgx_spark/shapes/n2048_k4096.cu")
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/nvfp4/dgx_spark/shapes/n12288_k4096.cu")
   target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/nvfp4/dgx_spark/shapes/n12288_k4096_tma.cu")

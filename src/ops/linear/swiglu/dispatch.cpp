@@ -6,6 +6,7 @@ namespace ninfer::ops::detail {
 void validate_swiglu_geometry(QType type, int rows, int k, bool clamped) {
     if (clamped) {
 #if NINFER_TARGET_SPARK
+        if (type == QType::BF16 && rows == 20480 && k == 4096) return;
         if (type == QType::NVFP4 && rows == 12288 && k == 4096) return;
         if ((type == QType::BF16 || type == QType::Q8_G32_FP16) && rows == 2048 && k == 4096)
             return;
@@ -13,6 +14,7 @@ void validate_swiglu_geometry(QType type, int rows, int k, bool clamped) {
         throw std::invalid_argument("linear_swiglu: unsupported clamped geometry");
     }
 #if NINFER_TARGET_SPARK
+    if (type == QType::BF16 && rows == 20480 && k == 4096) return;
     if (type == QType::NVFP4 && rows == 12288 && k == 4096) return;
     if ((type == QType::BF16 || type == QType::Q8_G32_FP16) && rows == 2048 && k == 4096) return;
 #endif
@@ -30,6 +32,17 @@ LinearSwiGluLaunch select_q8_linear_swiglu(int rows, int k, int tokens) {
         if (rows == 34816 && k == 5120) return select_q8_swiglu_n34816_k5120(tokens);
     }
     throw std::invalid_argument("q8 linear_swiglu: unsupported shape or token extent");
+}
+
+void bf16_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out, float limit,
+                                 bool clamped, cudaStream_t stream) {
+#if NINFER_TARGET_SPARK
+    if (weight.n == 2048 && weight.k == 4096)
+        return launch_bf16_swiglu_n2048_k4096(x, weight, out, limit, clamped, stream);
+    if (weight.n == 20480 && weight.k == 4096)
+        return launch_bf16_swiglu_n20480_k4096(x, weight, out, limit, clamped, stream);
+#endif
+    throw std::invalid_argument("linear_swiglu: unsupported BF16 geometry");
 }
 
 void q8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, float limit,

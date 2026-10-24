@@ -105,3 +105,5 @@ foreach(target IN ITEMS ninfer_moe_clamped_ep_bench ninfer_sigmoid_moe_bench)
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math;-ffp-contract=off>)
   endif()
 endforeach()
+
+ninfer_add_op_bench(ninfer_linear_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bias.cu")

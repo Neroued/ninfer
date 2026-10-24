@@ -22,4 +22,10 @@ void q4_linear_swiglu_dispatch(const Tensor&, const Weight&, Tensor&, MemoryAren
                                CudaExecutionView);
 void launch_bf16_swiglu_n2048_k4096(const Tensor&, const Weight&, Tensor&, float limit,
                                     bool clamped, cudaStream_t);
+void launch_bf16_swiglu_n20480_k4096(const Tensor&, const Weight&, Tensor&, float limit,
+                                     bool clamped, cudaStream_t);
+void launch_bf16_bias_swiglu_n8192_k1024(const Tensor&, const Weight&, const Tensor&, Tensor&,
+                                         float limit, cudaStream_t);
+void bf16_linear_swiglu_dispatch(const Tensor&, const Weight&, Tensor&, float limit, bool clamped,
+                                 cudaStream_t);
 } // namespace ninfer::ops::detail

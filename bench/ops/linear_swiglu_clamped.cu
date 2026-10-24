@@ -12,6 +12,7 @@ struct Options {
     measurement::Options timing;
     std::vector<int> tokens{1, 6, 16, 32, 128, 512, 2048, 4096};
     std::string format = "nvfp4";
+    int n = 0, k = 4096;
 };
 
 Options parse(int argc, char** argv) {
@@ -19,16 +20,22 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help") {
-            std::cout << "Clamped Linear SwiGLU benchmark\n"
-                         "  --format nvfp4|bf16|q8 --tokens T[,T...] --sweep START:END[:STEP]\n"
-                         "  NVFP4: N=12288, K=4096, AllowA4; BF16: N=2048, K=4096, A16Only. Q8: "
-                         "N=2048, K=4096, A16Only.\n"
-                         "  Clamp limit=10. Operand traffic excludes private staging.\n";
+            std::cout
+                << "Clamped Linear SwiGLU benchmark\n"
+                   "  --format nvfp4|bf16|q8 --tokens T[,T...] --sweep START:END[:STEP] --n N --k "
+                   "K\n"
+                   "  Defaults: NVFP4 N=12288, K=4096, AllowA4; BF16: N=2048, K=4096, A16Only. Q8: "
+                   "N=2048, K=4096, A16Only.\n"
+                   "  Clamp limit=10. Operand traffic excludes private staging.\n";
             measurement::help();
             std::exit(0);
         }
         const auto value = measurement::take(argc, argv, i);
-        if (flag == "--format")
+        if (flag == "--n")
+            o.n = measurement::integer(value);
+        else if (flag == "--k")
+            o.k = measurement::integer(value);
+        else if (flag == "--format")
             o.format = value;
         else if (flag == "--tokens")
             o.tokens = measurement::integers(value);
@@ -39,6 +46,7 @@ Options parse(int argc, char** argv) {
     }
     if (o.format != "bf16" && o.format != "nvfp4" && o.format != "q8")
         throw std::invalid_argument("unknown weight format");
+    if (o.n == 0) o.n = o.format == "nvfp4" ? 12288 : 2048;
     return o;
 }
 
@@ -72,7 +80,10 @@ void run(const Options& options, Fixture& fixture) {
         row.workspace_bytes  = capacity;
         const auto bytes     = fixture.model_weight_bytes() + 2ULL * (weight.k + weight.n / 2) * t;
         const double flops   = 2.0 * weight.n * weight.k * t;
-        const bool tensor    = options.format == "nvfp4" ? t >= 3 : t >= 2;
+        const bool tensor =
+            options.format == "nvfp4"
+                ? t >= 3
+                : t >= 2 || (options.format == "bf16" && weight.n == 20480 && weight.k == 4096);
         const bool native_a4 = options.format == "nvfp4" && t >= 17;
         const double peak    = !tensor     ? std::numeric_limits<double>::quiet_NaN()
                                : native_a4 ? kRoofline.nvfp4_f32_tflops
@@ -114,13 +125,14 @@ int main(int argc, char** argv) {
         const auto options = parse(argc, argv);
         measurement::hardware();
         if (options.format == "bf16") {
-            auto weight = make_direct_bf16_weight(2048, 4096, 191U);
+            auto weight = make_direct_bf16_weight(options.n, options.k, 191U);
             run(options, weight);
         } else if (options.format == "q8") {
-            auto weight = make_row_split_weight(QType::Q8_G32_FP16, 2048, 4096, 4096, 191U);
+            auto weight =
+                make_row_split_weight(QType::Q8_G32_FP16, options.n, options.k, options.k, 191U);
             run(options, weight);
         } else {
-            auto weight = make_nvfp4_weight(12288, 4096, 191U);
+            auto weight = make_nvfp4_weight(options.n, options.k, 191U);
             run(options, weight);
         }
     } catch (const std::exception& error) {

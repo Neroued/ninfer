@@ -16,6 +16,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
                            .single_block_grouping  = t <= 64,
                            .column_major_down      = t >= 1024,
                            .preserve_balanced_down = true,
+                           .token_ordered_groups   = t >= 1024,
                            .queued_ctas_per_sm     = 6,
                            .clamp_limit            = *ffn.clamp_limit};
     using kernel::block_scaled::Nvfp4CachePolicy;

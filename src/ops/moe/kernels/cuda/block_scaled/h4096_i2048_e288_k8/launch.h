@@ -30,6 +30,8 @@ struct Plan {
     bool column_major_down = false;
     // Keep the original expert-major jobs when every expert has at most two jobs.
     bool preserve_balanced_down = false;
+    // Preserve token order when every selected expert covers all input columns.
+    bool token_ordered_groups = false;
 
     int queued_ctas_per_sm      = 6;
     int vector_gate_ctas_per_sm = 0;

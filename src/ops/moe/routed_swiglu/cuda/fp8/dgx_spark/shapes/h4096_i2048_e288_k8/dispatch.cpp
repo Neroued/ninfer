@@ -16,6 +16,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
                            .vector                  = t <= 2,
                            .atomic_output           = t >= 3,
                            .single_block_grouping   = t <= 64,
+                           .token_ordered_groups    = true,
                            .queued_ctas_per_sm      = 6,
                            .vector_gate_ctas_per_sm = t == 2 ? 8 : 0,
                            .clamp_limit             = *ffn.clamp_limit};

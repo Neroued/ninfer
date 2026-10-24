@@ -480,6 +480,8 @@ int main(int argc, char** argv) {
                         for (int hits : {0, 1, 8}) cases.push_back({m, hits, true});
                     for (int hits : {0, 1, 8}) cases.push_back({9, hits, true});
                     cases.push_back({16, 8, true});
+                    for (int m : {1024, 2048}) cases.push_back({m, 1, true});
+                    cases.push_back({4097, 1, true, false, false, true});
                 }
                 for (int m : {1, 17, 4097}) cases.push_back({m, 0, true, true});
                 for (int m : {8, 4097}) cases.push_back({m, 8, true, false, true});

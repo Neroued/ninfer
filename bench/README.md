@@ -1538,6 +1538,97 @@ split entry's exact state alias, restoring its initial history outside every tim
 are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096) and
 `--channels 10240` gives (2048, 2048, 6144).
 
+## Kpool MLA
+
+DGX Spark's BF16 family provides `ninfer_kpool_prepare_bench`, `ninfer_kpool_indexer_bench`,
+`ninfer_kpool_sparse_mla_bench`, `ninfer_kpool_chain_bench` and
+`ninfer_kpool_application_bench`. Build them in `build/dgx-spark-dev` or `build/dgx-spark-ops`.
+The [family reference](../docs/designs/glm5next/kpool-sparse-mla.md) explains native cache layout,
+weight views and ownership; the [delivery checklist](../docs/designs/glm5next/mla-checklist.md)
+separates implementation support from outstanding roofline and model-integration work.
+
+The first four executables use the shared measurement options (`--execution`, `--cache`,
+`--warmup`, `--repeat`, `--csv-out`). Prepare additionally selects `--projection
+full|query-history|history`, `--form record|update` and pool phase. Indexer and sparse MLA take
+`--end E`, the final physical query's exclusive end, so `T<=E<=1048576`. `--layers 1|11`
+selects MTP or Main page-group geometry; only one layer's Op is timed. The Indexer option
+`--latent-cache fp8` changes page geometry around the BF16 index plane; it does not execute
+FP8 Prepare or FP8 sparse MLA.
+
+```bash
+./build/dgx-spark-dev/bench/ninfer_kpool_prepare_bench \
+  --projection full --form update --tokens 1,8,64,512 --batch 1 --cache cold
+./build/dgx-spark-dev/bench/ninfer_kpool_indexer_bench \
+  --tokens 1,16,128 --batch 4 --end 262144 --layers 11 --cache cold
+./build/dgx-spark-dev/bench/ninfer_kpool_sparse_mla_bench \
+  --tokens 1,16,128 --batch 4 --end 262144 --selected 512 --cache cold
+./build/dgx-spark-dev/bench/ninfer_kpool_chain_bench \
+  --tokens 1,64,512 --batch 1 --end 262144 --stages 1 --cache cold
+```
+
+The chain entry measures Prepare → BF16 W_B split → Indexer → complete sparse MLA. The
+application entry adds the Q8 A16 O projection and accepts a JSON case or an array of jobs:
+
+```bash
+./build/dgx-spark-dev/bench/ninfer_kpool_application_bench \
+  --case .agent-tmp/mla/case.json --out .agent-tmp/mla/result.json \
+  --repeat 100 --warmup 10 --stages 1
+./build/dgx-spark-dev/bench/ninfer_kpool_application_bench --jobs .agent-tmp/mla/jobs.json
+```
+
+Create the output directory before running. A static case describes per-request frontiers and
+valid columns rather than deriving every request from one context length:
+
+```json
+{
+  "id": "ragged-b4-t128",
+  "mode": "static",
+  "T": 128,
+  "B": 4,
+  "frontiers": [8192, 32768, 65536, 131072],
+  "valid_columns": [128, 96, 32, 0],
+  "envelope_max": 262144,
+  "layers": 11,
+  "prepare": "update"
+}
+```
+
+`shared_prefix_tokens` (default 0, a multiple of 64) shares physical prefix pages;
+`contiguous_pages` (default false) selects a diagnostic contiguous placement. Static cases use
+the actual weighted Indexer to produce selections. `prepare: "record"` times record publication
+instead of tail update. Static results include resource admission, body and Host launch samples,
+workspace peak, useful FLOPs, unique external bytes and memory/compute roofline floors.
+The fixture admission budget is for isolated Op composition, not a complete model.
+
+`mode: "trajectory"` uses the same geometry/frontier fields plus `steps` (default 512),
+`repetitions` (default 5) and `kind: "growth"` or `"churn"`. Each active step advances by T;
+churn requires at least four steps and introduces inert rows, an empty batch and new frontiers.
+The benchmark preallocates histories and upload frames, captures envelope variants and updates
+the child Graph at crossings. It reports per-step GPU body, Host update/launch and wall timings.
+Uploads and graph updates are outside the GPU body but included in the corresponding wall scope.
+
+`mode: "mtp"` instead requires `B`, `draft_steps`, `context` and
+`acceptance: "zero"|"half"|"all"|"mixed"` (plus `id`). It measures the Op sequence for draft
+selection reuse, Main record production, accepted-tail extraction and canonical History refresh.
+Main/MTP use separate native page groups. This synthetic sequence does not implement model
+acceptance, FFN, sampling or a complete MTP round.
+
+Jobs are an array of `{ "case": { ... }, "out": "path.json", "repeat": 100,
+"warmup": 10, "stages": true }`; trajectory repetitions come from the case. Static samples
+use a 256 MiB read-only L2 eviction after 200 µs conditioning, outside the measured body.
+MTP restores its initial states before each sample without forcing L2 eviction; trajectory
+measurements retain the cache effects of the actual sequence. Stage diagnostics use
+an additional event-instrumented Graph and include event cost; do not sum their medians as a
+replacement for the uninstrumented body.
+
+All inputs are synthetic represented finite data. These benchmarks establish Op/branch costs,
+not Engine TPOT or multi-node throughput. Useful bytes and FLOPs are ideal work models, not
+hardware traffic counters; mandatory publications, history unions and selected-token visits are
+reported separately. The global roofline lower bound excludes intermediate traffic that could
+stay on chip; attaining it is a separate optimization question. Performance acceptance uses
+roofline, not speedup over an older implementation. Keep raw results and Markdown/chart analysis
+under the task's `.agent-tmp/` directory.
+
 ## Reports
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,

@@ -15,3 +15,4 @@ ninfer_add_op_test(ninfer_softmax_attention_test
   FORMATS bf16 int8 fp8 nvfp4 k8v4)
 
 include("${CMAKE_CURRENT_LIST_DIR}/qsa/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/kpool_mla/tests.cmake")

@@ -69,6 +69,7 @@ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/ple/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/kpool_mla/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/benchmarks.cmake")

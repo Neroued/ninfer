@@ -10,9 +10,11 @@
 已有能力与待补任务，列出 `.50` 执行所需的几何、代码入口和顺序。
 [Frontend 清单](frontend-checklist.md)列出共享基础提取后，GLM 输入输出需要逐项
 实现的能力、方法与完成条件。
+[MLA 交付与后续清单](mla-checklist.md)区分已实现的 BF16 family、尚未完成的逐点
+roofline 验收、FP8 和模型存储／MTP 交接。
 
-阅读实现设计前先读相应长期参考。这里的接口名称和代码片段是待落地合同，不能
-据此宣称已有运行能力；已确认的模型／数值决策不因实现进度或文档迁移而重开。
+阅读实现设计前先读相应长期参考。接口以实际公共头的接管状态为准；设计片段或
+已有声明都不代表实现已经可运行。已确认的模型／数值决策不因实现进度或文档迁移而重开。
 
 Context 存储采用现有[统一容量、记录视图与执行借用合同](../../maintainer/paged-kv-cache.md)。
 GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-state-variants-与字段布局)
@@ -33,7 +35,7 @@ GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-stat
 | [Attention DP 放置与上下文管理](../attention-dp-placement.md) | token 负载、缓存亲和、完整预留、跨 owner 恢复及压力处理已确定 | 共享合同扩展与 GLM 接入待实施 |
 | [Linear/MoE 清单](op-checklist.md) | Q8 shared 完整链、MLA query/O、Q4 draft head、stem/Vision 纯矩阵与 MoE 优化迁入 | `.50` 工作区按清单逐项实施 |
 | [KDA 计算与 ReplaySSM](replayssm-kda.md) | 字段／I64 offsets、source/destination、五个 frame record planes、Host/Device fold 与搬迁后 Graph 使用已明确 | 原位 batch update 已使用字段视图；新增输入链、独立目的及 record/fold 待实现／验收 |
-| [Kpool Sparse MLA](kpool-sparse-mla.md) | 读写 views、多层页组、冻结 selection、Context/frame tail 和五个计算入口已明确 | 设计待实现／验收 |
+| [Kpool Sparse MLA](kpool-sparse-mla.md) | [计算合同](../../../include/ninfer/ops/kpool_mla.h)及[布局规划](../../../include/ninfer/ops/kpool_mla_layout.h)已实现 | Spark BF16 Prepare／Indexer／sparse MLA／tail 与组合验证已交付；FP8、逐点性能完成和模型接入见 [MLA 清单](mla-checklist.md) |
 | [mHC](mhc.md) | 五个 C++ 入口、M 列布局、容量查询、两阶段融合与资源归属已明确 | 设计待实现／验收 |
 | [MTP](mtp.md) | 输入移位、stem/residual、共享 Main hidden、provisional 页与 frame、首步采用及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
 | [Vision](vision.md) | GLM processor、patch 顺序、bias/2D norm-RoPE/D64 attention、segment 分配与媒体生命周期已明确 | 输入基础、Op 扩展与模型组合待实现／验收 |
@@ -69,8 +71,10 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 | 通用 Context 容量、记录寻址、借用与搬迁 | [Context 存储合同](../../maintainer/paged-kv-cache.md) |
 | 分片、owner、State variants、通信交接与部署预算 | parallel.md |
 | 动态放置、来源选择、联合预留与跨 owner 生命周期 | [Attention DP 设计](../attention-dp-placement.md) |
-| 具体 Op/views、physical layout、写域、alias、融合与验收 | 对应 family 设计 |
-| 执行条目与完成证据 | op-checklist.md |
+| 具体 Op/views、physical layout、写域、alias | 已声明部分由公共头维护；其余见对应 family 设计 |
+| 模型链路、实现候选与资源交接 | 对应 family 设计 |
+| Linear/MoE 执行条目与完成证据 | op-checklist.md |
+| MLA 执行步骤、优化与验收条目 | [MLA 清单](mla-checklist.md) |
 | Frontend 接入条目与完成条件 | [Frontend 清单](frontend-checklist.md) |
 | 集成步骤、并行任务与阶段进度 | [实施路线](roadmap.md) |
 | 文档导航与既有设计范围 | 本索引 |

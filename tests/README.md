@@ -151,6 +151,18 @@ and independent oracle rows share at most eight CPU workers; nested work runs se
 dot product retains its accumulation order. Shared oracle support and CXX suite targets use
 `-fno-fast-math -ffp-contract=off` on GNU/Clang.
 
+The Spark BF16 Kpool MLA family is qualified through its public Prepare, Indexer, sparse MLA,
+tail extraction and composed-chain entries. The chain includes the existing BF16 W_B split;
+it checks each represented handoff against independent mathematics. Layout, write-set,
+selection-reuse and Graph-envelope cases remain part of their owning suites. Its shared Top512
+implementation also requires the QSA Indexer regression:
+
+```bash
+ctest --test-dir build/dgx-spark-dev \
+  -R '^ninfer_(kpool_.*|qsa_indexer)_test$' --output-on-failure
+./build/dgx-spark-dev/tests/ninfer_kpool_sparse_mla_test --execution graph --list
+```
+
 Enable numerical error records when reviewing a criterion:
 
 ```bash

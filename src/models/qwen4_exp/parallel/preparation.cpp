@@ -104,7 +104,7 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_);
 }
 
-void RankPreparation::release_program() {
+void RankPreparation::release_resources() {
     instance_->program.reset();
     device_.synchronize();
 }

@@ -28,7 +28,7 @@ public:
 
     void prepare(runtime::ContextCapacity capacity, std::size_t available_bytes,
                  std::size_t available_host_bytes);
-    void release_program();
+    void release_resources();
     [[nodiscard]] RankExecutionDescription describe() const;
     [[nodiscard]] ExecutionCodec codec(const distributed::ExecutionTopology&) const;
     [[nodiscard]] std::unique_ptr<Instance> finish() &&;

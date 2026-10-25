@@ -29,7 +29,7 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
             if (layout.variant != owner || layout.parts.size() != 1 || layout.parts[0].rank != rank)
                 throw std::invalid_argument("GLM5Next State variant has inconsistent rank parts");
             const auto& expected = owner == rank ? r.state.owner : r.state.common;
-            if (layout.parts[0].image_bytes != expected.image_bytes ||
+            if (layout.parts[0].image_bytes != expected.bytes ||
                 layout.parts[0].alignment != expected.alignment)
                 throw std::invalid_argument("GLM5Next State part differs from its field layout");
             out.state.layouts[owner].parts.push_back(layout.parts[0]);
@@ -58,6 +58,20 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
     if (histories > UINT32_MAX)
         throw std::overflow_error("GLM5Next history capacity exceeds uint32");
     for (auto& pool : out.pools) pool.histories = static_cast<std::uint32_t>(histories);
+    return out;
+}
+
+PreparedContext prepare_context(const ParallelPlan& parallel,
+                                std::span<const RankResourceDescription> ranks) {
+    auto spec = plan_group_context(parallel, ranks);
+    PreparedContext out{ranks.front().shape,
+                        {},
+                        ranks.front().vision_max_features,
+                        std::make_unique<context::ContextDirectory>(spec)};
+    for (const auto& rank : ranks) {
+        out.states.push_back(rank.state);
+        out.vision_max_features = std::min(out.vision_max_features, rank.vision_max_features);
+    }
     return out;
 }
 

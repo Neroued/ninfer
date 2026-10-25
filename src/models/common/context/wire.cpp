@@ -119,4 +119,62 @@ ContextActions decode_actions(Decoder& in) {
     return actions;
 }
 
+void encode_directory(distributed::wire::Encoder& out, const ContextDirectorySpec& c) {
+    out.u64(c.ranks.size());
+    for (const auto& rank : c.ranks) {
+        out.u32(rank.rank);
+        out.u64(rank.device_bytes);
+        out.u64(rank.host_bytes);
+    }
+    out.u32(c.state.logical_capacity);
+    out.u64(c.state.layouts.size());
+    for (const auto& layout : c.state.layouts) {
+        out.u32(layout.variant);
+        out.u64(layout.parts.size());
+        for (const auto& part : layout.parts) {
+            out.u32(part.rank);
+            out.u64(part.image_bytes);
+            out.u64(part.alignment);
+        }
+    }
+    out.u64(c.metadata_budget_bytes);
+    out.u64(c.pools.size());
+    for (const auto& pool : c.pools) {
+        for (auto n : {pool.pool_id, pool.logical_pages, pool.histories, pool.page_capacity,
+                       pool.table_rows})
+            out.u32(n);
+        out.u64(pool.parts.size());
+        for (const auto& part : pool.parts) {
+            out.u32(part.rank);
+            out.u64(part.record.bytes);
+            out.u64(part.record.alignment);
+        }
+    }
+}
+
+ContextDirectorySpec decode_directory(distributed::wire::Decoder& in) {
+    ContextDirectorySpec c;
+    c.ranks.resize(in.count(20));
+    for (auto& rank : c.ranks) rank = {in.u32(), in.u64(), in.u64()};
+    c.state.logical_capacity = in.u32();
+    c.state.layouts.resize(in.count(12));
+    for (auto& layout : c.state.layouts) {
+        layout.variant = in.u32();
+        layout.parts.resize(in.count(20));
+        for (auto& part : layout.parts) part = {in.u32(), in.u64(), in.u64()};
+    }
+    c.metadata_budget_bytes = in.u64();
+    c.pools.resize(in.count(28));
+    for (auto& pool : c.pools) {
+        pool.pool_id       = in.u32();
+        pool.logical_pages = in.u32();
+        pool.histories     = in.u32();
+        pool.page_capacity = in.u32();
+        pool.table_rows    = in.u32();
+        pool.parts.resize(in.count(20));
+        for (auto& part : pool.parts) part = {in.u32(), {in.u64(), in.u64()}};
+    }
+    return c;
+}
+
 } // namespace ninfer::models::context

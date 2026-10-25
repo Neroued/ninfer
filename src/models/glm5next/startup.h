@@ -1,46 +1,58 @@
 #pragma once
 
-#include "models/common/startup.h"
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/frontend/frontend.h"
 #include "models/glm5next/load.h"
 #include "models/glm5next/parallel/preparation.h"
 #include "models/glm5next/program/resources.h"
+#include "runtime/executor/preparation.h"
 
 namespace ninfer::models::glm5next {
 
-// Owns rank preparation through teardown. The Reader is borrowed only until materialize();
-// DeviceContext and optional communication groups outlive this owner.
+// Parameters borrow the immutable model; Resources may contain asynchronous device work.
+// Their addresses remain stable when preparation hands ownership to execution.
+struct PreparedRank {
+    PreparedRank()                               = default;
+    PreparedRank(const PreparedRank&)            = delete;
+    PreparedRank& operator=(const PreparedRank&) = delete;
+
+    std::unique_ptr<ModelShard> model;
+    std::unique_ptr<const execution::Parameters> parameters;
+    std::unique_ptr<Resources> resources;
+};
+
+// The Reader is borrowed until materialize(). DeviceContext and communication groups outlive
+// both preparation and the returned PreparedRank.
 class RankPreparation {
 public:
-    RankPreparation(const artifact::Reader&, std::shared_ptr<const ModelDefinition>, RankPlan,
-                    const EngineOptions&, DeviceContext&);
+    RankPreparation(const artifact::Reader&, RankLoadRequest, DeviceContext&,
+                    ContextCommunication = {});
+    RankPreparation(const artifact::Reader&, std::span<const std::byte>,
+                    const distributed::RankIdentity&, DeviceContext&,
+                    const distributed::ExecutionTopology&, distributed::CommunicationContext&);
     ~RankPreparation();
     RankPreparation(const RankPreparation&)            = delete;
     RankPreparation& operator=(const RankPreparation&) = delete;
 
-    [[nodiscard]] WeightCandidate weights() const noexcept { return weights_; }
-
-    [[nodiscard]] const ExecutionPlan& plan() const noexcept { return plan_; }
-
-    [[nodiscard]] runtime::RankCapacityOffer offer(std::size_t available,
-                                                   std::size_t available_host) const;
-    void materialize(const StartupObserver& = {});
-    void allocate(runtime::ContextCapacityResolution, ContextCommunication = {});
+    [[nodiscard]] runtime::PreparationMemory memory() const;
+    [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
+    void materialize();
+    void prepare(runtime::ContextCapacity, std::size_t available_bytes,
+                 std::size_t available_host_bytes);
     void release_resources();
-    [[nodiscard]] const execution::Parameters& parameters() const;
-    [[nodiscard]] Resources& resources();
     [[nodiscard]] RankResourceDescription describe() const;
+    [[nodiscard]] std::unique_ptr<PreparedRank> finish() &&;
 
 private:
     DeviceContext& device_;
-    WeightCandidate weights_;
+    EngineOptions options_;
+    ContextCommunication peer_;
+    runtime::PreparationMemory memory_;
+    bool control_owner_;
     std::optional<ResolvedLoadPlan> load_;
     ExecutionPlan plan_;
     runtime::ContextCapacityPlan capacity_;
-    std::unique_ptr<ModelShard> model_;
-    std::unique_ptr<const execution::Parameters> parameters_;
-    std::unique_ptr<Resources> resources_;
+    std::unique_ptr<PreparedRank> prepared_;
 };
 
 [[nodiscard]] Frontend create_frontend(const ModelDefinition&, const EngineOptions&);

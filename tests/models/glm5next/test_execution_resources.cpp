@@ -53,6 +53,7 @@ struct Fixture {
     std::array<glm::ExecutionPlan, 2> plans;
     glm::ParallelPlan parallel;
     ctx::ContextDirectorySpec context;
+    std::vector<glm::RankResourceDescription> descriptions;
 
     explicit Fixture(bool mtp) : plans{storage_plan(0, mtp), storage_plan(1, mtp)} {
         parallel.ranks.resize(2);
@@ -64,11 +65,11 @@ struct Fixture {
                                        2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0}};
         const auto capacities = runtime::resolve_group_context_capacity(
             ContextCapacityPolicy::automatic(1ULL << 30), offers, 0);
-        std::vector<glm::RankResourceDescription> descriptions;
         for (unsigned rank = 0; rank < 2; ++rank) {
             auto& p    = plans[rank];
             p.capacity = capacities[rank];
-            descriptions.push_back({rank, p.shape, p.state, glm::describe_context(p), {}, {}});
+            descriptions.push_back(
+                {rank, p.shape, glm::describe_state(p.state), glm::describe_context(p), {}, {}});
         }
         context = glm::plan_group_context(parallel, descriptions);
     }
@@ -90,7 +91,8 @@ void host() {
         require(f.context.ranks[1].device_bytes > f.context.ranks[0].device_bytes &&
                     f.context.pools.size() == 1U + mtp,
                 "group preparation discarded rank capacity or optional history");
-        ctx::ContextDirectory directory(f.context);
+        auto prepared   = glm::prepare_context(f.parallel, f.descriptions);
+        auto& directory = *prepared.directory;
         ctx::ContextDemand demand;
         const auto state0 = demand.add_state({.count = 1, .variant = 0});
         const auto state1 = demand.add_state({.count = 1, .variant = 1});
@@ -113,8 +115,7 @@ void host() {
         for (const auto& pool : directory.usage().pools)
             require(pool.live_bytes == 0 && pool.reserved_bytes == 0,
                     "released GLM records retained physical ownership");
-        const std::array states{f.plans[0].state, f.plans[1].state};
-        const auto copies = glm::state_conversion(states, 0, 1);
+        const auto copies = glm::state_conversion(prepared.states, 0, 1);
         require(copies.size() == 3 && copies[0].source_rank == copies[0].destination_rank &&
                     copies[1].source_rank == copies[1].destination_rank &&
                     copies[2].source_rank == 0 && copies[2].destination_rank == 1 &&

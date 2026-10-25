@@ -21,6 +21,12 @@ StateLayout plan_state(const execution::ModelProfile& p) {
     return out;
 }
 
+StatePlacement describe_state(const StateLayout& s) {
+    return {{s.common.image_bytes, s.common.alignment},
+            {s.owner.image_bytes, s.owner.alignment},
+            s.owner_fields};
+}
+
 ops::KpoolMlaStorage latent_storage(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
@@ -74,13 +80,13 @@ ops::KpoolMlaCacheView CacheViews::layer(std::uint32_t layer) const {
         static_cast<std::int32_t>(layer));
 }
 
-std::vector<context::RecordRangeCopy> state_conversion(std::span<const StateLayout> states,
+std::vector<context::RecordRangeCopy> state_conversion(std::span<const StatePlacement> states,
                                                        std::uint32_t from, std::uint32_t to) {
     if (from >= states.size() || to >= states.size())
         throw std::out_of_range("GLM5Next State conversion owner is outside its rank group");
     std::vector<context::RecordRangeCopy> out;
     for (std::uint32_t rank = 0; rank < states.size(); ++rank)
-        out.push_back({rank, rank, 0, 0, states[rank].common.image_bytes});
+        out.push_back({rank, rank, 0, 0, states[rank].common.bytes});
     const auto& source      = states[from].owner_fields;
     const auto& destination = states[to].owner_fields;
     if (source.bytes != destination.bytes)

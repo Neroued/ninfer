@@ -17,7 +17,16 @@ struct StateLayout {
     LayoutRegion owner_fields;
 };
 
+// Directory geometry and record-relative migration ranges; rank-local field views stay
+// with StateLayout and do not cross the preparation boundary.
+struct StatePlacement {
+    RecordSpec common, owner;
+    LayoutRegion owner_fields;
+    bool operator==(const StatePlacement&) const = default;
+};
+
 [[nodiscard]] StateLayout plan_state(const execution::ModelProfile&);
+[[nodiscard]] StatePlacement describe_state(const StateLayout&);
 [[nodiscard]] ops::KpoolMlaStorage latent_storage(KvCacheStorage);
 
 struct CacheLayout {
@@ -64,7 +73,7 @@ private:
 // Record-relative copies for a change of attention owner. Common KDA/hidden fields stay on
 // their original rank; only the raw tails move. History placement is handled separately.
 [[nodiscard]] std::vector<context::RecordRangeCopy>
-state_conversion(std::span<const StateLayout>, std::uint32_t source_owner,
+state_conversion(std::span<const StatePlacement>, std::uint32_t source_owner,
                  std::uint32_t destination_owner);
 
 } // namespace ninfer::models::glm5next

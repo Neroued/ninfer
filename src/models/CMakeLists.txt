@@ -51,7 +51,8 @@ target_include_directories(ninfer_model_control SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
 if(NINFER_ENABLE_DISTRIBUTED)
-  target_sources(ninfer_model_control PRIVATE common/context/wire.cpp common/vision/input.cpp)
+  target_sources(ninfer_model_control PRIVATE common/context/wire.cpp common/vision/input.cpp
+    common/parallel_wire.cpp)
   target_link_libraries(ninfer_model_control PRIVATE ninfer_distributed_wire)
 endif()
 

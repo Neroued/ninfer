@@ -599,12 +599,14 @@ bool EngineCore<Instance>::compute_pending() const noexcept {
 }
 
 template <class Instance>
-void EngineCore<Instance>::fail_all_locked(std::exception_ptr error) noexcept {
+void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     std::deque<std::shared_ptr<Request>> pending;
+    std::unique_ptr<MeasurementRequest> measurement;
     {
         std::lock_guard lock(queue_mutex_);
         failed_ = true;
         pending.swap(pending_);
+        measurement = std::move(measurement_);
     }
     scheduler_ = Scheduling{};
     const std::shared_ptr<Request> materializing_request =
@@ -634,6 +636,8 @@ void EngineCore<Instance>::fail_all_locked(std::exception_ptr error) noexcept {
     if (materializing_request != nullptr) { complete_error(materializing_request, error); }
     for (const auto& request : pending) { complete_error(request, error); }
     publish_runtime_stats();
+    if (measurement) measurement->completion.set_exception(error);
+    queue_cv_.notify_all();
 }
 
 } // namespace ninfer::runtime

@@ -391,7 +391,6 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle);
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    void reset_measurement_peaks();
 
 private:
     std::unique_ptr<detail::SessionImpl> impl_;

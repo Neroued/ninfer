@@ -740,11 +740,21 @@ int coordinator(int argc, char** argv) {
         require(rank.memory.allocations.workspace_device_bytes ==
                     2 * (131072 + kContextBytes) + kPeerChunkBytes,
                 "rank resource observation differs from owned buffers");
-    executor.reset_measurement_peaks();
+    executor.measure({rt::MeasurementAction::Reset});
     for (const auto& rank : executor.observations())
         require(rank.memory.workspace.measurement_peak_bytes == 0 &&
                     rank.memory.workspace.required_peak_bytes > 0,
                 "measurement reset erased lifetime peaks or omitted a rank");
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        executor.measure({rt::MeasurementAction::Begin});
+        run(executor, {Operation::Sum, DType::FP32, 64}, state);
+        executor.measure({rt::MeasurementAction::End});
+        for (const auto& rank : executor.observations())
+            require(rank.memory.workspace.measurement_peak_bytes > 0 &&
+                        rank.memory.workspace.measurement_peak_bytes <=
+                            rank.memory.workspace.required_peak_bytes,
+                    "completed measurement omitted rank work or corrupted lifetime peaks");
+    }
     executor.drain();
     for (const auto operation : {Operation::Sum, Operation::ContextScatter}) {
         Executor failing(prepare(), {1, 1}, {});

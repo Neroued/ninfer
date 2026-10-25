@@ -7,6 +7,23 @@
 namespace ninfer::runtime::protocol {
 namespace wire = distributed::wire;
 
+std::size_t measurement_report_capacity(std::size_t snapshot_bytes) {
+    constexpr std::size_t envelope = 16 + kMeasurementErrorBytes;
+    if (snapshot_bytes > SIZE_MAX - envelope)
+        throw std::overflow_error("measurement report capacity overflow");
+    return snapshot_bytes + envelope;
+}
+
+void encode_measurement_report(wire::Encoder& out, std::uint64_t query, std::string_view error,
+                               const RankSnapshot& snapshot) {
+    out.u64(query);
+    if (error.size() > kMeasurementErrorBytes)
+        out.string(std::string(error.substr(0, kMeasurementErrorBytes - 3)) + "...");
+    else
+        out.string(error);
+    encode(out, snapshot);
+}
+
 void Scope::validate(const distributed::ExecutionTopology& topology) const {
     std::set<distributed::RankId> members;
     if (owners.empty()) throw std::invalid_argument("execution has no owners");

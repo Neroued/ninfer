@@ -204,6 +204,21 @@ public:
 
     ~Impl() noexcept { core.emplace<std::monostate>(); }
 
+    EngineSnapshot measure(runtime::MeasurementCommand command) {
+        auto result = std::visit(
+            [&](auto& value) -> EngineSnapshot {
+                using State = std::remove_cvref_t<decltype(value)>;
+                if constexpr (std::is_same_v<State, std::monostate>)
+                    throw std::logic_error("Engine core is unavailable");
+                else
+                    return value->measure(command);
+            },
+            core);
+        result.media = std::visit(
+            [](const auto& instance) { return instance->frontend.media_cache_summary(); }, active);
+        return result;
+    }
+
     std::shared_ptr<const void> frontend_domain;
     EngineOptions options;
     runtime::ActiveModel active;
@@ -472,15 +487,18 @@ bool Engine::is_available() const {
 }
 
 void Engine::reset_measurement_peaks() {
-    if (impl_ == nullptr) { return; }
-    std::visit(
-        [](auto& core) {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
-                core->reset_measurement_peaks();
-            }
-        },
-        impl_->core);
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    (void)impl_->measure({runtime::MeasurementAction::Reset});
+}
+
+EngineSnapshot Engine::begin_measurement(MeasurementOptions options) {
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    return impl_->measure({runtime::MeasurementAction::Begin, options.profile});
+}
+
+EngineSnapshot Engine::end_measurement() {
+    if (!impl_) throw std::logic_error("Engine is moved from");
+    return impl_->measure({runtime::MeasurementAction::End});
 }
 
 } // namespace ninfer

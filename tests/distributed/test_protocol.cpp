@@ -488,6 +488,29 @@ int main() {
                     report.memory.experts->fixed_experts_per_layer ==
                         std::vector<std::uint32_t>{1, 7, 3},
                 "resource observation lost rank identity, values or signed calibration");
+        wire::Encoder snapshot;
+        runtime::protocol::encode(snapshot, memory);
+        const auto snapshot_bytes = std::move(snapshot).take().size();
+        for (const auto& error :
+             {std::string{}, std::string(runtime::protocol::kMeasurementErrorBytes + 1, 'x')}) {
+            wire::Encoder boundary;
+            runtime::protocol::encode_measurement_report(boundary, 17, error, memory);
+            const auto payload = std::move(boundary).take();
+            require(payload.size() <=
+                        runtime::protocol::measurement_report_capacity(snapshot_bytes),
+                    "measurement envelope exceeds its reserved report capacity");
+            wire::Decoder input(payload);
+            require(input.u64() == 17, "measurement query identity changed");
+            const auto detail = input.string();
+            require(detail.size() <= runtime::protocol::kMeasurementErrorBytes &&
+                        detail.empty() == error.empty(),
+                    "measurement error exceeded its bound or lost success status");
+            const auto measured = runtime::protocol::rank_snapshot(input);
+            input.finish();
+            require(measured.rank == memory.rank &&
+                        measured.memory.workspace.measurement_peak_bytes == 80,
+                    "measurement framing changed the resource snapshot");
+        }
         RankExecutionObservation completion;
         completion.path                                 = ExecutionPath::Graph;
         completion.gpu                                  = {123, {}, 456, {}};

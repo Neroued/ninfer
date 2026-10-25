@@ -10,6 +10,7 @@
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/executor/contract.h"
+#include "runtime/executor/measurement.h"
 #include "runtime/observability/snapshot.h"
 
 #include <algorithm>
@@ -179,7 +180,11 @@ public:
         std::uint64_t request_id        = 0;
         std::uint64_t publication_order = 0;
         {
-            std::lock_guard lock(queue_mutex_);
+            std::unique_lock lock(queue_mutex_);
+            if (!queue_cv_.wait_until(lock, pending_deadline,
+                                      [&] { return stopping_ || failed_ || !measurement_; }))
+                throw RequestError(RequestErrorKind::QueueTimeout,
+                                   "inference request expired at a measurement boundary");
             if (stopping_ || failed_) {
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
@@ -191,6 +196,7 @@ public:
                 throw std::overflow_error("request identity space exhausted");
             }
             ++outstanding_;
+            ++preparing_requests_;
             request_id        = next_request_id_++;
             publication_order = next_publication_order_++;
         }
@@ -227,12 +233,18 @@ public:
             request->decode_by_batch.resize(max_concurrency_);
             request->context_transfers.resize(instance_.session->kv_pools().size() + 1);
         } catch (...) {
-            release_reserved_capacity();
+            {
+                std::lock_guard lock(queue_mutex_);
+                --preparing_requests_;
+                --outstanding_;
+            }
+            queue_cv_.notify_all();
             throw;
         }
 
         {
             std::lock_guard lock(queue_mutex_);
+            --preparing_requests_;
             if (stopping_ || failed_) {
                 --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
@@ -255,17 +267,28 @@ public:
         return !stopping_ && !failed_;
     }
 
-    void reset_measurement_peaks() {
-        std::scoped_lock execution_lock(execution_mutex_);
-        if (!resident_empty() || instance_.executor->has_pending_work())
-            throw std::logic_error("measurement window requires an idle engine");
-        instance_.session->reset_measurement_peaks();
-        std::lock_guard stats_lock(stats_mutex_);
-        const auto ranks = instance_.executor->observations();
-        published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
+    [[nodiscard]] EngineSnapshot measure(MeasurementCommand command) {
+        auto request     = std::make_unique<MeasurementRequest>();
+        request->command = command;
+        auto result      = request->completion.get_future();
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) throw std::runtime_error("inference engine is unavailable");
+            if (measurement_) throw std::logic_error("a measurement boundary is already pending");
+            measurement_ = std::move(request);
+        }
+        queue_cv_.notify_all();
+        return result.get();
     }
 
 private:
+    struct MeasurementRequest {
+        MeasurementCommand command{};
+        std::promise<EngineSnapshot> completion;
+    };
+
+    bool process_measurement();
+
     enum class HostWorkClass : std::uint8_t {
         Decode,
         Prefill,
@@ -579,9 +602,7 @@ private:
 
     [[nodiscard]] bool compute_pending() const noexcept;
 
-    // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
-    // Session introspection can observe a partially cleared physical state.
-    void fail_all_locked(std::exception_ptr error) noexcept;
+    void fail_all(std::exception_ptr error) noexcept;
 
     void begin_cycle(HostPhaseMeasurement& boundary);
 
@@ -597,11 +618,12 @@ private:
     ResourceManagement resources_;
     PlacementId next_placement_tie_;
 
-    mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+    std::unique_ptr<MeasurementRequest> measurement_;
+    std::size_t preparing_requests_       = 0;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;

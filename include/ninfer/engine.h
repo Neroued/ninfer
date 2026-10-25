@@ -56,6 +56,10 @@ private:
     friend class Engine;
 };
 
+struct MeasurementOptions {
+    bool profile = false;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -107,6 +111,12 @@ public:
     [[nodiscard]] EngineSnapshot snapshot() const;
     [[nodiscard]] bool is_available() const;
 
+    // Synchronous boundaries on the execution thread. Previously submitted requests and their
+    // cleanup complete before the boundary; concurrent submissions wait until it finishes.
+    // Begin resets window peaks and optionally starts the profiler on every execution rank.
+    // End includes final retirement and returns the completed window's resource observations.
+    [[nodiscard]] EngineSnapshot begin_measurement(MeasurementOptions options = {});
+    [[nodiscard]] EngineSnapshot end_measurement();
     void reset_measurement_peaks();
 
 private:

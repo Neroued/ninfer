@@ -6,6 +6,7 @@ add_library(ninfer_runtime_support STATIC
   engine/context_capacity.cpp
   engine/startup_memory.cpp
   engine/public_types.cpp
+  executor/measurement.cpp
   observability/snapshot.cpp
   observability/execution.cpp
 )

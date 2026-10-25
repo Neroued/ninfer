@@ -47,7 +47,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 {group.id, static_cast<std::uint32_t>(group.members.size())});
     wire::Encoder report;
     runtime::protocol::encode(report, snapshot);
-    budget_ = {work, context_work, decision, commit, event, 8 + std::move(report).take().size()};
+    budget_ = {work, context_work, decision, commit, event, std::move(report).take().size()};
 }
 
 void ExecutionCodec::validate_work(const Work& w, runtime::FrameKind f) const {

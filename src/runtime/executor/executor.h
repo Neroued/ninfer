@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/executor/execution_pool.h"
+#include "runtime/executor/measurement.h"
 #include "runtime/observability/execution.h"
 
 namespace ninfer::runtime {
@@ -24,7 +25,7 @@ public:
     virtual void fail(std::string message)                       = 0;
     [[nodiscard]] virtual bool failed() const noexcept           = 0;
     [[nodiscard]] virtual bool has_pending_work() const noexcept = 0;
-    virtual void reset_measurement_peaks()                       = 0;
+    virtual void measure(MeasurementCommand command)             = 0;
 
     [[nodiscard]] std::span<const RankSnapshot> observations() const noexcept {
         return observations_;

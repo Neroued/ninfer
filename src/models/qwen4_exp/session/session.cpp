@@ -452,8 +452,6 @@ std::optional<SessionEvent> Session::poll() {
 
 void Session::fail_all_cleanup() noexcept { impl_->cleanup(); }
 
-void Session::reset_measurement_peaks() { impl_->executor->reset_measurement_peaks(); }
-
 ResumeState::ResumeState(std::unique_ptr<detail::Suspended> state) : state_(std::move(state)) {}
 
 ResumeState::~ResumeState()                                 = default;

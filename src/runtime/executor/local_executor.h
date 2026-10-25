@@ -30,6 +30,7 @@ public:
         } catch (...) {
             // RankProgram's teardown retains its allocation owners until outstanding work ends.
         }
+        measurement_.cancel();
     }
 
     void bind_to_current_thread() override { worker_->bind_to_current_thread(); }
@@ -196,6 +197,7 @@ public:
         pool_.retire_submitted();
         std::fill(compute_.begin(), compute_.end(), Flight{});
         std::fill(context_.begin(), context_.end(), Flight{});
+        measurement_.cancel();
         if (error) std::rethrow_exception(error);
     }
 
@@ -209,9 +211,19 @@ public:
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
 
-    void reset_measurement_peaks() override {
-        worker_->program().reset_measurement_peaks();
-        this->observations_[0].memory = worker_->program().observe_resources();
+    void measure(MeasurementCommand command) override {
+        require_available();
+        if (pool_.busy()) throw std::logic_error("measurement boundary requires an idle executor");
+        try {
+            measurement_.apply(command, worker_->program());
+            sample_resources(true);
+        } catch (...) {
+            const auto error = std::current_exception();
+            try {
+                measurement_.apply({MeasurementAction::Cancel}, worker_->program());
+            } catch (...) { fail("failed to close rank measurement window"); }
+            std::rethrow_exception(error);
+        }
     }
 
 private:
@@ -267,6 +279,7 @@ private:
     }
 
     std::unique_ptr<RankWorker<Types>> worker_;
+    RankMeasurement measurement_;
     SessionEpoch epoch_;
     ExecutionPool pool_;
     std::vector<Flight> compute_, context_;

@@ -354,6 +354,7 @@ void RankProgramImpl::advance_compute() {
                     resources.vision->release(use.id);
             }
             auto observed = observation();
+            observed.path = f.graph_round ? ExecutionPath::Graph : ExecutionPath::Eager;
             timer.observe_retirement(f.gpu);
             observed.gpu       = f.gpu;
             const auto ticket  = f.request.ticket;

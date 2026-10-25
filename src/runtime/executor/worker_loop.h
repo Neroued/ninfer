@@ -1,6 +1,7 @@
 #pragma once
 
 #include "distributed/bootstrap.h"
+#include "runtime/executor/measurement.h"
 #include "runtime/executor/protocol.h"
 #include "runtime/observability/snapshot.h"
 
@@ -62,31 +63,24 @@ private:
                     throw std::logic_error("execution codec has no input resources");
                 continue;
             }
-            if (message->kind == distributed::wire::Kind::ResetMeasurement) {
+            if (message->kind == distributed::wire::Kind::Measurement) {
                 distributed::wire::Decoder query(message->payload);
-                const auto id = query.u64();
+                if (measurement_boundary_)
+                    throw std::logic_error("overlapping rank measurement boundaries");
+                MeasurementBoundary boundary;
+                boundary.id              = query.u64();
+                boundary.through_command = query.u64();
+                boundary.command.action  = static_cast<MeasurementAction>(query.u8());
+                boundary.command.profile = query.boolean();
                 query.finish();
-                if (active()) throw std::logic_error("measurement reset requires an idle rank");
-                program_.reset_measurement_peaks();
-                observation_.memory        = program_.observe_resources();
-                observation_.host          = host_;
-                observation_.communication = connection_.communication().statistics();
-                observation_.physical_memory =
-                    sample_physical_memory(connection_.device().device());
-                observation_.stamp = {observation_.stamp.sequence + 1, observation_time_ns()};
-                distributed::wire::Encoder report;
-                report.u64(id);
-                protocol::encode(report, observation_);
-                auto payload = std::move(report).take();
-                if (payload.size() > codec_.control_budget().report)
-                    throw std::logic_error("rank resource report exceeds its prepared capacity");
-                connection_.send(distributed::wire::Kind::MeasurementReset, std::move(payload));
+                measurement_boundary_ = boundary;
                 continue;
             }
             if (message->kind == distributed::wire::Kind::Shutdown) {
-                if (!commands_.empty() || active())
+                if (!commands_.empty() || active() || measurement_boundary_)
                     throw std::logic_error("shutdown arrived before execution retirement");
                 program_.drain();
+                measurement_.cancel();
                 return false;
             }
             switch (message->kind) {
@@ -109,24 +103,45 @@ private:
             commands_.push_back({std::move(envelope), std::move(*message)});
         }
         if (!commands_.empty()) apply();
+        progress_measurement();
         sample_resources();
         return true;
+    }
+
+    void observe_resources(bool idle) {
+        observation_.memory        = program_.observe_resources();
+        observation_.host          = host_;
+        observation_.communication = connection_.communication().statistics();
+        if (idle)
+            observation_.physical_memory = sample_physical_memory(connection_.device().device());
+        observation_.stamp = {observation_.stamp.sequence + 1, observation_time_ns()};
+    }
+
+    void progress_measurement() {
+        if (!measurement_boundary_) return;
+        const auto& boundary = *measurement_boundary_;
+        if (applied_ < boundary.through_command || retired_prefix_ < boundary.through_command ||
+            active())
+            return;
+        std::string error;
+        try {
+            measurement_.apply(boundary.command, program_);
+        } catch (const std::exception& e) { error = e.what(); }
+        observe_resources(true);
+        distributed::wire::Encoder report;
+        protocol::encode_measurement_report(report, boundary.id, error, observation_);
+        auto payload = std::move(report).take();
+        if (payload.size() > protocol::measurement_report_capacity(codec_.control_budget().report))
+            throw std::logic_error("rank measurement report exceeds its prepared capacity");
+        connection_.send(distributed::wire::Kind::MeasurementComplete, std::move(payload));
+        measurement_boundary_.reset();
     }
 
     void sample_resources() {
         if (!received_) return;
         const auto now = observation_time_ns();
         if (now - observation_.stamp.sampled_ns < kResourceSamplePeriodNs) return;
-        const auto& rank           = connection_.bootstrap().identity;
-        observation_.rank          = rank.rank;
-        observation_.node          = rank.node;
-        observation_.hardware      = connection_.device().properties().name;
-        observation_.memory        = program_.observe_resources();
-        observation_.host          = host_;
-        observation_.communication = connection_.communication().statistics();
-        if (!active())
-            observation_.physical_memory = sample_physical_memory(connection_.device().device());
-        observation_.stamp = {observation_.stamp.sequence + 1, now};
+        observe_resources(!active());
         distributed::wire::Encoder out;
         protocol::encode(out, observation_);
         // Cumulative samples may be skipped under pressure; execution continuations keep their
@@ -182,6 +197,9 @@ private:
     void apply() {
         auto& command        = commands_.front();
         const auto& envelope = command.envelope;
+        if (measurement_boundary_ &&
+            envelope.command.value > measurement_boundary_->through_command)
+            return;
         distributed::wire::Decoder in(command.message.payload);
         (void)protocol::envelope(in);
         const auto rank = connection_.bootstrap().identity.rank;
@@ -306,6 +324,14 @@ private:
     std::vector<Flight> compute_, context_;
     std::deque<Command> commands_;
     std::map<std::uint64_t, bool> completed_;
+
+    struct MeasurementBoundary {
+        std::uint64_t id = 0, through_command = 0;
+        MeasurementCommand command{};
+    };
+
+    RankMeasurement measurement_;
+    std::optional<MeasurementBoundary> measurement_boundary_;
     std::uint64_t received_ = 0, applied_ = 0, retired_prefix_ = 0;
 };
 

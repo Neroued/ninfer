@@ -46,7 +46,7 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
                                40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
     runtime::protocol::encode(report, rank.observation);
-    return {work, context_work, decision, commit, event, 8 + std::move(report).take().size()};
+    return {work, context_work, decision, commit, event, std::move(report).take().size()};
 }
 
 } // namespace

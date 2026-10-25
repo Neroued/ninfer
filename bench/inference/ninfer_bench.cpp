@@ -6,11 +6,10 @@
 #include "product/logging/startup_log.h"
 #include "product/prompt_input/prompt_input.h"
 
-#include <cuda_profiler_api.h>
-#include <cuda_runtime.h>
 #include <spdlog/logger.h>
 
 #include <chrono>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -18,31 +17,6 @@
 namespace {
 
 using namespace ninfer;
-
-class ProfilerRange {
-public:
-    explicit ProfilerRange(bool enabled) : enabled_(enabled) {
-        if (enabled_) check(cudaProfilerStart(), "cudaProfilerStart");
-    }
-
-    ~ProfilerRange() {
-        if (enabled_) (void)cudaProfilerStop();
-    }
-
-    void finish() {
-        if (!enabled_) return;
-        enabled_ = false;
-        check(cudaProfilerStop(), "cudaProfilerStop");
-    }
-
-private:
-    static void check(cudaError_t status, const char* operation) {
-        if (status != cudaSuccess)
-            throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
-    }
-
-    bool enabled_;
-};
 
 bench::Repetition run(Engine& engine, const bench::Options& options,
                       const std::vector<PromptInput>& inputs,
@@ -65,19 +39,27 @@ bench::Repetition run(Engine& engine, const bench::Options& options,
     for (std::size_t row = 0; row < requests.size(); ++row)
         prompts.push_back(engine.prepare(inputs[inputs.size() == 1 ? 0 : row]));
     if (measured) {
-        engine.reset_measurement_peaks();
-        repetition.before = engine.snapshot();
+        repetition.before = engine.begin_measurement({.profile = options.profile_measured});
     }
-    ProfilerRange profile(measured && options.profile_measured);
     const auto started = std::chrono::steady_clock::now();
-    for (std::size_t row = 0; row < requests.size(); ++row)
-        handles.push_back(
-            engine.submit(std::move(prompts[row]), requests[row], OutputConsumerMode::Aggregate));
-    for (auto& handle : handles) repetition.requests.push_back(handle.wait());
-    repetition.wall_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    if (measured) repetition.after = engine.snapshot();
-    profile.finish();
+    try {
+        for (std::size_t row = 0; row < requests.size(); ++row)
+            handles.push_back(engine.submit(std::move(prompts[row]), requests[row],
+                                            OutputConsumerMode::Aggregate));
+        for (auto& handle : handles) repetition.requests.push_back(handle.wait());
+        repetition.wall_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (measured) repetition.after = engine.end_measurement();
+    } catch (...) {
+        const auto error = std::current_exception();
+        handles.clear();
+        if (measured) {
+            try {
+                (void)engine.end_measurement();
+            } catch (...) {}
+        }
+        std::rethrow_exception(error);
+    }
     return repetition;
 }
 

@@ -90,7 +90,7 @@ benchmark:
   --repetitions N     Full measured generations (default 3).
   --output table|json|csv
   --output-file FILE  Write the report to FILE instead of stdout.
-  --profile-measured  CUDA profiler range around one measured run; requires --repetitions 1.
+  --profile-measured  CUDA profiler range on all execution ranks; requires --repetitions 1.
 
 Each run starts with the same inputs and sampling seeds; runtime caches stay warm.
 Before each decode run, the first C-1 inputs complete ordinary one-token requests.

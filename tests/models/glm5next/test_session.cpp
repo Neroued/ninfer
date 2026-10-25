@@ -135,7 +135,7 @@ public:
 
     bool has_pending_work() const noexcept override { return pool.in_flight(); }
 
-    void reset_measurement_peaks() override {}
+    void measure(rt::MeasurementCommand) override {}
 };
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition) {

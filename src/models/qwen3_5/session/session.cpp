@@ -371,8 +371,6 @@ void Session::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->physical_usage(); }
 
-void Session::reset_measurement_peaks() { impl_->reset_measurement_peaks(); }
-
 std::optional<SequenceHandle> Session::prefill_continuation() const {
     const auto owner = impl_->vision_window.owner();
     if (owner && impl_->valid_sequence(owner->sequence)) return owner->sequence;
@@ -458,8 +456,6 @@ AbortResult SessionImpl::abort(SequenceHandle h) noexcept {
     clear_lane(sequences[l], requests[l]);
     return out;
 }
-
-void SessionImpl::reset_measurement_peaks() { executor().reset_measurement_peaks(); }
 
 
 } // namespace ninfer::models::qwen3_5::detail

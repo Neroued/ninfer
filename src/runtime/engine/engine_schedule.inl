@@ -1129,6 +1129,47 @@ template <class Instance>
 }
 
 template <class Instance>
+bool EngineCore<Instance>::process_measurement() {
+    if (!resident_empty() || !paused_.empty() || materializing_ || context_owner_ ||
+        admission_decision_ || execution_outstanding())
+        return false;
+    MeasurementCommand command;
+    {
+        std::lock_guard lock(queue_mutex_);
+        if (!measurement_ || !pending_.empty() || preparing_requests_) return false;
+        command = measurement_->command;
+    }
+    EngineSnapshot result;
+    std::exception_ptr error;
+    try {
+        instance_.executor->measure(command);
+        publish_runtime_stats();
+        result = snapshot();
+    } catch (...) {
+        error = std::current_exception();
+        if (!instance_.executor->failed()) {
+            try {
+                instance_.executor->measure({MeasurementAction::Cancel});
+            } catch (...) {
+                instance_.executor->fail("failed to close measurement after a boundary error");
+            }
+        }
+        if (instance_.executor->failed()) std::rethrow_exception(error);
+    }
+    std::unique_ptr<MeasurementRequest> completed;
+    {
+        std::lock_guard lock(queue_mutex_);
+        completed = std::move(measurement_);
+    }
+    if (error)
+        completed->completion.set_exception(error);
+    else
+        completed->completion.set_value(std::move(result));
+    queue_cv_.notify_all();
+    return true;
+}
+
+template <class Instance>
 void EngineCore<Instance>::worker_loop() noexcept {
     std::uint64_t scheduled_revision = 0;
     for (;;) {
@@ -1136,17 +1177,16 @@ void EngineCore<Instance>::worker_loop() noexcept {
             std::unique_lock lock(queue_mutex_);
             if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                 !execution_outstanding()) {
-                queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                queue_cv_.wait(lock,
+                               [&] { return stopping_ || !pending_.empty() || measurement_; });
             }
             if (stopping_) {
                 lock.unlock();
-                std::scoped_lock execution_lock(execution_mutex_);
-                fail_all_locked(std::make_exception_ptr(RequestError(
+                fail_all(std::make_exception_ptr(RequestError(
                     RequestErrorKind::Unavailable, "inference engine is shutting down")));
                 return;
             }
         }
-        std::unique_lock execution_lock(execution_mutex_);
         bool progressed  = false;
         bool outstanding = false;
         try {
@@ -1178,20 +1218,18 @@ void EngineCore<Instance>::worker_loop() noexcept {
                 call.finish();
             }
             outstanding = execution_outstanding();
+            if (!outstanding) progressed |= process_measurement();
         } catch (...) {
-            fail_all_locked(std::current_exception());
+            fail_all(std::current_exception());
             return;
         }
         if (outstanding) {
             const auto exposed = active_exposure_set();
             const auto started = Clock::now();
-            execution_lock.unlock();
             std::this_thread::yield();
-            execution_lock.lock();
             record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
                                     exposed);
         }
-        execution_lock.unlock();
         if (!outstanding && !progressed) {
             std::unique_lock lock(queue_mutex_);
             queue_cv_.wait_for(lock, std::chrono::milliseconds(1));

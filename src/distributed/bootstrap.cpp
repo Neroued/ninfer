@@ -372,7 +372,7 @@ void WorkerConnection::shutdown() {
 
 void WorkerConnection::fail(std::string_view message) noexcept {
     if (closed_) return;
-    if (communication_) communication_->abort();
+    if (communication_) communication_->request_stop();
     try {
         wire::Encoder payload;
         payload.string(message);
@@ -384,6 +384,7 @@ void WorkerConnection::fail(std::string_view message) noexcept {
     } catch (...) {}
     transport_->close();
     closed_ = true;
+    if (communication_) communication_->abort();
 }
 
 } // namespace ninfer::distributed

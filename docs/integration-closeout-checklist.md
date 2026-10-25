@@ -54,7 +54,7 @@ Host 阶段统计和求和补齐 `executor_flush`，与生产端的 total 保持
 
 ## 5. Profiler 与峰值重置使用完整执行边界
 
-- [ ] 接通实际执行 rank，并统一测量窗口的生命周期。
+- [x] 接通实际执行 rank，并统一测量窗口的生命周期。
 
 入口：[ninfer_bench.cpp](../bench/inference/ninfer_bench.cpp)、
 [EngineCore](../src/runtime/engine/engine_core.h)、
@@ -65,11 +65,13 @@ Host 阶段统计和求和补齐 `executor_flush`，与生产端的 total 保持
 Session 待提交的 residency release 和相关 context work，不能直接以结果返回作为空闲证明，
 也不能把正常收尾当作非法 busy。
 
-已有 `ResetMeasurement` 下发与全 rank 回包可以复用。测量控制应由 Engine 执行路径串行处理，
-明确全 rank 完成语义、开始／结束配对及部分失败后的清理。
+`begin_measurement`／`end_measurement` 与独立峰值重置均由 Engine 执行线程处理。
+`Measurement`／`MeasurementComplete` 按命令退役边界下发并汇总全 rank 观测，包含配对和失败清理。
 
 完成条件：5090 与双 Spark 的各 rank 捕获只包含正式测量请求，覆盖最终提交，排除加载、
 Graph 准备和预热；结果返回后的尾部工作能正常收尾；失败后不遗留开启的测量状态。
+
+5090 短 bench 已通过预热和连续两组测量；双 Spark 实际捕获留到随后性能分析时验收。
 
 ## 6. 分布式 worker 启动进度贯通
 

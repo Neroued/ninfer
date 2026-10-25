@@ -7,7 +7,8 @@ namespace ninfer::models::qwen4_exp::detail {
 
 RankExecutionObservation RankProgramImpl::retirement_observation() const noexcept {
     RankExecutionObservation out;
-    const auto peak = std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
+    const auto peak            = std::max({resources.workspace.peak_used(),
+                                resources.vision ? resources.vision->workspace_peak_bytes() : 0,
                                 graphs ? graphs->workspace_peak() : 0,
                                 device_graphs ? device_graphs->workspace_peak() : 0,
                                 commit_graphs ? commit_graphs->workspace_peak() : 0});
@@ -43,30 +44,16 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
         a.expert_pinned_bytes = experts.bridge_pinned_bytes;
         a.expert_host_bytes   = experts.cpu_workspace_bytes;
     }
-    const auto active_vision = active_vision_bytes();
-    const auto peak = std::max({resources.workspace.peak_used(), vision_workspace_peak_bytes,
+    const auto peak = std::max({resources.workspace.peak_used(),
+                                resources.vision ? resources.vision->workspace_peak_bytes() : 0,
                                 graphs ? graphs->workspace_peak() : 0,
                                 device_graphs ? device_graphs->workspace_peak() : 0,
                                 commit_graphs ? commit_graphs->workspace_peak() : 0});
     out.workspace   = {resources.workspace.used(), std::max(workspace_lifetime_peak, peak), peak};
-    if (plan.workspace.vision) {
-        const auto& vision              = *plan.workspace.vision;
-        auto& summary                   = out.vision.emplace();
-        summary.aggregate_prompt_tokens = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(shape.max_context, qwen::kMaximumPromptVisionTokens));
-        summary.max_item_tokens        = vision.max_merged_tokens;
-        summary.general_capacity_bytes = vision.general_capacity_bytes;
-        summary.encode_required_bytes  = vision.encode_peak_bytes;
-        summary.handoff_offset_bytes   = vision.handoff_offset_bytes;
-        summary.handoff_capacity_bytes = vision.handoff_capacity_bytes;
-        summary.handoff_active_bytes   = active_vision;
-        summary.handoff_peak_bytes     = vision_handoff_peak_bytes;
-    }
-    if (out.vision && plan.persistent.buffers.vision_features) {
-        const auto& region                 = plan.persistent.buffers.vision_features->region;
-        out.vision->handoff_in_persistent  = true;
-        out.vision->handoff_offset_bytes   = region.offset;
-        out.vision->handoff_capacity_bytes = region.bytes;
+    if (resources.vision) {
+        out.vision = resources.vision->observe();
+        a.persistent_device_bytes += resources.vision->capacity().output_bytes;
+        a.io_pinned_bytes += resources.vision->capacity().encoder.host_staging_bytes;
     }
     if (resources.ple_prepare) {
         const auto stats = resources.ple_prepare->stats();
@@ -109,18 +96,15 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
 
 void RankProgramImpl::reset_measurement_peaks() noexcept {
     workspace_lifetime_peak = std::max(
-        {workspace_lifetime_peak, resources.workspace.peak_used(), vision_workspace_peak_bytes,
+        {workspace_lifetime_peak, resources.workspace.peak_used(),
+         resources.vision ? resources.vision->workspace_peak_bytes() : 0,
          graphs ? graphs->workspace_peak() : 0, device_graphs ? device_graphs->workspace_peak() : 0,
          commit_graphs ? commit_graphs->workspace_peak() : 0});
     resources.workspace.reset_peak();
     if (graphs) graphs->reset_workspace_peak();
     if (device_graphs) device_graphs->reset_workspace_peak();
     if (commit_graphs) commit_graphs->reset_workspace_peak();
-    vision_handoff_peak_bytes = active_vision_bytes();
-    vision_workspace_peak_bytes =
-        vision_handoff_peak_bytes && !resources.plan.persistent.buffers.vision_features
-            ? resources.plan.workspace.vision->handoff_offset_bytes + vision_handoff_peak_bytes
-            : 0;
+    if (resources.vision) resources.vision->reset_peaks();
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

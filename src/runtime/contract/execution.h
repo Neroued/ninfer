@@ -6,6 +6,12 @@
 
 namespace ninfer::runtime {
 
+enum class UnitReservationStatus : std::uint8_t {
+    Granted,
+    ContextUnavailable,
+    ExecutionUnavailable,
+};
+
 struct LaneId {
     std::uint32_t value = 0;
 

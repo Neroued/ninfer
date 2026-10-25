@@ -30,6 +30,7 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         host_context_ = PinnedHostBuffer(plan.host_context_bytes);
         phase.complete(plan.host_context_bytes, plan.host_context_bytes);
     }
+    if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
     const auto backing = persistent_.span();
     states             = std::make_unique<StateViews>(context_.span(), plan.persistent.state);
     main               = std::make_unique<QsaCache>(context_.span(), backing, plan.persistent.main);

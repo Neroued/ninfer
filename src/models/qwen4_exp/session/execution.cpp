@@ -12,6 +12,7 @@ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservat
     work.actions = session.actions(tx.context);
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
     tx.context.mark_submitted();
+    if (tx.vision_id) session.vision_window.submitted(tx.vision_id, tx.ticket);
 }
 
 std::optional<PlePrefetch> prefetch(const detail::SessionImpl& p, const detail::Sequence& s,
@@ -54,6 +55,8 @@ std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle ha
         forward.kind   = ForwardKind::Prefill;
         forward.sample = sample ? SampleKind::FirstToken : SampleKind::None;
         forward.rows.push_back(std::move(row));
+        forward.visual = p.prepare_visual(s, frontier, end);
+        if (forward.visual) tx.vision_id = forward.visual->window.id;
         forward.prefetch = prefetch(p, s, end, s.request->summary.prompt_tokens);
         submit(p, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;
@@ -81,8 +84,10 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
         if (end > begin) p.prepare_write(s, end, tx.context);
         tx.rows.push_back(p.work_row(s, end - begin));
         ForwardWork forward;
-        forward.kind     = ForwardKind::Replay;
-        forward.rows     = tx.rows;
+        forward.kind   = ForwardKind::Replay;
+        forward.rows   = tx.rows;
+        forward.visual = p.prepare_visual(s, begin, end);
+        if (forward.visual) tx.vision_id = forward.visual->window.id;
         forward.prefetch = prefetch(p, s, end, s.replay_target);
         submit(p, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;

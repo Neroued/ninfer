@@ -43,3 +43,7 @@ ninfer_add_test(ninfer_tool_call_parser_test
 set_tests_properties(ninfer_context_store_test ninfer_kv_history_test ninfer_kv_cache_test
   ninfer_qwen_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+ninfer_add_test(ninfer_vision_window_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
+  LIBRARIES ninfer_model_control)

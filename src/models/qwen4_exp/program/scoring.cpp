@@ -18,9 +18,6 @@ void RankProgramImpl::score_next() {
         if (f.timer_started)
             f.gpu.add_prefill(
                 static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
-        if (auto ns = collect_vision_timing(binding(work.row.member.residency),
-                                            work.row.main_frontier + result.processed))
-            f.gpu.add_vision(*ns);
         gpu_timer.observe_result(f.gpu);
         events.emplace_back(
             runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(std::move(result))});

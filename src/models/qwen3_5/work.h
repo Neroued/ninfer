@@ -4,6 +4,7 @@
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
+#include "models/common/qwen/vision/control.h"
 #include "runtime/contract/resources.h"
 #include "runtime/executor/contract.h"
 
@@ -44,7 +45,7 @@ struct InputWindow {
     std::vector<std::int32_t> rope_positions;
     // Forward mathematical segments inside one scheduling unit; excludes zero and window end.
     std::vector<std::uint32_t> execution_splits;
-    std::shared_ptr<const qwen::VisionExecutionInput> vision;
+    std::optional<qwen::VisionWork> visual;
     std::uint32_t prompt_begin = 0;
 };
 

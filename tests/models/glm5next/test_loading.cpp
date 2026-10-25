@@ -1,4 +1,5 @@
 #include "models/glm5next/load.h"
+#include "models/glm5next/execution/parameters.h"
 
 #include <algorithm>
 #include <array>
@@ -272,7 +273,31 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         model = glm::materialize_model(
             glm::resolve_rank_load(reader, definition, plan, device.device()), device);
     }
-    const auto& w   = model->definition().weights();
+    const auto& w      = model->definition().weights();
+    const auto profile = glm::execution::describe_model(model->definition(), model->weight_data(),
+                                                        model->rank_plan());
+    const glm::execution::Parameters parameters(*model, profile);
+    const auto& prepared_mla =
+        std::get<glm::execution::MlaParameters>(parameters.text.layers[1].mixer);
+    const auto& mla_config  = model->definition().config().text.mla;
+    const auto history_rows = mla_config.latent_dim + 2 * mla_config.index_dim;
+    require(prepared_mla.prepare[0].a_projection.qdata ==
+                    prepared_mla.prepare[1].a_projection.qdata &&
+                prepared_mla.prepare[0].a_projection.qdata ==
+                    prepared_mla.prepare[2].a_projection.qdata &&
+                prepared_mla.prepare[2].a_projection.n == history_rows &&
+                prepared_mla.prepare[1].a_projection.n == history_rows + mla_config.query_lowrank,
+            "MLA preparation did not bind continuous history/query prefixes");
+    require(parameters.text.embedding.qdata == parameters.mtp->embedding.qdata &&
+                (!optimized ? parameters.text.head.weight.qdata == parameters.mtp->head.weight.qdata
+                            : parameters.mtp->head.weight.qtype == QType::Q4_G64_FP16),
+            "prepared embedding/head sharing or proposal representation differs");
+    require(parameters.vision &&
+                parameters.vision->layers[0].qkv_bias.numel() ==
+                    3 * model->definition().config().vision->hidden &&
+                std::get<glm::execution::MoeParameters>(parameters.text.layers[1].ffn)
+                        .weights.routed.bank.count == 2,
+            "prepared bias parent or global expert domain differs");
     const auto& k   = std::get<glm::KdaWeights>(w.text.layers[0].mixer);
     const auto& d   = std::get<glm::DenseWeights>(w.text.layers[0].ffn);
     const auto& m   = std::get<glm::MoeWeights>(w.text.layers[1].ffn);

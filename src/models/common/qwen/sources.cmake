@@ -18,7 +18,6 @@ target_sources(ninfer_model_loading PRIVATE
 
 target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/vision/vision.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/vision/prefill.cpp"
 )
 
 target_sources(ninfer_model_control PRIVATE "${CMAKE_CURRENT_LIST_DIR}/vision/control.cpp")

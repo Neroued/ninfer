@@ -16,7 +16,9 @@ void mtp_stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditi
     auto scope = arena.scope();
     auto b     = workspace::mtp_stem(arena, c, m);
     ops::embedding(batch.ids.view({m}), p.embedding, b.embedding, cuda);
-    if (visual) ops::scatter(visual->features, visual->columns, b.embedding, cuda);
+    if (visual)
+        for (const auto& slice : visual->slices)
+            ops::scatter(slice.features, slice.columns, b.embedding, cuda);
     ops::rmsnorm(b.embedding, p.embedding_norm, c.norm_epsilon, true, b.normalized_embedding, cuda);
     ops::rmsnorm(conditioning.view({dimension(c.residual_width()), m}), p.hidden_norm,
                  c.norm_epsilon, true, b.normalized_hidden, cuda);

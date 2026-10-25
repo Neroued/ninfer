@@ -281,7 +281,7 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
     ninfer::Engine engine(dflash_vision_engine_options(artifact));
     const auto before = engine.snapshot().ranks.at(0).memory;
     if (!before.vision || before.allocations.workspace_device_bytes == 0 ||
-        before.vision->general_capacity_bytes == 0 || before.vision->handoff_capacity_bytes == 0) {
+        before.vision->output_capacity_bytes == 0) {
         std::cerr << "combined DFlash and Vision Engine has no frozen Vision workspace\n";
         return 1;
     }
@@ -368,12 +368,12 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     (void)engine.generate(engine.prepare_tokens(text_prompt), greedy_options(1, false));
     const auto after = engine.snapshot().ranks.at(0).memory;
-    if (!after.vision || after.vision->handoff_active_bytes != 0 ||
-        after.vision->handoff_peak_bytes == 0 || after.workspace.measurement_peak_bytes == 0 ||
+    if (!after.vision || after.vision->output_active_bytes != 0 ||
+        after.vision->output_peak_bytes == 0 || after.workspace.measurement_peak_bytes == 0 ||
         after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
         std::cerr << "combined DFlash and Vision workspace: available=" << after.vision.has_value()
-                  << " active=" << (after.vision ? after.vision->handoff_active_bytes : 0)
-                  << " handoff_peak=" << (after.vision ? after.vision->handoff_peak_bytes : 0)
+                  << " active=" << (after.vision ? after.vision->output_active_bytes : 0)
+                  << " output_peak=" << (after.vision ? after.vision->output_peak_bytes : 0)
                   << " work_peak=" << after.workspace.measurement_peak_bytes
                   << " capacity=" << after.allocations.workspace_device_bytes << '\n';
         return 1;

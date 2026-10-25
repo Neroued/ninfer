@@ -75,15 +75,12 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     if (memory.allocations.device_weights_bytes == 0 ||
 
         memory.allocations.persistent_device_bytes == 0 ||
-
         memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
-        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
-        vision->general_capacity_bytes == 0 || vision->encode_required_bytes == 0 ||
-        vision->handoff_offset_bytes > memory.allocations.workspace_device_bytes ||
-        vision->handoff_capacity_bytes == 0 ||
-        vision->handoff_capacity_bytes >
-            memory.allocations.workspace_device_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
+        vision->max_window_features == 0 || vision->max_window_features > 4096 ||
+        vision->encoder_workspace_bytes == 0 || vision->output_capacity_bytes == 0 ||
+        vision->encoder_workspace_bytes + vision->output_capacity_bytes > vision->budget_bytes ||
+        vision->output_capacity_bytes > memory.allocations.persistent_device_bytes ||
+        vision->output_active_bytes != 0 || vision->output_peak_bytes != 0 ||
         memory.workspace.measurement_peak_bytes != 0 ||
         (engine.startup_report().ranks.at(0).graphs.has_value()) !=
             engine.options().use_cuda_graph) {
@@ -95,14 +92,12 @@ int verify_loaded_product(const ninfer::Engine& engine) {
                   << " graph=" << engine.startup_report().ranks.at(0).graphs.has_value()
                   << " expected_graph=" << engine.options().use_cuda_graph << '\n';
         if (vision)
-            std::cerr << "vision: prompt=" << vision->aggregate_prompt_tokens
-                      << " item=" << vision->max_item_tokens
-                      << " general=" << vision->general_capacity_bytes
-                      << " encode_peak=" << vision->encode_required_bytes
-                      << " handoff=" << vision->handoff_offset_bytes << '+'
-                      << vision->handoff_capacity_bytes
-                      << " active=" << vision->handoff_active_bytes
-                      << " peak=" << vision->handoff_peak_bytes << '\n';
+            std::cerr << "vision: window_features=" << vision->max_window_features
+                      << " budget=" << vision->budget_bytes
+                      << " encoder=" << vision->encoder_workspace_bytes
+                      << " output=" << vision->output_capacity_bytes
+                      << " active=" << vision->output_active_bytes
+                      << " peak=" << vision->output_peak_bytes << '\n';
         else
             std::cerr << "vision workspace is absent\n";
         return 1;
@@ -175,9 +170,9 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
 int exercise_vision(ninfer::Engine& engine) {
     engine.reset_measurement_peaks();
     const auto before = engine.snapshot().ranks.at(0).memory;
-    if (!before.vision || before.vision->handoff_active_bytes != 0 ||
-        before.vision->handoff_peak_bytes != 0) {
-        std::cerr << "35B Vision handoff peak did not reset before Vision\n";
+    if (!before.vision || before.vision->output_active_bytes != 0 ||
+        before.vision->output_peak_bytes != 0) {
+        std::cerr << "35B Vision output peak did not reset before Vision\n";
         return 1;
     }
     ninfer::MessagePart image;
@@ -209,13 +204,12 @@ int exercise_vision(ninfer::Engine& engine) {
     (void)engine.generate(engine.prepare_tokens({198}), greedy_options(1, false));
     const auto after = engine.snapshot().ranks.at(0).memory;
     if (!after.vision ||
-        after.vision->handoff_offset_bytes != before.vision->handoff_offset_bytes ||
-        after.vision->handoff_capacity_bytes != before.vision->handoff_capacity_bytes ||
-        after.vision->handoff_active_bytes != 0 || after.vision->handoff_peak_bytes == 0 ||
-        after.vision->handoff_peak_bytes > after.vision->handoff_capacity_bytes ||
+        after.vision->output_capacity_bytes != before.vision->output_capacity_bytes ||
+        after.vision->output_active_bytes != 0 || after.vision->output_peak_bytes == 0 ||
+        after.vision->output_peak_bytes > after.vision->output_capacity_bytes ||
         after.workspace.measurement_peak_bytes == 0 ||
         after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
-        std::cerr << "35B Vision request did not use the startup-frozen workspace handoff\n";
+        std::cerr << "35B Vision request did not use the startup-frozen output window\n";
         return 1;
     }
     return 0;
@@ -229,13 +223,10 @@ int exercise_maximum_configuration(const char* artifact) {
         engine.description().kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
         memory.allocations.context_device_bytes == 0 ||
         memory.allocations.persistent_device_bytes == 0 ||
-
         memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
-        vision->handoff_offset_bytes > memory.allocations.workspace_device_bytes ||
-        vision->handoff_capacity_bytes == 0 ||
-        vision->handoff_capacity_bytes >
-            memory.allocations.workspace_device_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 ||
+        vision->output_capacity_bytes == 0 ||
+        vision->output_capacity_bytes > memory.allocations.persistent_device_bytes ||
+        vision->output_active_bytes != 0 ||
         !engine.startup_report().ranks.at(0).graphs.has_value()) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << engine.description().max_context

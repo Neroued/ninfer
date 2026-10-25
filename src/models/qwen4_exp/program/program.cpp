@@ -228,6 +228,10 @@ RankMemoryBudget RankProgram::resource_budget() const {
 
 RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_resources(); }
 
+MemorySpan RankProgram::input_storage() {
+    return impl_->resources.vision ? impl_->resources.vision->staging() : MemorySpan{};
+}
+
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
 } // namespace ninfer::models::qwen4_exp

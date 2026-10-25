@@ -30,48 +30,6 @@ void SessionImpl::initialize_prefill(RequestControl& request, std::uint32_t base
     staged.prompt_tokens        = plan.summary.prompt_tokens;
     staged.reuse                = base ? PrefixReusePath::Checkpoint : PrefixReusePath::Root;
     initialize_captures(request, base, plan.summary.prompt_tokens);
-    if (plan.vision_control_plan) {
-        auto& vision        = staged.vision_plan.emplace();
-        vision.control_plan = plan.vision_control_plan;
-        vision.control      = std::make_shared<qwen::VisionControl>(
-            qwen::build_vision_control(staged.prompt, *vision.control_plan, 0));
-        for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
-            const auto& item = vision.control_plan->items[i];
-            if (item.token_end <= base) { continue; }
-            vision.uses.push_back({item.token_begin, item.token_end, i, i});
-            vision.max_merged_count = std::max(vision.max_merged_count, item.merged_count);
-        }
-        if (!vision.uses.empty()) {
-            staged.vision = std::make_shared<qwen::VisionExecutionInput>(
-                qwen::VisionExecutionInput{staged.prompt_tokens, staged.prompt.vision_items,
-                                           staged.prompt.media_payloads, vision});
-        }
-    }
-}
-
-void SessionImpl::initialize_replay(std::uint32_t lane) {
-    auto& request = requests[lane];
-    request.replay.reset();
-    if (!request.base->vision_control_plan ||
-        request.replay_cursor >= request.base->summary.prompt_tokens)
-        return;
-    const auto& prompt = *request.base->prompt;
-    auto& replay       = request.replay.emplace();
-    replay.base = replay.cursor = request.replay_cursor;
-    replay.prompt_tokens        = request.base->summary.prompt_tokens;
-    auto& vision                = replay.vision_plan.emplace();
-    vision.control_plan         = request.base->vision_control_plan;
-    vision.control              = std::make_shared<qwen::VisionControl>(
-        qwen::build_vision_control(prompt, *vision.control_plan, 0));
-    for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
-        const auto& item = vision.control_plan->items[i];
-        if (item.token_end <= request.replay_cursor) continue;
-        vision.uses.push_back({item.token_begin, item.token_end, i, i});
-        vision.max_merged_count = std::max(vision.max_merged_count, item.merged_count);
-    }
-    if (!vision.uses.empty())
-        replay.vision = std::make_shared<qwen::VisionExecutionInput>(qwen::VisionExecutionInput{
-            replay.prompt_tokens, prompt.vision_items, prompt.media_payloads, vision});
 }
 
 BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
@@ -123,6 +81,16 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     } else
         first =
             next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind, resume_tokens);
+    if (base.impl_->vision &&
+        (first.kind == ExecutionUnitKind::Prefill || first.kind == ExecutionUnitKind::Replay)) {
+        first.main_frontier =
+            vision::Window{}.limit({}, base.impl_->vision->units, transaction.reuse_frontier,
+                                   first.main_frontier, plan.vision_max_features);
+        first.backend_frontier = speculative_backend == SpeculativeBackend::Mtp
+                                     ? (first.main_frontier ? first.main_frontier - 1 : 0)
+                                 : has_backend_pool() ? first.main_frontier
+                                                      : 0;
+    }
     transaction.first_unit = transaction.reservation_demand = first;
     if (resume) {
         auto coverage =
@@ -361,7 +329,6 @@ void SessionImpl::install_binding(BindOperation& tx) {
             state.continuation.metadata.backend_kv_valid        = tx.backend_frontier;
             state.continuation.metadata.dflash_context_frontier = tx.reuse_frontier;
             initialize_captures(request, tx.reuse_frontier, request.replay_target);
-            initialize_replay(tx.lane);
         }
         request.sampling_host = request.base->sampling;
     } else {

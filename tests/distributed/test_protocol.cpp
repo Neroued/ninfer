@@ -82,9 +82,6 @@ q::WorkRow row() {
 
 void native_work() {
     q::VisionInputBindings bindings;
-    auto vision           = std::make_shared<models::qwen::VisionExecutionInput>();
-    vision->prompt_tokens = 37;
-    bindings.install(91, vision);
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
     const auto original = row();
@@ -143,21 +140,30 @@ void native_work() {
     wire::Decoder truncated{std::span(bytes).first(bytes.size() - 1)};
     rejects([&] { (void)q::decode_work(truncated, bindings); });
 
-    q::Work bind{{}, q::ContextWork{{{original.member, original.sampling, {4, 5}, vision}}, {}}};
-    wire::Encoder encoded_binding;
-    q::encode_work(encoded_binding, bind, bindings, 0);
-    const auto binding_bytes = std::move(encoded_binding).take();
-    wire::Decoder binding_input(binding_bytes);
-    const auto bound = q::decode_work(binding_input, bindings);
-    bindings.release(91);
-    require(std::get<q::ContextWork>(bound.operation).bindings[0].vision == vision,
-            "decoded binding lost its input owner");
-    std::weak_ptr<const models::qwen::VisionExecutionInput> owner = vision;
-    vision.reset();
-    std::get<q::ContextWork>(bind.operation).bindings.clear();
-    require(!owner.expired(), "decoded binding did not retain the installed input");
-    wire::Decoder missing_binding(binding_bytes);
-    rejects([&] { (void)q::decode_work(missing_binding, bindings); });
+    auto window         = std::make_shared<models::vision::WindowPlan>();
+    window->features    = 2;
+    window->consume_end = 23;
+    window->outputs     = {{0, 0, {21, 22}}};
+    auto input_owner    = std::make_shared<models::qwen::VisionWindowInput>();
+    const models::vision::WindowUse use{91, original.member, window, true};
+    bindings.install({use, input_owner});
+    q::ForwardWork producer;
+    producer.rows   = {original};
+    producer.visual = models::qwen::VisionWork{use, input_owner};
+    q::Work producing{{}, producer};
+    wire::Encoder encoded_producer;
+    q::encode_work(encoded_producer, producing, bindings, 0);
+    const auto producer_bytes = std::move(encoded_producer).take();
+    wire::Decoder producer_input(producer_bytes);
+    const auto produced = q::decode_work(producer_input, bindings);
+    producer_input.finish();
+    require(std::get<q::ForwardWork>(produced.operation).visual->input == input_owner,
+            "producing ticket must retain its raw input owner");
+    bindings.release_payload(91);
+    const auto continuation = bindings.get(91, false);
+    require(!continuation.input && continuation.window.plan == window,
+            "input retirement must retain the frozen output mapping");
+    rejects([&] { (void)bindings.get(91, true); });
 
     auto prefill_row           = original;
     prefill_row.ids            = {23, 24};

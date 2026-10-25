@@ -70,6 +70,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.u32(o.speculative.draft_tokens);
     out.u8(static_cast<std::uint8_t>(o.speculative.proposal_head));
     out.boolean(o.enable_vision);
+    out.u64(o.vision_memory_budget_bytes);
     out.boolean(o.use_cuda_graph);
     out.boolean(o.observability.gpu_timing);
     out.boolean(o.context_cache.enabled);
@@ -124,6 +125,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     o.speculative.draft_tokens          = in.u32();
     o.speculative.proposal_head         = static_cast<ProposalHead>(in.u8());
     o.enable_vision                     = in.boolean();
+    o.vision_memory_budget_bytes        = in.u64();
     o.use_cuda_graph                    = in.boolean();
     o.observability.gpu_timing          = in.boolean();
     o.context_cache.enabled             = in.boolean();
@@ -175,7 +177,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
             out.u64(part.record.alignment);
         }
     }
-    out.u64(p.vision_max_merged_tokens);
+    out.u32(p.vision_max_features);
     out.u32(p.checkpoint_interval);
     out.u32(r.capacity.compute_frames);
     out.u32(r.capacity.context_frames);
@@ -216,11 +218,11 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
         pool.parts.resize(in.count(20));
         for (auto& part : pool.parts) part = {in.u32(), {in.u64(), in.u64()}};
     }
-    p.vision_max_merged_tokens = in.u64();
-    p.checkpoint_interval      = in.u32();
-    r.capacity                 = {in.u32(), in.u32()};
-    r.budget                   = runtime::protocol::memory_budget(in);
-    r.observation              = runtime::protocol::rank_snapshot(in);
+    p.vision_max_features = in.u32();
+    p.checkpoint_interval = in.u32();
+    r.capacity            = {in.u32(), in.u32()};
+    r.budget              = runtime::protocol::memory_budget(in);
+    r.observation         = runtime::protocol::rank_snapshot(in);
     return r;
 }
 } // namespace ninfer::models::qwen4_exp

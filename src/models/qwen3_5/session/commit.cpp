@@ -351,6 +351,20 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
     }
     if (!execution || execution->ticket != event.ticket || !execution->committed)
         throw std::logic_error("execution retired before its resolution");
+    if (execution->vision_id) {
+        const auto* window = vision_window.current();
+        bool complete      = execution->discarded;
+        if (window && valid_sequence(window->owner.sequence)) {
+            const auto& state = sequences[lane(window->owner.sequence)];
+            complete |=
+                state.continuation.metadata.execution_frontier >= window->plan->consume_end &&
+                (speculative_backend != SpeculativeBackend::Mtp ||
+                 backend_kv_valid(state) >= window->plan->consume_end - 1);
+        } else
+            complete = true;
+        vision_window.consumed(execution->vision_id, complete);
+        vision_window.retired(event.ticket);
+    }
     auto current = std::move(*execution);
     execution.reset();
     current.preparation->mark_completed();
@@ -366,7 +380,6 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
         if (current.kind == OperationKind::Replay &&
             request.replay_cursor == request.replay_target && !request.capture_pending) {
             request.lifecycle = request.resume_lifecycle;
-            request.replay.reset();
             if (request.lifecycle == Lifecycle::Prefilling)
                 initialize_captures(request, request.replay_target,
                                     request.base->summary.prompt_tokens);

@@ -63,25 +63,8 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
 
     const auto generated = std::span<const TokenId>(sequence.identity.tokens)
                                .subspan(sequence.request->summary.prompt_tokens);
-    ResidencyBinding result{member(sequence),
-                            sequence.request->sampling,
-                            {generated.begin(), generated.end()},
-                            sequence.request->vision};
-    if (result.vision) {
-        auto suffix = std::make_shared<qwen::VisionExecutionInput>(*result.vision);
-        std::erase_if(suffix->plan.uses,
-                      [&](const auto& use) { return use.end <= operation.frontier; });
-        if (suffix->plan.uses.empty())
-            result.vision.reset();
-        else {
-            suffix->plan.max_merged_count = 0;
-            for (const auto& use : suffix->plan.uses)
-                suffix->plan.max_merged_count =
-                    std::max(suffix->plan.max_merged_count,
-                             suffix->plan.control->items[use.control_index].merged_count);
-            result.vision = std::move(suffix);
-        }
-    }
+    ResidencyBinding result{
+        member(sequence), sequence.request->sampling, {generated.begin(), generated.end()}};
     operation.binding = std::move(binding);
     return result;
 }

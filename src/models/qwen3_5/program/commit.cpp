@@ -129,12 +129,25 @@ void RankProgramImpl::retire_compute() {
     auto ticket  = compute->request.ticket;
     auto command = compute->last_command;
     if (compute_actions->occupied()) compute_actions->finish();
-    if (compute->commit) {
-        for (std::size_t i = 0; i < compute->commit->rows.size(); ++i) {
-            if (!compute->commit->rows[i].terminal && !compute->commit->rows[i].discarded) continue;
-            auto& residency = residencies[compute->rows[i].member.residency.lane.value];
-            residency.vision.reset();
-            residency.vision_input.reset();
+    if (resources.vision) {
+        const auto* active = resources.vision->current();
+        if (active) {
+            const bool reads_window =
+                std::any_of(compute->rows.begin(), compute->rows.end(), [&](const auto& row) {
+                    return row.member.residency == active->owner.residency;
+                });
+            bool release = compute->cancelled && reads_window;
+            if (const auto* forward = std::get_if<ForwardWork>(&compute->request.work.operation))
+                for (const auto& input : forward->inputs)
+                    if (input.visual && input.visual->window.id == active->id)
+                        release |=
+                            input.prompt_begin + input.tokens.size() >= active->plan->consume_end;
+            if (compute->commit)
+                for (std::size_t i = 0; i < compute->commit->rows.size(); ++i)
+                    if (compute->rows[i].member.residency == active->owner.residency)
+                        release |=
+                            compute->commit->rows[i].terminal || compute->commit->rows[i].discarded;
+            if (release) resources.vision->release(active->id);
         }
     }
     auto observation = retirement_observation();

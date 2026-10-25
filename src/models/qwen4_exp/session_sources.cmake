@@ -1,5 +1,4 @@
 target_sources(ninfer_model_control PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/parallel/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/session.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/request.cpp"

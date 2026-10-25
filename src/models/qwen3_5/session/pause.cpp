@@ -110,9 +110,8 @@ std::vector<PauseOption> SessionImpl::pause_options(SequenceHandle handle) const
                               : state.continuation.metadata.execution_frontier;
     bool can_snapshot   = control.lifecycle != Lifecycle::Replaying && frontier && state.kv &&
                         state_store->valid(state.continuation.image);
-    if (can_snapshot && control.base->vision_control_plan)
-        for (const auto& item : control.base->vision_control_plan->items)
-            if (item.token_begin < frontier && frontier < item.token_end) can_snapshot = false;
+    if (can_snapshot && control.base->vision)
+        can_snapshot = control.base->vision->can_checkpoint(frontier);
 
     ContextReleaseSet optional_storage;
     if (state.pending_write.valid() &&
@@ -323,10 +322,7 @@ bool SessionImpl::begin_pause(SequenceHandle handle, runtime::PauseAction action
                       : control.lifecycle == Lifecycle::Replaying
                           ? control.replay_target
                           : state.continuation.metadata.execution_frontier;
-    if (control.lifecycle == Lifecycle::Replaying) {
-        control.lifecycle = control.resume_lifecycle;
-        control.replay.reset();
-    }
+    if (control.lifecycle == Lifecycle::Replaying) { control.lifecycle = control.resume_lifecycle; }
     if (save_snapshot) {
         saved->snapshot = detach_checkpoint(state, std::move(pause_reservation_->checkpoint));
         if (!saved->snapshot) throw std::logic_error("prepared pause lost its complete checkpoint");

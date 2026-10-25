@@ -5,6 +5,7 @@
 #include "runtime/executor/protocol.h"
 #include "runtime/executor/input.h"
 #include "models/common/qwen/vision/control.h"
+#include "models/common/vision/input.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -24,6 +25,8 @@ public:
     [[nodiscard]] runtime::protocol::ControlBudget control_budget() const noexcept {
         return budget_;
     }
+
+    void bind_input_storage(MemorySpan storage) { receiver_.bind(storage); }
 
     void validate_work(const Work&, runtime::FrameKind) const;
     void validate_decision(const Work&, const runtime::DecisionRequest&,
@@ -48,26 +51,19 @@ public:
                                                const std::vector<std::optional<Result>>&) const;
 
 private:
+    struct ReceivingInput {
+        vision::WindowUse window;
+        std::shared_ptr<qwen::VisionWindowInput> input;
+    };
+
     WorkContract contract_;
     runtime::protocol::ControlBudget budget_;
     runtime::protocol::Scope scope_;
     VisionInputBindings inputs_;
 
-    struct InputOwner {
-        std::shared_ptr<const qwen::VisionExecutionInput> input;
-        std::size_t references = 0;
-    };
-
-    struct ReceivingInput {
-        std::shared_ptr<qwen::VisionExecutionInput> input;
-        std::vector<std::shared_ptr<models::frontend::PreparedMediaPayload>> parts;
-        std::vector<std::size_t> received;
-    };
-
-    std::map<std::uint64_t, InputOwner> input_owners_;
-    std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint64_t> residency_inputs_;
-    std::map<std::uint64_t, ReceivingInput> receiving_;
-    std::uint64_t next_input_ = 0;
+    vision::InputReceiver receiver_;
+    std::optional<ReceivingInput> receiving_;
+    std::uint32_t rank_ = 0, ranks_ = 1, max_features_ = 0;
 };
 
 } // namespace ninfer::models::qwen4_exp

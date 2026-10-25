@@ -64,6 +64,7 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
         const auto& session = rank.session;
         if (session.shape != plan.session.shape ||
             session.checkpoint_interval != plan.session.checkpoint_interval ||
+            session.vision_max_features != plan.session.vision_max_features ||
             session.context.pools.size() != plan.session.context.pools.size())
             throw std::invalid_argument("Qwen4Exp rank execution semantics differ");
         auto& context = plan.session.context;
@@ -101,6 +102,9 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     : contract_{rank.session.shape, definition.config().text.vocabulary,
                 definition.resources().text.public_token_count, definition.options().mtp(),
                 definition.options().vision} {
+    rank_               = rank.observation.rank;
+    ranks_              = topology.ranks.size();
+    max_features_       = rank.session.vision_max_features;
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);

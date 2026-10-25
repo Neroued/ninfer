@@ -53,9 +53,6 @@ void RankProgramImpl::finish_control_window() {
     if (f.control_window) {
         auto& result = f.result.rows[f.control_row];
         result.processed += f.tokens;
-        if (auto ns = collect_vision_timing(binding(f.rows.front().member.residency),
-                                            f.rows.front().main_frontier + f.tokens))
-            f.gpu.add_vision(*ns);
         if (f.timer_started)
             f.gpu.add_prefill(
                 static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
@@ -73,12 +70,7 @@ void RankProgramImpl::finish_control_window() {
             return;
         }
     } else {
-        for (std::size_t b = 0; b < work.rows.size(); ++b) {
-            f.result.rows[b].processed = 1;
-            if (auto ns = collect_vision_timing(binding(work.rows[b].member.residency),
-                                                work.rows[b].main_frontier + 1))
-                f.gpu.add_vision(*ns);
-        }
+        for (std::size_t b = 0; b < work.rows.size(); ++b) { f.result.rows[b].processed = 1; }
     }
     f.rows           = work.rows;
     f.control_row    = 0;

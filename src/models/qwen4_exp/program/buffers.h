@@ -50,7 +50,6 @@ struct BufferLayout {
     std::optional<TensorRegion> logits;
     std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
     std::optional<TensorRegion> proposal_sampling;
-    std::optional<TensorRegion> vision_features;
     std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };

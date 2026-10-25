@@ -27,10 +27,12 @@ using ContextAssessment = context::ContextAssessment;
 using ContextReleaseSet = context::ContextReleaseSet;
 
 struct ResourceReservation {
-    bool reserved = false;
+    runtime::UnitReservationStatus status = runtime::UnitReservationStatus::ContextUnavailable;
     ContextAssessment assessment;
 
-    explicit operator bool() const noexcept { return reserved; }
+    explicit operator bool() const noexcept {
+        return status == runtime::UnitReservationStatus::Granted;
+    }
 };
 
 using CheckpointHandle = context::CheckpointHandle;
@@ -273,6 +275,9 @@ private:
 
 class Session {
 public:
+    [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
+    void yield_prefill(SequenceHandle);
+
     using ContextDemand     = qwen4_exp::ContextDemand;
     using ContextAssessment = qwen4_exp::ContextAssessment;
     using ContextReleaseSet = qwen4_exp::ContextReleaseSet;

@@ -39,7 +39,7 @@ ninfer_add_test(ninfer_glm5next_protocol_test
 
 add_executable(ninfer_glm5next_loading_test "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp")
 ninfer_test_includes(ninfer_glm5next_loading_test)
-target_link_libraries(ninfer_glm5next_loading_test PRIVATE ninfer_model_loading)
+target_link_libraries(ninfer_glm5next_loading_test PRIVATE ninfer_model_execution)
 foreach(mode IN ITEMS host gpu)
   add_test(NAME ninfer_glm5next_loading_${mode}_test
     COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_loading.py"
@@ -48,3 +48,20 @@ foreach(mode IN ITEMS host gpu)
 endforeach()
 set_tests_properties(ninfer_glm5next_loading_gpu_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 set_tests_properties(ninfer_glm5next_loading_host_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
+add_executable(ninfer_glm5next_execution_resources_test "${CMAKE_CURRENT_LIST_DIR}/test_execution_resources.cpp")
+ninfer_test_includes(ninfer_glm5next_execution_resources_test)
+target_link_libraries(ninfer_glm5next_execution_resources_test PRIVATE ninfer_model_execution)
+foreach(mode IN ITEMS host gpu)
+  add_test(NAME ninfer_glm5next_execution_resources_${mode}_test
+    COMMAND ninfer_glm5next_execution_resources_test --${mode})
+endforeach()
+set_tests_properties(ninfer_glm5next_execution_resources_host_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+set_tests_properties(ninfer_glm5next_execution_resources_gpu_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_add_test(ninfer_glm5next_vision_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision.cpp"
+    LIBRARIES ninfer_model_execution)
+  set_tests_properties(ninfer_glm5next_vision_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+endif()

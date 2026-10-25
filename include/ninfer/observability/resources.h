@@ -21,18 +21,15 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8KeyNvfp4Value,
 };
 
-// Logical Vision regions within existing backing; these are subsets of owned allocations.
-// Handoff offsets refer to persistent or workspace backing as indicated.
-struct VisionWorkspaceMemorySummary {
-    bool handoff_in_persistent            = false;
-    std::uint32_t aggregate_prompt_tokens = 0;
-    std::uint32_t max_item_tokens         = 0;
-    std::size_t general_capacity_bytes    = 0;
-    std::size_t encode_required_bytes     = 0;
-    std::size_t handoff_offset_bytes      = 0;
-    std::size_t handoff_capacity_bytes    = 0;
-    std::size_t handoff_active_bytes      = 0;
-    std::size_t handoff_peak_bytes        = 0;
+// Vision fields describe subsets of the instance's owned allocations.
+struct VisionMemorySummary {
+    std::size_t budget_bytes            = 0;
+    std::uint32_t max_window_features   = 0;
+    std::size_t encoder_workspace_bytes = 0;
+    std::size_t output_capacity_bytes   = 0;
+    std::size_t input_staging_bytes     = 0;
+    std::size_t output_active_bytes     = 0;
+    std::size_t output_peak_bytes       = 0;
 };
 
 struct MoeMemorySummary {
@@ -107,7 +104,7 @@ struct PleReadStats {
 struct RankMemoryUsage {
     MemoryAllocations allocations;
     WorkspaceUsage workspace;
-    std::optional<VisionWorkspaceMemorySummary> vision;
+    std::optional<VisionMemorySummary> vision;
     std::optional<MoeMemorySummary> experts;
     std::optional<PleReadStats> ple;
 };

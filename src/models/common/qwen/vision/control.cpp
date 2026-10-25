@@ -31,191 +31,149 @@ std::size_t checked_mul(std::size_t left, std::size_t right, const char* label) 
 
 } // namespace
 
-VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
-                                      const VisionConfig& config) {
-    const auto merge         = checked_i32(config.spatial_merge_size, "merge size");
-    const auto position_side = checked_i32(config.position_grid_side, "position grid side");
-    if (merge <= 0 || position_side <= 0) {
-        throw std::invalid_argument("Vision control geometry must be positive");
-    }
-    if (prompt.token_ids.size() != prompt.token_types.size()) {
-        throw std::invalid_argument("vision control token types must cover the prompt");
-    }
-    VisionControlPlan plan{.spatial_merge_size = merge, .position_grid_side = position_side};
-    plan.items.reserve(prompt.vision_items.size());
-    std::size_t patch_cursor    = 0;
-    std::size_t token_cursor    = 0;
-    std::size_t next_span_begin = 0;
-    for (const models::frontend::VisionItem& item : prompt.vision_items) {
-        const std::int32_t t = item.grid.temporal;
-        const std::int32_t h = item.grid.height;
-        const std::int32_t w = item.grid.width;
-        if (t <= 0 || h <= 0 || w <= 0 || h % merge != 0 || w % merge != 0) {
-            throw std::invalid_argument(
-                "vision control grid must be positive and merge-aligned: " + std::to_string(t) +
-                "x" + std::to_string(h) + "x" + std::to_string(w));
-        }
-        const std::size_t item_patches =
-            checked_mul(checked_mul(static_cast<std::size_t>(t), static_cast<std::size_t>(h),
-                                    "temporal/spatial patch product"),
-                        static_cast<std::size_t>(w), "patch product");
-        if (item.patch_begin != patch_cursor || item.patch_count != item_patches) {
-            throw std::invalid_argument("vision control patch ranges are not canonical");
-        }
-        const std::size_t expected_spans =
-            item.modality == models::frontend::Modality::Video ? static_cast<std::size_t>(t) : 1;
-        if (item.token_spans.size() != expected_spans) {
-            throw std::invalid_argument("vision control token spans do not match modality grid");
-        }
-        std::size_t item_tokens = 0;
-        for (const models::frontend::TokenSpan& span : item.token_spans) {
-            if (span.count == 0 || span.begin > prompt.token_types.size() ||
-                span.count > prompt.token_types.size() - span.begin) {
-                throw std::invalid_argument("vision control token span exceeds prompt");
-            }
-            if (span.begin < next_span_begin) {
-                throw std::invalid_argument("vision control token spans are not ordered");
-            }
-            if (span.count > std::numeric_limits<std::size_t>::max() - item_tokens) {
-                throw std::overflow_error("vision control merged token count exceeds size_t");
-            }
-            item_tokens += span.count;
-            next_span_begin = span.begin + span.count;
-        }
-        if (item_tokens != item_patches / static_cast<std::size_t>(merge * merge)) {
-            throw std::invalid_argument("vision control token spans do not cover merged patches");
-        }
-        if (item.token_spans.front().begin > std::numeric_limits<std::uint32_t>::max() ||
-            item.token_spans.back().begin + item.token_spans.back().count >
-                std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("vision control token frontier exceeds uint32");
-        }
-        plan.items.push_back(VisionItemControlPlan{
-            .token_begin  = static_cast<std::uint32_t>(item.token_spans.front().begin),
-            .token_end    = static_cast<std::uint32_t>(item.token_spans.back().begin +
-                                                       item.token_spans.back().count),
-            .merged_count = item_tokens,
-        });
-        token_cursor += item_tokens;
-        patch_cursor += item_patches;
-    }
-    if (static_cast<std::uint64_t>(patch_cursor) != prompt.prepare.raw_patches ||
-        static_cast<std::uint64_t>(token_cursor) != prompt.prepare.vision_tokens ||
-        plan.items.size() != prompt.vision_items.size()) {
-        throw std::invalid_argument("vision control metadata does not cover prepared prompt");
-    }
-    return plan;
+bool VisionExecutionInput::can_checkpoint(std::uint32_t frontier) const noexcept {
+    return std::none_of(items.begin(), items.end(), [frontier](const auto& item) {
+        return item.begin < frontier && frontier < item.end;
+    });
 }
 
-VisionControl build_vision_control(const PreparedPromptData& prompt, const VisionControlPlan& plan,
-                                   std::uint32_t prepared_item_begin) {
-    if (plan.items.size() != prompt.vision_items.size() ||
-        prepared_item_begin > prompt.vision_items.size()) {
-        throw std::invalid_argument("vision control plan does not cover the prepared media");
-    }
-    const auto merge         = plan.spatial_merge_size;
-    const auto position_side = plan.position_grid_side;
-    if (merge <= 0 || position_side <= 0) {
-        throw std::invalid_argument("Vision control plan has no geometry");
-    }
-    VisionControl out;
-    out.prepared_item_begin = prepared_item_begin;
-    out.items.reserve(prompt.vision_items.size() - prepared_item_begin);
-    for (std::size_t item_index = prepared_item_begin; item_index < prompt.vision_items.size();
-         ++item_index) {
-        const models::frontend::VisionItem& item = prompt.vision_items[item_index];
-        const VisionItemControlPlan& input       = plan.items[item_index];
-        const std::int32_t t                     = item.grid.temporal;
-        const std::int32_t h                     = item.grid.height;
-        const std::int32_t w                     = item.grid.width;
-        const std::size_t item_patches           = item.patch_count;
-
-        VisionItemControl control;
-        control.modality       = item.modality;
-        control.grid           = item.grid;
-        control.patch_begin    = item.patch_begin;
-        control.patch_count    = item.patch_count;
-        control.merged_count   = input.merged_count;
-        control.segment_length = checked_i32(
-            checked_mul(static_cast<std::size_t>(h), static_cast<std::size_t>(w), "segment length"),
-            "segment length");
-        control.segment_count = t;
-        control.position_ids.resize(checked_mul(item_patches, 2, "position id count"));
-        control.position_table_indices.reserve(
-            checked_mul(item_patches, 4, "position table index count"));
-        control.position_table_weights.reserve(
-            checked_mul(item_patches, 4, "position table weight count"));
-        const auto expected = static_cast<std::uint8_t>(item.modality);
-        for (const models::frontend::TokenSpan& span : item.token_spans) {
-            if (!std::all_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
-                             prompt.token_types.begin() +
-                                 static_cast<std::ptrdiff_t>(span.begin + span.count),
-                             [expected](std::uint8_t value) { return value == expected; })) {
-                throw std::invalid_argument("vision control token span modality mismatch");
-            }
-            for (std::size_t i = 0; i < span.count; ++i) {
-                control.scatter_indices.push_back(checked_i32(span.begin + i, "scatter index"));
-            }
+std::shared_ptr<const VisionExecutionInput> prepare_vision_input(const PreparedPromptData& prompt,
+                                                                 const VisionConfig& config,
+                                                                 std::uint32_t capacity) {
+    const auto merge = checked_i32(config.spatial_merge_size, "merge size");
+    if (merge <= 0 || !config.position_grid_side ||
+        prompt.token_ids.size() != prompt.token_types.size() ||
+        prompt.media_payloads.size() != prompt.vision_items.size())
+        throw std::invalid_argument("Vision prepared input has incomplete geometry or media");
+    auto out                 = std::make_shared<VisionExecutionInput>();
+    out->config              = config;
+    out->vision_items        = prompt.vision_items;
+    out->media_payloads      = prompt.media_payloads;
+    std::size_t patch_cursor = 0, token_count = 0, previous_end = 0;
+    for (std::size_t index = 0; index < prompt.vision_items.size(); ++index) {
+        const auto& item = prompt.vision_items[index];
+        const auto& grid = item.grid;
+        if (grid.temporal <= 0 || grid.height <= 0 || grid.width <= 0 || grid.height % merge ||
+            grid.width % merge ||
+            (item.modality == models::frontend::Modality::Image && grid.temporal != 1))
+            throw std::invalid_argument("Vision grid must be positive and merge-aligned");
+        const auto patches =
+            checked_mul(checked_mul(grid.temporal, grid.height, "grid"), grid.width, "grid");
+        if (item.patch_begin != patch_cursor || item.patch_count != patches ||
+            item.token_spans.size() != static_cast<std::size_t>(grid.temporal))
+            throw std::invalid_argument("Vision patch ranges or temporal spans are incomplete");
+        const auto& payload = prompt.media_payloads[index];
+        if (!payload || payload->features_per_patch != config.patch_width() ||
+            payload->span().size() != checked_mul(patches, config.patch_width(), "patch payload"))
+            throw std::invalid_argument("Vision item has an invalid patch payload");
+        for (const auto& span : item.token_spans) {
+            if (!span.count || span.begin < previous_end ||
+                span.begin > prompt.token_types.size() ||
+                span.count > prompt.token_types.size() - span.begin)
+                throw std::invalid_argument("Vision token spans are not ordered prompt ranges");
+            const auto expected = static_cast<std::uint8_t>(item.modality);
+            if (!std::all_of(prompt.token_types.begin() + span.begin,
+                             prompt.token_types.begin() + span.begin + span.count,
+                             [expected](auto value) { return value == expected; }))
+                throw std::invalid_argument("Vision token span modality mismatch");
+            token_count += span.count;
+            previous_end = span.begin + span.count;
         }
-
-        std::size_t position_cursor = 0;
-        for (std::int32_t temporal = 0; temporal < t; ++temporal) {
-            for (std::int32_t block_y = 0; block_y < h / merge; ++block_y) {
-                for (std::int32_t block_x = 0; block_x < w / merge; ++block_x) {
-                    for (std::int32_t inner_y = 0; inner_y < merge; ++inner_y) {
-                        for (std::int32_t inner_x = 0; inner_x < merge; ++inner_x) {
-                            const std::int32_t y                  = block_y * merge + inner_y;
-                            const std::int32_t x                  = block_x * merge + inner_x;
-                            control.position_ids[position_cursor] = y;
-                            control.position_ids[item_patches + position_cursor] = x;
-                            ++position_cursor;
-
-                            const float yf        = coordinate(y, h, position_side);
-                            const float xf        = coordinate(x, w, position_side);
-                            const auto y0         = static_cast<std::int32_t>(yf);
-                            const auto x0         = static_cast<std::int32_t>(xf);
-                            const std::int32_t y1 = std::min(y0 + 1, position_side - 1);
-                            const std::int32_t x1 = std::min(x0 + 1, position_side - 1);
-                            const float wy        = yf - static_cast<float>(y0);
-                            const float wx        = xf - static_cast<float>(x0);
-                            control.position_table_indices.insert(
-                                control.position_table_indices.end(),
-                                {y0 * position_side + x0, y0 * position_side + x1,
-                                 y1 * position_side + x0, y1 * position_side + x1});
-                            control.position_table_weights.insert(
-                                control.position_table_weights.end(),
-                                {(1.0F - wy) * (1.0F - wx), (1.0F - wy) * wx, wy * (1.0F - wx),
-                                 wy * wx});
-                        }
-                    }
-                }
-            }
-        }
-
-        if (position_cursor != item_patches || control.position_ids.size() != item_patches * 2 ||
-            control.position_table_indices.size() != item_patches * 4 ||
-            control.position_table_weights.size() != item_patches * 4 ||
-            control.scatter_indices.size() != input.merged_count ||
-            checked_mul(static_cast<std::size_t>(control.segment_length),
-                        static_cast<std::size_t>(control.segment_count),
-                        "segmented patch count") != item_patches) {
-            throw std::invalid_argument("vision item control metadata is incomplete");
-        }
-        out.items.push_back(std::move(control));
+        out->items.push_back(
+            {static_cast<std::uint32_t>(checked_i32(item.token_spans.front().begin, "item begin")),
+             static_cast<std::uint32_t>(checked_i32(previous_end, "item end"))});
+        patch_cursor += patches;
     }
-    if (out.items.size() != prompt.vision_items.size() - prepared_item_begin) {
-        throw std::invalid_argument("vision control metadata does not cover prepared prompt");
+    if (patch_cursor != prompt.prepare.raw_patches || token_count != prompt.prepare.vision_tokens)
+        throw std::invalid_argument("Vision metadata does not cover the prepared prompt");
+    out->units = vision_units(prompt.vision_items, config);
+    vision::validate_units(out->units, capacity, prompt.token_ids.size());
+    return out;
+}
+
+std::vector<vision::Unit> vision_units(std::span<const models::frontend::VisionItem> items,
+                                       const VisionConfig& config) {
+    std::vector<vision::Unit> out;
+    const auto merge = std::uint64_t(config.spatial_merge_size) * config.spatial_merge_size;
+    for (std::uint32_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        const auto patches =
+            checked_i32(std::uint64_t(item.grid.height) * item.grid.width, "segment patches");
+        if (item.token_spans.size() != static_cast<std::size_t>(item.grid.temporal) ||
+            patches % merge != 0)
+            throw std::invalid_argument("Vision temporal grids differ from their token spans");
+        for (std::uint32_t t = 0; t < item.token_spans.size(); ++t) {
+            const auto& span = item.token_spans[t];
+            if (span.count != patches / merge)
+                throw std::invalid_argument("Vision grid does not cover its feature span");
+            const auto linear =
+                std::uint64_t(4) * config.hidden_size + std::uint64_t(2) * config.intermediate_size;
+            out.push_back({i, t, std::uint64_t(t) * patches, static_cast<std::uint32_t>(patches),
+                           static_cast<std::uint32_t>(checked_i32(span.begin, "token position")),
+                           static_cast<std::uint32_t>(span.count),
+                           std::uint64_t(patches) * (linear + patches)});
+        }
     }
     return out;
 }
 
-std::uint32_t VisionPrefillPlan::window_end(std::uint32_t begin, std::uint32_t end) const {
-    const auto next = std::lower_bound(
-        uses.begin(), uses.end(), begin,
-        [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
-    if (next != uses.end() && next->begin < end && next + 1 != uses.end())
-        end = std::min(end, (next + 1)->begin);
-    return end;
+VisionEncoderBatch encoder_batch(const VisionExecutionInput& input, const vision::WindowPlan& plan,
+                                 std::uint32_t rank) {
+    VisionEncoderBatch out;
+    out.cu_seqlens.push_back(0);
+    std::vector<std::int32_t> x_positions;
+    for (const auto& placement : plan.placements) {
+        if (placement.rank != rank) continue;
+        const auto& unit    = plan.units.at(placement.unit);
+        const auto& source  = input.vision_items.at(unit.item);
+        const auto& payload = input.media_payloads.at(unit.item);
+        const auto first    = static_cast<std::size_t>(unit.patch_begin);
+        const auto count    = static_cast<std::size_t>(unit.patches);
+        if (!payload || first > source.patch_count || count > source.patch_count - first)
+            throw std::invalid_argument("Vision encoder unit exceeds its prepared input");
+        out.patches.push_back(payload->span().subspan(first * payload->features_per_patch,
+                                                      count * payload->features_per_patch));
+        const auto merge = static_cast<std::int32_t>(input.config.spatial_merge_size);
+        const auto side  = static_cast<std::int32_t>(input.config.position_grid_side);
+        const auto h = source.grid.height, w = source.grid.width;
+        for (std::int32_t by = 0; by < h / merge; ++by)
+            for (std::int32_t bx = 0; bx < w / merge; ++bx)
+                for (std::int32_t iy = 0; iy < merge; ++iy)
+                    for (std::int32_t ix = 0; ix < merge; ++ix) {
+                        const auto y = by * merge + iy, x = bx * merge + ix;
+                        out.positions.push_back(y);
+                        x_positions.push_back(x);
+                        const auto yf = coordinate(y, h, side), xf = coordinate(x, w, side);
+                        const auto y0 = static_cast<std::int32_t>(yf),
+                                   x0 = static_cast<std::int32_t>(xf);
+                        const auto y1 = std::min(y0 + 1, side - 1), x1 = std::min(x0 + 1, side - 1);
+                        const auto wy = yf - y0, wx = xf - x0;
+                        out.position_indices.insert(
+                            out.position_indices.end(),
+                            {y0 * side + x0, y0 * side + x1, y1 * side + x0, y1 * side + x1});
+                        out.position_weights.insert(
+                            out.position_weights.end(),
+                            {(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx});
+                    }
+        out.cu_seqlens.push_back(out.cu_seqlens.back() + unit.patches);
+        out.features += unit.features;
+    }
+    out.positions.insert(out.positions.end(), x_positions.begin(), x_positions.end());
+    return out;
+}
+
+VisionWork prepare_vision_work(vision::WindowUse use,
+                               std::shared_ptr<const VisionExecutionInput> source,
+                               std::uint32_t ranks) {
+    VisionWork out{std::move(use), {}};
+    if (!out.window.produce) return out;
+    if (!source) throw std::logic_error("Vision production has no prepared input");
+    auto input = std::make_shared<VisionWindowInput>();
+    for (std::uint32_t rank = 0; rank < ranks; ++rank)
+        input->batches.push_back(encoder_batch(*source, *out.window.plan, rank));
+    input->owner = std::move(source);
+    out.input    = std::move(input);
+    return out;
 }
 
 } // namespace ninfer::models::qwen

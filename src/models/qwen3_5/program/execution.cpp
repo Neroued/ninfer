@@ -112,17 +112,9 @@ void RankProgramImpl::progress() {
                 auto& result       = std::get<ForwardResult>(operation.result->output);
                 const auto& window = forward->inputs[operation.forward_row];
                 operation.forward_offset += operation.width;
-                const auto lane = operation.rows[operation.forward_row].member.residency.lane.value;
-                auto& residency = residencies[lane];
-                if (residency.vision) {
-                    operation.gpu.add_vision(static_cast<std::uint64_t>(
-                        (residency.vision->elapsed_seconds() - operation.vision_before) * 1.0e9));
-                    if (window.prompt_begin + operation.forward_offset >=
-                        residency.vision_input->plan.uses.back().end) {
-                        residency.vision.reset();
-                        residency.vision_input.reset();
-                    }
-                }
+                if (window.visual && resources.vision)
+                    if (auto elapsed = resources.vision->take_timing())
+                        operation.gpu.add_vision(*elapsed);
                 if (operation.forward_offset == window.tokens.size()) {
                     result.processed_tokens.push_back(operation.forward_offset);
                     operation.forward_offset = 0;

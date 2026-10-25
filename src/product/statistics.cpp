@@ -179,7 +179,7 @@ Json resource_json(const RankSnapshot& rank) {
                {"required_peak_bytes", m.workspace.required_peak_bytes},
                {"measurement_peak_bytes", m.workspace.measurement_peak_bytes}}},
              {"physical_memory", nullptr},
-             {"vision_workspace", nullptr},
+             {"vision", nullptr},
              {"experts", nullptr},
              {"ple", nullptr}};
     if (rank.physical_memory) {
@@ -192,16 +192,14 @@ Json resource_json(const RankSnapshot& rank) {
                                   {"sampled_ns", p.sampled_ns}};
     }
     if (m.vision) {
-        const auto& v           = *m.vision;
-        out["vision_workspace"] = {{"handoff_in_persistent", v.handoff_in_persistent},
-                                   {"aggregate_prompt_tokens", v.aggregate_prompt_tokens},
-                                   {"max_item_tokens", v.max_item_tokens},
-                                   {"general_capacity_bytes", v.general_capacity_bytes},
-                                   {"encode_required_bytes", v.encode_required_bytes},
-                                   {"handoff_offset_bytes", v.handoff_offset_bytes},
-                                   {"handoff_capacity_bytes", v.handoff_capacity_bytes},
-                                   {"handoff_active_bytes", v.handoff_active_bytes},
-                                   {"handoff_peak_bytes", v.handoff_peak_bytes}};
+        const auto& v = *m.vision;
+        out["vision"] = {{"budget_bytes", v.budget_bytes},
+                         {"max_window_features", v.max_window_features},
+                         {"encoder_workspace_bytes", v.encoder_workspace_bytes},
+                         {"output_capacity_bytes", v.output_capacity_bytes},
+                         {"input_staging_bytes", v.input_staging_bytes},
+                         {"output_active_bytes", v.output_active_bytes},
+                         {"output_peak_bytes", v.output_peak_bytes}};
     }
     if (m.experts) {
         const auto& e  = *m.experts;

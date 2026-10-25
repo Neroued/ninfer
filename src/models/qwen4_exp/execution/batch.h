@@ -4,6 +4,7 @@
 #include "core/gdn_replay_records.h"
 
 #include <variant>
+#include <vector>
 
 namespace ninfer::models::qwen4_exp::execution {
 
@@ -32,9 +33,13 @@ struct TextOutputs {
     Tensor conditioning;
 };
 
-struct VisualEmbeddingView {
+struct VisualEmbeddingSlice {
     Tensor features;
     Tensor columns;
+};
+
+struct VisualEmbeddingView {
+    std::vector<VisualEmbeddingSlice> slices;
 };
 
 } // namespace ninfer::models::qwen4_exp::execution

@@ -6,7 +6,7 @@
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "models/common/moe/schedule.h"
-#include "models/common/qwen/vision/vision.h"
+#include "models/common/vision/resources.h"
 #include "models/qwen3_5/program/frames.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/state/state_image.h"
@@ -66,7 +66,7 @@ struct WorkspaceSpec {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
-    std::optional<qwen::VisionWorkspacePlan> vision;
+    std::optional<vision::Capacity> vision;
     std::size_t capacity = 0;
 };
 
@@ -108,6 +108,7 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
     Tensor token_counts;
+    std::optional<vision::Storage> vision;
     ExecutionFrame frame;
     std::unique_ptr<moe::Schedule> moe;
 };

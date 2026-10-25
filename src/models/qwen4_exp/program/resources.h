@@ -63,6 +63,7 @@ private:
     CudaStream ple_stream_;
     CudaExecutionView ple_transfer_;
 public:
+    std::optional<vision::Storage> vision;
     MemoryArena workspace;
     std::unique_ptr<StateViews> states;
     std::unique_ptr<QsaCache> main, mtp;

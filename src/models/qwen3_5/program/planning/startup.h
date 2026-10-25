@@ -39,6 +39,7 @@ struct SequencePlanningInputs {
     bool causal_scoring               = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    std::size_t vision_memory_budget_bytes = 0;
 };
 
 struct SequencePlanImpl {
@@ -59,6 +60,7 @@ struct SequencePlanImpl {
     bool causal_scoring               = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    std::size_t vision_memory_budget_bytes = 0;
     ResourceLayout persistent;
     WorkspaceSpec workspace;
     bool graph_probe                     = false;

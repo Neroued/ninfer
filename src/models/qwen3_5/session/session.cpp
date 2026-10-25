@@ -373,6 +373,17 @@ PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->p
 
 void Session::reset_measurement_peaks() { impl_->reset_measurement_peaks(); }
 
+std::optional<SequenceHandle> Session::prefill_continuation() const {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && impl_->valid_sequence(owner->sequence)) return owner->sequence;
+    return {};
+}
+
+void Session::yield_prefill(SequenceHandle sequence) {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && owner->sequence == sequence) impl_->vision_window.revoke(*owner);
+}
+
 } // namespace ninfer::models::qwen3_5
 
 namespace ninfer::models::qwen3_5::detail {
@@ -449,5 +460,6 @@ AbortResult SessionImpl::abort(SequenceHandle h) noexcept {
 }
 
 void SessionImpl::reset_measurement_peaks() { executor().reset_measurement_peaks(); }
+
 
 } // namespace ninfer::models::qwen3_5::detail

@@ -311,6 +311,9 @@ struct SessionEvent {
 
 class Session {
 public:
+    [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
+    void yield_prefill(SequenceHandle);
+
     using ContextDemand     = qwen3_5::ContextDemand;
     using ContextAssessment = qwen3_5::ContextAssessment;
     using ContextReleaseSet = qwen3_5::ContextReleaseSet;

@@ -146,7 +146,7 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     out.kv_storage          = source.kv_storage;
     out.proposal_head       = source.proposal_head;
     out.causal_scoring      = source.causal_scoring;
-    out.vision_workspace    = source.workspace.vision;
+    out.vision_max_features = source.workspace.vision ? source.workspace.vision->max_features : 0;
     const auto& image       = source.persistent.state_images;
     out.state_transfer      = image.images.transfer_work();
     if (image.dflash_local) {

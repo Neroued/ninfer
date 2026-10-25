@@ -117,6 +117,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::Vision:
             value = e.enable_vision;
             break;
+        case Field::VisionMemoryBudget:
+            value = std::uint64_t{e.vision_memory_budget_bytes};
+            break;
         case Field::Device:
             value = static_cast<std::uint64_t>(e.device);
             break;

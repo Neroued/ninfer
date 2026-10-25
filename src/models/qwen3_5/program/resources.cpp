@@ -120,9 +120,7 @@ Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
       work(workspace_storage.span().subspan(0, workspace.general_capacity)),
       decoder(context.span(), persistent.span(), layout.decoder),
       state_images(context.span(), layout.state_images), frame(persistent.span(), layout.frame) {
-    if (workspace.general_capacity == 0 ||
-        (workspace.vision &&
-         workspace.vision->general_capacity_bytes != workspace.general_capacity)) {
+    if (workspace.general_capacity == 0 || workspace.capacity < workspace.general_capacity) {
         throw std::invalid_argument("Qwen3.5 execution workspace layout is inconsistent");
     }
     if (layout.host_context_bytes) {
@@ -131,6 +129,7 @@ Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
         host_context = PinnedHostBuffer(layout.host_context_bytes);
         phase.complete(layout.host_context_bytes, layout.host_context_bytes);
     }
+    if (workspace.vision) vision.emplace(device, *workspace.vision);
     const auto backing = persistent.span();
     if (layout.replay_records) {
         replay_records.emplace(backing, *layout.replay_records);

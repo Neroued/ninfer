@@ -149,33 +149,13 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
     if (tokens == skip) visual.reset();
     const auto metadata = mtp_inputs(frame.history, rows, width, {inputs.data(), rows.size()});
     if (visual && skip) {
-        // A root skips the unconditioned first embedding in its MTP history.
-        const auto& input = *binding(rows.front().member.residency).vision_input;
-        const auto& plan  = input.plan;
-        const auto item   = std::find_if(plan.uses.begin(), plan.uses.end(), [&](const auto& use) {
-            return use.begin < std::uint64_t(first) + tokens && use.end > first;
-        });
-        if (item == plan.uses.end())
-            throw std::logic_error("MTP visual embedding has no input item");
-        const auto& control = plan.control->items[item->control_index];
-        const auto slice    = qwen::visual_embedding_slice(
-            control.scatter_indices, input.prompt_tokens, first + skip, tokens - skip);
-        if (slice.empty()) {
-            visual.reset();
-        } else {
-            const auto& region = *frame.history.visual_indices;
-            auto host = resources.mtp_ingress().subspan(region.region.offset - frame.ingress.offset,
-                                                        slice.size() * sizeof(std::int32_t));
-            std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-                      static_cast<std::int32_t*>(host.data));
-            auto indices = device_tensor(region).slice(0, 0, slice.size());
-            copy_bytes_async({indices.data, indices.bytes(), cuda.device()}, host, cuda);
-            const auto prior = qwen::visual_embedding_slice(control.scatter_indices,
-                                                            input.prompt_tokens, first, tokens);
-            visual           = execution::VisualEmbeddingView{
-                visual->features.slice(1, slice.source_begin - prior.source_begin, slice.size()),
-                indices};
-        }
+        const auto& forward = std::get<ForwardWork>(compute->request.work.operation);
+        if (!forward.visual) throw std::logic_error("MTP visual history has no window mapping");
+        const auto& region = *frame.history.visual_indices;
+        auto host = resources.mtp_ingress().subspan(region.region.offset - frame.ingress.offset,
+                                                    region.region.bytes);
+        visual =
+            visual_view(*forward.visual->window.plan, first + skip, tokens - skip, region, host);
     }
     execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
                            *parameters.mtp, aligned, metadata,

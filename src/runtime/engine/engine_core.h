@@ -549,6 +549,8 @@ private:
     [[nodiscard]] ExecutionUnit execution_unit(const Request& request) const;
 
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round);
+    [[nodiscard]] std::optional<std::uint32_t>
+    next_prefill(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
 
     // Admission can pin an existing writer's tail after its reservation. Membership must
     // observe current context dependencies, including pauses selected during reclamation.

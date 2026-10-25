@@ -210,6 +210,7 @@ struct ComputeTransaction {
     Kind kind;
     context::ContextTransaction context;
     runtime::ExecutionTicket ticket;
+    std::uint64_t vision_id = 0;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> extents;
@@ -323,6 +324,9 @@ public:
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
+    vision::Window vision_window;
+    [[nodiscard]] std::optional<qwen::VisionWork>
+    prepare_visual(const Sequence&, std::uint32_t begin, std::uint32_t end);
     const ExecutionShape& shape;
     runtime::Executor<ExecutionTypes>* executor = nullptr;
     context::ContextDirectory directory;

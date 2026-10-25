@@ -6,9 +6,7 @@ namespace ninfer::models::qwen4_exp::detail {
 
 bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
     if (!frontier) return false;
-    if (vision)
-        for (const auto& item : vision->plan.control_plan->items)
-            if (item.token_begin < frontier && frontier < item.token_end) return false;
+    if (vision && !vision->can_checkpoint(frontier)) return false;
     return true;
 }
 
@@ -29,28 +27,8 @@ std::shared_ptr<const qwen::VisionExecutionInput>
 SessionImpl::plan_vision(const qwen::PreparedPromptData& prompt) const {
     if (!definition->options().vision || !definition->config().vision)
         throw std::invalid_argument("Vision is disabled for this Engine");
-    const auto& config    = *definition->config().vision;
-    auto input            = std::make_shared<qwen::VisionExecutionInput>();
-    input->prompt_tokens  = prompt.token_ids.size();
-    input->vision_items   = prompt.vision_items;
-    input->media_payloads = prompt.media_payloads;
-    auto& vision          = input->plan;
-    vision.control_plan =
-        std::make_shared<qwen::VisionControlPlan>(qwen::plan_vision_control(prompt, config));
-    vision.control = std::make_shared<qwen::VisionControl>(
-        qwen::build_vision_control(prompt, *vision.control_plan, 0));
-    for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
-        const auto& item  = vision.control_plan->items[i];
-        const auto& media = input->media_payloads[i];
-        if (!media || media->features_per_patch != config.patch_width() ||
-            media->patch_elements != input->vision_items[i].patch_count * config.patch_width())
-            throw std::invalid_argument("Vision item has an invalid patch payload");
-        if (item.merged_count > plan.vision_max_merged_tokens)
-            throw std::invalid_argument("Vision item exceeds the prepared workspace envelope");
-        vision.uses.push_back({item.token_begin, item.token_end, i, i});
-        vision.max_merged_count = std::max(vision.max_merged_count, item.merged_count);
-    }
-    return input;
+    return qwen::prepare_vision_input(prompt, *definition->config().vision,
+                                      plan.vision_max_features);
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

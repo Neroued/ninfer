@@ -130,6 +130,19 @@ void SessionImpl::finish_result(ComputeResult result) {
 
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     auto& tx = *compute;
+    if (tx.vision_id) {
+        const auto* window = vision_window.current();
+        bool complete      = tx.discarded;
+        if (window && valid(window->owner.sequence)) {
+            const auto& metadata = sequence(window->owner.sequence).continuation.metadata;
+            complete |= metadata.main_frontier >= window->plan->consume_end &&
+                        (!metadata.mtp_frontier ||
+                         metadata.mtp_frontier.value_or(0) >= window->plan->consume_end - 1);
+        } else
+            complete = true;
+        vision_window.consumed(tx.vision_id, complete);
+        vision_window.retired(event.ticket);
+    }
     tx.context.mark_completed();
     tx.context.publish();
     if (tx.completion) {

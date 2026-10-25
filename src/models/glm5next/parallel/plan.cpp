@@ -138,8 +138,9 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     out.topology.plan = identity ? identity : 1;
     if (size > 1) {
         out.topology.groups.push_back({0, {0, 1}});
-        out.topology.roles = {
-            {"tensor", 0}, {"expert", 0}, {"attention", 0}, {"vocabulary", 0}, {"vision", 0}};
+        out.topology.groups.push_back({1, {0, 1}});
+        out.topology.roles = {{"tensor", 0},     {"expert", 0}, {"attention", 0},
+                              {"vocabulary", 0}, {"vision", 0}, {"context", 1}};
     }
     out.topology.validate(deployment);
     return out;

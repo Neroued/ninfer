@@ -9,7 +9,7 @@ namespace ninfer::models::qwen4_exp::execution {
 struct WorkspacePlan {
     std::size_t prefill = 0, ordinary = 0, verify = 0, mtp = 0, history = 0, finish = 0;
     std::size_t general_bytes = 0, bytes = 0;
-    std::optional<qwen::VisionWorkspacePlan> vision;
+    std::optional<vision::Capacity> vision;
 };
 
 [[nodiscard]] WorkspacePlan plan_workspace(const ModelProfile&, const EngineOptions&,

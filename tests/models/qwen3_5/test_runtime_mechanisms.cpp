@@ -1,4 +1,4 @@
-#include "models/common/qwen/vision/prefill.h"
+#include "models/common/vision/window.h"
 #include "core/layout.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/common/qwen/vision/control.h"
@@ -144,20 +144,22 @@ void test_decoder_layout() {
 }
 
 void test_visual_embedding_windows() {
-    const std::vector<std::int32_t> scatter{2, 4, 7};
-    const auto first = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 0, 4);
-    expect(first.source_begin == 0 && first.destination_columns == std::vector<std::int32_t>({2}),
-           "first input window selects only its visual columns");
-    const auto final = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 4, 4);
-    expect(final.source_begin == 1 &&
-               final.destination_columns == std::vector<std::int32_t>({0, 3}),
-           "last input window retains visual columns at both boundaries");
-    const auto shifted = ninfer::models::qwen::visual_embedding_slice(scatter, 8, 1, 3);
-    expect(shifted.source_begin == 0 &&
-               shifted.destination_columns == std::vector<std::int32_t>({1}),
-           "root MTP history uses token positions after its skipped first input");
-    expect(ninfer::models::qwen::visual_embedding_slice(scatter, 8, 8, 1).empty(),
-           "generated input beyond the prompt has no visual embedding");
+    ninfer::models::vision::WindowPlan plan;
+    plan.outputs     = {{0, 0, {2, 4, 7}}};
+    const auto first = ninfer::models::vision::embedding_slices(plan, 0, 4);
+    expect(first.size() == 1 && first[0].source_begin == 0 &&
+               first[0].destination_columns == std::vector<std::int32_t>{2},
+           "first window selects only its visual columns");
+    const auto final = ninfer::models::vision::embedding_slices(plan, 4, 4);
+    expect(final.size() == 1 && final[0].source_begin == 1 &&
+               final[0].destination_columns == std::vector<std::int32_t>({0, 3}),
+           "last window retains both visual boundaries");
+    const auto shifted = ninfer::models::vision::embedding_slices(plan, 1, 3);
+    expect(shifted.size() == 1 && shifted[0].source_begin == 0 &&
+               shifted[0].destination_columns == std::vector<std::int32_t>{1},
+           "MTP shifted history selects matching visual positions");
+    expect(ninfer::models::vision::embedding_slices(plan, 8, 1).empty(),
+           "generated tokens have no visual embedding");
 }
 
 void test_vision_control() {
@@ -183,35 +185,33 @@ void test_vision_control() {
                   .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
-    const ninfer::models::qwen::VisionControlPlan plan = ninfer::models::qwen::plan_vision_control(
-        prompt, {.spatial_merge_size = 2, .position_grid_side = 48});
-    const ninfer::models::qwen::VisionControl control =
-        ninfer::models::qwen::build_vision_control(prompt, plan, 0);
-    expect(control.items.size() == 2, "Vision per-item control count");
-    expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
-               control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
-               control.items[0].segment_count == 1 &&
-               control.items[0].scatter_indices == std::vector<std::int32_t>({1}) &&
-               control.items[0].position_ids.size() == 8 &&
-               control.items[0].position_table_indices.size() == 16 &&
-               control.items[0].position_table_weights.size() == 16,
-           "image item control offsets");
-    expect(control.items[1].patch_begin == 4 && control.items[1].patch_count == 8 &&
-               control.items[1].merged_count == 2 && control.items[1].segment_length == 4 &&
-               control.items[1].segment_count == 2 &&
-               control.items[1].scatter_indices == std::vector<std::int32_t>({3, 5}) &&
-               control.items[1].position_ids.size() == 16 &&
-               control.items[1].position_table_indices.size() == 32 &&
-               control.items[1].position_table_weights.size() == 32,
-           "video item control offsets");
-
-    const ninfer::models::qwen::VisionControl suffix =
-        ninfer::models::qwen::build_vision_control(prompt, plan, 1);
-    expect(suffix.prepared_item_begin == 1 && suffix.items.size() == 1 &&
-               suffix.items[0].patch_begin == control.items[1].patch_begin &&
-               suffix.items[0].scatter_indices == control.items[1].scatter_indices &&
-               suffix.items[0].position_ids == control.items[1].position_ids,
-           "Vision suffix control contents");
+    const ninfer::models::qwen::VisionConfig config{.patch_size          = 1,
+                                                    .temporal_patch_size = 1,
+                                                    .spatial_merge_size  = 2,
+                                                    .position_grid_side  = 48};
+    for (const auto& item : prompt.vision_items) {
+        auto payload = std::make_shared<ninfer::models::frontend::PreparedMediaPayload>();
+        payload->features_per_patch = config.patch_width();
+        payload->patch_elements     = item.patch_count * config.patch_width();
+        payload->patches            = std::make_unique<std::uint16_t[]>(payload->patch_elements);
+        prompt.media_payloads.push_back(std::move(payload));
+    }
+    const auto input = ninfer::models::qwen::prepare_vision_input(prompt, config, 2);
+    const auto plan  = ninfer::models::vision::plan_window(input->units, 2, 7, 2, 1);
+    const auto batch = ninfer::models::qwen::encoder_batch(*input, *plan, 0);
+    expect(input->units.size() == 3 && plan->units.size() == 2 && batch.features == 2,
+           "video temporal grids form independently encodable units");
+    expect(batch.cu_seqlens == std::vector<std::int32_t>({0, 4, 8}) &&
+               batch.positions ==
+                   std::vector<std::int32_t>({0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1}),
+           "selected grids retain spatial rotary coordinates");
+    expect(batch.position_indices[0] == 0 && batch.position_indices[4] == 47 &&
+               batch.position_indices[8] == 2256 && batch.position_indices[12] == 2303 &&
+               batch.position_weights[0] == 1 && batch.position_weights[4] == 1,
+           "position interpolation maps grid corners to the learned table corners");
+    expect(batch.patches[0].data() == prompt.media_payloads[1]->span().data() &&
+               batch.patches[1].data() == prompt.media_payloads[1]->span().data() + 12,
+           "window borrows only its temporal patch ranges");
 }
 
 ninfer::models::qwen::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {

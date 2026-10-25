@@ -3,7 +3,9 @@
 #include "models/load_options.h"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::artifact {
@@ -11,6 +13,12 @@ struct Directory;
 }
 
 namespace ninfer::models::glm5next {
+
+[[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
+    if (!value || value > std::uint64_t(std::numeric_limits<std::int32_t>::max()))
+        throw std::overflow_error("GLM5Next tensor extent is outside int32");
+    return static_cast<std::int32_t>(value);
+}
 
 enum class MixerKind { Kda, Mla };
 enum class FfnKind { Dense, Moe };

@@ -577,7 +577,22 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 if (request->admission_generation == admission_generation_) { continue; }
                 request->admission_generation = admission_generation_;
             }
-            ensure_base_plan(request);
+            try {
+                ensure_base_plan(request);
+            } catch (const RequestError&) {
+                // Planning has not bound a sequence or submitted device work. A native
+                // request rejection therefore ends only this pending request.
+                if (restoring) throw;
+                const auto error = std::current_exception();
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    std::erase(pending_, request);
+                }
+                complete_error(request, error);
+                request_admission_check();
+                publish_runtime_stats();
+                return true;
+            }
             const auto retained = resources_.retained_source(request->id);
             const auto revoked  = resources_.source_revocations(request->id);
             if (!restoring && revoked > request->admission.revoked_checkpoints) {
@@ -847,6 +862,20 @@ EngineCore<Instance>::execution_unit(const Request& request) const {
 }
 
 template <class Instance>
+std::optional<std::uint32_t> EngineCore<Instance>::next_prefill(
+    const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+    const auto preferred = instance_.session->prefill_continuation();
+    if (preferred)
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = candidates[lane];
+            if (request && request->sequence == preferred && !request->capture_pending &&
+                (request->is_prefilling() || request->is_replaying()))
+                return lane;
+        }
+    return scheduler_.next_prefill(candidates, max_concurrency_);
+}
+
+template <class Instance>
 void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
     reserved_units_.fill(std::nullopt);
     std::optional<std::uint32_t> recovering;
@@ -860,10 +889,15 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             recovering = lane;
         }
     }
+    if (recovering) {
+        const auto owner = instance_.session->prefill_continuation();
+        if (owner && slots_[*recovering]->sequence != owner)
+            instance_.session->yield_prefill(*owner);
+    }
     const auto prefill =
         recovering && (slots_[*recovering]->is_prefilling() || slots_[*recovering]->is_replaying())
             ? recovering
-            : scheduler_.next_prefill(slots_, max_concurrency_);
+            : next_prefill(slots_);
     std::vector<std::uint32_t> candidates;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto& request = slots_[lane];
@@ -883,10 +917,21 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
         if (recovering == a || recovering == b) { return recovering == a; }
         return slots_[a]->id < slots_[b]->id;
     });
+    if (prefill) {
+        auto remaining = slots_;
+        remaining[*prefill].reset();
+        while (const auto fallback = scheduler_.next_prefill(remaining, max_concurrency_)) {
+            candidates.push_back(*fallback);
+            remaining[*fallback].reset();
+        }
+    }
+    std::optional<std::uint32_t> granted_prefill;
     std::optional<std::uint32_t> blocked;
     std::optional<ContextAssessment> blocked_assessment;
     for (const auto lane : candidates) {
         const auto request = slots_[lane];
+        if (granted_prefill && request && (request->is_prefilling() || request->is_replaying()))
+            continue;
         // Reclaiming for an earlier row may already have paused this candidate.
         if (!request || !request->sequence || request->capture_pending ||
             request->cancelled.load(std::memory_order_acquire) ||
@@ -902,8 +947,10 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             const auto result = instance_.session->reserve_units({&unit, 1});
             if (result) {
                 reserved_units_[lane] = UnitPermit{unit, *request->residency};
+                if (request->is_prefilling() || request->is_replaying()) granted_prefill = lane;
                 break;
             }
+            if (result.status == UnitReservationStatus::ExecutionUnavailable) break;
             if (instance_.session->has_context_operation()) { break; }
             if (!cursor) { cursor.emplace(resources_.begin_reclaim(*instance_.session)); }
             const auto reclaimed = reclaim(result.assessment, false, {}, &*cursor);
@@ -935,8 +982,8 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
     if (blocked && !instance_.session->has_context_operation()) {
         (void)pause_resident(*blocked, PauseGoal::RecoverCapacity, &*blocked_assessment);
     }
-    if (prefill && reserved_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
-        reserved_units_[*prefill].reset();
+    if (granted_prefill && !prepare_semantic_capture(slots_[*granted_prefill])) {
+        reserved_units_[*granted_prefill].reset();
     }
 }
 
@@ -1062,7 +1109,7 @@ template <class Instance>
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (!unit_runnable(lane)) eligible[lane].reset();
             }
-            if (const auto lane = scheduler_.next_prefill(eligible, max_concurrency_)) {
+            if (const auto lane = next_prefill(eligible)) {
                 set_host_work_class(HostWorkClass::Prefill);
                 if (!start_prefill(*lane)) return submitted;
                 submitted = true;

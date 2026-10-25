@@ -513,11 +513,10 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                   out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
-        const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, qwen::kMaximumVisionItemTokens));
-        out.vision   = qwen::VisionContext::plan_workspace(*profile.config.vision, *profile.vision,
-                                                           merged, out.general_capacity);
-        out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
+        out.vision =
+            qwen::VisionContext::plan_resources(*profile.config.vision, *profile.vision,
+                                                plan.capacity, plan.vision_memory_budget_bytes);
+        out.capacity = std::max(out.capacity, out.vision->encoder.workspace_bytes);
     }
     return out;
 }
@@ -596,6 +595,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring                    = inputs.causal_scoring;
     impl->multiprocessor_count              = inputs.multiprocessor_count;
     impl->context_cache                     = inputs.context_cache;
+    impl->vision_memory_budget_bytes        = inputs.vision_memory_budget_bytes;
     impl->kv_storage                        = inputs.kv_storage;
     impl->persistent                        = persistent_layout(*impl);
     impl->context_cache.host_capacity_bytes = context::host_context_capacity(
@@ -605,6 +605,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes      = checked_add(
         checked_add(impl->persistent.bytes, impl->context_bytes, "Context arena capacity"),
         impl->workspace.capacity, "sequence device capacity");
+    if (impl->workspace.vision)
+        impl->device_reservation_bytes +=
+            impl->workspace.vision->output_bytes +
+            (NINFER_SHARED_PHYSICAL_MEMORY ? impl->workspace.vision->encoder.host_staging_bytes
+                                           : 0);
     if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0)
         impl->device_reservation_bytes =
             checked_add(impl->device_reservation_bytes, impl->persistent.pinned_bytes(),
@@ -631,16 +636,17 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .max_concurrency = options.max_concurrency,
         .prefill_chunk =
             std::min(options.prefill_chunk ? options.prefill_chunk : 1024U, options.max_context),
-        .draft_window         = options.speculative.draft_tokens,
-        .speculative_backend  = options.speculative.backend,
-        .kv_storage           = options.kv_cache,
-        .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options),
-        .gpu_timing           = options.observability.gpu_timing,
-        .use_cuda_graph       = options.use_cuda_graph,
-        .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .multiprocessor_count = device.multiprocessor_count(),
-        .context_cache        = options.context_cache,
+        .draft_window               = options.speculative.draft_tokens,
+        .speculative_backend        = options.speculative.backend,
+        .kv_storage                 = options.kv_cache,
+        .proposal_head              = options.speculative.proposal_head,
+        .features                   = models::load_options(options),
+        .gpu_timing                 = options.observability.gpu_timing,
+        .use_cuda_graph             = options.use_cuda_graph,
+        .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
+        .multiprocessor_count       = device.multiprocessor_count(),
+        .context_cache              = options.context_cache,
+        .vision_memory_budget_bytes = options.vision_memory_budget_bytes,
     };
     auto planner           = std::make_unique<SequencePlannerImpl>();
     planner->inputs        = inputs;
@@ -674,6 +680,8 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
     capacity.fixed_device_bytes = base->device_reservation_bytes;
     capacity.fixed_host_bytes =
         base->persistent.host_context_bytes + base->persistent.pinned_bytes();
+    if (base->workspace.vision)
+        capacity.fixed_host_bytes += base->workspace.vision->encoder.host_staging_bytes;
     if (base->moe)
         capacity.fixed_host_bytes += base->moe->description().bridge_pinned_bytes +
                                      base->moe->description().cpu_workspace_bytes;

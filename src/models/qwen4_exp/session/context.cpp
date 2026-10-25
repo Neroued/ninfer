@@ -110,8 +110,11 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         }
     if (const auto& vision = base.plan_->vision) {
         out.remaining_work.chunks = 0;
+        const vision::Window available;
         for (auto cursor = out.reused_tokens; cursor < end;) {
-            cursor = vision->plan.window_end(cursor, std::min(end, cursor + p.shape.prefill_chunk));
+            cursor = available.limit({}, vision->units, cursor,
+                                     std::min(end, cursor + p.shape.prefill_chunk),
+                                     p.plan.vision_max_features);
             ++out.remaining_work.chunks;
         }
     }
@@ -179,7 +182,8 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
         peak = std::min<std::uint64_t>(base.summary().prompt_tokens,
                                        std::uint64_t(target) + shape.prefill_chunk);
     if ((!resume || resume_kind == ExecutionUnitKind::Prefill) && base.plan_->vision)
-        peak = base.plan_->vision->plan.window_end(target, peak);
+        peak = vision::Window{}.limit({}, base.plan_->vision->units, target, peak,
+                                      this->plan.vision_max_features);
     std::array<std::vector<const context::HistoryPrefix*>, 2> retired_prefixes;
     for (const auto point : candidate.retired_points) {
         if ((source && point == *source) ||
@@ -451,6 +455,11 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
     ContextDemand demand;
     for (const auto& unit : units) {
         auto& sequence = p.sequence(unit.sequence);
+        if ((unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) &&
+            p.unit_end(sequence, unit.kind, unit.tokens) ==
+                sequence.continuation.metadata.main_frontier &&
+            sequence.continuation.metadata.main_frontier < sequence.request->summary.prompt_tokens)
+            return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
         if (std::any_of(needed.begin(), needed.end(),
                         [&](const auto& n) { return n.sequence == &sequence; }))
             throw std::logic_error("execution reservation repeats a sequence");
@@ -489,7 +498,7 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
         sequence.permit             = units[i];
         sequence.permitted_frontier = needed[i].end;
     }
-    return {.reserved = true, .assessment = result.assessment};
+    return {.status = runtime::UnitReservationStatus::Granted, .assessment = result.assessment};
 }
 
 ResourceReservation Session::reserve_units(std::span<const ExecutionUnit> units) {

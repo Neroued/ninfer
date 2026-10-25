@@ -80,6 +80,8 @@ Suspended::~Suspended() {
 }
 
 void SessionImpl::release_residency(runtime::ResidencyId id) {
+    const auto owner = vision_window.owner();
+    if (owner && owner->residency == id) vision_window.revoke(*owner);
     if (executor->failed() || !id.generation) return;
     if (std::find(releases.begin(), releases.end(), id) == releases.end()) releases.push_back(id);
 }
@@ -96,6 +98,7 @@ void SessionImpl::submit_releases() {
 }
 
 void SessionImpl::clear(Sequence& s) noexcept {
+    vision_window.revoke(member(s));
     try {
         release_residency(member(s).residency);
         s.capture.reset();
@@ -153,9 +156,10 @@ std::uint32_t SessionImpl::window_end(const Sequence& s, std::uint32_t begin,
         }
     if (s.capture && s.next_capture < s.captures.size())
         end = std::min(end, s.captures[s.next_capture].frontier);
-    if (s.request->vision && begin < s.request->summary.prompt_tokens)
-        end = s.request->vision->plan.window_end(begin,
-                                                 std::min(end, s.request->summary.prompt_tokens));
+    if (s.request->vision && begin < s.request->summary.prompt_tokens && begin < end)
+        end = vision_window.limit(member(s), s.request->vision->units, begin,
+                                  std::min(end, s.request->summary.prompt_tokens),
+                                  plan.vision_max_features);
     return end;
 }
 
@@ -270,6 +274,22 @@ void SessionImpl::adopt_commit(Sequence& s, const ContinuationMetadata& metadata
 }
 
 PhysicalUsageSnapshot SessionImpl::usage() const noexcept { return directory.usage(); }
+
+std::optional<qwen::VisionWork> SessionImpl::prepare_visual(const Sequence& s, std::uint32_t begin,
+                                                            std::uint32_t end) {
+    if (!s.request->vision || begin >= end) return {};
+    const auto ranks   = static_cast<std::uint32_t>(plan.context.ranks.size());
+    const auto* active = vision_window.current();
+    if (active && active->owner.sequence == member(s).sequence &&
+        active->owner.residency == member(s).residency)
+        return qwen::prepare_vision_work(vision_window.reserve(active->owner, {}),
+                                         s.request->vision, ranks);
+    auto planned =
+        vision::plan_window(s.request->vision->units, begin, end, plan.vision_max_features, ranks);
+    if (!planned) return {};
+    return qwen::prepare_vision_work(vision_window.reserve(member(s), std::move(planned)),
+                                     s.request->vision, ranks);
+}
 
 } // namespace ninfer::models::qwen4_exp::detail
 
@@ -447,5 +467,16 @@ std::optional<CheckpointHandle> ResumeState::snapshot_handle() const noexcept {
 }
 
 std::uint32_t ResumeState::frontier() const noexcept { return state_ ? state_->frontier : 0; }
+
+std::optional<SequenceHandle> Session::prefill_continuation() const {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && impl_->valid(owner->sequence)) return owner->sequence;
+    return {};
+}
+
+void Session::yield_prefill(SequenceHandle sequence) {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && owner->sequence == sequence) impl_->vision_window.revoke(*owner);
+}
 
 } // namespace ninfer::models::qwen4_exp

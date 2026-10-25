@@ -42,6 +42,7 @@ public:
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
     [[nodiscard]] RankMemoryBudget resource_budget() const;
     void reset_measurement_peaks() noexcept;
+    [[nodiscard]] MemorySpan input_storage();
 
 private:
     std::unique_ptr<detail::RankProgramImpl> impl_;

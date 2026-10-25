@@ -3,20 +3,16 @@
 #include "distributed/wire.h"
 #include "models/qwen4_exp/work.h"
 
-#include <map>
-
 namespace ninfer::models::qwen4_exp {
 
-// Installed Host inputs have session-scoped identities. A decoded binding acquires its own
-// shared owner, so removing the lookup entry does not release an input still used by Program.
+// A single frozen window mapping survives release of the raw production payload.
 class VisionInputBindings {
 public:
-    void install(std::uint64_t, std::shared_ptr<const qwen::VisionExecutionInput>);
-    void release(std::uint64_t);
-    [[nodiscard]] std::uint64_t id(const std::shared_ptr<const qwen::VisionExecutionInput>&) const;
-    [[nodiscard]] std::shared_ptr<const qwen::VisionExecutionInput> get(std::uint64_t) const;
+    void install(qwen::VisionWork);
+    void release_payload(std::uint64_t);
+    [[nodiscard]] qwen::VisionWork get(std::uint64_t id, bool produce) const;
 private:
-    std::map<std::uint64_t, std::shared_ptr<const qwen::VisionExecutionInput>> inputs_;
+    std::optional<qwen::VisionWork> current_;
 };
 
 void encode_work(distributed::wire::Encoder&, const Work&, const VisionInputBindings&,

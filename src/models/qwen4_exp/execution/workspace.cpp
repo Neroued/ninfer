@@ -170,11 +170,9 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
         std::max({out.prefill, out.ordinary, out.verify, out.mtp, out.history, out.finish});
     out.bytes = out.general_bytes;
     if (p.vision) {
-        out.vision = qwen::VisionContext::plan_workspace(
-            *p.config.vision, *p.vision,
-            std::min<std::uint64_t>(o.max_context, qwen::kMaximumVisionItemTokens),
-            out.general_bytes);
-        out.bytes = out.vision->capacity_bytes;
+        out.vision = qwen::VisionContext::plan_resources(*p.config.vision, *p.vision, o.max_context,
+                                                         o.vision_memory_budget_bytes);
+        out.bytes  = std::max(out.bytes, out.vision->encoder.workspace_bytes);
     }
     return out;
 }

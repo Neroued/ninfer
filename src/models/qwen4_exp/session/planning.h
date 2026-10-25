@@ -10,8 +10,8 @@ struct ExecutionPlan;
 struct SessionPlan {
     ExecutionShape shape;
     context::ContextDirectorySpec context;
-    std::size_t vision_max_merged_tokens = 0;
-    std::uint32_t checkpoint_interval    = 8192;
+    std::uint32_t vision_max_features = 0;
+    std::uint32_t checkpoint_interval = 8192;
 
     bool operator==(const SessionPlan&) const = default;
 };

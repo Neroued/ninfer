@@ -38,7 +38,7 @@ SessionPlan plan_session(const ExecutionPlan& execution) {
     if (execution.persistent.mtp) add(*execution.persistent.mtp);
     plan.context.metadata_budget_bytes = execution.capacity.metadata_budget_bytes;
     if (execution.workspace.vision)
-        plan.vision_max_merged_tokens = execution.workspace.vision->max_merged_tokens;
+        plan.vision_max_features = execution.workspace.vision->max_features;
     return plan;
 }
 

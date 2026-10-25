@@ -125,6 +125,8 @@ void test_file_merge(const Files& files) {
 [model]
 path = "weights/model.ninfer"
 vision = true
+[vision]
+memory_budget = "512MiB"
 [engine]
 max_context = 16384
 context_capacity = "1.5GiB"
@@ -154,7 +156,8 @@ regex = "file"
     require(base.launch.engine.artifact_path == files.root / "weights/model.ninfer",
             "file-relative model path changed");
     require(base.launch.engine.context_capacity.explicit_bytes == (1536ULL << 20) &&
-                base.launch.engine.context_cache.host_capacity_bytes == 65536,
+                base.launch.engine.context_cache.host_capacity_bytes == 65536 &&
+                base.launch.engine.vision_memory_budget_bytes == (512ULL << 20),
             "file values or exact capacity conversion failed");
     require(base.launch.generation.sampling.seed == UINT64_MAX,
             "uint64 seed string lost precision");
@@ -165,6 +168,8 @@ regex = "file"
                                  "--messages",
                                  "local.json",
                                  "--no-vision",
+                                 "--vision-memory-budget",
+                                 "768MiB",
                                  "--spec",
                                  "none",
                                  "--temperature",
@@ -184,7 +189,8 @@ regex = "file"
     require(replaced.launch.engine.max_context == 32768 &&
                 replaced.launch.engine.context_capacity.mode ==
                     ninfer::ContextCapacityMode::Automatic &&
-                !replaced.launch.engine.enable_vision,
+                !replaced.launch.engine.enable_vision &&
+                replaced.launch.engine.vision_memory_budget_bytes == (768ULL << 20),
             "command-line overrides were applied before the file");
     require(replaced.prompt.empty() && replaced.messages_path == fs::absolute("local.json"),
             "input choice or argv path base failed");

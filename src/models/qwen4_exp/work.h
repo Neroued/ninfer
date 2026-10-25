@@ -4,6 +4,7 @@
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
 #include "models/qwen4_exp/execution_shape.h"
+#include "models/common/qwen/vision/control.h"
 #include "ninfer/types.h"
 #include "runtime/contract/resources.h"
 #include "runtime/executor/contract.h"
@@ -62,6 +63,7 @@ struct ForwardWork {
     SampleKind sample = SampleKind::None;
     std::vector<WorkRow> rows;
     std::optional<PlePrefetch> prefetch;
+    std::optional<qwen::VisionWork> visual;
 };
 
 struct MtpWork {
@@ -73,7 +75,6 @@ struct ResidencyBinding {
     runtime::ExecutionMember member;
     ResolvedSamplingParameters sampling;
     std::vector<TokenId> generated;
-    std::shared_ptr<const qwen::VisionExecutionInput> vision;
 };
 
 struct ContextWork {

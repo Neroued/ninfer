@@ -1,7 +1,10 @@
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
-#include "models/common/qwen/vision/prefill.h"
+#include "models/common/vision/window.h"
+
+#include "core/transfer.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -12,14 +15,6 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 int main() {
-    const ninfer::models::qwen::VisionPrefillPlan plan{
-        .uses = {{2, 8, 0, 0}, {12, 20, 1, 1}, {22, 26, 2, 2}}};
-    if (plan.window_end(0, 24) != 12 || plan.window_end(4, 7) != 7 ||
-        plan.window_end(8, 24) != 22 || plan.window_end(9, 11) != 11 ||
-        plan.window_end(26, 30) != 30) {
-        std::cerr << "Vision windows must preserve chunks and stop before a second media item\n";
-        return 1;
-    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -46,18 +41,28 @@ int main() {
     ninfer::DeviceBuffer work_storage(ninfer::test::cuda_environment().context.device(),
                                       1ULL << 20);
     MemoryArena work(work_storage.span());
+    PinnedHostBuffer host_indices(v * sizeof(std::int32_t));
 
     auto run = [&](std::int32_t prompt_tokens, const char* label) {
         DeviceBuffer dinput = to_device_bf16(token_embeddings);
         Tensor input(dinput.span(), DType::BF16, {d, t});
         work.reset();
-        const auto overlap = ninfer::models::qwen::visual_embedding_slice(
-            scatter_indices, static_cast<std::uint32_t>(prompt_tokens), 1, t);
-        Tensor destination_indices =
-            work.alloc(DType::I32, {static_cast<std::int32_t>(overlap.size())});
-        ninfer::models::qwen::scatter_visual_embeddings(
-            input, visual, overlap, destination_indices,
-            ninfer::test::cuda_environment().default_execution);
+        ninfer::models::vision::WindowPlan plan;
+        plan.outputs = {{0, 0, {}}};
+        for (auto p : scatter_indices)
+            if (p < prompt_tokens) plan.outputs[0].token_positions.push_back(p);
+        const auto slices = ninfer::models::vision::embedding_slices(plan, 1, t);
+        for (const auto& slice : slices) {
+            const auto count = static_cast<std::int32_t>(slice.destination_columns.size());
+            auto indices     = work.alloc(DType::I32, {count});
+            std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
+                      static_cast<std::int32_t*>(host_indices.data()));
+            copy_bytes_async({indices.data, indices.bytes(), indices.device},
+                             host_indices.span().subspan(0, indices.bytes()),
+                             cuda_environment().default_execution);
+            auto features = visual.slice(1, slice.source_begin, count);
+            ops::scatter(features, indices, input, cuda_environment().default_execution);
+        }
         cudaDeviceSynchronize();
 
         std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());

@@ -58,16 +58,22 @@ void RankProgramImpl::install_residencies(const ContextWork& work) {
         auto& residency = residencies[id.lane.value];
         if (!residency.installed || residency.id != id)
             throw std::logic_error("Qwen3.5 release no longer matches its residency");
-        residency.vision.reset();
-        residency.vision_input.reset();
+        if (resources.vision) {
+            const auto* active = resources.vision->current();
+            if (active && active->owner.residency == residency.id)
+                resources.vision->release(active->id);
+        }
         residency.installed = false;
     }
     auto* counts = static_cast<std::int32_t*>(context_counts.data());
     for (const auto& binding : work.bindings) {
         const auto lane = binding.member.residency.lane.value;
         auto& residency = residencies[lane];
-        residency.vision.reset();
-        residency.vision_input.reset();
+        if (resources.vision) {
+            const auto* active = resources.vision->current();
+            if (active && active->owner.residency == residency.id)
+                resources.vision->release(active->id);
+        }
         residency.id        = binding.member.residency;
         residency.sequence  = binding.member.sequence;
         residency.installed = true;
@@ -171,10 +177,8 @@ void RankProgramImpl::drain() {
     compute.reset();
     context_operation.reset();
     events.clear();
-    for (auto& residency : residencies) {
-        residency.vision.reset();
-        residency.vision_input.reset();
-    }
+    if (resources.vision)
+        if (const auto* active = resources.vision->current()) resources.vision->release(active->id);
     if (failure) std::rethrow_exception(failure);
 }
 

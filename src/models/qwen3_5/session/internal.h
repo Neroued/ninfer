@@ -39,7 +39,7 @@ struct RequestBasePlanImpl {
     runtime::RequestPlanSummary summary;
     models::frontend::PreparedContextCache context_cache;
     ResolvedSamplingParameters sampling;
-    std::shared_ptr<const qwen::VisionControlPlan> vision_control_plan;
+    std::shared_ptr<const qwen::VisionExecutionInput> vision;
     std::vector<CaptureGroup> capture_groups;
     std::shared_ptr<const PreparedCaptureBacking> capture_backing;
     qwen::PrefixShortlistDigests prefix_digests;
@@ -135,8 +135,6 @@ struct RequestControl {
 
     struct Prefill {
         qwen::PreparedPromptData prompt;
-        std::optional<qwen::VisionPrefillPlan> vision_plan;
-        std::shared_ptr<const qwen::VisionExecutionInput> vision;
         std::uint32_t base          = 0;
         std::uint32_t cursor        = 0;
         std::uint32_t prompt_tokens = 0;
@@ -144,7 +142,6 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
-    std::optional<Prefill> replay;
 };
 
 using Snapshot = context::ContextSnapshot<ContinuationMetadata, PreparedCaptureBacking>;
@@ -399,6 +396,9 @@ public:
 
     std::shared_ptr<const ModelDefinition> definition;
     SessionPlan plan;
+    vision::Window vision_window;
+    [[nodiscard]] std::optional<qwen::VisionWork>
+    prepare_visual(const SequenceState&, std::uint32_t begin, std::uint32_t end);
     runtime::Executor<ExecutionTypes>* executor_ = nullptr;
 
     [[nodiscard]] runtime::Executor<ExecutionTypes>& executor() const { return *executor_; }
@@ -468,9 +468,10 @@ public:
         ExecutionSample observed_result;
         std::optional<SessionEvent> completion;
         std::vector<runtime::CommitDecision> decisions;
-        bool result_ready = false;
-        bool committed    = false;
-        bool discarded    = false;
+        std::uint64_t vision_id = 0;
+        bool result_ready       = false;
+        bool committed          = false;
+        bool discarded          = false;
     };
 
     std::optional<Execution> execution;
@@ -507,8 +508,9 @@ public:
     [[nodiscard]] ExecutionRow execution_row(const SequenceState&) const;
     [[nodiscard]] InputWindow input_window(const SequenceState&, std::uint32_t begin,
                                            std::uint32_t end) const;
-    [[nodiscard]] std::uint32_t window_end(std::uint32_t lane, std::uint32_t begin,
-                                           std::uint32_t end) const;
+    [[nodiscard]] std::uint32_t window_end(const SequenceState&, const RequestControl&,
+                                           std::uint32_t begin, std::uint32_t end,
+                                           const vision::Window&) const;
     void ensure_sequence_kv_mapped(SequenceState&, std::uint32_t main, std::uint32_t backend,
                                    context::ContextTransaction&);
     void complete_state_write(SequenceState&);
@@ -534,7 +536,6 @@ public:
     [[nodiscard]] std::optional<CheckpointHandle> detach_checkpoint(SequenceState&,
                                                                     PreparedCheckpoint = {});
     void initialize_prefill(RequestControl&, std::uint32_t base);
-    void initialize_replay(std::uint32_t lane);
     void initialize_captures(RequestControl&, std::uint32_t from, std::uint32_t through);
     [[nodiscard]] bool
     reserve_capture_destination(std::uint32_t, std::uint32_t,

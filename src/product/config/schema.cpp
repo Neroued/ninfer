@@ -14,6 +14,9 @@ constexpr FieldSpec kFields[] = {
     {Field::ChatTemplate, "model.chat_template", "--chat-template", "", "FILE",
      "Chat template override; empty uses the artifact."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
+    {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
+     "Per-rank Vision activation and output-window budget (1GiB); excludes weights.", Scope::Common,
+     ConfigurationUnit::Bytes},
     {Field::Device, "engine.device", "--device", "", "N", "Local CUDA device ordinal."},
     {Field::MaxContext, "engine.max_context", "--max-context", "", "N",
      "Per-request context limit (8192)."},
@@ -344,6 +347,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::MediaCache:
         return quantity(value, true, false);
     case Field::MediaLive:
+    case Field::VisionMemoryBudget:
     case Field::MaxRequestSize:
     case Field::ResponseSize:
         return quantity(value, true, true);

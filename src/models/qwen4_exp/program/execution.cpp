@@ -155,8 +155,8 @@ void RankProgramImpl::prepare_main() {
         }
     }
     if (f.sequence) {
-        auto& resident = binding(f.rows.front().member.residency);
-        f.visual       = prepare_vision(resident, f.rows.front().main_frontier, f.tokens);
+        if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation))
+            f.visual = prepare_vision(forward->visual, f.rows.front().main_frontier, f.tokens);
         prefill_timer.start();
         f.timer_started = true;
     }

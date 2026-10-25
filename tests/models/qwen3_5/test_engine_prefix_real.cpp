@@ -1800,15 +1800,12 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     if (memory.allocations.device_weights_bytes == 0 ||
 
         memory.allocations.persistent_device_bytes == 0 ||
-
         memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
-        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
-        vision->general_capacity_bytes == 0 || vision->encode_required_bytes == 0 ||
-        vision->handoff_offset_bytes > memory.allocations.workspace_device_bytes ||
-        vision->handoff_capacity_bytes == 0 ||
-        vision->handoff_capacity_bytes >
-            memory.allocations.workspace_device_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 ||
+        vision->max_window_features == 0 || vision->max_window_features > 4096 ||
+        vision->encoder_workspace_bytes == 0 || vision->output_capacity_bytes == 0 ||
+        vision->encoder_workspace_bytes + vision->output_capacity_bytes > vision->budget_bytes ||
+        vision->output_capacity_bytes > memory.allocations.persistent_device_bytes ||
+        vision->output_active_bytes != 0 ||
         !engine.startup_report().ranks.at(0).graphs.has_value()) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;

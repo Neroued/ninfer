@@ -133,7 +133,7 @@ void contexts(Executor& executor, const q4::SessionPlan& plan) {
         std::vector<ctx::RecordLease> retained;
         const rt::ExecutionMember member{{generation, 1}, {{0}, generation}};
         q4::ContextWork binding;
-        binding.bindings.push_back({member, {}, {1, 2, 1}, {}});
+        binding.bindings.push_back({member, {}, {1, 2, 1}});
         q4::Work work{{}, std::move(binding)};
         std::uint32_t expected_images = 0, expected_pages = 0;
         for (std::size_t i = 0; i < layouts.size(); ++i) {

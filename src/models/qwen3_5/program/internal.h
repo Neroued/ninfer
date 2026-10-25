@@ -5,7 +5,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 
 #include "models/common/context/transfer.h"
-#include "models/common/qwen/vision/prefill.h"
+#include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/resources.h"
@@ -29,8 +29,6 @@ struct Residency {
     runtime::SequenceId sequence;
     bool installed = false;
     bool penalties = false;
-    std::shared_ptr<const qwen::VisionExecutionInput> vision_input;
-    std::unique_ptr<qwen::VisionPrefillExecution> vision;
 };
 
 enum class ComputeStage : std::uint8_t {
@@ -56,7 +54,6 @@ struct ComputeOperation {
     std::uint32_t forward_offset = 0;
     std::uint32_t score_cursor   = 0;
     std::uint32_t score_count    = 0;
-    double vision_before         = 0.0;
     ComputeStage stage           = ComputeStage::Inputs;
     std::uint32_t decision_stage = 0;
     bool decision_requested      = false;
@@ -161,9 +158,7 @@ public:
     std::unique_ptr<ContextOperation> context_operation;
     PinnedHostBuffer context_counts;
     std::array<Residency, kMaximumConcurrency> residencies;
-    qwen::VisionHandoffState vision_handoff;
     std::size_t workspace_peak = 0;
-    std::size_t vision_peak    = 0;
     std::unique_ptr<ComputeOperation> compute;
     CudaCompletionEvent result_ready;
     CudaCompletionEvent drafts_ready;

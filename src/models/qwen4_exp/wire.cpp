@@ -135,29 +135,26 @@ std::vector<WorkRow> rows(Decoder& in, std::uint32_t rank) {
 
 } // namespace
 
-void VisionInputBindings::install(std::uint64_t id,
-                                  std::shared_ptr<const qwen::VisionExecutionInput> input) {
-    if (!id || !input || !inputs_.emplace(id, std::move(input)).second)
-        throw std::invalid_argument("duplicate or empty Vision input resource");
+void VisionInputBindings::install(qwen::VisionWork work) {
+    if (!work.window.id || !work.window.plan || !work.input ||
+        (current_ && work.window.id <= current_->window.id))
+        throw std::invalid_argument("Vision input window is empty or stale");
+    current_ = std::move(work);
 }
 
-void VisionInputBindings::release(std::uint64_t id) {
-    if (!inputs_.erase(id)) throw std::invalid_argument("Vision input resource is absent");
+void VisionInputBindings::release_payload(std::uint64_t id) {
+    if (!current_ || current_->window.id != id || !current_->input)
+        throw std::logic_error("Vision input payload has no matching production");
+    current_->input.reset();
 }
 
-std::uint64_t
-VisionInputBindings::id(const std::shared_ptr<const qwen::VisionExecutionInput>& input) const {
-    if (!input) return 0;
-    for (const auto& [id, value] : inputs_)
-        if (value == input) return id;
-    throw std::logic_error("Vision input must be installed before binding its residency");
-}
-
-std::shared_ptr<const qwen::VisionExecutionInput> VisionInputBindings::get(std::uint64_t id) const {
-    if (!id) return {};
-    const auto found = inputs_.find(id);
-    if (found == inputs_.end()) throw std::logic_error("Vision input resource is not installed");
-    return found->second;
+qwen::VisionWork VisionInputBindings::get(std::uint64_t id, bool produce) const {
+    if (!current_ || current_->window.id != id || (produce && !current_->input))
+        throw std::logic_error("Vision work has no installed window input");
+    auto out           = *current_;
+    out.window.produce = produce;
+    if (!produce) out.input.reset();
+    return out;
 }
 
 void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inputs,
@@ -172,6 +169,11 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 out.u8(static_cast<std::uint8_t>(v.kind));
                 out.u8(static_cast<std::uint8_t>(v.sample));
                 rows(out, v.rows, rank);
+                out.boolean(v.visual.has_value());
+                if (v.visual) {
+                    out.u64(v.visual->window.id);
+                    out.boolean(v.visual->window.produce);
+                }
                 out.boolean(v.prefetch.has_value());
                 if (v.prefetch) {
                     member(out, v.prefetch->member);
@@ -190,7 +192,6 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                     member(out, binding.member);
                     sampling(out, binding.sampling);
                     integers(out, binding.generated);
-                    out.u64(inputs.id(binding.vision));
                 }
                 out.u64(v.releases.size());
                 for (auto id : v.releases) residency(out, id);
@@ -215,6 +216,10 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         v.sample = static_cast<SampleKind>(in.u8());
         v.rows   = rows(in, rank);
         if (in.boolean()) {
+            const auto id = in.u64();
+            v.visual      = inputs.get(id, in.boolean());
+        }
+        if (in.boolean()) {
             v.prefetch.emplace();
             v.prefetch->member   = member(in);
             v.prefetch->frontier = in.u32();
@@ -229,12 +234,11 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         break;
     case 3: {
         ContextWork v;
-        v.bindings.resize(in.count(76));
+        v.bindings.resize(in.count(68));
         for (auto& binding : v.bindings) {
             binding.member    = member(in);
             binding.sampling  = sampling(in);
             binding.generated = integers<TokenId>(in);
-            binding.vision    = inputs.get(in.u64());
         }
         v.releases.resize(in.count(12));
         for (auto& id : v.releases) id = residency(in);

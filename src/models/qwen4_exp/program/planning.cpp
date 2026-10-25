@@ -138,6 +138,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
 
 std::size_t ExecutionPlan::device_bytes() const {
     return capacity.device_bytes + persistent.bytes + workspace.bytes + ple_upload.device_bytes +
+           (workspace.vision ? workspace.vision->output_bytes : 0) +
            (moe ? moe->description().device_bytes : 0);
 }
 
@@ -166,7 +167,8 @@ std::size_t ExecutionPlan::host_reservation_bytes() const {
     return host_context_bytes + pinned_draft_bytes + ple_prepare_bytes +
            ple_upload.ordinary_host_bytes + ple_upload.pinned_host_bytes + pinned_io_bytes +
            pinned_output_bytes + pinned_sampling_bytes + pinned_mtp_bytes + pinned_context_bytes() +
-           pinned_aux_bytes() + pinned_context_counts_bytes() + expert;
+           pinned_aux_bytes() + pinned_context_counts_bytes() + expert +
+           (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0);
 }
 
 std::size_t ExecutionPlan::device_reservation_bytes() const {

@@ -15,6 +15,7 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
         work.context      = execution->preparation->actions();
         const auto ticket = executor().submit(std::move(reservation), std::move(work));
         execution->ticket = ticket;
+        if (execution->vision_id) vision_window.submitted(execution->vision_id, ticket);
         execution->preparation->mark_submitted();
         return ticket;
     } catch (const std::exception& error) {
@@ -37,8 +38,10 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_prefill(SequenceHandl
     try {
         prepare_capture_boundary(l);
         const auto begin = state.continuation.metadata.execution_frontier;
-        const auto end   = window_end(
-            l, begin, std::min(request.permit->main_frontier, request.base->summary.prompt_tokens));
+        const auto end =
+            window_end(state, request, begin,
+                       std::min(request.permit->main_frontier, request.base->summary.prompt_tokens),
+                       vision_window);
         const bool sample = end == request.base->summary.prompt_tokens;
         Execution pending{.kind = OperationKind::Prefill};
         pending.members     = {handle};
@@ -55,6 +58,9 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_prefill(SequenceHandl
         forward.purpose = ForwardPurpose::Prefill;
         forward.rows.push_back(execution_row(state));
         forward.inputs.push_back(input_window(state, begin, end));
+        forward.inputs.back().visual = prepare_visual(state, begin, end);
+        if (forward.inputs.back().visual)
+            pending.vision_id = forward.inputs.back().visual->window.id;
         forward.sample = sample ? SamplePurpose::FirstToken : SamplePurpose::None;
         forward.sampling.push_back({request.sampling_host, constrained});
         return submit_execution(std::move(pending), std::move(*reservation),
@@ -78,8 +84,9 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_replay(SequenceHandle
     try {
         prepare_capture_boundary(l);
         const auto begin = state.continuation.metadata.execution_frontier;
-        const auto end =
-            window_end(l, begin, std::min(request.permit->main_frontier, request.replay_target));
+        const auto end   = window_end(state, request, begin,
+                                      std::min(request.permit->main_frontier, request.replay_target),
+                                      vision_window);
         Execution pending{.kind = OperationKind::Replay};
         pending.members     = {handle};
         pending.bases       = {state.continuation};
@@ -95,6 +102,9 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_replay(SequenceHandle
         forward.purpose = ForwardPurpose::Replay;
         forward.rows.push_back(execution_row(state));
         forward.inputs.push_back(input_window(state, begin, end));
+        forward.inputs.back().visual = prepare_visual(state, begin, end);
+        if (forward.inputs.back().visual)
+            pending.vision_id = forward.inputs.back().visual->window.id;
         return submit_execution(std::move(pending), std::move(*reservation),
                                 Work{.operation = std::move(forward)});
     } catch (const std::exception& error) {

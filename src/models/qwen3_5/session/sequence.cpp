@@ -101,28 +101,11 @@ InputWindow SessionImpl::input_window(const SequenceState& state, std::uint32_t 
                     ? prompt.position_axis(axis)[p]
                     : static_cast<std::int32_t>(p) + state.continuation.metadata.rope_delta;
     out.prompt_begin = begin;
-    if (begin < prompt.token_ids.size()) {
-        if (request.prefill) out.vision = request.prefill->vision;
-        if (request.lifecycle == Lifecycle::Replaying && request.replay)
-            out.vision = request.replay->vision;
-    }
     if (!causal_scoring) {
         const auto frontiers = state.prefix_identity.execution_frontiers();
         for (auto it = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
              it != frontiers.end() && *it < end; ++it)
             out.execution_splits.push_back(*it - begin);
-        const auto* staged = request.lifecycle == Lifecycle::Replaying
-                                 ? (request.replay ? &*request.replay : nullptr)
-                                 : (request.prefill ? &*request.prefill : nullptr);
-        if (staged && staged->vision_plan) {
-            for (auto cursor = begin; cursor < end;) {
-                const auto next = staged->vision_plan->window_end(cursor, end);
-                if (next >= end) break;
-                if (next <= cursor) throw std::logic_error("Vision input split made no progress");
-                out.execution_splits.push_back(next - begin);
-                cursor = next;
-            }
-        }
         std::sort(out.execution_splits.begin(), out.execution_splits.end());
         out.execution_splits.erase(
             std::unique(out.execution_splits.begin(), out.execution_splits.end()),
@@ -131,20 +114,21 @@ InputWindow SessionImpl::input_window(const SequenceState& state, std::uint32_t 
     return out;
 }
 
-std::uint32_t SessionImpl::window_end(std::uint32_t lane, std::uint32_t begin,
-                                      std::uint32_t end) const {
-    const auto& request = requests[lane];
-    end                 = std::min(end, begin + prefill_chunk);
+std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestControl& request,
+                                      std::uint32_t begin, std::uint32_t end,
+                                      const vision::Window& window) const {
+    end = std::min(end, begin + prefill_chunk);
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)
         end = std::min(end, request.base->summary.prompt_tokens);
     if (request.lifecycle == Lifecycle::Replaying) {
-        const auto frontiers = sequences[lane].prefix_identity.execution_frontiers();
+        const auto frontiers = state.prefix_identity.execution_frontiers();
         const auto next      = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
         if (next != frontiers.end()) end = std::min(end, *next);
-        if (request.replay && request.replay->vision_plan)
-            end = request.replay->vision_plan->window_end(begin, end);
     }
+    if (request.base->vision && begin < request.base->summary.prompt_tokens && begin < end)
+        end = window.limit({state.id, state.residency}, request.base->vision->units, begin, end,
+                           plan.vision_max_features);
     return end;
 }
 
@@ -183,10 +167,10 @@ void SessionImpl::release_sequence_state(SequenceState& state) noexcept {
 void SessionImpl::release_sequence_kv(SequenceState& state) noexcept { state.kv.reset(); }
 
 void SessionImpl::clear_lane(SequenceState& state, RequestControl& request) noexcept {
+    vision_window.revoke({state.id, state.residency});
     const auto lane = state.lane;
     if (!closing && state.residency.generation) release_residency(state.residency);
     request.prefill.reset();
-    request.replay.reset();
     release_sequence_kv(state);
     release_sequence_state(state);
     state      = {};
@@ -196,6 +180,8 @@ void SessionImpl::clear_lane(SequenceState& state, RequestControl& request) noex
 }
 
 void SessionImpl::release_residency(runtime::ResidencyId residency) {
+    const auto owner = vision_window.owner();
+    if (owner && owner->residency == residency) vision_window.revoke(*owner);
     if (std::find(releases.begin(), releases.end(), residency) == releases.end())
         releases.push_back(residency);
 }
@@ -210,6 +196,20 @@ void SessionImpl::submit_releases() {
     release_ticket =
         executor().submit(std::move(*reservation), Work{.operation = std::move(context)});
     releases.clear();
+}
+
+std::optional<qwen::VisionWork>
+SessionImpl::prepare_visual(const SequenceState& state, std::uint32_t begin, std::uint32_t end) {
+    const auto& request = requests[state.lane];
+    const auto& source  = request.base->vision;
+    if (!source || begin >= end) return {};
+    const auto* active = vision_window.current();
+    if (active && active->owner.sequence == state.id && active->owner.residency == state.residency)
+        return qwen::prepare_vision_work(vision_window.reserve(active->owner, {}), source, 1);
+    auto planned = vision::plan_window(source->units, begin, end, plan.vision_max_features, 1);
+    if (!planned) return {};
+    return qwen::prepare_vision_work(
+        vision_window.reserve({state.id, state.residency}, std::move(planned)), source, 1);
 }
 
 } // namespace ninfer::models::qwen3_5::detail

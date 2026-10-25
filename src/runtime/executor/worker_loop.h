@@ -17,6 +17,8 @@ public:
     WorkerLoop(distributed::WorkerConnection& connection, Program& program, Codec codec)
         : connection_(connection), program_(program), codec_(std::move(codec)),
           compute_(program.capacity().compute_frames), context_(program.capacity().context_frames) {
+        if constexpr (requires { codec_.bind_input_storage(program_.input_storage()); })
+            codec_.bind_input_storage(program_.input_storage());
         connection_.communication().reset_statistics();
         const auto& identity  = connection_.bootstrap().identity;
         observation_.rank     = identity.rank;

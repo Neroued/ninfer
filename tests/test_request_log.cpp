@@ -128,29 +128,26 @@ int main() {
     memory.allocations.device_weights_bytes    = 100;
     memory.allocations.persistent_device_bytes = 200;
     memory.allocations.workspace_device_bytes  = 500;
-    memory.vision                              = ninfer::VisionWorkspaceMemorySummary{
-                                     .aggregate_prompt_tokens = 32768,
-                                     .max_item_tokens         = 16384,
-                                     .general_capacity_bytes  = 300,
-                                     .encode_required_bytes   = 400,
-                                     .handoff_offset_bytes    = 300,
-                                     .handoff_capacity_bytes  = 200,
-                                     .handoff_active_bytes    = 0,
-                                     .handoff_peak_bytes      = 150,
-    };
-    budget.minimum_runtime_reservation_bytes = 1300;
-    budget.context_capacity_bytes            = 8ULL << 30;
-    budget.runtime_reservation_bytes         = 1600;
-    budget.available_after_weights_bytes     = 1700;
-    budget.available_after_startup_bytes     = 180;
-    budget.planned_slack_bytes               = 100;
-    budget.graphs                            = ninfer::GraphMemorySummary{600, -30, 800, 200};
-    budget.retained_bytes                    = 1000;
-    snapshot.runtime.context_pools           = {{.rank           = 0,
-                                                 .domain         = ninfer::ContextMemoryDomain::Host,
-                                                 .capacity_bytes = 64ULL << 20,
-                                                 .live_bytes     = 8ULL << 20,
-                                                 .reserved_bytes = 4ULL << 20}};
+    memory.vision                              = ninfer::VisionMemorySummary{.budget_bytes            = 600,
+                                                                             .max_window_features     = 16384,
+                                                                             .encoder_workspace_bytes = 400,
+                                                                             .output_capacity_bytes   = 200,
+                                                                             .input_staging_bytes     = 256,
+                                                                             .output_active_bytes     = 0,
+                                                                             .output_peak_bytes       = 150};
+    budget.minimum_runtime_reservation_bytes   = 1300;
+    budget.context_capacity_bytes              = 8ULL << 30;
+    budget.runtime_reservation_bytes           = 1600;
+    budget.available_after_weights_bytes       = 1700;
+    budget.available_after_startup_bytes       = 180;
+    budget.planned_slack_bytes                 = 100;
+    budget.graphs                              = ninfer::GraphMemorySummary{600, -30, 800, 200};
+    budget.retained_bytes                      = 1000;
+    snapshot.runtime.context_pools             = {{.rank           = 0,
+                                                   .domain         = ninfer::ContextMemoryDomain::Host,
+                                                   .capacity_bytes = 64ULL << 20,
+                                                   .live_bytes     = 8ULL << 20,
+                                                   .reserved_bytes = 4ULL << 20}};
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -247,20 +244,20 @@ int main() {
                                   .at("ranks")
                                   .at(0)
                                   .at("resources")
-                                  .at("vision_workspace")
-                                  .at("general_capacity_bytes") == 300 &&
+                                  .at("vision")
+                                  .at("encoder_workspace_bytes") == 400 &&
                           server.at("resources")
                                   .at("ranks")
                                   .at(0)
                                   .at("resources")
-                                  .at("vision_workspace")
-                                  .at("handoff_capacity_bytes") == 200 &&
+                                  .at("vision")
+                                  .at("output_capacity_bytes") == 200 &&
                           server.at("resources")
                                   .at("ranks")
                                   .at(0)
                                   .at("resources")
-                                  .at("vision_workspace")
-                                  .at("handoff_peak_bytes") == 150,
+                                  .at("vision")
+                                  .at("output_peak_bytes") == 150,
                       "Vision workspace layout missing");
     failures += check(server.at("resources")
                               .at("ranks")

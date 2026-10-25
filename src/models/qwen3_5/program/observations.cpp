@@ -32,23 +32,12 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
         a.expert_pinned_bytes = plan.bridge_pinned_bytes;
         a.expert_host_bytes   = plan.cpu_workspace_bytes;
     }
-    std::size_t handoff = 0;
-    for (const auto& residency : residencies)
-        if (residency.vision) handoff = std::max(handoff, residency.vision->active_handoff_bytes());
     const auto peak = std::max(resources.work.peak_used(), workspace_peak);
     out.workspace   = {resources.work.used(), std::max(workspace_lifetime_peak, peak), peak};
-    if (workspace_plan.vision) {
-        const auto& vision              = *workspace_plan.vision;
-        auto& summary                   = out.vision.emplace();
-        summary.aggregate_prompt_tokens = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(capacity, qwen::kMaximumPromptVisionTokens));
-        summary.max_item_tokens        = vision.max_merged_tokens;
-        summary.general_capacity_bytes = vision.general_capacity_bytes;
-        summary.encode_required_bytes  = vision.encode_peak_bytes;
-        summary.handoff_offset_bytes   = vision.handoff_offset_bytes;
-        summary.handoff_capacity_bytes = vision.handoff_capacity_bytes;
-        summary.handoff_active_bytes   = handoff;
-        summary.handoff_peak_bytes     = vision_peak;
+    if (resources.vision) {
+        out.vision = resources.vision->observe();
+        a.persistent_device_bytes += resources.vision->capacity().output_bytes;
+        a.io_pinned_bytes += resources.vision->capacity().encoder.host_staging_bytes;
     }
     if (resources.moe) {
         const auto& plan = resources.moe->description();
@@ -84,14 +73,8 @@ void RankProgramImpl::reset_measurement_peaks() noexcept {
     workspace_lifetime_peak =
         std::max({workspace_lifetime_peak, resources.work.peak_used(), workspace_peak});
     resources.work.reset_peak();
-    vision_peak = 0;
-    for (const auto& residency : residencies)
-        if (residency.vision)
-            vision_peak = std::max(vision_peak, residency.vision->active_handoff_bytes());
-    workspace_peak = resources.work.used();
-    if (workspace_plan.vision && vision_peak)
-        workspace_peak =
-            std::max(workspace_peak, workspace_plan.vision->handoff_offset_bytes + vision_peak);
+    workspace_peak = 0;
+    if (resources.vision) resources.vision->reset_peaks();
 }
 
 } // namespace ninfer::models::qwen3_5::detail

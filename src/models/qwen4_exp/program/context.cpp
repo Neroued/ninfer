@@ -23,7 +23,7 @@ void RankProgramImpl::advance_context() {
             const auto& input = work.bindings[b];
             const auto lane   = input.member.residency.lane.value;
             if (bindings[lane]) retire_vision(*bindings[lane]);
-            bindings[lane].emplace(ResidentBinding{input.member, input.vision, {}, 0});
+            bindings[lane].emplace(ResidentBinding{input.member});
             if (resources.plan.persistent.buffers.token_counts) {
                 auto output = device_tensor(*resources.plan.persistent.buffers.token_counts)
                                   .slice(1, lane, 1);

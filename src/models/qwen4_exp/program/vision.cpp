@@ -1,133 +1,86 @@
 #include "models/qwen4_exp/program/internal.h"
 #include "core/transfer.h"
-#include "models/qwen4_exp/parallel/vision.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp::detail {
 
 std::optional<execution::VisualEmbeddingView>
-RankProgramImpl::prepare_vision(ResidentBinding& binding, std::uint32_t begin,
-                                std::uint32_t tokens) {
-    const auto& input = binding.vision_input;
-    if (!input || begin >= input->prompt_tokens) return {};
-    const auto& plan = input->plan;
-    const auto item  = std::lower_bound(
-        plan.uses.begin(), plan.uses.end(), begin,
-        [](const auto& use, std::uint32_t position) { return use.end <= position; });
-    if (item == plan.uses.end() || item->begin >= std::uint64_t(begin) + tokens) return {};
-    if (!parallel && !binding.vision) {
-        binding.vision = std::make_unique<qwen::VisionPrefillExecution>(
-            device, *parameters.profile->config.vision, *parameters.vision,
-            resources.workspace_storage(), *resources.plan.workspace.vision, input, vision_handoff,
-            vision_handoff_peak_bytes);
+RankProgramImpl::visual_view(const vision::WindowPlan& plan, std::uint32_t begin,
+                             std::uint32_t tokens, const TensorRegion& region, MemorySpan host) {
+    const auto slices = vision::embedding_slices(plan, begin, tokens);
+    if (slices.empty()) return {};
+    execution::VisualEmbeddingView out;
+    auto indices       = device_tensor(region);
+    std::size_t offset = 0;
+    for (const auto& slice : slices) {
+        const auto n = slice.destination_columns.size();
+        if ((offset + n) * sizeof(std::int32_t) > host.bytes || offset + n > indices.numel())
+            throw std::logic_error("Vision consumer indices exceed their frame");
+        std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
+                  static_cast<std::int32_t*>(host.data) + offset);
+        out.slices.push_back(
+            {resources.vision->output(slice.source_begin, n), indices.slice(0, offset, n)});
+        offset += n;
     }
-    const auto chunk = parallel ? prepare_parallel_vision(binding, begin, tokens)
-                                : binding.vision->prepare_chunk(begin, tokens);
-    if (chunk.length != static_cast<std::int32_t>(tokens) || !chunk.control)
-        throw std::logic_error("Vision execution differs from the reserved input window");
-    vision_workspace_peak_bytes =
-        std::max(vision_workspace_peak_bytes, chunk.encode_workspace_bytes);
-    const auto slice = qwen::visual_embedding_slice(chunk.control->scatter_indices,
-                                                    input->prompt_tokens, begin, tokens);
-    if (slice.empty()) return {};
-    const auto count   = static_cast<std::int32_t>(slice.size());
+    copy_bytes_async({indices.data, offset * sizeof(std::int32_t), indices.device},
+                     host.subspan(0, offset * sizeof(std::int32_t)), cuda);
+    return out;
+}
+
+std::optional<execution::VisualEmbeddingView>
+RankProgramImpl::prepare_vision(const std::optional<qwen::VisionWork>& work, std::uint32_t begin,
+                                std::uint32_t tokens) {
+    if (!work) return {};
+    if (!resources.vision || !parameters.vision)
+        throw std::logic_error("Vision work has no prepared resources");
+    auto& window = *resources.vision;
+    if (window.begin(work->window)) {
+        if (!work->input) throw std::logic_error("Vision production has no input batch");
+        const auto rank   = parameters.profile->local.rank;
+        const auto& batch = work->input->batches.at(rank);
+        std::size_t bytes = 0;
+        if (batch.features) {
+            const auto output =
+                std::find_if(work->window.plan->outputs.begin(), work->window.plan->outputs.end(),
+                             [&](const auto& b) { return b.rank == rank; });
+            if (output == work->window.plan->outputs.end())
+                throw std::logic_error("Vision rank batch has no output block");
+            auto destination = window.output(output->feature_begin, batch.features);
+            qwen::VisionContext encoder(cuda, *parameters.profile->config.vision,
+                                        *parameters.vision);
+            bytes =
+                encoder.encode(batch, destination, resources.workspace_storage(), window.staging());
+        }
+        if (parallel)
+            for (const auto& block : work->window.plan->outputs) {
+                auto destination = window.output(block.feature_begin, block.token_positions.size());
+                parallel->broadcast(destination, block.rank, cuda);
+            }
+        window.produced(bytes);
+    }
     const auto& region = *resources.plan.persistent.buffers.batch.visual_indices;
-    auto indices       = device_tensor(region).slice(0, 0, count);
-    auto host          = host_tensor(region).slice(0, 0, count);
-    std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-              static_cast<std::int32_t*>(host.data));
-    copy_bytes_async({indices.data, indices.bytes(), cuda.device()},
-                     {host.data, host.bytes(), Device::cpu(), true}, cuda);
-    return execution::VisualEmbeddingView{
-        chunk.embeddings.slice(1, static_cast<std::int32_t>(slice.source_begin), count), indices};
+    const auto host    = host_tensor(region);
+    return visual_view(*work->window.plan, begin, tokens, region,
+                       {host.data, host.bytes(), host.device, true});
 }
 
 std::optional<std::uint64_t>
-RankProgramImpl::collect_vision_timing(ResidentBinding& binding, std::uint32_t committed_frontier) {
-    if (!binding.vision && !binding.vision_timer) return {};
-    const auto elapsed = static_cast<std::uint64_t>(
-        (binding.vision_timer ? double(binding.vision_timer->elapsed_ms()) * 1.0e6
-                              : binding.vision->elapsed_seconds() * 1.0e9) +
-        0.5);
-    const auto increment       = elapsed - binding.observed_vision_ns;
-    binding.observed_vision_ns = elapsed;
-    if (committed_frontier >= binding.vision_input->plan.uses.back().end) retire_vision(binding);
-    return increment;
+RankProgramImpl::collect_vision_timing(const ResidentBinding& binding) {
+    if (!resources.vision) return {};
+    auto& window       = *resources.vision;
+    const auto* active = window.current();
+    if (!active || active->owner.sequence != binding.member.sequence ||
+        active->owner.residency != binding.member.residency)
+        return {};
+    return window.take_timing();
 }
 
 void RankProgramImpl::retire_vision(ResidentBinding& binding) noexcept {
-    binding.vision.reset();
-    binding.vision_timer.reset();
-    binding.feature_offsets.clear();
-    binding.distributed_vision_ready = false;
-    binding.observed_vision_ns       = 0;
-}
-
-qwen::VisionChunk RankProgramImpl::prepare_parallel_vision(ResidentBinding& binding,
-                                                           std::uint32_t begin,
-                                                           std::uint32_t tokens) {
-    const auto& input = *binding.vision_input;
-    const auto& plan  = input.plan;
-    auto features     = device_tensor(*resources.plan.persistent.buffers.vision_features)
-                        .slice(2, binding.member.residency.lane.value, 1);
-    if (!binding.distributed_vision_ready) {
-        const auto owners = vision_owners(input, parameters.profile->local.size);
-        binding.feature_offsets.assign(input.vision_items.size(), UINT32_MAX);
-        binding.vision_timer.emplace(device);
-        binding.vision_timer->start();
-        qwen::VisionContext encoder(cuda, *parameters.profile->config.vision, *parameters.vision);
-        std::uint32_t offset = 0;
-        for (const auto& use : plan.uses) {
-            if (use.end <= begin) continue;
-            const auto& control = plan.control->items.at(use.control_index);
-            if (control.merged_count > std::size_t(features.ne[1]) - offset)
-                throw std::logic_error("Vision features exceed the reserved resident capacity");
-            binding.feature_offsets.at(use.prepared_item_index) = offset;
-            auto output = features.slice(1, offset, control.merged_count);
-            offset += control.merged_count;
-            if (owners[use.prepared_item_index] != parameters.profile->local.rank) continue;
-            const auto& payload = input.media_payloads.at(use.prepared_item_index);
-            if (!payload) throw std::logic_error("Vision encoder owner has no input payload");
-            const auto bytes =
-                encoder.encode({payload->span(), &control}, output, resources.workspace_storage(),
-                               *resources.plan.workspace.vision);
-            vision_workspace_peak_bytes = std::max(vision_workspace_peak_bytes, bytes);
-        }
-        for (const auto& use : plan.uses) {
-            const auto offset = binding.feature_offsets.at(use.prepared_item_index);
-            if (offset == UINT32_MAX) continue;
-            auto output =
-                features.slice(1, offset, plan.control->items[use.control_index].merged_count);
-            parallel->broadcast(output, owners[use.prepared_item_index], cuda);
-        }
-        binding.vision_timer->record_stop();
-        binding.distributed_vision_ready = true;
-    }
-    const auto use = std::find_if(plan.uses.begin(), plan.uses.end(), [&](const auto& item) {
-        return item.end > begin && item.begin < std::uint64_t(begin) + tokens;
-    });
-    if (use == plan.uses.end()) return {static_cast<int>(tokens), nullptr, {}};
-    const auto& control = plan.control->items[use->control_index];
-    const auto offset   = binding.feature_offsets.at(use->prepared_item_index);
-    if (offset == UINT32_MAX) throw std::logic_error("Vision replay precedes retained features");
-    return {static_cast<int>(tokens), &control, features.slice(1, offset, control.merged_count), 0};
-}
-
-std::size_t RankProgramImpl::active_vision_bytes() const noexcept {
-    std::size_t bytes = 0;
-    for (const auto& binding : bindings) {
-        if (!binding) continue;
-        if (binding->vision) bytes = std::max(bytes, binding->vision->active_handoff_bytes());
-        if (binding->distributed_vision_ready) {
-            const auto& input = *binding->vision_input;
-            for (const auto& use : input.plan.uses)
-                if (binding->feature_offsets[use.prepared_item_index] != UINT32_MAX)
-                    bytes += input.plan.control->items[use.control_index].merged_count *
-                             parameters.profile->config.text.hidden * sizeof(std::uint16_t);
-        }
-    }
-    return bytes;
+    if (!resources.vision) return;
+    const auto* active = resources.vision->current();
+    if (active && active->owner.residency == binding.member.residency)
+        resources.vision->release(active->id);
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

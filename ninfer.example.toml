@@ -32,6 +32,9 @@ backend = "none" # none / mtp / dflash / dflash2
 draft_tokens = 0 # none: 0; MTP: 1..5; DFlash/DFlash2: 1..15.
 proposal_head = "full" # full / optimized; support depends on the model and artifact.
 
+[vision]
+memory_budget = "1GiB" # Per-rank encoder activations and output window; excludes weights and Host staging.
+
 [media]
 cache_capacity = "1GiB" # 0B disables the retained media cache.
 live_capacity = "2GiB" # Includes live patch payloads retained in the cache, counted once.

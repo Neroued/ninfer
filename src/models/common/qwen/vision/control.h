@@ -2,6 +2,7 @@
 
 #include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/common/qwen/vision/parameters.h"
+#include "models/common/vision/window.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,64 +10,47 @@
 
 namespace ninfer::models::qwen {
 
-struct VisionItemControl {
-    models::frontend::Modality modality = models::frontend::Modality::Image;
-    models::frontend::VisionGrid grid;
-    std::size_t patch_begin     = 0;
-    std::size_t patch_count     = 0;
-    std::size_t merged_count    = 0;
-    std::int32_t segment_length = 0;
-    std::int32_t segment_count  = 0;
-    std::vector<std::int32_t> position_ids;
-    std::vector<std::int32_t> scatter_indices;
-    std::vector<std::int32_t> position_table_indices;
-    std::vector<float> position_table_weights;
-};
-
-struct VisionControl {
-    std::uint32_t prepared_item_begin = 0;
-    std::vector<VisionItemControl> items;
-};
-
-struct VisionItemControlPlan {
-    std::uint32_t token_begin = 0;
-    std::uint32_t token_end   = 0;
-    std::size_t merged_count  = 0;
-};
-
-struct VisionControlPlan {
-    std::int32_t spatial_merge_size = 0;
-    std::int32_t position_grid_side = 0;
-    std::vector<VisionItemControlPlan> items;
-};
-
-struct VisionUseSpan {
-    std::uint32_t begin               = 0;
-    std::uint32_t end                 = 0;
-    std::uint32_t prepared_item_index = 0;
-    std::uint32_t control_index       = 0;
-};
-
-struct VisionPrefillPlan {
-    std::shared_ptr<const VisionControlPlan> control_plan;
-    std::shared_ptr<const VisionControl> control;
-    std::vector<VisionUseSpan> uses;
-    std::size_t max_merged_count = 0;
-
-    [[nodiscard]] std::uint32_t window_end(std::uint32_t begin, std::uint32_t end) const;
+struct VisionItemRange {
+    std::uint32_t begin = 0, end = 0;
 };
 
 struct VisionExecutionInput {
-    std::uint32_t prompt_tokens = 0;
+    VisionConfig config;
     std::vector<models::frontend::VisionItem> vision_items;
     std::vector<std::shared_ptr<const models::frontend::PreparedMediaPayload>> media_payloads;
-    VisionPrefillPlan plan;
+    std::vector<VisionItemRange> items;
+    std::vector<vision::Unit> units;
+
+    [[nodiscard]] bool can_checkpoint(std::uint32_t frontier) const noexcept;
 };
 
-[[nodiscard]] VisionControlPlan plan_vision_control(const PreparedPromptData& prompt,
-                                                    const VisionConfig& config);
-[[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt,
-                                                 const VisionControlPlan& plan,
-                                                 std::uint32_t prepared_item_begin);
+[[nodiscard]] std::shared_ptr<const VisionExecutionInput>
+prepare_vision_input(const PreparedPromptData&, const VisionConfig&, std::uint32_t capacity);
+
+struct VisionEncoderBatch {
+    std::vector<std::span<const std::uint16_t>> patches;
+    std::vector<std::int32_t> positions, position_indices, cu_seqlens;
+    std::vector<float> position_weights;
+    std::uint32_t features = 0;
+};
+
+struct VisionWindowInput {
+    std::vector<VisionEncoderBatch> batches;
+    std::shared_ptr<const VisionExecutionInput> owner;
+};
+
+struct VisionWork {
+    vision::WindowUse window;
+    std::shared_ptr<const VisionWindowInput> input;
+};
+
+[[nodiscard]] VisionWork prepare_vision_work(vision::WindowUse,
+                                             std::shared_ptr<const VisionExecutionInput>,
+                                             std::uint32_t ranks);
+
+[[nodiscard]] std::vector<vision::Unit> vision_units(std::span<const models::frontend::VisionItem>,
+                                                     const VisionConfig&);
+[[nodiscard]] VisionEncoderBatch encoder_batch(const VisionExecutionInput&,
+                                               const vision::WindowPlan&, std::uint32_t rank);
 
 } // namespace ninfer::models::qwen

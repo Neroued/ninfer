@@ -8,7 +8,7 @@
 #include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
-#include "models/common/qwen/vision/prefill.h"
+#include "models/common/qwen/vision/vision.h"
 #include "ninfer/ops/sampling.h"
 
 #include <deque>
@@ -19,12 +19,6 @@ class DeviceGraphs;
 
 struct ResidentBinding {
     runtime::ExecutionMember member;
-    std::shared_ptr<const qwen::VisionExecutionInput> vision_input;
-    std::unique_ptr<qwen::VisionPrefillExecution> vision;
-    std::uint64_t observed_vision_ns = 0;
-    bool distributed_vision_ready    = false;
-    std::vector<std::uint32_t> feature_offsets;
-    std::optional<CudaEventTimer> vision_timer;
 };
 
 struct MtpInputRow {
@@ -68,6 +62,7 @@ struct ComputeFrame {
     std::optional<execution::VisualEmbeddingView> visual;
     std::optional<runtime::DecisionInput> decision;
     bool decision_requested = false, sequence = false;
+    bool release_vision = false;
     bool first_sample = false, timer_started = false;
     bool graph_decided = false, graph_main = false;
     std::vector<std::uint32_t> draft_visible;
@@ -150,13 +145,13 @@ public:
     [[nodiscard]] Tensor packed_tensor(const TensorRegion&, std::initializer_list<std::int32_t>);
     [[nodiscard]] ResidentBinding& binding(runtime::ResidencyId);
     [[nodiscard]] std::optional<execution::VisualEmbeddingView>
-    prepare_vision(ResidentBinding&, std::uint32_t begin, std::uint32_t tokens);
-    [[nodiscard]] qwen::VisionChunk prepare_parallel_vision(ResidentBinding&, std::uint32_t begin,
-                                                            std::uint32_t tokens);
-    std::optional<std::uint64_t> collect_vision_timing(ResidentBinding&,
-                                                       std::uint32_t committed_frontier);
+    prepare_vision(const std::optional<qwen::VisionWork>&, std::uint32_t begin,
+                   std::uint32_t tokens);
+    [[nodiscard]] std::optional<execution::VisualEmbeddingView>
+    visual_view(const vision::WindowPlan&, std::uint32_t begin, std::uint32_t tokens,
+                const TensorRegion& indices, MemorySpan host);
+    std::optional<std::uint64_t> collect_vision_timing(const ResidentBinding&);
     void retire_vision(ResidentBinding&) noexcept;
-    [[nodiscard]] std::size_t active_vision_bytes() const noexcept;
     [[nodiscard]] RankMemoryUsage observe_resources() const;
     [[nodiscard]] RankExecutionObservation retirement_observation() const noexcept;
     void reset_measurement_peaks() noexcept;
@@ -178,8 +173,6 @@ public:
     CudaEventTimer prefill_timer;
     runtime::ExecutionGpuTimer gpu_timer;
     CudaCompletionEvent compute_done, context_done;
-    qwen::VisionHandoffState vision_handoff;
-    std::size_t vision_handoff_peak_bytes = 0, vision_workspace_peak_bytes = 0;
     std::array<std::optional<ResidentBinding>, kMaximumConcurrency> bindings;
     std::optional<ComputeFrame> compute;
     std::optional<ContextFrame> context;

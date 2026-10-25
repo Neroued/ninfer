@@ -4,9 +4,9 @@
 
 #include "models/common/context/directory.h"
 #include "models/qwen3_5/execution/profile.h"
-#include "models/common/qwen/vision/vision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/resources.h"
+#include "runtime/contract/execution.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,10 +29,12 @@ using ContextAssessment = context::ContextAssessment;
 using ContextReleaseSet = context::ContextReleaseSet;
 
 struct ResourceReservation {
-    bool reserved = false;
+    runtime::UnitReservationStatus status = runtime::UnitReservationStatus::ContextUnavailable;
     ContextAssessment assessment;
 
-    explicit operator bool() const noexcept { return reserved; }
+    explicit operator bool() const noexcept {
+        return status == runtime::UnitReservationStatus::Granted;
+    }
 };
 
 inline constexpr runtime::KvPoolId kTextKvPool{0};
@@ -72,8 +74,8 @@ struct SessionPlan {
     TransferWork state_transfer;
     std::optional<LayoutRegion> dflash_local_group;
     std::optional<TransferWork> dflash_local_transfer;
-    std::optional<qwen::VisionWorkspacePlan> vision_workspace;
-    bool causal_scoring = false;
+    std::uint32_t vision_max_features = 0;
+    bool causal_scoring               = false;
 };
 
 class SequencePlan {

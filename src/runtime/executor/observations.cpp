@@ -14,10 +14,10 @@ auto fields(T& v) {
     if constexpr (std::is_same_v<Value, GraphMemorySummary>)
         return std::tie(v.rebuild_estimate_bytes, v.preparation_increment_bytes,
                         v.calibration_increment_bytes, v.calibration_retained_bytes);
-    else if constexpr (std::is_same_v<Value, VisionWorkspaceMemorySummary>)
-        return std::tie(v.handoff_in_persistent, v.aggregate_prompt_tokens, v.max_item_tokens,
-                        v.general_capacity_bytes, v.encode_required_bytes, v.handoff_offset_bytes,
-                        v.handoff_capacity_bytes, v.handoff_active_bytes, v.handoff_peak_bytes);
+    else if constexpr (std::is_same_v<Value, VisionMemorySummary>)
+        return std::tie(v.budget_bytes, v.max_window_features, v.encoder_workspace_bytes,
+                        v.output_capacity_bytes, v.input_staging_bytes, v.output_active_bytes,
+                        v.output_peak_bytes);
     else if constexpr (std::is_same_v<Value, MoeMemorySummary>)
         return std::tie(v.host_weights_bytes, v.registered_host_bytes, v.cache_bytes, v.fixed_bytes,
                         v.window_bytes, v.window_count, v.used_bytes, v.target_bytes, v.ready_bytes,

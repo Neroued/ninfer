@@ -304,8 +304,10 @@ int main(int argc, char** argv) {
                         long_context.max_context = 65536;
                         const auto workspace     = q4::execution::plan_workspace(
                             *profile, long_context, 4096, device.multiprocessor_count(), nullptr);
-                        require(workspace.vision->max_merged_tokens == 16384,
-                                "Vision encoder reserved aggregate prompt capacity");
+                        require(workspace.vision->max_features > 0 &&
+                                    workspace.vision->device_bytes() <=
+                                        long_context.vision_memory_budget_bytes,
+                                "Vision execution exceeded its configured budget");
                     }
                     std::cout << "vision=" << vision << " mtp=" << mtp << " weights=" << weights
                               << " state_stride=" << selected->persistent.state.images.image_bytes

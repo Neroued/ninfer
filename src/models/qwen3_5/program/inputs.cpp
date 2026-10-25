@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/internal.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/execution/text.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/indexing.h"
@@ -124,44 +125,46 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
                     rope + axis * operation.width);
     upload_input(operation.width, 1);
     const auto prompt_begin = window.prompt_begin + offset;
-    if (window.vision && prompt_begin < window.vision->plan.uses.back().end) {
-        auto& residency = residencies[row.member.residency.lane.value];
-        if (residency.vision_input != window.vision) {
-            if (!parameters.vision || !workspace_plan.vision)
-                throw std::logic_error("Vision input has no prepared execution resources");
-            residency.vision_input = window.vision;
-            residency.vision       = std::make_unique<qwen::VisionPrefillExecution>(
-                device, *parameters.profile->config.vision, *parameters.vision,
-                resources.workspace_storage.span(), *workspace_plan.vision, window.vision,
-                vision_handoff, vision_peak);
+    if (window.visual) {
+        if (!parameters.vision || !resources.vision)
+            throw std::logic_error("Vision input has no prepared execution resources");
+        const auto& visual = *window.visual;
+        auto& storage      = *resources.vision;
+        if (storage.begin(visual.window)) {
+            if (!visual.input) throw std::logic_error("Vision production has no encoder batch");
+            const auto& batch = visual.input->batches.at(0);
+            auto output       = storage.output(0, batch.features);
+            qwen::VisionContext encoder(device.execution_view(), *parameters.profile->config.vision,
+                                        *parameters.vision);
+            const auto bytes = encoder.encode(batch, output, resources.workspace_storage.span(),
+                                              storage.staging());
+            storage.produced(bytes);
+            workspace_peak = std::max(workspace_peak, bytes);
         }
-        operation.vision_before = residency.vision->elapsed_seconds();
-        const auto chunk        = residency.vision->prepare_chunk(prompt_begin, operation.width);
-        if (chunk.length != static_cast<std::int32_t>(operation.width))
-            throw std::logic_error("Vision window crosses an unplanned handoff boundary");
-        const auto input  = frame.input_view(static_cast<int>(operation.width), 1);
-        Tensor embeddings = frame.input_embeddings.slice(1, 0, static_cast<int>(operation.width));
-        ops::embedding(input.ids.view({static_cast<int>(operation.width)}),
-                       parameters.text.token_embedding, embeddings, device.execution_view());
-        if (chunk.control) {
-            const auto slice = qwen::visual_embedding_slice(chunk.control->scatter_indices,
-                                                            window.vision->prompt_tokens,
-                                                            prompt_begin, operation.width);
-            if (!slice.empty()) {
-                auto host_indices =
-                    frame.host_visual_indices.slice(0, 0, static_cast<int>(slice.size()));
-                auto indices = frame.visual_indices.slice(0, 0, static_cast<int>(slice.size()));
+        const auto slices =
+            vision::embedding_slices(*visual.window.plan, prompt_begin, operation.width);
+        if (!slices.empty()) {
+            const auto input = frame.input_view(operation.width, 1);
+            auto embeddings  = frame.input_embeddings.slice(1, 0, operation.width);
+            ops::embedding(input.ids.view({static_cast<int>(operation.width)}),
+                           parameters.text.token_embedding, embeddings, device.execution_view());
+            std::size_t offset = 0;
+            for (const auto& slice : slices) {
+                const auto n = slice.destination_columns.size();
+                auto host    = frame.host_visual_indices.slice(0, offset, n);
+                auto indices = frame.visual_indices.slice(0, offset, n);
                 std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-                          static_cast<std::int32_t*>(host_indices.data));
-                CUDA_CHECK(cudaMemcpyAsync(indices.data, host_indices.data, indices.bytes(),
-                                           cudaMemcpyHostToDevice, device.stream()));
-                auto visual = chunk.embeddings.slice(1, static_cast<int>(slice.source_begin),
-                                                     static_cast<int>(slice.size()));
-                ops::scatter(visual, indices, embeddings, device.execution_view());
+                          static_cast<std::int32_t*>(host.data));
+                copy_bytes_async({indices.data, indices.bytes(), indices.device},
+                                 {host.data, host.bytes(), host.device, true},
+                                 device.execution_view());
+                auto source = storage.output(slice.source_begin, n);
+                ops::scatter(source, indices, embeddings, device.execution_view());
+                offset += n;
             }
+            operation.input_embeddings =
+                embeddings.view({embeddings.ne[0], static_cast<int>(operation.width), 1});
         }
-        operation.input_embeddings =
-            embeddings.view({embeddings.ne[0], static_cast<int>(operation.width), 1});
     }
 }
 

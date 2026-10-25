@@ -128,6 +128,17 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 for (const auto& row : rows)
                     if (row.ids.size() != count)
                         throw std::invalid_argument("Qwen4Exp forward rows have different lengths");
+                if (operation.visual) {
+                    const auto& use = operation.visual->window;
+                    if (!vision || rows.size() != 1 || !use.id || !use.plan ||
+                        use.owner.sequence != rows.front().member.sequence ||
+                        use.owner.residency != rows.front().member.residency ||
+                        (operation.kind != ForwardKind::Prefill &&
+                         operation.kind != ForwardKind::Replay) ||
+                        use.produce != bool(operation.visual->input))
+                        throw std::invalid_argument(
+                            "Qwen4Exp Vision work differs from its window owner");
+                }
                 const bool sampling = operation.sample != SampleKind::None;
                 switch (operation.kind) {
                 case ForwardKind::Prefill:
@@ -212,8 +223,6 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                         if (previous.member.sequence == binding.member.sequence)
                             throw std::invalid_argument("duplicate Qwen4Exp sequence binding");
                     }
-                    if (binding.vision && !vision)
-                        throw std::invalid_argument("Qwen4Exp Vision resources were not prepared");
                     if (binding.generated.size() > shape.max_context)
                         throw std::invalid_argument(
                             "Qwen4Exp generated history exceeds its context");

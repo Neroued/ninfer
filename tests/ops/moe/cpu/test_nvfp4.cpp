@@ -323,10 +323,11 @@ void validation(Fixture& f, CpuExecutor& executor) {
     });
     MemoryArena small({storage.data(), cap - 1, Device::cpu()});
     weights.gate_up = f.gu.view;
-    rejects([&] {
+    try {
         ops::routed_swiglu(x, f.profile, weights, routes, {}, out, small,
                            executor.execution_view());
-    });
+        check(false, "accepted insufficient workspace");
+    } catch (const std::bad_alloc&) {}
     // Empty masks must not resolve even missing banks or their divisor metadata.
     std::array<int, E> zeros{};
     ops::routed_swiglu(

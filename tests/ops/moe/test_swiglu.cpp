@@ -69,8 +69,10 @@ int run(std::span<const Call> calls) {
             "swiglu/nvfp4/T" + std::to_string(call.t) + (call.graph ? "/graph" : "/eager");
         const auto capacity = ops::swiglu_workspace_capacity_bytes(profile, call.t, call.t);
         if (capacity > interval) ++failures;
-        GuardedDeviceBuffer scratch(capacity);
+        const std::size_t prefix = call.t == 1 ? 64 : 0;
+        GuardedDeviceBuffer scratch(capacity + (prefix ? 256 : 0));
         MemoryArena arena(scratch.span());
+        if (prefix) (void)arena.alloc_bytes(prefix, 1);
         input_projection::GuardedBf16Tensor destination(H, call.t);
         Tensor x(input.span(), DType::BF16, {H, call.t});
         auto y = destination.tensor();
@@ -98,7 +100,7 @@ int run(std::span<const Call> calls) {
             else
                 launch();
             cuda_check(cudaStreamSynchronize(cuda.stream()), "finish FFN");
-            if (arena.used() != 0 || arena.peak_used() > capacity) ++failures;
+            if (arena.used() != prefix || arena.peak_used() > scratch.bytes()) ++failures;
             auto actual = destination.values();
             for (double v : actual)
                 if (!std::isfinite(v)) {
@@ -317,9 +319,11 @@ int tail_clamp(int recipe) {
             };
             GuardedDeviceBuffer small(cap - 1);
             MemoryArena insufficient(small.span());
-            rejected([&] {
+            try {
                 ops::swiglu(x, p, weights, y, insufficient, cuda_environment().default_execution);
-            });
+
+                ++failures;
+            } catch (const std::bad_alloc&) {}
             auto bad        = weights;
             bad.down.policy = ops::LinearPolicy::A16Only;
             rejected([&] { ops::swiglu(x, p, bad, y, ws, cuda_environment().default_execution); });

@@ -18,11 +18,9 @@ struct WholeStorage {
 template <class Arena>
 WholeStorage allocate_whole(Arena& arena, int tokens) {
     WholeStorage s;
-    s.routes = {arena.alloc(DType::I32, {8, tokens}), arena.alloc(DType::FP32, {8, tokens})};
-    s.routed = arena.alloc(DType::FP32, {4096, tokens});
-    // Child Ops borrow a 256-byte-aligned cursor after this persistent metadata.
-    const auto validity_bytes = (std::size_t(tokens) * sizeof(int) + 255) / 256 * 256;
-    s.valid_tokens            = Tensor(arena.alloc_bytes(validity_bytes), DType::I32, {tokens});
+    s.routes       = {arena.alloc(DType::I32, {8, tokens}), arena.alloc(DType::FP32, {8, tokens})};
+    s.routed       = arena.alloc(DType::FP32, {4096, tokens});
+    s.valid_tokens = arena.alloc(DType::I32, {tokens});
     return s;
 }
 
@@ -72,22 +70,24 @@ void topk_sigmoid_swiglu_moe(const Tensor& x, const SigmoidMoeProfile& p,
         operands.coefficient(w.correction_bias, p.routing.route.experts, false);
         operands.experts(w.routed, p.routed);
     }
-    operands.workspace(
-        ws, topk_sigmoid_swiglu_moe_workspace_capacity_bytes(p, subset.kind, tokens, tokens));
+    auto scope = ws.scope();
+    MemoryArena scratch(ws.alloc_bytes(
+        topk_sigmoid_swiglu_moe_workspace_capacity_bytes(p, subset.kind, tokens, tokens)));
+    operands.workspace(scratch.storage());
     operands.finish();
     if (subset.kind == ExpertSubsetKind::None) {
-        swiglu(x, p.shared, w.shared, out, ws, execution);
+        swiglu(x, p.shared, w.shared, out, scratch, execution);
         return;
     }
 #if NINFER_TARGET_SPARK
-    auto scope   = ws.scope();
-    auto storage = allocate_whole(ws, tokens);
-    topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, ws, execution);
+    auto storage = allocate_whole(scratch, tokens);
+    topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, scratch,
+                       execution);
     const auto routed = detail::moe_routed::execute_contribution(
         x, p.routed, w.routed, storage.routes, subset, storage.routed,
-        static_cast<int*>(storage.valid_tokens.data), ws, execution);
-    detail::swiglu_ffn::launch_a16_ffn_join(x, w.shared, out, routed, *p.shared.clamp_limit, ws,
-                                            execution.stream());
+        static_cast<int*>(storage.valid_tokens.data), scratch, execution);
+    detail::swiglu_ffn::launch_a16_ffn_join(x, w.shared, out, routed, *p.shared.clamp_limit,
+                                            scratch, execution.stream());
 #endif
 }
 } // namespace ninfer::ops

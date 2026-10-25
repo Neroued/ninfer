@@ -88,8 +88,10 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
     operands.subset(subset, p.experts);
     if (subset.kind != ExpertSubsetKind::None) { operands.experts(weights.routed, p); }
     operands.shared(weights.shared, profile.shared);
-    operands.workspace(workspace, topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                                      profile, subset.kind, mode, tokens, tokens));
+    auto workspace_scope = workspace.scope();
+    MemoryArena scratch(workspace.alloc_bytes(topk_softmax_swiglu_moe_workspace_capacity_bytes(
+        profile, subset.kind, mode, tokens, tokens)));
+    operands.workspace(scratch.storage());
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxSwiGLUMoe, nvtx::Category::Moe, tokens);
     const int slice = shape.slice_tokens(subset.kind);
@@ -99,8 +101,8 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         const auto plan    = shape.select(count, profile.shared.intermediate, subset.kind);
         const auto input   = x.slice(1, offset, count);
         auto output        = destination.slice(1, offset, count);
-        auto scope         = workspace.scope();
-        const auto storage = allocate(workspace, plan, count, profile, subset.kind);
+        auto scope         = scratch.scope();
+        const auto storage = allocate(scratch, plan, count, profile, subset.kind);
         const ScaledSwiGLUTerm shared{weights.shared, storage.shared};
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             block_scaled::launch_control_shared(input, weights, storage.routes, subset,

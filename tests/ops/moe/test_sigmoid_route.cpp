@@ -78,7 +78,7 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
         GuardedDeviceBuffer ids(std::size_t(K) * call.t * 4),
             coefficients(std::size_t(K) * call.t * 4), scratch(cap + 256);
         MemoryArena ws(scratch.span());
-        (void)ws.alloc_bytes(256);
+        (void)ws.alloc_bytes(64, 1);
         cuda_check(cudaMemset(scratch.data(), 0x5a, 256), "route prefix");
         ops::ExpertRoutes out{Tensor(ids.span(), DType::I32, {K, call.t}),
                               Tensor(coefficients.span(), DType::FP32, {K, call.t})};
@@ -140,7 +140,7 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
                                                         std::as_bytes(std::span(values)), label) +
                         linear_common::verify_preserved(
                             device_bias.data(), std::as_bytes(std::span(corrections)), label);
-            if (ws.used() != 256 || ws.peak_used() > cap + 256 || cap > interval) ++failures;
+            if (ws.used() != 64 || ws.peak_used() > cap + 256 || cap > interval) ++failures;
         }
         std::array<std::byte, 256> prefix;
         prefix.fill(std::byte{0x5a});
@@ -198,10 +198,12 @@ int metadata() {
         });
     }
     MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
-    rejected([&] {
+    try {
         ops::topk_sigmoid_route(x, p, weight.view(), b, out, short_ws,
                                 cuda_environment().default_execution);
-    });
+
+        ++failures;
+    } catch (const std::bad_alloc&) {}
     auto alias              = out;
     alias.coefficients.data = ids.data();
     rejected([&] {

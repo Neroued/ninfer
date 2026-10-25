@@ -37,17 +37,20 @@ void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weig
     operands.control(control, profile);
     operands.routes(routes, profile.top_k, tokens, true);
     operands.coefficient(shared_coefficients, tokens, true);
-    operands.workspace(workspace,
-                       topk_softmax_route_workspace_capacity_bytes(profile, tokens, tokens));
+    auto workspace_scope = workspace.scope();
+    const auto bytes     = topk_softmax_route_workspace_capacity_bytes(profile, tokens, tokens);
+    MemoryArena scratch(bytes ? workspace.alloc_bytes(bytes)
+                              : MemorySpan{nullptr, 0, workspace.device()});
+    operands.workspace(scratch.storage());
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxRoute, nvtx::Category::Moe, tokens);
     for (std::int64_t start = 0; start < tokens; start += detail::moe_route::kSliceTokens) {
         const int offset = static_cast<int>(start);
         const int count  = std::min(tokens - offset, detail::moe_route::kSliceTokens);
-        auto scope       = workspace.scope();
+        auto scope       = scratch.scope();
         const auto plan  = select(profile, count);
         const auto storage =
-            detail::moe_cuda::routing::allocate_route(workspace, plan, count, profile.experts);
+            detail::moe_cuda::routing::allocate_route(scratch, plan, count, profile.experts);
         const ExpertRoutes result{routes.ids.slice(1, offset, count),
                                   routes.coefficients.slice(1, offset, count)};
         detail::moe_cuda::routing::launch_route(x.slice(1, offset, count), control, result,

@@ -55,7 +55,7 @@ int run(std::span<const Call> calls, bool repeated = false) {
         if (cap > interval) ++failures;
         GuardedDeviceBuffer scratch(cap + 256);
         MemoryArena ws(scratch.span());
-        (void)ws.alloc_bytes(256);
+        (void)ws.alloc_bytes(64, 1);
         cuda_check(cudaMemset(scratch.data(), 0x5a, 256), "FFN prefix");
         input_projection::GuardedBf16Tensor output(H, call.t);
         Tensor x(input.span(), DType::BF16, {H, call.t});
@@ -83,7 +83,7 @@ int run(std::span<const Call> calls, bool repeated = false) {
             else
                 launch();
             cuda_check(cudaStreamSynchronize(cuda.stream()), "finish native FFN");
-            if (ws.used() != 256 || ws.peak_used() > cap + 256) ++failures;
+            if (ws.used() != 64 || ws.peak_used() > cap + 256) ++failures;
             auto actual = output.values();
             for (double value : actual)
                 if (!std::isfinite(value)) {
@@ -223,8 +223,10 @@ int metadata() {
         rejected([&] { ops::swiglu(x, p, bad, y, ws, cuda_environment().default_execution); });
     }
     MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
-    rejected(
-        [&] { ops::swiglu(x, p, weights, y, short_ws, cuda_environment().default_execution); });
+    try {
+        ops::swiglu(x, p, weights, y, short_ws, cuda_environment().default_execution);
+        ++failures;
+    } catch (const std::bad_alloc&) {}
     rejected([&] { ops::swiglu(x, p, weights, x, ws, cuda_environment().default_execution); });
     failures += linear_common::verify_preserved(output.data(), untouched, "BF16 rejected output") +
                 output.verify_guards("BF16 metadata") + scratch.verify_guards("BF16 metadata");

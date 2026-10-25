@@ -259,10 +259,12 @@ int metadata(bool fp8) {
                            env.context.execution_view());
     });
     MemoryArena short_arena(scratch.span().subspan(0, cap - 256));
-    rejected([&] {
+    try {
         ops::routed_swiglu(x, p, w.experts(), routes, w.subset(), ops::MoeEpilogue::Write, y,
                            short_arena, env.context.execution_view());
-    });
+
+        ++failures;
+    } catch (const std::bad_alloc&) {}
     failures += linear_common::verify_preserved(output.data(), poison, "EP rejected output");
     for (auto type : {DType::BF16, DType::FP32}) {
         const int bytes = type == DType::BF16 ? 2 : 4;

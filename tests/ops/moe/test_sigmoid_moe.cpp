@@ -369,10 +369,12 @@ int metadata(bool fp8, bool q8 = false) {
                                      cuda_environment().default_execution);
     });
     MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
-    reject([&] {
+    try {
         ops::topk_sigmoid_swiglu_moe(x, p, w, f.bank.subset(), y, short_ws,
                                      cuda_environment().default_execution);
-    });
+
+        ++failures;
+    } catch (const std::bad_alloc&) {}
     failures += linear_common::verify_preserved(out.data(), poison, "whole rejected output");
     return failures;
 }

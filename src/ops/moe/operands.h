@@ -28,7 +28,7 @@ public:
     void experts(const CudaSwiGLUExperts& weights, const RoutedSwiGLUProfile& profile);
     void shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile);
     void unscaled_shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile);
-    void workspace(const MemoryArena& workspace, std::size_t bytes);
+    void workspace(ConstMemorySpan scratch);
     void finish() const;
 
 private:

@@ -91,9 +91,12 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         operands.shared(shared->weights, *shared_profile);
         operands.coefficient(shared->coefficients, tokens, false);
     }
-    operands.workspace(workspace,
-                       capacity(profile, shared_profile ? &*shared_profile : nullptr, subset.kind,
-                                destination.dtype, mode, tokens, tokens, valid_tokens != nullptr));
+    auto workspace_scope = workspace.scope();
+    const auto bytes = capacity(profile, shared_profile ? &*shared_profile : nullptr, subset.kind,
+                                destination.dtype, mode, tokens, tokens, valid_tokens != nullptr);
+    MemoryArena scratch(bytes ? workspace.alloc_bytes(bytes)
+                              : MemorySpan{nullptr, 0, workspace.device()});
+    operands.workspace(scratch.storage());
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::RoutedSwiGLU, nvtx::Category::Moe, tokens);
     if (subset.kind == ExpertSubsetKind::None && !shared) {
@@ -116,10 +119,10 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         if (shared) {
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
-        auto scope      = workspace.scope();
+        auto scope      = scratch.scope();
         const auto plan = shape.select(profile.ffn, count, shared_intermediate);
         auto buffers =
-            allocate(workspace, plan, count, subset.kind, shared_intermediate,
+            allocate(scratch, plan, count, subset.kind, shared_intermediate,
                      profile.ffn.gate_up_type == QType::Q8_G32_FP16, valid_tokens != nullptr);
         if (valid_tokens) buffers.clamped.active_tokens = valid_tokens + offset;
 #if NINFER_TARGET_SPARK

@@ -79,13 +79,15 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
     const int tokens = x.ne[1];
     require(tokens > 0, "swiglu: token count must be positive");
     const auto bytes = capacity(p, tokens);
+    auto scope       = ws.scope();
+    MemoryArena work(ws.alloc_bytes(bytes));
     if (p.gate_up_type == QType::BF16 || p.gate_up_type == QType::Q8_G32_FP16) {
         detail::MoeOperands operands(op, execution);
         (void)operands.input(x, p.hidden);
         require(out.dtype == DType::BF16, "swiglu: destination must be BF16");
         operands.output(out, p.hidden, tokens, MoeEpilogue::Write);
         operands.unscaled_shared(weights, p);
-        operands.workspace(ws, bytes);
+        operands.workspace(work.storage());
         operands.finish();
     } else {
         operand::tensor(x, DType::BF16, {p.hidden, tokens}, 16, op, "x", execution.device());
@@ -94,11 +96,9 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
         auto expected        = swiglu_profile(weights);
         expected.clamp_limit = p.clamp_limit;
         require(expected == p, "swiglu: prepared weights differ from profile");
-        operand::device(ws.device(), execution.device(), op, "workspace");
-        require(bytes <= ws.capacity() - ws.used(), "swiglu: insufficient workspace");
-        auto* cursor = static_cast<std::byte*>(ws.storage().data) + ws.used();
-        require(operand::aligned(cursor, 256), "swiglu: workspace cursor must be 256-byte aligned");
-        const auto output = operand::range(out, op), scratch = operand::range(cursor, bytes, op);
+        operand::device(work.device(), execution.device(), op, "workspace");
+        const auto output  = operand::range(out, op),
+                   scratch = operand::range(work.storage().data, bytes, op);
         operand::disjoint(output, scratch, op);
         const auto read = [&](const void* data, std::size_t size) {
             const auto r = operand::range(data, size, op);
@@ -116,26 +116,27 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
     }
 #if NINFER_TARGET_SPARK
     if (p.gate_up_type == QType::Q8_G32_FP16) {
-        detail::swiglu_ffn::launch_q8_ffn(x, weights, out, *p.clamp_limit, ws, execution.stream());
+        detail::swiglu_ffn::launch_q8_ffn(x, weights, out, *p.clamp_limit, work,
+                                          execution.stream());
         return;
     }
     if (p.gate_up_type == QType::BF16) {
-        detail::swiglu_ffn::launch_bf16_ffn(x, weights, out, *p.clamp_limit, ws,
+        detail::swiglu_ffn::launch_bf16_ffn(x, weights, out, *p.clamp_limit, work,
                                             execution.stream());
         return;
     }
     if (tokens >= 129) {
-        detail::swiglu_ffn::launch_nvfp4_quantized_ffn(x, weights, out, *p.clamp_limit, ws,
+        detail::swiglu_ffn::launch_nvfp4_quantized_ffn(x, weights, out, *p.clamp_limit, work,
                                                        execution.stream());
         return;
     }
-    auto scope   = ws.scope();
-    auto product = ws.alloc(DType::FP32, {p.intermediate, tokens});
+    auto product = work.alloc(DType::FP32, {p.intermediate, tokens});
     detail::swiglu_ffn::launch_nvfp4_gu_float(x, weights.gate_up.weight,
-                                              static_cast<float*>(product.data), *p.clamp_limit, ws,
-                                              execution.stream());
+                                              static_cast<float*>(product.data), *p.clamp_limit,
+                                              work, execution.stream());
     detail::swiglu_ffn::launch_nvfp4_down(static_cast<const float*>(product.data),
-                                          weights.down.weight, out, tokens, ws, execution.stream());
+                                          weights.down.weight, out, tokens, work,
+                                          execution.stream());
 #endif
 }
 

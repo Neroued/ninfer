@@ -21,20 +21,13 @@ void require(bool condition, const char* message) {
 
 class Operands {
 public:
-    Operands(const Tensor& x, Tensor& out, MemoryArena& workspace, std::size_t capacity,
-             int hidden) {
+    Operands(const Tensor& x, Tensor& out, ConstMemorySpan scratch, int hidden) {
         operand::tensor(x, DType::BF16, {hidden, x.ne[1]}, 2, op, "x", Device::cpu());
         operand::tensor(out, DType::FP32, {hidden, x.ne[1]}, 4, op, "destination", Device::cpu());
-        operand::device(workspace.device(), Device::cpu(), op, "workspace");
-        require(capacity <= workspace.capacity() - workspace.used(),
-                "routed_swiglu CPU: insufficient workspace");
+        operand::device(scratch.device, Device::cpu(), op, "workspace");
         output_ = operand::range(out, op);
-        if (capacity) {
-            const auto* begin =
-                static_cast<const std::byte*>(workspace.storage().data) + workspace.used();
-            require(operand::aligned(begin, 256),
-                    "routed_swiglu CPU: workspace cursor must be 256-byte aligned");
-            scratch_ = operand::range(begin, capacity, op);
+        if (scratch.bytes) {
+            scratch_ = operand::range(scratch.data, scratch.bytes, op);
             operand::disjoint(output_, scratch_, op);
         }
         read(x.data, x.bytes());
@@ -122,7 +115,10 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int tokens  = x.ne[1];
     impl::validate_capacity(subset.kind, tokens, tokens);
     const auto capacity = subset.kind == ExpertSubsetKind::None ? 0 : shape.capacity(tokens);
-    const Operands operands(x, destination, workspace, capacity, profile.ffn.hidden);
+    auto scope          = workspace.scope();
+    MemoryArena scratch(capacity ? workspace.alloc_bytes(capacity)
+                                 : MemorySpan{nullptr, 0, workspace.device()});
+    const Operands operands(x, destination, scratch.storage(), profile.ffn.hidden);
     if (subset.kind == ExpertSubsetKind::None) {
         std::memset(destination.data, 0, destination.bytes());
         return;
@@ -166,7 +162,6 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                   2 * profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
     operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout, profile.ffn.hidden,
                   profile.ffn.intermediate, profile.experts, selected);
-    auto scope = workspace.scope();
     const kernel::Invocation args{.input        = static_cast<const std::uint16_t*>(x.data),
                                   .ids          = ids,
                                   .coefficients = coefficients,
@@ -175,7 +170,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                   .mask         = mask,
                                   .output       = static_cast<float*>(destination.data),
                                   .tokens       = tokens};
-    shape.launch(args, workspace, execution);
+    shape.launch(args, scratch, execution);
 }
 
 } // namespace ninfer::ops

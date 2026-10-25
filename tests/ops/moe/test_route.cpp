@@ -12,8 +12,8 @@ int route_case(Fixture& fixture, CudaExecutionView execution, int tokens) {
     Tensor beta(shared.span(), DType::FP32, {tokens});
     const ops::RouteProfile profile{kHidden, kExperts, kTopK};
     const auto bytes = ops::topk_softmax_route_workspace_capacity_bytes(profile, tokens, tokens);
-    // The current address, not the arena's base or relative cursor, must be aligned.
-    const std::size_t prefix = tokens == 1 ? 255 : 0;
+    // A borrowed arena may start and end its live prefix at unaligned addresses.
+    const std::size_t prefix = tokens == 1 ? 31 : 0;
     GuardedDeviceBuffer scratch(bytes + (prefix ? 256 : 0));
     MemoryArena arena(scratch.span().subspan(prefix ? 1 : 0));
     if (prefix) { (void)arena.alloc_bytes(prefix, 1); }
@@ -57,7 +57,8 @@ int route_case(Fixture& fixture, CudaExecutionView execution, int tokens) {
                                  expected_beta, kRouteAccuracy);
     failures += ids.verify_guards(label) + coefficients.verify_guards(label) +
                 shared.verify_guards(label) + scratch.verify_guards(label);
-    if (arena.used() != prefix || arena.peak_used() != prefix + bytes) {
+    if (arena.used() != prefix ||
+        arena.peak_used() != (bytes ? (prefix ? 255 : 0) + bytes : prefix)) {
         std::cerr << label << " workspace mismatch\n";
         ++failures;
     }

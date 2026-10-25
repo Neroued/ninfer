@@ -11,6 +11,10 @@
 
 namespace ninfer::ops {
 
+// Workspace capacities start at a 256-byte-aligned local origin. Entries suballocate that
+// region from the caller arena and restore its cursor on return; the caller accounts for
+// any leading alignment gap when composing allocations. Zero scratch performs no allocation.
+
 // Every SwiGLU uses gate_up [2I,H] with gate rows first, then up rows; down is [H,I].
 struct SwiGLUProfile {
     std::int32_t hidden = 0, intermediate = 0;
@@ -72,7 +76,7 @@ struct SwiGLUWeights {
 // down [H,I]; inputs and native weight planes are immutable and disjoint from destination
 // and live caller scratch. Profile and prepared weights must agree. No observable product
 // rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
-// Capacity covers the inclusive extent interval from a 256-byte-aligned arena cursor.
+// Capacity covers the inclusive extent interval.
 // No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
 // Supports registered BF16, Q8-G32/FP16 and NVFP4 profiles with an explicit finite positive clamp
 // limit.
@@ -232,7 +236,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
 // allocation, transfer or thread creation occurs. Shared experts and residual addition are
 // separate computations. Requires an AVX2/FMA/F16C worker team for nonempty contributions.
 // NVFP4 consumes the native swizzled scales and each expert's matrix divisor directly.
-// Capacity covers the inclusive token interval from a 256-byte-aligned local cursor; it is
+// Capacity covers the inclusive token interval; it is
 // independent of worker count and excludes destination storage. None requires no scratch.
 [[nodiscard]] std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
                                                                  ExpertSubsetKind subset,

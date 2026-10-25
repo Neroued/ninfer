@@ -38,11 +38,13 @@ void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile& p, const Wei
     operands.sigmoid_control(control, p.route);
     operands.coefficient(bias, p.route.experts, false);
     operands.routes(routes, p.route.top_k, tokens, true);
-    operands.workspace(ws, topk_sigmoid_route_workspace_capacity_bytes(p, tokens, tokens));
+    auto scope = ws.scope();
+    MemoryArena scratch(
+        ws.alloc_bytes(topk_sigmoid_route_workspace_capacity_bytes(p, tokens, tokens)));
+    operands.workspace(scratch.storage());
     operands.finish();
 #if NINFER_TARGET_SPARK
-    auto scope  = ws.scope();
-    auto scores = ws.alloc(DType::FP32, {p.route.experts, tokens});
+    auto scores = scratch.alloc(DType::FP32, {p.route.experts, tokens});
     detail::moe_sigmoid::launch(x, control, bias, routes, p, static_cast<float*>(scores.data),
                                 execution.stream());
 #endif

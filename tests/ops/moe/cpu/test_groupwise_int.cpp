@@ -376,10 +376,11 @@ void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, ops::Exp
           "CPU Op modified an input");
     if (capacity) {
         MemoryArena short_arena(scratch.span().subspan(0, capacity - 1));
-        rejects([&] {
+        try {
             ops::routed_swiglu(x, f.profile, weights, routes, subset, out, short_arena,
                                executor.execution_view());
-        });
+            check(false, "accepted insufficient workspace");
+        } catch (const std::bad_alloc&) {}
     }
     std::cout << "down_bits=" << f.experts[0].down.bits << " T=" << tokens << " active=" << active
               << " workers=" << executor.plan().worker_cpus.size()
@@ -568,8 +569,16 @@ void validation(Fixture& f, CpuExecutor& executor) {
     x.data            = original_x;
     const auto before = arena.used();
     (void)arena.alloc_bytes(1, 1);
-    rejects([&] { call(); });
-    check(arena.used() == before + 1, "rejected call changed the workspace cursor");
+    call();
+    check(arena.used() == before + 1 && arena.peak_used() == 512 + capacity,
+          "unaligned caller scratch was not aligned and scoped");
+    MemoryArena short_arena(storage.span().subspan(0, capacity + 511));
+    (void)short_arena.alloc_bytes(257, 1);
+    try {
+        ops::routed_swiglu(x, f.profile, weights, routes, {}, out, short_arena, view);
+        check(false, "workspace capacity omitted leading alignment");
+    } catch (const std::bad_alloc&) {}
+    check(short_arena.used() == 257, "failed allocation changed the caller cursor");
 
     // Empty contributions need no banks; None also needs no routes and no aligned scratch cursor.
     weights = {};

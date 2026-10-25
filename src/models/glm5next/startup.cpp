@@ -1,5 +1,9 @@
 #include "models/glm5next/startup.h"
+
 #include "core/platform.h"
+#include "models/glm5next/program/graph_inputs.h"
+
+#include <algorithm>
 
 namespace ninfer::models::glm5next {
 
@@ -9,8 +13,6 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
       control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
-    if (options_.use_cuda_graph)
-        throw std::invalid_argument("GLM5Next rank preparation requires eager execution");
     auto definition = read_definition(reader, load_options(options_));
     load_.emplace(
         resolve_rank_load(reader, std::move(definition), std::move(request.rank), device.device()));
@@ -36,25 +38,57 @@ void RankPreparation::materialize() {
 
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {
     if (!instance_) throw std::logic_error("GLM5Next parameters have not been materialized");
-    const auto& model = *instance_->model;
-    const auto& s     = model.storage_stats();
-    return {.capacity          = {capacity_, available},
-            .weight_bytes      = s.device_capacity_bytes + model.metadata_bytes(),
-            .host_weight_bytes = s.host_capacity_bytes,
-            .staging_bytes     = s.peak_staging_bytes,
-            .read_bytes        = s.read_bytes,
-            .upload_bytes      = s.h2d_bytes,
-            .load_seconds      = s.upload_seconds,
-            .device_objects    = s.device_object_count,
-            .host_objects      = s.host_object_count,
-            .control_owner     = control_owner_};
+    const auto& model  = *instance_->model;
+    const auto& s      = model.storage_stats();
+    const auto reserve = graph_memory_.rebuild_estimate_bytes;
+    return {.capacity             = {capacity_, available > reserve ? available - reserve : 0},
+            .weight_bytes         = s.device_capacity_bytes + model.metadata_bytes(),
+            .host_weight_bytes    = s.host_capacity_bytes,
+            .staging_bytes        = s.peak_staging_bytes,
+            .read_bytes           = s.read_bytes,
+            .upload_bytes         = s.h2d_bytes,
+            .load_seconds         = s.upload_seconds,
+            .device_objects       = s.device_object_count,
+            .host_objects         = s.host_object_count,
+            .preparation_required = plan_.use_cuda_graph,
+            .control_owner        = control_owner_};
 }
+
+void RankPreparation::prepare_probe() {
+    if (!plan_.use_cuda_graph) return;
+    auto plan                               = plan_;
+    plan.capacity                           = {};
+    plan.capacity.device_bytes              = detail::graph_context_bytes(plan);
+    plan.capacity.runtime_reservation_bytes = plan.reservation_bytes();
+    auto resources                          = std::make_unique<Resources>(std::move(plan), device_);
+    probe_ = std::make_unique<RankProgram>(instance_->parameters, std::move(resources), device_,
+                                           binding_);
+}
+
+void RankPreparation::calibrate() {
+    if (!probe_) return;
+    const auto before = device_memory_snapshot(device_.device());
+    probe_->prepare_execution();
+    const auto ready = device_memory_snapshot(device_.device());
+    probe_->release_execution();
+    const auto released                       = device_memory_snapshot(device_.device());
+    graph_memory_.calibration_increment_bytes = device_memory_growth(before, ready);
+    graph_memory_.calibration_retained_bytes  = device_memory_growth(before, released);
+    graph_memory_.rebuild_estimate_bytes =
+        std::max<std::int64_t>(0, device_memory_growth(released, ready));
+    probe_.reset();
+    device_.synchronize();
+}
+
+void RankPreparation::prepare_execution() { instance_->program->prepare_execution(); }
 
 void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t available,
                               std::size_t available_host) {
     if (!instance_ || instance_->program)
         throw std::logic_error(
             "GLM5Next resource allocation requires weights and an empty resource slot");
+    const auto reserve  = graph_memory_.rebuild_estimate_bytes;
+    available           = available > reserve ? available - reserve : 0;
     const auto reserved = capacity_.reservation_bytes(capacity);
     const auto control =
         control_owner_ && NINFER_SHARED_PHYSICAL_MEMORY ? capacity_.control_bytes(capacity) : 0;
@@ -98,6 +132,12 @@ RankResourceDescription RankPreparation::describe() const {
                   .available_after_weights_bytes     = c.available_after_weights_bytes,
                   .headroom_bytes                    = c.automatic_headroom_bytes,
                   .planned_slack_bytes               = c.planned_slack_bytes};
+    if (plan_.use_cuda_graph) {
+        auto observed     = instance_->program->resource_budget().graphs;
+        out.budget.graphs = graph_memory_;
+        if (observed)
+            out.budget.graphs->preparation_increment_bytes = observed->preparation_increment_bytes;
+    }
     out.caches.push_back(p.main.cache.page.geometry);
     if (p.mtp) out.caches.push_back(p.mtp->cache.page.geometry);
     if (p.workspace.vision) out.vision_max_features = p.workspace.vision->max_features;

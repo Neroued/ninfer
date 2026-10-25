@@ -165,20 +165,8 @@ void RankProgramImpl::prepare_main() {
         const bool control     = forward && forward->sample == SampleKind::None;
         const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
                                              [](const auto& row) { return row.constrained; });
-        const bool greedy      = std::all_of(f.rows.begin(), f.rows.end(), [](const auto& row) {
-            return !(row.sampling.temperature > 0);
-        });
-        const auto mode        = control       ? DeviceRound::Control
-                                 : constrained ? DeviceRound::Compute
-                                 : greedy      ? DeviceRound::Greedy
-                                               : DeviceRound::Sample;
-        f.graph_decided        = !control && !constrained;
-        if (f.graph_decided) {
-            request_decision();
-            install_sampling(f.verify.has_value());
-        }
-        device_graphs->replay(batch, mode, f.draft_visible, f.visible);
-        if (!f.graph_decided) request_decision();
+        device_graphs->replay(batch, f.draft_visible, f.visible, !control, constrained);
+        request_decision();
         f.graph_main = true;
         f.phase      = ComputePhase::AfterMain;
         return;
@@ -201,10 +189,8 @@ void RankProgramImpl::prepare_main() {
     f.run = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
     if (graphs && host_ple && !f.sequence) {
         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-        const auto kind     = f.verify                                   ? MainGraph::Verify
-                              : forward->sample == SampleKind::NextToken ? MainGraph::Ordinary
-                                                                         : MainGraph::Control;
-        f.graph             = &graphs->main(batch, kind, f.visible);
+        f.graph             = &graphs->main(batch, f.verify.has_value(), f.visible,
+                                            f.verify || forward->sample != SampleKind::None);
     }
     f.layer = 0;
     if (!f.graph)
@@ -245,12 +231,6 @@ void RankProgramImpl::after_main() {
         }
     }
     if (f.timer_started) prefill_timer.record_stop();
-    if (f.graph_decided) {
-        gpu_timer.record_result();
-        compute_done.record(cuda.stream());
-        f.phase = ComputePhase::AwaitResult;
-        return;
-    }
     if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation)) {
         if (forward->sample == SampleKind::None) {
             gpu_timer.record_result();
@@ -269,12 +249,7 @@ void RankProgramImpl::after_main() {
 
 void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
     if (parallel) {
-        vocabulary_sample(
-            batch, first_token,
-            std::all_of(compute->rows.begin(), compute->rows.end(),
-                        [](const auto& row) { return !(row.sampling.temperature > 0); })
-                ? 1
-                : 20);
+        vocabulary_sample(batch, first_token);
         return;
     }
     const auto& io = resources.plan.persistent.buffers;
@@ -398,10 +373,7 @@ void RankProgramImpl::prepare_decision() {
     const auto& buffers = resources.plan.persistent.buffers;
     const auto batch    = f.rows.size();
     if (device_graphs && f.graph_main) {
-        const bool greedy = std::all_of(f.rows.begin(), f.rows.end(), [](const auto& row) {
-            return !(row.sampling.temperature > 0);
-        });
-        device_graphs->decide(batch, f.verify.has_value(), greedy ? 1 : 20);
+        device_graphs->decide(batch, f.verify.has_value());
         gpu_timer.record_result();
         compute_done.record(cuda.stream());
         f.phase = ComputePhase::AwaitResult;
@@ -447,14 +419,20 @@ void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
                      resources.persistent().subspan(begin, bytes), cuda);
 }
 
-void RankProgramImpl::copy_verify_inputs(std::int32_t batch, bool capture) {
+void RankProgramImpl::copy_verify_inputs(std::int32_t batch, DecodeGraphSection* section) {
     const auto ids      = resources.main_batch(shape.draft_tokens + 1, batch, 1).ids;
     const auto transfer = resources.ple_transfer();
     ple_inputs.record(cuda.stream());
     ple_inputs.wait(transfer.stream());
-    copy_bytes_async(draft_output.span().subspan(0, ids.bytes()),
-                     {ids.data, ids.bytes(), cuda.device()}, transfer);
-    if (capture)
+    const auto copy = [&] {
+        copy_bytes_async(draft_output.span().subspan(0, ids.bytes()),
+                         {ids.data, ids.bytes(), cuda.device()}, transfer);
+    };
+    if (section)
+        section->capture(transfer.stream(), copy);
+    else
+        copy();
+    if (section)
         draft_copied.record_external(transfer.stream());
     else
         draft_copied.record(transfer.stream());

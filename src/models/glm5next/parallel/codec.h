@@ -1,9 +1,9 @@
 #pragma once
+#include "models/common/vision/input.h"
 #include "models/glm5next/parallel/wire.h"
 #include "models/glm5next/wire.h"
-#include "runtime/executor/protocol.h"
 #include "runtime/executor/input.h"
-#include "models/common/vision/input.h"
+#include "runtime/executor/protocol.h"
 
 namespace ninfer::models::glm5next {
 

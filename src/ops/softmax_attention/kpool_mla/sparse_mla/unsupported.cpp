@@ -12,6 +12,10 @@ std::size_t sparse_mla_capacity(int, int, int, KpoolExecutionEnvelope, int) {
     throw std::invalid_argument("Kpool Sparse MLA: no implementation for this target");
 }
 
+SparseMlaPlan sparse_mla_plan(int, int, KpoolExecutionEnvelope, int) {
+    throw std::invalid_argument("Kpool Sparse MLA: no implementation for this target");
+}
+
 void launch_sparse_mla(SparseMlaArguments, MemorySpan, KpoolExecutionEnvelope, int, cudaStream_t) {
     throw std::invalid_argument("Kpool Sparse MLA: no implementation for this target");
 }

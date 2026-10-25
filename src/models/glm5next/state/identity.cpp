@@ -1,4 +1,5 @@
 #include "models/glm5next/state/identity.h"
+
 #include <algorithm>
 
 namespace ninfer::models::glm5next {

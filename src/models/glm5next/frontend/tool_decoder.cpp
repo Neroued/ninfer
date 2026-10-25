@@ -1,8 +1,8 @@
 #include "models/glm5next/frontend/tool_decoder.h"
 
-#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <nlohmann/json.hpp>
 #include <unordered_set>
 #include <utility>
 

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "models/glm5next/execution_shape.h"
-#include "models/glm5next/execution/profile.h"
 #include "models/common/vision/resources.h"
+#include "models/glm5next/execution/profile.h"
+#include "models/glm5next/execution_shape.h"
 
 namespace ninfer::models::glm5next::execution {
 
@@ -21,6 +21,16 @@ struct Roots {
     Tensor residual, input, output;
     std::array<ops::MhcCoefficients, 2> coefficients;
 };
+
+struct AttentionBuffers {
+    Tensor input, output, gathered;
+};
+
+template <class Arena>
+AttentionBuffers attention(Arena& a, int hidden, int columns, int ranks) {
+    return {a.alloc(DType::BF16, {hidden, columns}), a.alloc(DType::BF16, {hidden, columns}),
+            a.alloc(DType::BF16, {hidden, columns * ranks})};
+}
 
 template <class Arena>
 Roots roots(Arena& a, const TextConfig& c, int columns) {

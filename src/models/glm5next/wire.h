@@ -1,6 +1,6 @@
 #pragma once
-#include "models/glm5next/work.h"
 #include "distributed/wire.h"
+#include "models/glm5next/work.h"
 
 namespace ninfer::models::glm5next {
 // Retain the frozen mapping after the producer payload has retired.

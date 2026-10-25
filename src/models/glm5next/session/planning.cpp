@@ -1,4 +1,5 @@
 #include "models/glm5next/session/internal.h"
+
 #include "models/glm5next/parallel/preparation.h"
 
 namespace ninfer::models::glm5next {

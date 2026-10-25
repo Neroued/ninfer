@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 namespace ninfer::ops {
 
@@ -397,5 +398,30 @@ kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
                                           KpoolMlaStorage storage, KpoolExecutionEnvelope envelope,
                                           std::int32_t batch_size, std::int32_t min_tokens,
                                           std::int32_t max_tokens, std::int32_t sm_count);
+
+// Equality identifies identical captured launch parameters and scratch layout at fixed
+// operands/profile/storage/device. Device positions, validity and mappings remain replay inputs.
+// A changed value requires a new capture/update; the value has no caller-interpretable fields.
+class KpoolGraphProfile {
+public:
+    bool operator==(const KpoolGraphProfile&) const = default;
+private:
+    std::array<std::uint64_t, 24> words_{};
+    friend KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile&,
+                                                         KpoolExecutionEnvelope, std::int32_t,
+                                                         std::int32_t, std::int32_t);
+    friend KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&,
+                                                            KpoolMlaStorage, KpoolExecutionEnvelope,
+                                                            std::int32_t, std::int32_t,
+                                                            std::int32_t);
+};
+
+[[nodiscard]] KpoolGraphProfile
+kpool_indexer_graph_profile(const KpoolIndexerProfile&, KpoolExecutionEnvelope,
+                            std::int32_t batch_size, std::int32_t tokens, std::int32_t sm_count);
+[[nodiscard]] KpoolGraphProfile
+kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&, KpoolMlaStorage,
+                               KpoolExecutionEnvelope, std::int32_t batch_size, std::int32_t tokens,
+                               std::int32_t sm_count);
 
 } // namespace ninfer::ops

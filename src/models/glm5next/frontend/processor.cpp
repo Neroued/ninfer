@@ -1,8 +1,9 @@
 #include "models/glm5next/frontend/processor.h"
-#include "models/glm5next/frontend/prompt_layout.h"
-#include "models/common/frontend/media_cache.h"
-#include "models/common/frontend/image_transform.h"
+
 #include "media/decode/decode.h"
+#include "models/common/frontend/image_transform.h"
+#include "models/common/frontend/media_cache.h"
+#include "models/glm5next/frontend/prompt_layout.h"
 
 #include <algorithm>
 #include <atomic>

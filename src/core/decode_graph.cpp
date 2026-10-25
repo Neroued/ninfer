@@ -4,6 +4,7 @@
 #include "core/nvtx.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -46,6 +47,46 @@ void discard_capture(cudaStream_t stream) noexcept {
 }
 
 } // namespace
+
+void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()>& body) {
+    cudaStreamCaptureStatus status;
+    cudaGraph_t graph = nullptr;
+    check_graph(
+        cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph, nullptr, nullptr, nullptr),
+        "cudaStreamGetCaptureInfo");
+    if (status != cudaStreamCaptureStatusActive)
+        throw std::logic_error("a graph section requires an active parent capture");
+    const auto nodes = [&] {
+        std::size_t count = 0;
+        check_graph(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
+        std::vector<cudaGraphNode_t> result(count);
+        check_graph(cudaGraphGetNodes(graph, result.data(), &count), "cudaGraphGetNodes");
+        return result;
+    };
+    const auto before = nodes();
+    nodes_.clear();
+    enabled_ = true;
+    body();
+    for (auto node : nodes()) {
+        if (std::find(before.begin(), before.end(), node) != before.end()) continue;
+        cudaGraphNodeType type;
+        check_graph(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
+        if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeMemcpy &&
+            type != cudaGraphNodeTypeMemset)
+            throw std::logic_error(
+                "a switchable graph section must contain only kernels or copies");
+        nodes_.push_back(node);
+    }
+}
+
+void DecodeGraphSection::set_enabled(const DecodeGraphExecutable& executable, bool enabled) {
+    if (!executable.ready()) throw std::logic_error("graph section has no executable");
+    if (enabled == enabled_) return;
+    for (auto node : nodes_)
+        check_graph(cudaGraphNodeSetEnabled(executable.exec_, node, enabled),
+                    "cudaGraphNodeSetEnabled");
+    enabled_ = enabled;
+}
 
 DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
 

@@ -5,6 +5,7 @@
 #include "../../../../tools/support/kpool_indexer_fixture.h"
 
 #include <cmath>
+#include <optional>
 #include <cstring>
 #include <iostream>
 #include <set>
@@ -66,7 +67,10 @@ int run(int T, int B, int E, int kind = -1, bool fp8 = false) {
 int graph() {
     auto& d = cuda_environment().context;
     kp::IndexerFixture f(d.execution_view(), 129, 3, 262148, 1);
+    DecodeGraphDefinition outer;
     DecodeGraphExecutable graph;
+    DecodeGraphChild child;
+    std::optional<ops::KpoolGraphProfile> installed;
     int failures = 0;
     for (int bound : {2051, 262148, 131108, 0, 8192}) {
         f.envelope.max_visible_tokens = bound;
@@ -77,12 +81,19 @@ int graph() {
                 f.positions.at(t, b) = t < f.valid.at(b) ? bound - f.T + t : -1;
         }
         f.upload_metadata();
-        DecodeGraphDefinition definition;
-        definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
-        if (graph.ready())
-            graph.update(definition);
-        else
-            graph.instantiate(definition);
+        const auto profile = ops::kpool_indexer_graph_profile(
+            {32, 128}, f.envelope, f.B, f.T, d.execution_view().multiprocessor_count());
+        if (!installed || *installed != profile) {
+            DecodeGraphDefinition definition;
+            definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+            if (graph.ready())
+                graph.update_child(child, definition);
+            else {
+                outer.capture(d.stream(), [&] { child = definition.append_to(d.stream()); });
+                graph.instantiate(outer);
+            }
+            installed = profile;
+        }
         // Relocate page mappings and turn another row into all-select after capture.
         for (int p = 0; p + 1 < f.P; p += 2) std::swap(f.tables.at(p, 0), f.tables.at(p + 1, 0));
         if (bound > 2051) {

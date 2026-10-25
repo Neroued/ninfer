@@ -1,48 +1,52 @@
 #include "models/glm5next/program/internal.h"
+
 #include "core/transfer.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "ninfer/ops/vocabulary.h"
+
 #include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
 
-void RankProgramImpl::sample() {
-    auto& f           = *compute;
-    const auto rows   = work_rows(f.request.work);
+void RankProgramImpl::copy_result(int rows, bool verify) {
+    const auto& io = resources.plan.frame;
+    if (verify)
+        copy_bytes_async(resources.egress().subspan(0, io.result_egress.bytes),
+                         io.result_egress.bind(resources.fixed()), cuda);
+    else {
+        const auto ids = resources.packed(*io.sampled_ids, {rows});
+        copy_bytes_async(resources.egress().subspan(0, ids.bytes()),
+                         {ids.data, ids.bytes(), cuda.device()}, cuda);
+    }
+}
+
+DistributedVocabulary RankProgramImpl::vocabulary() {
+    const auto& io = resources.plan.frame;
+    return {parameters.profile->local.vocabulary.begin,
+            parameters.profile->public_tokens,
+            io.candidates->region.bind(resources.fixed()),
+            io.gathered_candidates->region.bind(resources.fixed()),
+            *parallel,
+            resources.workspace,
+            cuda};
+}
+
+void RankProgramImpl::sample(int b, SampleKind kind) {
     const auto& io    = resources.plan.frame;
     const auto& local = parameters.profile->local;
-    const int b       = rows.size();
     auto logits       = resources.packed(*io.logits, {dimension(local.vocabulary.size), 1, b});
     auto ids          = resources.packed(*io.sampled_ids, {b});
-    auto positions    = resources.tensor(io.main.sampling_positions).slice(0, 0, b);
+    auto positions    = resources.tensor(io.rows.sampling_positions).slice(0, 0, b);
     const auto* configs =
         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data);
-    const auto& forward = std::get<ForwardWork>(f.request.work.operation);
-    const int purpose   = forward.sample == SampleKind::FirstToken ? ops::kSamplePurposePrefill
-                                                                   : ops::kSamplePurposeDecode;
+    const int purpose =
+        kind == SampleKind::FirstToken ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode;
     if (!parallel) {
         ops::sample(logits.view({logits.ne[0], b}), ids, parameters.profile->public_tokens, configs,
                     positions, purpose, resources.workspace, cuda);
         return;
     }
-    const bool greedy = std::all_of(rows.begin(), rows.end(),
-                                    [](const auto& r) { return !(r.sampling.temperature > 0); });
-    const int k       = greedy ? 1 : 20;
-    auto keys         = resources.packed(*io.candidates, {k, 1, b});
-    auto valid        = resources.tensor(io.main.accepted_columns).slice(0, 0, b);
-    ops::vocabulary_candidates(logits, local.vocabulary.begin, parameters.profile->public_tokens,
-                               configs, valid, {}, keys, resources.workspace, cuda);
-    Tensor combined;
-    if (greedy) {
-        parallel->maximum(keys, cuda);
-        combined = keys.view({1, 1, b, 1});
-    } else {
-        combined = resources.packed(*io.gathered_candidates, {k, 1, b, dimension(local.size)});
-        parallel->gather(keys, combined, cuda);
-    }
-    if (greedy || parallel->output_owner())
-        ops::sample_vocabulary_candidates(combined, configs, positions, purpose, ids, cuda);
-    if (!greedy) parallel->broadcast(ids, cuda);
+    vocabulary().sample(logits, configs, row(io.rows.accepted_columns, b), positions, purpose, ids);
 }
 
 void RankProgramImpl::score() {

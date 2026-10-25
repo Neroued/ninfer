@@ -113,8 +113,7 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
     auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
     if (parallel)
-        vocabulary_draft(logits, ids,
-                         device_tensor(frame.draft_steps[step].valid_columns).slice(0, 0, batch));
+        vocabulary_draft(logits, ids);
     else
         ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
 }
@@ -175,11 +174,7 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
 
 void RankProgramImpl::accept_forward(std::int32_t batch) {
     if (parallel) {
-        vocabulary_accept(
-            batch, std::all_of(compute->rows.begin(), compute->rows.end(),
-                               [](const auto& row) { return !(row.sampling.temperature > 0); })
-                       ? 1
-                       : 20);
+        vocabulary_accept(batch);
         return;
     }
     const auto& buffers   = resources.plan.persistent.buffers;
@@ -257,7 +252,7 @@ void RankProgramImpl::prepare_mtp() {
         copy_bytes_async({saved.data, saved.bytes(), cuda.device()},
                          {previous.data, previous.bytes(), cuda.device()}, cuda);
     }
-    const auto steps = *std::max_element(round.extents.begin(), round.extents.end());
+    const auto steps = k;
     std::vector<execution::BatchView> calls;
     calls.reserve(steps);
     for (std::uint32_t step = 0; step < steps; ++step) {
@@ -297,7 +292,7 @@ void RankProgramImpl::prepare_mtp() {
     ops::prepare_verify_ids(row_tensor(frame.anchors), drafts, row_tensor(frame.extents),
                             f.batch.ids, cuda);
     if (!host_ple) {
-        copy_verify_inputs(batch, false);
+        copy_verify_inputs(batch);
         prepare_device_ple(f.batch);
     }
     prepare_main();

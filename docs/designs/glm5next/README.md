@@ -12,6 +12,8 @@
 实现的能力、方法与完成条件。
 [MLA 交付与后续清单](mla-checklist.md)区分已实现的 BF16 family、尚未完成的逐点
 roofline 验收、FP8 和模型存储／MTP 交接。
+[Decode CUDA Graph 接入设计](cuda-graph.md)定义完整 round、G/C 容量变体、MLA 局部
+padding 与等长汇集、Indexer/MLA 节点更新、启动校准及 S1–S4 实施步骤。
 
 阅读实现设计前先读相应长期参考。接口以实际公共头的接管状态为准；设计片段或
 已有声明都不代表实现已经可运行。已确认的模型／数值决策不因实现进度或文档迁移而重开。
@@ -39,6 +41,7 @@ GLM 的 State variants 和 owner placement 由[并行设计](parallel.md#12-stat
 | [mHC](mhc.md) | 五个 C++ 入口、M 列布局、容量查询、两阶段融合与资源归属已明确 | 设计待实现／验收 |
 | [MTP](mtp.md) | 输入移位、stem/residual、共享 Main hidden、provisional 页与 frame、首步采用及双机交接已明确 | 模型组合与新增 norm Ops 待实现／验收 |
 | [Vision](vision.md) | GLM processor、patch 顺序、bias/2D norm-RoPE/D64 attention、segment 分配与媒体生命周期已明确 | 输入基础、Op 扩展与模型组合待实现／验收 |
+| [Decode CUDA Graph](cuda-graph.md) | 整轮计算、G/C 容量与行映射、局部节点更新、decision/commit 与资源生命周期已明确 | 图结构、接入边界与验收要求见设计 |
 | [Frontend 清单](frontend-checklist.md) | 资源、tokenizer、模板、缓存边界、thinking/tools/constraints 与媒体准备 | 分阶段实施，进度见清单 |
 | Converter 与模型接入 | 数值规则已定，接入未完成 | block-FP8 编码入口、GLM converter/binding 与运行路径待实现 |
 
@@ -73,6 +76,7 @@ KDA 状态链、MLA/Indexer、mHC 按路线中的独立任务包实施与调优�
 | 动态放置、来源选择、联合预留与跨 owner 生命周期 | [Attention DP 设计](../attention-dp-placement.md) |
 | 具体 Op/views、physical layout、写域、alias | 已声明部分由公共头维护；其余见对应 family 设计 |
 | 模型链路、实现候选与资源交接 | 对应 family 设计 |
+| Decode 图组装、局部更新与准备流程 | [CUDA Graph 接入设计](cuda-graph.md) |
 | Linear/MoE 执行条目与完成证据 | op-checklist.md |
 | MLA 执行步骤、优化与验收条目 | [MLA 清单](mla-checklist.md) |
 | Frontend 接入条目与完成条件 | [Frontend 清单](frontend-checklist.md) |

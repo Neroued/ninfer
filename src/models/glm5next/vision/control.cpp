@@ -1,4 +1,5 @@
 #include "models/glm5next/vision/control.h"
+
 #include "models/glm5next/frontend/prepared_prompt.h"
 
 #include <algorithm>

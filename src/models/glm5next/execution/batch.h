@@ -1,16 +1,25 @@
 #pragma once
 
 #include "core/kda_replay_records.h"
-#include "models/common/parallel.h"
+
+#include <optional>
 #include <variant>
 
 namespace ninfer::models::glm5next::execution {
+struct AttentionBatchView {
+    std::int32_t rows;
+    Tensor ids, positions, valid_columns, source_offsets, destination_offsets;
+    Tensor table_rows, record_offsets, selection_rows, to_global, from_gather, live_rows;
+    std::uint32_t max_visible_tokens;
+};
+
 struct BatchView {
     std::int32_t tokens, rows;
     Tensor ids, positions, valid_columns, source_offsets, destination_offsets;
-    Tensor table_rows, record_offsets, selection_rows;
-    std::span<const IndexRange> owners;
-    std::uint32_t max_visible_tokens;
+    AttentionBatchView attention;
+    // Sequence execution has one owner and broadcasts its attention result. Decode uses
+    // the fixed local capacity and an equal-size gather, independent of live owner counts.
+    std::optional<std::uint32_t> sequence_owner;
 };
 
 struct SequenceUpdate {

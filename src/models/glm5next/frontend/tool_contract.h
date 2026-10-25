@@ -1,8 +1,8 @@
 #pragma once
 
+#include "models/common/frontend/tools.h"
 #include "ninfer/types.h"
 #include "text/json_schema.h"
-#include "models/common/frontend/tools.h"
 
 #include <cstddef>
 #include <cstdint>

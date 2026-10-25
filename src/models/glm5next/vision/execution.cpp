@@ -1,4 +1,5 @@
 #include "models/glm5next/vision/execution.h"
+
 #include "core/layout.h"
 #include "core/transfer.h"
 #include "ninfer/ops/gelu.h"

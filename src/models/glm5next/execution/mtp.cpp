@@ -1,6 +1,7 @@
 #include "models/glm5next/execution/mtp.h"
-#include "distributed/communication.h"
+
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/paired_rmsnorm_concat.h"
 #include "ninfer/ops/residual_add_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -22,60 +23,55 @@ void prepare_stem(const Parameters& p, const BatchView& batch, const Tensor& hid
     ops::rmsnorm(residual, m.input_norm, c.norm_epsilon, false, normalized, cuda);
 }
 
-ops::ConstKpoolTailStateView slice(ops::ConstKpoolTailStateView tail, int begin, int rows) {
-    tail.raw_keys.records.byte_offsets  = tail.raw_keys.records.byte_offsets.slice(0, begin, rows);
-    tail.raw_gates.records.byte_offsets = tail.raw_gates.records.byte_offsets.slice(0, begin, rows);
-    return tail;
-}
-
-ops::KpoolTailStateView slice(ops::KpoolTailStateView tail, int begin, int rows) {
-    tail.raw_keys.records.byte_offsets  = tail.raw_keys.records.byte_offsets.slice(0, begin, rows);
-    tail.raw_gates.records.byte_offsets = tail.raw_gates.records.byte_offsets.slice(0, begin, rows);
-    return tail;
-}
 } // namespace
 
 MtpRun::MtpRun(const Parameters& p, MtpExecution execution, BatchView batch, CudaExecutionView cuda)
     : parameters_(p), execution_(execution), batch_(batch), cuda_(cuda),
       scope_(execution.workspace.scope()),
       roots_(workspace::mtp_roots(execution.workspace, p.profile->config.text,
-                                  batch.tokens * batch.rows)) {}
+                                  batch.tokens * batch.rows)) {
+    if (execution.parallel)
+        attention_ =
+            workspace::attention(execution.workspace, dimension(p.profile->config.text.hidden),
+                                 batch.tokens * batch.attention.rows, p.profile->local.size);
+}
 
 void MtpRun::stem(const Tensor& conditioning) {
     prepare_stem(parameters_, batch_, conditioning, roots_.residual, roots_.input,
                  execution_.workspace, cuda_);
 }
 
-void MtpRun::local_attention(MlaSelection selection) {
-    const auto& p    = *parameters_.profile;
-    const auto local = batch_.owners[p.local.rank];
-    if (!local.size) return;
-    const int t = batch_.tokens, begin = local.begin, rows = local.size, h = p.config.text.hidden;
-    auto output = roots_.output.view({h, t, batch_.rows}).slice(2, begin, rows).view({h, t * rows});
-    mla(roots_.input.view({h, t, batch_.rows}).slice(2, begin, rows).view({h, t * rows}),
-        p.config.text, parameters_.mtp->attention,
-        {batch_.positions.slice(1, begin, rows), batch_.valid_columns.slice(0, begin, rows),
-         batch_.table_rows.slice(0, begin, rows)},
-        slice(execution_.before, begin, rows), slice(execution_.after, begin, rows),
-        execution_.cache.layer(0), {}, batch_.selection_rows.slice(1, begin, rows),
-        batch_.max_visible_tokens, output, execution_.workspace, cuda_, selection);
+MlaRun MtpRun::local_mla(MlaSelection selection) {
+    const auto& p     = *parameters_.profile;
+    const auto& local = batch_.attention;
+    return MlaRun(
+        attention_.input.data ? attention_.input : roots_.input, p.config.text,
+        parameters_.mtp->attention, {local.positions, local.valid_columns, local.table_rows},
+        execution_.before, execution_.after, execution_.cache.layer(0), {}, local.selection_rows,
+        local.max_visible_tokens, attention_.output.data ? attention_.output : roots_.output,
+        execution_.workspace, cuda_, selection);
+}
+
+void MtpRun::local_attention(MlaSelection selection, const MlaSubmit& submit) {
+    if (attention_.input.data) {
+        const int h = parameters_.profile->config.text.hidden, t = batch_.tokens;
+        auto input = attention_.input.view({h, t, batch_.attention.rows});
+        ops::gather_batch_rows(roots_.input.view({h, t, batch_.rows}), batch_.attention.to_global,
+                               input, cuda_);
+    }
+    auto run = local_mla(selection);
+    run.execute(submit);
 }
 
 void MtpRun::finish_attention() {
     const auto& p = *parameters_.profile;
     if (execution_.parallel) {
-        const auto local = batch_.owners[p.local.rank];
-        const auto bytes =
-            std::size_t(p.config.text.hidden) * batch_.tokens * sizeof(std::uint16_t);
-        const auto memory = MemorySpan{roots_.output.data, roots_.output.bytes(), cuda_.device()};
-        std::vector<distributed::PeerTransfer> transfers;
-        for (std::uint32_t rank = 0; rank < p.local.size; ++rank) {
-            if (rank == p.local.rank) continue;
-            const auto remote = batch_.owners[rank];
-            transfers.push_back({rank, memory.subspan(bytes * local.begin, bytes * local.size),
-                                 memory.subspan(bytes * remote.begin, bytes * remote.size)});
-        }
-        execution_.parallel->exchange(transfers, cuda_);
+        execution_.parallel->gather(attention_.output, attention_.gathered, cuda_);
+        const int h = p.config.text.hidden, t = batch_.tokens;
+        auto output = roots_.output.view({h, t, batch_.rows});
+        ops::gather_batch_rows(
+            attention_.gathered.view({h, t, batch_.attention.rows * int(p.local.size)}),
+            batch_.attention.from_gather, output, cuda_);
     }
     ops::residual_add_rmsnorm(roots_.residual, roots_.output, parameters_.mtp->post_attention_norm,
                               p.config.text.norm_epsilon, roots_.residual, roots_.input, cuda_);
@@ -96,24 +92,26 @@ void MtpRun::finish(Tensor& hidden) {
 
 void mtp_history(const Parameters& p, MtpExecution e, const BatchView& batch,
                  const Tensor& conditioning, CudaExecutionView cuda) {
-    const auto local = batch.owners[p.profile->local.rank];
-    if (!local.size) return;
-    const int h = p.profile->config.text.hidden, t = batch.tokens, begin = local.begin,
-              rows        = local.size;
-    auto scope            = e.workspace.scope();
-    auto residual         = e.workspace.alloc(DType::BF16, {h, t * rows});
-    auto normalized       = e.workspace.alloc(DType::BF16, {h, t * rows});
+    if (batch.sequence_owner && *batch.sequence_owner != p.profile->local.rank) return;
+    const auto& local = batch.attention;
+    const int h = p.profile->config.text.hidden, t = batch.tokens, rows = local.rows;
+    auto scope      = e.workspace.scope();
+    auto residual   = e.workspace.alloc(DType::BF16, {h, t * rows});
+    auto normalized = e.workspace.alloc(DType::BF16, {h, t * rows});
+    auto hidden     = conditioning;
+    if (!batch.sequence_owner && p.profile->local.size > 1) {
+        hidden = e.workspace.alloc(DType::BF16, {h, t, rows});
+        ops::gather_batch_rows(conditioning.view({h, t, batch.rows}), local.to_global, hidden,
+                               cuda);
+        hidden = hidden.view({h, t * rows});
+    }
     auto local_batch      = batch;
     local_batch.rows      = rows;
-    local_batch.ids       = batch.ids.slice(1, begin, rows);
-    local_batch.positions = batch.positions.slice(1, begin, rows);
-    const auto hidden =
-        conditioning.view({h, t, batch.rows}).slice(2, begin, rows).view({h, t * rows});
+    local_batch.ids       = local.ids;
+    local_batch.positions = local.positions;
     prepare_stem(p, local_batch, hidden, residual, normalized, e.workspace, cuda);
     mla_history(normalized.view({h, t, rows}), p.mtp->attention,
-                {local_batch.positions, batch.valid_columns.slice(0, begin, rows),
-                 batch.table_rows.slice(0, begin, rows)},
-                slice(e.before, begin, rows), slice(e.after, begin, rows), e.cache.layer(0),
-                e.workspace, cuda);
+                {local.positions, local.valid_columns, local.table_rows}, e.before, e.after,
+                e.cache.layer(0), e.workspace, cuda);
 }
 } // namespace ninfer::models::glm5next::execution

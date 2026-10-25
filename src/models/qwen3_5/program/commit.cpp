@@ -52,10 +52,12 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
                 for (const auto& row : value.rows)
                     if (!row.discarded && row.accepted_tokens)
                         columns = std::max(columns, row.accepted_tokens - 1);
-                if (graphs)
-                    graphs->rebuild_mtp_history(operation.batch, columns, device.execution_view());
-                else
-                    rebuild_mtp_history(operation.batch, columns);
+                if (columns) {
+                    if (graphs)
+                        graphs->rebuild_mtp_history(operation.batch, device.execution_view());
+                    else
+                        rebuild_mtp_history(operation.batch);
+                }
             }
         }
         const auto hidden =

@@ -6,6 +6,7 @@
 #include "../../../../tools/support/kpool_sparse_mla_fixture.h"
 
 #include <cmath>
+#include <optional>
 #include <cstring>
 #include <set>
 #include <tuple>
@@ -79,7 +80,10 @@ int empty() {
 int graph() {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 65, 3, 1048576, 3, 1, true);
+    DecodeGraphDefinition outer;
     DecodeGraphExecutable executable;
+    DecodeGraphChild child;
+    std::optional<ops::KpoolGraphProfile> installed;
     int failures = 0;
     for (int bound : {259, 8192, 1048576, 0, 259}) {
         f.envelope.max_visible_tokens = bound;
@@ -97,12 +101,20 @@ int graph() {
             }
         }
         f.upload_metadata();
-        DecodeGraphDefinition definition;
-        definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
-        if (executable.ready())
-            executable.update(definition);
-        else
-            executable.instantiate(definition);
+        const auto profile = ops::kpool_sparse_mla_graph_profile(
+            {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16, f.envelope, f.B, f.T,
+            d.execution_view().multiprocessor_count());
+        if (!installed || *installed != profile) {
+            DecodeGraphDefinition definition;
+            definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+            if (executable.ready())
+                executable.update_child(child, definition);
+            else {
+                outer.capture(d.stream(), [&] { child = definition.append_to(d.stream()); });
+                executable.instantiate(outer);
+            }
+            installed = profile;
+        }
         // Same request, earlier frozen selection, changed after capture.
         for (int t = 1; t < f.T; ++t) f.selection_rows.at(t, 0) = f.selection_rows.at(0, 0);
         f.selection_rows.upload();

@@ -1,10 +1,10 @@
 #include "models/glm5next/frontend/tool_contract.h"
+
 #include "text/json_schema.h"
 #include "text/schema_composition.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string_view>
 #include <utility>

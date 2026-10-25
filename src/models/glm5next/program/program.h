@@ -1,8 +1,8 @@
 #pragma once
-#include "models/glm5next/program/resources.h"
-#include "models/glm5next/execution/parameters.h"
-#include "models/glm5next/work.h"
 #include "models/common/parallel_execution.h"
+#include "models/glm5next/execution/parameters.h"
+#include "models/glm5next/program/resources.h"
+#include "models/glm5next/work.h"
 
 namespace ninfer::models::glm5next {
 namespace detail {
@@ -29,6 +29,8 @@ public:
     [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const;
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
+    void prepare_execution();
+    void release_execution();
     [[nodiscard]] const ExecutionPlan& plan() const;
     [[nodiscard]] MemorySpan input_storage();
     [[nodiscard]] RankMemoryUsage observe_resources() const;

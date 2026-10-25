@@ -4,6 +4,23 @@
 namespace ninfer::ops {
 using namespace detail::kpool;
 
+KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile& profile,
+                                              KpoolExecutionEnvelope envelope, int batch,
+                                              int tokens, int sms) {
+    indexer_geometry(profile, envelope, batch, tokens, tokens, sms);
+    const auto p = indexer_plan(tokens, tokens, batch, envelope);
+    KpoolGraphProfile key;
+    key.words_ = {std::uint64_t(tokens),
+                  std::uint64_t(batch),
+                  std::uint64_t(sms),
+                  std::uint64_t(p.windows),
+                  std::uint64_t(p.columns),
+                  std::uint64_t(p.partitions),
+                  std::uint64_t(p.merge_groups),
+                  p.bytes};
+    return key;
+}
+
 std::size_t kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
                                                    KpoolExecutionEnvelope envelope,
                                                    std::int32_t batch, std::int32_t lo,

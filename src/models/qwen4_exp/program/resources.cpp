@@ -94,6 +94,10 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         copy_bytes(raw->region.bind(backing),
                    {configs.data(), configs.size() * sizeof(configs.front()), Device::cpu()},
                    device.execution_view());
+        const std::vector<std::int32_t> columns(plan.shape.max_concurrency, 1);
+        copy_bytes(plan.persistent.buffers.proposal_columns->region.bind(backing),
+                   {columns.data(), columns.size() * sizeof(columns.front()), Device::cpu()},
+                   device.execution_view());
     }
     device.synchronize();
 }

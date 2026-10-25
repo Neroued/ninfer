@@ -1,6 +1,9 @@
 #include "models/glm5next/program/internal.h"
-#include <algorithm>
+
 #include "core/transfer.h"
+#include "models/glm5next/program/graph_inputs.h"
+
+#include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
 namespace {
@@ -27,6 +30,8 @@ RankProgramImpl::~RankProgramImpl() {
         drain();
     } catch (const std::logic_error&) { std::terminate(); } catch (...) {
     }
+    graphs.reset();
+    graph_inputs.reset();
 }
 
 WorkContract RankProgramImpl::contract() const {
@@ -172,6 +177,89 @@ std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgramImpl::poll() {
     events.pop_front();
     return out;
 }
+
+void RankProgramImpl::advance_context() {
+    if (!context) return;
+    auto& f          = *context;
+    const auto& work = std::get<ContextWork>(f.request.work.operation);
+    if (!f.submitted) {
+        const auto transfer   = device.transfer_view();
+        const auto vocabulary = parameters.profile->public_tokens;
+        for (auto r : work.releases) {
+            retire_vision(r);
+            bindings[r.lane.value].reset();
+        }
+        for (std::size_t i = 0; i < work.bindings.size(); ++i) {
+            const auto& b   = work.bindings[i];
+            const auto lane = b.member.residency.lane.value;
+            bindings[lane]  = b.member;
+            if (!resources.plan.frame.token_counts) continue;
+            auto counts = resources.tensor(*resources.plan.frame.token_counts).slice(1, lane, 1);
+            if (b.generated.empty())
+                CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), transfer.stream()));
+            else {
+                auto* host =
+                    static_cast<std::int32_t*>(resources.context_counts().data) + i * vocabulary;
+                std::fill_n(host, vocabulary, 0);
+                for (auto id : b.generated) ++host[id];
+                copy_bytes_async({counts.data, counts.bytes(), transfer.device()},
+                                 {host, counts.bytes(), Device::cpu(), true}, transfer);
+            }
+        }
+        context_done.record(transfer.stream());
+        f.submitted = true;
+    }
+    if (!context_done.ready()) return;
+    const auto transfers = resources.context_actions->observations();
+    ContextResult result{{transfers.begin(), transfers.end()}};
+    resources.context_actions->finish();
+    const auto ticket  = f.request.ticket;
+    const auto command = f.request.command;
+    context.reset();
+    events.emplace_back(runtime::ResultReady<ExecutionTypes>{ticket, Result(std::move(result))});
+    events.emplace_back(runtime::DeviceRetired{ticket, command, observation()});
+}
+
+RankExecutionObservation RankProgramImpl::observation() const {
+    RankExecutionObservation out;
+    const auto peak            = std::max({resources.workspace.peak_used(),
+                                resources.vision ? resources.vision->workspace_peak_bytes() : 0,
+                                graphs ? graphs->workspace_peak() : 0});
+    out.workspace_peak_bytes   = std::max(lifetime_peak, peak);
+    out.measurement_peak_bytes = peak;
+    return out;
+}
+
+RankMemoryUsage RankProgramImpl::memory() const {
+    auto out      = resources.observe();
+    const auto& w = parameters.model.storage_stats();
+    out.allocations.device_weights_bytes =
+        w.device_capacity_bytes + parameters.model.metadata_bytes();
+    out.allocations.host_weights_bytes   = w.host_capacity_bytes;
+    const auto execution                 = observation();
+    out.workspace.required_peak_bytes    = execution.workspace_peak_bytes;
+    out.workspace.measurement_peak_bytes = execution.measurement_peak_bytes;
+    return out;
+}
+
+RankMemoryBudget RankProgramImpl::budget() const {
+    const auto& c = resources.plan.capacity;
+    RankMemoryBudget out{.runtime_reservation_bytes         = c.runtime_reservation_bytes,
+                         .minimum_runtime_reservation_bytes = c.minimum_runtime_reservation_bytes,
+                         .context_capacity_bytes            = c.device_bytes,
+                         .minimum_context_capacity_bytes    = c.minimum_device_bytes,
+                         .context_control_budget_bytes      = c.control_reservation_bytes};
+    if (graphs) out.graphs = graph_memory;
+    return out;
+}
+
+void RankProgramImpl::reset_peaks() {
+    lifetime_peak = observation().workspace_peak_bytes;
+    resources.workspace.reset_peak();
+    if (resources.vision) resources.vision->reset_peaks();
+    if (graphs) graphs->reset_workspace_peak();
+}
+
 } // namespace ninfer::models::glm5next::detail
 
 namespace ninfer::models::glm5next {
@@ -227,86 +315,10 @@ RankMemoryUsage RankProgram::observe_resources() const { return impl_->memory();
 
 RankMemoryBudget RankProgram::resource_budget() const { return impl_->budget(); }
 
+void RankProgram::prepare_execution() { impl_->prepare_graphs(); }
+
+void RankProgram::release_execution() { impl_->release_graphs(); }
+
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_peaks(); }
 
 } // namespace ninfer::models::glm5next
-
-namespace ninfer::models::glm5next::detail {
-
-void RankProgramImpl::advance_context() {
-    if (!context) return;
-    auto& f          = *context;
-    const auto& work = std::get<ContextWork>(f.request.work.operation);
-    if (!f.submitted) {
-        const auto transfer   = device.transfer_view();
-        const auto vocabulary = parameters.profile->public_tokens;
-        for (auto r : work.releases) {
-            retire_vision(r);
-            bindings[r.lane.value].reset();
-        }
-        for (std::size_t i = 0; i < work.bindings.size(); ++i) {
-            const auto& b   = work.bindings[i];
-            const auto lane = b.member.residency.lane.value;
-            bindings[lane]  = b.member;
-            if (!resources.plan.frame.token_counts) continue;
-            auto counts = resources.tensor(*resources.plan.frame.token_counts).slice(1, lane, 1);
-            if (b.generated.empty())
-                CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), transfer.stream()));
-            else {
-                auto* host =
-                    static_cast<std::int32_t*>(resources.context_counts().data) + i * vocabulary;
-                std::fill_n(host, vocabulary, 0);
-                for (auto id : b.generated) ++host[id];
-                copy_bytes_async({counts.data, counts.bytes(), transfer.device()},
-                                 {host, counts.bytes(), Device::cpu(), true}, transfer);
-            }
-        }
-        context_done.record(transfer.stream());
-        f.submitted = true;
-    }
-    if (!context_done.ready()) return;
-    const auto transfers = resources.context_actions->observations();
-    ContextResult result{{transfers.begin(), transfers.end()}};
-    resources.context_actions->finish();
-    const auto ticket  = f.request.ticket;
-    const auto command = f.request.command;
-    context.reset();
-    events.emplace_back(runtime::ResultReady<ExecutionTypes>{ticket, Result(std::move(result))});
-    events.emplace_back(runtime::DeviceRetired{ticket, command, observation()});
-}
-
-RankExecutionObservation RankProgramImpl::observation() const {
-    RankExecutionObservation out;
-    const auto peak            = std::max(resources.workspace.peak_used(),
-                               resources.vision ? resources.vision->workspace_peak_bytes() : 0);
-    out.workspace_peak_bytes   = std::max(lifetime_peak, peak);
-    out.measurement_peak_bytes = peak;
-    return out;
-}
-
-RankMemoryUsage RankProgramImpl::memory() const {
-    auto out      = resources.observe();
-    const auto& w = parameters.model.storage_stats();
-    out.allocations.device_weights_bytes =
-        w.device_capacity_bytes + parameters.model.metadata_bytes();
-    out.allocations.host_weights_bytes = w.host_capacity_bytes;
-    out.workspace.required_peak_bytes  = std::max(out.workspace.required_peak_bytes, lifetime_peak);
-    return out;
-}
-
-RankMemoryBudget RankProgramImpl::budget() const {
-    const auto& c = resources.plan.capacity;
-    return {.runtime_reservation_bytes         = c.runtime_reservation_bytes,
-            .minimum_runtime_reservation_bytes = c.minimum_runtime_reservation_bytes,
-            .context_capacity_bytes            = c.device_bytes,
-            .minimum_context_capacity_bytes    = c.minimum_device_bytes,
-            .context_control_budget_bytes      = c.control_reservation_bytes};
-}
-
-void RankProgramImpl::reset_peaks() {
-    lifetime_peak = observation().workspace_peak_bytes;
-    resources.workspace.reset_peak();
-    if (resources.vision) resources.vision->reset_peaks();
-}
-
-} // namespace ninfer::models::glm5next::detail

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "models/common/vision/resources.h"
-#include "models/glm5next/vision/control.h"
 #include "models/glm5next/execution/parameters.h"
+#include "models/glm5next/vision/control.h"
 
 namespace ninfer::models::glm5next::vision {
 

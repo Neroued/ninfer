@@ -1,10 +1,10 @@
 #include "models/glm5next/frontend/frontend.h"
 
+#include "models/common/frontend/media_cache.h"
 #include "models/glm5next/frontend/prepared_prompt.h"
+#include "models/glm5next/frontend/processor.h"
 #include "models/glm5next/frontend/prompt_layout.h"
 #include "models/glm5next/frontend/resources.h"
-#include "models/glm5next/frontend/processor.h"
-#include "models/common/frontend/media_cache.h"
 
 #include <algorithm>
 #include <chrono>

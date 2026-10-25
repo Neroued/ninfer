@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <functional>
+#include <vector>
 
 namespace ninfer {
 
@@ -10,6 +11,26 @@ namespace ninfer {
 // updating the executable instantiated from it.
 struct DecodeGraphChild {
     cudaGraphNode_t node = nullptr;
+};
+
+class DecodeGraphExecutable;
+
+// Inline kernel/copy/memset nodes in one parent capture. The enclosing definition and
+// executable outlive the section; recapture the section when replacing that executable.
+class DecodeGraphSection {
+public:
+    DecodeGraphSection()                                         = default;
+    DecodeGraphSection(const DecodeGraphSection&)                = delete;
+    DecodeGraphSection& operator=(const DecodeGraphSection&)     = delete;
+    DecodeGraphSection(DecodeGraphSection&&) noexcept            = default;
+    DecodeGraphSection& operator=(DecodeGraphSection&&) noexcept = default;
+
+    void capture(cudaStream_t, const std::function<void()>&);
+    void set_enabled(const DecodeGraphExecutable&, bool);
+
+private:
+    std::vector<cudaGraphNode_t> nodes_;
+    bool enabled_ = true;
 };
 
 class DecodeGraphDefinition {
@@ -67,6 +88,7 @@ public:
     void reset() noexcept;
 
 private:
+    friend class DecodeGraphSection;
     cudaGraphExec_t exec_ = nullptr;
 };
 

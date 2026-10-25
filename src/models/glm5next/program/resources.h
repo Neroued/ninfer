@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/glm5next/program/planning.h"
 #include "models/common/context/transfer.h"
+#include "models/glm5next/program/planning.h"
 #include "ninfer/ops/kda_replay.h"
 
 namespace ninfer::models::glm5next {

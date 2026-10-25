@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/glm5next/config.h"
 #include "models/common/vision/window.h"
+#include "models/glm5next/config.h"
 
 namespace ninfer::models::glm5next {
 struct PreparedPromptData;

@@ -237,14 +237,13 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     execution::mtp_history(mtp_execution, inputs, {0, static_cast<std::uint32_t>(history_width)});
 }
 
-void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_t columns) {
-    if (!columns) return;
+void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
     auto& frame       = resources.frame;
     auto& mtp         = *frame.mtp;
     const auto cuda   = device.execution_view();
     const auto batch  = static_cast<std::int32_t>(batch_size);
     const auto width  = static_cast<std::int32_t>(draft_window + 1);
-    const auto count  = static_cast<std::int32_t>(columns);
+    const auto count  = static_cast<std::int32_t>(draft_window);
     const auto hidden = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto main   = frame.input_view(width, batch);
     auto conditioning = packed(mtp.history_conditioning, {hidden, count, batch});
@@ -275,7 +274,7 @@ void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_
         .kv_table_rows   = frame.backend_table_rows.slice(0, 0, batch),
     };
     execution::mtp_history(mtp_view(parameters, resources, cuda, proposal_head), inputs,
-                           {0, columns});
+                           {0, draft_window});
 }
 
 } // namespace ninfer::models::qwen3_5::detail

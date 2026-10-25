@@ -64,9 +64,7 @@ void RankProgramImpl::initialize_graphs() {
         decide_decode(call.batch, call.width);
     };
     if (backend == SpeculativeBackend::Mtp)
-        bodies.mtp_history = [this](std::uint32_t batch, std::uint32_t columns) {
-            rebuild_mtp_history(batch, columns);
-        };
+        bodies.mtp_history = [this](std::uint32_t batch) { rebuild_mtp_history(batch); };
     bodies.readback = [this](const GraphInvocation&) { readback_decode(); };
     graphs->prepare(resources, parameters, device, bodies);
     device.synchronize();

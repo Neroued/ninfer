@@ -6,6 +6,30 @@
 namespace ninfer::ops {
 using namespace detail::kpool;
 
+KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile,
+                                                 KpoolMlaStorage storage,
+                                                 KpoolExecutionEnvelope envelope, int batch,
+                                                 int tokens, int sms) {
+    sparse_mla_geometry(profile, storage, envelope, batch, tokens, tokens, sms);
+    KpoolGraphProfile key;
+    key.words_        = {std::uint64_t(tokens), std::uint64_t(batch), std::uint64_t(sms),
+                         std::uint64_t(storage)};
+    std::size_t at    = 4;
+    const auto append = [&](int columns) {
+        if (!columns) return;
+        const auto p = sparse_mla_plan(columns, batch, envelope, sms);
+        for (const auto word :
+             {std::uint64_t(p.factor), std::uint64_t(p.attention), std::uint64_t(p.splits),
+              std::uint64_t(p.tile), std::uint64_t(p.direct), std::uint64_t(p.merge_value),
+              std::uint64_t(p.bytes)})
+            key.words_[at++] = word;
+    };
+    const auto columns = std::int64_t(tokens) * batch;
+    if (columns >= kMlaWindow) append(kMlaWindow);
+    append(columns % kMlaWindow);
+    return key;
+}
+
 std::size_t kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
                                                       KpoolMlaStorage storage,
                                                       KpoolExecutionEnvelope envelope,

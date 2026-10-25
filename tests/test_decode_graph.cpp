@@ -73,9 +73,13 @@ int check_child_graph(ninfer::DeviceContext& device) {
             CUDA_CHECK(cudaMemsetAsync(source.data(), i + 1, source.size(), device.stream()));
         });
     ninfer::DecodeGraphChild child;
+    ninfer::DecodeGraphSection optional;
     parent.capture(device.stream(), [&] {
         CUDA_CHECK(cudaMemsetAsync(source.data(), 0xff, source.size(), device.stream()));
         child = children[0].append_to(device.stream());
+        optional.capture(device.stream(), [&] {
+            CUDA_CHECK(cudaMemsetAsync(source.data(), 3, source.size(), device.stream()));
+        });
         CUDA_CHECK(cudaMemcpyAsync(destination.data(), source.data(), source.size(),
                                    cudaMemcpyDeviceToDevice, device.stream()));
     });
@@ -84,10 +88,12 @@ int check_child_graph(ninfer::DeviceContext& device) {
     int failures = 0;
     for (int i = 0; i < 8; ++i) {
         executable.update_child(child, children[i % 2]);
+        const bool enabled = (i / 2) % 2 == 0;
+        optional.set_enabled(executable, enabled);
         executable.launch(device.stream());
         device.synchronize();
-        failures += expect_value(destination.data(), (i % 2 + 1) * 0x01010101U,
-                                 "child update and surrounding capture dependencies");
+        failures += expect_value(destination.data(), (enabled ? 3 : i % 2 + 1) * 0x01010101U,
+                                 "child update, optional section and capture dependencies");
     }
     return failures;
 }

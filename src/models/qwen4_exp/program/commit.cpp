@@ -40,7 +40,8 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
         execute_mtp_commit(batch, rebuild_history);
 }
 
-void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_history) {
+void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_history,
+                                         DecodeGraphSection* captured_repair) {
     const auto& io   = resources.plan.persistent.buffers;
     const auto& mtp  = *io.mtp;
     const auto width = static_cast<int>(shape.draft_tokens + 1), k = width - 1;
@@ -79,8 +80,19 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
     auto counts = device_tensor(*io.token_counts);
     ops::increment_token_counts_batch(packed_tensor(*io.sampled_ids, {width, batch}), accepted,
                                       row(io.batch.count_slots), counts, cuda);
-    auto tail = mtp_working_tail(0, batch);
-    if (rebuild_history) {
+    const auto tail       = mtp_working_tail(0, batch);
+    const auto key_width  = dimension(parameters.profile->config.text.qsa.index_key_width());
+    const auto tail_width = dimension(parameters.profile->config.text.qsa.compression - 1);
+    // The repair destination starts with the candidate tail, including rows with zero history.
+    const auto seed = [&](const TensorRegion& region, int features) {
+        auto planes = packed_tensor(region, {features, batch, 3});
+        auto source = planes.slice(2, 0, 1), destination = planes.slice(2, 1, 1);
+        copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                         {source.data, source.bytes(), cuda.device()}, cuda);
+    };
+    seed(mtp.tail_keys, key_width * tail_width);
+    seed(mtp.tail_coordinates, 3);
+    const auto repair = [&] {
         auto aligned = packed_tensor(mtp.alignment_conditioning, {channels, k, batch});
         copy_rows_async({aligned.data, aligned.bytes(), cuda.device()}, channels * k * 2ULL,
                         {conditioning.data, conditioning.bytes(), cuda.device()},
@@ -89,13 +101,14 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
         execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
                                *parameters.mtp, aligned, history, tail, after,
                                resources.mtp->layer(0), {}, resources.workspace, cuda);
-        tail = after;
-    }
-    auto destination      = resources.states->mtp_tail(main.destination_offsets);
-    const auto tail_slot  = rebuild_history ? 1U : 0U;
-    const auto key_width  = dimension(parameters.profile->config.text.qsa.index_key_width());
-    const auto tail_width = dimension(parameters.profile->config.text.qsa.compression - 1);
-    auto source_keys      = packed_tensor(mtp.tail_keys, {key_width, tail_width, batch, 3})
+    };
+    if (captured_repair)
+        captured_repair->capture(cuda.stream(), repair);
+    else if (rebuild_history)
+        repair();
+    auto destination     = resources.states->mtp_tail(main.destination_offsets);
+    const auto tail_slot = 1U;
+    auto source_keys     = packed_tensor(mtp.tail_keys, {key_width, tail_width, batch, 3})
                            .slice(3, tail_slot, 1)
                            .view({key_width * tail_width, 1, batch});
     auto key_store               = destination.raw_keys;

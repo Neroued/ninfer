@@ -2,6 +2,7 @@
 
 #include "models/common/frontend/resources.h"
 #include "models/glm5next/frontend/processor_config.h"
+
 #include <optional>
 
 namespace ninfer::artifact {

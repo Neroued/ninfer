@@ -133,13 +133,7 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     const int width = static_cast<int>(operation.width);
     auto input      = frame.input_view(width, batch);
     if (!forward && graphs) {
-        operation.fused_decision =
-            !operation.speculative &&
-            std::none_of(operation.sampling.begin(), operation.sampling.end(),
-                         [](const auto& row) { return row.constrained; });
-        const auto phase       = operation.speculative      ? GraphPhase::Verify
-                                 : operation.fused_decision ? GraphPhase::Ordinary
-                                                            : GraphPhase::Main;
+        const auto phase       = operation.speculative ? GraphPhase::Verify : GraphPhase::Main;
         std::uint32_t frontier = 0;
         for (const auto& row : operation.rows) frontier = std::max(frontier, row.main_frontier);
         operation.graph_started = true;

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/glm5next/parallel/preparation.h"
 #include "distributed/wire.h"
+#include "models/glm5next/parallel/preparation.h"
 
 namespace ninfer::models::glm5next {
 

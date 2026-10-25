@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/glm5next/frontend/chat_template.h"
 #include "models/common/frontend/prompt.h"
+#include "models/glm5next/frontend/chat_template.h"
 
 #include <functional>
 

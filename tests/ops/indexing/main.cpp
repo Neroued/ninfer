@@ -7,6 +7,7 @@ void add_features_cases(ninfer::test::OpSuite&);
 
 void add_gather_remap_cases(ninfer::test::OpSuite&);
 void add_scatter_columns_cases(ninfer::test::OpSuite&);
+void add_gather_rows_cases(ninfer::test::OpSuite&);
 
 int main(int argc, char** argv) {
     ninfer::test::OpSuite suite;
@@ -16,5 +17,6 @@ int main(int argc, char** argv) {
     add_features_cases(suite);
     add_gather_remap_cases(suite);
     add_scatter_columns_cases(suite);
+    add_gather_rows_cases(suite);
     return suite.main(argc, argv);
 }

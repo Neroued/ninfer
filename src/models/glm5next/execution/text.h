@@ -1,11 +1,11 @@
 #pragma once
+#include "models/common/parallel_execution.h"
+#include "models/common/vision/execution.h"
 #include "models/glm5next/execution/batch.h"
+#include "models/glm5next/execution/mla.h"
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/execution/workspace.h"
 #include "models/glm5next/state/context.h"
-#include "models/common/vision/execution.h"
-#include "models/common/parallel_execution.h"
-#include "distributed/communication.h"
 
 namespace ninfer::models::glm5next::execution {
 struct TextExecution {
@@ -20,7 +20,8 @@ class TextRun {
 public:
     TextRun(const Parameters&, TextExecution, BatchView, StateUpdate, CudaExecutionView);
     void stem(std::optional<models::vision::EmbeddingView> = {});
-    void local_mixer(std::uint32_t layer);
+    void local_mixer(std::uint32_t layer, const MlaSubmit& = {});
+    [[nodiscard]] MlaRun local_mla(std::uint32_t layer);
     void finish_mixer(std::uint32_t layer);
     void ffn(std::uint32_t layer);
     void finish_layer(std::uint32_t layer);
@@ -35,6 +36,6 @@ private:
     MemoryArena::Scope scope_;
     workspace::Roots roots_;
     std::uint32_t coefficients_ = 0;
-    std::vector<distributed::PeerTransfer> mla_exchange_;
+    workspace::AttentionBuffers attention_;
 };
 } // namespace ninfer::models::glm5next::execution

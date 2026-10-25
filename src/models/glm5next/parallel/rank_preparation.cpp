@@ -1,6 +1,7 @@
 #include "models/glm5next/startup.h"
-#include "models/glm5next/parallel/wire.h"
+
 #include "models/glm5next/parallel/codec.h"
+#include "models/glm5next/parallel/wire.h"
 
 #include <algorithm>
 

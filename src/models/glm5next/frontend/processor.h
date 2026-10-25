@@ -1,9 +1,9 @@
 #pragma once
 
-#include "models/glm5next/frontend/processor_config.h"
-#include "models/common/frontend/media.h"
 #include "models/common/frontend/digest.h"
+#include "models/common/frontend/media.h"
 #include "models/common/frontend/prompt.h"
+#include "models/glm5next/frontend/processor_config.h"
 #include "text/byte_span.h"
 
 namespace ninfer::models::frontend {

@@ -5,10 +5,10 @@
 #include "models/glm5next/load.h"
 #include "models/glm5next/parallel/preparation.h"
 #include "models/glm5next/program/resources.h"
-#include "runtime/executor/preparation.h"
-#include "runtime/executor/rank_worker.h"
 #include "models/glm5next/runtime_types.h"
 #include "models/registry.h"
+#include "runtime/executor/preparation.h"
+#include "runtime/executor/rank_worker.h"
 
 namespace ninfer::models::glm5next {
 class ExecutionCodec;
@@ -31,6 +31,9 @@ public:
     [[nodiscard]] runtime::PreparationMemory memory() const;
     [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
     void materialize();
+    void prepare_probe();
+    void calibrate();
+    void prepare_execution();
     void prepare(runtime::ContextCapacity, std::size_t available_bytes,
                  std::size_t available_host_bytes);
     void release_resources();
@@ -49,6 +52,8 @@ private:
     ExecutionPlan plan_;
     runtime::ContextCapacityPlan capacity_;
     std::unique_ptr<Instance> instance_;
+    std::unique_ptr<RankProgram> probe_;
+    GraphMemorySummary graph_memory_;
 };
 
 class Startup {

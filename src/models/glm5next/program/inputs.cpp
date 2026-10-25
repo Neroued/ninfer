@@ -1,5 +1,8 @@
 #include "models/glm5next/program/internal.h"
+
 #include "core/transfer.h"
+#include "ninfer/ops/indexing.h"
+
 #include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
@@ -31,58 +34,102 @@ void RankProgramImpl::upload_region(const LayoutRegion& region, std::size_t byte
 
 void RankProgramImpl::upload(std::span<const WorkRow> rows, const BatchPlan& plan,
                              std::uint32_t width, std::span<const std::uint32_t> valid_columns) {
-    auto& f         = *compute;
-    const auto& io  = resources.plan.frame.main;
-    const auto rank = parameters.profile->local.rank;
-    const auto i32  = [&](const TensorRegion& r) {
+    auto& f            = *compute;
+    const auto& io     = resources.plan.frame.main;
+    const auto& global = resources.plan.frame.rows;
+    const auto rank    = parameters.profile->local.rank;
+    const auto i32     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host(r).data);
     };
     const auto i64 = [&](const TensorRegion& r) {
         return static_cast<std::int64_t*>(host(r).data);
     };
-    std::uint32_t visible = 0;
     for (std::size_t b = 0; b < plan.members.size(); ++b) {
-        const auto logical             = plan.members[b];
-        const auto& row                = rows[logical];
-        const auto offsets             = row.states.at(rank);
-        const auto count               = row.ids.size();
-        const auto valid               = valid_columns.empty() ? count : valid_columns[logical];
-        i32(io.valid_columns)[b]       = valid;
-        i64(io.source_offsets)[b]      = offsets.source;
-        i64(io.destination_offsets)[b] = offsets.destination;
-        i32(io.table_rows)[b]          = row.main_table.index;
-        i32(io.base_positions)[b]      = row.main_frontier;
-        i32(io.record_offsets)[b]      = 0;
-        i32(io.accepted_columns)[b]    = 1;
-        i32(io.count_slots)[b]         = row.member.residency.lane.value;
-        i32(io.sampling_positions)[b]  = row.sampling_position;
-        const auto local               = b - plan.owners[row.attention_rank].begin;
+        const auto logical                 = plan.members[b];
+        const auto& row                    = rows[logical];
+        const auto offsets                 = row.states.at(rank);
+        const auto count                   = row.ids.size();
+        const auto valid                   = valid_columns.empty() ? count : valid_columns[logical];
+        i32(io.valid_columns)[b]           = valid;
+        i64(global.source_offsets)[b]      = offsets.source;
+        i64(global.destination_offsets)[b] = offsets.destination;
+        i32(global.base_positions)[b]      = row.main_frontier;
+        i32(global.accepted_columns)[b]    = 1;
+        i32(global.count_slots)[b]         = row.member.residency.lane.value;
+        i32(global.sampling_positions)[b]  = row.sampling_position;
         for (std::uint32_t t = 0; t < width; ++t) {
             i32(io.ids)[b * width + t] = count ? row.ids[std::min<std::size_t>(t, count - 1)] : 0;
             i32(io.positions)[b * width + t] =
                 row.main_frontier + std::min<std::size_t>(t, valid ? valid - 1 : 0);
-            i32(io.selection_rows)[b * width + t] = local * width + t;
         }
-        visible = std::max(visible, row.main_frontier + std::uint32_t(valid));
     }
     const int t = width, b = plan.members.size();
-    upload_region(io.ids.region, t * b * 4ULL);
-    upload_region(io.positions.region, t * b * 4ULL);
-    upload_region(io.metadata,
-                  io.selection_rows.region.offset - io.valid_columns.region.offset + t * b * 4ULL);
-    const auto row = [&](const TensorRegion& r) { return resources.tensor(r).slice(0, 0, b); };
-    f.batch        = {t,
-                      b,
-                      resources.packed(io.ids, {t, b}),
-                      resources.packed(io.positions, {t, b}),
-                      row(io.valid_columns),
-                      row(io.source_offsets),
-                      row(io.destination_offsets),
-                      row(io.table_rows),
-                      row(io.record_offsets),
-                      resources.packed(io.selection_rows, {t, b}),
-                      f.physical.owners,
-                      visible};
+    const auto c = std::max_element(plan.owners.begin(), plan.owners.end(), [](auto a, auto b) {
+                       return a.size < b.size;
+                   })->size;
+    const auto& local = resources.plan.frame.attention;
+    const auto own    = plan.owners[rank];
+    for (std::uint32_t j = 0; j < c; ++j) {
+        const bool live                = j < own.size;
+        i32(local.to_global)[j]        = live ? int(own.begin + j) : -1;
+        i32(local.live_rows)[j]        = live;
+        i32(local.active_columns)[j]   = live ? 0 : -1;
+        i32(local.record_offsets)[j]   = 0;
+        i32(local.accepted_columns)[j] = 0;
+        i64(local.source_offsets)[j]   = live ? i64(global.source_offsets)[own.begin + j] : -1;
+        i64(local.destination_offsets)[j] =
+            live ? i64(global.destination_offsets)[own.begin + j] : -1;
+        i32(local.base_positions)[j] = live ? i32(global.base_positions)[own.begin + j] : 0;
+        i32(local.main_tables)[j] = live ? rows[plan.members[own.begin + j]].main_table.index : -1;
+        i32(local.mtp_tables)[j]  = live ? rows[plan.members[own.begin + j]].mtp_table.index : -1;
+    }
+    for (int j = 0; j < b; ++j) {
+        const auto owner          = rows[plan.members[j]].attention_rank;
+        i32(local.from_gather)[j] = owner * c + j - plan.owners[owner].begin;
+    }
+    upload_region(io.ids.region, std::size_t(t) * b * sizeof(TokenId));
+    upload_region(io.positions.region, std::size_t(t) * b * sizeof(std::int32_t));
+    upload_region(io.valid_columns.region, b * sizeof(std::int32_t));
+    upload_region(global.ingress, global.ingress.bytes);
+    upload_region(local.ingress, local.ingress.bytes);
+    std::uint32_t local_visible = 0;
+    for (std::uint32_t j = own.begin; j < own.begin + own.size; ++j)
+        if (i32(io.valid_columns)[j])
+            local_visible = std::max(local_visible, std::uint32_t(i32(global.base_positions)[j] +
+                                                                  i32(io.valid_columns)[j]));
+    f.batch = batch(io, t, b, c, local_visible,
+                    f.sequence ? std::optional{rows.front().attention_rank} : std::nullopt);
+}
+
+execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g, int c,
+                                            std::uint32_t visible,
+                                            std::optional<std::uint32_t> sequence_owner) {
+    const auto& a      = resources.plan.frame.attention;
+    const auto& global = resources.plan.frame.rows;
+    return {t,
+            g,
+            resources.packed(io.ids, {t, g}),
+            resources.packed(io.positions, {t, g}),
+            row(io.valid_columns, g),
+            row(global.source_offsets, g),
+            row(global.destination_offsets, g),
+            {c, resources.packed(io.attention.ids, {t, c}),
+             resources.packed(io.attention.positions, {t, c}), row(io.attention.valid_columns, c),
+             row(a.source_offsets, c), row(a.destination_offsets, c),
+             row(io.attention.table_rows, c), row(a.record_offsets, c),
+             resources.packed(a.selection_rows, {t, c}), row(a.to_global, c), row(a.from_gather, g),
+             row(a.live_rows, c), visible},
+            sequence_owner};
+}
+
+void RankProgramImpl::localize(const execution::BatchView& call) {
+    auto& a     = call.attention;
+    const int t = call.tokens, g = call.rows, c = a.rows;
+    auto ids = a.ids.view({t, 1, c}), positions = a.positions.view({t, 1, c});
+    auto valid = a.valid_columns.view({1, 1, c});
+    ops::gather_batch_rows(call.ids.view({t, 1, g}), a.to_global, ids, cuda);
+    ops::gather_batch_rows(call.positions.view({t, 1, g}), a.to_global, positions, cuda);
+    ops::gather_batch_rows(call.valid_columns.view({1, 1, g}), a.to_global, valid, cuda);
 }
 
 void RankProgramImpl::request_decision() {
@@ -143,11 +190,9 @@ void RankProgramImpl::upload_sampling() {
                               .seed              = p.seed};
         auto counts =
             resources.tensor(*layout.token_counts).slice(1, row.member.residency.lane.value, 1);
-        if (std::holds_alternative<MtpWork>(f.request.work.operation)) {
-            auto scratch = resources.tensor(layout.mtp->token_counts).slice(1, b, 1);
-            copy_bytes_async({scratch.data, scratch.bytes(), cuda.device()},
-                             {counts.data, counts.bytes(), cuda.device()}, cuda);
-            counts = scratch;
+        if (!parallel && std::holds_alternative<MtpWork>(f.request.work.operation)) {
+            auto scratch = resources.tensor(*layout.mtp->token_counts).slice(1, b, 1);
+            counts       = scratch;
         }
         configs[b].token_counts = static_cast<std::int32_t*>(counts.data);
         if (row.constrained) {

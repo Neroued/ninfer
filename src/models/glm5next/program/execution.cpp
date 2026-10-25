@@ -1,10 +1,64 @@
 #include "models/glm5next/program/internal.h"
-#include "core/transfer.h"
+
 #include "core/nvtx.h"
-#include "ninfer/ops/indexing.h"
+#include "core/transfer.h"
 #include "models/glm5next/state/continuation.h"
+#include "ninfer/ops/indexing.h"
+#include "ninfer/ops/sequence.h"
+
+#include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
+void RankProgramImpl::execute_round(const execution::BatchView& main,
+                                    std::span<const std::uint32_t> draft_bounds, bool head,
+                                    bool read_drafts, const execution::MlaSubmit& submit,
+                                    RoundSections* sections) {
+    const auto& io = resources.plan.frame;
+    const int g = main.rows, c = main.attention.rows, h = parameters.profile->config.text.hidden;
+    const bool verify = !draft_bounds.empty();
+    auto hidden       = resources.packed(io.pending_hidden, {h, main.tokens, g});
+    if (parameters.mtp) stage_conditioning(g);
+    if (verify) {
+        const auto& m = *io.mtp;
+        auto drafts   = resources.packed(m.drafts, {dimension(shape.draft_tokens), g});
+        CUDA_CHECK(cudaMemsetAsync(drafts.data, 0, drafts.bytes(), cuda.stream()));
+        seed_mtp_tail(main, false);
+        {
+            nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
+            for (std::uint32_t step = 0; step < draft_bounds.size(); ++step)
+                draft_forward(step, batch(m.draft_steps[step], 1, g, c, draft_bounds[step]),
+                              submit);
+        }
+        const auto readback = [&] {
+            copy_bytes_async(output(m.drafts).subspan(0, drafts.bytes()),
+                             {drafts.data, drafts.bytes(), cuda.device()}, cuda);
+        };
+        if (sections) {
+            sections->drafts.capture(cuda.stream(), readback);
+            drafts_done.record_external(cuda.stream());
+        } else if (read_drafts) {
+            readback();
+            drafts_done.record(cuda.stream());
+        }
+        auto ids = main.ids, positions = main.positions;
+        ops::prepare_verify_inputs(row(m.anchors, g), drafts, row(io.rows.base_positions, g),
+                                   row(m.extents, g), ids, positions, cuda);
+        {
+            nvtx::ScopedRange range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
+            main_forward(main, execution::RecordWindow{*resources.kda_records}, hidden, {}, submit);
+        }
+    } else {
+        main_forward(main, execution::StepUpdate{}, hidden, {}, submit);
+        if (parameters.mtp) align_history(main, hidden, 1);
+        ops::scatter(hidden.view({h, g}), resources.states.hidden(main.destination_offsets), cuda);
+    }
+    const auto project = [&] { project_head(hidden.view({h, main.tokens * g})); };
+    if (sections)
+        sections->head.capture(cuda.stream(), project);
+    else if (head)
+        project();
+}
+
 void RankProgramImpl::forward() {
     auto& f             = *compute;
     const auto& work    = f.request.work;
@@ -37,14 +91,32 @@ void RankProgramImpl::forward() {
         f.physical = work.batch;
     f.tokens = rows.front().ids.size();
     upload(rows, f.physical, std::max(1U, f.tokens));
-    if (parameters.mtp && f.tokens) {
-        stage_conditioning(rows, f.physical);
-        prepare_history_metadata(rows);
-    }
+    if (parameters.mtp && f.tokens) { prepare_history_metadata(rows); }
     const auto& io = resources.plan.frame;
     const int h = dimension(parameters.profile->config.text.hidden), b = rows.size();
     f.hidden = f.sequence ? resources.tensor(io.prefill_hidden).slice(1, 0, std::max(1U, f.tokens))
                           : resources.packed(io.pending_hidden, {h, 1, b}).view({h, b});
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        f.result.rows[control ? f.control_row : i].processed += rows[i].ids.size();
+    if (!f.sequence && f.tokens == 1) {
+        const bool sample = forward && forward->sample != SampleKind::None;
+        f.graph_round     = graphs != nullptr;
+        if (graphs)
+            graphs->replay(f.batch, {}, sample, false);
+        else
+            execute_round(f.batch, {}, sample, false);
+        f.head_ready = sample;
+        if (sample) {
+            f.phase = ComputePhase::Decision;
+            decide();
+        } else {
+            timer.record_result();
+            compute_done.record(cuda.stream());
+            f.phase = ComputePhase::AwaitForward;
+        }
+        return;
+    }
+    if (parameters.mtp && f.tokens) stage_conditioning(rows.size());
     if (!f.tokens) {
         const auto offset = rows[0].states.at(parameters.profile->local.rank).source;
         const auto source =
@@ -62,24 +134,11 @@ void RankProgramImpl::forward() {
             const auto s = rows[0].states.at(parameters.profile->local.rank);
             update       = execution::SequenceUpdate{s.source, s.destination};
         }
-        {
-            execution::TextRun run(parameters,
-                                   {resources.workspace, resources.states, resources.main,
-                                    resources.tensor(io.main_records.raw_keys),
-                                    resources.tensor(io.main_records.raw_gates),
-                                    parallel ? &*parallel : nullptr},
-                                   f.batch, update, cuda);
-            run.stem(std::move(visual));
-            for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
-                nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
-                run.local_mixer(i);
-                run.finish_mixer(i);
-                run.ffn(i);
-                run.finish_layer(i);
-            }
-            run.finish(f.hidden);
-        }
-        if (parameters.mtp) align_history(rows);
+        main_forward(f.batch, update, f.hidden, std::move(visual));
+        if (parameters.mtp)
+            align_history(
+                f.batch, f.hidden,
+                std::max(1U, f.tokens - (rows.size() == 1 && !rows[0].main_frontier ? 1 : 0)));
         if (f.sequence) {
             auto last         = f.hidden.slice(1, f.tokens - 1, 1);
             const auto offset = rows[0].states.at(parameters.profile->local.rank).destination;
@@ -92,8 +151,6 @@ void RankProgramImpl::forward() {
             ops::scatter(f.hidden, resources.states.hidden(f.batch.destination_offsets), cuda);
         if (f.timed_prefill) prefill_timer->record_stop();
     }
-    for (std::size_t i = 0; i < rows.size(); ++i)
-        f.result.rows[control ? f.control_row : i].processed += rows[i].ids.size();
     if (forward && forward->sample != SampleKind::None) {
         f.phase = ComputePhase::Decision;
         decide();
@@ -102,6 +159,44 @@ void RankProgramImpl::forward() {
         compute_done.record(cuda.stream());
         f.phase = ComputePhase::AwaitForward;
     }
+}
+
+execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
+                                             execution::StateUpdate update) {
+    const auto& io = resources.plan.frame;
+    return execution::TextRun(parameters,
+                              {resources.workspace, resources.states, resources.main,
+                               resources.tensor(io.main_records.raw_keys),
+                               resources.tensor(io.main_records.raw_gates),
+                               parallel ? &*parallel : nullptr},
+                              call, update, cuda);
+}
+
+void RankProgramImpl::main_forward(const execution::BatchView& call, execution::StateUpdate update,
+                                   Tensor hidden,
+                                   std::optional<models::vision::EmbeddingView> visual,
+                                   const execution::MlaSubmit& submit) {
+    localize(call);
+    auto run = text_run(call, update);
+    run.stem(std::move(visual));
+    for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
+        nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
+        run.local_mixer(i, submit);
+        run.finish_mixer(i);
+        run.ffn(i);
+        run.finish_layer(i);
+    }
+    auto output =
+        hidden.view({dimension(parameters.profile->config.text.hidden), call.tokens * call.rows});
+    run.finish(output);
+}
+
+void RankProgramImpl::project_head(Tensor hidden) {
+    auto logits =
+        resources.packed(*resources.plan.frame.logits,
+                         {dimension(parameters.profile->local.vocabulary.size), hidden.ne[1]});
+    ops::linear(hidden, parameters.text.head.weight, logits, parameters.text.head.policy,
+                resources.workspace, cuda);
 }
 
 void RankProgramImpl::finish_forward() {
@@ -151,27 +246,21 @@ void RankProgramImpl::decide() {
     if (mtp && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
-    if (mtp) {
-        accept_mtp();
-        const auto& result = resources.plan.frame.result_egress;
-        copy_bytes_async(resources.egress().subspan(0, result.bytes),
-                         result.bind(resources.fixed()), cuda);
-        timer.record_result();
-        compute_done.record(cuda.stream());
-        f.phase = ComputePhase::AwaitResult;
-        return;
+    const auto rows = work_rows(f.request.work);
+    const int b     = rows.size();
+    if (f.graph_round) {
+        graphs->decide(b, mtp);
+    } else if (mtp) {
+        accept_mtp(b);
+        copy_result(b, true);
+    } else {
+        if (!f.head_ready) {
+            auto hidden = f.sequence ? f.hidden.slice(1, f.tokens ? f.tokens - 1 : 0, 1) : f.hidden;
+            project_head(hidden);
+        }
+        sample(b, std::get<ForwardWork>(f.request.work.operation).sample);
+        copy_result(b, false);
     }
-    const auto& io = resources.plan.frame;
-    const int b    = work_rows(f.request.work).size();
-    auto hidden    = f.sequence ? f.hidden.slice(1, f.tokens ? f.tokens - 1 : 0, 1) : f.hidden;
-    auto logits =
-        resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), b});
-    ops::linear(hidden, parameters.text.head.weight, logits, parameters.text.head.policy,
-                resources.workspace, cuda);
-    sample();
-    auto ids = resources.packed(*io.sampled_ids, {b});
-    copy_bytes_async(resources.egress().subspan(0, ids.bytes()),
-                     {ids.data, ids.bytes(), cuda.device()}, cuda);
     timer.record_result();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitResult;

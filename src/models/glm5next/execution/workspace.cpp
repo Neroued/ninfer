@@ -1,4 +1,5 @@
 #include "models/glm5next/execution/workspace.h"
+
 #include "models/glm5next/state/context.h"
 #include "models/glm5next/vision/execution.h"
 #include "ninfer/ops/kda_input_proj.h"
@@ -64,6 +65,8 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
     const int columns = dimension(std::uint64_t(last) * batch);
     if (mtp) {
         (void)workspace::mtp_roots(a, p.config.text, columns);
+        if (p.local.size > 1)
+            (void)workspace::attention(a, dimension(p.config.text.hidden), columns, p.local.size);
         {
             auto scope = a.scope();
             (void)workspace::mtp_stem(a, p.config.text, columns);
@@ -75,6 +78,8 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
         return a.peak_bytes();
     }
     (void)workspace::roots(a, p.config.text, columns);
+    if (!prefill && p.local.size > 1)
+        (void)workspace::attention(a, dimension(p.config.text.hidden), columns, p.local.size);
     {
         auto scope = a.scope();
         (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
@@ -118,12 +123,14 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
 }
 
 std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, int last, int batch,
-                    int sm_count) {
+                    int sm_count, bool sequence = false) {
     WorkspaceLayoutBuilder a;
     const int columns = dimension(std::uint64_t(last) * batch);
     const int minimum = dimension(std::uint64_t(first) * batch);
     (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
     (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
+    if (!sequence && p.local.size > 1)
+        (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
     {
         auto scope = a.scope();
         (void)workspace::mtp_stem(a, p.config.text, columns);
@@ -159,7 +166,7 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int
     }
     if (p.mtp)
         out.history =
-            std::max(out.history, history(p, s, 1, dimension(s.prefill_chunk), 1, sm_count));
+            std::max(out.history, history(p, s, 1, dimension(s.prefill_chunk), 1, sm_count, true));
     const int columns = s.purpose == EnginePurpose::CausalScoring
                             ? dimension(std::min(s.prefill_chunk, 1024U))
                             : dimension(std::uint64_t(s.max_concurrency) * (s.draft_tokens + 1ULL));

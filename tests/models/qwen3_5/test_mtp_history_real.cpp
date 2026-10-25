@@ -436,8 +436,7 @@ public:
         const auto rebuild = [&](std::array<std::uint32_t, 2> accepted, bool run_production) {
             if (!operation.speculative) return;
             HistoryInput expected;
-            expected.width =
-                static_cast<int>(*std::max_element(accepted.begin(), accepted.end()) - 1);
+            expected.width = kDrafts;
             expected.batch = kBatch;
             expected.lanes = {0, 1};
             expected.conditioning.resize(std::size_t(hidden) * expected.width * kBatch);
@@ -468,14 +467,13 @@ public:
                                            kBatch * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                            native_.device().stream()));
                 if (native.graphs)
-                    native.graphs->rebuild_mtp_history(kBatch, expected.width,
-                                                       native_.device().execution_view());
+                    native.graphs->rebuild_mtp_history(kBatch, native_.device().execution_view());
                 else
-                    native.rebuild_mtp_history(kBatch, expected.width);
+                    native.rebuild_mtp_history(kBatch);
                 native_.device().synchronize();
-                if (expected.width) oracle_.compare_inputs(expected);
+                oracle_.compare_inputs(expected);
             }
-            if (expected.width) oracle_.history(expected);
+            oracle_.history(expected);
             for (std::uint32_t lane = 0; lane < kBatch; ++lane)
                 oracle_.compare(lane, rows_[lane].main_frontier + accepted[lane] - 1);
         };

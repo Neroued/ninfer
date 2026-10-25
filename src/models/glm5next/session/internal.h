@@ -1,9 +1,9 @@
 #pragma once
 
+#include "models/common/context/snapshot.h"
+#include "models/glm5next/definition.h"
 #include "models/glm5next/session/session.h"
 #include "models/glm5next/state/continuation.h"
-#include "models/glm5next/definition.h"
-#include "models/common/context/snapshot.h"
 #include "models/glm5next/state/identity.h"
 
 #include <deque>

@@ -6,18 +6,37 @@
 
 namespace ninfer::models::glm5next {
 
+struct AttentionLayout {
+    TensorRegion ids, positions, valid_columns, table_rows;
+};
+
 struct BatchLayout {
-    TensorRegion ids, positions, valid_columns, source_offsets, destination_offsets, table_rows;
-    TensorRegion base_positions, record_offsets, accepted_columns;
-    TensorRegion count_slots, sampling_positions, selection_rows;
-    LayoutRegion metadata;
+    TensorRegion ids, positions, valid_columns;
+    LayoutRegion ingress;
+    AttentionLayout attention;
+};
+
+struct RowLayout {
+    TensorRegion source_offsets, destination_offsets, base_positions, accepted_columns;
+    TensorRegion count_slots, sampling_positions;
+    LayoutRegion ingress;
+};
+
+struct AttentionFrameLayout {
+    TensorRegion to_global, from_gather, live_rows, source_offsets, destination_offsets;
+    TensorRegion main_tables, mtp_tables, base_positions, record_offsets;
+    TensorRegion accepted_columns, active_columns;
+    TensorRegion selection_rows;
+    LayoutRegion ingress;
 };
 
 struct MtpFrameLayout {
     BatchLayout history;
     std::vector<BatchLayout> draft_steps;
-    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, anchors, lengths;
-    TensorRegion target_tokens, token_counts, proposal_sampling, proposal_columns;
+    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, anchors;
+    TensorRegion round_frontiers;
+    TensorRegion proposal_sampling, proposal_columns;
+    std::optional<TensorRegion> target_tokens, token_counts;
     TensorRegion skip_first, last_columns, active_columns, accepted_drafts;
     ops::KpoolBlockSelectionLayout selection;
     TensorRegion tail_keys, tail_gates;
@@ -26,6 +45,8 @@ struct MtpFrameLayout {
 
 struct FrameLayout {
     BatchLayout main;
+    RowLayout rows;
+    AttentionFrameLayout attention;
     LayoutRegion ingress, sampling_ingress, egress, result_egress;
     TensorRegion prefill_hidden, pending_hidden;
     std::optional<KdaReplayRecordLayout> kda_records;

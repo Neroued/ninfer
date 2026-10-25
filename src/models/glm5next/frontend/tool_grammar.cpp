@@ -1,16 +1,16 @@
 #include "models/glm5next/frontend/tool_grammar.h"
-#include "text/json_schema.h"
-#include "text/unicode.h"
 
 #include "grammar_builder.h"
 #include "grammar_functor.h"
 #include "json_schema_converter.h"
 #include "json_schema_converter_ext.h"
 #include "json_string_grammar.h"
-#include <nlohmann/json.hpp>
+#include "text/json_schema.h"
+#include "text/unicode.h"
 
 #include <algorithm>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <unordered_set>
 

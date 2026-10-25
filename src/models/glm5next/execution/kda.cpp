@@ -1,9 +1,11 @@
 #include "models/glm5next/execution/kda.h"
+
 #include "models/glm5next/execution/workspace.h"
 #include "ninfer/ops/kda_input_proj.h"
 #include "ninfer/ops/kimi_delta_attention.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/rmsnorm.h"
+
 #include <cmath>
 
 namespace ninfer::models::glm5next::execution {

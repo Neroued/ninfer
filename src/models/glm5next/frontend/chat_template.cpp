@@ -1,7 +1,7 @@
 #include "models/glm5next/frontend/chat_template.h"
-#include "models/glm5next/frontend/prompt_layout.h"
 
 #include "models/common/frontend/media_cache.h"
+#include "models/glm5next/frontend/prompt_layout.h"
 #include "text/unicode.h"
 
 #include <algorithm>

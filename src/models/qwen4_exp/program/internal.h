@@ -9,6 +9,7 @@
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
 #include "models/common/qwen/vision/vision.h"
+#include "models/common/vocabulary.h"
 #include "ninfer/ops/sampling.h"
 
 #include <deque>
@@ -64,7 +65,7 @@ struct ComputeFrame {
     bool decision_requested = false, sequence = false;
     bool release_vision = false;
     bool first_sample = false, timer_started = false;
-    bool graph_decided = false, graph_main = false;
+    bool graph_main = false;
     std::vector<std::uint32_t> draft_visible;
     std::uint32_t tokens = 0, visible = 0, layer = 0;
     std::uint32_t score_at = 0, score_count = 0;
@@ -123,7 +124,8 @@ public:
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
                    const Tensor& conditioning, std::optional<models::vision::EmbeddingView>);
     void commit_verify(const Commit&);
-    void execute_mtp_commit(std::int32_t batch, bool rebuild_history);
+    void execute_mtp_commit(std::int32_t batch, bool rebuild_history,
+                            DecodeGraphSection* = nullptr);
     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
                                               std::uint32_t visible);
     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
@@ -131,11 +133,12 @@ public:
     void save_draft(std::uint32_t step, std::int32_t batch);
     void sample_forward(std::int32_t batch, bool first_token);
     void accept_forward(std::int32_t batch);
-    void vocabulary_sample(std::int32_t batch, bool first_token, std::int32_t candidates);
-    void vocabulary_draft(const Tensor& logits, Tensor& ids, const Tensor& valid);
-    void vocabulary_accept(std::int32_t batch, std::int32_t candidates);
+    [[nodiscard]] DistributedVocabulary vocabulary();
+    void vocabulary_sample(std::int32_t batch, bool first_token);
+    void vocabulary_draft(const Tensor& logits, Tensor& ids);
+    void vocabulary_accept(std::int32_t batch);
     void copy_sample_result(std::int32_t batch, bool verify);
-    void copy_verify_inputs(std::int32_t batch, bool capture);
+    void copy_verify_inputs(std::int32_t batch, DecodeGraphSection* = nullptr);
     [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<const WorkRow>,
                                                   std::uint32_t tokens,
                                                   std::span<const MtpInputRow>);

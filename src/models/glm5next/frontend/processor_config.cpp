@@ -1,4 +1,5 @@
 #include "models/glm5next/frontend/processor_config.h"
+
 #include "artifact/schema.h"
 
 #include <cmath>

@@ -6,22 +6,6 @@
 
 namespace ninfer::models::qwen4_exp {
 
-void GraphSegment::prepare(CudaExecutionView cuda, const std::function<void()>& body,
-                           ParallelExecution* parallel) {
-    const auto capture = [&] { definition.capture(cuda.stream(), body); };
-    if (parallel)
-        parallel->record_graph(communication, capture);
-    else
-        capture();
-    executable.instantiate(definition);
-    executable.upload(cuda.stream());
-}
-
-void GraphSegment::launch(CudaExecutionView cuda, ParallelExecution* parallel) {
-    executable.launch(cuda.stream());
-    if (parallel) parallel->replayed(communication);
-}
-
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
                         moe::Schedule* experts, std::span<const std::uint32_t> bounds,
                         std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
@@ -86,7 +70,7 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
             run.resident_moe(i);
             run.combine(i);
         }
-        run.finish(output, logits);
+        capture_finish(run, p, output, logits, workspace, cuda);
     });
     for (auto& bytes : workspace_bytes_) bytes = std::max(bytes, workspace.peak_used());
 }
@@ -109,7 +93,7 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
             inputs[slot].consumed.record_external(cuda.stream());
         });
     }
-    graph.finish.prepare(cuda, [&] { run.finish(output, logits); });
+    graph.finish.prepare(cuda, [&] { capture_finish(run, p, output, logits, workspace, cuda); });
     const auto fixed_workspace = workspace.peak_used();
     for (const auto bound : bounds_) {
         run.set_visible_tokens(bound);
@@ -131,6 +115,24 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
             std::max({fixed_workspace, workspace.peak_used(), workspace_bytes_.front()});
     }
     for (const auto& layer : graph.profiles.front()) graph.layers.push_back(layer->instantiate());
+}
+
+void TextGraph::capture_finish(execution::TextRun& run, const execution::Parameters& p,
+                               execution::TextOutputs output, Tensor logits, MemoryArena& workspace,
+                               CudaExecutionView cuda) {
+    run.finish(output);
+    head_.capture(cuda.stream(), [&] {
+        const int columns = logits.numel() / logits.ne[0];
+        auto hidden       = output.sample.view({dimension(p.profile->config.text.hidden), columns});
+        auto projected    = logits.view({logits.ne[0], columns});
+        execution::project_head(hidden, p.text.head, projected, workspace, cuda);
+    });
+}
+
+void TextGraph::set_head(bool enabled) {
+    auto& executable = resident() ? std::get<Resident>(implementation_).main.executable
+                                  : std::get<Offloaded>(implementation_).finish.executable;
+    head_.set_enabled(executable, enabled);
 }
 
 bool TextGraph::resident() const { return std::holds_alternative<Resident>(implementation_); }

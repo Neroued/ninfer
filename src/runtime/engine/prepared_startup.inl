@@ -3,8 +3,8 @@
 
 namespace ninfer::runtime::detail {
 
-// Native preparation owns weights and execution resources until activation. This path has no
-// captured execution preparation; its accepted resources move directly to the local worker.
+// Native preparation owns weights, calibration and execution resources through activation.
+// The same preparation contract serves local and distributed rank ownership.
 template <class Setup>
 BuiltModel<typename Setup::Types>
 build_prepared_local_model(const artifact::Reader& reader, EngineOptions& options,
@@ -51,6 +51,12 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     preparation->materialize();
     device->synchronize();
     const auto after_weights = device_memory_snapshot(device->device());
+    if (preparation->report(budget.available(after_weights)).preparation_required) {
+        StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
+        preparation->prepare_probe();
+        preparation->calibrate();
+        phase.complete();
+    }
     std::optional<typename Types::PreparedSession> session;
     ContextCapacityResolution capacity;
     std::size_t correction = 0;
@@ -60,9 +66,11 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
             const auto room   = budget.available(before);
             if (correction >= room)
                 throw DeviceAllocationError("runtime exceeds local resource budget");
-            const auto report = preparation->report(room - correction);
+            const auto report   = preparation->report(room - correction);
+            const auto offered  = std::min(report.capacity.available_bytes, room - correction);
+            const auto withheld = room - correction - offered;
             capacity = resolve_context_capacity(options.context_capacity, report.capacity.plan,
-                                                      room - correction, budget.available_host(before),
+                                                      offered, budget.available_host(before),
                                                       before.shared_physical_memory);
             std::optional<DeviceMemorySnapshot> ready;
             std::exception_ptr allocation_error;
@@ -70,6 +78,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
                 StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
                 preparation->prepare({capacity.device_bytes}, room - correction,
                                            budget.available_host(before));
+                preparation->prepare_execution();
                 auto described = preparation->describe();
                 session.emplace(
                     setup.session(described, options.context_cache.checkpoint_interval));
@@ -98,7 +107,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
             if (ready) {
                 const auto released = device_memory_snapshot(device->device());
                 const auto explicit_bytes =
-                    capacity.runtime_reservation_bytes +
+                    withheld + capacity.runtime_reservation_bytes +
                     (before.shared_physical_memory ? capacity.control_reservation_bytes : 0);
                 const auto reclaimed = device_memory_growth(released, *ready);
                 correction           = reclaimed > static_cast<std::int64_t>(explicit_bytes)

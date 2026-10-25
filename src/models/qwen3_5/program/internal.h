@@ -63,7 +63,6 @@ struct ComputeOperation {
     bool speculative             = false;
     bool row_finished            = false;
     bool graph_started           = false;
-    bool fused_decision          = false;
     bool projected               = false;
     std::array<std::uint32_t, kMaximumConcurrency> dead_positions{};
     std::optional<runtime::DecisionInput> decision;
@@ -127,7 +126,7 @@ public:
     void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
-    void rebuild_mtp_history(std::uint32_t batch, std::uint32_t columns);
+    void rebuild_mtp_history(std::uint32_t batch);
     void request_decision(ComputeOperation&);
     void launch_decision(ComputeOperation&);
     void launch_commit(ComputeOperation&);

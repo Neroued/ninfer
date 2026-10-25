@@ -24,7 +24,7 @@ struct Segment {
 struct Resident {
     Segment main;
     std::vector<DecodeGraphChild> mixers;
-    std::shared_ptr<std::vector<std::vector<DecodeGraphDefinition>>> profiles;
+    std::vector<std::vector<DecodeGraphDefinition>> profiles;
 };
 
 struct LayerDefinition {
@@ -37,15 +37,10 @@ struct LayerExecutable {
     std::unique_ptr<moe::LayerGraphExecutable> offloaded;
 };
 
-struct OffloadedTarget {
-    std::vector<std::vector<LayerDefinition>> profiles;
-    std::vector<LayerExecutable> layers;
-    std::size_t installed = 0;
-};
-
 struct Offloaded {
     Segment prefix, suffix;
-    std::shared_ptr<OffloadedTarget> target;
+    std::vector<std::vector<LayerDefinition>> profiles;
+    std::vector<LayerExecutable> layers;
     Tensor residual;
     moe::Schedule* schedule = nullptr;
     std::optional<moe::Schedule::Activity> activity;
@@ -55,8 +50,8 @@ struct Offloaded {
 
     bool advance() {
         if (!cuda) throw std::logic_error("text graph is not active");
-        while (next_layer < target->layers.size()) {
-            auto& layer = target->layers[next_layer];
+        while (next_layer < layers.size()) {
+            auto& layer = layers[next_layer];
             if (layer.offloaded) {
                 const bool complete =
                     waiting ? layer.offloaded->poll() : layer.offloaded->start(residual, *cuda);
@@ -77,7 +72,7 @@ struct Offloaded {
     }
 
     void cancel() {
-        if (waiting) target->layers[next_layer].offloaded->cancel();
+        if (waiting) layers[next_layer].offloaded->cancel();
         waiting = false;
         activity.reset();
         cuda.reset();
@@ -97,7 +92,6 @@ struct TextGraph::Impl {
     std::variant<Resident, Offloaded> graph;
     std::size_t installed      = 0;
     std::size_t workspace_peak = 0;
-    std::uint32_t width        = 0;
 };
 
 TextGraph::TextGraph()                                = default;
@@ -109,18 +103,13 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                         std::span<const GraphProfile> profiles, std::uint32_t width,
                         const std::function<void()>& prologue,
                         const std::function<void()>& epilogue, MemoryArena& workspace,
-                        DeviceContext& device, const TextGraph* shared) {
+                        DeviceContext& device) {
     if (impl_) throw std::logic_error("text graph is already prepared");
     if (profiles.empty() || profiles.front().min != 0 || width == 0) {
         throw std::invalid_argument("text graph profiles are invalid");
     }
     auto result = std::make_unique<Impl>();
     result->profiles.assign(profiles.begin(), profiles.end());
-    result->width = width;
-    if (shared && (!shared->impl_ || shared->impl_->profiles != result->profiles ||
-                   shared->impl_->width != width)) {
-        throw std::invalid_argument("shared text graphs must have identical execution geometry");
-    }
     const auto capacity = profiles.back().max + 1;
     const auto cuda     = device.execution_view();
     const auto layers   = parameters.text.layers.size();
@@ -136,19 +125,17 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
     device.synchronize();
 
     if (!schedule) {
-        auto& graph    = result->graph.emplace<Resident>();
-        graph.profiles = shared ? std::get<Resident>(shared->impl_->graph).profiles
-                                : std::make_shared<std::vector<std::vector<DecodeGraphDefinition>>>(
-                                      profiles.size());
+        auto& graph = result->graph.emplace<Resident>();
+        graph.profiles.resize(profiles.size());
         std::vector<std::uint32_t> attention_layers;
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             if (std::holds_alternative<AttentionParameters>(parameters.text.layers[layer].mixer)) {
                 attention_layers.push_back(layer);
             }
         }
-        for (std::size_t profile = 0; !shared && profile < profiles.size(); ++profile) {
+        for (std::size_t profile = 0; profile < profiles.size(); ++profile) {
             run.set_attention_envelope(envelope(profiles[profile], width, capacity));
-            auto& definitions = (*graph.profiles)[profile];
+            auto& definitions = graph.profiles[profile];
             definitions.resize(attention_layers.size());
             for (std::size_t index = 0; index < attention_layers.size(); ++index) {
                 definitions[index].capture(cuda.stream(),
@@ -162,7 +149,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 if (attention < attention_layers.size() && attention_layers[attention] == layer) {
                     graph.mixers.push_back(
-                        graph.profiles->front()[attention++].append_to(cuda.stream()));
+                        graph.profiles.front()[attention++].append_to(cuda.stream()));
                 } else {
                     run.mixer(layer);
                 }
@@ -172,42 +159,39 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
             run.finish();
             epilogue();
         });
-        for (std::size_t profile = 1; profile < graph.profiles->size(); ++profile) {
-            const auto& definitions = (*graph.profiles)[profile];
+        for (std::size_t profile = 1; profile < graph.profiles.size(); ++profile) {
+            const auto& definitions = graph.profiles[profile];
             for (std::size_t index = 0; index < definitions.size(); ++index) {
                 graph.main.executable.update_child(graph.mixers[index], definitions[index]);
             }
             graph.main.executable.upload(cuda.stream());
             device.synchronize();
         }
-        if (graph.profiles->size() > 1) {
+        if (graph.profiles.size() > 1) {
             for (std::size_t index = 0; index < graph.mixers.size(); ++index)
                 graph.main.executable.update_child(graph.mixers[index],
-                                                   graph.profiles->front()[index]);
+                                                   graph.profiles.front()[index]);
             graph.main.executable.upload(cuda.stream());
         }
     } else {
         auto& graph    = result->graph.emplace<Offloaded>();
         graph.residual = run.residual();
         graph.schedule = schedule;
-        graph.target   = shared ? std::get<Offloaded>(shared->impl_->graph).target
-                                : std::make_shared<OffloadedTarget>();
         graph.prefix.capture(cuda, [&] {
             prologue();
             run.prefix();
         });
-        auto& target = *graph.target;
-        if (!shared) target.profiles.resize(profiles.size());
-        for (std::size_t profile = 0; !shared && profile < profiles.size(); ++profile) {
+        graph.profiles.resize(profiles.size());
+        for (std::size_t profile = 0; profile < profiles.size(); ++profile) {
             run.set_attention_envelope(envelope(profiles[profile], width, capacity));
-            auto& definitions = target.profiles[profile];
+            auto& definitions = graph.profiles[profile];
             definitions.resize(layers);
             for (std::uint32_t layer = 0; layer < layers; ++layer) {
                 auto& definition = definitions[layer];
                 const auto* routed =
                     std::get_if<moe::Parameters>(&parameters.text.layers[layer].ffn);
                 if (routed) {
-                    const auto prior = profile ? target.profiles.front()[layer].offloaded : nullptr;
+                    const auto prior = profile ? graph.profiles.front()[layer].offloaded : nullptr;
                     definition.offloaded = schedule->capture_layer(
                         routed->bank, cuda, run.residual().ne[1], [&] { run.mixer(layer); },
                         [&](const moe::GpuCall& call) { run.post_mixer(layer, &call); },
@@ -225,19 +209,19 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
             run.finish();
             epilogue();
         });
-        if (!shared) target.layers.resize(layers);
-        for (std::size_t layer = 0; !shared && layer < layers; ++layer) {
-            auto& executable       = target.layers[layer];
-            const auto& definition = target.profiles.front()[layer];
+        graph.layers.resize(layers);
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            auto& executable       = graph.layers[layer];
+            const auto& definition = graph.profiles.front()[layer];
             if (definition.offloaded)
                 executable.offloaded = definition.offloaded->instantiate();
             else
                 executable.resident.instantiate(definition.resident);
         }
-        for (std::size_t profile = 0; !shared && profile < profiles.size(); ++profile) {
-            const auto& definitions = target.profiles[profile];
+        for (std::size_t profile = 0; profile < profiles.size(); ++profile) {
+            const auto& definitions = graph.profiles[profile];
             for (std::size_t layer = 0; layer < layers; ++layer) {
-                auto& executable = target.layers[layer];
+                auto& executable = graph.layers[layer];
                 if (executable.offloaded) {
                     executable.offloaded->update(*definitions[layer].offloaded);
                     executable.offloaded->upload(cuda.stream());
@@ -248,9 +232,9 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
             }
             device.synchronize();
         }
-        for (std::size_t layer = 0; !shared && layer < layers; ++layer) {
-            auto& executable       = target.layers[layer];
-            const auto& definition = target.profiles.front()[layer];
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            auto& executable       = graph.layers[layer];
+            const auto& definition = graph.profiles.front()[layer];
             if (executable.offloaded)
                 executable.offloaded->update(*definition.offloaded);
             else
@@ -275,22 +259,20 @@ void TextGraph::select(std::uint32_t frontier) {
         if (index == impl_->installed) return;
         for (std::size_t layer = 0; layer < graph->mixers.size(); ++layer) {
             graph->main.executable.update_child(graph->mixers[layer],
-                                                (*graph->profiles)[index][layer]);
+                                                graph->profiles[index][layer]);
         }
     } else {
         auto& offload = std::get<Offloaded>(impl_->graph);
         if (offload.cuda) throw std::logic_error("cannot update an active text graph");
-        auto& target = *offload.target;
-        if (target.installed != index) {
-            for (std::size_t layer = 0; layer < target.layers.size(); ++layer) {
-                auto& executable       = target.layers[layer];
-                const auto& definition = target.profiles[index][layer];
+        if (impl_->installed != index) {
+            for (std::size_t layer = 0; layer < offload.layers.size(); ++layer) {
+                auto& executable       = offload.layers[layer];
+                const auto& definition = offload.profiles[index][layer];
                 if (executable.offloaded)
                     executable.offloaded->update(*definition.offloaded);
                 else
                     executable.resident.update(definition.resident);
             }
-            target.installed = index;
         }
     }
     impl_->installed = index;

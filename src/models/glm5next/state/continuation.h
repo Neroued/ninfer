@@ -1,5 +1,6 @@
 #pragma once
 #include "runtime/contract/placement.h"
+
 #include <optional>
 
 namespace ninfer::models::glm5next {

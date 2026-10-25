@@ -316,18 +316,11 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                 [&] {
                     auto scope = resources.work.scope();
                     bodies.project(call);
-                    if (phase == GraphPhase::Ordinary) {
-                        auto sample  = call;
-                        sample.phase = GraphPhase::Sample;
-                        bodies.decision(sample);
-                        bodies.readback(sample);
-                    }
                 },
-                resources.work, device, phase == GraphPhase::Ordinary ? &target.main : nullptr);
+                resources.work, device);
             workspace_peak_ = std::max(workspace_peak_, graph.workspace_peak());
         };
         prepare_main(GraphPhase::Main, target.main, 1, ordinary_profiles);
-        prepare_main(GraphPhase::Ordinary, target.ordinary, 1, ordinary_profiles);
         if (spec_.draft_window) {
             prepare_main(GraphPhase::Verify, target.verify, spec_.draft_window + 1,
                          verify_profiles);
@@ -372,24 +365,19 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
         if (bodies.mtp_history && spec_.draft_window) {
             inputs.prepare(invocation(GraphPhase::Verify, batch, spec_.draft_window + 1,
                                       {0, spec_.capacity - 1, 0}, spec_.capacity));
-            target.mtp_history.resize(spec_.draft_window);
-            for (std::uint32_t columns = 1; columns <= spec_.draft_window; ++columns) {
-                auto& frame = resources.frame;
-                for (std::uint32_t row = 0; row < batch; ++row)
-                    frame.host_commit->history_columns[row] = columns;
-                CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit,
-                                           sizeof(FrameCommit), cudaMemcpyHostToDevice,
-                                           device.stream()));
-                resources.work.reset_peak();
-                bodies.mtp_history(batch, columns);
-                device.synchronize();
-                auto& history = target.mtp_history[columns - 1];
-                history.definition.capture(device.stream(),
-                                           [&] { bodies.mtp_history(batch, columns); });
-                history.executable.instantiate(history.definition);
-                history.executable.upload(device.stream());
-                workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
-            }
+            auto& frame = resources.frame;
+            for (std::uint32_t row = 0; row < batch; ++row)
+                frame.host_commit->history_columns[row] = spec_.draft_window;
+            CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
+                                       cudaMemcpyHostToDevice, device.stream()));
+            resources.work.reset_peak();
+            bodies.mtp_history(batch);
+            device.synchronize();
+            auto& history = target.mtp_history;
+            history.definition.capture(device.stream(), [&] { bodies.mtp_history(batch); });
+            history.executable.instantiate(history.definition);
+            history.executable.upload(device.stream());
+            workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
             device.synchronize();
         }
     }
@@ -405,9 +393,6 @@ bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier
     auto& family               = batches_[batch - 1];
     execution::TextGraph* text = nullptr;
     switch (phase) {
-    case GraphPhase::Ordinary:
-        text = &family.ordinary;
-        break;
     case GraphPhase::Main:
         text = &family.main;
         break;
@@ -443,11 +428,9 @@ bool Graphs::poll() {
     return true;
 }
 
-void Graphs::rebuild_mtp_history(std::uint32_t batch, std::uint32_t columns,
-                                 CudaExecutionView cuda) {
-    if (!columns) return;
+void Graphs::rebuild_mtp_history(std::uint32_t batch, CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("MTP history cannot precede its completed target");
-    batches_.at(batch - 1).mtp_history.at(columns - 1).executable.launch(cuda.stream());
+    batches_.at(batch - 1).mtp_history.executable.launch(cuda.stream());
 }
 
 void Graphs::cancel() {

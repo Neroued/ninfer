@@ -1,9 +1,9 @@
 #pragma once
 
+#include "models/common/context/directory.h"
 #include "models/glm5next/execution/workspace.h"
 #include "models/glm5next/program/frame.h"
 #include "models/glm5next/state/context.h"
-#include "models/common/context/directory.h"
 #include "runtime/engine/context_capacity.h"
 
 namespace ninfer::models::glm5next {
@@ -21,6 +21,7 @@ struct ExecutionPlan {
     std::size_t mapping_elements    = 0;
     std::size_t pinned_output_bytes = 0;
     runtime::ContextCapacityResolution capacity;
+    bool use_cuda_graph = false;
 
     [[nodiscard]] std::size_t pinned_bytes() const;
     [[nodiscard]] std::size_t device_bytes() const;

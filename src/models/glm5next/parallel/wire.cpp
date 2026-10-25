@@ -1,6 +1,7 @@
 #include "models/glm5next/parallel/wire.h"
-#include "models/common/parallel_wire.h"
+
 #include "models/common/context/wire.h"
+#include "models/common/parallel_wire.h"
 #include "runtime/executor/protocol.h"
 
 namespace ninfer::models::glm5next {

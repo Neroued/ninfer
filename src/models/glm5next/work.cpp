@@ -1,4 +1,5 @@
 #include "models/glm5next/work.h"
+
 #include "models/glm5next/state/continuation.h"
 
 #include <algorithm>

@@ -7,9 +7,9 @@
 #include "models/glm5next/frontend/prepared_prompt.h"
 #include "models/glm5next/session/planning.h"
 #include "models/glm5next/work.h"
-#include "runtime/executor/executor.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/placement.h"
+#include "runtime/executor/executor.h"
 
 namespace ninfer::models::glm5next {
 class Session;

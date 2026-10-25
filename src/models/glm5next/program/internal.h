@@ -1,8 +1,12 @@
 #pragma once
-#include "models/glm5next/program/program.h"
+#include "models/common/vocabulary.h"
+#include "models/glm5next/execution/mtp.h"
 #include "models/glm5next/execution/text.h"
-#include "runtime/observability/gpu_timing.h"
+#include "models/glm5next/program/graphs.h"
+#include "models/glm5next/program/program.h"
 #include "ninfer/ops/sampling.h"
+#include "runtime/observability/gpu_timing.h"
+
 #include <deque>
 
 namespace ninfer::models::glm5next::detail {
@@ -26,6 +30,7 @@ struct ComputeFrame {
     std::optional<runtime::DecisionInput> decision;
     std::optional<WorkRow> window;
     BatchPlan physical;
+    std::vector<std::uint32_t> draft_visible;
     std::uint32_t control_row = 0, control_offset = 0, tokens = 0;
     std::uint32_t score_at = 0, score_count = 0;
     std::vector<float> logprobs;
@@ -33,6 +38,7 @@ struct ComputeFrame {
     Tensor hidden;
     GpuExecutionObservation gpu;
     bool sequence = false, timed_prefill = false, counts_pending = false;
+    bool head_ready = false, graph_round = false;
     bool release_vision = false;
 };
 
@@ -63,24 +69,42 @@ public:
     void collect_vision_timing();
     void retire_vision(runtime::ResidencyId) noexcept;
     void forward();
+    void prepare_graphs();
+    void release_graphs();
+    void execute_round(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
+                       bool head, bool read_drafts, const execution::MlaSubmit& = {},
+                       RoundSections* = nullptr);
+    [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
+    [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, const execution::BatchView&);
+    [[nodiscard]] execution::MlaSelection draft_selection(std::uint32_t step, int local);
+    void copy_result(int rows, bool verify);
     void prepare_mtp();
-    void draft_forward(std::uint32_t step);
-    void verify_forward();
-    void accept_mtp();
+    void draft_forward(std::uint32_t step, const execution::BatchView&,
+                       const execution::MlaSubmit& = {});
+    void main_forward(const execution::BatchView&, execution::StateUpdate, Tensor hidden,
+                      std::optional<models::vision::EmbeddingView> = {},
+                      const execution::MlaSubmit&                  = {});
+    void project_head(Tensor hidden);
+    void accept_mtp(std::int32_t rows);
+    [[nodiscard]] DistributedVocabulary vocabulary();
     void commit_mtp(const Commit&);
-    void execute_mtp_commit(bool repair_history);
-    void stage_conditioning(std::span<const WorkRow>, const BatchPlan&);
-    void align_history(std::span<const WorkRow>);
+    void execute_mtp_commit(const execution::BatchView&, bool repair_history,
+                            DecodeGraphSection* = nullptr);
+    void stage_conditioning(std::int32_t rows);
+    void seed_mtp_tail(const execution::BatchView&, bool canonical_destination);
+    void localize(const execution::BatchView&);
+    void align_history(const execution::BatchView&, Tensor hidden, std::int32_t width);
     void prepare_history_metadata(std::span<const WorkRow>,
                                   std::span<const std::uint32_t> skip_first = {});
     [[nodiscard]] execution::BatchView batch(const BatchLayout&, int tokens, int rows,
-                                             std::uint32_t visible);
+                                             int attention_rows, std::uint32_t visible,
+                                             std::optional<std::uint32_t> sequence_owner = {});
     [[nodiscard]] Tensor row(const TensorRegion&, int rows);
     [[nodiscard]] MemorySpan output(const TensorRegion&);
     void finish_forward();
     void request_decision();
     void decide();
-    void sample();
+    void sample(std::int32_t rows, SampleKind);
     void score();
     void result();
     void upload(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
@@ -103,6 +127,9 @@ public:
     Resources& resources;
     const ExecutionShape shape;
     std::optional<ParallelExecution> parallel;
+    std::unique_ptr<GraphInputs> graph_inputs;
+    std::unique_ptr<Graphs> graphs;
+    GraphMemorySummary graph_memory;
     std::unique_ptr<ComputeFrame> compute;
     std::unique_ptr<ContextFrame> context;
     std::array<std::optional<runtime::ExecutionMember>, kMaximumConcurrency> bindings;

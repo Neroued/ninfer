@@ -60,18 +60,12 @@ void RankProgramImpl::progress() {
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
                 if (backend == SpeculativeBackend::Mtp && !operation.speculative)
                     align_mtp_history(operation);
-                if (operation.fused_decision) {
-                    gpu_timer.record_result();
-                    result_ready.record(device.stream());
-                    operation.stage = ComputeStage::Readback;
-                } else {
-                    if (!operation.projected) {
-                        resources.work.reset();
-                        project_decode(operation.batch, operation.width);
-                        operation.projected = true;
-                    }
-                    operation.stage = ComputeStage::AwaitDecision;
+                if (!operation.projected) {
+                    resources.work.reset();
+                    project_decode(operation.batch, operation.width);
+                    operation.projected = true;
                 }
+                operation.stage = ComputeStage::AwaitDecision;
                 break;
             }
             if (operation.width) {

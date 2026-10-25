@@ -26,8 +26,7 @@ public:
 
     void prepare(TextRun&, const Parameters&, moe::Schedule*, std::span<const GraphProfile>,
                  std::uint32_t width, const std::function<void()>& prologue,
-                 const std::function<void()>& epilogue, MemoryArena&, DeviceContext&,
-                 const TextGraph* shared = nullptr);
+                 const std::function<void()>& epilogue, MemoryArena&, DeviceContext&);
     void select(std::uint32_t frontier);
     [[nodiscard]] bool start(CudaExecutionView);
     [[nodiscard]] bool poll();

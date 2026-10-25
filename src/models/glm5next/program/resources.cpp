@@ -1,9 +1,11 @@
 #include "models/glm5next/program/resources.h"
+
 #include "core/transfer.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 
 namespace ninfer::models::glm5next {
 namespace {
@@ -57,6 +59,13 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
     }
     copy_bytes_async(plan.frame.ingress.bind(fixed_.span()), ingress_.span(),
                      device.execution_view());
+    {
+        const auto& r = plan.frame.attention.selection_rows;
+        std::vector<std::int32_t> indices(r.shape[0]);
+        std::iota(indices.begin(), indices.end(), 0);
+        copy_bytes(r.region.bind(fixed_.span()), {indices.data(), r.region.bytes, Device::cpu()},
+                   device.execution_view());
+    }
     if (const auto& m = plan.frame.mtp) {
         std::array<ops::SamplingConfig, kMaximumConcurrency> proposal;
         std::array<std::int32_t, kMaximumConcurrency> columns;
@@ -80,7 +89,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
     clear(plan.main.tables.page_offsets, 255);
     if (plan.mtp) clear(plan.mtp->tables.page_offsets, 255);
     if (plan.frame.token_counts) clear(*plan.frame.token_counts, 0);
-    if (plan.frame.mtp) clear(plan.frame.mtp->token_counts, 0);
+    if (plan.frame.mtp && plan.frame.mtp->token_counts) clear(*plan.frame.mtp->token_counts, 0);
     device.synchronize();
 }
 

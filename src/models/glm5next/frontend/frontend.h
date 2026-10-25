@@ -1,7 +1,7 @@
 #pragma once
 
-#include "models/common/frontend/prompt.h"
 #include "models/common/frontend/output_session.h"
+#include "models/common/frontend/prompt.h"
 #include "ninfer/types.h"
 
 #include <memory>

@@ -1,10 +1,9 @@
 #include "models/glm5next/execution/text.h"
+
 #include "models/glm5next/execution/kda.h"
 #include "models/glm5next/execution/mla.h"
-#include "distributed/communication.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/indexing.h"
-#include "core/nvtx.h"
 
 namespace ninfer::models::glm5next::execution {
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
@@ -13,75 +12,68 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
       scope_(execution.workspace.scope()),
       roots_(workspace::roots(execution.workspace, p.profile->config.text,
                               batch.tokens * batch.rows)) {
-    if (batch.tokens < 1 || batch.rows < 1 || batch.owners.size() != p.profile->local.size ||
+    if (batch.tokens < 1 || batch.rows < 1 || batch.attention.rows < 1 ||
         (std::holds_alternative<SequenceUpdate>(update) && batch.rows != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1))
         throw std::invalid_argument("GLM5Next forward has inconsistent state-write extents");
+    if (execution.parallel && !batch.sequence_owner)
+        attention_ =
+            workspace::attention(execution.workspace, dimension(p.profile->config.text.hidden),
+                                 batch.tokens * batch.attention.rows, p.profile->local.size);
 }
 
 void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.rows}), parameters_.text.embedding,
-                   roots_.input, cuda_);
+                   roots_.output, cuda_);
     if (visual)
         for (const auto& slice : visual->slices)
-            ops::scatter(slice.features, slice.columns, roots_.input, cuda_);
-    ops::mhc_expand_pre(roots_.input, parameters_.text.layers.front().attention_hc,
+            ops::scatter(slice.features, slice.columns, roots_.output, cuda_);
+    ops::mhc_expand_pre(roots_.output, parameters_.text.layers.front().attention_hc,
                         parameters_.profile->text.mhc_parameters, roots_.residual,
-                        {roots_.output, roots_.coefficients[coefficients_]}, execution_.workspace,
+                        {roots_.input, roots_.coefficients[coefficients_]}, execution_.workspace,
                         cuda_);
-    std::swap(roots_.input, roots_.output);
-    if (execution_.parallel) {
-        const auto& profile = *parameters_.profile;
-        const auto local    = batch_.owners[profile.local.rank];
-        const auto bytes_per_row =
-            std::size_t(profile.config.text.hidden) * batch_.tokens * sizeof(std::uint16_t);
-        const auto memory = MemorySpan{roots_.output.data, roots_.output.bytes(), cuda_.device()};
-        mla_exchange_.reserve(profile.local.size - 1);
-        for (std::uint32_t rank = 0; rank < profile.local.size; ++rank) {
-            if (rank == profile.local.rank) continue;
-            const auto remote = batch_.owners[rank];
-            mla_exchange_.push_back(
-                {rank, memory.subspan(bytes_per_row * local.begin, bytes_per_row * local.size),
-                 memory.subspan(bytes_per_row * remote.begin, bytes_per_row * remote.size)});
-        }
-    }
 }
 
-void TextRun::local_mixer(std::uint32_t layer) {
+void TextRun::local_mixer(std::uint32_t layer, const MlaSubmit& submit) {
     const auto& profile = *parameters_.profile;
-    const auto& c       = profile.config.text;
     const auto& p       = parameters_.text.layers.at(layer);
-    const auto index    = c.layers.at(layer).state_index;
+    const auto index    = profile.config.text.layers.at(layer).state_index;
     if (const auto* k = std::get_if<KdaParameters>(&p.mixer)) {
         kda(roots_.input, profile, *k, batch_, execution_.states.kda(), index, update_,
             roots_.output, execution_.workspace, cuda_);
         return;
     }
-    const auto local = batch_.owners[profile.local.rank];
-    if (!local.size) return;
-    const int t = batch_.tokens, begin = static_cast<int>(local.begin),
-              rows     = dimension(local.size);
-    const int h        = dimension(c.hidden);
-    const auto subset  = [&](const Tensor& v) { return v.slice(0, begin, rows); };
-    const auto columns = [&](const Tensor& v) { return v.slice(1, begin, rows); };
-    const auto offsets = subset(batch_.source_offsets);
-    const auto before  = execution_.states.main_tail(offsets).layer(index);
+    if (batch_.sequence_owner && *batch_.sequence_owner != profile.local.rank) return;
+    if (attention_.input.data) {
+        const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
+        auto input = attention_.input.view({h, t, batch_.attention.rows});
+        ops::gather_batch_rows(roots_.input.view({h, t, batch_.rows}), batch_.attention.to_global,
+                               input, cuda_);
+    }
+    auto run = local_mla(layer);
+    run.execute(submit);
+}
+
+MlaRun TextRun::local_mla(std::uint32_t layer) {
+    const auto& profile = *parameters_.profile;
+    const auto& local   = batch_.attention;
+    const auto index    = profile.config.text.layers.at(layer).state_index;
+    const auto before   = execution_.states.main_tail(local.source_offsets).layer(index);
     const auto after =
         std::holds_alternative<RecordWindow>(update_)
             ? std::nullopt
-            : std::optional{
-                  execution_.states.main_tail(subset(batch_.destination_offsets)).layer(index)};
+            : std::optional{execution_.states.main_tail(local.destination_offsets).layer(index)};
     ops::KpoolRawRecordWriteView records;
     if (!after)
-        records = {execution_.raw_keys.slice(3, index, 1).slice(2, begin, rows),
-                   execution_.raw_gates.slice(3, index, 1).slice(2, begin, rows),
-                   subset(batch_.record_offsets)};
-    auto input  = roots_.input.view({h, t, batch_.rows}).slice(2, begin, rows).view({h, t * rows});
-    auto output = roots_.output.view({h, t, batch_.rows}).slice(2, begin, rows).view({h, t * rows});
-    mla(input, c, std::get<MlaParameters>(p.mixer),
-        {columns(batch_.positions), subset(batch_.valid_columns), subset(batch_.table_rows)},
-        before, after, execution_.cache.layer(index), records, columns(batch_.selection_rows),
-        batch_.max_visible_tokens, output, execution_.workspace, cuda_);
+        records = {execution_.raw_keys.slice(3, index, 1).slice(2, 0, local.rows),
+                   execution_.raw_gates.slice(3, index, 1).slice(2, 0, local.rows),
+                   local.record_offsets};
+    return MlaRun(
+        attention_.input.data ? attention_.input : roots_.input, profile.config.text,
+        std::get<MlaParameters>(parameters_.text.layers.at(layer).mixer),
+        {local.positions, local.valid_columns, local.table_rows}, before, after,
+        execution_.cache.layer(index), records, local.selection_rows, local.max_visible_tokens,
+        attention_.output.data ? attention_.output : roots_.output, execution_.workspace, cuda_);
 }
 
 void TextRun::next_pre(const ops::MhcPreWeights& weights) {
@@ -97,7 +89,16 @@ void TextRun::finish_mixer(std::uint32_t layer) {
     if (execution_.parallel) {
         if (profile.config.text.layers.at(layer).mixer == MixerKind::Kda)
             execution_.parallel->sum(roots_.output, cuda_);
-        else { execution_.parallel->exchange(mla_exchange_, cuda_); }
+        else if (batch_.sequence_owner)
+            execution_.parallel->broadcast(roots_.output, *batch_.sequence_owner, cuda_);
+        else {
+            execution_.parallel->gather(attention_.output, attention_.gathered, cuda_);
+            const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
+            auto output = roots_.output.view({h, t, batch_.rows});
+            ops::gather_batch_rows(
+                attention_.gathered.view({h, t, batch_.attention.rows * int(profile.local.size)}),
+                batch_.attention.from_gather, output, cuda_);
+        }
     }
     next_pre(parameters_.text.layers.at(layer).mlp_hc);
 }

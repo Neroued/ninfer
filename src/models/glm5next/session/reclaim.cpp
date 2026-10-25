@@ -117,17 +117,8 @@ SessionImpl::plan_releases(std::span<const CheckpointHandle> allowed,
 ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                              std::span<const CheckpointHandle> excluded,
                                              const ContextDemand& demand) const {
-    auto facts = physical_facts(*this, allowed, excluded);
-    ContextReclaimPlan result;
-    result.inventory = facts.inventory;
-    if (operation) return result;
-    auto selected = facts.inventory->select();
-    for (const auto& group : facts.groups) {
-        auto probe = selected.probe(group.sources);
-        if (!selected.released().empty())
-            result.releases.push_back({group.sources, selected.released()});
-    }
-    return result;
+    auto plan = plan_releases(allowed, excluded, demand);
+    return {{}, std::move(plan.releases), std::move(plan.inventory)};
 }
 
 runtime::ContextStart SessionImpl::try_pending_maintenance() {

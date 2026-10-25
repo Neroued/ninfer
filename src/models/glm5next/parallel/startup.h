@@ -1,9 +1,9 @@
 #pragma once
 
-#include "models/glm5next/parallel/wire.h"
 #include "models/glm5next/frontend/frontend.h"
-#include "models/glm5next/runtime_types.h"
 #include "models/glm5next/parallel/codec.h"
+#include "models/glm5next/parallel/wire.h"
+#include "models/glm5next/runtime_types.h"
 #include "models/registry.h"
 
 namespace ninfer::models::glm5next {

@@ -1,4 +1,5 @@
 #include "models/glm5next/program/planning.h"
+
 #include "core/platform.h"
 #include "models/glm5next/session/planning.h"
 
@@ -91,9 +92,10 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     if (!profile)
         throw std::invalid_argument("GLM5Next execution planning requires its weight profile");
     ExecutionPlan out;
-    out.profile = std::move(profile);
-    out.shape   = shape(*out.profile, o);
-    out.state   = plan_state(*out.profile);
+    out.profile        = std::move(profile);
+    out.shape          = shape(*out.profile, o);
+    out.use_cuda_graph = o.use_cuda_graph && o.purpose == EnginePurpose::Generation;
+    out.state          = plan_state(*out.profile);
     out.workspace =
         execution::plan_workspace(*out.profile, out.shape, sm_count, o.vision_memory_budget_bytes);
     const auto& c = out.profile->config.text;

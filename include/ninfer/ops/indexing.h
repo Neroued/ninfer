@@ -57,6 +57,21 @@ void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Te
 void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
                                CudaExecutionView execution);
 
+// out[:,t,b] = source[:,t,rows[b]], or represented zero when rows[b]==-1.
+// Source [D,T,S] and out [D,T,B] are contiguous BF16, I32 or I64 with positive extents;
+// rows is contiguous Device I32 [B], with values in {-1} union [0,S). Read rows may repeat.
+// Copies bits exactly, writes all output, and consumes current selectors under Graph replay.
+// Output is disjoint from inputs. No workspace or state is used.
+void gather_batch_rows(const Tensor& source, const Tensor& rows, Tensor& out,
+                       CudaExecutionView execution);
+
+// out[:,b] = source.record[b].field[:] when active[b]>0, otherwise BF16 +0.
+// Out is contiguous BF16 [D,B]; source is a single-layer contiguous BF16 [D] field with
+// Device I64 offsets [B]. Active is Device I32 [B] with nonnegative values. Inactive rows
+// read neither offsets nor fields. Copies bits exactly; output and accessed inputs are disjoint.
+void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out,
+            CudaExecutionView execution);
+
 // For columns[b]>=0, destination.record[b].field[:]=source[:,columns[b],b]; -1 preserves the
 // destination and reads no source or record offset. Source is contiguous BF16 or I32 [D,T,B],
 // columns is contiguous I32 [B], B=1..8, and destination has same-dtype contiguous [D] fields

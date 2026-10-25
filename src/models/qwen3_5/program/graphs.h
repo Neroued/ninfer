@@ -11,7 +11,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-enum class GraphPhase : std::uint8_t { Ordinary, Main, Verify, Draft, Sample, Accept };
+enum class GraphPhase : std::uint8_t { Main, Verify, Draft, Sample, Accept };
 
 struct GraphProfile {
     std::uint32_t min                                                = 0;
@@ -44,7 +44,7 @@ struct GraphBodies {
     std::function<void(const GraphInvocation&)> draft;
     std::function<void(const GraphInvocation&)> decision;
     std::function<void(const GraphInvocation&)> readback;
-    std::function<void(std::uint32_t batch, std::uint32_t columns)> mtp_history;
+    std::function<void(std::uint32_t batch)> mtp_history;
 };
 
 class Graphs {
@@ -56,7 +56,7 @@ public:
     [[nodiscard]] bool poll();
     void cancel();
     void clear();
-    void rebuild_mtp_history(std::uint32_t batch, std::uint32_t columns, CudaExecutionView);
+    void rebuild_mtp_history(std::uint32_t batch, CudaExecutionView);
 
     [[nodiscard]] std::size_t workspace_peak() const noexcept { return workspace_peak_; }
 
@@ -80,7 +80,7 @@ private:
     };
 
     struct Batch {
-        execution::TextGraph ordinary, main, verify;
+        execution::TextGraph main, verify;
         SegmentFamily draft, sample, accept;
 
         struct History {
@@ -88,7 +88,7 @@ private:
             DecodeGraphExecutable executable;
         };
 
-        std::vector<History> mtp_history;
+        History mtp_history;
     };
 
     GraphSpec spec_;

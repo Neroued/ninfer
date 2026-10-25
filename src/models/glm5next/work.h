@@ -1,11 +1,11 @@
 #pragma once
 
 #include "models/common/context/contract.h"
-#include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
+#include "models/common/context/directory/state.h"
+#include "models/common/parallel.h"
 #include "models/glm5next/execution_shape.h"
 #include "models/glm5next/vision/control.h"
-#include "models/common/parallel.h"
 #include "runtime/executor/contract.h"
 
 #include <map>

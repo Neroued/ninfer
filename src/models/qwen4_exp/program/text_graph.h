@@ -1,19 +1,10 @@
 #pragma once
 
-#include "core/decode_graph.h"
+#include "models/common/graph.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/ple/upload.h"
 
 namespace ninfer::models::qwen4_exp {
-
-struct GraphSegment {
-    CommunicationWork communication;
-    DecodeGraphDefinition definition;
-    DecodeGraphExecutable executable;
-
-    void prepare(CudaExecutionView, const std::function<void()>&, ParallelExecution* = nullptr);
-    void launch(CudaExecutionView, ParallelExecution* = nullptr);
-};
 
 // One exact T/B traversal. Resident execution submits one graph, with replaceable QSA
 // mixers and PLE input. Expert offload retains its Host handoffs between layer segments.
@@ -24,6 +15,7 @@ public:
                  execution::TextOutputs, Tensor logits, std::int32_t columns, MemoryArena&,
                  DeviceContext&);
     void select(std::uint32_t visible_tokens);
+    void set_head(bool enabled);
     [[nodiscard]] bool resident() const;
     void replay(std::uint32_t ple_slot, CudaExecutionView);
     void begin_prefix(CudaExecutionView);
@@ -62,6 +54,9 @@ private:
     void prepare_offloaded(execution::TextRun&, const execution::Parameters&, moe::Schedule&,
                            std::array<ple::DeviceEmbedding, 2>, execution::TextOutputs,
                            Tensor logits, std::int32_t columns, MemoryArena&, CudaExecutionView);
+    void capture_finish(execution::TextRun&, const execution::Parameters&, execution::TextOutputs,
+                        Tensor logits, MemoryArena&, CudaExecutionView);
+    DecodeGraphSection head_;
     std::variant<std::monostate, Resident, Offloaded> implementation_;
     std::vector<std::uint32_t> bounds_;
     std::vector<std::size_t> workspace_bytes_;

@@ -17,7 +17,7 @@ struct TextExecution {
 class TextRun {
 public:
     TextRun(const Parameters&, TextExecution, BatchView, StateUpdate, CudaExecutionView);
-    void stem(std::optional<VisualEmbeddingView> = {});
+    void stem(std::optional<models::vision::EmbeddingView> = {});
     void local_mixer(std::uint32_t layer);
     void finish_mixer(std::uint32_t layer);
     void ffn(std::uint32_t layer);

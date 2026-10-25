@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/vision/execution.h"
+
 #include "core/kda_replay_records.h"
 #include "models/common/parallel.h"
 #include <variant>
@@ -25,7 +27,4 @@ struct RecordWindow {
 
 using StateUpdate = std::variant<SequenceUpdate, StepUpdate, RecordWindow>;
 
-struct VisualEmbeddingView {
-    Tensor features, columns;
-};
 } // namespace ninfer::models::glm5next::execution

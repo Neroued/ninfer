@@ -5,30 +5,14 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-std::optional<execution::VisualEmbeddingView>
+std::optional<models::vision::EmbeddingView>
 RankProgramImpl::visual_view(const vision::WindowPlan& plan, std::uint32_t begin,
                              std::uint32_t tokens, const TensorRegion& region, MemorySpan host) {
-    const auto slices = vision::embedding_slices(plan, begin, tokens);
-    if (slices.empty()) return {};
-    execution::VisualEmbeddingView out;
-    auto indices       = device_tensor(region);
-    std::size_t offset = 0;
-    for (const auto& slice : slices) {
-        const auto n = slice.destination_columns.size();
-        if ((offset + n) * sizeof(std::int32_t) > host.bytes || offset + n > indices.numel())
-            throw std::logic_error("Vision consumer indices exceed their frame");
-        std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-                  static_cast<std::int32_t*>(host.data) + offset);
-        out.slices.push_back(
-            {resources.vision->output(slice.source_begin, n), indices.slice(0, offset, n)});
-        offset += n;
-    }
-    copy_bytes_async({indices.data, offset * sizeof(std::int32_t), indices.device},
-                     host.subspan(0, offset * sizeof(std::int32_t)), cuda);
-    return out;
+    return vision::prepare_embedding_view(*resources.vision, plan, begin, tokens,
+                                          device_tensor(region), host, cuda);
 }
 
-std::optional<execution::VisualEmbeddingView>
+std::optional<models::vision::EmbeddingView>
 RankProgramImpl::prepare_vision(const std::optional<qwen::VisionWork>& work, std::uint32_t begin,
                                 std::uint32_t tokens) {
     if (!work) return {};

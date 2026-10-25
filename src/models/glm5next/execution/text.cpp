@@ -19,10 +19,12 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
         throw std::invalid_argument("GLM5Next forward has inconsistent state-write extents");
 }
 
-void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
+void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.rows}), parameters_.text.embedding,
                    roots_.input, cuda_);
-    if (visual) ops::scatter(visual->features, visual->columns, roots_.input, cuda_);
+    if (visual)
+        for (const auto& slice : visual->slices)
+            ops::scatter(slice.features, slice.columns, roots_.input, cuda_);
     ops::mhc_expand_pre(roots_.input, parameters_.text.layers.front().attention_hc,
                         parameters_.profile->text.mhc_parameters, roots_.residual,
                         {roots_.output, roots_.coefficients[coefficients_]}, execution_.workspace,

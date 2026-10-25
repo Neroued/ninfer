@@ -22,6 +22,7 @@ using Identity = InputIdentity;
 
 struct RequestPlan {
     PreparedPromptData prompt;
+    std::shared_ptr<const vision::ExecutionInput> vision;
     runtime::RequestPlanSummary summary;
     std::shared_ptr<const Identity> identity;
     std::vector<CapturePoint> captures;
@@ -184,8 +185,9 @@ struct ComputeTransaction {
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
     std::unique_ptr<context::ContextTransaction> completion;
-    bool committed = false;
-    bool discarded = false;
+    std::uint64_t vision_id = 0;
+    bool committed          = false;
+    bool discarded          = false;
     std::optional<SessionEvent> event;
 
     ComputeTransaction(Kind kind, context::ContextDirectory& directory)
@@ -237,6 +239,8 @@ public:
     void submit_releases();
     void cleanup() noexcept;
 
+    [[nodiscard]] std::optional<vision::Work> prepare_visual(const Sequence&, std::uint32_t begin,
+                                                             std::uint32_t end);
     [[nodiscard]] WorkRow work_row(const Sequence&, std::uint32_t tokens) const;
     void prepare_write(Sequence&, std::uint32_t end, context::ContextTransaction&);
     [[nodiscard]] ContinuationMetadata prepare_commit(Sequence&, const WorkRow&,
@@ -291,6 +295,7 @@ public:
     std::unique_ptr<ContextOperation> operation;
     std::optional<ContextAssessment> pending_maintenance;
     std::optional<PauseReservation> pause_reservation;
+    models::vision::Window vision_window;
     std::unique_ptr<ComputeTransaction> compute;
     std::unique_ptr<Scoring> scoring;
     std::deque<SessionEvent> events;

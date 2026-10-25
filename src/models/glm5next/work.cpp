@@ -132,6 +132,17 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) {
         require(shape.purpose == EnginePurpose::Generation, "generation on scoring instance");
         const auto n = rows.front().ids.size();
+        if (f->visual) {
+            const auto& use = f->visual->window;
+            require(vision_max_features && rows.size() == 1 && n && use.id && use.plan &&
+                        same_member(use.owner, rows.front().member) &&
+                        (f->kind == ForwardKind::Prefill || f->kind == ForwardKind::Replay) &&
+                        use.produce == bool(f->visual->input),
+                    "Vision work differs from its prepared window or owner");
+            require(use.plan->features && use.plan->features <= vision_max_features &&
+                        use.plan->consume_end <= shape.max_context,
+                    "Vision window exceeds prepared capacity");
+        }
         for (const auto& r : rows) require(r.ids.size() == n, "unequal forward widths");
         require(f->kind == ForwardKind::Control || n <= shape.prefill_chunk,
                 "window exceeds frame");

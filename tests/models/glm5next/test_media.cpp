@@ -1,6 +1,7 @@
 #include "chat_fixture.h"
 #include "models/glm5next/frontend/prepared_prompt.h"
 #include "models/glm5next/frontend/resources.h"
+#include "models/glm5next/vision/control.h"
 #include "models/common/frontend/digest.h"
 #include "media/decode/decode.h"
 
@@ -54,6 +55,43 @@ PromptInput media_prompt(const Json& test, const std::filesystem::path& root) {
             .media.bytes.assign(bytes.begin(), bytes.end());
     }
     return input;
+}
+
+void execution_input(const glm::PreparedPromptData& prompt) {
+    const glm::VisionConfig config{24, 1024, 16, 4096, 3, 14, 2, 2, 4096, 10240, 1e-5F, 10.F};
+    std::uint32_t capacity = 0;
+    for (const auto& media : prompt.identity.media)
+        for (const auto& span : media.item.token_spans)
+            capacity = std::max(capacity, static_cast<std::uint32_t>(span.count));
+    const auto input     = glm::vision::prepare_input(prompt, config, capacity);
+    std::uint32_t begin  = 0;
+    std::size_t consumed = 0;
+    while (const auto plan = models::vision::plan_window(input->units, begin,
+                                                         prompt.token_ids.size(), capacity, 2)) {
+        std::size_t features = 0;
+        for (std::uint32_t rank = 0; rank < 2; ++rank) {
+            const auto batch =
+                glm::vision::prepare_batch(input->items, input->payloads, *plan, rank, config);
+            features += batch.features;
+            require(batch.cu_seqlens.back() == int(batch.features * 4),
+                    "encoder segments do not cover their features");
+            std::size_t segment = 0;
+            for (const auto& placement : plan->placements) {
+                if (placement.rank != rank) continue;
+                const auto& unit  = plan->units[placement.unit];
+                const auto source = prompt.media_payloads[unit.item]->span().subspan(
+                    unit.patch_begin * 1176, std::size_t(unit.patches) * 1176);
+                require(std::equal(source.begin(), source.end(), batch.patches.at(segment).begin(),
+                                   batch.patches.at(segment).end()),
+                        "rank encoder input changed prepared patch values");
+                ++segment;
+            }
+        }
+        require(features == plan->features, "rank assignment lost visual features");
+        consumed += features;
+        begin = plan->consume_end;
+    }
+    require(consumed == prompt.prepare.vision_tokens, "bounded windows lost media tokens");
 }
 
 void golden(const std::filesystem::path& path, const std::filesystem::path& dump,
@@ -111,6 +149,7 @@ void golden(const std::filesystem::path& path, const std::filesystem::path& dump
         for (std::size_t i = 0; i < data.media_payloads.size(); ++i)
             require(data.media_payloads[i] == hit.media_payloads[i],
                     name + ": cached payload not retained");
+        execution_input(data);
         std::cout << name << " passed\n";
     }
 }

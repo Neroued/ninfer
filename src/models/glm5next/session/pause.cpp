@@ -193,6 +193,7 @@ namespace ninfer::models::glm5next::detail {
 void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) {
     auto& pause    = std::get<PauseOperation>(operation->action);
     auto& sequence = *sequences[pause.lane];
+    vision_window.revoke(member(sequence));
     sequence.capture.reset();
     sequence.capture_pending = false;
     sequence.recovery_peak   = 0;

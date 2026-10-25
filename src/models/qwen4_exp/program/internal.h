@@ -59,7 +59,7 @@ struct ComputeFrame {
     TextGraph* graph = nullptr;
     execution::BatchView batch;
     Tensor sample, conditioning, previous_conditioning;
-    std::optional<execution::VisualEmbeddingView> visual;
+    std::optional<models::vision::EmbeddingView> visual;
     std::optional<runtime::DecisionInput> decision;
     bool decision_requested = false, sequence = false;
     bool release_vision = false;
@@ -121,7 +121,7 @@ public:
     void install_sampling(bool speculative);
     void upload_main(std::span<const WorkRow>, std::uint32_t tokens);
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
-                   const Tensor& conditioning, std::optional<execution::VisualEmbeddingView>);
+                   const Tensor& conditioning, std::optional<models::vision::EmbeddingView>);
     void commit_verify(const Commit&);
     void execute_mtp_commit(std::int32_t batch, bool rebuild_history);
     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
@@ -144,10 +144,10 @@ public:
     [[nodiscard]] Tensor host_tensor(const TensorRegion&);
     [[nodiscard]] Tensor packed_tensor(const TensorRegion&, std::initializer_list<std::int32_t>);
     [[nodiscard]] ResidentBinding& binding(runtime::ResidencyId);
-    [[nodiscard]] std::optional<execution::VisualEmbeddingView>
+    [[nodiscard]] std::optional<models::vision::EmbeddingView>
     prepare_vision(const std::optional<qwen::VisionWork>&, std::uint32_t begin,
                    std::uint32_t tokens);
-    [[nodiscard]] std::optional<execution::VisualEmbeddingView>
+    [[nodiscard]] std::optional<models::vision::EmbeddingView>
     visual_view(const vision::WindowPlan&, std::uint32_t begin, std::uint32_t tokens,
                 const TensorRegion& indices, MemorySpan host);
     std::optional<std::uint64_t> collect_vision_timing(const ResidentBinding&);

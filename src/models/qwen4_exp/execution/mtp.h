@@ -43,7 +43,7 @@ void mtp_forward(const TextConfig&, const QsaConfig&, const MtpParameters&,
 // Builds target-aligned history without attention readout, MoE or final mixing.
 void mtp_history(const TextConfig&, const QsaConfig&, const MtpParameters&,
                  const Tensor& conditioning, const BatchView&, const ops::QsaTailStateView& before,
-                 ops::QsaTailStateView after, ops::QsaCacheView, std::optional<VisualEmbeddingView>,
-                 MemoryArena&, CudaExecutionView);
+                 ops::QsaTailStateView after, ops::QsaCacheView,
+                 std::optional<models::vision::EmbeddingView>, MemoryArena&, CudaExecutionView);
 
 } // namespace ninfer::models::qwen4_exp::execution

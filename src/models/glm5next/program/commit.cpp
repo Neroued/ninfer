@@ -8,6 +8,8 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     prepare_commit(ticket, commit);
     auto& f = *compute;
     timer.resolve();
+    f.release_vision    = std::any_of(commit.rows.begin(), commit.rows.end(),
+                                      [](const auto& row) { return row.terminal; });
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     if (forward && forward->sample != SampleKind::None) {
         const auto& io = resources.plan.frame;

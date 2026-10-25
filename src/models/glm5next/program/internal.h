@@ -33,6 +33,7 @@ struct ComputeFrame {
     Tensor hidden;
     GpuExecutionObservation gpu;
     bool sequence = false, timed_prefill = false, counts_pending = false;
+    bool release_vision = false;
 };
 
 struct ContextFrame {
@@ -57,6 +58,10 @@ public:
     void drain();
     void advance_compute();
     void advance_context();
+    [[nodiscard]] std::optional<models::vision::EmbeddingView>
+    prepare_vision(const std::optional<vision::Work>&, std::uint32_t begin, std::uint32_t tokens);
+    void collect_vision_timing();
+    void retire_vision(runtime::ResidencyId) noexcept;
     void forward();
     void finish_forward();
     void request_decision();

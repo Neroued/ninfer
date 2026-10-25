@@ -47,6 +47,8 @@ void RankProgramImpl::forward() {
         copy_bytes_async({f.hidden.data, f.hidden.bytes(), cuda.device()},
                          {source.data, source.bytes(), cuda.device()}, cuda);
     } else {
+        auto visual     = forward ? prepare_vision(forward->visual, rows[0].main_frontier, f.tokens)
+                                  : std::nullopt;
         f.timed_prefill = f.sequence && prefill_timer.has_value();
         if (f.timed_prefill) prefill_timer->start();
         execution::StateUpdate update = execution::StepUpdate{};
@@ -60,7 +62,7 @@ void RankProgramImpl::forward() {
                                 resources.tensor(io.main_records.raw_gates),
                                 parallel ? &*parallel : nullptr},
                                f.batch, update, cuda);
-        run.stem();
+        run.stem(std::move(visual));
         for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
             nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
             run.local_mixer(i);
@@ -156,6 +158,7 @@ void RankProgramImpl::decide() {
 
 void RankProgramImpl::result() {
     auto& f = *compute;
+    collect_vision_timing();
     if (f.timed_prefill) {
         f.gpu.add_prefill(
             static_cast<std::uint64_t>(double(prefill_timer->elapsed_ms()) * 1e6 + 0.5));
@@ -210,6 +213,14 @@ void RankProgramImpl::advance_compute() {
     case ComputePhase::Retiring:
         if (compute_done.ready()) {
             if (resources.compute_actions->occupied()) resources.compute_actions->finish();
+            collect_vision_timing();
+            if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+                forward && forward->visual) {
+                const auto& use = forward->visual->window;
+                const auto& row = forward->rows.front();
+                if (f.release_vision || row.main_frontier + row.ids.size() >= use.plan->consume_end)
+                    resources.vision->release(use.id);
+            }
             auto observed = observation();
             timer.observe_retirement(f.gpu);
             observed.gpu       = f.gpu;

@@ -7,9 +7,9 @@ namespace wire = distributed::wire;
 ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const RankResourceDescription& rank,
                                const distributed::ExecutionTopology& topology)
-    : contract_{rank.shape, definition.config().text.vocabulary,
-                definition.resources().text.public_token_count,
-                static_cast<std::uint32_t>(topology.ranks.size())} {
+    : rank_(rank.rank), ranks_(topology.ranks.size()),
+      contract_{rank.shape, definition.config().text.vocabulary,
+                definition.resources().text.public_token_count, ranks_, rank.vision_max_features} {
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);
@@ -68,7 +68,9 @@ void ExecutionCodec::encode_work(wire::Encoder& out, const Work& w, distributed:
     glm5next::encode_work(out, w, r);
 }
 
-Work ExecutionCodec::decode_work(wire::Decoder& in) const { return glm5next::decode_work(in); }
+Work ExecutionCodec::decode_work(wire::Decoder& in) const {
+    return glm5next::decode_work(in, inputs_);
+}
 
 void ExecutionCodec::encode_commit(wire::Encoder& out, const Commit& c,
                                    distributed::RankId r) const {

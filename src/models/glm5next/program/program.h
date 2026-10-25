@@ -30,6 +30,7 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     [[nodiscard]] const ExecutionPlan& plan() const;
+    [[nodiscard]] MemorySpan input_storage();
     [[nodiscard]] RankMemoryUsage observe_resources() const;
     [[nodiscard]] RankMemoryBudget resource_budget() const;
     void reset_measurement_peaks() noexcept;

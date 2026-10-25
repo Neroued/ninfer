@@ -4,6 +4,7 @@
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
 #include "models/glm5next/execution_shape.h"
+#include "models/glm5next/vision/control.h"
 #include "models/common/parallel.h"
 #include "runtime/executor/contract.h"
 
@@ -44,6 +45,7 @@ struct ForwardWork {
     ForwardKind kind  = ForwardKind::Prefill;
     SampleKind sample = SampleKind::None;
     std::vector<WorkRow> rows;
+    std::optional<vision::Work> visual;
 };
 
 struct ResidencyBinding {
@@ -111,6 +113,7 @@ struct ExecutionTypes {
 struct WorkContract {
     ExecutionShape shape;
     std::uint32_t vocabulary, public_tokens, ranks;
+    std::uint32_t vision_max_features = 0;
     void validate(const Work&, runtime::FrameKind) const;
     void validate(const Work&, const Result&, const Commit&) const;
     void validate_commit(const Work&, std::span<const RowResult>, const Commit&) const;

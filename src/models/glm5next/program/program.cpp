@@ -18,7 +18,8 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
     if (binding.group) parallel.emplace(binding, d);
     if (p.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::invalid_argument("GLM5Next communication differs from weight partition");
-    if (p.mtp) throw std::invalid_argument("GLM5Next eager text requires speculative backend none");
+    if (p.mtp)
+        throw std::invalid_argument("GLM5Next eager execution requires speculative backend none");
     if (shape.gpu_timing) prefill_timer.emplace(d);
 }
 
@@ -31,7 +32,8 @@ RankProgramImpl::~RankProgramImpl() {
 
 WorkContract RankProgramImpl::contract() const {
     return {shape, parameters.profile->config.text.vocabulary, parameters.profile->public_tokens,
-            parameters.profile->local.size};
+            parameters.profile->local.size,
+            resources.vision ? resources.vision->capacity().max_features : 0};
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
@@ -134,8 +136,9 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
     timer.resolve();
     timer.record_retirement();
     compute_done.record(cuda.stream());
-    compute->phase      = ComputePhase::Retiring;
-    compute->retirement = command;
+    compute->release_vision = true;
+    compute->phase          = ComputePhase::Retiring;
+    compute->retirement     = command;
 }
 
 void RankProgramImpl::drain() {
@@ -152,6 +155,8 @@ void RankProgramImpl::drain() {
     compute.reset();
     context.reset();
     events.clear();
+    if (resources.vision)
+        if (const auto* active = resources.vision->current()) resources.vision->release(active->id);
     for (auto& b : bindings) b.reset();
     drained = true;
     if (error) std::rethrow_exception(error);
@@ -212,6 +217,10 @@ void RankProgram::drain() { impl_->drain(); }
 
 const ExecutionPlan& RankProgram::plan() const { return impl_->resources.plan; }
 
+MemorySpan RankProgram::input_storage() {
+    return impl_->resources.vision ? impl_->resources.vision->staging() : MemorySpan{};
+}
+
 RankMemoryUsage RankProgram::observe_resources() const { return impl_->memory(); }
 
 RankMemoryBudget RankProgram::resource_budget() const { return impl_->budget(); }
@@ -229,7 +238,10 @@ void RankProgramImpl::advance_context() {
     if (!f.submitted) {
         const auto transfer   = device.transfer_view();
         const auto vocabulary = parameters.profile->public_tokens;
-        for (auto r : work.releases) bindings[r.lane.value].reset();
+        for (auto r : work.releases) {
+            retire_vision(r);
+            bindings[r.lane.value].reset();
+        }
         for (std::size_t i = 0; i < work.bindings.size(); ++i) {
             const auto& b   = work.bindings[i];
             const auto lane = b.member.residency.lane.value;
@@ -263,8 +275,10 @@ void RankProgramImpl::advance_context() {
 
 RankExecutionObservation RankProgramImpl::observation() const {
     RankExecutionObservation out;
-    out.workspace_peak_bytes   = std::max(lifetime_peak, resources.workspace.peak_used());
-    out.measurement_peak_bytes = resources.workspace.peak_used();
+    const auto peak            = std::max(resources.workspace.peak_used(),
+                               resources.vision ? resources.vision->workspace_peak_bytes() : 0);
+    out.workspace_peak_bytes   = std::max(lifetime_peak, peak);
+    out.measurement_peak_bytes = peak;
     return out;
 }
 
@@ -288,7 +302,7 @@ RankMemoryBudget RankProgramImpl::budget() const {
 }
 
 void RankProgramImpl::reset_peaks() {
-    lifetime_peak = std::max(lifetime_peak, resources.workspace.peak_used());
+    lifetime_peak = observation().workspace_peak_bytes;
     resources.workspace.reset_peak();
     if (resources.vision) resources.vision->reset_peaks();
 }

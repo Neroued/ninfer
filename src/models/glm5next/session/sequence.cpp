@@ -14,7 +14,26 @@ std::uint32_t SessionImpl::window_end(const Sequence& s, std::uint32_t begin,
         }
     if (s.capture && s.next_capture < s.captures.size())
         end = std::min(end, s.captures[s.next_capture].frontier);
+    if (s.request->vision)
+        end = vision_window.limit(member(s), s.request->vision->units, begin, end,
+                                  plan.vision_max_features);
     return end;
+}
+
+std::optional<vision::Work> SessionImpl::prepare_visual(const Sequence& s, std::uint32_t begin,
+                                                        std::uint32_t end) {
+    if (!s.request->vision || begin == end) return {};
+    if (const auto* active = vision_window.current();
+        active && vision_window.available(member(s))) {
+        if (models::vision::embedding_slices(*active->plan, begin, end - begin).empty()) return {};
+        return vision::prepare_work(vision_window.reserve(member(s), active->plan),
+                                    s.request->vision, plan.states.size());
+    }
+    auto window = models::vision::plan_window(s.request->vision->units, begin, end,
+                                              plan.vision_max_features, plan.states.size());
+    if (!window) return {};
+    return vision::prepare_work(vision_window.reserve(member(s), std::move(window)),
+                                s.request->vision, plan.states.size());
 }
 
 std::uint32_t SessionImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,

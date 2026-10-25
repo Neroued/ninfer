@@ -9,8 +9,8 @@
 namespace ninfer::models::qwen4_exp::execution {
 namespace {
 void mtp_stem(const TextConfig& c, const MtpParameters& p, const Tensor& conditioning,
-              const BatchView& batch, std::optional<VisualEmbeddingView> visual, Tensor& residual,
-              Tensor& normalized, MemoryArena& arena, CudaExecutionView cuda) {
+              const BatchView& batch, std::optional<models::vision::EmbeddingView> visual,
+              Tensor& residual, Tensor& normalized, MemoryArena& arena, CudaExecutionView cuda) {
     const auto m = batch.tokens * batch.batch;
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     auto scope = arena.scope();
@@ -107,7 +107,7 @@ void mtp_forward(const TextConfig& c, const QsaConfig& qsa_config, const MtpPara
 void mtp_history(const TextConfig& c, const QsaConfig& qsa_config, const MtpParameters& p,
                  const Tensor& conditioning, const BatchView& batch,
                  const ops::QsaTailStateView& before, ops::QsaTailStateView after,
-                 ops::QsaCacheView cache, std::optional<VisualEmbeddingView> visual,
+                 ops::QsaCacheView cache, std::optional<models::vision::EmbeddingView> visual,
                  MemoryArena& arena, CudaExecutionView cuda) {
     auto scope = arena.scope();
     auto roots = workspace::history_roots(arena, c, batch.tokens * batch.batch);

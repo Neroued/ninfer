@@ -15,4 +15,5 @@ target_sources(ninfer_model_execution PRIVATE
 
 target_sources(ninfer_model_control PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/work.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/vision/control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/identity.cpp")

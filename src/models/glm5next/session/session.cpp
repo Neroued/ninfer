@@ -99,6 +99,7 @@ void SessionImpl::submit_releases() {
 
 void SessionImpl::clear(Sequence& s) noexcept {
     try {
+        vision_window.revoke(member(s));
         release_residency(member(s).residency);
         s.capture.reset();
         for (auto& history : s.histories) history.reset();
@@ -138,6 +139,7 @@ void SessionImpl::cleanup() noexcept {
             if (s) clear(*s);
             s.reset();
         }
+        vision_window = {};
         checkpoints.clear();
         events.clear();
         releases.clear();
@@ -325,8 +327,14 @@ std::optional<CheckpointHandle> ResumeState::snapshot_handle() const noexcept {
 
 std::uint32_t ResumeState::frontier() const noexcept { return state_ ? state_->frontier : 0; }
 
-std::optional<SequenceHandle> Session::prefill_continuation() const { return {}; }
+std::optional<SequenceHandle> Session::prefill_continuation() const {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && impl_->valid(owner->sequence)) return owner->sequence;
+    return {};
+}
 
-void Session::yield_prefill(SequenceHandle h) { (void)impl_->sequence(h); }
+void Session::yield_prefill(SequenceHandle h) {
+    impl_->vision_window.revoke(impl_->member(impl_->sequence(h)));
+}
 
 } // namespace ninfer::models::glm5next

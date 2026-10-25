@@ -20,13 +20,12 @@ ParallelStartup::requests(const EngineOptions& options) const {
         std::find_if(parallel_.ranks.begin(), parallel_.ranks.end(), [&](const auto& r) {
             return parallel_.topology.rank(r.rank).node == options.deployment->coordinator_node;
         });
+    const auto media = options.enable_vision ? options.media_live_bytes : 0;
     for (const auto& rank : parallel_.ranks) {
+        const bool control_owner = control != parallel_.ranks.end() && control->rank == rank.rank;
         distributed::wire::Encoder out;
-        const auto node  = parallel_.topology.rank(rank.rank).node;
-        const auto media = options.enable_vision ? options.media_live_bytes : 0;
-        encode_rank_load(out, {definition_->artifact_id(), rank, options,
-                               media + (node == options.deployment->coordinator_node ? media : 0),
-                               control != parallel_.ranks.end() && control->rank == rank.rank});
+        encode_rank_load(out, {definition_->artifact_id(), rank, options, control_owner ? media : 0,
+                               control_owner});
         payloads.push_back(std::move(out).take());
     }
     return payloads;

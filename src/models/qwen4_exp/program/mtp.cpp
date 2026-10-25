@@ -132,7 +132,7 @@ void RankProgramImpl::save_draft(std::uint32_t step, std::int32_t batch) {
 
 void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tokens,
                                 const Tensor& previous, const Tensor& conditioning,
-                                std::optional<execution::VisualEmbeddingView> visual) {
+                                std::optional<models::vision::EmbeddingView> visual) {
     const auto& frame   = *resources.plan.persistent.buffers.mtp;
     const auto batch    = static_cast<std::int32_t>(rows.size());
     const auto channels = dimension(parameters.profile->config.text.residual_width());

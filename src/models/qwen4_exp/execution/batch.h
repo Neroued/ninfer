@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/vision/execution.h"
+
 #include "core/tensor.h"
 #include "core/gdn_replay_records.h"
 
@@ -31,15 +33,6 @@ using StateUpdate = std::variant<SequenceState, StepUpdate, VerifyRecords>;
 struct TextOutputs {
     Tensor sample;
     Tensor conditioning;
-};
-
-struct VisualEmbeddingSlice {
-    Tensor features;
-    Tensor columns;
-};
-
-struct VisualEmbeddingView {
-    std::vector<VisualEmbeddingSlice> slices;
 };
 
 } // namespace ninfer::models::qwen4_exp::execution

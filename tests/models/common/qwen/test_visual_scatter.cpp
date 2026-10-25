@@ -1,7 +1,8 @@
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
-#include "models/common/vision/window.h"
+#include "models/common/vision/execution.h"
+#include "models/common/vision/resources.h"
 
 #include "core/transfer.h"
 #include "ninfer/ops/indexing.h"
@@ -36,7 +37,12 @@ int main() {
     round_to_bf16(token_embeddings);
     round_to_bf16(visual_embeddings);
     DeviceBuffer dvisual = to_device_bf16(visual_embeddings);
-    Tensor visual(dvisual.span(), DType::BF16, {d, v});
+    const auto cuda      = cuda_environment().default_execution;
+    models::vision::Storage storage(
+        cuda_environment().context,
+        {.max_features = v, .output_width = d, .output_bytes = std::size_t(d) * v * 2});
+    auto visual = storage.output(0, v);
+    copy_bytes_async({visual.data, visual.bytes(), visual.device}, dvisual.span(), cuda);
     const std::vector<std::int32_t> scatter_indices{2, 4, 7};
     ninfer::DeviceBuffer work_storage(ninfer::test::cuda_environment().context.device(),
                                       1ULL << 20);
@@ -51,18 +57,12 @@ int main() {
         plan.outputs = {{0, 0, {}}};
         for (auto p : scatter_indices)
             if (p < prompt_tokens) plan.outputs[0].token_positions.push_back(p);
-        const auto slices = ninfer::models::vision::embedding_slices(plan, 1, t);
-        for (const auto& slice : slices) {
-            const auto count = static_cast<std::int32_t>(slice.destination_columns.size());
-            auto indices     = work.alloc(DType::I32, {count});
-            std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-                      static_cast<std::int32_t*>(host_indices.data()));
-            copy_bytes_async({indices.data, indices.bytes(), indices.device},
-                             host_indices.span().subspan(0, indices.bytes()),
-                             cuda_environment().default_execution);
-            auto features = visual.slice(1, slice.source_begin, count);
-            ops::scatter(features, indices, input, cuda_environment().default_execution);
-        }
+        auto indices    = work.alloc(DType::I32, {v});
+        const auto view = models::vision::prepare_embedding_view(storage, plan, 1, t, indices,
+                                                                 host_indices.span(), cuda);
+        if (view)
+            for (const auto& slice : view->slices)
+                ops::scatter(slice.features, slice.columns, input, cuda);
         cudaDeviceSynchronize();
 
         std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());
@@ -79,6 +79,26 @@ int main() {
     int failures = 0;
     failures += run(8, "MTP shifted visual composition crosses chunk boundary");
     failures += run(4, "MTP shifted visual composition keeps bonus token embedding");
+    {
+        models::vision::WindowPlan plan;
+        plan.outputs        = {{0, 0, {4}}, {1, 1, {2, 7}}};
+        DeviceBuffer dinput = to_device_bf16(token_embeddings);
+        Tensor input(dinput.span(), DType::BF16, {d, t});
+        work.reset();
+        auto indices    = work.alloc(DType::I32, {v});
+        const auto view = models::vision::prepare_embedding_view(storage, plan, 2, t, indices,
+                                                                 host_indices.span(), cuda);
+        for (const auto& slice : view->slices)
+            ops::scatter(slice.features, slice.columns, input, cuda);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());
+        for (int row = 0; row < d; ++row) {
+            reference[row]                      = visual_embeddings[d + row];
+            reference[std::size_t(2) * d + row] = visual_embeddings[row];
+        }
+        failures += verify_exact("rank-major visual composition preserves text gaps",
+                                 from_device_bf16(dinput, reference.size()), reference);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " shifted visual composition\n";
     return failures ? 1 : 0;
 }

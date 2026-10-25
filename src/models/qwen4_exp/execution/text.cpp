@@ -25,7 +25,7 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
 }
 
-void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
+void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
     const auto& p = parameters_.text;
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.batch}), p.embedding, roots_.input,
                    cuda_);

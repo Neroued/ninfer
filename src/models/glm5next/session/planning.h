@@ -10,6 +10,7 @@ struct SessionPlan {
     std::vector<StatePlacement> states;
     std::vector<KVPageLayout> caches;
     std::uint32_t checkpoint_interval = 8192;
+    std::uint32_t vision_max_features = 0;
 };
 
 [[nodiscard]] runtime::ContextMetadataPlan

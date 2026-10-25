@@ -58,6 +58,7 @@ endif()
 
 # Rank-owned storage, mathematical execution and graph preparation.
 add_library(ninfer_model_execution STATIC
+  common/vision/execution.cpp
   common/parallel_execution.cpp
   common/context/storage.cpp
   common/context/transfer.cpp

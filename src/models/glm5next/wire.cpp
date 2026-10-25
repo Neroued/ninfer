@@ -132,6 +132,28 @@ std::vector<WorkRow> rows(Decoder& in) {
 
 } // namespace
 
+void VisionInputBindings::install(vision::Work work) {
+    if (!work.window.id || !work.window.plan || !work.input ||
+        (current_ && work.window.id <= current_->window.id))
+        throw std::invalid_argument("Vision input window is empty or stale");
+    current_ = std::move(work);
+}
+
+void VisionInputBindings::release_payload(std::uint64_t id) {
+    if (!current_ || current_->window.id != id || !current_->input)
+        throw std::logic_error("Vision input payload has no matching production");
+    current_->input.reset();
+}
+
+vision::Work VisionInputBindings::get(std::uint64_t id, bool produce) const {
+    if (!current_ || current_->window.id != id || (produce && !current_->input))
+        throw std::logic_error("Vision work has no installed window input");
+    auto out           = *current_;
+    out.window.produce = produce;
+    if (!produce) out.input.reset();
+    return out;
+}
+
 void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
     out.u32(rank);
     integers(out, work.batch.members);
@@ -149,6 +171,11 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 out.u8(static_cast<std::uint8_t>(v.kind));
                 out.u8(static_cast<std::uint8_t>(v.sample));
                 rows(out, v.rows);
+                out.boolean(v.visual.has_value());
+                if (v.visual) {
+                    out.u64(v.visual->window.id);
+                    out.boolean(v.visual->window.produce);
+                }
             } else if constexpr (std::is_same_v<T, ContextWork>) {
                 out.u8(3);
                 out.u64(v.bindings.size());
@@ -168,7 +195,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
         work.operation);
 }
 
-Work decode_work(Decoder& in) {
+Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank    = in.u32();
     work.batch.members = integers<std::uint32_t>(in);
@@ -178,9 +205,13 @@ Work decode_work(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
-        v.kind         = static_cast<ForwardKind>(in.u8());
-        v.sample       = static_cast<SampleKind>(in.u8());
-        v.rows         = rows(in);
+        v.kind   = static_cast<ForwardKind>(in.u8());
+        v.sample = static_cast<SampleKind>(in.u8());
+        v.rows   = rows(in);
+        if (in.boolean()) {
+            const auto id = in.u64();
+            v.visual      = inputs.get(id, in.boolean());
+        }
         work.operation = std::move(v);
         break;
     }

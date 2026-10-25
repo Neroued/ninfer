@@ -67,6 +67,18 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     runtime::protocol::encode(out, r.budget);
     runtime::protocol::encode(out, r.observation);
     out.u32(r.vision_max_features);
+    out.u64(r.caches.size());
+    for (const auto& cache : r.caches) {
+        out.u32(cache.page_tokens);
+        out.u64(cache.planes.size());
+        for (const auto& plane : cache.planes) {
+            out.u8(static_cast<std::uint8_t>(plane.dtype));
+            out.i32(plane.leading_extent);
+            out.i32(plane.head_extent);
+            out.u64(plane.alignment);
+            out.u32(plane.tokens_per_row);
+        }
+    }
 }
 
 RankResourceDescription decode_rank_resources(Decoder& in) {
@@ -87,6 +99,18 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
     r.budget              = runtime::protocol::memory_budget(in);
     r.observation         = runtime::protocol::rank_snapshot(in);
     r.vision_max_features = in.u32();
+    r.caches.resize(in.count(12));
+    for (auto& cache : r.caches) {
+        cache.page_tokens = in.u32();
+        cache.planes.resize(in.count(21));
+        for (auto& plane : cache.planes) {
+            plane.dtype          = static_cast<DType>(in.u8());
+            plane.leading_extent = in.i32();
+            plane.head_extent    = in.i32();
+            plane.alignment      = in.u64();
+            plane.tokens_per_row = in.u32();
+        }
+    }
     return r;
 }
 

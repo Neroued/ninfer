@@ -1,12 +1,12 @@
-#include "models/qwen4_exp/parallel/execution.h"
+#include "models/common/parallel_execution.h"
 #include "distributed/communication.h"
 
-namespace ninfer::models::qwen4_exp {
+namespace ninfer::models {
 
 ParallelExecution::ParallelExecution(ParallelBinding binding, const DeviceContext& device)
     : binding_(binding), stream_(device), cuda_(device.execution_view(stream_.stream())),
       input_(device), output_(device) {
-    if (!binding.group) throw std::invalid_argument("Qwen4Exp parallel execution has no group");
+    if (!binding.group) throw std::invalid_argument("parallel execution has no group");
 }
 
 bool ParallelExecution::output_owner() const {
@@ -46,7 +46,7 @@ void ParallelExecution::sum(Tensor& value, CudaExecutionView cuda) {
             value.dtype, value.numel(), 0, cuda);
 }
 
-void ParallelExecution::merge_embedding(Tensor& value, CudaExecutionView cuda) {
+void ParallelExecution::merge_unique(Tensor& value, CudaExecutionView cuda) {
     enqueue(distributed::Collective::AllReduce, distributed::Reduction::Sum, value, value,
             DType::U32, value.bytes() / sizeof(std::uint32_t), 0, cuda);
 }
@@ -70,6 +70,19 @@ void ParallelExecution::broadcast(Tensor& value, std::uint32_t owner, CudaExecut
             value.dtype, value.numel(), owner, cuda);
 }
 
+void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> transfers,
+                                 CudaExecutionView execution) {
+#if NINFER_ENABLE_DISTRIBUTED
+    input_.record(execution.stream());
+    input_.wait(cuda_.stream());
+    binding_.group->exchange(transfers, cuda_);
+    output_.record(cuda_.stream());
+    output_.wait(execution.stream());
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
+}
+
 void ParallelExecution::record_graph(CommunicationWork& work, const std::function<void()>& body) {
 #if NINFER_ENABLE_DISTRIBUTED
     binding_.group->record_graph(work, body);
@@ -86,4 +99,4 @@ void ParallelExecution::replayed(const CommunicationWork& work) const {
 
 void ParallelExecution::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(cuda_.stream())); }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace ninfer::models

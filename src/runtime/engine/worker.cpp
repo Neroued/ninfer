@@ -2,6 +2,9 @@
 #include "distributed/bootstrap.h"
 
 #include "models/qwen4_exp/parallel/preparation.h"
+#include "models/glm5next/startup.h"
+#include "models/glm5next/parallel/codec.h"
+#include "models/registry.h"
 #include "runtime/executor/rank_preparation.h"
 #include "runtime/executor/worker_loop.h"
 
@@ -80,9 +83,17 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
             throw std::runtime_error("worker model plan identity differs");
         const auto payload = in.bytes();
         in.finish();
-        run_rank<models::qwen4_exp::RankPreparation>(
-            connection, std::make_unique<artifact::Reader>(connection.bootstrap().artifact),
-            payload);
+        auto reader = std::make_unique<artifact::Reader>(connection.bootstrap().artifact);
+        switch (models::resolve_architecture(reader->directory())) {
+        case models::Architecture::Qwen4Exp:
+            run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), payload);
+            break;
+        case models::Architecture::Glm5Next:
+            run_rank<models::glm5next::RankPreparation>(connection, std::move(reader), payload);
+            break;
+        default:
+            throw std::invalid_argument("architecture has no distributed worker implementation");
+        }
     } catch (const std::exception& error) {
         connection.fail(error.what());
         throw;

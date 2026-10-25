@@ -1,4 +1,5 @@
 #include "models/glm5next/program/frame.h"
+#include "models/glm5next/execution/profile.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>
@@ -18,7 +19,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     };
     const auto rows     = [&] { return tensor(DType::I32, {batch}, "row metadata"); };
     const auto metadata = [&](int n) {
-        return BatchLayout{tensor(DType::I32, {n}, "token IDs"),
+        BatchLayout result{tensor(DType::I32, {n}, "token IDs"),
                            tensor(DType::I32, {n}, "token ordinals"),
                            rows(),
                            tensor(DType::I64, {batch}, "source State offsets"),
@@ -30,10 +31,13 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                            rows(),
                            rows(),
                            tensor(DType::I32, {n}, "selection rows")};
+        const auto begin = result.valid_columns.region.offset;
+        const auto end   = result.selection_rows.region.offset + result.selection_rows.region.bytes;
+        result.metadata  = {begin, end - begin, 256};
+        return result;
     };
     FrameLayout out;
-    out.main  = metadata(columns);
-    out.owner = metadata(columns);
+    out.main = metadata(columns);
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     if (p.mtp) {
         auto& m   = out.mtp.emplace();
@@ -69,8 +73,6 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         m.tail_image  = tail.finish();
         m.tails = b.add(m.tail_image.image_bytes * batch * m.tail_offsets.size(), 256, "MTP tails");
     }
-    // Owner attention outputs are restored to global column order before the collective.
-    out.branch_exchange = tensor(DType::BF16, {hidden, columns}, "complete branch exchange");
     if (s.purpose == EnginePurpose::Generation) {
         out.logits =
             tensor(DType::BF16, {dimension(p.local.vocabulary.size), width, batch}, "logits");

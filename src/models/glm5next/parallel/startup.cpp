@@ -32,15 +32,41 @@ ParallelStartup::requests(const EngineOptions& options) const {
     return payloads;
 }
 
-PreparedContext
-ParallelStartup::resolve(std::span<const distributed::wire::Bytes> descriptions) const {
-    std::vector<RankResourceDescription> ranks;
+void ParallelStartup::resolve(std::span<const distributed::wire::Bytes> descriptions,
+                              EngineOptions& options) {
+    ranks_.clear();
     for (const auto& bytes : descriptions) {
         distributed::wire::Decoder in(bytes);
-        ranks.push_back(decode_rank_resources(in));
+        ranks_.push_back(decode_rank_resources(in));
         in.finish();
     }
-    return prepare_context(parallel_, ranks);
+    (void)plan_group_context(parallel_, ranks_);
+    options.prefill_chunk                     = ranks_.front().shape.prefill_chunk;
+    options.context_cache.host_capacity_bytes = 0;
+    checkpoint_interval_                      = options.context_cache.checkpoint_interval;
 }
 
+PreparedSession ParallelStartup::session() const {
+    return prepare_session(definition_, prepare_context(parallel_, ranks_), checkpoint_interval_);
+}
+
+ParallelStartup::Codec ParallelStartup::codec() const {
+    return {*definition_, ranks_.front(), parallel_.topology};
+}
+
+std::vector<RankSnapshot> ParallelStartup::observations() const {
+    std::vector<RankSnapshot> result;
+    for (const auto& rank : ranks_) result.push_back(rank.observation);
+    return result;
+}
+
+std::vector<RankMemoryBudget> ParallelStartup::memory_budgets() const {
+    std::vector<RankMemoryBudget> result;
+    for (const auto& rank : ranks_) result.push_back(rank.budget);
+    return result;
+}
+
+std::string ParallelStartup::prefill_signature(std::uint32_t chunk) const {
+    return glm5next::prefill_signature(*definition_, chunk, parallel_.ranks.size());
+}
 } // namespace ninfer::models::glm5next

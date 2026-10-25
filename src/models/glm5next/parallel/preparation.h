@@ -1,6 +1,10 @@
 #pragma once
 
-#include "models/glm5next/program/planning.h"
+#include "models/glm5next/execution_shape.h"
+#include "models/glm5next/state/context.h"
+#include "models/glm5next/parallel/plan.h"
+#include "models/common/context/directory.h"
+#include "ninfer/observability/resources.h"
 
 namespace ninfer::models::glm5next {
 
@@ -12,6 +16,7 @@ struct RankResourceDescription {
     RankMemoryBudget budget;
     RankSnapshot observation;
     std::uint32_t vision_max_features = 0;
+    std::vector<KVPageGeometry> caches;
 };
 
 struct RankLoadRequest {
@@ -27,6 +32,8 @@ struct PreparedContext {
     std::vector<StatePlacement> states;
     std::uint32_t vision_max_features;
     std::unique_ptr<context::ContextDirectory> directory;
+    context::ContextDirectorySpec spec;
+    std::vector<KVPageGeometry> caches;
 };
 
 // Combines local record specifications; capacities remain independent. Construction of the

@@ -1,5 +1,6 @@
 #include "models/glm5next/program/planning.h"
 #include "core/platform.h"
+#include "models/glm5next/session/planning.h"
 
 #include <algorithm>
 
@@ -72,7 +73,8 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
 std::size_t ExecutionPlan::pinned_bytes() const {
     return (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0) +
            frame.ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
-           2 * mapping_elements * sizeof(std::int64_t);
+           2 * mapping_elements * sizeof(std::int64_t) +
+           (frame.token_counts ? frame.token_counts->region.bytes : 0);
 }
 
 std::size_t ExecutionPlan::device_bytes() const {
@@ -156,16 +158,8 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     // The selected TP plan has equal KDA shards. Describe whole logical objects for metadata
     // costs, while charging allocator metadata to each rank and fixed control storage once.
     auto description = schema(p, 0, true);
-    out.metadata     = context::ContextDirectory::metadata_plan(description);
+    out.metadata     = session_metadata_plan(description, geometry, rank);
     if (rank != 0) out.metadata.fixed_bytes = 0;
-    const auto history_cost = context::HistoryDirectory::metadata_bytes(4, 0, 0, size) -
-                              context::HistoryDirectory::metadata_bytes(0, 0, 0, size);
-    for (const auto& cls : geometry.classes)
-        if (cls.spec.bytes == p.state.common.image_bytes ||
-            cls.spec.bytes == p.state.owner.image_bytes) {
-            const auto index = &cls - geometry.classes.data();
-            out.metadata.bytes_per_record.at(index) += history_cost * description.pools.size();
-        }
     return out;
 }
 

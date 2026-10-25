@@ -4,14 +4,16 @@
 #include "core/tensor.h"
 #include "ninfer/observability/execution.h"
 #include <functional>
+#include <span>
 
 namespace ninfer::distributed {
 class Group;
+struct PeerTransfer;
 enum class Collective;
 enum class Reduction;
 } // namespace ninfer::distributed
 
-namespace ninfer::models::qwen4_exp {
+namespace ninfer::models {
 
 struct ParallelBinding {
     const distributed::Group* group = nullptr;
@@ -19,18 +21,21 @@ struct ParallelBinding {
 };
 
 // Borrows the execution group's communicator. Program owns the stream and dependencies;
-// all calls, including PLE and vocabulary, follow the same rank-wide communication order.
+// every collective and peer exchange follows the caller's rank-wide communication order.
 class ParallelExecution {
 public:
     ParallelExecution(ParallelBinding, const DeviceContext&);
     [[nodiscard]] bool output_owner() const;
     [[nodiscard]] std::uint32_t size() const;
     void sum(Tensor&, CudaExecutionView);
-    void merge_embedding(Tensor&, CudaExecutionView);
+    // Each U32 word has one contributing rank; all other ranks supply zero.
+    void merge_unique(Tensor&, CudaExecutionView);
+    // Unsigned 64-bit ordering for packed vocabulary candidates.
     void maximum(Tensor&, CudaExecutionView);
     void gather(const Tensor&, Tensor&, CudaExecutionView);
     void broadcast(Tensor&, CudaExecutionView);
     void broadcast(Tensor&, std::uint32_t owner, CudaExecutionView);
+    void exchange(std::span<const distributed::PeerTransfer>, CudaExecutionView);
     void synchronize() const;
     void record_graph(CommunicationWork&, const std::function<void()>&);
     void replayed(const CommunicationWork&) const;
@@ -44,4 +49,4 @@ private:
     CudaCompletionEvent input_, output_;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace ninfer::models

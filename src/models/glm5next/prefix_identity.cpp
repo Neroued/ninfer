@@ -138,4 +138,28 @@ std::array<std::uint64_t, 2> PrefixDigests::at(std::size_t frontier) const {
     return digests_.at(frontier);
 }
 
+void PrefixDigests::reserve(std::size_t tokens) { digests_.reserve(tokens + 1); }
+
+void PrefixDigests::append_generated(std::span<const TokenId> tokens,
+                                     std::optional<std::uint32_t> split) {
+    if (split && (!*split || *split > tokens.size()))
+        throw std::invalid_argument("GLM generated execution boundary is outside its input");
+    const auto base = digests_.size() - 1;
+    reserve(base + tokens.size());
+    auto digest = digests_.back();
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        mix(digest, static_cast<std::uint32_t>(tokens[i]));
+        if (split && i + 1 == *split) {
+            mix(digest, 0x676c6d2d73706c69ULL);
+            mix(digest, base + i + 1);
+        }
+        digests_.push_back(digest);
+    }
+}
+
+void PrefixDigests::truncate(std::size_t tokens) {
+    if (tokens >= digests_.size()) throw std::out_of_range("GLM prefix truncation exceeds input");
+    digests_.resize(tokens + 1);
+}
+
 } // namespace ninfer::models::glm5next

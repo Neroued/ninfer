@@ -3,9 +3,12 @@
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen4_exp/startup.h"
+#include "models/glm5next/startup.h"
+#include "runtime/engine/prepared_startup.inl"
 #if NINFER_ENABLE_DISTRIBUTED
 #    include "runtime/engine/distributed_startup.inl"
 #    include "models/qwen4_exp/parallel/startup.h"
+#    include "models/glm5next/parallel/startup.h"
 #endif
 
 #include <atomic>
@@ -83,6 +86,19 @@ ConstructedModel construct_model(EngineOptions& options) {
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
+    case models::Architecture::Glm5Next: {
+#if NINFER_ENABLE_DISTRIBUTED
+        if (options.deployment && options.deployment->ranks.size() > 1) {
+            auto built = detail::build_distributed_model<models::glm5next::ParallelStartup>(
+                reader, options, start);
+            return {std::move(built.instance), std::move(built.load),
+                    std::move(built.context_cost)};
+        }
+#endif
+        auto built =
+            detail::build_prepared_local_model<models::glm5next::Startup>(reader, options, start);
+        return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
+    }
     case models::Architecture::Qwen4Exp: {
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {

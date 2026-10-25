@@ -68,8 +68,17 @@ struct Fixture {
         for (unsigned rank = 0; rank < 2; ++rank) {
             auto& p    = plans[rank];
             p.capacity = capacities[rank];
-            descriptions.push_back(
-                {rank, p.shape, glm::describe_state(p.state), glm::describe_context(p), {}, {}});
+            descriptions.push_back({rank,
+                                    p.shape,
+                                    glm::describe_state(p.state),
+                                    glm::describe_context(p),
+                                    {},
+                                    {},
+                                    0,
+                                    p.mtp
+                                        ? std::vector<KVPageGeometry>{p.main.cache.page.geometry,
+                                                                      p.mtp->cache.page.geometry}
+                                        : std::vector<KVPageGeometry>{p.main.cache.page.geometry}});
         }
         context = glm::plan_group_context(parallel, descriptions);
     }
@@ -91,6 +100,13 @@ void host() {
         require(f.context.ranks[1].device_bytes > f.context.ranks[0].device_bytes &&
                     f.context.pools.size() == 1U + mtp,
                 "group preparation discarded rank capacity or optional history");
+        for (const unsigned tail : {3U, 4U, 63U}) {
+            const auto transfer = glm::history_conversion(p.main.cache.page, 0, 1, tail);
+            std::size_t copied  = 0;
+            for (const auto& field : transfer.partial_page) copied += field.bytes;
+            require(copied == 11ULL * (512 * tail * 2 + 128 * (tail / 4) * 2),
+                    "partial MLA migration includes invalid latent or pooled-index columns");
+        }
         auto prepared   = glm::prepare_context(f.parallel, f.descriptions);
         auto& directory = *prepared.directory;
         ctx::ContextDemand demand;

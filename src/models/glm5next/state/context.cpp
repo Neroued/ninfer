@@ -1,4 +1,5 @@
 #include "models/glm5next/state/context.h"
+#include "models/glm5next/execution/profile.h"
 
 namespace ninfer::models::glm5next {
 
@@ -92,6 +93,22 @@ std::vector<context::RecordRangeCopy> state_conversion(std::span<const StatePlac
     if (source.bytes != destination.bytes)
         throw std::invalid_argument("GLM5Next owner tail layouts differ");
     out.push_back({from, to, source.offset, destination.offset, source.bytes});
+    return out;
+}
+
+context::HistoryCopyLayout history_conversion(const KVPageLayout& cache, std::uint32_t from,
+                                              std::uint32_t to, std::uint32_t tail) {
+    context::HistoryCopyLayout out;
+    out.full_page.push_back({from, to, 0, 0, cache.page_bytes});
+    out.partial_columns = tail;
+    for (const auto& plane : cache.planes) {
+        const auto bytes = (tail / plane.geometry.tokens_per_row) * plane.row_stride_bytes();
+        if (!bytes) continue;
+        for (std::int32_t head = 0; head < plane.geometry.head_extent; ++head) {
+            const auto offset = plane.tensor.region.offset + head * plane.head_stride_bytes;
+            out.partial_page.push_back({from, to, offset, offset, bytes});
+        }
+    }
     return out;
 }
 

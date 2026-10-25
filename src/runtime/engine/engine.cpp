@@ -166,10 +166,13 @@ public:
     using GenerationCore = runtime::EngineCore<Qwen35>;
     using ScoringCore    = runtime::CausalScoreCore<Qwen35>;
     using Qwen4          = runtime::InferenceInstance<models::qwen4_exp::RuntimeTypes>;
+    using Glm            = runtime::InferenceInstance<models::glm5next::RuntimeTypes>;
     using Core =
         std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
                      std::unique_ptr<runtime::EngineCore<Qwen4>>,
-                     std::unique_ptr<runtime::CausalScoreCore<Qwen4>>>;
+                     std::unique_ptr<runtime::CausalScoreCore<Qwen4>>,
+                     std::unique_ptr<runtime::EngineCore<Glm>>,
+                     std::unique_ptr<runtime::CausalScoreCore<Glm>>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))) {

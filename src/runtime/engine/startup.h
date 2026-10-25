@@ -4,6 +4,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "models/qwen3_5/runtime_types.h"
 #include "models/qwen4_exp/runtime_types.h"
+#include "models/glm5next/runtime_types.h"
 
 #include <variant>
 
@@ -16,7 +17,8 @@ namespace ninfer::runtime {
 // Finite architecture dispatch ends at Engine startup; inner execution remains statically typed.
 using ActiveModel =
     std::variant<std::unique_ptr<InferenceInstance<models::qwen3_5::RuntimeTypes>>,
-                 std::unique_ptr<InferenceInstance<models::qwen4_exp::RuntimeTypes>>>;
+                 std::unique_ptr<InferenceInstance<models::qwen4_exp::RuntimeTypes>>,
+                 std::unique_ptr<InferenceInstance<models::glm5next::RuntimeTypes>>>;
 
 struct ConstructedModel {
     ActiveModel instance;

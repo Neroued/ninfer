@@ -6,8 +6,6 @@
 
 namespace ninfer::models::qwen4_exp {
 
-class ParallelExecution;
-
 struct GraphSegment {
     CommunicationWork communication;
     DecodeGraphDefinition definition;

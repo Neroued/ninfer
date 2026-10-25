@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/glm5next/program/frame.h"
+#include "models/glm5next/execution/profile.h"
 #include "models/common/vision/resources.h"
 
 namespace ninfer::models::glm5next::execution {
@@ -53,15 +54,14 @@ KdaBuffers kda(Arena& a, const ModelProfile& p, int columns, bool records) {
 }
 
 struct MlaBuffers {
-    Tensor input, query_lowrank, query, index_query, coefficients, output;
+    Tensor query_lowrank, query, index_query, coefficients, output;
     ops::KpoolBlockSelection selection;
 };
 
 template <class Arena>
 MlaBuffers mla(Arena& a, const TextConfig& c, int columns, bool frozen_selection) {
     const auto& m = c.mla;
-    MlaBuffers out{a.alloc(DType::BF16, {dimension(c.hidden), columns}),
-                   a.alloc(DType::BF16, {dimension(m.query_lowrank), columns}),
+    MlaBuffers out{a.alloc(DType::BF16, {dimension(m.query_lowrank), columns}),
                    a.alloc(DType::BF16, {dimension(m.query_width()), columns}),
                    a.alloc(DType::BF16, {dimension(m.index_query_width()), columns}),
                    a.alloc(DType::FP32, {dimension(m.index_heads), columns}),

@@ -3,6 +3,7 @@
 #include "models/common/frontend/media.h"
 #include "models/common/frontend/digest.h"
 #include "ninfer/types.h"
+#include <optional>
 
 namespace ninfer::models::glm5next {
 
@@ -26,7 +27,10 @@ bool complete_input_frontier(InputPrefixView input, std::size_t frontier);
 // Shortlisting only. Exact input comparison is still required before reusing model state.
 class PrefixDigests {
 public:
-    explicit PrefixDigests(InputPrefixView input);
+    explicit PrefixDigests(InputPrefixView input = {});
+    void reserve(std::size_t tokens);
+    void append_generated(std::span<const TokenId>, std::optional<std::uint32_t> split = {});
+    void truncate(std::size_t tokens);
     [[nodiscard]] std::array<std::uint64_t, 2> at(std::size_t frontier) const;
 private:
     std::vector<std::array<std::uint64_t, 2>> digests_;

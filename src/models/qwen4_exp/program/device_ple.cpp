@@ -32,7 +32,7 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch) {
     ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail_field}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);
-    if (parallel) parallel->merge_embedding(embedding, producer);
+    if (parallel) parallel->merge_unique(embedding, producer);
     ple_ready.record(producer.stream());
 }
 

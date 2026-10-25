@@ -58,6 +58,7 @@ endif()
 
 # Rank-owned storage, mathematical execution and graph preparation.
 add_library(ninfer_model_execution STATIC
+  common/parallel_execution.cpp
   common/context/storage.cpp
   common/context/transfer.cpp
   common/moe/execution.cpp
@@ -90,3 +91,5 @@ include(glm5next/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)
 include(qwen3_5/session_sources.cmake)
 include(qwen4_exp/session_sources.cmake)
+
+include(glm5next/session_sources.cmake)

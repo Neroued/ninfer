@@ -1,5 +1,6 @@
 #include "models/glm5next/startup.h"
 #include "models/glm5next/parallel/wire.h"
+#include "models/glm5next/parallel/codec.h"
 
 #include <algorithm>
 
@@ -37,6 +38,17 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  const distributed::ExecutionTopology& topology,
                                  distributed::CommunicationContext& communication)
     : RankPreparation(reader, request(payload, identity), device,
-                      context_group(topology, communication)) {}
+                      context_group(topology, communication)) {
+    const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
+                                   [](const auto& r) { return r.role == "tensor"; });
+    if (role == topology.roles.end())
+        throw std::invalid_argument("GLM5Next tensor group is absent");
+    const auto& group = topology.group(role->group);
+    binding_          = {&communication.group(group.id), group.index(topology.output_rank)};
+}
+
+ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topology) const {
+    return ExecutionCodec(instance_->model->definition(), describe(), topology);
+}
 
 } // namespace ninfer::models::glm5next

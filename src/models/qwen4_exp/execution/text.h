@@ -6,7 +6,7 @@
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
 #include "models/common/moe/schedule.h"
-#include "models/qwen4_exp/parallel/execution.h"
+#include "models/common/parallel_execution.h"
 
 namespace ninfer::models::qwen4_exp::execution {
 

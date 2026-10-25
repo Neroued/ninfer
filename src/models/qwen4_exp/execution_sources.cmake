@@ -1,5 +1,4 @@
 target_sources(ninfer_model_execution PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/parallel/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/startup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/workspace.cpp"

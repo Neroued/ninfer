@@ -39,7 +39,8 @@ public:
                 linear({w.output}),
                 tensor(w.convolution),
                 tensor(w.a_log),
-                tensor(w.dt_bias),
+                tensor(w.dt_bias).view({dimension(model_.definition().config().text.kda.head_dim),
+                                        dimension(model_.rank_plan().kda_heads.size)}),
                 tensor(w.norm)};
     }
 

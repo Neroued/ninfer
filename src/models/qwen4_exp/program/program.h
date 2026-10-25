@@ -3,7 +3,7 @@
 #include "models/qwen4_exp/program/planning.h"
 #include "models/qwen4_exp/session/planning.h"
 #include "models/qwen4_exp/work.h"
-#include "models/qwen4_exp/parallel/execution.h"
+#include "models/common/parallel_execution.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace execution {

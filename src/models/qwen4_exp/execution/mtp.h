@@ -2,7 +2,7 @@
 
 #include "models/qwen4_exp/execution/batch.h"
 #include "models/qwen4_exp/execution/parameters.h"
-#include "models/qwen4_exp/parallel/execution.h"
+#include "models/common/parallel_execution.h"
 #include "models/qwen4_exp/execution/workspace.h"
 
 namespace ninfer::models::qwen4_exp::execution {

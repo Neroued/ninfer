@@ -3,10 +3,15 @@
 #include "core/linear_attention_state.h"
 #include "models/common/context/storage.h"
 #include "models/common/context/directory/records.h"
-#include "models/glm5next/execution/profile.h"
+#include "models/common/context/directory/history.h"
+
 #include "ninfer/ops/kpool_mla_layout.h"
 
 namespace ninfer::models::glm5next {
+namespace execution {
+struct ModelProfile;
+}
+struct MlaConfig;
 
 struct StateLayout {
     StateImageLayout common, owner;
@@ -75,5 +80,8 @@ private:
 [[nodiscard]] std::vector<context::RecordRangeCopy>
 state_conversion(std::span<const StatePlacement>, std::uint32_t source_owner,
                  std::uint32_t destination_owner);
+
+[[nodiscard]] context::HistoryCopyLayout history_conversion(const KVPageLayout&, std::uint32_t from,
+                                                            std::uint32_t to, std::uint32_t tail);
 
 } // namespace ninfer::models::glm5next

@@ -34,6 +34,8 @@ public:
 
     [[nodiscard]] MemorySpan egress() { return egress_.span(); }
 
+    [[nodiscard]] MemorySpan context_counts() { return context_counts_.span(); }
+
     [[nodiscard]] Tensor tensor(const TensorRegion&);
     [[nodiscard]] Tensor packed(const TensorRegion&, std::initializer_list<std::int32_t>);
     [[nodiscard]] CacheViews& cache(std::uint32_t pool);
@@ -47,7 +49,7 @@ public:
 private:
     DeviceContext& device_;
     DeviceBuffer context_, fixed_, workspace_;
-    PinnedHostBuffer ingress_, sampling_, egress_;
+    PinnedHostBuffer ingress_, sampling_, egress_, context_counts_;
 
 public:
     std::optional<models::vision::Storage> vision;

@@ -20,6 +20,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
       fixed_(device.device(), plan.fixed_bytes), workspace_(device.device(), plan.workspace.bytes),
       ingress_(plan.frame.ingress.bytes), sampling_(plan.frame.sampling_ingress.bytes),
       egress_(plan.pinned_output_bytes),
+      context_counts_(plan.frame.token_counts ? plan.frame.token_counts->region.bytes : 0),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)),
       states(context_.span(), plan.state), main(context_.span(), fixed_.span(), plan.main) {
     if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
@@ -127,7 +128,7 @@ RankMemoryUsage Resources::observe() const {
     out.allocations.context_device_bytes    = context_.size();
     out.allocations.workspace_device_bytes  = workspace_.size();
     out.allocations.io_pinned_bytes         = ingress_.size() + sampling_.size() + egress_.size() +
-                                      compute_actions->pinned_bytes() +
+                                      context_counts_.size() + compute_actions->pinned_bytes() +
                                       context_actions->pinned_bytes();
     const auto peak = std::max(workspace.peak_used(), vision ? vision->workspace_peak_bytes() : 0);
     out.workspace   = {workspace.used(), peak, peak};

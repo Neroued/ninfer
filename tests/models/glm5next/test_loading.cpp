@@ -277,6 +277,12 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
     const auto profile = glm::execution::describe_model(model->definition(), model->weight_data(),
                                                         model->rank_plan());
     const glm::execution::Parameters parameters(*model, profile);
+    const auto& prepared_kda =
+        std::get<glm::execution::KdaParameters>(parameters.text.layers[0].mixer);
+    require(prepared_kda.dt_bias.dtype == DType::FP32 &&
+                prepared_kda.dt_bias.ne[0] == model->definition().config().text.kda.head_dim &&
+                prepared_kda.dt_bias.ne[1] == model->rank_plan().kda_heads.size,
+            "KDA decay bias does not expose channel/head axes");
     const auto& prepared_mla =
         std::get<glm::execution::MlaParameters>(parameters.text.layers[1].mixer);
     const auto& mla_config  = model->definition().config().text.mla;

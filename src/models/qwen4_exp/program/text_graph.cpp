@@ -1,6 +1,6 @@
 #include "models/qwen4_exp/program/text_graph.h"
 #include "core/nvtx.h"
-#include "models/qwen4_exp/parallel/execution.h"
+#include "models/common/parallel_execution.h"
 
 #include <algorithm>
 

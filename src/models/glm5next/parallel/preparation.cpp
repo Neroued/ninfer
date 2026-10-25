@@ -19,7 +19,8 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
         const auto& c = r.context;
         if (r.rank != parallel.ranks[rank].rank || r.rank != rank ||
             r.shape != ranks.front().shape || c.ranks.size() != 1 || c.ranks.front().rank != rank ||
-            c.state.layouts.size() != ranks.size() || c.pools.size() != out.pools.size())
+            c.state.layouts.size() != ranks.size() || c.pools.size() != out.pools.size() ||
+            r.caches != ranks.front().caches || r.caches.size() != out.pools.size())
             throw std::invalid_argument("GLM5Next rank resources disagree with the group layout");
         out.ranks.push_back(c.ranks.front());
         out.metadata_budget_bytes += c.metadata_budget_bytes;
@@ -67,7 +68,9 @@ PreparedContext prepare_context(const ParallelPlan& parallel,
     PreparedContext out{ranks.front().shape,
                         {},
                         ranks.front().vision_max_features,
-                        std::make_unique<context::ContextDirectory>(spec)};
+                        std::make_unique<context::ContextDirectory>(spec),
+                        std::move(spec),
+                        ranks.front().caches};
     for (const auto& rank : ranks) {
         out.states.push_back(rank.state);
         out.vision_max_features = std::min(out.vision_max_features, rank.vision_max_features);

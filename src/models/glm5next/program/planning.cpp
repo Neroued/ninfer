@@ -102,8 +102,8 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     out.main = plan_cache(b, c.mla, c.mla_layers, out.shape.max_context, out.shape.max_concurrency,
                           storage);
     if (out.profile->mtp)
-        out.mtp = plan_cache(b, c.mla, 1, out.shape.max_context,
-                             count(2ULL * out.shape.max_concurrency), storage);
+        out.mtp =
+            plan_cache(b, c.mla, 1, out.shape.max_context, out.shape.max_concurrency, storage);
     out.frame = plan_frame(b, *out.profile, out.shape);
     if (out.profile->local.size > 1)
         for (auto& region : out.peer_staging)

@@ -27,7 +27,10 @@ void SessionImpl::finish_result(ComputeResult result) {
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         const auto& row = tx.result->rows[b];
         generated |= !row.tokens.empty();
-        if (row.processed != tx.rows[b].ids.size())
+        if (tx.kind == Kind::Mtp
+                ? (row.drafts != tx.draft_extents[b] || row.processed != tx.draft_extents[b] + 1 ||
+                   row.accepted_drafts > row.drafts || row.tokens.size() != row.accepted_drafts + 1)
+                : (row.processed != tx.rows[b].ids.size()))
             throw std::logic_error("GLM5Next result changed its input extent");
     }
     if (generated) {
@@ -80,7 +83,7 @@ void SessionImpl::finish_result(ComputeResult result) {
             s.identity.prepare_generated(count, tx.splits[b]);
         }
         completed[b] =
-            prepare_commit(s, tx.rows[b], tx.rows[b].ids, retain_recovery, *tx.completion);
+            prepare_commit(s, tx.rows[b], tx.rows[b].ids.size(), retain_recovery, *tx.completion);
     }
     if (tx.kind == Kind::Prefill) {
         const auto& s = sequence(tx.members[0]);
@@ -202,7 +205,9 @@ CommitResult Session::commit(PendingBatch&& batch,
             if (!decision.accepted_tokens) continue;
             const auto count = decision.accepted_tokens;
             s.identity.prepare_generated(count, decision.prefix_execution_split_after);
-            completed[b] = p.prepare_commit(s, tx.rows[b], tx.rows[b].ids, false, *tx.completion);
+            const auto inputs =
+                tx.kind == detail::ComputeTransaction::Kind::Mtp ? count : tx.rows[b].ids.size();
+            completed[b] = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
         }
         tx.completion->prepare_actions();
         physical.actions = p.actions(*tx.completion);
@@ -218,8 +223,20 @@ CommitResult Session::commit(PendingBatch&& batch,
         auto& s              = p.sequence(tx.members[b]);
         const auto& decision = decisions[b];
         auto& row            = result.rows[b];
-        const auto& stats    = s.speculative;
-        row.speculative      = stats;
+        if (batch.decode_ && p.shape.draft_tokens) {
+            auto& stats         = s.speculative;
+            const auto drafted  = tx.result->rows[b].drafts;
+            const auto accepted = tx.result->rows[b].accepted_drafts;
+            stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
+            if (drafted)
+                ++stats.rounds;
+            else
+                ++stats.fallback_steps;
+            stats.drafted_tokens += drafted;
+            stats.accepted_tokens += accepted;
+            for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
+        }
+        row.speculative = s.speculative;
 
         if (decision.cancelled || decision.failed) {
             row.disposition = decision.cancelled ? runtime::CommitDisposition::CancelledReleased

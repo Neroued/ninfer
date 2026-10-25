@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/glm5next/program/frame.h"
+#include "models/glm5next/execution_shape.h"
 #include "models/glm5next/execution/profile.h"
 #include "models/common/vision/resources.h"
 
@@ -59,15 +59,18 @@ struct MlaBuffers {
 };
 
 template <class Arena>
-MlaBuffers mla(Arena& a, const TextConfig& c, int columns, bool frozen_selection) {
+MlaBuffers mla(Arena& a, const TextConfig& c, int columns, bool frozen_selection,
+               bool own_selection = true) {
     const auto& m = c.mla;
-    MlaBuffers out{a.alloc(DType::BF16, {dimension(m.query_lowrank), columns}),
-                   a.alloc(DType::BF16, {dimension(m.query_width()), columns}),
-                   a.alloc(DType::BF16, {dimension(m.index_query_width()), columns}),
-                   a.alloc(DType::FP32, {dimension(m.index_heads), columns}),
-                   a.alloc(DType::BF16, {dimension(m.output_width()), columns}),
-                   {}};
-    if (!frozen_selection)
+    MlaBuffers out{
+        a.alloc(DType::BF16, {dimension(m.query_lowrank), columns}),
+        a.alloc(DType::BF16, {dimension(m.query_width()), columns}),
+        frozen_selection ? Tensor{}
+                         : a.alloc(DType::BF16, {dimension(m.index_query_width()), columns}),
+        frozen_selection ? Tensor{} : a.alloc(DType::FP32, {dimension(m.index_heads), columns}),
+        a.alloc(DType::BF16, {dimension(m.output_width()), columns}),
+        {}};
+    if (own_selection)
         out.selection = {a.alloc(DType::I32, {dimension(m.pool_budget), columns}),
                          a.alloc(DType::I32, {columns}), a.alloc(DType::I32, {columns})};
     return out;
@@ -76,6 +79,17 @@ MlaBuffers mla(Arena& a, const TextConfig& c, int columns, bool frozen_selection
 struct MtpStemBuffers {
     Tensor embedding, normalized;
 };
+
+struct MtpRoots {
+    Tensor residual, input, output;
+};
+
+template <class Arena>
+MtpRoots mtp_roots(Arena& a, const TextConfig& c, int columns) {
+    const int h = dimension(c.hidden);
+    return {a.alloc(DType::BF16, {h, columns}), a.alloc(DType::BF16, {h, columns}),
+            a.alloc(DType::BF16, {h, columns})};
+}
 
 template <class Arena>
 MtpStemBuffers mtp_stem(Arena& a, const TextConfig& c, int columns) {

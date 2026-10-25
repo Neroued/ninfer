@@ -12,14 +12,13 @@ bool same(const runtime::ExecutionMember& a, const runtime::ExecutionMember& b) 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr<Resources> r,
                                  DeviceContext& d, ParallelBinding binding)
     : parameters(p), device(d), cuda(d.execution_view()), owner(std::move(r)), resources(*owner),
-      shape(resources.plan.shape), timer(d, shape.gpu_timing), compute_done(d), context_done(d) {
+      shape(resources.plan.shape), timer(d, shape.gpu_timing), compute_done(d), context_done(d),
+      drafts_done(d) {
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("GLM5Next resources have another profile");
     if (binding.group) parallel.emplace(binding, d);
     if (p.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::invalid_argument("GLM5Next communication differs from weight partition");
-    if (p.mtp)
-        throw std::invalid_argument("GLM5Next eager execution requires speculative backend none");
     if (shape.gpu_timing) prefill_timer.emplace(d);
 }
 
@@ -51,6 +50,9 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         (void)image.image(offsets.destination);
         if (row.main_table.index >= std::uint32_t(resources.main.tables().matrix().ne[1]))
             throw std::invalid_argument("GLM5Next table row exceeds rank storage");
+        if (resources.mtp &&
+            row.mtp_table.index >= std::uint32_t(resources.mtp->tables().matrix().ne[1]))
+            throw std::invalid_argument("GLM5Next MTP table row exceeds rank storage");
     }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
         std::array<bool, kMaximumConcurrency> released{};

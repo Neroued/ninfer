@@ -1,6 +1,7 @@
 target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/kda.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/mla.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/profile.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
@@ -10,6 +11,7 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/frame.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/inputs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/output.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/resources.cpp"

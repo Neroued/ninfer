@@ -25,7 +25,7 @@ int run(bool paired, int d, int m, bool alias, bool unaligned, bool replay) {
     auto dx = make_input(x, unaligned), dy = make_input(y, unaligned),
          dwx = make_input(wx, unaligned), dwy = make_input(wy, unaligned);
     std::vector<int> enabled(m);
-    for (int i = 0; i < m; ++i) enabled[i] = i % 3 != 0;
+    for (int i = 0; i < m; ++i) enabled[i] = i % 3 == 0 ? 0 : i % 3 == 1 ? 17 : -7;
     auto mask                 = to_device(enabled);
     const std::size_t leading = unaligned ? 2 : 0;
     GuardedDeviceBuffer out(size * (paired ? 4 : 2) + leading), residual(size * 2 + leading);
@@ -49,7 +49,7 @@ int run(bool paired, int d, int m, bool alias, bool unaligned, bool replay) {
         if (phase) {
             for (auto& value : x) value = -value;
             for (auto& value : wx) value = -value;
-            for (auto& value : enabled) value = 1 - value;
+            for (auto& value : enabled) value = value ? 0 : 19;
         }
         const auto upload = [&](DeviceInput& input, const std::vector<float>& values) {
             for (std::size_t i = 0; i < values.size(); ++i)

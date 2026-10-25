@@ -1,4 +1,5 @@
 #include "models/glm5next/execution/workspace.h"
+#include "models/glm5next/state/context.h"
 #include "models/glm5next/vision/execution.h"
 #include "ninfer/ops/kda_input_proj.h"
 #include "ninfer/ops/kimi_delta_attention.h"
@@ -28,29 +29,31 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
          bool frozen) {
     const auto storage = latent_storage(s.kv_storage);
     for (int local = 1; local <= batch; ++local) {
-        auto scope        = a.scope();
-        const int minimum = dimension(std::uint64_t(first) * local);
-        const int columns = dimension(std::uint64_t(last) * local);
-        (void)workspace::mla(a, p.config.text, columns, frozen);
-        const auto prepare = [&](ops::KpoolMlaPrepareProjection kind) {
-            const auto& profile = m.prepare.at(static_cast<std::size_t>(kind));
-            return record ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-                                profile, storage, local, first, last, sm_count)
-                          : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                                profile, storage, local, first, last, sm_count);
-        };
-        scratch(a, prepare(ops::KpoolMlaPrepareProjection::Full));
-        scratch(a, ops::linear_split_workspace_capacity_bytes({m.query_index, {}}, m.query_rows,
-                                                              minimum, columns));
-        scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, {s.max_context}, local,
-                                                               first, last, sm_count));
-        if (frozen) {
-            scratch(a, prepare(ops::KpoolMlaPrepareProjection::QueryAndHistory));
-            scratch(a, linear(m.query, minimum, columns));
+        for (int mode = 0; mode < (frozen ? 2 : 1); ++mode) {
+            auto scope        = a.scope();
+            const bool reuse  = mode != 0;
+            const int minimum = dimension(std::uint64_t(first) * local);
+            const int columns = dimension(std::uint64_t(last) * local);
+            (void)workspace::mla(a, p.config.text, columns, reuse, !frozen);
+            const auto& profile = m.prepare.at(
+                static_cast<std::size_t>(reuse ? ops::KpoolMlaPrepareProjection::QueryAndHistory
+                                               : ops::KpoolMlaPrepareProjection::Full));
+            scratch(a, record ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+                                    profile, storage, local, first, last, sm_count)
+                              : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+                                    profile, storage, local, first, last, sm_count));
+            if (reuse)
+                scratch(a, linear(m.query, minimum, columns));
+            else {
+                scratch(a, ops::linear_split_workspace_capacity_bytes(
+                               {m.query_index, {}}, m.query_rows, minimum, columns));
+                scratch(a, ops::kpool_indexer_workspace_capacity_bytes(
+                               m.indexer, {s.max_context}, local, first, last, sm_count));
+            }
+            scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
+                           m.attention, storage, {s.max_context}, local, first, last, sm_count));
+            scratch(a, linear(m.output, minimum, columns));
         }
-        scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
-                       m.attention, storage, {s.max_context}, local, first, last, sm_count));
-        scratch(a, linear(m.output, minimum, columns));
     }
 }
 
@@ -60,8 +63,7 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
     const int minimum = dimension(std::uint64_t(first) * batch);
     const int columns = dimension(std::uint64_t(last) * batch);
     if (mtp) {
-        for (int i = 0; i < 3; ++i)
-            (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
+        (void)workspace::mtp_roots(a, p.config.text, columns);
         {
             auto scope = a.scope();
             (void)workspace::mtp_stem(a, p.config.text, columns);
@@ -128,8 +130,7 @@ std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, i
         scratch(a, linear(p.mtp->stem, minimum, columns));
     }
     for (int local = 1; local <= batch; ++local) {
-        auto scope = a.scope();
-        (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), last * local});
+        auto scope          = a.scope();
         const auto& profile = p.mtp->attention.prepare.at(
             static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History));
         scratch(a, ops::kpool_mla_prepare_update_workspace_capacity_bytes(

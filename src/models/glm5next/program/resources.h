@@ -38,9 +38,6 @@ public:
 
     [[nodiscard]] Tensor tensor(const TensorRegion&);
     [[nodiscard]] Tensor packed(const TensorRegion&, std::initializer_list<std::int32_t>);
-    [[nodiscard]] CacheViews& cache(std::uint32_t pool);
-    [[nodiscard]] ops::KpoolMlaBatchView batch(const BatchLayout&, std::int32_t tokens,
-                                               std::int32_t rows);
     [[nodiscard]] ops::KpoolTailStateView mtp_tail(std::uint32_t slot, std::int32_t rows);
     [[nodiscard]] RankMemoryUsage observe() const;
 

@@ -6,6 +6,24 @@
 
 namespace ninfer::ops {
 
+struct CausalPairOutputs {
+    Tensor hidden, ids, positions, lengths, last_columns, active_columns;
+};
+
+// Pair each adopted token with its preceding hidden state. For n=max(prefix[b]-skip[b],0),
+// j<n and i=j+skip[b]: out.hidden[:,j,b]=(i ? hidden[:,i-1,b] : previous[:,b]),
+// out.ids[j,b]=ids[i,b], out.positions[j,b]=positions[i,b]-1. Remaining physical columns are
+// zero. Also writes lengths=n, last_columns=prefix-1, active_columns=(prefix>0 ? 0 : -1).
+// BF16 hidden[D,W,B], previous[D,B], output hidden[D,P,B] are contiguous and 16-byte aligned;
+// D is divisible by eight. All metadata are contiguous I32: ids/positions[W,B], prefix/skip[B],
+// output ids/positions[P,B], other outputs[B]. W,P>=1, B=1..8. Caller supplies 0<=prefix<=W,
+// skip in {0,1}, n<=P, and positive live input positions. Invalid tails and unused previous
+// hidden are not read. Outputs are disjoint from each other and all inputs. Copies represented
+// values exactly, without workspace or persistent effects; Device controls are read on replay.
+void prepare_causal_pairs(const Tensor& hidden, const Tensor& previous, const Tensor& ids,
+                          const Tensor& positions, const Tensor& prefix, const Tensor& skip,
+                          const CausalPairOutputs& out, CudaExecutionView execution);
+
 // Shift an adopted prefix to pair its next token with the preceding position. For A=prefix[b],
 // 0<=A<=W, n=max(A-1,0), shifted_ids[j,b]=ids[j+1,b], shifted_positions[j,b]=positions[j,b]
 // and shifted_rope[j,axis,b]=rope[j,axis,b] for j<n. Remaining output columns copy input column

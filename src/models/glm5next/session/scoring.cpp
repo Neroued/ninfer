@@ -96,8 +96,9 @@ void SessionImpl::finish_score(ScoreResult result) {
         throw std::logic_error("score result has the wrong target extent");
     if (result.logprobs.size() > scoring->logprobs.capacity() - scoring->logprobs.size())
         throw std::logic_error("score result exceeds its prepared target capacity");
-    tx.completion        = std::make_unique<context::ContextTransaction>(directory);
-    const auto completed = prepare_commit(s, tx.rows[0], tx.rows[0].ids, false, *tx.completion);
+    tx.completion = std::make_unique<context::ContextTransaction>(directory);
+    const auto completed =
+        prepare_commit(s, tx.rows[0], tx.rows[0].ids.size(), false, *tx.completion);
     tx.completion->prepare_actions();
     Commit commit;
     commit.rows.push_back({member(s), tx.rows[0].states, result.processed});

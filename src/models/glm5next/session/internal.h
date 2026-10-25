@@ -173,13 +173,14 @@ struct ContextOperation {
 };
 
 struct ComputeTransaction {
-    enum class Kind { Prefill, Replay, Ordinary, Control, Score };
+    enum class Kind { Prefill, Replay, Ordinary, Mtp, Control, Score };
 
     Kind kind;
     context::ContextTransaction context;
     runtime::ExecutionTicket ticket;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
+    std::vector<std::uint32_t> draft_extents;
     std::vector<std::optional<std::uint32_t>> splits;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
@@ -244,7 +245,7 @@ public:
     [[nodiscard]] WorkRow work_row(const Sequence&, std::uint32_t tokens) const;
     void prepare_write(Sequence&, std::uint32_t end, context::ContextTransaction&);
     [[nodiscard]] ContinuationMetadata prepare_commit(Sequence&, const WorkRow&,
-                                                      std::span<const TokenId> inputs,
+                                                      std::uint32_t input_columns,
                                                       bool retain_recovery,
                                                       context::ContextTransaction&);
     void adopt_commit(Sequence&, const ContinuationMetadata&, bool state_written,

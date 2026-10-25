@@ -8,32 +8,50 @@ void mla(const Tensor& input, const TextConfig& c, const MlaParameters& p,
          const ops::KpoolMlaBatchView& batch, ops::ConstKpoolTailStateView before,
          std::optional<ops::KpoolTailStateView> after, ops::KpoolMlaCacheView cache,
          ops::KpoolRawRecordWriteView records, const Tensor& selection_rows, std::uint32_t visible,
-         Tensor& output, MemoryArena& arena, CudaExecutionView cuda) {
+         Tensor& output, MemoryArena& arena, CudaExecutionView cuda,
+         std::optional<MlaSelection> selection) {
     const int t = batch.positions.ne[0], rows = batch.positions.ne[1], columns = t * rows;
-    const auto& m = c.mla;
-    auto scope    = arena.scope();
-    auto b        = workspace::mla(arena, c, columns, false);
+    const auto& m    = c.mla;
+    auto scope       = arena.scope();
+    const bool reuse = selection && selection->reuse;
+    auto b           = workspace::mla(arena, c, columns, reuse, !selection);
+    auto selected    = selection ? selection->value : b.selection;
+    const auto& prepare =
+        p.prepare[static_cast<std::size_t>(reuse ? ops::KpoolMlaPrepareProjection::QueryAndHistory
+                                                 : ops::KpoolMlaPrepareProjection::Full)];
     const ops::KpoolMlaPrepareOutputs prepared{
         b.query_lowrank.view({dimension(m.query_lowrank), t, rows}),
-        b.coefficients.view({dimension(m.index_heads), t, rows})};
+        reuse ? Tensor{} : b.coefficients.view({dimension(m.index_heads), t, rows})};
     const auto x = input.view({dimension(c.hidden), t, rows});
     if (after)
-        ops::kpool_mla_prepare_update(x, p.prepare[0], batch, before, cache, *after, prepared,
-                                      arena, cuda);
+        ops::kpool_mla_prepare_update(x, prepare, batch, before, cache, *after, prepared, arena,
+                                      cuda);
     else
-        ops::kpool_mla_prepare_record(x, p.prepare[0], batch, before, cache, records, prepared,
-                                      arena, cuda);
-    const std::array query_outputs{b.query, b.index_query};
-    ops::linear_split(b.query_lowrank, p.query_index, query_outputs, arena, cuda);
-    auto index_query =
-        b.index_query.view({dimension(m.index_dim), dimension(m.index_heads), t, rows});
-    ops::kpool_indexer(index_query, prepared.head_coeff, cache.index, batch, {visible}, arena,
-                       b.selection, cuda);
+        ops::kpool_mla_prepare_record(x, prepare, batch, before, cache, records, prepared, arena,
+                                      cuda);
+    if (reuse)
+        ops::linear(b.query_lowrank, p.query.weight, b.query, p.query.policy, arena, cuda);
+    else {
+        const std::array query_outputs{b.query, b.index_query};
+        ops::linear_split(b.query_lowrank, p.query_index, query_outputs, arena, cuda);
+        auto index_query =
+            b.index_query.view({dimension(m.index_dim), dimension(m.index_heads), t, rows});
+        ops::kpool_indexer(index_query, prepared.head_coeff, cache.index, batch, {visible}, arena,
+                           selected, cuda);
+    }
     auto heads = b.output.view({dimension(m.value_dim), dimension(m.heads), t, rows});
     ops::kpool_sparse_mla(b.query.view({dimension(m.query_dim), dimension(m.heads), t, rows}),
-                          {p.key_up, p.value_up}, cache.latent, batch, b.selection, selection_rows,
+                          {p.key_up, p.value_up}, cache.latent, batch, selected, selection_rows,
                           static_cast<float>(1.0 / std::sqrt(double(m.query_dim))), {visible},
                           arena, heads, cuda);
     ops::linear(b.output, p.output.weight, output, p.output.policy, arena, cuda);
+}
+
+void mla_history(const Tensor& input, const MlaParameters& p, const ops::KpoolMlaBatchView& batch,
+                 ops::ConstKpoolTailStateView before, ops::KpoolTailStateView after,
+                 ops::KpoolMlaCacheView cache, MemoryArena& arena, CudaExecutionView cuda) {
+    ops::kpool_mla_prepare_update(
+        input, p.prepare[static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History)], batch,
+        before, cache, after, {}, arena, cuda);
 }
 } // namespace ninfer::models::glm5next::execution

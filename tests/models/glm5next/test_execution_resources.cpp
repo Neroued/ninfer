@@ -39,7 +39,7 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp) {
     p.state = glm::plan_state(*p.profile);
     LayoutBuilder b;
     p.main = glm::plan_cache(b, c.mla, 11, 129, 3, ops::KpoolMlaStorage::BFloat16);
-    if (mtp) p.mtp = glm::plan_cache(b, c.mla, 1, 129, 6, ops::KpoolMlaStorage::BFloat16);
+    if (mtp) p.mtp = glm::plan_cache(b, c.mla, 1, 129, 3, ops::KpoolMlaStorage::BFloat16);
     p.frame            = glm::plan_frame(b, *p.profile, p.shape);
     p.fixed_bytes      = b.finish(256);
     p.mapping_elements = p.main.tables.page_offsets.region.bytes / 8;
@@ -175,7 +175,7 @@ void gpu() {
     std::array<std::int64_t, 2> tails{};
     CUDA_CHECK(cudaMemcpy(tails.data(), tail.raw_keys.records.byte_offsets.data, sizeof(tails),
                           cudaMemcpyDeviceToHost));
-    const auto bytes = r.plan.frame.mtp->tail_image.image_bytes;
+    const auto bytes = r.plan.frame.mtp->tail_keys.shape[0] * 3ULL * sizeof(std::uint16_t);
     require(tails[0] == 6 * bytes && tails[1] == 7 * bytes && r.kda_fold.has_value(),
             "MTP tail slots overlap or KDA fold was not prepared");
     r.synchronize();

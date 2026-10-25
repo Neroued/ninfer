@@ -32,6 +32,8 @@ public:
     std::uint64_t next      = 0;
     std::size_t peer_copies = 0;
     bool failure            = false;
+    std::vector<std::uint32_t> accept;
+    glm::ComputeResult computed;
 
     explicit Executor(glm::WorkContract c) : contract(c) {}
 
@@ -75,14 +77,23 @@ public:
             events.emplace_back(rt::DeviceRetired{ticket, {next}, {}});
         } else {
             glm::ComputeResult result;
-            const auto& forward = std::get<glm::ForwardWork>(last.operation);
-            for (const auto& row : forward.rows) {
+            const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
+            const auto* mtp     = std::get_if<glm::MtpWork>(&last.operation);
+            const auto rows     = glm::work_rows(last);
+            for (std::size_t b = 0; b < rows.size(); ++b) {
+                const auto& row = rows[b];
                 glm::RowResult r;
                 r.processed = row.ids.size();
-                if (forward.sample != glm::SampleKind::None)
+                if (mtp) {
+                    r.processed       = mtp->draft_extents[b] + 1;
+                    r.drafts          = mtp->draft_extents[b];
+                    r.accepted_drafts = accept.empty() ? r.drafts : std::min(accept[b], r.drafts);
+                    r.tokens.resize(r.accepted_drafts + 1, 0);
+                } else if (forward->sample != glm::SampleKind::None)
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
                 result.rows.push_back(std::move(r));
             }
+            computed = result;
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, std::move(result)});
         }
         return ticket;
@@ -92,7 +103,8 @@ public:
         throw std::logic_error("unexpected mask");
     }
 
-    rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit) override {
+    rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit commit) override {
+        contract.validate_commit(last, computed.rows, commit);
         events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
         return {ticket, {next}};
     }
@@ -128,14 +140,22 @@ public:
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition) {
     glm::SessionPlan p;
-    p.shape = {256, 3, 64, 0, KvCacheStorage::BFloat16, EnginePurpose::Generation, true, false};
+    p.shape                  = {256,
+                                3,
+                                64,
+               definition.options().mtp() ? 3U : 0U,
+                                KvCacheStorage::BFloat16,
+                                EnginePurpose::Generation,
+                                true,
+                                false};
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
     profile->local.size      = 2;
     profile->local.kda_heads = {0, c.kda.heads / 2};
-    const auto state         = glm::describe_state(glm::plan_state(*profile));
-    p.states                 = {state, state};
+    if (definition.options().mtp()) profile->mtp.emplace();
+    const auto state = glm::describe_state(glm::plan_state(*profile));
+    p.states         = {state, state};
     p.caches.push_back(ops::plan_kpool_mla_cache_layout(
                            {ops::KpoolMlaStorage::BFloat16, glm::dimension(c.mla.latent_dim),
                             glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
@@ -158,6 +178,16 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
                                .table_rows    = 3,
                                .parts         = {{0, {page.page_bytes, page.alignment}},
                                                  {1, {page.page_bytes, page.alignment}}}});
+    if (definition.options().mtp()) {
+        p.caches.push_back(ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16,
+                                                             glm::dimension(c.mla.latent_dim),
+                                                             glm::dimension(c.mla.index_dim), 1})
+                               .page);
+        auto pool    = p.context.pools[0];
+        pool.pool_id = 1;
+        for (auto& part : pool.parts) part.record = {p.caches[1].page_bytes, p.caches[1].alignment};
+        p.context.pools.push_back(std::move(pool));
+    }
     const auto records              = p.context.state.logical_capacity * 8ULL;
     p.context.metadata_budget_bytes = ctx::ContextDirectory::metadata_bytes(p.context) +
                                       glm::detail::Checkpoints::metadata_bytes(records) +
@@ -343,6 +373,59 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
                             [](auto n) { return n == 0; }),
             "discard leaked context objects");
 }
+
+void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
+    for (const auto accepted : {0U, 1U, 3U}) {
+        Fixture f(definition);
+        auto request0 = f.request(63), request1 = f.request(4);
+        const auto a = f.bind(request0, 0, 1), b = f.bind(request1, 1, 0);
+        f.commit(f.prefill(a));
+        f.commit(f.prefill(b));
+        const std::array members{a, b};
+        const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 4},
+                               glm::ExecutionUnit{b, glm::ExecutionUnitKind::Decode, 1}};
+        require(bool(f.session.reserve_units(units)), "MTP capacity not reserved");
+        std::array<rt::RoundBudget, 2> budgets;
+        budgets[0].generated_tokens_remaining = 4;
+        budgets[1].generated_tokens_remaining = 1;
+        f.executor.accept                     = {accepted, 0};
+        require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
+        const auto& work = std::get<glm::MtpWork>(f.executor.last.operation);
+        require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
+                    f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
+                "mixed MTP rows lost extents or ownership");
+        require(work.rows[0].mtp_frontier == 62 && work.rows[1].mtp_frontier == 3,
+                "MTP canonical frontier is not Main minus one");
+        auto result = f.event<glm::PendingBatch>();
+        std::array<rt::CommitDecision, 2> decisions;
+        // Full acceptance is deliberately truncated by the frontend output budget.
+        const auto adopted           = accepted == 3 ? 2 : accepted + 1;
+        decisions[0].accepted_tokens = adopted;
+        decisions[1].accepted_tokens = 1;
+        decisions[0].terminal = decisions[1].terminal = true;
+        const auto committed = f.session.commit(std::move(result), decisions);
+        require(committed.rows[0].speculative.drafted_tokens == 3 &&
+                    committed.rows[0].speculative.accepted_tokens == accepted &&
+                    committed.rows[0].speculative.committed_draft_tokens ==
+                        std::min(adopted, accepted),
+                "MTP accounting ignores actual committed prefix");
+        f.idle();
+        auto done0 = f.session.finish(a), done1 = f.session.finish(b);
+        require(done0.checkpoint && done1.checkpoint, "MTP continuation missing");
+        require(f.session.checkpoint_metadata(*done0.checkpoint).frontier == 63 + adopted &&
+                    f.session.checkpoint_metadata(*done1.checkpoint).frontier == 5,
+                "MTP commit advanced by provisional instead of adopted inputs");
+        f.idle();
+        require(f.session.release_checkpoint(*done0.checkpoint) &&
+                    f.session.release_checkpoint(*done1.checkpoint),
+                "MTP release failed");
+        const auto usage = f.session.physical_usage();
+        require(!usage.state_objects && !usage.history_objects &&
+                    std::all_of(usage.kv_page_groups.begin(), usage.kv_page_groups.end(),
+                                [](auto n) { return n == 0; }),
+                "MTP provisional suffix leaked");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -350,6 +433,8 @@ int main(int argc, char** argv) {
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         transactions(glm::read_definition(reader, {}));
+        auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+        mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

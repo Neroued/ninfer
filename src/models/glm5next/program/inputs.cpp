@@ -30,7 +30,7 @@ void RankProgramImpl::upload_region(const LayoutRegion& region, std::size_t byte
 }
 
 void RankProgramImpl::upload(std::span<const WorkRow> rows, const BatchPlan& plan,
-                             std::uint32_t width) {
+                             std::uint32_t width, std::span<const std::uint32_t> valid_columns) {
     auto& f         = *compute;
     const auto& io  = resources.plan.frame.main;
     const auto rank = parameters.profile->local.rank;
@@ -42,10 +42,12 @@ void RankProgramImpl::upload(std::span<const WorkRow> rows, const BatchPlan& pla
     };
     std::uint32_t visible = 0;
     for (std::size_t b = 0; b < plan.members.size(); ++b) {
-        const auto& row                = rows[plan.members[b]];
+        const auto logical             = plan.members[b];
+        const auto& row                = rows[logical];
         const auto offsets             = row.states.at(rank);
         const auto count               = row.ids.size();
-        i32(io.valid_columns)[b]       = count;
+        const auto valid               = valid_columns.empty() ? count : valid_columns[logical];
+        i32(io.valid_columns)[b]       = valid;
         i64(io.source_offsets)[b]      = offsets.source;
         i64(io.destination_offsets)[b] = offsets.destination;
         i32(io.table_rows)[b]          = row.main_table.index;
@@ -57,10 +59,11 @@ void RankProgramImpl::upload(std::span<const WorkRow> rows, const BatchPlan& pla
         const auto local               = b - plan.owners[row.attention_rank].begin;
         for (std::uint32_t t = 0; t < width; ++t) {
             i32(io.ids)[b * width + t] = count ? row.ids[std::min<std::size_t>(t, count - 1)] : 0;
-            i32(io.positions)[b * width + t]      = row.main_frontier + t;
+            i32(io.positions)[b * width + t] =
+                row.main_frontier + std::min<std::size_t>(t, valid ? valid - 1 : 0);
             i32(io.selection_rows)[b * width + t] = local * width + t;
         }
-        visible = std::max(visible, row.main_frontier + std::uint32_t(count));
+        visible = std::max(visible, row.main_frontier + std::uint32_t(valid));
     }
     const int t = width, b = plan.members.size();
     upload_region(io.ids.region, t * b * 4ULL);
@@ -83,13 +86,33 @@ void RankProgramImpl::upload(std::span<const WorkRow> rows, const BatchPlan& pla
 }
 
 void RankProgramImpl::request_decision() {
-    auto& f             = *compute;
+    auto& f = *compute;
+    if (f.requested || f.decision) return;
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    if (!forward || forward->sample == SampleKind::None) return;
+    const auto* mtp     = std::get_if<MtpWork>(&f.request.work.operation);
+    if (mtp) {
+        const bool constrained = std::any_of(mtp->rows.begin(), mtp->rows.end(),
+                                             [](const auto& r) { return r.constrained; });
+        if (constrained && (f.phase == ComputePhase::Forward || !drafts_done.ready())) return;
+    } else if (!forward || forward->sample == SampleKind::None)
+        return;
     runtime::DecisionRequest request;
     request.vocabulary = parameters.profile->public_tokens;
-    for (std::uint32_t i = 0; i < forward->rows.size(); ++i)
-        if (forward->rows[i].constrained) request.rows.push_back({i, {}});
+    const auto rows    = work_rows(f.request.work);
+    for (std::uint32_t i = 0; i < rows.size(); ++i) {
+        if (!rows[i].constrained) continue;
+        runtime::DecisionRequest::Row input{i, {}};
+        if (mtp) {
+            const auto physical =
+                std::find(f.physical.members.begin(), f.physical.members.end(), i) -
+                f.physical.members.begin();
+            const auto* drafts =
+                static_cast<const TokenId*>(output(resources.plan.frame.mtp->drafts).data) +
+                physical * shape.draft_tokens;
+            input.drafts.assign(drafts, drafts + mtp->draft_extents[i]);
+        }
+        request.rows.push_back(std::move(input));
+    }
     if (request.rows.empty())
         f.decision.emplace();
     else {
@@ -120,6 +143,12 @@ void RankProgramImpl::upload_sampling() {
                               .seed              = p.seed};
         auto counts =
             resources.tensor(*layout.token_counts).slice(1, row.member.residency.lane.value, 1);
+        if (std::holds_alternative<MtpWork>(f.request.work.operation)) {
+            auto scratch = resources.tensor(layout.mtp->token_counts).slice(1, b, 1);
+            copy_bytes_async({scratch.data, scratch.bytes(), cuda.device()},
+                             {counts.data, counts.bytes(), cuda.device()}, cuda);
+            counts = scratch;
+        }
         configs[b].token_counts = static_cast<std::int32_t*>(counts.data);
         if (row.constrained) {
             const auto mask = std::find_if(f.decision->rows.begin(), f.decision->rows.end(),
@@ -129,12 +158,13 @@ void RankProgramImpl::upload_sampling() {
             auto dst = mask_device.slice(2, b, 1), src = mask_host.slice(2, b, 1);
             std::copy(mask->words.begin(), mask->words.end(),
                       static_cast<std::uint32_t*>(src.data));
-            copy_bytes_async({dst.data, words * 4ULL, cuda.device()},
-                             {src.data, words * 4ULL, Device::cpu(), true}, cuda);
+            const auto bytes = mask->words.size() * sizeof(std::uint32_t);
+            copy_bytes_async({dst.data, bytes, cuda.device()},
+                             {src.data, bytes, Device::cpu(), true}, cuda);
             configs[b].mask                       = {static_cast<const std::uint32_t*>(dst.data),
                                                      static_cast<int>(words)};
             f.result.rows[logical].dead_positions = mask->dead_positions;
-            consumed.rows.push_back({logical, words * 4ULL});
+            consumed.rows.push_back({logical, bytes});
         }
     }
     upload_region(layout.sampling->region, rows.size() * sizeof(ops::SamplingConfig));

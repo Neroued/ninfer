@@ -16,18 +16,17 @@ struct BatchLayout {
 struct MtpFrameLayout {
     BatchLayout history;
     std::vector<BatchLayout> draft_steps;
-    TensorRegion conditioning, recursive_hidden, drafts, extents, anchors;
-    TensorRegion target_tokens, token_counts, embedding_enabled;
+    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, anchors, lengths;
+    TensorRegion target_tokens, token_counts, proposal_sampling, proposal_columns;
+    TensorRegion skip_first, last_columns, active_columns, accepted_drafts;
     ops::KpoolBlockSelectionLayout selection;
-    StateImageLayout tail_image;
-    ops::KpoolTailFields tail_fields;
-    LayoutRegion tails;
+    TensorRegion tail_keys, tail_gates;
     std::array<TensorRegion, 3> tail_offsets;
 };
 
 struct FrameLayout {
     BatchLayout main;
-    LayoutRegion ingress, sampling_ingress, egress;
+    LayoutRegion ingress, sampling_ingress, egress, result_egress;
     TensorRegion prefill_hidden, pending_hidden;
     std::optional<KdaReplayRecordLayout> kda_records;
     ops::KpoolRawRecordLayout main_records;

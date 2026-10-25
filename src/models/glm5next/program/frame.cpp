@@ -42,10 +42,14 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     if (p.mtp) {
         auto& m   = out.mtp.emplace();
         m.history = metadata(columns);
-        for (std::uint32_t i = 0; i < s.draft_tokens; ++i) m.draft_steps.push_back(metadata(batch));
+        for (std::uint32_t i = 0; i <= s.draft_tokens; ++i)
+            m.draft_steps.push_back(metadata(batch));
         for (auto& offsets : m.tail_offsets)
             offsets = tensor(DType::I64, {batch}, "frame tail offsets");
-        m.embedding_enabled = tensor(DType::I32, {columns}, "MTP ordinal-zero embedding mask");
+        m.extents    = rows();
+        m.anchors    = rows();
+        m.lengths    = rows();
+        m.skip_first = rows();
     }
     const auto ingress_end = b.finish(256);
     out.ingress = {out.main.ids.region.offset, ingress_end - out.main.ids.region.offset, 256};
@@ -59,19 +63,22 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
             plan_kda_replay_records(b, {dimension(c.kda_layers), batch, width,
                                         dimension(3ULL * heads * d), heads, heads, d, d});
         auto& m            = *out.mtp;
+        m.last_columns     = rows();
+        m.active_columns   = rows();
+        m.proposal_columns = rows();
+        m.proposal_sampling =
+            tensor(DType::I32, {sizeof(ops::SamplingConfig) / sizeof(std::int32_t), batch},
+                   "proposal sampling");
+        m.previous_hidden  = tensor(DType::BF16, {hidden, batch}, "previous Main hidden");
         m.conditioning     = tensor(DType::BF16, {hidden, columns}, "MTP true conditioning");
         m.recursive_hidden = tensor(DType::BF16, {hidden, batch, 2}, "MTP recursive hidden");
-        m.drafts           = tensor(DType::I32, {width - 1, batch}, "draft tokens");
-        m.extents          = rows();
-        m.anchors          = rows();
         m.target_tokens    = tensor(DType::I32, {width, batch}, "target tokens");
         m.token_counts =
             tensor(DType::I32, {dimension(p.public_tokens), batch}, "draft token counts");
-        m.selection = ops::plan_kpool_block_selection(b, batch);
-        StateImageBuilder tail;
-        m.tail_fields = ops::append_kpool_tail_fields(tail, index, 1);
-        m.tail_image  = tail.finish();
-        m.tails = b.add(m.tail_image.image_bytes * batch * m.tail_offsets.size(), 256, "MTP tails");
+        m.selection    = ops::plan_kpool_block_selection(b, batch);
+        const int tail = ops::kKpoolPoolSize - 1, slots = dimension(m.tail_offsets.size());
+        m.tail_keys  = tensor(DType::BF16, {index, tail, batch, slots}, "MTP raw key tails");
+        m.tail_gates = tensor(DType::BF16, {index, tail, batch, slots}, "MTP raw gate tails");
     }
     if (s.purpose == EnginePurpose::Generation) {
         out.logits =
@@ -95,8 +102,17 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         out.sampled_ids   = tensor(DType::I32, {width, batch}, "generated tokens");
         out.output_counts = rows();
         const auto first  = out.sampled_ids->region.offset;
-        const auto& last  = out.output_counts->region;
-        out.egress        = {first, last.offset + last.bytes - first, 256};
+        auto last         = out.output_counts->region;
+        if (out.mtp) {
+            out.mtp->accepted_drafts = rows();
+            last                     = out.mtp->accepted_drafts.region;
+        }
+        out.result_egress = {first, last.offset + last.bytes - first, 256};
+        if (out.mtp) {
+            out.mtp->drafts = tensor(DType::I32, {width - 1, batch}, "draft tokens");
+            last            = out.mtp->drafts.region;
+        }
+        out.egress = {first, last.offset + last.bytes - first, 256};
     }
     return out;
 }

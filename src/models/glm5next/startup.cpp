@@ -9,8 +9,6 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
       control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
-    if (load_options(options_).mtp())
-        throw std::invalid_argument("GLM5Next MTP execution is not implemented");
     if (options_.use_cuda_graph)
         throw std::invalid_argument("GLM5Next rank preparation requires eager execution");
     auto definition = read_definition(reader, load_options(options_));

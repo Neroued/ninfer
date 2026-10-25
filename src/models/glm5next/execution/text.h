@@ -2,6 +2,8 @@
 #include "models/glm5next/execution/batch.h"
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/execution/workspace.h"
+#include "models/glm5next/state/context.h"
+#include "models/common/vision/execution.h"
 #include "models/common/parallel_execution.h"
 #include "distributed/communication.h"
 

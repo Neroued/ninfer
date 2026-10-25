@@ -20,8 +20,8 @@ struct WorkRow {
     runtime::ExecutionMember member;
     std::uint32_t attention_rank = 0;
     StateBindings states;
-    context::TableRow main_table;
-    std::uint32_t main_frontier = 0;
+    context::TableRow main_table, mtp_table;
+    std::uint32_t main_frontier = 0, mtp_frontier = 0;
     std::vector<TokenId> ids, count_tokens;
     std::vector<std::uint32_t> window_ends;
     ResolvedSamplingParameters sampling;
@@ -48,6 +48,11 @@ struct ForwardWork {
     std::optional<vision::Work> visual;
 };
 
+struct MtpWork {
+    std::vector<WorkRow> rows;
+    std::vector<std::uint32_t> draft_extents;
+};
+
 struct ResidencyBinding {
     runtime::ExecutionMember member;
     std::vector<TokenId> generated;
@@ -66,14 +71,14 @@ struct ScoreWork {
 
 struct Work {
     ContextActions actions;
-    std::variant<ForwardWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, MtpWork, ContextWork, ScoreWork> operation;
     BatchPlan batch;
 };
 
 struct RowResult {
     std::uint32_t processed = 0;
     std::vector<TokenId> tokens;
-    std::uint32_t dead_positions = 0;
+    std::uint32_t dead_positions = 0, drafts = 0, accepted_drafts = 0;
 };
 
 struct ComputeResult {

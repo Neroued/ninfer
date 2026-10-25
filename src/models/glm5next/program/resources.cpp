@@ -1,5 +1,6 @@
 #include "models/glm5next/program/resources.h"
 #include "core/transfer.h"
+#include "ninfer/ops/sampling.h"
 
 #include <algorithm>
 #include <cstring>
@@ -50,11 +51,28 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
             auto* values =
                 reinterpret_cast<std::int64_t*>(static_cast<std::byte*>(ingress_.data()) + offset);
             for (std::uint32_t row = 0; row < plan.shape.max_concurrency; ++row)
-                values[row] = (slot * plan.shape.max_concurrency + row) * m->tail_image.image_bytes;
+                values[row] = (slot * plan.shape.max_concurrency + row) * m->tail_keys.shape[0] *
+                              m->tail_keys.shape[1] * sizeof(std::uint16_t);
         }
     }
     copy_bytes_async(plan.frame.ingress.bind(fixed_.span()), ingress_.span(),
                      device.execution_view());
+    if (const auto& m = plan.frame.mtp) {
+        std::array<ops::SamplingConfig, kMaximumConcurrency> proposal;
+        std::array<std::int32_t, kMaximumConcurrency> columns;
+        for (std::uint32_t i = 0; i < plan.shape.max_concurrency; ++i) {
+            proposal[i] = {.temperature = 0, .top_k = 1, .top_p = 1};
+            columns[i]  = 1;
+        }
+        // Every physical proposal row produces a vocabulary ID, including inert rows whose
+        // dense stem still reads that ID in the next recursive step.
+        copy_bytes(m->proposal_sampling.region.bind(fixed_.span()),
+                   {proposal.data(), m->proposal_sampling.region.bytes, Device::cpu()},
+                   device.execution_view());
+        copy_bytes(m->proposal_columns.region.bind(fixed_.span()),
+                   {columns.data(), m->proposal_columns.region.bytes, Device::cpu()},
+                   device.execution_view());
+    }
     const auto clear = [&](const TensorRegion& r, int value) {
         const auto region = r.region.bind(fixed_.span());
         CUDA_CHECK(cudaMemsetAsync(region.data, value, region.bytes, device.stream()));
@@ -97,29 +115,17 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
     return value.view({dimension(value.numel())}).slice(0, 0, dimension(elements)).view(shape);
 }
 
-CacheViews& Resources::cache(std::uint32_t pool) {
-    if (pool == 0) return main;
-    if (pool == 1 && mtp) return *mtp;
-    throw std::out_of_range("GLM5Next history pool is absent");
-}
-
-ops::KpoolMlaBatchView Resources::batch(const BatchLayout& layout, int tokens, int rows) {
-    if (rows < 1 || rows > static_cast<int>(plan.shape.max_concurrency))
-        throw std::out_of_range("GLM5Next batch exceeds frame row capacity");
-    return {packed(layout.positions, {tokens, rows}),
-            tensor(layout.valid_columns).slice(0, 0, rows),
-            tensor(layout.table_rows).slice(0, 0, rows)};
-}
-
 ops::KpoolTailStateView Resources::mtp_tail(std::uint32_t slot, int rows) {
     const auto& m = plan.frame.mtp.value();
     if (slot >= m.tail_offsets.size() || rows < 1 ||
         rows > static_cast<int>(plan.shape.max_concurrency))
         throw std::out_of_range("GLM5Next provisional tail exceeds frame capacity");
-    StateImageStorage tails(m.tails.bind(fixed_.span()), m.tail_image);
     const auto offsets = tensor(m.tail_offsets[slot]).slice(0, 0, rows);
-    return {tails.field(m.tail_fields.raw_keys, offsets),
-            tails.field(m.tail_fields.raw_gates, offsets)};
+    const int d = m.tail_keys.shape[0], tail = m.tail_keys.shape[1];
+    const TensorRegion field{
+        {0, std::size_t(d) * tail * sizeof(std::uint16_t), 16}, DType::BF16, {d, tail, 1, 1}};
+    return {{{m.tail_keys.region.bind(fixed_.span()), offsets}, {field, 1, 0}},
+            {{m.tail_gates.region.bind(fixed_.span()), offsets}, {field, 1, 0}}};
 }
 
 RankMemoryUsage Resources::observe() const {

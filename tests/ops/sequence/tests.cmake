@@ -5,4 +5,5 @@ ninfer_add_op_test(ninfer_sequence_test
           "${CMAKE_CURRENT_LIST_DIR}/autoregressive_round.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/verify.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/shifted_prefix.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/causal_pairs.cpp"
   LIBRARIES ninfer_ops)

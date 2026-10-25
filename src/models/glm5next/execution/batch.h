@@ -1,7 +1,5 @@
 #pragma once
 
-#include "models/common/vision/execution.h"
-
 #include "core/kda_replay_records.h"
 #include "models/common/parallel.h"
 #include <variant>

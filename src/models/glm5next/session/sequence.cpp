@@ -81,6 +81,11 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     row.states     = selectors(s);
     row.main_table = directory.pool(0).histories().execution_row(s.histories[0].handle()).handle();
     const auto& m  = s.continuation.metadata;
+    if (pool_count() > 1) {
+        row.mtp_table =
+            directory.pool(1).histories().execution_row(s.histories[1].handle()).handle();
+        row.mtp_frontier = m.mtp_frontier.value();
+    }
     row.main_frontier     = m.main_frontier;
     row.attention_rank    = m.placement.value;
     row.sampling          = s.request->sampling;
@@ -104,13 +109,11 @@ void SessionImpl::prepare_write(Sequence& s, std::uint32_t end,
 }
 
 ContinuationMetadata SessionImpl::prepare_commit(Sequence& s, const WorkRow& row,
-                                                 std::span<const TokenId> inputs,
-                                                 bool retain_recovery,
+                                                 std::uint32_t input_columns, bool retain_recovery,
                                                  context::ContextTransaction& transaction) {
-    const auto tokens = inputs.size();
-    auto metadata     = s.continuation.metadata;
-    if (tokens) {
-        metadata.main_frontier = row.main_frontier + tokens;
+    auto metadata = s.continuation.metadata;
+    if (input_columns) {
+        metadata.main_frontier = row.main_frontier + input_columns;
         if (pool_count() > 1) metadata.mtp_frontier = mtp_history_frontier(metadata.main_frontier);
     }
     const auto peak = retain_recovery ? s.recovery_peak : 0;

@@ -2,6 +2,7 @@
 #include "core/transfer.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/indexing.h"
+#include "models/glm5next/state/continuation.h"
 
 namespace ninfer::models::glm5next::detail {
 void RankProgramImpl::forward() {
@@ -27,6 +28,7 @@ void RankProgramImpl::forward() {
         auto& w  = *f.window;
         w.ids.assign(original.ids.begin() + f.control_offset, original.ids.begin() + end);
         w.main_frontier += f.control_offset;
+        w.mtp_frontier = mtp_history_frontier(w.main_frontier);
         if (f.control_offset)
             for (auto& [rank, s] : w.states) s.source = s.destination;
         rows       = {&w, 1};
@@ -35,6 +37,10 @@ void RankProgramImpl::forward() {
         f.physical = work.batch;
     f.tokens = rows.front().ids.size();
     upload(rows, f.physical, std::max(1U, f.tokens));
+    if (parameters.mtp && f.tokens) {
+        stage_conditioning(rows, f.physical);
+        prepare_history_metadata(rows);
+    }
     const auto& io = resources.plan.frame;
     const int h = dimension(parameters.profile->config.text.hidden), b = rows.size();
     f.hidden = f.sequence ? resources.tensor(io.prefill_hidden).slice(1, 0, std::max(1U, f.tokens))
@@ -56,21 +62,24 @@ void RankProgramImpl::forward() {
             const auto s = rows[0].states.at(parameters.profile->local.rank);
             update       = execution::SequenceUpdate{s.source, s.destination};
         }
-        execution::TextRun run(parameters,
-                               {resources.workspace, resources.states, resources.main,
-                                resources.tensor(io.main_records.raw_keys),
-                                resources.tensor(io.main_records.raw_gates),
-                                parallel ? &*parallel : nullptr},
-                               f.batch, update, cuda);
-        run.stem(std::move(visual));
-        for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
-            nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
-            run.local_mixer(i);
-            run.finish_mixer(i);
-            run.ffn(i);
-            run.finish_layer(i);
+        {
+            execution::TextRun run(parameters,
+                                   {resources.workspace, resources.states, resources.main,
+                                    resources.tensor(io.main_records.raw_keys),
+                                    resources.tensor(io.main_records.raw_gates),
+                                    parallel ? &*parallel : nullptr},
+                                   f.batch, update, cuda);
+            run.stem(std::move(visual));
+            for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
+                nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
+                run.local_mixer(i);
+                run.finish_mixer(i);
+                run.ffn(i);
+                run.finish_layer(i);
+            }
+            run.finish(f.hidden);
         }
-        run.finish(f.hidden);
+        if (parameters.mtp) align_history(rows);
         if (f.sequence) {
             auto last         = f.hidden.slice(1, f.tokens - 1, 1);
             const auto offset = rows[0].states.at(parameters.profile->local.rank).destination;
@@ -137,9 +146,21 @@ void RankProgramImpl::finish_forward() {
 }
 
 void RankProgramImpl::decide() {
-    auto& f = *compute;
+    auto& f        = *compute;
+    const bool mtp = std::holds_alternative<MtpWork>(f.request.work.operation);
+    if (mtp && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
+    if (mtp) {
+        accept_mtp();
+        const auto& result = resources.plan.frame.result_egress;
+        copy_bytes_async(resources.egress().subspan(0, result.bytes),
+                         result.bind(resources.fixed()), cuda);
+        timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     const auto& io = resources.plan.frame;
     const int b    = work_rows(f.request.work).size();
     auto hidden    = f.sequence ? f.hidden.slice(1, f.tokens ? f.tokens - 1 : 0, 1) : f.hidden;
@@ -170,6 +191,25 @@ void RankProgramImpl::result() {
         for (std::size_t b = 0; b < f.physical.members.size(); ++b)
             f.result.rows[f.physical.members[b]].tokens = {ids[b]};
     }
+    if (const auto* mtp = std::get_if<MtpWork>(&f.request.work.operation)) {
+        const auto& io     = resources.plan.frame;
+        const auto* ids    = static_cast<const TokenId*>(output(*io.sampled_ids).data);
+        const auto* counts = static_cast<const std::int32_t*>(output(*io.output_counts).data);
+        const auto* accepted =
+            static_cast<const std::int32_t*>(output(io.mtp->accepted_drafts).data);
+        for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
+            const auto logical = f.physical.members[b];
+            if (counts[b] < 1 || std::uint32_t(counts[b]) > mtp->draft_extents[logical] + 1 ||
+                accepted[b] != counts[b] - 1)
+                throw std::logic_error("GLM5Next acceptance returned an invalid prefix");
+            auto& r           = f.result.rows[logical];
+            r.processed       = mtp->draft_extents[logical] + 1;
+            r.drafts          = mtp->draft_extents[logical];
+            r.accepted_drafts = accepted[b];
+            r.tokens.assign(ids + b * (shape.draft_tokens + 1),
+                            ids + b * (shape.draft_tokens + 1) + counts[b]);
+        }
+    }
     timer.observe_result(f.gpu);
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
     events.emplace_back(runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(f.result)});
@@ -181,7 +221,10 @@ void RankProgramImpl::advance_compute() {
     auto& f = *compute;
     switch (f.phase) {
     case ComputePhase::Forward:
-        forward();
+        if (std::holds_alternative<MtpWork>(f.request.work.operation))
+            prepare_mtp();
+        else
+            forward();
         break;
     case ComputePhase::AwaitForward:
         if (compute_done.ready()) finish_forward();

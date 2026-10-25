@@ -24,16 +24,19 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
         8 + 46 * context::kContextActionBatchOperations + 8 * context::kContextActionBatchOffsets;
     const auto work         = header + actions + 128 + batch * (192 + 20 * ranks + 12 * context);
     const auto context_work = header + context_actions + 128 + batch * (88 + 4 * context);
-    const auto decision = header + 12 + batch * (20 + 4 * ((contract_.public_tokens + 31) / 32));
-    const auto commit   = header + 64 + batch * (64 + 20 * ranks) + 8 +
+    const auto width        = std::size_t(rank.shape.draft_tokens) + 1;
+    const auto decision =
+        header + 12 + batch * (20 + 4 * width * ((contract_.public_tokens + 31) / 32));
+    const auto commit = header + 64 + batch * (64 + 20 * ranks) + 8 +
                         54 * (2 * batch * pools + batch) + 21 * batch * pools;
     wire::Encoder observed;
     RankExecutionObservation sample;
     sample.gpu = {0, 0, 0, 0};
     runtime::protocol::encode(observed, sample);
-    const auto event = std::move(observed).take().size() + 128 +
-                       std::max<std::size_t>({batch * 24, 4ULL * rank.shape.prefill_chunk,
-                                              64ULL * 5 * (pools + 1) * ranks});
+    const auto event =
+        std::move(observed).take().size() + 128 +
+        std::max<std::size_t>({batch * (24 + 4 * width), 4ULL * rank.shape.prefill_chunk,
+                               64ULL * 5 * (pools + 1) * ranks});
     auto snapshot = rank.observation;
     snapshot.physical_memory.emplace();
     snapshot.communication.clear();

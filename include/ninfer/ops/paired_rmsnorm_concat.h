@@ -11,7 +11,7 @@ namespace ninfer::ops {
  *   out[D:2D,m] = h[:,m]*gamma_h/sqrt(mean(h[:,m]^2)+epsilon).
  *
  * Inputs are contiguous BF16 [D,M], gains BF16 [D], and out BF16 [2D,M], with
- * D>0 and M>=0. enabled is contiguous Device I32 [M], containing 0 or 1. Disabled
+ * D>0 and M>=0. enabled is contiguous Device I32 [M]; zero disables and nonzero enables. Disabled
  * embedding halves are positive zero without reading that embedding column.
  * Reductions and scaling use FP32; each normalized half is stored as BF16.
  * Gains are direct multipliers and epsilon is positive and finite.

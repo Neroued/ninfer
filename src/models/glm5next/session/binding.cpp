@@ -282,6 +282,12 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.captures     = operation.request->captures;
         sequence.last_saved   = operation.frontier;
         sequence.resume_phase = Phase::Prefill;
+        if (shape.draft_tokens) {
+            sequence.speculative.backend      = SpeculativeBackend::Mtp;
+            sequence.speculative.enabled      = true;
+            sequence.speculative.draft_window = shape.draft_tokens;
+            sequence.speculative.accepted_per_position.resize(shape.draft_tokens);
+        }
     }
     sequence.lane                = operation.lane;
     const auto identity_capacity = std::size_t(sequence.request->summary.prompt_tokens) +
@@ -296,6 +302,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.continuation.metadata =
             checkpoints.at(*operation.source).snapshot.continuation().metadata;
     }
+    if (!operation.source && pool_count() > 1) sequence.continuation.metadata.mtp_frontier = 0;
     sequence.continuation.metadata.placement = operation.placement;
     while (sequence.next_capture < sequence.captures.size() &&
            sequence.captures[sequence.next_capture].frontier <= operation.frontier)

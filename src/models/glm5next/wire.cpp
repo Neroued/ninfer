@@ -90,7 +90,9 @@ void row(Encoder& out, const WorkRow& r) {
         selectors(out, state);
     }
     slot(out, r.main_table);
+    slot(out, r.mtp_table);
     out.u32(r.main_frontier);
+    out.u32(r.mtp_frontier);
     out.u32(r.attention_rank);
     integers(out, r.ids);
     integers(out, r.count_tokens);
@@ -108,7 +110,9 @@ WorkRow row(Decoder& in) {
         r.states.emplace(owner, selectors(in));
     }
     r.main_table        = slot<context::TableRow>(in);
+    r.mtp_table         = slot<context::TableRow>(in);
     r.main_frontier     = in.u32();
+    r.mtp_frontier      = in.u32();
     r.attention_rank    = in.u32();
     r.ids               = integers<TokenId>(in);
     r.count_tokens      = integers<TokenId>(in);
@@ -176,6 +180,10 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                     out.u64(v.visual->window.id);
                     out.boolean(v.visual->window.produce);
                 }
+            } else if constexpr (std::is_same_v<T, MtpWork>) {
+                out.u8(2);
+                rows(out, v.rows);
+                integers(out, v.draft_extents);
             } else if constexpr (std::is_same_v<T, ContextWork>) {
                 out.u8(3);
                 out.u64(v.bindings.size());
@@ -213,6 +221,13 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
             v.visual      = inputs.get(id, in.boolean());
         }
         work.operation = std::move(v);
+        break;
+    }
+    case 2: {
+        MtpWork v;
+        v.rows          = rows(in);
+        v.draft_extents = integers<std::uint32_t>(in);
+        work.operation  = std::move(v);
         break;
     }
     case 3: {
@@ -289,6 +304,8 @@ void encode_result(Encoder& out, const Result& result) {
                     out.u32(r.processed);
                     integers(out, r.tokens);
                     out.u32(r.dead_positions);
+                    out.u32(r.drafts);
+                    out.u32(r.accepted_drafts);
                 }
 
             } else if constexpr (std::is_same_v<T, ContextResult>) {
@@ -324,11 +341,13 @@ Result decode_result(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ComputeResult v;
-        v.rows.resize(in.count(16));
+        v.rows.resize(in.count(24));
         for (auto& r : v.rows) {
-            r.processed      = in.u32();
-            r.tokens         = integers<TokenId>(in);
-            r.dead_positions = in.u32();
+            r.processed       = in.u32();
+            r.tokens          = integers<TokenId>(in);
+            r.dead_positions  = in.u32();
+            r.drafts          = in.u32();
+            r.accepted_drafts = in.u32();
         }
 
         return v;

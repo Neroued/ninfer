@@ -103,15 +103,24 @@ Session::start_decode(std::span<const SequenceHandle> members,
             std::find(members.begin(), members.begin() + b, members[b]) != members.begin() + b)
             throw std::logic_error("decode row is not executable");
     }
+    std::vector<std::uint32_t> extents(members.size());
+    bool speculative = false;
+    for (std::size_t b = 0; b < members.size(); ++b) {
+        const auto& s = p.sequence(members[b]);
+        extents[b]    = std::min({p.shape.draft_tokens, budgets[b].generated_tokens_remaining - 1,
+                                  p.shape.max_context - s.continuation.metadata.main_frontier - 1});
+        speculative |= extents[b] != 0;
+    }
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Ordinary, p.directory);
-    auto& tx  = *p.compute;
+    p.compute = std::make_unique<detail::ComputeTransaction>(
+        speculative ? Kind::Mtp : Kind::Ordinary, p.directory);
+    auto& tx = *p.compute;
     tx.members.assign(members.begin(), members.end());
     try {
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s        = p.sequence(members[b]);
-            const auto end = s.continuation.metadata.main_frontier + 1;
+            const auto end = s.continuation.metadata.main_frontier + extents[b] + 1;
             if (end > s.permitted_frontier)
                 throw std::logic_error("decode exceeds its reservation");
             p.prepare_write(s, end, tx.context);
@@ -120,7 +129,11 @@ Session::start_decode(std::span<const SequenceHandle> members,
             tx.rows.push_back(std::move(row));
         }
         Work work;
-        work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows};
+        if (speculative) {
+            tx.draft_extents = extents;
+            work.operation   = MtpWork{tx.rows, std::move(extents)};
+        } else
+            work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows};
         submit(p, std::move(*reservation), std::move(work));
         return tx.ticket;
     } catch (const std::exception& error) {

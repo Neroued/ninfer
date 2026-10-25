@@ -63,13 +63,28 @@ public:
     void collect_vision_timing();
     void retire_vision(runtime::ResidencyId) noexcept;
     void forward();
+    void prepare_mtp();
+    void draft_forward(std::uint32_t step);
+    void verify_forward();
+    void accept_mtp();
+    void commit_mtp(const Commit&);
+    void execute_mtp_commit(bool repair_history);
+    void stage_conditioning(std::span<const WorkRow>, const BatchPlan&);
+    void align_history(std::span<const WorkRow>);
+    void prepare_history_metadata(std::span<const WorkRow>,
+                                  std::span<const std::uint32_t> skip_first = {});
+    [[nodiscard]] execution::BatchView batch(const BatchLayout&, int tokens, int rows,
+                                             std::uint32_t visible);
+    [[nodiscard]] Tensor row(const TensorRegion&, int rows);
+    [[nodiscard]] MemorySpan output(const TensorRegion&);
     void finish_forward();
     void request_decision();
     void decide();
     void sample();
     void score();
     void result();
-    void upload(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens);
+    void upload(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
+                std::span<const std::uint32_t> valid_columns = {});
     void upload_sampling();
     void control_counts();
     [[nodiscard]] MemorySpan host_region(const LayoutRegion&);
@@ -94,7 +109,7 @@ public:
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
     runtime::ExecutionGpuTimer timer;
     std::optional<CudaEventTimer> prefill_timer;
-    CudaCompletionEvent compute_done, context_done;
+    CudaCompletionEvent compute_done, context_done, drafts_done;
     std::size_t lifetime_peak = 0;
     bool drained              = false;
 };

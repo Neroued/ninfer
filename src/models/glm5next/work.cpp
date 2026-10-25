@@ -1,4 +1,5 @@
 #include "models/glm5next/work.h"
+#include "models/glm5next/state/continuation.h"
 
 #include <algorithm>
 
@@ -26,6 +27,7 @@ void tokens(std::span<const TokenId> values, std::uint32_t vocabulary) {
 
 std::span<const WorkRow> work_rows(const Work& work) {
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) return f->rows;
+    if (const auto* m = std::get_if<MtpWork>(&work.operation)) return m->rows;
     if (const auto* s = std::get_if<ScoreWork>(&work.operation)) return {&s->row, 1};
     return {};
 }
@@ -62,6 +64,10 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
     out.rows        = rows.size();
     for (const auto& row : rows) out.input_tokens += row.ids.size();
     out.scheduled_positions = out.input_tokens;
+    if (const auto* m = std::get_if<MtpWork>(&work.operation)) {
+        out.kind = ExecutionKind::Decode;
+        for (auto n : m->draft_extents) out.scheduled_positions += n;
+    }
     return out;
 }
 
@@ -98,6 +104,10 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         member(r.member, shape.max_concurrency);
         require(r.states.size() == ranks && r.main_table.valid() && r.main_table.pool_id == 0,
                 "incomplete context binding");
+        require(shape.draft_tokens ? (r.mtp_table.valid() && r.mtp_table.pool_id == 1 &&
+                                      r.mtp_frontier == mtp_history_frontier(r.main_frontier))
+                                   : !r.mtp_table.valid(),
+                "MTP history binding");
         for (std::uint32_t rank = 0; rank < ranks; ++rank) {
             const auto found = r.states.find(rank);
             require(found != r.states.end() && found->second.source >= 0 &&
@@ -118,7 +128,8 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         for (std::size_t j = 0; j < i; ++j) {
             require(r.member.sequence != rows[j].member.sequence &&
                         r.member.residency.lane != rows[j].member.residency.lane &&
-                        r.main_table.index != rows[j].main_table.index,
+                        r.main_table.index != rows[j].main_table.index &&
+                        (!shape.draft_tokens || r.mtp_table.index != rows[j].mtp_table.index),
                     "overlapping batch owners");
             for (const auto& [rank, offsets] : r.states) {
                 const auto other = rows[j].states.at(rank);
@@ -165,6 +176,19 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         default:
             require(false, "unknown forward kind");
         }
+    } else if (const auto* m = std::get_if<MtpWork>(&work.operation)) {
+        require(shape.purpose == EnginePurpose::Generation && shape.draft_tokens &&
+                    m->draft_extents.size() == rows.size(),
+                "MTP extent");
+        bool live = false;
+        for (std::size_t b = 0; b < rows.size(); ++b) {
+            const auto k = m->draft_extents[b];
+            require(rows[b].ids.size() == 1 && rows[b].main_frontier && k <= shape.draft_tokens &&
+                        k < shape.max_context - rows[b].main_frontier,
+                    "MTP verify window");
+            live |= k != 0;
+        }
+        require(live, "MTP round has no proposals");
     } else {
         const auto& s = std::get<ScoreWork>(work.operation);
         require(shape.purpose == EnginePurpose::CausalScoring && !s.row.constrained &&
@@ -184,14 +208,23 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
     std::array<bool, kMaximumConcurrency> requested{}, seen{};
     for (const auto& r : request.rows) {
         require(r.member < rows.size() && rows[r.member].constrained && !requested[r.member] &&
-                    r.drafts.empty(),
+                    r.drafts.size() ==
+                        (std::holds_alternative<MtpWork>(work.operation)
+                             ? std::get<MtpWork>(work.operation).draft_extents.at(r.member)
+                             : 0),
                 "decision member");
+        tokens(r.drafts, public_tokens);
         requested[r.member] = true;
     }
     for (const auto& r : input.rows) {
+        const auto positions =
+            std::holds_alternative<MtpWork>(work.operation) && r.member < rows.size()
+                ? std::get<MtpWork>(work.operation).draft_extents[r.member] + 1
+                : 1;
         require(r.member < rows.size() && requested[r.member] && !seen[r.member] &&
-                    r.positions == 1 && r.words.size() == (std::size_t(public_tokens) + 31) / 32 &&
-                    r.dead_positions <= 1,
+                    r.positions == positions &&
+                    r.words.size() == positions * ((std::size_t(public_tokens) + 31) / 32) &&
+                    (std::uint64_t(r.dead_positions) >> positions) == 0,
                 "decision mask extent");
         seen[r.member] = true;
     }
@@ -214,7 +247,8 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                                    const Commit& commit) const {
     const auto rows    = work_rows(work);
     const auto* f      = std::get_if<ForwardWork>(&work.operation);
-    const bool sampled = f && f->sample != SampleKind::None;
+    const auto* m      = std::get_if<MtpWork>(&work.operation);
+    const bool sampled = m || (f && f->sample != SampleKind::None);
     require(commit.rows.size() == rows.size() &&
                 (std::holds_alternative<ScoreWork>(work.operation) || result.size() == rows.size()),
             "commit membership");
@@ -233,7 +267,11 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                         (!c.failed || (sampled && result[i].dead_positions)),
                     "invalid rejected result");
         } else if (sampled) {
-            require(result[i].tokens.size() == 1 && c.accepted == 1 && !result[i].dead_positions,
+            const auto produced = result[i].tokens.size();
+            const auto reached  = produced >= 32 ? UINT32_MAX : (std::uint32_t{1} << produced) - 1;
+            require(produced && produced <= (m ? m->draft_extents[i] + 1 : 1) && c.accepted &&
+                        c.accepted <= produced && (c.terminal || c.accepted == produced) &&
+                        !(result[i].dead_positions & reached),
                     "invalid sampled commit");
         } else
             require(!c.failed && c.accepted == rows[i].ids.size(),

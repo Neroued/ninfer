@@ -1,6 +1,8 @@
 #pragma once
 
 #include "models/glm5next/execution/workspace.h"
+#include "models/glm5next/program/frame.h"
+#include "models/glm5next/state/context.h"
 #include "models/common/context/directory.h"
 #include "runtime/engine/context_capacity.h"
 

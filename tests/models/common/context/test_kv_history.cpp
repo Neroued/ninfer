@@ -952,7 +952,7 @@ void qwen_reclaim_facts(DeviceContext& device) {
     const std::array all{root, left, right, kept_left, kept_right, domain, position, alias};
     const std::array removed{root, left, right};
     const std::array kept{kept_left, kept_right};
-    context::RecoveryIndex index;
+    context::RecoveryIndex index(f.directory->metadata_budget());
     index.synchronize(qwen::RecoveryStoreView{store});
     auto evaluation = index.evaluate(kept);
     expect(evaluation.loss(removed) == 200 && !evaluation.prefix(domain, left) &&

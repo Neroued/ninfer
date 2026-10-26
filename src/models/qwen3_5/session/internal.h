@@ -421,8 +421,8 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::uint64_t next_sequence = 1;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
     Checkpoints checkpoints;
-    mutable context::RecoveryIndex<> recovery_index;
     std::unique_ptr<PendingContext> context_operation_;
     std::optional<ContextAssessment> pending_maintenance_;
     std::optional<SequenceHandle> normalizing_pause_;

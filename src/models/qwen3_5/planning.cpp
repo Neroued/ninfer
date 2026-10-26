@@ -32,9 +32,9 @@ context::ContextDirectorySpec context_spec(const detail::SequencePlanImpl& plan)
     result.state.logical_capacity =
         directory_count(maximum_records(0) + 2ULL * plan.max_concurrency);
     result.state.layouts.push_back({0, {{0, image.image_bytes, image.alignment}}});
-    const auto histories =
-        directory_count(4ULL * result.state.logical_capacity + 3ULL * plan.max_concurrency + 2);
-    const auto add_pool = [&](std::uint32_t id, const PagedKVCacheLayout& layout) {
+    const auto histories = directory_count(std::uint64_t(result.state.logical_capacity) +
+                                           3ULL * plan.max_concurrency + 2);
+    const auto add_pool  = [&](std::uint32_t id, const PagedKVCacheLayout& layout) {
         context::KVDirectorySpec spec;
         spec.pool_id       = id;
         spec.logical_pages = directory_count(maximum_records(id + 1));
@@ -50,6 +50,10 @@ context::ContextDirectorySpec context_spec(const detail::SequencePlanImpl& plan)
     else if (resources.dflash && resources.dflash->full)
         add_pool(1, *resources.dflash->full);
     result.metadata_budget_bytes = plan.context_metadata_bytes;
+    if (result.metadata_budget_bytes)
+        for (auto& pool : result.pools)
+            pool.histories =
+                context::HistoryDirectory::capacity_for_metadata(result.metadata_budget_bytes);
     return result;
 }
 
@@ -120,15 +124,19 @@ SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProf
     auto spec                    = context_spec(*impl->minimum);
     impl->capacity_plan.metadata = context::ContextDirectory::metadata_plan(spec);
     auto& metadata               = impl->capacity_plan.metadata;
-    metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(4ULL * spec.state.logical_capacity +
-                                                                2ULL * options.max_concurrency);
+    const auto checkpoints =
+        std::size_t(spec.state.logical_capacity) + 2ULL * options.max_concurrency;
+    metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(checkpoints) +
+                            context::RecoveryIndex<>::metadata_bytes(checkpoints);
     const auto geometry    = describe_context_pool(impl->capacity_plan.records);
     const auto state_class = geometry.spec_classes.front().index;
-    metadata.bytes_per_record[state_class] += 4 * sizeof(detail::Checkpoints::Slot);
+    metadata.bytes_per_record[state_class] +=
+        detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0) +
+        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0);
     for (const auto& pool : spec.pools)
         metadata.bytes_per_record[state_class] +=
-            4 * (context::HistoryDirectory::metadata_bytes(1, 0, 0) -
-                 sizeof(context::HistoryDirectory));
+            context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity) -
+            context::HistoryDirectory::metadata_bytes(0, 0, pool.page_capacity);
     return SequencePlanner(std::move(impl));
 }
 

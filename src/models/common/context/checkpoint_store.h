@@ -114,19 +114,30 @@ public:
 
     CheckpointStore() = default;
 
-    CheckpointStore(std::size_t capacity, MetadataBudget& budget) { configure(capacity, budget); }
+    CheckpointStore(std::size_t capacity, MetadataBudget& budget,
+                    MetadataCapacity* index = nullptr) {
+        configure(capacity, budget, index);
+    }
 
     [[nodiscard]] static std::size_t metadata_bytes(std::size_t capacity) {
-        return sizeof(CheckpointStore) + capacity * sizeof(Slot);
+        return sizeof(CheckpointStore) + (capacity + 255) * sizeof(Slot) +
+               (capacity + 510) / 256 * sizeof(std::unique_ptr<Slot[]>);
+    }
+
+    [[nodiscard]] static std::uint32_t capacity_for_metadata(std::size_t bytes) {
+        return static_cast<std::uint32_t>(
+            std::min<std::size_t>(UINT32_MAX - 1, bytes / sizeof(Slot)));
     }
 
     CheckpointStore(const CheckpointStore&)            = delete;
     CheckpointStore& operator=(const CheckpointStore&) = delete;
 
-    void configure(std::size_t capacity, MetadataBudget& budget) {
+    void configure(std::size_t capacity, MetadataBudget& budget,
+                   MetadataCapacity* index = nullptr) {
         if (slots_) throw std::logic_error("checkpoint metadata is already configured");
         slots_  = std::make_unique<DirectorySlots<Slot>>(capacity, budget);
         budget_ = &budget;
+        index_  = index;
     }
 
     class Iterator {
@@ -185,8 +196,12 @@ public:
                 index = first;
                 break;
             }
-        if (index == capacity() || slots_->ensure_bytes(index) > budget_->available())
+        const auto target =
+            std::max<std::size_t>(size(), std::min(capacity(), std::size_t(index / 256 + 1) * 256));
+        const auto index_bytes = index_ ? index_->metadata_requirement(target) : 0;
+        if (index == capacity() || slots_->ensure_bytes(index) + index_bytes > budget_->available())
             return std::nullopt;
+        if (index_) index_->reserve_metadata(target);
         slots_->ensure(index);
         return reserve_slot(index);
     }
@@ -314,6 +329,7 @@ private:
 
     std::unique_ptr<DirectorySlots<Slot>> slots_;
     MetadataBudget* budget_        = nullptr;
+    MetadataCapacity* index_       = nullptr;
     std::uint64_t next_generation_ = 0;
     std::uint64_t revision_        = 1;
 };

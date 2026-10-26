@@ -56,8 +56,8 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
             .pool_id = count(spec.pools.size()),
             .logical_pages =
                 count(capacity / cache.cache.page.page_bytes + 2ULL * p.shape.max_concurrency),
-            .histories =
-                count(4ULL * spec.state.logical_capacity + 3ULL * p.shape.max_concurrency + 2),
+            .histories     = count(std::uint64_t(spec.state.logical_capacity) +
+                                   3ULL * p.shape.max_concurrency + 2),
             .page_capacity = cache.tables.spec.logical_page_capacity,
             .table_rows    = static_cast<std::uint32_t>(cache.tables.spec.table_rows)};
         for (const auto& part : spec.ranks)
@@ -161,13 +161,15 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     // costs, while charging allocator metadata to each rank and fixed control storage once.
     auto description = schema(p, 0, true);
     out.metadata     = session_metadata_plan(description, geometry, rank);
-    if (rank != 0) out.metadata.fixed_bytes = 0;
     return out;
 }
 
 context::ContextDirectorySpec describe_context(const ExecutionPlan& p) {
     auto out                  = schema(p, p.capacity.device_bytes, false);
     out.metadata_budget_bytes = p.capacity.metadata_budget_bytes;
+    for (auto& pool : out.pools)
+        pool.histories =
+            context::HistoryDirectory::capacity_for_metadata(out.metadata_budget_bytes);
     return out;
 }
 

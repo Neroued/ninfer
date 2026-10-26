@@ -183,7 +183,8 @@ struct Program {
     bool transfer_in_progress        = false;
     std::vector<Handle> placement_holders;
     std::uint64_t checkpoint_revision = 1;
-    mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index;
+    ninfer::models::context::MetadataBudget metadata{16 * 1024 * 1024};
+    mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index{metadata};
     using ReleaseInventory = ninfer::models::context::ReleaseInventory<Usage, Handle>;
     mutable std::shared_ptr<const ReleaseInventory> last_inventory;
     mutable std::uint64_t score_queries = 0, scored_handles = 0;

@@ -265,10 +265,34 @@ void cancellation() {
                 "discard failed to release unpublished history destinations");
     }
 }
+
+void sharded_history() {
+    Fixture fixture;
+    auto& histories = fixture.histories();
+    auto demand     = histories.binding_demand(nullptr, 0, 65);
+    demand.records  = {{fixture.pages().layout_id(), context::ContextMemory::Device, 2, {0}},
+                       {fixture.pages().layout_id(), context::ContextMemory::Device, 2, {1}}};
+    context::ContextTransaction binding(fixture.directory);
+    binding.add_binding(0, histories.prepare_binding(nullptr, 0, 65, 0, fixture.reserve(demand)));
+    fixture.complete(binding);
+    auto owner = binding.binding(0)->commit();
+    context::ContextTransaction write(fixture.directory);
+    histories.prepare_write(owner, 0, 65, write);
+    fixture.complete(write);
+    histories.commit_frontier(owner.handle(), 65);
+    const auto page = histories.logical_page(owner.handle(), 1);
+    require(fixture.pages().ranks(page) == std::vector<std::uint32_t>({0, 1}) &&
+                fixture.pages().physical(page, 0).domain.rank == 0 &&
+                fixture.pages().physical(page, 1).domain.rank == 1,
+            "rank-local reservations did not materialize one complete sharded page");
+    owner.reset();
+    require(fixture.pages().occupied() == 0, "sharded history retained physical page ownership");
+}
 } // namespace
 
 int main() {
     try {
+        sharded_history();
         state_conversion();
         history_conversion();
         cancellation();

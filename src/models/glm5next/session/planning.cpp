@@ -7,17 +7,20 @@ namespace ninfer::models::glm5next {
 runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirectorySpec& schema,
                                                    const ContextPoolGeometry& geometry,
                                                    std::uint32_t rank) {
-    auto metadata      = context::ContextDirectory::metadata_plan(schema);
-    const auto records = std::size_t(schema.state.logical_capacity) * 8;
-    metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(records) +
-                            context::RecoveryIndex<>::metadata_bytes(records);
+    auto metadata      = context::ContextDirectory::metadata_plan(schema, rank, 1);
+    const auto records = std::size_t(schema.state.logical_capacity);
+    if (rank == schema.ranks.front().rank)
+        metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(records) +
+                                context::RecoveryIndex<>::metadata_bytes(records);
     const auto checkpoint_cost =
-        detail::Checkpoints::metadata_bytes(8) - detail::Checkpoints::metadata_bytes(0);
+        detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0);
     const auto recovery_cost =
-        context::RecoveryIndex<>::metadata_bytes(8) - context::RecoveryIndex<>::metadata_bytes(0);
-    const auto ranks        = schema.ranks.size();
-    const auto history_cost = context::HistoryDirectory::metadata_bytes(4, 0, 0, ranks) -
-                              context::HistoryDirectory::metadata_bytes(0, 0, 0, ranks);
+        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0);
+    const auto ranks         = schema.ranks.size();
+    std::size_t history_cost = 0;
+    for (const auto& pool : schema.pools)
+        history_cost += context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity, 1) -
+                        context::HistoryDirectory::metadata_bytes(0, 0, pool.page_capacity, 1);
     for (std::size_t i = 0; i < geometry.classes.size(); ++i) {
         const auto state_class = std::any_of(
             schema.state.layouts.begin(), schema.state.layouts.end(), [&](const auto& layout) {
@@ -29,7 +32,7 @@ runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirecto
             });
         if (state_class)
             metadata.bytes_per_record.at(i) +=
-                checkpoint_cost + recovery_cost + history_cost * schema.pools.size();
+                (checkpoint_cost + recovery_cost + history_cost + ranks - 1) / ranks;
     }
     return metadata;
 }

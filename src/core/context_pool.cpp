@@ -761,6 +761,12 @@ std::size_t ContextPool::block_bytes() const noexcept { return impl_->geometry.b
 
 std::size_t ContextPool::record_limit() const noexcept { return impl_->record_limit; }
 
+std::size_t ContextPool::allocation_extent(std::size_t additional) const noexcept {
+    const auto& p    = *impl_;
+    const auto fresh = additional > p.free_entries.size() ? additional - p.free_entries.size() : 0;
+    return p.entry_count + std::min(fresh, p.record_limit - p.entry_count);
+}
+
 std::uint64_t ContextPool::revision() const noexcept { return impl_->revision; }
 
 RecordClassId ContextPool::record_class(std::size_t spec_index) const {

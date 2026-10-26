@@ -8,7 +8,8 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
                          std::unique_ptr<context::ContextDirectory> prepared_directory)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
       directory_owner(std::move(prepared_directory)), directory(*directory_owner),
-      checkpoints(plan.context.state.logical_capacity * 8ULL, directory.metadata_budget()) {
+      checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
+                  directory.metadata_budget(), &recovery_index) {
     if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
     releases.reserve(shape.max_concurrency);
     for (std::uint32_t i = 0; i < plan.states.size(); ++i) placements.push_back({i});

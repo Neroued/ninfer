@@ -17,7 +17,6 @@ struct SessionPlan {
 };
 
 [[nodiscard]] SessionPlan plan_session(const ExecutionPlan&);
-[[nodiscard]] std::size_t session_metadata_bytes(const ExecutionPlan&);
 [[nodiscard]] runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan&,
                                                                  const ContextPoolGeometry&);
 

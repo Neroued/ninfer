@@ -54,11 +54,9 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
             target.parts.push_back(source.parts[0]);
         }
     }
-    const auto histories =
-        4ULL * out.state.logical_capacity + 3ULL * ranks.front().shape.max_concurrency + 2;
-    if (histories > UINT32_MAX)
-        throw std::overflow_error("GLM5Next history capacity exceeds uint32");
-    for (auto& pool : out.pools) pool.histories = static_cast<std::uint32_t>(histories);
+    for (auto& pool : out.pools)
+        pool.histories =
+            context::HistoryDirectory::capacity_for_metadata(out.metadata_budget_bytes);
     return out;
 }
 

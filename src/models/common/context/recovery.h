@@ -7,10 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <span>
 #include <stdexcept>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,27 +24,68 @@ struct RecoveryKey {
 template <class Handle>
 class RecoveryEvaluation;
 
-// Immutable checkpoint identities form a forest; equal identities/frontiers share a node, not
-// physical State/KV ownership. No node owns checkpoint content or pins a store replica.
+// Immutable checkpoint identities form a forest. Flat links and hash buckets keep all storage
+// bounded by the prepared checkpoint extent; no node owns State/KV or allocates child containers.
 template <class Handle = CheckpointHandle>
-class RecoveryIndex {
+class RecoveryIndex : public MetadataCapacity {
 public:
     static constexpr auto none = std::numeric_limits<std::uint32_t>::max();
 
+    explicit RecoveryIndex(MetadataBudget& budget) : metadata_(budget), scratch_(budget) {}
+
     [[nodiscard]] static std::size_t metadata_bytes(std::size_t capacity) {
-        return sizeof(RecoveryIndex) +
-               capacity * (sizeof(Slot) + sizeof(Node) + sizeof(std::uint32_t));
+        capacity += 255; // Checkpoint descriptors grow by slabs of 256.
+        return sizeof(RecoveryIndex) + capacity * sizeof(Slot) +
+               (capacity + 1) * (sizeof(Node) + 2 * sizeof(std::uint32_t)) +
+               capacity * sizeof(Depth) + 4 * (capacity + 1) * sizeof(std::uint32_t) +
+               capacity * (sizeof(std::uint8_t) + sizeof(std::uint64_t)) +
+               (capacity + 1) *
+                   (3 * sizeof(std::uint64_t) + 6 * sizeof(std::uint32_t) + sizeof(LossPath)) +
+               11 * 7;
+    }
+
+    [[nodiscard]] std::size_t metadata_requirement(std::size_t capacity) const override {
+        std::size_t reallocation = 0;
+        const auto growth        = [&](const auto& values, std::size_t count) {
+            using Value = typename std::decay_t<decltype(values)>::value_type;
+            if (count > values.capacity())
+                reallocation = std::max(reallocation, values.capacity() * sizeof(Value));
+            return count > values.capacity() ? (count - values.capacity()) * sizeof(Value) : 0;
+        };
+        const auto retained = growth(slots_, capacity) + growth(nodes_, capacity + 1) +
+                              growth(free_, capacity + 1) + growth(preorder_, capacity + 1) +
+                              growth(depths_, capacity) +
+                              growth(buckets_, hash_capacity(capacity)) +
+                              scratch_.growth_bytes(evaluation_bytes(capacity, capacity + 1));
+        return retained + reallocation;
+    }
+
+    void reserve_metadata(std::size_t capacity) override {
+        if (capacity < slots_.size()) return;
+        if (capacity >= none) throw std::length_error("recovery index exceeds uint32");
+        metadata_.reserve(slots_, capacity);
+        slots_.resize(capacity);
+        metadata_.reserve(nodes_, capacity + 1);
+        if (nodes_.empty()) nodes_.emplace_back();
+        metadata_.reserve(free_, capacity + 1);
+        metadata_.reserve(preorder_, capacity + 1);
+        metadata_.reserve(depths_, capacity);
+        const auto hash_size = hash_capacity(capacity);
+        if (buckets_.size() < hash_size) {
+            metadata_.reserve(buckets_, hash_size);
+            buckets_.assign(hash_size, none);
+            for (std::uint32_t i = 1; i < nodes_.size(); ++i)
+                if (nodes_[i].first_alias != none) link_bucket(i);
+        }
+        scratch_.reserve(evaluation_bytes(capacity, capacity + 1));
     }
 
     struct Work {
-        std::uint64_t synchronizations  = 0;
-        std::uint64_t shortlist_queries = 0;
-        std::uint64_t exact_comparisons = 0;
+        std::uint64_t synchronizations = 0, shortlist_queries = 0, exact_comparisons = 0;
     };
 
-    // View supplies revision() by const reference, capacity(), handle(index), valid(handle),
-    // frontier(handle), key(handle, frontier), and prefix(earlier, later). Identity is immutable
-    // between publication and retirement; a changed generation denotes new content.
+    // View supplies immutable identities and an exact prefix proof. The producer reserves index
+    // capacity before publication; synchronize only updates links within that prepared extent.
     template <class View>
     void synchronize(const View& view) {
         if (revision_ == &view.revision() && observed_revision_ == view.revision()) return;
@@ -54,11 +93,11 @@ public:
             throw std::logic_error("recovery index changed checkpoint owner");
         revision_ = &view.revision();
         ++work_.synchronizations;
+        reserve_metadata(view.capacity());
         try {
-            slots_.resize(view.capacity());
             for (std::uint32_t i = 0; i < slots_.size(); ++i)
                 if (slots_[i].node != none && !view.valid(slots_[i].handle)) erase(i);
-            for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+            for (std::uint32_t i = 0; i < view.capacity(); ++i) {
                 const auto handle = view.handle(i);
                 if (slots_[i].node == none && view.valid(handle)) insert(handle, view);
             }
@@ -66,11 +105,12 @@ public:
             observed_revision_ = view.revision();
             ++epoch_;
         } catch (...) {
-            slots_.clear();
+            std::fill(slots_.begin(), slots_.end(), Slot{});
             nodes_.assign(1, {});
             free_.clear();
             depths_.clear();
             preorder_.clear();
+            std::fill(buckets_.begin(), buckets_.end(), none);
             observed_revision_ = 0;
             ++epoch_;
             throw;
@@ -85,27 +125,55 @@ public:
 
 private:
     struct Node {
-        std::uint32_t frontier = 0, parent = 0, sibling = 0, component = 0;
-        std::uint32_t begin = 0, end = 0;
+        std::uint32_t frontier = 0, parent = 0, first_child = none;
+        std::uint32_t previous = none, next = none, component = 0, begin = 0, end = 0;
         RecoveryKey key;
-        std::vector<Handle> aliases;
-        std::vector<std::uint32_t> children;
+        std::uint32_t first_alias = none, bucket_next = none;
     };
 
     struct Slot {
         Handle handle{};
-        std::uint32_t node = none, alias = 0;
+        std::uint32_t node = none, previous = none, next = none;
     };
 
-    struct KeyHash {
-        std::size_t operator()(const RecoveryKey& key) const noexcept {
-            auto hash = key.digests[0] ^ (key.digests[1] + 0x9e3779b97f4a7c15ULL +
-                                          (key.digests[0] << 6) + (key.digests[0] >> 2));
-            return hash ^ (std::uint64_t(key.domain) * 0x9e3779b97f4a7c15ULL);
-        }
+    struct Depth {
+        std::uint32_t frontier = 0, count = 0;
     };
 
-    using Buckets = std::unordered_map<RecoveryKey, std::vector<std::uint32_t>, KeyHash>;
+    struct LossPath {
+        std::uint32_t node, worst;
+        bool leaf;
+    };
+
+    static std::size_t hash_capacity(std::size_t capacity) {
+        std::size_t size = 2;
+        while (size < 2 * (capacity + 1)) size *= 2;
+        return size;
+    }
+
+    static std::size_t evaluation_bytes(std::size_t slots, std::size_t nodes) {
+        // Four stamp arrays, five counters/lists, traversal path and loss stack. Each array
+        // starts on an eight-byte boundary, including the byte-per-slot advertised flags.
+        const auto aligned = [](std::size_t n) { return (n + 7) / 8 * 8; };
+        return aligned(slots) + aligned(slots * sizeof(std::uint64_t)) +
+               3 * aligned(nodes * sizeof(std::uint64_t)) +
+               6 * aligned(nodes * sizeof(std::uint32_t)) + aligned(nodes * sizeof(LossPath));
+    }
+
+    std::size_t bucket(std::uint32_t frontier, const RecoveryKey& key) const {
+        auto h = key.digests[0] ^ (key.digests[1] + 0x9e3779b97f4a7c15ULL + (key.digests[0] << 6) +
+                                   (key.digests[0] >> 2));
+        h ^= (std::uint64_t(key.domain) << 32) | frontier;
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        return (h ^ (h >> 27)) & (buckets_.size() - 1);
+    }
+
+    void link_bucket(std::uint32_t index) {
+        auto& head                = buckets_[bucket(nodes_[index].frontier, nodes_[index].key)];
+        nodes_[index].bucket_next = head;
+        head                      = index;
+    }
 
     void check() const {
         if (!revision_ || *revision_ != observed_revision_)
@@ -119,40 +187,64 @@ private:
     }
 
     void detach(std::uint32_t child) {
-        auto& node             = nodes_[child];
-        auto& siblings         = nodes_[node.parent].children;
-        const auto moved       = siblings.back();
-        siblings[node.sibling] = moved;
-        nodes_[moved].sibling  = node.sibling;
-        siblings.pop_back();
+        const auto& node = nodes_[child];
+        if (node.previous != none)
+            nodes_[node.previous].next = node.next;
+        else
+            nodes_[node.parent].first_child = node.next;
+        if (node.next != none) nodes_[node.next].previous = node.previous;
     }
 
     void attach(std::uint32_t child, std::uint32_t parent) {
-        nodes_[child].parent  = parent;
-        nodes_[child].sibling = nodes_[parent].children.size();
-        nodes_[parent].children.push_back(child);
+        auto& node    = nodes_[child];
+        node.parent   = parent;
+        node.previous = none;
+        node.next     = nodes_[parent].first_child;
+        if (node.next != none) nodes_[node.next].previous = child;
+        nodes_[parent].first_child = child;
     }
 
-    void erase(std::uint32_t slot_index) {
-        auto& slot                = slots_[slot_index];
-        const auto index          = slot.node;
-        auto& node                = nodes_[index];
-        const auto moved          = node.aliases.back();
-        node.aliases[slot.alias]  = moved;
-        slots_[moved.index].alias = slot.alias;
-        node.aliases.pop_back();
-        slot.node = none;
-        if (!node.aliases.empty()) return;
-        const auto parent = node.parent;
-        detach(index);
-        for (const auto child : node.children) attach(child, parent);
-        auto depth  = depths_.find(node.frontier);
-        auto bucket = depth->second.find(node.key);
-        std::erase(bucket->second, index);
-        if (bucket->second.empty()) depth->second.erase(bucket);
-        if (depth->second.empty()) depths_.erase(depth);
+    void add_alias(std::uint32_t index, Handle handle) {
+        auto& first          = nodes_[index].first_alias;
+        slots_[handle.index] = {handle, index, none, first};
+        if (first != none) slots_[first].previous = handle.index;
+        first = handle.index;
+    }
+
+    Handle representative(std::uint32_t index) const {
+        return slots_[nodes_[index].first_alias].handle;
+    }
+
+    auto depth(std::uint32_t frontier) {
+        return std::lower_bound(
+            depths_.begin(), depths_.end(), frontier,
+            [](const Depth& entry, auto value) { return entry.frontier < value; });
+    }
+
+    void erase(std::uint32_t index) {
+        auto& slot    = slots_[index];
+        const auto id = slot.node;
+        auto& node    = nodes_[id];
+        if (slot.previous != none)
+            slots_[slot.previous].next = slot.next;
+        else
+            node.first_alias = slot.next;
+        if (slot.next != none) slots_[slot.next].previous = slot.previous;
+        slot = {};
+        if (node.first_alias != none) return;
+        detach(id);
+        for (auto child = node.first_child; child != none;) {
+            const auto next = nodes_[child].next;
+            attach(child, node.parent);
+            child = next;
+        }
+        auto* link = &buckets_[bucket(node.frontier, node.key)];
+        while (*link != id) link = &nodes_[*link].bucket_next;
+        *link  = node.bucket_next;
+        auto d = depth(node.frontier);
+        if (!--d->count) depths_.erase(d);
         node = {};
-        free_.push_back(index);
+        free_.push_back(id);
     }
 
     template <class View>
@@ -168,31 +260,29 @@ private:
     }
 
     template <class View>
+    std::uint32_t find(const View& view, Handle handle, std::uint32_t frontier,
+                       const RecoveryKey& key) {
+        for (auto id = buckets_[bucket(frontier, key)]; id != none; id = nodes_[id].bucket_next)
+            if (nodes_[id].frontier == frontier && nodes_[id].key == key &&
+                prefix(view, representative(id), handle))
+                return id;
+        return none;
+    }
+
+    template <class View>
     void insert(Handle handle, const View& view) {
         const auto frontier = view.frontier(handle);
         const auto identity = key(view, handle, frontier);
-        if (const auto depth = depths_.find(frontier); depth != depths_.end()) {
-            if (const auto found = depth->second.find(identity); found != depth->second.end())
-                for (const auto index : found->second)
-                    if (prefix(view, nodes_[index].aliases.back(), handle)) {
-                        slots_[handle.index] = {
-                            handle, index,
-                            static_cast<std::uint32_t>(nodes_[index].aliases.size())};
-                        nodes_[index].aliases.push_back(handle);
-                        return;
-                    }
+        if (const auto equal = find(view, handle, frontier, identity); equal != none) {
+            add_alias(equal, handle);
+            return;
         }
         std::uint32_t parent = 0;
-        auto depth           = depths_.lower_bound(frontier);
-        while (depth != depths_.begin() && !parent) {
-            --depth;
-            const auto found = depth->second.find(key(view, handle, depth->first));
-            if (found == depth->second.end()) continue;
-            for (const auto index : found->second)
-                if (prefix(view, nodes_[index].aliases.back(), handle)) {
-                    parent = index;
-                    break;
-                }
+        auto d               = depth(frontier);
+        while (d != depths_.begin() && !parent) {
+            --d;
+            const auto found = find(view, handle, d->frontier, key(view, handle, d->frontier));
+            if (found != none) parent = found;
         }
         const auto index = free_.empty() ? static_cast<std::uint32_t>(nodes_.size()) : free_.back();
         if (free_.empty())
@@ -201,51 +291,57 @@ private:
             free_.pop_back();
         nodes_[index].frontier = frontier;
         nodes_[index].key      = identity;
-        nodes_[index].aliases.push_back(handle);
-        slots_[handle.index] = {handle, index, 0};
-        // Only direct children of the nearest ancestor can need reparenting. Exact checks on
-        // shortlist matches keep digest collisions from inventing an ancestry relationship.
-        auto children = nodes_[parent].children;
-        for (const auto child : children) {
-            if (nodes_[child].frontier <= frontier) continue;
-            const auto representative = nodes_[child].aliases.back();
-            if (key(view, representative, frontier) == identity &&
-                prefix(view, handle, representative)) {
-                detach(child);
-                attach(child, index);
+        add_alias(index, handle);
+        for (auto child = nodes_[parent].first_child; child != none;) {
+            const auto next = nodes_[child].next;
+            if (nodes_[child].frontier > frontier) {
+                const auto other = representative(child);
+                if (key(view, other, frontier) == identity && prefix(view, handle, other)) {
+                    detach(child);
+                    attach(child, index);
+                }
             }
+            child = next;
         }
         attach(index, parent);
-        depths_[frontier][identity].push_back(index);
+        link_bucket(index);
+        d = depth(frontier);
+        if (d == depths_.end() || d->frontier != frontier) d = depths_.insert(d, {frontier, 0});
+        ++d->count;
     }
 
     void number_nodes() {
         preorder_.clear();
-        std::uint32_t clock = 0;
-        std::vector<std::pair<std::uint32_t, bool>> stack{{0, false}};
-        while (!stack.empty()) {
-            const auto [index, closing] = stack.back();
-            stack.pop_back();
-            auto& node = nodes_[index];
-            if (closing) {
-                node.end = clock;
+        std::uint32_t clock = 0, id = 0;
+        for (;;) {
+            auto& node     = nodes_[id];
+            node.begin     = clock++;
+            node.component = node.parent ? nodes_[node.parent].component : id;
+            preorder_.push_back(id);
+            if (node.first_child != none) {
+                id = node.first_child;
                 continue;
             }
-            node.begin     = clock++;
-            node.component = node.parent ? nodes_[node.parent].component : index;
-            preorder_.push_back(index);
-            stack.emplace_back(index, true);
-            for (auto child = node.children.rbegin(); child != node.children.rend(); ++child)
-                stack.emplace_back(*child, false);
+            for (;;) {
+                nodes_[id].end = clock;
+                if (!id) return;
+                if (nodes_[id].next != none) {
+                    id = nodes_[id].next;
+                    break;
+                }
+                id = nodes_[id].parent;
+            }
         }
     }
 
+    MetadataAccount metadata_;
+    mutable MetadataScratch scratch_;
     const std::uint64_t* revision_   = nullptr;
     std::uint64_t observed_revision_ = 0, epoch_ = 0;
-    std::vector<Node> nodes_{1};
+    std::vector<Node> nodes_;
     std::vector<Slot> slots_;
-    std::vector<std::uint32_t> free_, preorder_;
-    std::map<std::uint32_t, Buckets> depths_;
+    std::vector<std::uint32_t> free_, preorder_, buckets_;
+    std::vector<Depth> depths_;
     Work work_;
     friend class RecoveryEvaluation<Handle>;
 };
@@ -263,11 +359,29 @@ public:
     };
 
     RecoveryEvaluation(const Index& index, std::span<const Handle> advertised)
-        : index_(&index), epoch_(index.epoch_), advertised_(index.slots_.size()),
-          available_(index.nodes_.size()), nearest_(index.nodes_.size()),
-          removed_(index.nodes_.size()), memo_(index.nodes_.size()),
-          handle_stamp_(index.slots_.size()), node_stamp_(index.nodes_.size()),
-          memo_stamp_(index.nodes_.size()), score_stamp_(index.nodes_.size()) {
+        : storage_(index.scratch_.acquire(
+              Index::evaluation_bytes(index.slots_.size(), index.nodes_.size()))),
+          index_(&index), epoch_(index.epoch_) {
+        auto* cursor    = storage_.data();
+        const auto take = [&]<class T>(std::size_t count) {
+            auto values = std::span<T>(reinterpret_cast<T*>(cursor), count);
+            cursor += (count * sizeof(T) + 7) / 8 * 8;
+            std::fill(values.begin(), values.end(), T{});
+            return values;
+        };
+        const auto slots = index.slots_.size(), nodes = index.nodes_.size();
+        advertised_     = take.template operator()<std::uint8_t>(slots);
+        handle_stamp_   = take.template operator()<std::uint64_t>(slots);
+        node_stamp_     = take.template operator()<std::uint64_t>(nodes);
+        memo_stamp_     = take.template operator()<std::uint64_t>(nodes);
+        score_stamp_    = take.template operator()<std::uint64_t>(nodes);
+        available_      = take.template operator()<std::uint32_t>(nodes);
+        nearest_        = take.template operator()<std::uint32_t>(nodes);
+        removed_        = take.template operator()<std::uint32_t>(nodes);
+        memo_           = take.template operator()<std::uint32_t>(nodes);
+        groups_.storage = take.template operator()<std::uint32_t>(nodes);
+        path_.storage   = take.template operator()<std::uint32_t>(nodes);
+        stack_.storage  = take.template operator()<Path>(nodes);
         check();
         for (const auto handle : advertised) {
             const auto node = index.node(handle);
@@ -313,12 +427,8 @@ public:
 
         // The stack is the virtual forest induced by removed nodes. Propagate the maximum
         // degradation along each path; count it only at that path's deepest removed node.
-        struct Path {
-            std::uint32_t node, worst;
-            bool leaf;
-        };
-
-        std::vector<Path> stack;
+        auto& stack = stack_;
+        stack.clear();
         std::uint64_t total = 0;
         for (const auto node : groups_) {
             const auto& record = index_->nodes_[node];
@@ -407,7 +517,8 @@ private:
     }
 
     std::uint32_t fallback(std::uint32_t node) {
-        std::vector<std::uint32_t> path;
+        auto& path = path_;
+        path.clear();
         node = nearest_[node];
         while (node && node_stamp_[node] == stamp_ && removed_[node] == available_[node] &&
                memo_stamp_[node] != stamp_) {
@@ -424,11 +535,35 @@ private:
         return result;
     }
 
+    template <class T>
+    struct List {
+        std::span<T> storage;
+        std::size_t count = 0;
+
+        auto begin() const { return storage.begin(); }
+
+        auto end() const { return storage.begin() + count; }
+
+        bool empty() const { return count == 0; }
+
+        T& back() { return storage[count - 1]; }
+
+        void clear() { count = 0; }
+
+        void pop_back() { --count; }
+
+        void push_back(T value) { storage[count++] = value; }
+    };
+
+    using Path = typename Index::LossPath;
+    MetadataScratch::Lease storage_;
     const Index* index_;
     std::uint64_t epoch_, stamp_ = 0;
-    std::vector<bool> advertised_;
-    std::vector<std::uint32_t> available_, nearest_, removed_, memo_, groups_;
-    std::vector<std::uint64_t> handle_stamp_, node_stamp_, memo_stamp_, score_stamp_;
+    std::span<std::uint8_t> advertised_;
+    std::span<std::uint32_t> available_, nearest_, removed_, memo_;
+    std::span<std::uint64_t> handle_stamp_, node_stamp_, memo_stamp_, score_stamp_;
+    List<std::uint32_t> groups_, path_;
+    List<Path> stack_;
     Work work_;
 };
 

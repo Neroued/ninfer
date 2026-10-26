@@ -93,6 +93,9 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
         plan.capacity.context_frames =
             std::min(plan.capacity.context_frames, rank.capacity.context_frames);
     }
+    for (auto& pool : plan.session.context.pools)
+        pool.histories = context::HistoryDirectory::capacity_for_metadata(
+            plan.session.context.metadata_budget_bytes);
     return plan;
 }
 

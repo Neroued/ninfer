@@ -177,6 +177,8 @@ public:
     [[nodiscard]] std::size_t alignment() const noexcept;
     [[nodiscard]] std::size_t block_bytes() const noexcept;
     [[nodiscard]] std::size_t record_limit() const noexcept;
+    // Stable allocation-index extent after reserving additional records, including ID reuse.
+    [[nodiscard]] std::size_t allocation_extent(std::size_t additional_records = 0) const noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] RecordClassId record_class(std::size_t spec_index) const;
     [[nodiscard]] RecordSpec record_spec(RecordClassId record_class) const;

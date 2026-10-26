@@ -184,6 +184,7 @@ struct HistoryMetadataDemand {
     // An invalid history prepares a new binding; otherwise prepare this existing writer.
     HistoryId history;
     std::uint32_t growth_pages = 0;
+    std::uint32_t prefix_pages = 0;
 };
 
 struct HistoryBindingDemand {
@@ -210,6 +211,7 @@ public:
                                                     std::uint32_t page_capacity,
                                                     std::uint32_t ranks = 1);
     [[nodiscard]] static std::size_t page_metadata_bytes() noexcept;
+    [[nodiscard]] static std::uint32_t capacity_for_metadata(std::size_t bytes) noexcept;
 
     HistoryDirectory(const HistoryDirectory&)            = delete;
     HistoryDirectory& operator=(const HistoryDirectory&) = delete;
@@ -308,38 +310,46 @@ public:
 private:
     static constexpr std::uint32_t kChunkPages = 32;
 
-    struct DirectoryNode;
+    struct Chunk;
 
-    class Directory {
+    class ChunkRef {
     public:
-        Directory() noexcept = default;
-        ~Directory();
-        Directory(const Directory&) noexcept;
-        Directory& operator=(const Directory&) noexcept;
-        Directory(Directory&&) noexcept;
-        Directory& operator=(Directory&&) noexcept;
+        ChunkRef() noexcept = default;
+        ~ChunkRef();
+        ChunkRef(const ChunkRef&) noexcept;
+        ChunkRef& operator=(const ChunkRef&) noexcept;
+        ChunkRef(ChunkRef&&) noexcept;
+        ChunkRef& operator=(ChunkRef&&) noexcept;
 
-        [[nodiscard]] DirectoryNode* get() const noexcept { return node_; }
+        [[nodiscard]] Chunk* get() const noexcept { return chunk_; }
 
-        [[nodiscard]] DirectoryNode* operator->() const noexcept { return node_; }
+        [[nodiscard]] Chunk* operator->() const noexcept { return chunk_; }
 
-        [[nodiscard]] DirectoryNode& operator*() const noexcept { return *node_; }
+        [[nodiscard]] Chunk& operator*() const noexcept { return *chunk_; }
 
-        explicit operator bool() const noexcept { return node_ != nullptr; }
+        explicit operator bool() const noexcept { return chunk_ != nullptr; }
 
         [[nodiscard]] bool unique() const noexcept;
         void reset() noexcept;
     private:
-        DirectoryNode* node_ = nullptr;
+        Chunk* chunk_ = nullptr;
 
-        explicit Directory(DirectoryNode* node) noexcept : node_(node) {}
+        explicit ChunkRef(Chunk* chunk) noexcept : chunk_(chunk) {}
         friend class HistoryDirectory;
     };
 
-    struct DirectoryNode {
-        Directory left;
-        Directory right;
-        std::array<PageId, kChunkPages> pages{};
+    struct LocalPage {
+        std::uint32_t index = 0, generation = 0;
+
+        LocalPage& operator=(PageId page) noexcept {
+            index      = page.index;
+            generation = page.generation;
+            return *this;
+        }
+    };
+
+    struct Chunk {
+        std::array<LocalPage, kChunkPages> pages{};
         HistoryDirectory* owner  = nullptr;
         std::uint32_t references = 0;
         std::uint32_t index      = 0;
@@ -347,8 +357,8 @@ private:
     };
 
     struct History {
-        Directory directory;
-        std::vector<DirectoryNode*> spare_nodes;
+        std::vector<ChunkRef> directory;
+        std::vector<Chunk*> spare_chunks;
         MetadataReservation branch_descriptor;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> prefixes;
         RecordReservation reservation;
@@ -385,35 +395,32 @@ private:
     void abort(HistoryBinding& binding) noexcept;
     [[nodiscard]] HistoryOwner commit(HistoryBinding& binding);
     [[nodiscard]] PageId membership(const History& history, std::uint32_t index) const noexcept;
-    [[nodiscard]] PageId& directory_slot(History&, std::uint32_t index);
-    [[nodiscard]] Directory prefix_directory(History&, const Directory& root, std::uint64_t width,
-                                             std::uint32_t count);
+    [[nodiscard]] LocalPage& directory_slot(History&, std::uint32_t index);
+    void copy_prefix(History& destination, const History& source, std::uint32_t pages);
     void branch_owner(HistoryOwner& history, std::uint32_t frontier,
                       ContextTransaction& transaction);
 
     MetadataAccount metadata_;
     PageDirectory* pages_;
     std::uint32_t page_capacity_;
-    std::uint64_t directory_capacity_ = kChunkPages;
     std::vector<std::uint32_t> row_generations_;
     std::vector<bool> row_active_;
-    DirectorySlots<DirectoryNode> nodes_;
-    std::vector<DirectoryNode*> free_nodes_;
+    DirectorySlots<Chunk> chunks_;
+    std::vector<Chunk*> free_chunks_;
     DirectorySlots<History> histories_;
     std::uint32_t initialized_     = 0;
     std::uint32_t occupied_        = 0;
     std::uint32_t next_generation_ = 1;
-    std::uint32_t tree_depth_      = 0;
-    void reserve_nodes(History&, std::size_t count);
+    void reserve_chunks(History&, std::size_t count);
     void reserve_branch(History&);
     void release_spares(History&) noexcept;
     void trim_prepared_metadata(History&, std::uint32_t records) noexcept;
-    [[nodiscard]] Directory allocate_node(History&, const DirectoryNode* source = nullptr);
-    void release_node(DirectoryNode*) noexcept;
+    [[nodiscard]] ChunkRef allocate_chunk(History&, const Chunk* source = nullptr);
+    void release_chunk(Chunk*) noexcept;
 
     struct MetadataRetirement {
         std::vector<std::uint32_t> histories;
-        std::vector<std::uint32_t> nodes;
+        std::vector<std::uint32_t> chunks;
     };
 
     [[nodiscard]] MetadataRetirement metadata_retirement(std::span<const HistoryId>) const;

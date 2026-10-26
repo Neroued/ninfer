@@ -21,18 +21,20 @@ std::uint32_t coverage(std::uint32_t frontier, std::uint32_t page) {
     return begin >= frontier ? 0 : std::min<std::uint64_t>(kPageTokens, frontier - begin);
 }
 
-std::uint32_t directory_depth(std::uint32_t page_capacity) {
-    std::uint32_t result = 1;
-    for (std::uint64_t width = 32; width < page_capacity; width *= 2) ++result;
-    return result;
+std::uint32_t chunk_count(std::uint64_t pages) {
+    return static_cast<std::uint32_t>((pages + 31) / 32);
 }
 
-std::uint32_t node_limit(std::uint32_t pages, std::uint32_t histories,
-                         std::uint32_t page_capacity) {
-    const auto limit =
-        std::uint64_t(pages) * 2 + std::uint64_t(histories) * directory_depth(page_capacity) * 4;
-    if (limit > UINT32_MAX) throw std::overflow_error("KV directory metadata limit exceeds uint32");
+std::uint32_t chunk_limit(std::uint32_t pages, std::uint32_t histories) {
+    // Every occupied or reserved chunk contains a page, except the shared boundary
+    // and the prepared append boundary of each history.
+    const auto limit = std::uint64_t(pages) + 2ULL * histories;
+    if (limit > UINT32_MAX) throw std::overflow_error("KV chunk directory exceeds uint32");
     return static_cast<std::uint32_t>(limit);
+}
+
+std::size_t append_chunks(std::uint32_t prefix, std::uint32_t growth) {
+    return growth ? chunk_count(std::uint64_t(growth) + (prefix ? 31 : 0)) : 0;
 }
 
 } // namespace
@@ -221,35 +223,45 @@ HistoryDirectory::HistoryDirectory(PageDirectory& pages, MetadataBudget& metadat
                                    std::uint32_t page_capacity)
     : metadata_(metadata), pages_(&pages), page_capacity_(page_capacity),
       row_generations_(row_count, 1), row_active_(row_count, false),
-      nodes_(node_limit(pages.capacity(), history_capacity, page_capacity), metadata),
+      chunks_(chunk_limit(pages.capacity(), history_capacity), metadata),
       histories_(history_capacity, metadata), free_count_(0), row_pages_(row_count) {
     if (!history_capacity || !page_capacity || !row_count || row_count > INT32_MAX)
         throw std::invalid_argument("KV history capacity is inconsistent");
-    while (directory_capacity_ < page_capacity) directory_capacity_ *= 2;
-    tree_depth_ = directory_depth(page_capacity);
     metadata_.acquire(row_generations_.capacity() * sizeof(std::uint32_t) +
                       (row_active_.capacity() + 7) / 8 +
                       row_pages_.capacity() * sizeof(std::vector<PageId>));
     metadata_.reserve(publish_, page_capacity);
     metadata_.reserve(materialize_, page_capacity);
     for (auto& row : row_pages_) metadata_.reserve(row, page_capacity);
-    pages.reserve_table_capacity(row_count);
+    pages.configure_histories(row_count, page_capacity, history_capacity);
 }
 
 std::size_t HistoryDirectory::metadata_bytes(std::uint32_t histories, std::uint32_t rows,
                                              std::uint32_t page_capacity, std::uint32_t ranks) {
-    const auto nodes = std::size_t(histories) * directory_depth(page_capacity) * 4;
-    return sizeof(HistoryDirectory) +
+    const auto directory = chunk_count(page_capacity) * sizeof(ChunkRef);
+    const auto boundary  = 2 * (sizeof(Chunk) + sizeof(Chunk*));
+    // Admission materializes descriptors/chunks in slabs; retain one rounding slab independent
+    // of the number of cache histories selected by the capacity forecast.
+    const auto slabs =
+        255 * (sizeof(History) + sizeof(std::uint32_t) + sizeof(Chunk) + sizeof(Chunk*));
+    return sizeof(HistoryDirectory) + slabs +
+           PageDirectory::coverage_metadata_bytes(histories + 255) +
+           PageDirectory::table_metadata_bytes(rows, page_capacity) +
            std::size_t(histories) *
-               (sizeof(History) + (std::size_t(ranks) + 1) * sizeof(std::uint32_t)) +
-           nodes * (sizeof(DirectoryNode) + 2 * sizeof(DirectoryNode*)) +
+               (sizeof(History) + (std::size_t(ranks) + 1) * sizeof(std::uint32_t) + directory +
+                boundary) +
            std::size_t(rows) * (sizeof(std::uint32_t) + sizeof(std::vector<PageId>) +
                                 std::size_t(page_capacity) * sizeof(PageId)) +
            ((std::size_t(rows) + 63) / 64) * 8 + std::size_t(page_capacity) * sizeof(PageId) * 2;
 }
 
+std::uint32_t HistoryDirectory::capacity_for_metadata(std::size_t bytes) noexcept {
+    return static_cast<std::uint32_t>(
+        std::min<std::size_t>(UINT32_MAX / 4, bytes / sizeof(History)));
+}
+
 std::size_t HistoryDirectory::page_metadata_bytes() noexcept {
-    return 2 * (sizeof(DirectoryNode) + 2 * sizeof(DirectoryNode*));
+    return (sizeof(Chunk) + sizeof(Chunk*) + kChunkPages - 1) / kChunkPages;
 }
 
 void HistoryDirectory::reserve_metadata(std::uint32_t count) {
@@ -262,6 +274,7 @@ void HistoryDirectory::reserve_metadata(std::uint32_t count) {
         histories_.grow(needed);
         while (initialized_ < histories_.size()) free_[free_count_++] = initialized_++;
     }
+    pages_->reserve_coverage(histories_.size());
     for (auto i = free_count_ - count; i < free_count_; ++i) {
         histories_.ensure(free_[i]);
         metadata_.reserve(histories_[free_[i]].placement, pages_->layout().parts.size());
@@ -297,7 +310,14 @@ void HistoryDirectory::release_metadata(std::span<const std::uint32_t> ids) noex
 HistoryDirectory::MetadataRetirement
 HistoryDirectory::metadata_retirement(std::span<const HistoryId> released) const {
     MetadataRetirement result;
-    std::vector<const DirectoryNode*> pending;
+    std::map<std::uint32_t, std::uint32_t> dropped;
+    const auto include = [&](std::uint32_t index) {
+        result.histories.push_back(index);
+        const auto& history = histories_[index];
+        for (const auto* chunk : history.spare_chunks) result.chunks.push_back(chunk->index);
+        for (const auto& chunk : history.directory)
+            if (++dropped[chunk->index] == chunk->references) result.chunks.push_back(chunk->index);
+    };
     for (const auto handle : released) {
         const auto& history = require(handle);
         if (history.owned)
@@ -305,24 +325,8 @@ HistoryDirectory::metadata_retirement(std::span<const HistoryId> released) const
         if (std::find(result.histories.begin(), result.histories.end(), handle.index) !=
             result.histories.end())
             continue;
-        if (history.branch_descriptor.remaining()) {
-            const auto branch = history.branch_descriptor.last();
-            result.histories.push_back(branch);
-            for (const auto* node : histories_[branch].spare_nodes)
-                result.nodes.push_back(node->index);
-        }
-        result.histories.push_back(handle.index);
-        for (const auto* node : history.spare_nodes) result.nodes.push_back(node->index);
-        if (history.directory) pending.push_back(history.directory.get());
-    }
-    std::map<std::uint32_t, std::uint32_t> dropped;
-    while (!pending.empty()) {
-        const auto* node = pending.back();
-        pending.pop_back();
-        if (++dropped[node->index] != node->references) continue;
-        result.nodes.push_back(node->index);
-        if (node->left) pending.push_back(node->left.get());
-        if (node->right) pending.push_back(node->right.get());
+        if (history.branch_descriptor.remaining()) include(history.branch_descriptor.last());
+        include(handle.index);
     }
     return result;
 }
@@ -344,20 +348,21 @@ std::size_t HistoryDirectory::reclaimable_metadata(std::span<const HistoryId> re
             }
             segment +=
                 sizeof(History) + history.placement.capacity() * sizeof(std::uint32_t) +
-                history.spare_nodes.capacity() * sizeof(DirectoryNode*) +
+                history.spare_chunks.capacity() * sizeof(Chunk*) +
+                history.directory.capacity() * sizeof(ChunkRef) +
                 history.prefixes.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>);
         }
         bytes += segment;
     }
-    for (std::uint32_t first = 0; first < nodes_.size(); first += 256) {
-        if (!nodes_.is_allocated(first)) continue;
-        const auto end = first + std::min(256U, nodes_.size() - first);
+    for (std::uint32_t first = 0; first < chunks_.size(); first += 256) {
+        if (!chunks_.is_allocated(first)) continue;
+        const auto end = first + std::min(256U, chunks_.size() - first);
         bool empty     = true;
         for (auto i = first; i < end; ++i)
             empty &=
-                (!nodes_[i].references && !nodes_[i].reserved) ||
-                std::find(retired.nodes.begin(), retired.nodes.end(), i) != retired.nodes.end();
-        if (empty) bytes += std::size_t(end - first) * sizeof(DirectoryNode);
+                (!chunks_[i].references && !chunks_[i].reserved) ||
+                std::find(retired.chunks.begin(), retired.chunks.end(), i) != retired.chunks.end();
+        if (empty) bytes += std::size_t(end - first) * sizeof(Chunk);
     }
     return bytes;
 }
@@ -373,24 +378,25 @@ void HistoryDirectory::reclaim_metadata() noexcept {
         for (auto i = first; i < end; ++i) {
             auto& history = histories_[i];
             metadata_.release(history.placement.capacity() * sizeof(std::uint32_t) +
-                              history.spare_nodes.capacity() * sizeof(DirectoryNode*) +
+                              history.spare_chunks.capacity() * sizeof(Chunk*) +
+                              history.directory.capacity() * sizeof(ChunkRef) +
                               history.prefixes.capacity() *
                                   sizeof(std::pair<std::uint32_t, std::uint32_t>));
         }
         histories_.release_segment(first);
     }
-    for (std::uint32_t first = 0; first < nodes_.size(); first += 256) {
-        if (!nodes_.is_allocated(first)) continue;
-        const auto end = std::min<std::uint64_t>(nodes_.size(), std::uint64_t(first) + 256);
+    for (std::uint32_t first = 0; first < chunks_.size(); first += 256) {
+        if (!chunks_.is_allocated(first)) continue;
+        const auto end = std::min<std::uint64_t>(chunks_.size(), std::uint64_t(first) + 256);
         bool empty     = true;
-        for (auto i = first; i < end; ++i) empty &= !nodes_[i].references && !nodes_[i].reserved;
+        for (auto i = first; i < end; ++i) empty &= !chunks_[i].references && !chunks_[i].reserved;
         if (!empty) continue;
-        free_nodes_.erase(std::remove_if(free_nodes_.begin(), free_nodes_.end(),
-                                         [first, end](const DirectoryNode* node) {
-                                             return node->index >= first && node->index < end;
-                                         }),
-                          free_nodes_.end());
-        nodes_.release_segment(first);
+        free_chunks_.erase(std::remove_if(free_chunks_.begin(), free_chunks_.end(),
+                                          [first, end](const Chunk* chunk) {
+                                              return chunk->index >= first && chunk->index < end;
+                                          }),
+                           free_chunks_.end());
+        chunks_.release_segment(first);
     }
 }
 
@@ -404,24 +410,24 @@ HistoryDirectory::metadata_requirement(std::span<const HistoryMetadataDemand> de
     auto materialized  = histories_.size();
     auto new_begin = materialized, new_end = materialized;
     std::vector<std::uint32_t> segments;
-    std::size_t bytes = 0, extra_nodes = 0;
-    const auto vector_bytes = [](std::size_t capacity, std::size_t required, std::size_t element) {
+    std::size_t bytes = 0, extra_chunks = 0, reallocation = 0;
+    const auto vector_bytes = [&](std::size_t capacity, std::size_t required, std::size_t element) {
+        if (required > capacity) reallocation = std::max(reallocation, capacity * element);
         return required > capacity ? (required - capacity) * element : 0;
     };
     const auto descriptor = [&]() -> std::optional<std::uint32_t> {
         std::uint32_t index;
-        if (retired_count) {
+        if (retired_count)
             index = retired.histories[--retired_count];
-        } else if (free_count) {
+        else if (free_count)
             index = free_[--free_count];
-        } else {
+        else {
             if (new_begin == new_end) {
                 if (materialized == histories_.limit()) return std::nullopt;
-                const auto end =
+                new_begin = materialized;
+                new_end =
                     std::min<std::uint64_t>(histories_.limit(), std::uint64_t(materialized) + 256);
-                new_begin    = materialized;
-                new_end      = end;
-                materialized = end;
+                materialized = new_end;
             }
             index = --new_end;
         }
@@ -436,15 +442,17 @@ HistoryDirectory::metadata_requirement(std::span<const HistoryMetadataDemand> de
         bytes += vector_bytes(capacity, pages_->layout().parts.size(), sizeof(std::uint32_t));
         return index;
     };
-    const auto prepare = [&](std::uint32_t index, std::size_t nodes, std::size_t prefixes) {
+    const auto prepare = [&](std::uint32_t index, std::size_t directory, std::size_t chunks,
+                             std::size_t prefixes) {
         const auto* history = histories_.is_allocated(index) ? &histories_[index] : nullptr;
-        const auto held = history && std::find(retired.histories.begin(), retired.histories.end(),
-                                               index) == retired.histories.end()
-                              ? history->spare_nodes.size()
-                              : 0;
-        extra_nodes += nodes > held ? nodes - held : 0;
-        bytes += vector_bytes(history ? history->spare_nodes.capacity() : 0, nodes,
-                              sizeof(DirectoryNode*));
+        const bool reused = std::find(retired.histories.begin(), retired.histories.end(), index) !=
+                            retired.histories.end();
+        const auto held = history && !reused ? history->spare_chunks.size() : 0;
+        extra_chunks += chunks > held ? chunks - held : 0;
+        bytes +=
+            vector_bytes(history ? history->directory.capacity() : 0, directory, sizeof(ChunkRef));
+        bytes +=
+            vector_bytes(history ? history->spare_chunks.capacity() : 0, chunks, sizeof(Chunk*));
         bytes += vector_bytes(history ? history->prefixes.capacity() : 0, prefixes,
                               sizeof(std::pair<std::uint32_t, std::uint32_t>));
     };
@@ -462,169 +470,164 @@ HistoryDirectory::metadata_requirement(std::span<const HistoryMetadataDemand> de
             if (!next) return std::nullopt;
             index = *next;
         }
-        const auto* history = demand.history.valid() ? &histories_[index] : nullptr;
-        const auto prefixes = history ? history->prefixes.size() : 0;
-        prepare(index,
-                (std::size_t(demand.growth_pages) + prefixes + (history ? 4 : 6)) * tree_depth_,
-                prefixes + 1);
-        if (history && history->branch_descriptor.remaining()) {
-            prepare(history->branch_descriptor.last(), (prefixes + 4) * tree_depth_, 0);
-        } else {
-            const auto branch = descriptor();
+        const auto* history  = demand.history.valid() ? &histories_[index] : nullptr;
+        const auto prefix    = history ? history->page_count : demand.prefix_pages;
+        const auto directory = chunk_count(
+            std::min<std::uint64_t>(page_capacity_, std::uint64_t(prefix) + demand.growth_pages));
+        prepare(index, directory, append_chunks(prefix, demand.growth_pages),
+                history ? history->prefixes.size() + 1 : 1);
+        if (history && history->retained) {
+            const auto branch = history->branch_descriptor.remaining()
+                                    ? std::optional{history->branch_descriptor.last()}
+                                    : descriptor();
             if (!branch) return std::nullopt;
-            prepare(*branch, (prefixes + 4) * tree_depth_, 0);
+            prepare(*branch, std::max<std::size_t>(directory, history->directory.capacity()), 0, 0);
         }
     }
+    bytes += pages_->coverage_metadata_requirement(materialized);
     bytes += vector_bytes(free_.capacity(), materialized, sizeof(std::uint32_t));
-    // growth_bytes includes newly allocated segments and their pointer table.
     const auto new_payload = std::size_t(materialized - histories_.size()) * sizeof(History);
     bytes += histories_.growth_bytes(materialized) - new_payload;
-    auto available_nodes = free_nodes_.size() + retired.nodes.size();
-    auto node_size       = nodes_.size();
-    for (std::uint32_t first = 0; available_nodes < extra_nodes && first < nodes_.limit();
+    auto available  = free_chunks_.size() + retired.chunks.size();
+    auto chunk_size = chunks_.size();
+    for (std::uint32_t first = 0; available < extra_chunks && first < chunks_.limit();
          first += 256) {
-        if (nodes_.is_allocated(first)) continue;
-        const auto count = std::min(256U, nodes_.limit() - first);
-        available_nodes += count;
-        bytes += std::size_t(count) * sizeof(DirectoryNode);
-        node_size = std::max(node_size, first + count);
+        if (chunks_.is_allocated(first)) continue;
+        const auto count = std::min(256U, chunks_.limit() - first);
+        available += count;
+        bytes += std::size_t(count) * sizeof(Chunk);
+        chunk_size = std::max(chunk_size, first + count);
     }
-    if (available_nodes < extra_nodes) return std::nullopt;
-    bytes += vector_bytes(free_nodes_.capacity(), node_size, sizeof(DirectoryNode*));
-    bytes += nodes_.growth_bytes(node_size) -
-             std::size_t(node_size - nodes_.size()) * sizeof(DirectoryNode);
-    return bytes;
+    if (available < extra_chunks) return std::nullopt;
+    bytes += vector_bytes(free_chunks_.capacity(), chunk_size, sizeof(Chunk*));
+    bytes +=
+        chunks_.growth_bytes(chunk_size) - std::size_t(chunk_size - chunks_.size()) * sizeof(Chunk);
+    return bytes + reallocation;
 }
 
 MetadataReservation HistoryDirectory::reserve_control(const HistoryMetadataDemand& demand) {
     MetadataReservation descriptor;
     History* history;
-    if (demand.history.valid()) {
+    if (demand.history.valid())
         history = &require(demand.history);
-    } else {
+    else {
         descriptor = reserve_descriptors(1);
         history    = &histories_[descriptor.last()];
     }
-    reserve_nodes(*history, (std::size_t(demand.growth_pages) + history->prefixes.size() +
-                             (demand.history.valid() ? 4 : 6)) *
-                                tree_depth_);
+    const auto prefix = demand.history.valid() ? history->page_count : demand.prefix_pages;
+    metadata_.reserve(history->directory,
+                      chunk_count(std::min<std::uint64_t>(
+                          page_capacity_, std::uint64_t(prefix) + demand.growth_pages)));
+    reserve_chunks(*history, append_chunks(prefix, demand.growth_pages));
     metadata_.reserve(history->prefixes, history->prefixes.size() + 1);
-    reserve_branch(*history);
+    if (history->retained) reserve_branch(*history);
     return descriptor;
 }
 
-void HistoryDirectory::reserve_nodes(History& history, std::size_t count) {
-    if (history.spare_nodes.size() >= count) return;
-    const auto extra = count - history.spare_nodes.size();
-    metadata_.reserve(history.spare_nodes, count);
-    while (free_nodes_.size() < extra) {
-        auto first = nodes_.size();
-        for (std::uint32_t i = 0; i < nodes_.size(); i += 256)
-            if (!nodes_.is_allocated(i)) {
+void HistoryDirectory::reserve_chunks(History& history, std::size_t count) {
+    if (history.spare_chunks.size() >= count) return;
+    const auto extra = count - history.spare_chunks.size();
+    metadata_.reserve(history.spare_chunks, count);
+    while (free_chunks_.size() < extra) {
+        auto first = chunks_.size();
+        for (std::uint32_t i = 0; i < chunks_.size(); i += 256)
+            if (!chunks_.is_allocated(i)) {
                 first = i;
                 break;
             }
-        if (first == nodes_.limit()) throw std::runtime_error("KV tree metadata exhausted");
-        const auto end = std::min<std::uint64_t>(nodes_.limit(), std::uint64_t(first) + 256);
-        metadata_.reserve(free_nodes_, std::max<std::uint64_t>(nodes_.size(), end));
-        nodes_.ensure(first);
+        if (first == chunks_.limit()) throw std::runtime_error("KV chunk metadata exhausted");
+        const auto end = std::min<std::uint64_t>(chunks_.limit(), std::uint64_t(first) + 256);
+        metadata_.reserve(free_chunks_, std::max<std::uint64_t>(chunks_.size(), end));
+        chunks_.ensure(first);
         for (auto i = first; i < end; ++i) {
-            nodes_[i].owner = this;
-            nodes_[i].index = i;
-            free_nodes_.push_back(&nodes_[i]);
+            chunks_[i].owner = this;
+            chunks_[i].index = i;
+            free_chunks_.push_back(&chunks_[i]);
         }
     }
     for (std::size_t i = 0; i < extra; ++i) {
-        auto* node = free_nodes_.back();
-        free_nodes_.pop_back();
-        node->reserved = true;
-        history.spare_nodes.push_back(node);
+        auto* chunk = free_chunks_.back();
+        free_chunks_.pop_back();
+        chunk->reserved = true;
+        history.spare_chunks.push_back(chunk);
     }
 }
 
 void HistoryDirectory::reserve_branch(History& history) {
     if (!history.branch_descriptor.remaining()) history.branch_descriptor = reserve_descriptors(1);
-    const auto index = history.branch_descriptor.take(*this);
-    history.branch_descriptor.restore(*this, index);
-    reserve_nodes(histories_[index], (history.prefixes.size() + 4) * tree_depth_);
+    auto& branch = histories_[history.branch_descriptor.last()];
+    metadata_.reserve(branch.directory, history.directory.capacity());
 }
 
 void HistoryDirectory::release_spares(History& history) noexcept {
-    for (auto* node : history.spare_nodes) {
-        node->reserved = false;
-        free_nodes_.push_back(node);
+    for (auto* chunk : history.spare_chunks) {
+        chunk->reserved = false;
+        free_chunks_.push_back(chunk);
     }
-    history.spare_nodes.clear();
+    history.spare_chunks.clear();
 }
 
 void HistoryDirectory::trim_prepared_metadata(History& history, std::uint32_t records) noexcept {
-    const auto keep = (std::size_t(records) + history.prefixes.size() + 4) * tree_depth_;
-    while (history.spare_nodes.size() > keep) {
-        auto* node = history.spare_nodes.back();
-        history.spare_nodes.pop_back();
-        node->reserved = false;
-        free_nodes_.push_back(node);
+    const auto keep = append_chunks(history.page_count, records);
+    while (history.spare_chunks.size() > keep) {
+        auto* chunk = history.spare_chunks.back();
+        history.spare_chunks.pop_back();
+        chunk->reserved = false;
+        free_chunks_.push_back(chunk);
     }
-    if (!records) history.branch_descriptor.reset();
+    if (!records || !history.retained) history.branch_descriptor.reset();
 }
 
-HistoryDirectory::Directory HistoryDirectory::allocate_node(History& reservation,
-                                                            const DirectoryNode* source) {
-    if (reservation.spare_nodes.empty())
-        throw std::logic_error("KV tree mutation exceeds its metadata reservation");
-    auto* node = reservation.spare_nodes.back();
-    reservation.spare_nodes.pop_back();
-    if (source) {
-        node->left  = source->left;
-        node->right = source->right;
-        node->pages = source->pages;
-    }
-    node->references = 1;
-    node->reserved   = false;
-    return Directory(node);
+HistoryDirectory::ChunkRef HistoryDirectory::allocate_chunk(History& reservation,
+                                                            const Chunk* source) {
+    if (reservation.spare_chunks.empty())
+        throw std::logic_error("KV directory mutation exceeds its chunk reservation");
+    auto* chunk = reservation.spare_chunks.back();
+    reservation.spare_chunks.pop_back();
+    if (source) chunk->pages = source->pages;
+    chunk->references = 1;
+    chunk->reserved   = false;
+    return ChunkRef(chunk);
 }
 
-void HistoryDirectory::release_node(DirectoryNode* node) noexcept {
-    if (!node->references) std::terminate();
-    if (--node->references) return;
-    node->left.reset();
-    node->right.reset();
-    node->pages = {};
-    free_nodes_.push_back(node);
+void HistoryDirectory::release_chunk(Chunk* chunk) noexcept {
+    if (!chunk->references) std::terminate();
+    if (--chunk->references) return;
+    chunk->pages = {};
+    free_chunks_.push_back(chunk);
 }
 
-HistoryDirectory::Directory::~Directory() { reset(); }
+HistoryDirectory::ChunkRef::~ChunkRef() { reset(); }
 
-HistoryDirectory::Directory::Directory(const Directory& other) noexcept : node_(other.node_) {
-    if (node_) ++node_->references;
+HistoryDirectory::ChunkRef::ChunkRef(const ChunkRef& other) noexcept : chunk_(other.chunk_) {
+    if (chunk_) ++chunk_->references;
 }
 
-HistoryDirectory::Directory&
-HistoryDirectory::Directory::operator=(const Directory& other) noexcept {
+HistoryDirectory::ChunkRef& HistoryDirectory::ChunkRef::operator=(const ChunkRef& other) noexcept {
     if (this != &other) {
-        Directory copy(other);
+        ChunkRef copy(other);
         *this = std::move(copy);
     }
     return *this;
 }
 
-HistoryDirectory::Directory::Directory(Directory&& other) noexcept
-    : node_(std::exchange(other.node_, nullptr)) {}
+HistoryDirectory::ChunkRef::ChunkRef(ChunkRef&& other) noexcept
+    : chunk_(std::exchange(other.chunk_, nullptr)) {}
 
-HistoryDirectory::Directory& HistoryDirectory::Directory::operator=(Directory&& other) noexcept {
+HistoryDirectory::ChunkRef& HistoryDirectory::ChunkRef::operator=(ChunkRef&& other) noexcept {
     if (this != &other) {
         reset();
-        node_ = std::exchange(other.node_, nullptr);
+        chunk_ = std::exchange(other.chunk_, nullptr);
     }
     return *this;
 }
 
-bool HistoryDirectory::Directory::unique() const noexcept {
-    return node_ && node_->references == 1;
+bool HistoryDirectory::ChunkRef::unique() const noexcept {
+    return chunk_ && chunk_->references == 1;
 }
 
-void HistoryDirectory::Directory::reset() noexcept {
-    if (auto* node = std::exchange(node_, nullptr)) node->owner->release_node(node);
+void HistoryDirectory::ChunkRef::reset() noexcept {
+    if (auto* chunk = std::exchange(chunk_, nullptr)) chunk->owner->release_chunk(chunk);
 }
 
 HistoryDirectory::~HistoryDirectory() = default;
@@ -751,9 +754,8 @@ void HistoryDirectory::add_prefix(HistoryId h, std::uint32_t frontier) {
     if (frontier > history.frontier)
         throw std::invalid_argument("KV retained prefix is outside committed history");
     const auto old = history.retained;
-    reserve_nodes(history, (std::size_t(history.prefixes.size()) + 3) * tree_depth_);
-    auto entry = std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
-                                  [](const auto& value, auto key) { return value.first < key; });
+    auto entry     = std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
+                                      [](const auto& value, auto key) { return value.first < key; });
     if (entry == history.prefixes.end() || entry->first != frontier) {
         const auto index = entry - history.prefixes.begin();
         metadata_.reserve(history.prefixes, history.prefixes.size() + 1);
@@ -873,14 +875,13 @@ std::vector<HistoryId> HistoryDirectory::released_histories(HistoryId owner) con
 
 void HistoryDirectory::truncate_membership(History& history, std::uint32_t count) {
     if (count == history.page_count) return;
-    auto directory = prefix_directory(history, history.directory, directory_capacity_, count);
     for (std::uint32_t i = count; i < history.page_count; ++i)
         if (!pages_->can_release_reference(membership(history, i)))
             throw std::logic_error("KV history still has an unowned reader");
     for (std::uint32_t i = count; i < history.page_count; ++i)
         if (!pages_->release_reference(membership(history, i)))
             throw std::logic_error("KV history still has an unowned reader");
-    history.directory  = std::move(directory);
+    history.directory.resize(chunk_count(count));
     history.page_count = count;
 }
 
@@ -891,15 +892,18 @@ void HistoryDirectory::collect(HistoryId h) {
     history.frontier = history.retained;
     if (history.prefix_count) return;
     release_spares(history);
-    auto placement   = std::move(history.placement);
-    auto spare_nodes = std::move(history.spare_nodes);
-    auto prefixes    = std::move(history.prefixes);
+    auto directory = std::move(history.directory);
+    directory.clear();
+    auto placement    = std::move(history.placement);
+    auto spare_chunks = std::move(history.spare_chunks);
+    auto prefixes     = std::move(history.prefixes);
     placement.clear();
     prefixes.clear();
-    history             = History{};
-    history.placement   = std::move(placement);
-    history.spare_nodes = std::move(spare_nodes);
-    history.prefixes    = std::move(prefixes);
+    history              = History{};
+    history.directory    = std::move(directory);
+    history.placement    = std::move(placement);
+    history.spare_chunks = std::move(spare_chunks);
+    history.prefixes     = std::move(prefixes);
     --occupied_;
     free_[free_count_++] = h.index;
 }
@@ -924,9 +928,9 @@ HistoryOwner HistoryDirectory::fork_history(const HistoryPrefix& source, std::ui
         throw std::invalid_argument("KV binding source belongs to another history");
     auto& from = require(source.history());
     HistoryOwner result(*this, allocate(from.placement, metadata));
-    auto& to     = require(result.handle());
-    to.directory = prefix_directory(to, from.directory, directory_capacity_, page_count(frontier));
-    to.frontier  = frontier;
+    auto& to = require(result.handle());
+    copy_prefix(to, from, page_count(frontier));
+    to.frontier = frontier;
     for (std::uint32_t i = 0; i < page_count(frontier); ++i) {
         auto page = membership(to, i);
         pages_->retain_reference(page);
@@ -1014,7 +1018,7 @@ HistoryDirectory::binding_demand(const HistoryPrefix* source, std::uint32_t fron
     for (auto& demand : result.records) demand.count += result.tail_copies;
     result.logical_pages += result.tail_copies;
     result.metadata = {result.reuse_history ? source->history() : HistoryId{},
-                       result.growth_pages + result.tail_copies};
+                       result.growth_pages + result.tail_copies, page_count(frontier)};
     return result;
 }
 
@@ -1349,9 +1353,7 @@ bool HistoryDirectory::growth_contributes(HistoryId handle, const RecordAssessme
     const auto& history = require(handle);
     if (history.reservation.contributes_to(pressure, metadata_pressure)) return true;
     if (!metadata_pressure) return false;
-    const auto retained_nodes = (history.prefixes.size() + 4) * tree_depth_;
-    return history.branch_descriptor.remaining() != 0 ||
-           history.spare_nodes.size() > retained_nodes;
+    return history.branch_descriptor.remaining() != 0 || !history.spare_chunks.empty();
 }
 
 void HistoryDirectory::shrink_growth(HistoryId handle, std::uint32_t count) {
@@ -1495,7 +1497,7 @@ void HistoryDirectory::branch_owner(HistoryOwner& owner, std::uint32_t frontier,
     HistoryOwner branch = fork_history(source, frontier, require(handle).branch_descriptor);
     auto& from          = require(handle);
     auto& to            = require(branch.handle());
-    to.spare_nodes.swap(from.spare_nodes);
+    to.spare_chunks.swap(from.spare_chunks);
     if (from.row) {
         for (auto i = to.page_count; i < from.page_count; ++i)
             transaction.retain(*pages_, membership(from, i));
@@ -1559,8 +1561,7 @@ void HistoryDirectory::update_mapping(TableRow row, std::uint32_t begin,
         const auto column = begin + i;
         if (mapped[column] == pages[i]) continue;
         const PageTableLocation location{row.index, row.generation, column};
-        pages_->bind_table(pages[i], location);
-        if (mapped[column].valid()) pages_->unbind_table(mapped[column], location);
+        pages_->replace_table(mapped[column], pages[i], location);
         mapped[column] = pages[i];
     }
     transaction.update_mapping(*pages_, row, begin, pages);
@@ -1575,56 +1576,30 @@ void HistoryDirectory::trim_mapping(TableRow row, std::uint32_t size) noexcept {
 }
 
 PageId HistoryDirectory::membership(const History& history, std::uint32_t index) const noexcept {
-    const auto* node = history.directory.get();
-    auto width       = directory_capacity_;
-    while (width > kChunkPages) {
-        width /= 2;
-        if (index < width)
-            node = node->left.get();
-        else {
-            index -= width;
-            node = node->right.get();
-        }
-    }
-    return node->pages[index];
+    const auto& page = history.directory[index / kChunkPages]->pages[index % kChunkPages];
+    return {pages_->pool_id(), page.index, page.generation};
 }
 
-PageId& HistoryDirectory::directory_slot(History& history, std::uint32_t index) {
-    auto* node = &history.directory;
-    auto width = directory_capacity_;
-    for (;;) {
-        if (!*node)
-            *node = allocate_node(history);
-        else if (!node->unique())
-            *node = allocate_node(history, node->get());
-        if (width == kChunkPages) return (*node)->pages[index];
-        width /= 2;
-        if (index < width)
-            node = &(*node)->left;
-        else {
-            index -= width;
-            node = &(*node)->right;
-        }
-    }
+HistoryDirectory::LocalPage& HistoryDirectory::directory_slot(History& history,
+                                                              std::uint32_t index) {
+    const auto count = chunk_count(std::uint64_t(index) + 1);
+    if (index >= page_capacity_ || count > history.directory.capacity())
+        throw std::logic_error("KV directory index exceeds its prepared capacity");
+    history.directory.resize(std::max<std::size_t>(history.directory.size(), count));
+    auto& chunk = history.directory[index / kChunkPages];
+    if (!chunk)
+        chunk = allocate_chunk(history);
+    else if (!chunk.unique())
+        chunk = allocate_chunk(history, chunk.get());
+    return chunk->pages[index % kChunkPages];
 }
 
-HistoryDirectory::Directory HistoryDirectory::prefix_directory(History& reservation,
-                                                               const Directory& node,
-                                                               std::uint64_t width,
-                                                               std::uint32_t count) {
-    if (!node || !count) return {};
-    if (count >= width) return node;
-    auto result = allocate_node(reservation, node.get());
-    if (width == kChunkPages)
-        std::fill(result->pages.begin() + count, result->pages.end(), PageId{});
-    else {
-        width /= 2;
-        if (count <= width) {
-            result->left = prefix_directory(reservation, node->left, width, count);
-            result->right.reset();
-        } else
-            result->right = prefix_directory(reservation, node->right, width, count - width);
-    }
-    return result;
+void HistoryDirectory::copy_prefix(History& destination, const History& source,
+                                   std::uint32_t pages) {
+    const auto count = chunk_count(pages);
+    if (!destination.directory.empty() || count > destination.directory.capacity() ||
+        pages > source.page_count)
+        throw std::logic_error("KV prefix has no prepared chunk index");
+    for (std::uint32_t i = 0; i < count; ++i) destination.directory.push_back(source.directory[i]);
 }
 } // namespace ninfer::models::context

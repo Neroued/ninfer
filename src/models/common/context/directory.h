@@ -156,7 +156,7 @@ struct HostWriteRequirements {
 
 class KVPoolDirectory {
 public:
-    KVPoolDirectory(const KVDirectorySpec&, RecordDomains&, MetadataBudget&);
+    KVPoolDirectory(const KVDirectorySpec&, RecordDomains&, PageAllocationIndex&, MetadataBudget&);
 
     [[nodiscard]] PageDirectory& pages() noexcept { return pages_; }
 
@@ -184,7 +184,8 @@ class ContextDirectory {
 public:
     explicit ContextDirectory(ContextDirectorySpec);
     [[nodiscard]] static std::size_t metadata_bytes(const ContextDirectorySpec&);
-    [[nodiscard]] static runtime::ContextMetadataPlan metadata_plan(const ContextDirectorySpec&);
+    [[nodiscard]] static runtime::ContextMetadataPlan
+    metadata_plan(const ContextDirectorySpec&, std::uint32_t rank = 0, std::uint32_t kv_parts = 0);
     ContextDirectory(const ContextDirectory&)            = delete;
     ContextDirectory& operator=(const ContextDirectory&) = delete;
 
@@ -237,6 +238,7 @@ private:
     std::size_t core_metadata_budget_ = 0;
     MetadataBudget metadata_;
     RecordDomains records_;
+    PageAllocationIndex page_allocations_;
     StateDirectory states_;
     std::vector<std::unique_ptr<KVPoolDirectory>> pools_;
     std::size_t address_borrows_ = 0;

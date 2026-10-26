@@ -92,6 +92,8 @@ public:
 
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
 
+    [[nodiscard]] MetadataBudget& budget() const noexcept { return *budget_; }
+
     void acquire(std::size_t bytes) {
         budget_->acquire(bytes);
         bytes_ += bytes;
@@ -106,7 +108,8 @@ public:
     template <class T>
     void reserve(std::vector<T>& values, std::size_t capacity) {
         if (capacity <= values.capacity()) return;
-        const auto bytes = (capacity - values.capacity()) * sizeof(T);
+        const auto old_bytes = values.capacity() * sizeof(T);
+        const auto bytes     = capacity * sizeof(T);
         acquire(bytes);
         try {
             values.reserve(capacity);
@@ -114,6 +117,7 @@ public:
             release(bytes);
             throw;
         }
+        release(old_bytes);
     }
 private:
     MetadataBudget* budget_;
@@ -124,6 +128,101 @@ class MetadataOwner {
 public:
     virtual ~MetadataOwner()                                                   = default;
     virtual void release_metadata(std::span<const std::uint32_t> ids) noexcept = 0;
+};
+
+// Storage whose capacity must be prepared before its producer publishes new identities.
+class MetadataCapacity {
+public:
+    virtual ~MetadataCapacity()                                               = default;
+    [[nodiscard]] virtual std::size_t metadata_requirement(std::size_t) const = 0;
+    virtual void reserve_metadata(std::size_t)                                = 0;
+};
+
+// The index prepares reusable evaluation storage. Extra simultaneous evaluations own separately
+// charged buffers; all evaluations must retire before the index. Idle scratch is allocated
+// metadata, not an in-flight reservation.
+class MetadataScratch {
+public:
+    explicit MetadataScratch(MetadataBudget& budget) : budget_(&budget) {}
+
+    ~MetadataScratch() {
+        if (readers_) std::terminate();
+        if (data_) budget_->release(capacity_);
+    }
+
+    MetadataScratch(const MetadataScratch&)            = delete;
+    MetadataScratch& operator=(const MetadataScratch&) = delete;
+
+    [[nodiscard]] std::size_t growth_bytes(std::size_t bytes) const noexcept {
+        return bytes > capacity_ ? bytes : 0;
+    }
+
+    void reserve(std::size_t bytes) {
+        if (bytes <= capacity_) return;
+        budget_->acquire(bytes);
+        std::unique_ptr<std::byte[]> next;
+        try {
+            next = std::make_unique<std::byte[]>(bytes);
+        } catch (...) {
+            budget_->release(bytes);
+            throw;
+        }
+        if (data_) {
+            data_.reset();
+            budget_->release(capacity_);
+        }
+        data_     = std::move(next);
+        capacity_ = bytes;
+    }
+
+    class Lease {
+    public:
+        Lease(MetadataScratch& owner, std::size_t bytes) : owner_(&owner), bytes_(bytes) {
+            if (owner.data_ && bytes <= owner.capacity_) {
+                bytes_ = owner.capacity_;
+                data_  = std::move(owner.data_);
+            } else {
+                owner.budget_->acquire(bytes);
+                try {
+                    data_ = std::make_unique<std::byte[]>(bytes);
+                } catch (...) {
+                    owner.budget_->release(bytes);
+                    throw;
+                }
+            }
+            ++owner.readers_;
+        }
+
+        ~Lease() {
+            if (!owner_) return;
+            --owner_->readers_;
+            if (!owner_->data_ && bytes_ == owner_->capacity_)
+                owner_->data_ = std::move(data_);
+            else {
+                data_.reset();
+                owner_->budget_->release(bytes_);
+            }
+        }
+
+        Lease(Lease&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)), bytes_(other.bytes_),
+              data_(std::move(other.data_)) {}
+
+        Lease(const Lease&)            = delete;
+        Lease& operator=(const Lease&) = delete;
+
+        [[nodiscard]] std::byte* data() noexcept { return data_.get(); }
+    private:
+        MetadataScratch* owner_;
+        std::size_t bytes_;
+        std::unique_ptr<std::byte[]> data_;
+    };
+
+    [[nodiscard]] Lease acquire(std::size_t bytes) { return Lease(*this, bytes); }
+private:
+    MetadataBudget* budget_;
+    std::size_t capacity_ = 0, readers_ = 0;
+    std::unique_ptr<std::byte[]> data_;
 };
 
 class MetadataReservation {
@@ -221,8 +320,7 @@ public:
         const auto segments = (std::uint64_t(minimum_size) + SegmentSize - 1) / SegmentSize;
         const auto target   = std::min<std::uint64_t>(limit_, segments * SegmentSize);
         return (target - size_) * sizeof(T) +
-               (segments > segments_.capacity() ? segments - segments_.capacity() : 0) *
-                   sizeof(std::unique_ptr<T[]>);
+               (segments > segments_.capacity() ? segments : 0) * sizeof(std::unique_ptr<T[]>);
     }
 
     [[nodiscard]] std::size_t ensure_bytes(std::uint32_t index) const {
@@ -237,7 +335,7 @@ public:
         const auto segments = (std::uint64_t(minimum_size) + SegmentSize - 1) / SegmentSize;
         if (segments > segments_.capacity()) {
             const auto before = segments_.capacity() * sizeof(std::unique_ptr<T[]>);
-            const auto bytes  = segments * sizeof(std::unique_ptr<T[]>) - before;
+            const auto bytes  = segments * sizeof(std::unique_ptr<T[]>);
             budget_->acquire(bytes);
             try {
                 segments_.reserve(segments);
@@ -245,6 +343,7 @@ public:
                 budget_->release(bytes);
                 throw;
             }
+            budget_->release(before);
         }
         while (size_ < minimum_size) {
             const auto count = std::min(SegmentSize, limit_ - size_);

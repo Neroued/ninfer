@@ -227,15 +227,17 @@ std::uint32_t StateDirectory::available_descriptors() const noexcept {
 std::size_t StateDirectory::metadata_requirement(std::uint32_t count) const {
     if (count > available_descriptors()) return SIZE_MAX;
     std::uint32_t highwater = initialized_objects_;
-    std::size_t bytes       = 0;
+    std::size_t bytes = 0, reallocation = 0;
     if (count > free_object_count_) {
         const auto required = occupied() + count;
         highwater           = static_cast<std::uint32_t>(std::max<std::uint64_t>(
             objects_.size(),
             std::min<std::uint64_t>(capacity(), (std::uint64_t(required) + 255) / 256 * 256)));
         bytes += objects_.growth_bytes(required);
-        if (highwater > free_objects_.capacity())
+        if (highwater > free_objects_.capacity()) {
             bytes += (highwater - free_objects_.capacity()) * sizeof(std::uint32_t);
+            reallocation = free_objects_.capacity() * sizeof(std::uint32_t);
+        }
     }
     const auto added = highwater - initialized_objects_;
     std::vector<std::uint32_t> holes;
@@ -251,9 +253,12 @@ std::size_t StateDirectory::metadata_requirement(std::uint32_t count) const {
             }
         }
         const auto parts = present ? objects_[index].parts.capacity() : 0;
-        if (parts < max_parts_) bytes += (max_parts_ - parts) * sizeof(Object::Part);
+        if (parts < max_parts_) {
+            bytes += (max_parts_ - parts) * sizeof(Object::Part);
+            reallocation = std::max(reallocation, parts * sizeof(Object::Part));
+        }
     }
-    return bytes;
+    return bytes + reallocation;
 }
 
 bool StateDirectory::reserve_metadata(std::uint32_t count) {

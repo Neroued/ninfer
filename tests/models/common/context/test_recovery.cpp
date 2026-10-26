@@ -20,7 +20,8 @@ struct Record {
 };
 
 struct View {
-    context::MetadataBudget metadata{context::CheckpointStore<Record>::metadata_bytes(128)};
+    context::MetadataBudget metadata{context::CheckpointStore<Record>::metadata_bytes(128) +
+                                     context::RecoveryIndex<>::metadata_bytes(128) * 4};
     context::CheckpointStore<Record> store{128, metadata};
     bool collide = false;
 
@@ -114,7 +115,7 @@ void known_losses() {
         left.resize(150);
         right.resize(150);
         const auto x = view.add(left), y = view.add(right);
-        context::RecoveryIndex index;
+        context::RecoveryIndex index(view.metadata);
         index.synchronize(view);
         const std::array removed{root, a, b};
         const std::array one{x};
@@ -134,7 +135,7 @@ void known_losses() {
 void lifecycle() {
     View view;
     view.collide = true;
-    context::RecoveryIndex index;
+    context::RecoveryIndex index(view.metadata);
     const auto deep = view.add({1, 2, 3, 4});
     index.synchronize(view);
     const auto shallow   = view.add({1, 2});
@@ -180,7 +181,7 @@ void exhaustive_and_random() {
     for (unsigned fixture = 0; fixture < 80; ++fixture) {
         View view;
         view.collide = fixture % 4 == 0;
-        context::RecoveryIndex index;
+        context::RecoveryIndex index(view.metadata);
         std::vector<Handle> handles;
         for (unsigned i = 0; i < 32; ++i) {
             std::vector<std::uint32_t> tokens;
